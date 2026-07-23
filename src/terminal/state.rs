@@ -1459,7 +1459,10 @@ impl TerminalState {
         self.suppress_current_full_lifecycle_hook_authority(
             FullLifecycleHookSuppressionReason::HookClear,
         );
-        self.detected_agent = None;
+        // Keep detected_agent: clearing hook authority hands control back to
+        // the detector for the same live process. Only the stale fallback
+        // activity state may not survive — it would resurrect and mint a
+        // phantom detector turn.
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;

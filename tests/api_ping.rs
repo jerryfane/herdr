@@ -2100,18 +2100,6 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let fallback_before_hook = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_clear_fallback","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
-        ),
-    );
-    let fallback_status = fallback_before_hook["result"]["pane"]["agent_status"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
     let hook = send_request(
         &socket_path,
         &format!(
@@ -2137,8 +2125,12 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
+    // Identity survives the authority clear (same live process, detector
+    // resumes ownership) but the stale pre-hook activity status must NOT be
+    // resurrected — that resurrection is the phantom-turn hazard. Status
+    // reads unknown until the detector observes fresh evidence.
     assert_eq!(pane["result"]["pane"]["agent"], "pi");
-    assert_eq!(pane["result"]["pane"]["agent_status"], fallback_status);
+    assert_eq!(pane["result"]["pane"]["agent_status"], "unknown");
 
     cleanup_spawned_herdr(child, base);
 }
