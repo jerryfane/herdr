@@ -483,6 +483,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_get_exposes_live_turn_hints_before_first_completion() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+
+        let response = app.handle_agent_get(
+            "req".into(),
+            AgentTarget {
+                target: "reviewer".into(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info response");
+        };
+        assert_eq!(agent.turn, Some(0));
+        assert!(agent.turn_epoch.is_some());
+        assert!(agent.last_completed_turn.is_none());
+    }
+
+    #[test]
     fn agent_rename_does_not_replace_the_pane_label() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;

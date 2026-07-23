@@ -6579,6 +6579,24 @@
               },
               "type": "object"
             },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "workspace_id": {
               "type": "string"
             }
