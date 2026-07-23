@@ -257,6 +257,11 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
+        if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
+            if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                terminal.mark_turn_aborted();
+            }
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }

@@ -458,6 +458,97 @@ mod tests {
     }
 
     #[test]
+    fn detector_flap_within_idle_stabilization_does_not_double_count_turns() {
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_new("turn-flap")];
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let started_at = std::time::Instant::now();
+        state.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: started_at,
+        });
+
+        let plain_idle = AgentDetection {
+            state: AgentState::Idle,
+            skip_state_update: false,
+            visible_idle: false,
+            visible_blocker: false,
+            visible_working: false,
+        };
+        let visible_working = screen_detection(AgentState::Working);
+        let input = |detection, now| ScreenDetectionPublishInput {
+            current_state: AgentState::Working,
+            last_visible_idle: false,
+            last_visible_blocker: false,
+            last_visible_working: true,
+            last_visible_signal_refresh: None,
+            screen_detection: detection,
+            process_exited: false,
+            agent_changed: false,
+            now,
+        };
+        let mut pending_idle = PendingIdleConfirmation::default();
+
+        assert_eq!(
+            decide_screen_detection_publish(
+                input(plain_idle, started_at + AGENT_PENDING_IDLE_RECHECK),
+                &mut pending_idle,
+            ),
+            DetectionPublishDecision::NoPublish
+        );
+        assert_eq!(
+            decide_screen_detection_publish(
+                input(visible_working, started_at + AGENT_PENDING_IDLE_RECHECK * 2),
+                &mut pending_idle,
+            ),
+            DetectionPublishDecision::NoPublish
+        );
+        assert_eq!(state.terminals[&terminal_id].turn, 0);
+
+        let mut completion = DetectionPublishDecision::NoPublish;
+        for confirmation in 0..=AGENT_PENDING_IDLE_CONFIRMATIONS {
+            completion = decide_screen_detection_publish(
+                input(
+                    plain_idle,
+                    started_at
+                        + AGENT_PENDING_IDLE_RECHECK * u32::from(confirmation.saturating_add(3)),
+                ),
+                &mut pending_idle,
+            );
+        }
+        let DetectionPublishDecision::Publish {
+            state: completed_state,
+            visible_blocker,
+            visible_working,
+            process_exited,
+            ..
+        } = completion
+        else {
+            panic!("confirmed idle should publish exactly once");
+        };
+        state.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Codex),
+            state: completed_state,
+            visible_blocker,
+            visible_working,
+            process_exited,
+            observed_at: started_at + AGENT_PENDING_IDLE_CAP,
+        });
+
+        assert_eq!(state.terminals[&terminal_id].turn, 1);
+    }
+
+    #[test]
     fn visible_idle_bypasses_plain_idle_hold() {
         let now = std::time::Instant::now();
         let previous = publish_state(AgentState::Working);

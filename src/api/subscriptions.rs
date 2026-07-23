@@ -2,8 +2,8 @@ use regex::Regex;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneAgentStatusChangedEvent, PaneOutputMatchedEvent,
-    PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription, SubscriptionEventData,
-    SubscriptionEventEnvelope, SubscriptionEventKind,
+    PaneScrollChangedEvent, PaneScrollInfo, PaneTurnCompletedEvent, Request, Subscription,
+    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
 use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
 use crate::api::{ApiRequestSender, EventHub};
@@ -62,6 +62,11 @@ pub(super) struct ActiveScrollChangedSubscription {
     request_prefix: String,
 }
 
+pub(super) struct ActiveTurnCompletedSubscription {
+    pane_id: String,
+    last_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PanePresentationSnapshot {
     title: Option<String>,
@@ -100,6 +105,7 @@ pub(super) enum ActiveSubscription {
     Event(ActiveEventSubscription),
     OutputMatched(ActiveOutputMatchedSubscription),
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
+    TurnCompleted(ActiveTurnCompletedSubscription),
     ScrollChanged(ActiveScrollChangedSubscription),
 }
 
@@ -266,6 +272,8 @@ impl ActiveSubscription {
                         title: probe.title,
                         display_agent: probe.display_agent,
                         state_labels: probe.state_labels,
+                        turn: probe.last_completed_turn.map(|turn| turn.turn),
+                        turn_epoch: probe.last_completed_turn.map(|turn| turn.turn_epoch),
                     });
 
                 Ok(Self::AgentStatusChanged(Box::new(
@@ -279,6 +287,14 @@ impl ActiveSubscription {
                         request_prefix: format!("{request_id}:sub:{index}"),
                     },
                 )))
+            }
+            Subscription::PaneTurnCompleted { pane_id } => {
+                let last_sequence = event_hub.current_sequence();
+                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                Ok(Self::TurnCompleted(ActiveTurnCompletedSubscription {
+                    pane_id: probe.pane_id,
+                    last_sequence,
+                }))
             }
             Subscription::PaneScrollChanged { pane_id } => {
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
@@ -304,6 +320,9 @@ impl ActiveSubscription {
             }
             Self::AgentStatusChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx, event_hub)?).ok()
+            }
+            Self::TurnCompleted(subscription) => {
+                serde_json::to_value(subscription.poll(event_hub)?).ok()
             }
             Self::ScrollChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
@@ -398,6 +417,8 @@ impl ActiveAgentStatusChangedSubscription {
                 title,
                 display_agent,
                 state_labels,
+                turn,
+                turn_epoch,
             } = event.data
             else {
                 continue;
@@ -432,6 +453,8 @@ impl ActiveAgentStatusChangedSubscription {
                     title,
                     display_agent,
                     state_labels,
+                    turn,
+                    turn_epoch,
                 }),
             }));
         }
@@ -498,8 +521,46 @@ impl ActiveAgentStatusChangedSubscription {
                 title: pane.title,
                 display_agent: pane.display_agent,
                 state_labels: pane.state_labels,
+                turn: pane.last_completed_turn.map(|turn| turn.turn),
+                turn_epoch: pane.last_completed_turn.map(|turn| turn.turn_epoch),
             }),
         })
+    }
+}
+
+impl ActiveTurnCompletedSubscription {
+    fn poll(&mut self, event_hub: &EventHub) -> Option<SubscriptionEventEnvelope> {
+        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+            self.last_sequence = sequence;
+            let crate::api::schema::EventData::PaneTurnCompleted {
+                pane,
+                turn,
+                turn_epoch,
+                outcome,
+                message,
+                completed_at,
+            } = event.data
+            else {
+                continue;
+            };
+            if event.event != crate::api::schema::EventKind::PaneTurnCompleted
+                || pane.pane_id != self.pane_id
+            {
+                continue;
+            }
+            return Some(SubscriptionEventEnvelope {
+                event: SubscriptionEventKind::PaneTurnCompleted,
+                data: SubscriptionEventData::PaneTurnCompleted(Box::new(PaneTurnCompletedEvent {
+                    pane,
+                    turn,
+                    turn_epoch,
+                    outcome,
+                    message,
+                    completed_at,
+                })),
+            });
+        }
+        None
     }
 }
 
@@ -643,6 +704,8 @@ mod tests {
                 title: title.map(str::to_string),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
             },
         }
     }
@@ -666,6 +729,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            last_completed_turn: None,
             scroll,
             revision: 0,
         }
@@ -728,6 +792,37 @@ mod tests {
     }
 
     #[test]
+    fn turn_completed_subscription_filters_and_round_trips_internal_event() {
+        let event_hub = EventHub::default();
+        let mut subscription = ActiveTurnCompletedSubscription {
+            pane_id: "pane_1".into(),
+            last_sequence: event_hub.current_sequence(),
+        };
+        event_hub.push(EventEnvelope {
+            event: EventKind::PaneTurnCompleted,
+            data: EventData::PaneTurnCompleted {
+                pane: pane_info_with_scroll(None),
+                turn: 3,
+                turn_epoch: 9,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: Some("done".into()),
+                completed_at: 123,
+            },
+        });
+
+        let event = subscription
+            .poll(&event_hub)
+            .expect("turn completion event");
+        assert_eq!(event.event, SubscriptionEventKind::PaneTurnCompleted);
+        let SubscriptionEventData::PaneTurnCompleted(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.pane.pane_id, "pane_1");
+        assert_eq!(data.turn, 3);
+        assert_eq!(data.outcome, crate::terminal::TurnOutcome::Completed);
+    }
+
+    #[test]
     fn agent_status_subscription_replays_queued_metadata_set_and_expiry_events() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
@@ -785,6 +880,8 @@ mod tests {
                 title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
             }),
             request_prefix: "test".into(),
         };
@@ -830,6 +927,8 @@ mod tests {
                 title: Some("short lived".into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
             }),
             request_prefix: "test".into(),
         };

@@ -462,6 +462,13 @@ impl App {
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
+            last_completed_turn: terminal.last_completed_turn().map(|record| {
+                crate::api::schema::LastCompletedTurn {
+                    turn: record.turn,
+                    turn_epoch: record.turn_epoch,
+                    completed_at: record.completed_at,
+                }
+            }),
             scroll,
             revision: terminal.revision,
         })

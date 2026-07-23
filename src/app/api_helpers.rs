@@ -14,6 +14,18 @@ fn parse_api_key(key: &str) -> Option<crossterm::event::KeyEvent> {
     Some(crossterm::event::KeyEvent::new(code, modifiers))
 }
 
+pub(super) fn api_keys_abort_turn(keys: &[String]) -> bool {
+    keys.iter().any(|key| {
+        parse_api_key(key).is_some_and(|event| {
+            event.code == crossterm::event::KeyCode::Esc
+                || (event.code == crossterm::event::KeyCode::Char('c')
+                    && event
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL))
+        })
+    })
+}
+
 fn normalize_api_key_alias(key: &str) -> &str {
     match key {
         "C-c" | "c-c" => "ctrl+c",

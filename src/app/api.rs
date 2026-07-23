@@ -590,15 +590,33 @@ impl App {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentStatusChanged,
                 data: crate::api::schema::EventData::PaneAgentStatusChanged {
-                    pane_id,
-                    workspace_id,
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
                     agent_status,
                     agent: update.agent_label.clone(),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     state_labels: presentation.state_labels,
+                    turn: update.turn,
+                    turn_epoch: update.turn_epoch,
                 },
             });
+        }
+
+        if let Some(completed) = &update.completed_turn {
+            if let Some(pane) = self.pane_info(update.ws_idx, update.pane_id) {
+                self.emit_event(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::PaneTurnCompleted,
+                    data: crate::api::schema::EventData::PaneTurnCompleted {
+                        pane,
+                        turn: completed.turn,
+                        turn_epoch: completed.turn_epoch,
+                        outcome: completed.outcome,
+                        message: completed.message.clone(),
+                        completed_at: completed.completed_at,
+                    },
+                });
+            }
         }
     }
 
@@ -1041,6 +1059,7 @@ impl App {
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
+            Method::PaneTurns(params) => return self.handle_pane_turns(request.id, params),
             Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),

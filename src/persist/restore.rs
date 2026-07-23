@@ -76,7 +76,7 @@ pub fn restore(
     render_dirty: Arc<AtomicBool>,
 ) -> RestoredSession {
     let mut imported_panes = HashMap::new();
-    restore_with_imports(
+    let mut restored = restore_with_imports(
         snapshot,
         history,
         rows,
@@ -88,7 +88,11 @@ pub fn restore(
         events,
         render_notify,
         render_dirty,
-    )
+    );
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SessionRestore);
+    }
+    restored
 }
 
 #[cfg(unix)]
@@ -102,7 +106,7 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<AtomicBool>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
+    let mut restored = restore_with_imports_strict(
         snapshot,
         None,
         24,
@@ -114,7 +118,11 @@ pub fn restore_handoff(
         events,
         render_notify,
         render_dirty,
-    )
+    )?;
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SelfUpdateHandoff);
+    }
+    Ok(restored)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Effective state arbitration is intentionally centralized here. Full lifecycle
 // Herdr hook integrations are hook-authoritative while live; screen recovery
@@ -9,6 +11,95 @@ use std::time::{Duration, Instant};
 
 use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
+
+pub(crate) const TURN_RECORD_LIMIT: usize = 64;
+pub(crate) const TURN_MESSAGE_MAX_BYTES: usize = 8 * 1024;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnRecord {
+    pub turn: u64,
+    pub turn_epoch: u64,
+    pub outcome: TurnOutcome,
+    pub completed_at: u64,
+    pub message: Option<String>,
+    pub message_truncated: bool,
+    pub agent_session_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnCounterResetPath {
+    ServerBoot,
+    PaneRespawn,
+    SessionRestore,
+    SelfUpdateHandoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnReplay {
+    pub turn_epoch: u64,
+    pub records: Vec<TurnRecord>,
+    pub truncated: bool,
+    pub oldest_available: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnReplayError {
+    EpochMismatch { expected: u64, actual: u64 },
+    SinceAhead { since: u64, newest: u64 },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TurnCompletionContext {
+    message: Option<String>,
+    agent_session_path: Option<String>,
+}
+
+fn fresh_turn_epoch() -> u64 {
+    static LAST_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(1)
+        .max(1);
+    let mut observed = LAST_EPOCH.load(Ordering::Relaxed);
+    loop {
+        let candidate = clock.max(observed.saturating_add(1));
+        match LAST_EPOCH.compare_exchange_weak(
+            observed,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return candidate,
+            Err(current) => observed = current,
+        }
+    }
+}
+
+fn fresh_turn_epoch_for(_path: TurnCounterResetPath) -> u64 {
+    fresh_turn_epoch()
+}
+
+fn truncate_turn_message(message: String) -> (String, bool) {
+    if message.len() <= TURN_MESSAGE_MAX_BYTES {
+        return (message, false);
+    }
+    let mut end = TURN_MESSAGE_MAX_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    (message[..end].to_string(), true)
+}
 
 #[path = "metadata.rs"]
 mod metadata;
@@ -119,6 +210,10 @@ pub struct TerminalState {
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
+    pub turn: u64,
+    pub turn_epoch: u64,
+    turn_records: VecDeque<TurnRecord>,
+    turn_abort_pending: bool,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -151,12 +246,128 @@ impl TerminalState {
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
+            turn: 0,
+            turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
+            turn_records: VecDeque::with_capacity(TURN_RECORD_LIMIT),
+            turn_abort_pending: false,
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit_at: None,
             pending_agent_resume_plan: None,
         }
+    }
+
+    pub(crate) fn reset_turn_counter(&mut self, path: TurnCounterResetPath) {
+        self.turn = 0;
+        self.turn_epoch = fresh_turn_epoch_for(path);
+        self.turn_records.clear();
+        self.turn_abort_pending = false;
+    }
+
+    pub(crate) fn mark_turn_aborted(&mut self) {
+        if matches!(self.state, AgentState::Working | AgentState::Blocked) {
+            self.turn_abort_pending = true;
+        }
+    }
+
+    pub(crate) fn turn_completion_context(&self) -> TurnCompletionContext {
+        let message = self
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| authority.message.clone());
+        let agent_session_path =
+            self.current_session_identity_for_persistence()
+                .and_then(|(_, _, kind, value)| {
+                    (kind == crate::agent_resume::AgentSessionRefKind::Path).then_some(value)
+                });
+        TurnCompletionContext {
+            message,
+            agent_session_path,
+        }
+    }
+
+    pub(crate) fn record_completed_turn(
+        &mut self,
+        completed_at: u64,
+        fallback_context: TurnCompletionContext,
+    ) -> TurnRecord {
+        self.turn = self.turn.saturating_add(1);
+        let current_context = self.turn_completion_context();
+        let message = current_context.message.or(fallback_context.message);
+        let (message, message_truncated) = message
+            .map(truncate_turn_message)
+            .map_or((None, false), |(message, truncated)| {
+                (Some(message), truncated)
+            });
+        let record = TurnRecord {
+            turn: self.turn,
+            turn_epoch: self.turn_epoch,
+            outcome: if std::mem::take(&mut self.turn_abort_pending) {
+                TurnOutcome::Aborted
+            } else {
+                TurnOutcome::Completed
+            },
+            completed_at,
+            message,
+            message_truncated,
+            agent_session_path: current_context
+                .agent_session_path
+                .or(fallback_context.agent_session_path),
+        };
+        if self.turn_records.len() == TURN_RECORD_LIMIT {
+            self.turn_records.pop_front();
+        }
+        self.turn_records.push_back(record.clone());
+        record
+    }
+
+    pub(crate) fn last_completed_turn(&self) -> Option<&TurnRecord> {
+        self.turn_records.back()
+    }
+
+    pub(crate) fn replay_turns(
+        &self,
+        since: Option<u64>,
+        expected_epoch: Option<u64>,
+    ) -> Result<TurnReplay, TurnReplayError> {
+        if let Some(expected) = expected_epoch {
+            if expected != self.turn_epoch {
+                return Err(TurnReplayError::EpochMismatch {
+                    expected,
+                    actual: self.turn_epoch,
+                });
+            }
+        }
+        if let Some(since) = since {
+            if since > self.turn {
+                return Err(TurnReplayError::SinceAhead {
+                    since,
+                    newest: self.turn,
+                });
+            }
+        }
+
+        let oldest_available = self.turn_records.front().map(|record| record.turn);
+        let truncated = match (since, oldest_available) {
+            (Some(0), Some(1)) | (None, _) | (_, None) => false,
+            (Some(since), Some(oldest)) => since < oldest,
+        };
+        let records = if truncated {
+            self.turn_records.iter().cloned().collect()
+        } else {
+            self.turn_records
+                .iter()
+                .filter(|record| since.is_none_or(|since| record.turn > since))
+                .cloned()
+                .collect()
+        };
+        Ok(TurnReplay {
+            turn_epoch: self.turn_epoch,
+            records,
+            truncated,
+            oldest_available,
+        })
     }
 
     pub(crate) fn terminal_title_stripped(&self) -> Option<String> {
@@ -1526,6 +1737,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.reset_turn_counter(TurnCounterResetPath::PaneRespawn);
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -4963,6 +5175,96 @@ mod tests {
         assert_eq!(
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
+        );
+    }
+
+    #[test]
+    fn turn_epoch_changes_on_every_counter_reset_path() {
+        let mut terminal = test_terminal();
+        let server_boot_epoch = terminal.turn_epoch;
+        assert_ne!(server_boot_epoch, 0);
+
+        let reset_paths = [
+            TurnCounterResetPath::PaneRespawn,
+            TurnCounterResetPath::SessionRestore,
+            TurnCounterResetPath::SelfUpdateHandoff,
+        ];
+        let mut previous_epoch = server_boot_epoch;
+        for path in reset_paths {
+            terminal.turn = 7;
+            terminal.record_completed_turn(1, TurnCompletionContext::default());
+            terminal.reset_turn_counter(path);
+            assert_eq!(terminal.turn, 0);
+            assert!(terminal.turn_records.is_empty());
+            assert_ne!(terminal.turn_epoch, previous_epoch);
+            previous_epoch = terminal.turn_epoch;
+        }
+    }
+
+    #[test]
+    fn turn_ring_eviction_and_since_semantics_are_explicit() {
+        let mut terminal = test_terminal();
+        let epoch = terminal.turn_epoch;
+        for completed_at in 1..=(TURN_RECORD_LIMIT as u64 + 1) {
+            terminal.record_completed_turn(completed_at, TurnCompletionContext::default());
+        }
+
+        let replay = terminal.replay_turns(Some(1), Some(epoch)).unwrap();
+        assert!(replay.truncated);
+        assert_eq!(replay.oldest_available, Some(2));
+        assert_eq!(replay.records.len(), TURN_RECORD_LIMIT);
+        assert_eq!(replay.records.first().map(|record| record.turn), Some(2));
+        assert_eq!(
+            replay.records.last().map(|record| record.turn),
+            Some(TURN_RECORD_LIMIT as u64 + 1)
+        );
+
+        let replay = terminal
+            .replay_turns(Some(TURN_RECORD_LIMIT as u64), Some(epoch))
+            .unwrap();
+        assert!(!replay.truncated);
+        assert_eq!(replay.records.len(), 1);
+
+        assert_eq!(
+            terminal.replay_turns(Some(terminal.turn + 1), Some(epoch)),
+            Err(TurnReplayError::SinceAhead {
+                since: terminal.turn + 1,
+                newest: terminal.turn,
+            })
+        );
+        assert_eq!(
+            terminal.replay_turns(None, Some(epoch + 1)),
+            Err(TurnReplayError::EpochMismatch {
+                expected: epoch + 1,
+                actual: epoch,
+            })
+        );
+    }
+
+    #[test]
+    fn turn_message_is_utf8_safe_and_bounded_with_truncation_flag() {
+        let mut terminal = test_terminal();
+        terminal.hook_authority = Some(HookAuthority {
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Idle,
+            message: Some(format!("{}é", "x".repeat(TURN_MESSAGE_MAX_BYTES - 1))),
+            reported_at: Instant::now(),
+            session_ref: Some(
+                crate::agent_resume::AgentSessionRef::path("/tmp/pi-session.jsonl").unwrap(),
+            ),
+        });
+
+        let record = terminal.record_completed_turn(42, TurnCompletionContext::default());
+
+        assert!(record.message_truncated);
+        assert!(record
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() <= TURN_MESSAGE_MAX_BYTES));
+        assert_eq!(
+            record.agent_session_path.as_deref(),
+            Some("/tmp/pi-session.jsonl")
         );
     }
 }

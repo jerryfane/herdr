@@ -27,6 +27,13 @@ fn is_background_completion_transition(prev_state: AgentState, new_state: AgentS
         && matches!(prev_state, AgentState::Working | AgentState::Blocked)
 }
 
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 fn is_completion_transition(change: &EffectiveStateChange) -> bool {
     is_completion_transition_parts(
         change.previous_state,
@@ -249,6 +256,9 @@ pub struct PaneStateUpdate {
     pub agent_name_changed: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    pub completed_turn: Option<crate::terminal::TurnRecord>,
+    pub turn: Option<u64>,
+    pub turn_epoch: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1041,12 @@ impl AppState {
                     .get_mut(&terminal_id)?
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
+                let (turn, turn_epoch) = self
+                    .terminals
+                    .get(&terminal_id)
+                    .filter(|terminal| terminal.is_agent_terminal())
+                    .map(|terminal| (Some(terminal.turn), Some(terminal.turn_epoch)))
+                    .unwrap_or((None, None));
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
                 let update = PaneStateUpdate {
                     pane_id,
@@ -1048,6 +1064,9 @@ impl AppState {
                     agent_name_changed: false,
                     agent_released: false,
                     agent_release_status: None,
+                    completed_turn: None,
+                    turn,
+                    turn_epoch,
                 };
                 Some(update)
             })
@@ -2855,8 +2874,15 @@ impl AppState {
             .clone();
         let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
         let now = Instant::now();
-        let (mutation, managed_changed, agent_name_changed, unchanged_change) = {
+        let (
+            mutation,
+            managed_changed,
+            agent_name_changed,
+            unchanged_change,
+            previous_turn_context,
+        ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
+            let previous_turn_context = terminal.turn_completion_context();
             let previous_agent_name = terminal.agent_name.clone();
             let mutation = update(terminal)?;
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
@@ -2868,6 +2894,7 @@ impl AppState {
                 managed_changed,
                 agent_name_changed,
                 unchanged_change,
+                previous_turn_context,
             )
         };
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
@@ -2875,12 +2902,26 @@ impl AppState {
         }
         let agent_released = mutation.agent_released;
         let change = mutation.effective_state_change.or(unchanged_change)?;
+        let mut completed_turn = None;
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                if is_background_completion_transition(change.previous_state, change.state)
+                    && (change.previous_agent_label.is_some() || change.agent_label.is_some())
+                {
+                    completed_turn = Some(
+                        terminal.record_completed_turn(current_unix_ms(), previous_turn_context),
+                    );
+                }
             }
         }
+        let (turn, turn_epoch) = self
+            .terminals
+            .get(&terminal_id)
+            .filter(|terminal| terminal.is_agent_terminal() || completed_turn.is_some())
+            .map(|terminal| (Some(terminal.turn), Some(terminal.turn_epoch)))
+            .unwrap_or((None, None));
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
         let update = PaneStateUpdate {
             pane_id,
@@ -2898,6 +2939,9 @@ impl AppState {
             agent_name_changed,
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            completed_turn,
+            turn,
+            turn_epoch,
         };
         Some(update)
     }
@@ -2946,6 +2990,7 @@ impl AppState {
             if agent.is_none() && !terminal.full_lifecycle_hook_authority_active() {
                 return None;
             }
+            terminal.mark_turn_aborted();
             Some(terminal.set_detected_state_with_screen_signals_at(
                 agent,
                 AgentState::Idle,
@@ -3264,6 +3309,16 @@ mod tests {
             state.mode = Mode::Terminal;
         }
         state
+    }
+
+    fn transition_detected_agent(
+        state: &mut AppState,
+        pane_id: PaneId,
+        agent_state: AgentState,
+    ) -> Option<PaneStateUpdate> {
+        state.update_terminal_state(pane_id, |terminal| {
+            Some(terminal.set_detected_state_with_mutation(Some(Agent::Pi), agent_state))
+        })
     }
 
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
@@ -5519,10 +5574,77 @@ mod tests {
             update.agent_release_status,
             Some(crate::api::schema::AgentStatus::Done)
         );
+        assert_eq!(
+            update.completed_turn.as_ref().map(|turn| turn.outcome),
+            Some(crate::terminal::TurnOutcome::Aborted)
+        );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         ));
+    }
+
+    #[test]
+    fn turn_boundary_matrix_counts_only_effective_agent_closes() {
+        let mut state = app_with_workspaces(&["turns"]);
+        state.outer_terminal_focus = Some(false);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Blocked).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        assert_eq!(state.terminals[&terminal_id].turn, 0);
+
+        let working_close =
+            transition_detected_agent(&mut state, pane_id, AgentState::Idle).unwrap();
+        assert_eq!(
+            working_close
+                .completed_turn
+                .as_ref()
+                .map(|record| record.turn),
+            Some(1)
+        );
+
+        state.mark_active_tab_seen();
+        assert_eq!(
+            state.terminals[&terminal_id].turn, 1,
+            "Done-to-Idle seen projection must not create a turn"
+        );
+
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Blocked).unwrap();
+        let blocked_close =
+            transition_detected_agent(&mut state, pane_id, AgentState::Idle).unwrap();
+        assert_eq!(
+            blocked_close
+                .completed_turn
+                .as_ref()
+                .map(|record| record.turn),
+            Some(2)
+        );
+
+        let _ = transition_detected_agent(&mut state, pane_id, AgentState::Idle);
+        assert_eq!(
+            state.terminals[&terminal_id].turn, 2,
+            "a repeated stabilized idle observation must not double-count"
+        );
+
+        let mut plain_state = app_with_workspaces(&["plain"]);
+        let plain_pane_id = plain_state.workspaces[0].tabs[0].root_pane;
+        let plain_terminal_id = plain_state.terminal_id_for_pane(0, plain_pane_id).unwrap();
+        plain_state
+            .update_terminal_state(plain_pane_id, |terminal| {
+                Some(terminal.set_detected_state_with_mutation(None, AgentState::Working))
+            })
+            .unwrap();
+        let plain_close = plain_state
+            .update_terminal_state(plain_pane_id, |terminal| {
+                Some(terminal.set_detected_state_with_mutation(None, AgentState::Idle))
+            })
+            .unwrap();
+        assert!(plain_close.completed_turn.is_none());
+        assert_eq!(plain_state.terminals[&plain_terminal_id].turn, 0);
     }
 
     #[test]
