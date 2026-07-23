@@ -78,6 +78,8 @@ pub enum Subscription {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
+    #[serde(rename = "pane.turn_completed")]
+    PaneTurnCompleted { pane_id: String },
     #[serde(rename = "pane.scroll_changed")]
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
@@ -217,6 +219,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    PaneTurnCompleted,
     LayoutUpdated,
 }
 
@@ -248,6 +251,7 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::PaneTurnCompleted => "pane.turn_completed",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -280,6 +284,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::PaneTurnCompleted,
     EventKind::LayoutUpdated,
 ];
 
@@ -370,6 +375,8 @@ pub enum SubscriptionEventKind {
     PaneOutputMatched,
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged,
+    #[serde(rename = "pane.turn_completed")]
+    PaneTurnCompleted,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
 }
@@ -385,6 +392,7 @@ pub struct SubscriptionEventEnvelope {
 pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
+    PaneTurnCompleted(Box<PaneTurnCompletedEvent>),
     ScrollChanged(PaneScrollChangedEvent),
 }
 
@@ -408,6 +416,31 @@ pub struct PaneAgentStatusChangedEvent {
     pub display_agent: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
+    /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTurnCompletedEvent {
+    pub pane: PaneInfo,
+    pub turn: u64,
+    pub turn_epoch: u64,
+    // Required to keep this event disjoint in the untagged subscription data enum.
+    /// `completed` means the agent became idle normally; `aborted` means it
+    /// became idle within 15 seconds of an Esc or Ctrl+C interrupt.
+    pub outcome: crate::terminal::TurnOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub message_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_path: Option<String>,
+    /// Unix timestamp in milliseconds.
+    pub completed_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -549,6 +582,28 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+        /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_epoch: Option<u64>,
+    },
+    PaneTurnCompleted {
+        pane: PaneInfo,
+        turn: u64,
+        turn_epoch: u64,
+        /// `completed` means the agent became idle normally; `aborted` means it
+        /// became idle within 15 seconds of an Esc or Ctrl+C interrupt.
+        outcome: crate::terminal::TurnOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        message_truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session_path: Option<String>,
+        /// Unix timestamp in milliseconds.
+        completed_unix_ms: u64,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

@@ -692,6 +692,24 @@
                     "null"
                   ]
                 },
+                "turn": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "turn_epoch": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "pane_agent_status_changed",
                   "type": "string"
@@ -705,6 +723,61 @@
                 "pane_id",
                 "workspace_id",
                 "agent_status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_session_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "completed_unix_ms": {
+                  "description": "Unix timestamp in milliseconds.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message_truncated": {
+                  "type": "boolean"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/event/$defs/TurnOutcome",
+                  "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+                },
+                "pane": {
+                  "$ref": "#/schemas/event/$defs/PaneInfo"
+                },
+                "turn": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turn_epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_turn_completed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane",
+                "turn",
+                "turn_epoch",
+                "outcome",
+                "completed_unix_ms"
               ],
               "type": "object"
             },
@@ -753,9 +826,36 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_turn_completed",
             "layout_updated"
           ],
           "type": "string"
+        },
+        "LastCompletedTurn": {
+          "properties": {
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "turn_epoch",
+            "completed_unix_ms"
+          ],
+          "type": "object"
         },
         "PaneInfo": {
           "properties": {
@@ -803,6 +903,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "last_completed_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/LastCompletedTurn"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "pane_id": {
@@ -862,6 +972,24 @@
                 "pattern": "^[A-Za-z0-9_-]{1,32}$"
               },
               "type": "object"
+            },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "workspace_id": {
               "type": "string"
@@ -1067,6 +1195,20 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TurnOutcome": {
+          "oneOf": [
+            {
+              "const": "completed",
+              "description": "The agent became idle without a recent interrupt.",
+              "type": "string"
+            },
+            {
+              "const": "aborted",
+              "description": "The agent became idle within 15 seconds of an Esc or Ctrl+C interrupt.",
+              "type": "string"
+            }
+          ]
         },
         "WorkspaceInfo": {
           "properties": {
@@ -4312,6 +4454,22 @@
                   "type": "string"
                 },
                 "type": {
+                  "const": "pane.turn_completed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
                   "const": "pane.scroll_changed",
                   "type": "string"
                 }
@@ -5822,6 +5980,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.turns",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTurnsParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -6409,6 +6583,36 @@
     },
     "subscription_event": {
       "$defs": {
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
+        },
         "AgentStatus": {
           "enum": [
             "idle",
@@ -6418,6 +6622,32 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "LastCompletedTurn": {
+          "properties": {
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "turn_epoch",
+            "completed_unix_ms"
+          ],
+          "type": "object"
         },
         "PaneAgentStatusChangedEvent": {
           "properties": {
@@ -6451,6 +6681,24 @@
                 "null"
               ]
             },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "workspace_id": {
               "type": "string"
             }
@@ -6459,6 +6707,155 @@
             "pane_id",
             "workspace_id",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "PaneInfo": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "foreground_cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_completed_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/LastCompletedTurn"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scroll": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneScrollInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state_labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_title_stripped": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "agent_status",
+            "revision"
           ],
           "type": "object"
         },
@@ -6566,6 +6963,56 @@
           ],
           "type": "object"
         },
+        "PaneTurnCompletedEvent": {
+          "properties": {
+            "agent_session_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message_truncated": {
+              "type": "boolean"
+            },
+            "outcome": {
+              "$ref": "#/schemas/subscription_event/$defs/TurnOutcome",
+              "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+            },
+            "pane": {
+              "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane",
+            "turn",
+            "turn_epoch",
+            "outcome",
+            "completed_unix_ms"
+          ],
+          "type": "object"
+        },
         "ReadFormat": {
           "enum": [
             "text",
@@ -6591,6 +7038,9 @@
               "$ref": "#/schemas/subscription_event/$defs/PaneAgentStatusChangedEvent"
             },
             {
+              "$ref": "#/schemas/subscription_event/$defs/PaneTurnCompletedEvent"
+            },
+            {
               "$ref": "#/schemas/subscription_event/$defs/PaneScrollChangedEvent"
             }
           ]
@@ -6599,9 +7049,24 @@
           "enum": [
             "pane.output_matched",
             "pane.agent_status_changed",
+            "pane.turn_completed",
             "pane.scroll_changed"
           ],
           "type": "string"
+        },
+        "TurnOutcome": {
+          "oneOf": [
+            {
+              "const": "completed",
+              "description": "The agent became idle without a recent interrupt.",
+              "type": "string"
+            },
+            {
+              "const": "aborted",
+              "description": "The agent became idle within 15 seconds of an Esc or Ctrl+C interrupt.",
+              "type": "string"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6666,6 +7131,16 @@
             },
             "interactive_ready": {
               "type": "boolean"
+            },
+            "last_completed_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LastCompletedTurn"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "launch_pending": {
               "type": "boolean"
@@ -7478,6 +7953,24 @@
                     "null"
                   ]
                 },
+                "turn": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "turn_epoch": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "pane_agent_status_changed",
                   "type": "string"
@@ -7491,6 +7984,61 @@
                 "pane_id",
                 "workspace_id",
                 "agent_status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_session_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "completed_unix_ms": {
+                  "description": "Unix timestamp in milliseconds.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message_truncated": {
+                  "type": "boolean"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/TurnOutcome",
+                  "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+                },
+                "pane": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInfo"
+                },
+                "turn": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turn_epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_turn_completed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane",
+                "turn",
+                "turn_epoch",
+                "outcome",
+                "completed_unix_ms"
               ],
               "type": "object"
             },
@@ -7554,6 +8102,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_turn_completed",
             "layout_updated"
           ],
           "type": "string"
@@ -7739,6 +8288,32 @@
           },
           "required": [
             "messages"
+          ],
+          "type": "object"
+        },
+        "LastCompletedTurn": {
+          "properties": {
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "turn_epoch",
+            "completed_unix_ms"
           ],
           "type": "object"
         },
@@ -7986,6 +8561,16 @@
                 "null"
               ]
             },
+            "last_completed_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LastCompletedTurn"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -8043,6 +8628,24 @@
                 "pattern": "^[A-Za-z0-9_-]{1,32}$"
               },
               "type": "object"
+            },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "workspace_id": {
               "type": "string"
@@ -9659,6 +10262,22 @@
             },
             {
               "properties": {
+                "turns": {
+                  "$ref": "#/schemas/success_response/$defs/PaneTurnsResult"
+                },
+                "type": {
+                  "const": "pane_turns",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "turns"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "swap": {
                   "$ref": "#/schemas/success_response/$defs/PaneSwapResult"
                 },
@@ -10736,6 +11355,20 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TurnOutcome": {
+          "oneOf": [
+            {
+              "const": "completed",
+              "description": "The agent became idle without a recent interrupt.",
+              "type": "string"
+            },
+            {
+              "const": "aborted",
+              "description": "The agent became idle within 15 seconds of an Esc or Ctrl+C interrupt.",
+              "type": "string"
+            }
+          ]
         },
         "WorkspaceInfo": {
           "properties": {
