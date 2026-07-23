@@ -590,15 +590,35 @@ impl App {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentStatusChanged,
                 data: crate::api::schema::EventData::PaneAgentStatusChanged {
-                    pane_id,
-                    workspace_id,
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
                     agent_status,
                     agent: update.agent_label.clone(),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     state_labels: presentation.state_labels,
+                    turn: update.turn,
+                    turn_epoch: update.turn_epoch,
                 },
             });
+        }
+
+        if let Some(completed) = &update.completed_turn {
+            if let Some(pane) = self.pane_info(update.ws_idx, update.pane_id) {
+                self.emit_event(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::PaneTurnCompleted,
+                    data: crate::api::schema::EventData::PaneTurnCompleted {
+                        pane,
+                        turn: completed.turn,
+                        turn_epoch: completed.turn_epoch,
+                        outcome: completed.outcome,
+                        message: completed.message.clone(),
+                        message_truncated: completed.message_truncated,
+                        agent_session_path: completed.agent_session_path.clone(),
+                        completed_unix_ms: completed.completed_unix_ms,
+                    },
+                });
+            }
         }
     }
 
@@ -1041,6 +1061,7 @@ impl App {
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
+            Method::PaneTurns(params) => return self.handle_pane_turns(request.id, params),
             Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
@@ -1355,6 +1376,38 @@ mod tests {
             },
         );
         app
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn respawn_shell_caller_changes_turn_epoch() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("respawn")];
+        app.state.ensure_test_terminals();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let previous_epoch = app.state.terminals[&terminal_id].turn_epoch;
+
+        assert!(app.respawn_shell_for_launch_pane(pane_id));
+
+        let respawn_epoch = app.state.terminals[&terminal_id].turn_epoch;
+        assert_ne!(respawn_epoch, previous_epoch);
+        assert_eq!(
+            crate::terminal::state::turn_epoch_reset_path_for_test(respawn_epoch),
+            crate::terminal::TurnCounterResetPath::PaneRespawn
+        );
+        if let Some(runtime) = app.terminal_runtimes.remove(&terminal_id) {
+            runtime.shutdown();
+        }
     }
 
     #[tokio::test]

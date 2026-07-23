@@ -10,8 +10,8 @@ use crate::api::schema::{
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTurnRecord, PaneTurnsParams, PaneTurnsResult,
+    PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -153,6 +153,68 @@ impl App {
         };
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_turns(&mut self, id: String, params: PaneTurnsParams) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let replay = match terminal.replay_turns(params.since, params.expected_epoch) {
+            Ok(replay) => replay,
+            Err(crate::terminal::TurnReplayError::EpochMismatch { expected, actual }) => {
+                return encode_error(
+                    id,
+                    "turn_epoch_mismatch",
+                    format!("expected turn epoch {expected}, current epoch is {actual}"),
+                );
+            }
+            Err(crate::terminal::TurnReplayError::SinceAhead { since, newest }) => {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    format!("since turn {since} is newer than current turn {newest}"),
+                );
+            }
+        };
+        let records = replay
+            .records
+            .into_iter()
+            .map(|record| PaneTurnRecord {
+                turn: record.turn,
+                turn_epoch: record.turn_epoch,
+                outcome: record.outcome,
+                completed_unix_ms: record.completed_unix_ms,
+                message: record.message,
+                message_truncated: record.message_truncated,
+                agent_session_path: record.agent_session_path,
+            })
+            .collect();
+        encode_success(
+            id,
+            ResponseResult::PaneTurns {
+                turns: PaneTurnsResult {
+                    pane_id: public_pane_id,
+                    turn_epoch: replay.turn_epoch,
+                    records,
+                    truncated: replay.truncated,
+                    oldest_available: replay.oldest_available,
+                },
+            },
+        )
     }
 
     pub(super) fn handle_pane_focus(&mut self, id: String, target: PaneTarget) -> String {
@@ -1471,8 +1533,23 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if aborts_turn {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1489,6 +1566,8 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text)
+            || super::super::api_helpers::api_keys_abort_turn(&params.keys);
         let bytes = match super::super::api_helpers::encode_api_input(
             runtime,
             &params.text,
@@ -1499,6 +1578,20 @@ impl App {
         };
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if aborts_turn {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1594,6 +1687,20 @@ impl App {
         for bytes in encoded_keys {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
+            }
+        }
+        if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
             }
         }
 
@@ -1912,6 +2019,119 @@ mod tests {
         (app, public_pane_id, pane_id)
     }
 
+    #[test]
+    fn api_pane_turns_reports_eviction_and_rejects_invalid_watermarks() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let epoch = terminal.turn_epoch;
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        for completed_unix_ms in 1..=65 {
+            terminal.record_completed_turn(
+                completed_unix_ms,
+                crate::terminal::state::TurnCompletionContext::default(),
+            );
+        }
+        let pane = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(pane.last_completed_turn.map(|turn| turn.turn), Some(65));
+        let agent = app.agent_info(0, pane_id).unwrap();
+        assert_eq!(agent.last_completed_turn.map(|turn| turn.turn), Some(65));
+
+        let response = app.handle_pane_turns(
+            "turns".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(1),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneTurns { turns } = success.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(!turns.truncated);
+        assert_eq!(turns.oldest_available, Some(2));
+        assert_eq!(turns.records.len(), 64);
+
+        let from_none = app.handle_pane_turns(
+            "none".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: None,
+                expected_epoch: Some(epoch),
+            },
+        );
+        let from_zero = app.handle_pane_turns(
+            "zero".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(0),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let from_none: SuccessResponse = serde_json::from_str(&from_none).unwrap();
+        let from_zero: SuccessResponse = serde_json::from_str(&from_zero).unwrap();
+        assert_eq!(from_none.result, from_zero.result);
+        let ResponseResult::PaneTurns { turns } = from_none.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(turns.truncated);
+
+        let newest = app.handle_pane_turns(
+            "newest".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(65),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let newest: SuccessResponse = serde_json::from_str(&newest).unwrap();
+        let ResponseResult::PaneTurns { turns } = newest.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(!turns.truncated);
+        assert!(turns.records.is_empty());
+
+        let response = app.handle_pane_turns(
+            "ahead".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(66),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+
+        let response = app.handle_pane_turns(
+            "epoch".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id,
+                since: None,
+                expected_epoch: Some(epoch + 1),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "turn_epoch_mismatch");
+    }
+
+    #[test]
+    fn pane_info_exposes_live_turn_hints_before_first_completion() {
+        let (mut app, _public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let epoch = terminal.turn_epoch;
+
+        let pane = app.pane_info(0, pane_id).unwrap();
+
+        assert_eq!(pane.turn, Some(0));
+        assert_eq!(pane.turn_epoch, Some(epoch));
+        assert!(pane.last_completed_turn.is_none());
+    }
+
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
         PaneReportMetadataParams {
             pane_id,
@@ -2101,6 +2321,36 @@ mod tests {
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x0a]));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_raw_etx_marks_nearby_idle_as_aborted() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, internal_pane_id).unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Working);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "\x03".into(),
+                keys: Vec::new(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x03"));
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let record = terminal
+            .record_completed_turn(42, crate::terminal::state::TurnCompletionContext::default());
+        assert_eq!(record.outcome, crate::terminal::TurnOutcome::Aborted);
     }
 
     #[tokio::test]

@@ -76,7 +76,7 @@ pub fn restore(
     render_dirty: Arc<AtomicBool>,
 ) -> RestoredSession {
     let mut imported_panes = HashMap::new();
-    restore_with_imports(
+    let mut restored = restore_with_imports(
         snapshot,
         history,
         rows,
@@ -88,7 +88,11 @@ pub fn restore(
         events,
         render_notify,
         render_dirty,
-    )
+    );
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SessionRestore);
+    }
+    restored
 }
 
 #[cfg(unix)]
@@ -102,7 +106,7 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<AtomicBool>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
+    let mut restored = restore_with_imports_strict(
         snapshot,
         None,
         24,
@@ -114,7 +118,11 @@ pub fn restore_handoff(
         events,
         render_notify,
         render_dirty,
-    )
+    )?;
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SelfUpdateHandoff);
+    }
+    Ok(restored)
 }
 
 #[cfg(unix)]
@@ -925,6 +933,113 @@ mod tests {
     #[cfg(not(windows))]
     fn test_restore_shell() -> &'static str {
         "/bin/sh"
+    }
+
+    fn snapshot_with_deferred_native_agent() -> SessionSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("turn-epoch".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:codex".into(),
+                                agent: "codex".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "turn-epoch-session".into(),
+                            }),
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    #[test]
+    fn restore_changes_turn_epoch_via_session_restore_path() {
+        let baseline = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            std::env::current_dir().unwrap(),
+        )
+        .turn_epoch;
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot_with_deferred_native_agent(),
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let restored_epoch = terminals.values().next().unwrap().turn_epoch;
+
+        assert!(runtimes.is_empty());
+        assert_ne!(restored_epoch, baseline);
+        assert_eq!(
+            crate::terminal::state::turn_epoch_reset_path_for_test(restored_epoch),
+            crate::terminal::TurnCounterResetPath::SessionRestore
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_handoff_changes_turn_epoch_via_handoff_path() {
+        let baseline = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            std::env::current_dir().unwrap(),
+        )
+        .turn_epoch;
+        let mut imports = HashMap::new();
+        let (_workspaces, terminals, runtimes) = restore_handoff(
+            &snapshot_with_deferred_native_agent(),
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let restored_epoch = terminals.values().next().unwrap().turn_epoch;
+
+        assert!(runtimes.is_empty());
+        assert_ne!(restored_epoch, baseline);
+        assert_eq!(
+            crate::terminal::state::turn_epoch_reset_path_for_test(restored_epoch),
+            crate::terminal::TurnCounterResetPath::SelfUpdateHandoff
+        );
     }
 
     #[test]

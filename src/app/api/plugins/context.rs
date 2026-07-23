@@ -136,6 +136,9 @@ impl App {
             EventData::PaneCreated { pane } | EventData::PaneUpdated { pane } => {
                 self.plugin_context_for_pane_info(pane, correlation_id)
             }
+            EventData::PaneTurnCompleted { pane, .. } => {
+                self.plugin_context_for_pane_info(pane, correlation_id)
+            }
             EventData::PaneMoved { pane, .. } => {
                 self.plugin_context_for_pane_info(pane.as_ref(), correlation_id)
             }
