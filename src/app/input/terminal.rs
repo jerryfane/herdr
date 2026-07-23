@@ -12,6 +12,7 @@ struct PreparedPaneInput {
     pane_id: crate::layout::PaneId,
     target: TerminalInputTarget,
     bytes: Bytes,
+    aborts_turn: bool,
 }
 
 enum PreparedPopupInput {
@@ -48,6 +49,9 @@ impl App {
         let sent = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
+        if sent && input.aborts_turn {
+            self.mark_pane_turn_aborted(input.ws_idx, input.pane_id);
+        }
         sent.then_some(input.target)
     }
 
@@ -215,7 +219,28 @@ impl App {
             pane_id,
             target: TerminalInputTarget { terminal_id },
             bytes: Bytes::from(bytes),
+            aborts_turn: key_event.kind != crossterm::event::KeyEventKind::Release
+                && (key_event.code == KeyCode::Esc
+                    || (key_event.code == KeyCode::Char('c')
+                        && key_event
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL))),
         })
+    }
+
+    fn mark_pane_turn_aborted(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned();
+        if let Some(terminal) = terminal_id
+            .as_ref()
+            .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+        {
+            terminal.mark_turn_aborted();
+        }
     }
 
     fn prepare_popup_key_forward(&mut self, key: TerminalKey) -> PreparedPopupInput {
@@ -369,6 +394,9 @@ impl App {
         } else {
             false
         };
+        if sent && input.aborts_turn {
+            self.mark_pane_turn_aborted(input.ws_idx, input.pane_id);
+        }
         sent.then_some(input.target)
     }
 }

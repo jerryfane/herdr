@@ -400,6 +400,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
+        Method::PaneTurns(_) => "pane.turns",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
@@ -874,6 +875,9 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            last_completed_turn: None,
+            turn: Some(0),
+            turn_epoch: Some(9),
             scroll: None,
             revision: 0,
         }
@@ -1106,6 +1110,8 @@ mod tests {
             response["result"]["event"]["data"]["agent_status"],
             "blocked"
         );
+        assert_eq!(response["result"]["event"]["data"]["turn"], 0);
+        assert_eq!(response["result"]["event"]["data"]["turn_epoch"], 9);
         drop(api_tx);
         responder.join().unwrap();
     }

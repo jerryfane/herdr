@@ -536,6 +536,10 @@ fn subscribe_request_parses_parameterized_subscriptions() {
                     "agent_status": "done"
                 },
                 {
+                    "type": "pane.turn_completed",
+                    "pane_id": "p_1_1"
+                },
+                {
                     "type": "pane.scroll_changed",
                     "pane_id": "p_1_1"
                 }
@@ -548,7 +552,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     let Method::EventsSubscribe(params) = request.method else {
         panic!("wrong method parsed");
     };
-    assert_eq!(params.subscriptions.len(), 3);
+    assert_eq!(params.subscriptions.len(), 4);
     assert!(matches!(
         &params.subscriptions[0],
         Subscription::PaneOutputMatched {
@@ -568,6 +572,10 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     ));
     assert!(matches!(
         &params.subscriptions[2],
+        Subscription::PaneTurnCompleted { pane_id } if pane_id == "p_1_1"
+    ));
+    assert!(matches!(
+        &params.subscriptions[3],
         Subscription::PaneScrollChanged { pane_id } if pane_id == "p_1_1"
     ));
 }
@@ -616,6 +624,60 @@ fn scroll_changed_subscription_event_round_trips() {
     let json = serde_json::to_string(&event).unwrap();
     assert!(json.contains("\"event\":\"pane.scroll_changed\""));
     let restored: SubscriptionEventEnvelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, event);
+}
+
+#[test]
+fn old_agent_status_event_shape_deserializes_without_turn_hints() {
+    let event: PaneAgentStatusChangedEvent = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1_1",
+        "workspace_id": "w_1",
+        "agent_status": "idle",
+        "state_labels": {}
+    }))
+    .unwrap();
+
+    assert_eq!(event.turn, None);
+    assert_eq!(event.turn_epoch, None);
+}
+
+#[test]
+fn turn_completed_subscription_event_round_trips_as_disjoint_variant() {
+    let json = serde_json::json!({
+        "event": "pane.turn_completed",
+        "data": {
+            "pane": {
+                "pane_id": "p_1_1",
+                "terminal_id": "term_1",
+                "workspace_id": "w_1",
+                "tab_id": "t_1",
+                "focused": true,
+                "agent_status": "idle",
+                "revision": 4
+            },
+            "turn": 7,
+            "turn_epoch": 99,
+            "outcome": "completed",
+            "message": "done",
+            "message_truncated": true,
+            "agent_session_path": "/tmp/session.jsonl",
+            "completed_unix_ms": 1234
+        }
+    });
+    let event: SubscriptionEventEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(event.event, SubscriptionEventKind::PaneTurnCompleted);
+    let SubscriptionEventData::PaneTurnCompleted(data) = &event.data else {
+        panic!("turn_completed was shadowed by another untagged event variant");
+    };
+    assert_eq!(data.outcome, crate::terminal::TurnOutcome::Completed);
+    assert!(data.message_truncated);
+    assert_eq!(
+        data.agent_session_path.as_deref(),
+        Some("/tmp/session.jsonl")
+    );
+
+    let restored: SubscriptionEventEnvelope =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
     assert_eq!(restored, event);
 }
 
@@ -736,6 +798,9 @@ fn worktree_request_and_response_round_trip() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                last_completed_turn: None,
+                turn: None,
+                turn_epoch: None,
                 scroll: None,
                 revision: 0,
             },
@@ -1150,6 +1215,9 @@ fn create_response_round_trips_with_root_pane() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                last_completed_turn: None,
+                turn: None,
+                turn_epoch: None,
                 scroll: None,
                 revision: 0,
             },
