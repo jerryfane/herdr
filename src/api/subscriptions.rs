@@ -823,6 +823,29 @@ mod tests {
     }
 
     #[test]
+    fn turn_completed_subscription_reconnect_does_not_replay_backlog() {
+        let event_hub = EventHub::default();
+        event_hub.push(EventEnvelope {
+            event: EventKind::PaneTurnCompleted,
+            data: EventData::PaneTurnCompleted {
+                pane: pane_info_with_scroll(None),
+                turn: 4,
+                turn_epoch: 9,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: None,
+                completed_at: 456,
+            },
+        });
+
+        let mut reconnected = ActiveTurnCompletedSubscription {
+            pane_id: "pane_1".into(),
+            last_sequence: event_hub.current_sequence(),
+        };
+
+        assert!(reconnected.poll(&event_hub).is_none());
+    }
+
+    #[test]
     fn agent_status_subscription_replays_queued_metadata_set_and_expiry_events() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {

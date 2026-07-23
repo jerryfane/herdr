@@ -2060,6 +2060,65 @@ mod tests {
         assert_eq!(error.error.code, "turn_epoch_mismatch");
     }
 
+    #[test]
+    fn api_pane_turns_recovers_turn_missed_during_subscription_reconnect() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let subscribed_at = app.event_hub.current_sequence();
+        let observed_at = std::time::Instant::now();
+
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at,
+        });
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: observed_at + std::time::Duration::from_millis(1),
+        });
+
+        assert!(app
+            .event_hub
+            .events_after(subscribed_at)
+            .iter()
+            .any(|(_, event)| {
+                matches!(&event.data, EventData::PaneTurnCompleted { turn: 1, .. })
+            }));
+
+        // A replacement subscription starts at the current event sequence, so it receives no
+        // backlog. Its persisted watermark must be recovered through pane.turns instead.
+        let reconnected_at = app.event_hub.current_sequence();
+        assert!(app.event_hub.events_after(reconnected_at).is_empty());
+
+        let epoch = app.state.terminals[&terminal_id].turn_epoch;
+        let response = app.handle_pane_turns(
+            "replay".into(),
+            PaneTurnsParams {
+                pane: public_pane_id,
+                since: Some(0),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneTurns { turns } = success.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(!turns.truncated);
+        assert_eq!(turns.records.len(), 1);
+        assert_eq!(turns.records[0].turn, 1);
+        assert_eq!(turns.records[0].turn_epoch, epoch);
+    }
+
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
         PaneReportMetadataParams {
             pane_id,
