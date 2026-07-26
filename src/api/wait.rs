@@ -347,6 +347,11 @@ enum PromptObservationVerdict {
     TimedOut,
 }
 
+enum ComposerObservation {
+    Unavailable,
+    Observed(Option<crate::detect::manifest::PromptFingerprint>),
+}
+
 fn classify_prompt_observation(
     initially_working: bool,
     baseline: u64,
@@ -397,6 +402,7 @@ fn observe_prompt_effect(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
+    let mut composer_matches = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -413,10 +419,17 @@ fn observe_prompt_effect(
                 .map(Some);
         }
 
-        let composer = agent_composer_fingerprint(request_id, target, &current, api_tx);
-        let composer_matches = composer.as_ref() == Some(submitted_fingerprint);
-        if composer_matches {
-            composer_observed = true;
+        match agent_composer_fingerprint(request_id, target, &current, api_tx) {
+            ComposerObservation::Observed(composer) => {
+                composer_matches = composer.as_ref() == Some(submitted_fingerprint);
+                if composer_matches {
+                    composer_observed = true;
+                }
+            }
+            ComposerObservation::Unavailable => {
+                // An unavailable snapshot cannot prove that a previously
+                // observed composer cleared.
+            }
         }
 
         match classify_prompt_observation(
@@ -481,8 +494,14 @@ fn agent_composer_fingerprint(
     target: &str,
     agent: &crate::api::schema::AgentInfo,
     api_tx: &ApiRequestSender,
-) -> Option<crate::detect::manifest::PromptFingerprint> {
-    let known_agent = crate::detect::parse_agent_label(agent.agent.as_deref()?)?;
+) -> ComposerObservation {
+    let Some(known_agent) = agent
+        .agent
+        .as_deref()
+        .and_then(crate::detect::parse_agent_label)
+    else {
+        return ComposerObservation::Unavailable;
+    };
     let response = dispatch_to_app_with_timeout(
         Request {
             id: format!("{request_id}:composer"),
@@ -497,22 +516,25 @@ fn agent_composer_fingerprint(
         api_tx,
         Some(APP_RESPONSE_TIMEOUT),
     );
-    let value = serde_json::from_str::<serde_json::Value>(&response).ok()?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return ComposerObservation::Unavailable;
+    };
     if value.get("error").is_some() {
-        return None;
+        return ComposerObservation::Unavailable;
     }
-    let read = serde_json::from_value::<crate::api::schema::PaneReadResult>(
+    let Ok(read) = serde_json::from_value::<crate::api::schema::PaneReadResult>(
         value["result"]["read"].clone(),
-    )
-    .ok()?;
-    crate::detect::manifest::composer_fingerprint(
+    ) else {
+        return ComposerObservation::Unavailable;
+    };
+    ComposerObservation::Observed(crate::detect::manifest::composer_fingerprint(
         known_agent,
         crate::detect::manifest::DetectionInput {
             screen: &read.text,
             osc_title: "",
             osc_progress: "",
         },
-    )
+    ))
 }
 
 fn agent_prompt_observation_error(
@@ -1068,6 +1090,7 @@ mod tests {
         screens: VecDeque<String>,
         last_screen: String,
         prompt_error: Option<ErrorBody>,
+        composer_read_error_from: Option<usize>,
     }
 
     fn spawn_prompt_responder(
@@ -1075,6 +1098,7 @@ mod tests {
     ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
+            let mut composer_read_count = 0;
             while let Some(message) = api_rx.blocking_recv() {
                 let id = message.request.id;
                 let response = match message.request.method {
@@ -1092,11 +1116,26 @@ mod tests {
                         None => success_agent_response(id, harness.prompted.clone(), true),
                     },
                     Method::AgentRead(_) => {
-                        let text = harness
-                            .screens
-                            .pop_front()
-                            .unwrap_or_else(|| harness.last_screen.clone());
-                        pane_read_response(id, text)
+                        composer_read_count += 1;
+                        if harness
+                            .composer_read_error_from
+                            .is_some_and(|first_error| composer_read_count >= first_error)
+                        {
+                            serde_json::to_string(&ErrorResponse {
+                                id,
+                                error: ErrorBody {
+                                    code: "server_unavailable".into(),
+                                    message: "composer snapshot unavailable".into(),
+                                },
+                            })
+                            .expect("serialize composer read error")
+                        } else {
+                            let text = harness
+                                .screens
+                                .pop_front()
+                                .unwrap_or_else(|| harness.last_screen.clone());
+                            pane_read_response(id, text)
+                        }
                     }
                     other => panic!("unexpected prompt observation request: {other:?}"),
                 };
@@ -1206,6 +1245,7 @@ mod tests {
                 screens: VecDeque::new(),
                 last_screen: "working".into(),
                 prompt_error: None,
+                composer_read_error_from: None,
             },
         );
 
@@ -1233,6 +1273,7 @@ mod tests {
                 screens: VecDeque::from([prompt_box(text), "working".into()]),
                 last_screen: "working".into(),
                 prompt_error: None,
+                composer_read_error_from: None,
             },
         );
 
@@ -1257,6 +1298,7 @@ mod tests {
                 screens: VecDeque::from([prompt_box(text)]),
                 last_screen: prompt_box(text),
                 prompt_error: None,
+                composer_read_error_from: None,
             },
         );
 
@@ -1264,6 +1306,30 @@ mod tests {
         assert!(
             !response.to_string().contains(text),
             "prompt text must not leak into observation errors"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_does_not_treat_a_failed_composer_read_as_clear() {
+        let text = "composer read failure";
+        let response = run_prompt_harness(
+            "composer-read-failure",
+            text,
+            crate::api::schema::AgentStatus::Idle,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text)]),
+                last_screen: prompt_box(text),
+                prompt_error: None,
+                composer_read_error_from: Some(2),
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_unsubmitted",
+            "an unavailable snapshot cannot prove the observed composer cleared: {response}"
         );
     }
 
@@ -1280,6 +1346,7 @@ mod tests {
                 screens: VecDeque::new(),
                 last_screen: "idle".into(),
                 prompt_error: None,
+                composer_read_error_from: None,
             },
         );
 
@@ -1299,6 +1366,7 @@ mod tests {
                 screens: VecDeque::new(),
                 last_screen: "working".into(),
                 prompt_error: None,
+                composer_read_error_from: None,
             },
         );
 
@@ -1322,6 +1390,7 @@ mod tests {
                     code: "pty_write_failed".into(),
                     message: "failed to write agent prompt to the PTY".into(),
                 }),
+                composer_read_error_from: None,
             },
         );
 
