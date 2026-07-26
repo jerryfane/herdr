@@ -44,6 +44,10 @@ pub(crate) enum TurnCounterResetPath {
     ServerBoot = 0,
     PaneRespawn = 1,
     SessionRestore = 2,
+    // The only non-test construction site is `restore_handoff`, which is `#[cfg(unix)]`;
+    // the `#[cfg(test)]` epoch-tag decoder below constructs it on every platform, which is
+    // why Windows `cargo test` compiles while `clippy --bin herdr` does not.
+    #[cfg_attr(windows, allow(dead_code))]
     SelfUpdateHandoff = 3,
 }
 
