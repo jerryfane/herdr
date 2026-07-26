@@ -44,6 +44,8 @@ pub(crate) enum TurnCounterResetPath {
     ServerBoot = 0,
     PaneRespawn = 1,
     SessionRestore = 2,
+    // This variant is constructed only on Unix because `restore_handoff` is `#[cfg(unix)]`.
+    #[cfg_attr(windows, allow(dead_code))]
     SelfUpdateHandoff = 3,
 }
 
