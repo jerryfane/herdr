@@ -181,6 +181,26 @@ pub(super) fn prompt_agent(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    prompt_agent_with_effect_timeout(
+        request_id,
+        params,
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+    )
+}
+
+fn prompt_agent_with_effect_timeout(
+    request_id: String,
+    params: crate::api::schema::AgentPromptParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    effect_timeout_cap_ms: u64,
+) -> std::io::Result<Option<String>> {
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout(
             Request {
@@ -227,14 +247,12 @@ pub(super) fn prompt_agent(
     let wait_started = std::time::Instant::now();
     let prompt_state_change_seq = prompted.state_change_seq;
     let until = agent_wait_statuses(wait.until);
-    let effect_timeout_ms = wait
-        .timeout_ms
-        .map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
-            timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-        });
+    let effect_timeout_ms = wait.timeout_ms.map_or(effect_timeout_cap_ms, |timeout_ms| {
+        timeout_ms.min(effect_timeout_cap_ms)
+    });
     let caller_timeout_is_effect_deadline = wait
         .timeout_ms
-        .is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS);
+        .is_some_and(|timeout_ms| timeout_ms <= effect_timeout_cap_ms);
     let Some(effect) = observe_prompt_effect(
         &request_id,
         &target,
@@ -951,6 +969,187 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn test_agent(
+        status: crate::api::schema::AgentStatus,
+        state_change_seq: u64,
+    ) -> crate::api::schema::AgentInfo {
+        crate::api::schema::AgentInfo {
+            terminal_id: "term_1".into(),
+            name: Some("reviewer".into()),
+            agent: Some("claude".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: status,
+            input_pending: false,
+            input_prompt_kind: None,
+            screen_detection_skipped: false,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            agent_session: None,
+            last_completed_turn: None,
+            turn: Some(1),
+            turn_epoch: Some(9),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            pane_id: "pane_1".into(),
+            focused: true,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    fn success_agent_response(
+        id: String,
+        agent: crate::api::schema::AgentInfo,
+        prompted: bool,
+    ) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id,
+            result: if prompted {
+                ResponseResult::AgentPrompted {
+                    agent,
+                    delivery: Some(crate::api::schema::AgentPromptDelivery::WrittenToPty),
+                }
+            } else {
+                ResponseResult::AgentInfo { agent }
+            },
+        })
+        .expect("serialize agent response")
+    }
+
+    fn pane_read_response(id: String, text: String) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id,
+            result: ResponseResult::PaneRead {
+                read: crate::api::schema::PaneReadResult {
+                    pane_id: "pane_1".into(),
+                    workspace_id: "ws_1".into(),
+                    tab_id: "tab_1".into(),
+                    source: crate::api::schema::ReadSource::Detection,
+                    format: crate::api::schema::ReadFormat::Text,
+                    text,
+                    revision: 1,
+                    truncated: false,
+                },
+            },
+        })
+        .expect("serialize pane read response")
+    }
+
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-prompt-wait-{name}-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).expect("bind local listener");
+        let client = crate::ipc::connect_local_stream(&path).expect("connect local stream");
+        let server = listener.accept().expect("accept local stream");
+        (client, server, path)
+    }
+
+    struct PromptHarness {
+        agents: VecDeque<crate::api::schema::AgentInfo>,
+        prompted: crate::api::schema::AgentInfo,
+        screens: VecDeque<String>,
+        last_screen: String,
+        prompt_error: Option<ErrorBody>,
+    }
+
+    fn spawn_prompt_responder(
+        mut harness: PromptHarness,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(message) = api_rx.blocking_recv() {
+                let id = message.request.id;
+                let response = match message.request.method {
+                    Method::AgentGet(_) => success_agent_response(
+                        id,
+                        harness
+                            .agents
+                            .pop_front()
+                            .unwrap_or_else(|| harness.prompted.clone()),
+                        false,
+                    ),
+                    Method::AgentPrompt(_) => match harness.prompt_error.clone() {
+                        Some(error) => serde_json::to_string(&ErrorResponse { id, error })
+                            .expect("serialize prompt error"),
+                        None => success_agent_response(id, harness.prompted.clone(), true),
+                    },
+                    Method::AgentRead(_) => {
+                        let text = harness
+                            .screens
+                            .pop_front()
+                            .unwrap_or_else(|| harness.last_screen.clone());
+                        pane_read_response(id, text)
+                    }
+                    other => panic!("unexpected prompt observation request: {other:?}"),
+                };
+                message
+                    .respond_to
+                    .send(response)
+                    .expect("prompt observer still receiving");
+            }
+        });
+        (api_tx, responder)
+    }
+
+    fn run_prompt_harness(
+        name: &str,
+        text: &str,
+        until: crate::api::schema::AgentStatus,
+        effect_timeout_cap_ms: u64,
+        harness: PromptHarness,
+    ) -> serde_json::Value {
+        let (api_tx, responder) = spawn_prompt_responder(harness);
+        let (mut client, _server, path) = local_stream_pair(name);
+        let response = prompt_agent_with_effect_timeout(
+            name.into(),
+            crate::api::schema::AgentPromptParams {
+                target: "reviewer".into(),
+                text: text.into(),
+                wait: Some(crate::api::schema::AgentPromptWaitOptions {
+                    until: vec![until],
+                    timeout_ms: Some(10_000),
+                }),
+            },
+            &mut client,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            effect_timeout_cap_ms,
+        )
+        .expect("prompt wait succeeds")
+        .expect("connection remains active");
+        drop(api_tx);
+        responder.join().expect("prompt responder joins");
+        drop(client);
+        let _ = std::fs::remove_file(path);
+        serde_json::from_str(&response).expect("decode prompt response")
+    }
+
+    fn prompt_box(text: &str) -> String {
+        format!(
+            "────────────────────────────────────────\n\
+             ❯ {text}\n\
+             ────────────────────────────────────────\n"
+        )
+    }
 
     #[test]
     fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
@@ -989,6 +1188,144 @@ mod tests {
             Some(PromptObservationVerdict::TimedOut),
             "caller deadlines at the observation boundary preserve ordinary timeout"
         );
+    }
+
+    #[test]
+    fn prompt_agent_reports_submitted_from_a_new_lifecycle_sequence() {
+        let response = run_prompt_harness(
+            "lifecycle-submitted",
+            "review the diff",
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    test_agent(crate::api::schema::AgentStatus::Working, 11),
+                ]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: "working".into(),
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(
+            response["result"]["type"], "agent_prompted",
+            "response: {response}"
+        );
+        assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_reports_submitted_when_the_exact_composer_clears() {
+        let text = "composer evidence";
+        let response = run_prompt_harness(
+            "composer-submitted",
+            text,
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    test_agent(crate::api::schema::AgentStatus::Working, 10),
+                ]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text), "working".into()]),
+                last_screen: "working".into(),
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(
+            response["result"]["type"], "agent_prompted",
+            "response: {response}"
+        );
+        assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_reports_unsubmitted_without_leaking_prompt_text() {
+        let text = "secret removal-sensitive prompt";
+        let response = run_prompt_harness(
+            "unsubmitted",
+            text,
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text)]),
+                last_screen: prompt_box(text),
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
+        assert!(
+            !response.to_string().contains(text),
+            "prompt text must not leak into observation errors"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_reports_stalled_without_composer_or_lifecycle_evidence() {
+        let response = run_prompt_harness(
+            "stalled",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: "idle".into(),
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+    }
+
+    #[test]
+    fn prompt_agent_does_not_attribute_an_already_working_sequence_advance() {
+        let response = run_prompt_harness(
+            "already-working",
+            "follow-up prompt",
+            crate::api::schema::AgentStatus::Working,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Working, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Working, 11),
+                screens: VecDeque::new(),
+                last_screen: "working".into(),
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(response["result"]["type"], "agent_prompted");
+        assert_eq!(response["result"]["delivery"], "written_to_pty");
+    }
+
+    #[test]
+    fn prompt_agent_preserves_the_pty_write_failure() {
+        let response = run_prompt_harness(
+            "write-failure",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: String::new(),
+                prompt_error: Some(ErrorBody {
+                    code: "pty_write_failed".into(),
+                    message: "failed to write agent prompt to the PTY".into(),
+                }),
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "pty_write_failed");
     }
 
     #[test]

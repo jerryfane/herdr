@@ -369,6 +369,23 @@ fn claude_enumerated_select_matches_captured_switch_model_dialog() {
 }
 
 #[test]
+fn claude_enumerated_select_matches_later_rewind_restore_options() {
+    let screen = "Rewind\nChoose what to restore from this checkpoint\n\n❯ 1. Restore code and conversation\n  2. Restore conversation only\n  3. Cancel\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert_eq!(explain.state, AgentState::Idle);
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Select));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("claude_enumerated_select")
+    );
+}
+
+#[test]
 fn claude_enumerated_select_rejects_composer_numbered_lists() {
     let prompt_box = |body: &str| {
         format!(
@@ -439,6 +456,49 @@ fn per_agent_input_rule_beats_shared_fallback_and_shared_unknown_is_typed() {
             .as_ref()
             .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
         Some(("shared_enter_escape_footer", true, InputPromptKind::Unknown))
+    );
+}
+
+#[test]
+fn equal_priority_per_agent_input_rule_beats_shared_fallback() {
+    let manifest = parse_manifest(
+        r#"
+id = "claude"
+
+[[input_rules]]
+id = "agent_enter_escape_confirm"
+priority = 100
+region = "bottom_non_empty_lines(5)"
+kind = "confirm"
+all = [
+  { line_regex = ['(?i)\benter\b.+$'] },
+  { line_regex = ['(?i)\besc(?:ape)?\s+to\s+cancel\b'] },
+]
+"#,
+    )
+    .expect("parse equal-priority agent rule");
+    let loaded = loaded_manifest(manifest, ManifestSource::Bundled, None, None, false)
+        .expect("load equal-priority agent rule");
+
+    let evaluation = evaluate_input_rules(
+        Some(&loaded),
+        DetectionInput {
+            screen: "Confirm deployment\nEnter to continue\nEsc to cancel\n",
+            osc_title: "",
+            osc_progress: "",
+        },
+    );
+
+    assert_eq!(
+        evaluation
+            .matched_rule
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
+        Some((
+            "agent_enter_escape_confirm",
+            false,
+            InputPromptKind::Confirm
+        ))
     );
 }
 

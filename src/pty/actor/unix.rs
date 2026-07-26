@@ -1015,6 +1015,30 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_batch_completes_before_a_later_write_backpressures() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let (reply, response) = std_mpsc::channel();
+        runner.enqueue_write(Bytes::from_static(b"prompt"), Some(reply));
+        runner.enqueue_write(Bytes::from(vec![0xA5; 8 * 1024 * 1024]), None);
+
+        runner.flush_pending_writes_once();
+
+        response
+            .recv_timeout(Duration::from_millis(100))
+            .expect("completed batch must be acknowledged immediately")
+            .expect("completed batch flush succeeds");
+        assert_eq!(
+            runner.pending_writes.len(),
+            1,
+            "the later backpressured write must remain queued"
+        );
+        assert!(
+            runner.current_write_offset > 0,
+            "the later write should have made partial progress before backpressure"
+        );
+    }
+
+    #[test]
     fn acknowledged_write_reports_closed_peer_and_actor_exit() {
         let (closed_handle, peer, _read_rx) = actor_with_socket_pair(false);
         drop(peer);
