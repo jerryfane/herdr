@@ -232,6 +232,9 @@ pub(super) fn prompt_agent(
         .map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
             timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
         });
+    let caller_timeout_is_effect_deadline = wait
+        .timeout_ms
+        .is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS);
     let Some(effect) = observe_prompt_effect(
         &request_id,
         &target,
@@ -241,6 +244,7 @@ pub(super) fn prompt_agent(
         initially_working,
         &submitted_fingerprint,
         effect_timeout_ms,
+        caller_timeout_is_effect_deadline,
         stream,
         api_tx,
         running,
@@ -322,6 +326,7 @@ enum PromptObservationVerdict {
     WrittenToPty,
     Unsubmitted,
     Stalled,
+    TimedOut,
 }
 
 fn classify_prompt_observation(
@@ -331,6 +336,7 @@ fn classify_prompt_observation(
     composer_observed: bool,
     composer_matches: bool,
     timed_out: bool,
+    caller_timeout_is_effect_deadline: bool,
 ) -> Option<PromptObservationVerdict> {
     if composer_observed && !composer_matches {
         return Some(PromptObservationVerdict::Submitted);
@@ -340,6 +346,9 @@ fn classify_prompt_observation(
     }
     if !timed_out {
         return None;
+    }
+    if caller_timeout_is_effect_deadline {
+        return Some(PromptObservationVerdict::TimedOut);
     }
     if composer_matches {
         return Some(PromptObservationVerdict::Unsubmitted);
@@ -362,6 +371,7 @@ fn observe_prompt_effect(
     initially_working: bool,
     submitted_fingerprint: &crate::detect::manifest::PromptFingerprint,
     timeout_ms: u64,
+    caller_timeout_is_effect_deadline: bool,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
@@ -398,6 +408,7 @@ fn observe_prompt_effect(
             composer_observed,
             composer_matches,
             std::time::Instant::now() >= deadline,
+            caller_timeout_is_effect_deadline,
         ) {
             Some(PromptObservationVerdict::Submitted) => {
                 return Ok(Some(PromptEffectOutcome::Submitted(current)));
@@ -419,6 +430,15 @@ fn observe_prompt_effect(
                     request_id,
                     "agent_prompt_stalled",
                     "agent prompt was written to the PTY, but submission could not be observed",
+                )
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+            }
+            Some(PromptObservationVerdict::TimedOut) => {
+                return agent_wait_timeout(
+                    request_id.to_string(),
+                    AgentWaitTimeoutKind::Status,
+                    &current,
                 )
                 .map(PromptEffectOutcome::Response)
                 .map(Some);
@@ -935,34 +955,39 @@ mod tests {
     #[test]
     fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
         assert_eq!(
-            classify_prompt_observation(false, 10, 11, false, false, false),
+            classify_prompt_observation(false, 10, 11, false, false, false, false),
             Some(PromptObservationVerdict::Submitted),
             "settled lifecycle advance is attributable submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, false, false),
+            classify_prompt_observation(false, 10, 10, true, false, false, false),
             Some(PromptObservationVerdict::Submitted),
             "composer observed then cleared is stronger submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, true, true),
+            classify_prompt_observation(false, 10, 10, true, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
             "persistent exact composer fingerprint is positive non-submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, false, true),
+            classify_prompt_observation(false, 10, 10, false, false, true, false),
             Some(PromptObservationVerdict::Stalled),
             "settled unobservable disposition remains the residual stalled case"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 11, false, false, true),
+            classify_prompt_observation(true, 10, 11, false, false, true, false),
             Some(PromptObservationVerdict::WrittenToPty),
             "an already-working completion is not attributable to the new prompt"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 11, true, false, false),
+            classify_prompt_observation(true, 10, 11, true, false, false, false),
             Some(PromptObservationVerdict::Submitted),
             "already-working prompts still use composer-cleared evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, true, true, true, true),
+            Some(PromptObservationVerdict::TimedOut),
+            "caller deadlines at the observation boundary preserve ordinary timeout"
         );
     }
 
