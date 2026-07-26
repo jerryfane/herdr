@@ -323,6 +323,30 @@ fn claude_rewind_checkpoint_picker_sets_select_without_changing_lifecycle() {
 }
 
 #[test]
+fn claude_dynamic_workflow_dialog_sets_confirm_with_blocked_lifecycle() {
+    let screen = "Run a dynamic workflow?\n\
+        This workflow can make changes while it runs.\n\
+        Esc to cancel\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert_eq!(explain.state, AgentState::Blocked);
+    assert!(explain.visible_blocker);
+    assert_eq!(
+        explain.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("dynamic_workflow_prompt")
+    );
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Confirm));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("dynamic_workflow_confirm")
+    );
+}
+
+#[test]
 fn claude_enumerated_select_matches_captured_switch_model_dialog() {
     let screen = "Switch model?\nYour next response will be slower and use more tokens\n\nThis conversation is cached for the current model.\n\n❯ 1. Yes, switch to Sonnet 5\n  2. No, go back\n";
     let explain = explain(Agent::Claude, screen);

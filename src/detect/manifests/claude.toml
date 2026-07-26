@@ -21,6 +21,13 @@ all = [
 ]
 
 [[input_rules]]
+id = "dynamic_workflow_confirm"
+priority = 1300
+region = "whole_recent"
+kind = "confirm"
+contains = ["run a dynamic workflow?", "esc to cancel"]
+
+[[input_rules]]
 id = "rewind_checkpoint_picker"
 priority = 1000
 region = "bottom_non_empty_lines(8)"
