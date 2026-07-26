@@ -391,7 +391,7 @@ mod windows {
         }
 
         #[test]
-        fn acknowledged_write_completes_partial_writes_and_flushes() {
+        fn windows_acknowledged_write_completes_partial_writes_and_flushes() {
             let state = Arc::new(Mutex::new(WriterState::default()));
             let writer: Arc<Mutex<Box<dyn Write + Send>>> =
                 Arc::new(Mutex::new(Box::new(ChunkedWriter {
@@ -424,7 +424,7 @@ mod windows {
         }
 
         #[test]
-        fn acknowledged_write_reports_closed_writer() {
+        fn windows_acknowledged_write_reports_closed_writer() {
             let writer: Arc<Mutex<Box<dyn Write + Send>>> =
                 Arc::new(Mutex::new(Box::new(ClosedWriter)));
             let accepting = Arc::new(Mutex::new(true));
@@ -448,7 +448,7 @@ mod windows {
         }
 
         #[test]
-        fn acknowledged_write_reports_queue_backpressure_and_actor_exit() {
+        fn windows_acknowledged_write_reports_queue_backpressure_and_actor_exit() {
             let accepting = Arc::new(Mutex::new(true));
             let (full_tx, _full_rx) = mpsc::channel(1);
             full_tx

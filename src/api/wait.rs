@@ -994,6 +994,7 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     fn test_agent(
@@ -1069,15 +1070,23 @@ mod tests {
         .expect("serialize pane read response")
     }
 
-    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "herdr-prompt-wait-{name}-{}-{}.sock",
+    fn local_stream_pair() -> (LocalStream, LocalStream, PathBuf) {
+        static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+        let file_name = format!(
+            "hpw-{:x}-{:x}.sock",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        #[cfg(unix)]
+        let path = PathBuf::from("/tmp").join(file_name);
+        #[cfg(windows)]
+        let path = std::env::temp_dir().join(file_name);
+        #[cfg(unix)]
+        assert!(
+            path.as_os_str().as_encoded_bytes().len() < 104,
+            "test socket path must fit macOS sockaddr_un.sun_path"
+        );
         let listener = crate::ipc::bind_local_listener(&path).expect("bind local listener");
         let client = crate::ipc::connect_local_stream(&path).expect("connect local stream");
         let server = listener.accept().expect("accept local stream");
@@ -1156,7 +1165,7 @@ mod tests {
         harness: PromptHarness,
     ) -> serde_json::Value {
         let (api_tx, responder) = spawn_prompt_responder(harness);
-        let (mut client, _server, path) = local_stream_pair(name);
+        let (mut client, _server, path) = local_stream_pair();
         let response = prompt_agent_with_effect_timeout(
             name.into(),
             crate::api::schema::AgentPromptParams {
@@ -1375,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_agent_preserves_the_pty_write_failure() {
+    fn prompt_agent_preserves_the_not_received_verdict() {
         let response = run_prompt_harness(
             "write-failure",
             "review the diff",
@@ -1387,14 +1396,14 @@ mod tests {
                 screens: VecDeque::new(),
                 last_screen: String::new(),
                 prompt_error: Some(ErrorBody {
-                    code: "pty_write_failed".into(),
-                    message: "failed to write agent prompt to the PTY".into(),
+                    code: "agent_prompt_not_received".into(),
+                    message: "agent prompt was not fully written to the pane PTY".into(),
                 }),
                 composer_read_error_from: None,
             },
         );
 
-        assert_eq!(response["error"]["code"], "pty_write_failed");
+        assert_eq!(response["error"]["code"], "agent_prompt_not_received");
     }
 
     #[test]

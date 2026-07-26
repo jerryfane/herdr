@@ -480,18 +480,40 @@ all = [
     let loaded = loaded_manifest(manifest, ManifestSource::Bundled, None, None, false)
         .expect("load equal-priority agent rule");
 
-    let evaluation = evaluate_input_rules(
-        Some(&loaded),
-        DetectionInput {
-            screen: "Confirm deployment\nEnter to continue\nEsc to cancel\n",
-            osc_title: "",
-            osc_progress: "",
-        },
+    let input = DetectionInput {
+        screen: "Confirm deployment\nEnter to continue\nEsc to cancel\n",
+        osc_title: "",
+        osc_progress: "",
+    };
+    let shared = shared_input_manifest();
+    let mut winner = None;
+    let mut evaluated_rules = Vec::new();
+    evaluate_input_rule_set(
+        &shared.manifest.input_rules,
+        &shared.compiled_input_rules,
+        input,
+        true,
+        &mut winner,
+        &mut evaluated_rules,
+    );
+    assert_eq!(
+        winner
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.priority, rule.shared)),
+        Some(("shared_enter_escape_footer", 100, true)),
+        "precondition: the shared rule wins first at the same priority"
+    );
+    evaluate_input_rule_set(
+        &loaded.manifest.input_rules,
+        &loaded.compiled_input_rules,
+        input,
+        false,
+        &mut winner,
+        &mut evaluated_rules,
     );
 
     assert_eq!(
-        evaluation
-            .matched_rule
+        winner
             .as_ref()
             .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
         Some((

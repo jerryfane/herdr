@@ -667,6 +667,51 @@ fn old_agent_info_shape_defaults_and_omits_the_input_tuple() {
 }
 
 #[test]
+fn old_pane_info_shape_defaults_and_omits_the_input_tuple() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1",
+        "terminal_id": "term_1",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!pane.input_pending);
+    assert_eq!(pane.input_prompt_kind, None);
+    let serialized = serde_json::to_value(pane).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_event_data_agent_status_shape_defaults_and_omits_the_input_tuple() {
+    let event: EventData = serde_json::from_value(serde_json::json!({
+        "type": "pane_agent_status_changed",
+        "pane_id": "p_1",
+        "workspace_id": "w_1",
+        "agent_status": "idle"
+    }))
+    .unwrap();
+
+    let EventData::PaneAgentStatusChanged {
+        input_pending,
+        input_prompt_kind,
+        ..
+    } = &event
+    else {
+        panic!("expected pane agent status event");
+    };
+    assert!(!input_pending);
+    assert_eq!(*input_prompt_kind, None);
+    let serialized = serde_json::to_value(event).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
 fn old_agent_prompted_response_defaults_delivery_to_none() {
     let response: SuccessResponse = serde_json::from_value(serde_json::json!({
         "id": "prompt",
