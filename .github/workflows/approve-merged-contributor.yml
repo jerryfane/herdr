@@ -6,7 +6,7 @@ on:
 
 jobs:
   approve:
-    if: ${{ github.event.pull_request.merged == true }}
+    if: ${{ github.repository == 'ogulcancelik/herdr' && github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
