@@ -198,6 +198,23 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_input_state_changed_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    kind: Option<crate::detect::InputPromptKind>,
+) {
+    if let Err(err) = state_events
+        .send(AppEvent::InputStateChanged { pane_id, kind })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %err,
+            "failed to deliver InputStateChanged event"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
     state: AgentState,
@@ -594,6 +611,8 @@ fn spawn_basic_detection_task(
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
         let mut last_screen_scan_detection_content_seq = None;
+        let mut last_input_screen_scan_detection_content_seq = None;
+        let mut last_input_prompt_kind = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
 
@@ -606,6 +625,13 @@ fn spawn_basic_detection_task(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
+                    if last_input_prompt_kind.take().is_some() {
+                        publish_input_state_changed_event(
+                            state_events.clone(),
+                            pane_id,
+                            None,
+                        ).await;
+                    }
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
                     last_visible_idle = false;
@@ -622,6 +648,7 @@ fn spawn_basic_detection_task(
                     release_was_active = false;
                     last_detection_text.clear();
                     last_screen_scan_detection_content_seq = None;
+                    last_input_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                 }
@@ -750,6 +777,35 @@ fn spawn_basic_detection_task(
             let process_exited = pending_foreground_shell_clear
                 && agent.is_some()
                 && !foreground_shell_exit_reported;
+
+            let input_content_seq = agent.map(|_| detection_content_seq.load(Ordering::Relaxed));
+            if process_exited || agent.is_none() {
+                last_input_screen_scan_detection_content_seq = input_content_seq;
+                if last_input_prompt_kind.take().is_some() {
+                    publish_input_state_changed_event(state_events.clone(), pane_id, None).await;
+                }
+            } else if input_content_seq != last_input_screen_scan_detection_content_seq
+                || agent_changed
+            {
+                let content = terminal.detection_text();
+                let osc_title = terminal.agent_osc_title();
+                let osc_progress = terminal.agent_osc_progress();
+                let kind = agent.and_then(|agent| {
+                    crate::detect::manifest::detect_input_with_osc(
+                        agent,
+                        crate::detect::manifest::DetectionInput {
+                            screen: &content,
+                            osc_title: &osc_title,
+                            osc_progress: &osc_progress,
+                        },
+                    )
+                });
+                last_input_screen_scan_detection_content_seq = input_content_seq;
+                if kind != last_input_prompt_kind {
+                    last_input_prompt_kind = kind;
+                    publish_input_state_changed_event(state_events.clone(), pane_id, kind).await;
+                }
+            }
 
             if lifecycle_authority_active && !process_exited {
                 pending_idle.clear();
@@ -1069,6 +1125,20 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+        }
+    }
+
+    fn write_bytes_acknowledged(
+        &self,
+        bytes: Bytes,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.write_user_input_acknowledged(bytes, timeout),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => sender
+                .try_send(bytes)
+                .map_err(|err| std::io::Error::other(err.to_string())),
         }
     }
 }
@@ -2000,6 +2070,8 @@ impl PaneRuntime {
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
                 let mut last_screen_scan_detection_content_seq = None;
+                let mut last_input_screen_scan_detection_content_seq = None;
+                let mut last_input_prompt_kind = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
 
@@ -2022,6 +2094,13 @@ impl PaneRuntime {
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
+                            if last_input_prompt_kind.take().is_some() {
+                                publish_input_state_changed_event(
+                                    state_events.clone(),
+                                    pane_id,
+                                    None,
+                                ).await;
+                            }
                             agent_presence = AgentDetectionPresence::from_agent(None);
                             state = AgentState::Unknown;
                             last_visible_idle = false;
@@ -2038,6 +2117,7 @@ impl PaneRuntime {
                             last_visible_signal_refresh = None;
                             last_detection_text.clear();
                             last_screen_scan_detection_content_seq = None;
+                            last_input_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
                         }
@@ -2203,6 +2283,38 @@ impl PaneRuntime {
                     let process_exited = pending_foreground_shell_clear
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
+
+                    let input_content_seq =
+                        agent.map(|_| detection_content_seq.load(Ordering::Relaxed));
+                    if process_exited || agent.is_none() {
+                        last_input_screen_scan_detection_content_seq = input_content_seq;
+                        if last_input_prompt_kind.take().is_some() {
+                            publish_input_state_changed_event(state_events.clone(), pane_id, None)
+                                .await;
+                        }
+                    } else if input_content_seq != last_input_screen_scan_detection_content_seq
+                        || agent_changed
+                    {
+                        let content = terminal.detection_text();
+                        let osc_title = terminal.agent_osc_title();
+                        let osc_progress = terminal.agent_osc_progress();
+                        let kind = agent.and_then(|agent| {
+                            crate::detect::manifest::detect_input_with_osc(
+                                agent,
+                                crate::detect::manifest::DetectionInput {
+                                    screen: &content,
+                                    osc_title: &osc_title,
+                                    osc_progress: &osc_progress,
+                                },
+                            )
+                        });
+                        last_input_screen_scan_detection_content_seq = input_content_seq;
+                        if kind != last_input_prompt_kind {
+                            last_input_prompt_kind = kind;
+                            publish_input_state_changed_event(state_events.clone(), pane_id, kind)
+                                .await;
+                        }
+                    }
 
                     if lifecycle_authority_active && !process_exited {
                         pending_idle.clear();
@@ -2583,6 +2695,14 @@ impl PaneRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
+    }
+
+    pub fn write_bytes_acknowledged(
+        &self,
+        bytes: Bytes,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        self.io.write_bytes_acknowledged(bytes, timeout)
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

@@ -111,7 +111,7 @@ Raw socket method names use dot notation:
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
-`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls.
+`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. Successful prompts include optional `delivery` evidence: `written_to_pty` after the complete text+Enter batch is acknowledged, or `submitted` after an attributable lifecycle advance or exact composer-observed-then-cleared transition. A visible modal returns `agent_input_pending` before any bytes are written.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
@@ -693,6 +693,8 @@ If no native session reference is stored, the field is omitted.
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
+
+Those records also expose modal input independently of lifecycle state. `input_pending: true` is paired with `input_prompt_kind` (`confirm`, `select`, `free_text`, or `unknown`); both fields are omitted when no modal is present. `pane.agent_status_changed` carries the same tuple and emits on input-only changes even when `agent_status` is unchanged. Unfiltered subscriptions provide this orthogonal transition stream, and `pane.get` / `agent.get` recover current state after reconnecting.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 

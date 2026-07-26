@@ -171,6 +171,8 @@ mod tests {
             agent_kind_label: Some("pi".into()),
             agent: Some(crate::detect::Agent::Pi),
             state: AgentState::Working,
+            input_pending: false,
+            input_prompt_kind: None,
             seen: true,
             last_agent_state_change_seq: None,
             state_labels: std::collections::HashMap::new(),

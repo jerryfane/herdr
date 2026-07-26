@@ -48,9 +48,17 @@ mod windows {
         Shutdown,
     }
 
+    enum PtyIoDataCommand {
+        WriteUserInput(Bytes),
+        WriteUserInputAcknowledged {
+            bytes: Bytes,
+            reply: std_mpsc::Sender<std::io::Result<()>>,
+        },
+    }
+
     #[derive(Clone)]
     pub(crate) struct PtyIoActorHandle {
-        data_tx: mpsc::Sender<Bytes>,
+        data_tx: mpsc::Sender<PtyIoDataCommand>,
         control_tx: std_mpsc::Sender<PtyIoControlCommand>,
         accepting: Arc<Mutex<bool>>,
     }
@@ -67,7 +75,15 @@ mod windows {
             {
                 return Err(mpsc::error::SendError(bytes));
             }
-            self.data_tx.send(bytes).await
+            self.data_tx
+                .send(PtyIoDataCommand::WriteUserInput(bytes))
+                .await
+                .map_err(|err| match err.0 {
+                    PtyIoDataCommand::WriteUserInput(bytes)
+                    | PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. } => {
+                        mpsc::error::SendError(bytes)
+                    }
+                })
         }
 
         pub(crate) fn try_write_user_input(
@@ -81,7 +97,57 @@ mod windows {
             {
                 return Err(mpsc::error::TrySendError::Closed(bytes));
             }
-            self.data_tx.try_send(bytes)
+            self.data_tx
+                .try_send(PtyIoDataCommand::WriteUserInput(bytes))
+                .map_err(|err| match err {
+                    mpsc::error::TrySendError::Full(PtyIoDataCommand::WriteUserInput(bytes))
+                    | mpsc::error::TrySendError::Full(
+                        PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+                    ) => mpsc::error::TrySendError::Full(bytes),
+                    mpsc::error::TrySendError::Closed(PtyIoDataCommand::WriteUserInput(bytes))
+                    | mpsc::error::TrySendError::Closed(
+                        PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+                    ) => mpsc::error::TrySendError::Closed(bytes),
+                })
+        }
+
+        pub(crate) fn write_user_input_acknowledged(
+            &self,
+            bytes: Bytes,
+            timeout: Duration,
+        ) -> std::io::Result<()> {
+            if !*self
+                .accepting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "PTY actor is not accepting input",
+                ));
+            }
+            let (reply, response) = std_mpsc::channel();
+            self.data_tx
+                .try_send(PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply })
+                .map_err(|err| match err {
+                    mpsc::error::TrySendError::Full(_) => std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "PTY input queue is full",
+                    ),
+                    mpsc::error::TrySendError::Closed(_) => {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY actor closed")
+                    }
+                })?;
+            response.recv_timeout(timeout).map_err(|err| match err {
+                std_mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "PTY write acknowledgement timed out",
+                ),
+                std_mpsc::RecvTimeoutError::Disconnected => std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "PTY actor closed before acknowledging input",
+                ),
+            })?
         }
 
         pub(crate) fn resize(
@@ -132,16 +198,39 @@ mod windows {
                 .take_writer()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             let writer = Arc::new(Mutex::new(writer));
-            let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(1024);
+            let (data_tx, mut data_rx) = mpsc::channel::<PtyIoDataCommand>(1024);
             let (control_tx, control_rx) = std_mpsc::channel::<PtyIoControlCommand>();
             let accepting = Arc::new(Mutex::new(!initially_quiesced));
 
             {
                 let writer = Arc::clone(&writer);
+                let accepting = Arc::clone(&accepting);
                 std::thread::spawn(move || {
-                    while let Some(bytes) = data_rx.blocking_recv() {
-                        if write_all_locked(&writer, &bytes).is_err() {
-                            break;
+                    while let Some(command) = data_rx.blocking_recv() {
+                        let running = *accepting
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match command {
+                            PtyIoDataCommand::WriteUserInput(bytes) => {
+                                if !running || write_all_locked(&writer, &bytes).is_err() {
+                                    break;
+                                }
+                            }
+                            PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply } => {
+                                let result = if running {
+                                    write_all_locked(&writer, &bytes)
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::BrokenPipe,
+                                        "PTY actor is not accepting input",
+                                    ))
+                                };
+                                let failed = result.is_err();
+                                let _ = reply.send(result);
+                                if failed {
+                                    break;
+                                }
+                            }
                         }
                     }
                     debug!(pane_id, "windows pty writer thread exiting");
@@ -150,6 +239,7 @@ mod windows {
 
             {
                 let writer = Arc::clone(&writer);
+                let accepting = Arc::clone(&accepting);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {
@@ -168,6 +258,9 @@ mod windows {
                                 break;
                             }
                         }
+                    }
+                    if let Ok(mut accepting) = accepting.lock() {
+                        *accepting = false;
                     }
                     if let Some(on_reader_exit) = on_reader_exit {
                         on_reader_exit();

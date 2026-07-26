@@ -51,6 +51,7 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     status_filter: Option<crate::api::schema::AgentStatus>,
     last_status: Option<crate::api::schema::AgentStatus>,
     last_presentation: Option<PanePresentationSnapshot>,
+    last_input: Option<(bool, Option<crate::detect::InputPromptKind>)>,
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
@@ -262,12 +263,15 @@ impl ActiveSubscription {
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
+                let last_input = (probe.input_pending, probe.input_prompt_kind);
                 let initial_event = agent_status
                     .is_some_and(|wanted| wanted == probe.agent_status)
                     .then_some(PaneAgentStatusChangedEvent {
                         pane_id: probe.pane_id.clone(),
                         workspace_id: probe.workspace_id,
                         agent_status: probe.agent_status,
+                        input_pending: probe.input_pending,
+                        input_prompt_kind: probe.input_prompt_kind,
                         agent: probe.agent,
                         title: probe.title,
                         display_agent: probe.display_agent,
@@ -282,6 +286,7 @@ impl ActiveSubscription {
                         status_filter: agent_status,
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
+                        last_input: Some(last_input),
                         last_sequence,
                         initial_event,
                         request_prefix: format!("{request_id}:sub:{index}"),
@@ -413,6 +418,8 @@ impl ActiveAgentStatusChangedSubscription {
                 pane_id,
                 workspace_id,
                 agent_status,
+                input_pending,
+                input_prompt_kind,
                 agent,
                 title,
                 display_agent,
@@ -435,6 +442,7 @@ impl ActiveAgentStatusChangedSubscription {
                 PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels);
             self.last_status = Some(agent_status);
             self.last_presentation = Some(current_presentation);
+            self.last_input = Some((input_pending, input_prompt_kind));
             if self
                 .status_filter
                 .is_some_and(|wanted| wanted != agent_status)
@@ -449,6 +457,8 @@ impl ActiveAgentStatusChangedSubscription {
                     pane_id,
                     workspace_id,
                     agent_status,
+                    input_pending,
+                    input_prompt_kind,
                     agent,
                     title,
                     display_agent,
@@ -495,13 +505,16 @@ impl ActiveAgentStatusChangedSubscription {
     ) -> Option<SubscriptionEventEnvelope> {
         let current_status = pane.agent_status;
         let current_presentation = PanePresentationSnapshot::from(&pane);
+        let current_input = (pane.input_pending, pane.input_prompt_kind);
         let previous_status = self.last_status.replace(current_status);
         let previous_presentation = self.last_presentation.replace(current_presentation.clone());
+        let previous_input = self.last_input.replace(current_input);
         let presentation_changed = previous_presentation
             .as_ref()
             .is_some_and(|previous| previous != &current_presentation);
         let status_changed = previous_status.is_some_and(|previous| previous != current_status);
-        if !(status_changed || presentation_changed) {
+        let input_changed = previous_input.is_some_and(|previous| previous != current_input);
+        if !(status_changed || presentation_changed || input_changed) {
             return None;
         }
         if self
@@ -517,6 +530,8 @@ impl ActiveAgentStatusChangedSubscription {
                 pane_id: pane.pane_id,
                 workspace_id: pane.workspace_id,
                 agent_status: current_status,
+                input_pending: pane.input_pending,
+                input_prompt_kind: pane.input_prompt_kind,
                 agent: pane.agent,
                 title: pane.title,
                 display_agent: pane.display_agent,
@@ -704,8 +719,32 @@ mod tests {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                input_pending: false,
+                input_prompt_kind: None,
                 agent: Some("pi".into()),
                 title: title.map(str::to_string),
+                display_agent: None,
+                state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
+            },
+        }
+    }
+
+    fn input_event(
+        input_pending: bool,
+        input_prompt_kind: Option<crate::detect::InputPromptKind>,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::PaneAgentStatusChanged,
+            data: EventData::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                workspace_id: "workspace_1".into(),
+                agent_status: AgentStatus::Working,
+                input_pending,
+                input_prompt_kind,
+                agent: Some("pi".into()),
+                title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
                 turn: None,
@@ -730,6 +769,8 @@ mod tests {
             terminal_title_stripped: None,
             display_agent: None,
             agent_status: AgentStatus::Unknown,
+            input_pending: false,
+            input_prompt_kind: None,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
@@ -847,6 +888,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
             }),
+            last_input: Some((false, None)),
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
@@ -884,11 +926,14 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
             }),
+            last_input: Some((false, None)),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                input_pending: false,
+                input_prompt_kind: None,
                 agent: Some("pi".into()),
                 title: None,
                 display_agent: None,
@@ -920,6 +965,61 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_subscription_initial_and_transition_events_carry_input_tuple() {
+        let event_hub = EventHub::default();
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: Some(AgentStatus::Working),
+            last_status: Some(AgentStatus::Working),
+            last_presentation: Some(PanePresentationSnapshot {
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            }),
+            last_input: Some((true, Some(crate::detect::InputPromptKind::Select))),
+            last_sequence: event_hub.current_sequence(),
+            initial_event: Some(PaneAgentStatusChangedEvent {
+                pane_id: "pane_1".into(),
+                workspace_id: "workspace_1".into(),
+                agent_status: AgentStatus::Working,
+                input_pending: true,
+                input_prompt_kind: Some(crate::detect::InputPromptKind::Select),
+                agent: Some("pi".into()),
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
+            }),
+            request_prefix: "test".into(),
+        };
+        let api_tx = tokio::sync::mpsc::unbounded_channel().0;
+
+        let initial = subscription
+            .poll(&api_tx, &event_hub)
+            .expect("initial snapshot");
+        let SubscriptionEventData::PaneAgentStatusChanged(initial) = initial.data else {
+            panic!("wrong initial event data");
+        };
+        assert!(initial.input_pending);
+        assert_eq!(
+            initial.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Select)
+        );
+
+        event_hub.push(input_event(false, None));
+        let transition = subscription
+            .poll(&api_tx, &event_hub)
+            .expect("input-only transition");
+        let SubscriptionEventData::PaneAgentStatusChanged(transition) = transition.data else {
+            panic!("wrong transition event data");
+        };
+        assert_eq!(transition.agent_status, AgentStatus::Working);
+        assert!(!transition.input_pending);
+        assert_eq!(transition.input_prompt_kind, None);
+    }
+
+    #[test]
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
@@ -931,11 +1031,14 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
             }),
+            last_input: Some((false, None)),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                input_pending: false,
+                input_prompt_kind: None,
                 agent: Some("pi".into()),
                 title: Some("short lived".into()),
                 display_agent: None,

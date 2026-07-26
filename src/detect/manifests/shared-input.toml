@@ -1,0 +1,26 @@
+id = "shared"
+min_engine_version = 4
+
+[[input_rules]]
+id = "shared_confirm_yn"
+priority = 200
+region = "bottom_non_empty_lines(4)"
+kind = "confirm"
+line_regex = ['(?i)\(\s*y\s*/\s*n\s*\)\s*$']
+
+[[input_rules]]
+id = "shared_select_footer"
+priority = 180
+region = "bottom_non_empty_lines(5)"
+kind = "select"
+contains = ["enter to select", "esc to cancel"]
+
+[[input_rules]]
+id = "shared_enter_escape_footer"
+priority = 100
+region = "bottom_non_empty_lines(5)"
+kind = "unknown"
+all = [
+  { line_regex = ['(?i)\benter\b.+$'] },
+  { line_regex = ['(?i)\besc(?:ape)?\s+to\s+cancel\b'] },
+]

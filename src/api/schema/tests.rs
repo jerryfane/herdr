@@ -639,6 +639,56 @@ fn old_agent_status_event_shape_deserializes_without_turn_hints() {
 
     assert_eq!(event.turn, None);
     assert_eq!(event.turn_epoch, None);
+    assert!(!event.input_pending);
+    assert_eq!(event.input_prompt_kind, None);
+    let serialized = serde_json::to_value(event).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_agent_info_shape_defaults_and_omits_the_input_tuple() {
+    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "idle",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "pane_id": "p_1",
+        "focused": true,
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!agent.input_pending);
+    assert_eq!(agent.input_prompt_kind, None);
+    let serialized = serde_json::to_value(agent).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_agent_prompted_response_defaults_delivery_to_none() {
+    let response: SuccessResponse = serde_json::from_value(serde_json::json!({
+        "id": "prompt",
+        "result": {
+            "type": "agent_prompted",
+            "agent": {
+                "terminal_id": "term_1",
+                "agent_status": "idle",
+                "workspace_id": "w_1",
+                "tab_id": "t_1",
+                "pane_id": "p_1",
+                "focused": true,
+                "revision": 3
+            }
+        }
+    }))
+    .unwrap();
+
+    let ResponseResult::AgentPrompted { delivery, .. } = response.result else {
+        panic!("expected prompted response");
+    };
+    assert_eq!(delivery, None);
 }
 
 #[test]
@@ -795,6 +845,8 @@ fn worktree_request_and_response_round_trip() {
                 terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
+                input_pending: false,
+                input_prompt_kind: None,
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
@@ -1212,6 +1264,8 @@ fn create_response_round_trips_with_root_pane() {
                 terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
+                input_pending: false,
+                input_prompt_kind: None,
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,

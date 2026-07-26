@@ -396,6 +396,14 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub fn write_bytes_acknowledged(
+        &self,
+        bytes: Bytes,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        self.0.write_bytes_acknowledged(bytes, timeout)
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }

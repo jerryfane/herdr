@@ -5,10 +5,11 @@ use std::{
 
 use regex::Regex;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::{
     agent_label, manifest_update::ManifestVersion, parse_agent_label, Agent, AgentDetection,
-    AgentState,
+    AgentState, InputPromptKind,
 };
 
 pub const DEFAULT_KNOWN_AGENT_IDLE_FALLBACK: &str = "default_known_agent_idle_fallback";
@@ -30,6 +31,9 @@ pub struct DetectionExplain {
     pub state: AgentState,
     pub source: Option<ManifestSource>,
     pub matched_rule: Option<MatchedRule>,
+    pub matched_input_rule: Option<MatchedInputRule>,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<InputPromptKind>,
     pub screen_detection_skipped: bool,
     pub visible_idle: bool,
     pub visible_blocker: bool,
@@ -38,6 +42,7 @@ pub struct DetectionExplain {
     pub skipped_update_reason: Option<String>,
     pub fallback_reason: Option<String>,
     pub evaluated_rules: Vec<EvaluatedRule>,
+    pub evaluated_input_rules: Vec<EvaluatedInputRule>,
     pub warning: Option<String>,
     pub manifest_version: Option<String>,
     pub cached_remote_version: Option<String>,
@@ -99,6 +104,15 @@ pub struct MatchedRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedInputRule {
+    pub id: String,
+    pub priority: i32,
+    pub region: String,
+    pub kind: InputPromptKind,
+    pub shared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatedRule {
     pub id: String,
     pub priority: i32,
@@ -106,6 +120,17 @@ pub struct EvaluatedRule {
     pub evidence: RuleEvidence,
     pub state: AgentState,
     pub matched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedInputRule {
+    pub id: String,
+    pub priority: i32,
+    pub region: String,
+    pub evidence: RuleEvidence,
+    pub kind: InputPromptKind,
+    pub matched: bool,
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +149,7 @@ pub struct RuleEvidence {
 struct LoadedManifest {
     manifest: AgentManifest,
     compiled_rules: Vec<CompiledRule>,
+    compiled_input_rules: Vec<CompiledRule>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -147,6 +173,9 @@ pub(crate) struct AgentManifest {
     aliases: Vec<String>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
+    #[serde(default)]
+    input_rules: Vec<InputManifestRule>,
+    composer: Option<ComposerManifest>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -178,6 +207,35 @@ struct ManifestRule {
     regex: Vec<String>,
     #[serde(default)]
     line_regex: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct InputManifestRule {
+    id: String,
+    kind: InputPromptKind,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_region")]
+    region: String,
+    #[serde(default)]
+    all: Vec<ManifestGate>,
+    #[serde(default)]
+    any: Vec<ManifestGate>,
+    #[serde(default, rename = "not")]
+    not_gate: Vec<ManifestGate>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    regex: Vec<String>,
+    #[serde(default)]
+    line_regex: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct ComposerManifest {
+    region: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -257,9 +315,11 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
     ("qodercli", include_str!("manifests/qodercli.toml")),
     ("copilot", include_str!("manifests/github-copilot.toml")),
 ];
+const SHARED_INPUT_MANIFEST: &str = include_str!("manifests/shared-input.toml");
 
 static MANIFEST_CACHE: OnceLock<RwLock<ManifestCache>> = OnceLock::new();
 static MANIFEST_RELOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SHARED_INPUT_RULES: OnceLock<LoadedManifest> = OnceLock::new();
 
 const MAX_RULES_PER_MANIFEST: usize = 128;
 const MAX_GATE_DEPTH: usize = 8;
@@ -338,6 +398,11 @@ pub fn detect_with_osc(agent: Agent, input: DetectionInput<'_>) -> AgentDetectio
     evaluate_loaded_manifest(agent, input, loaded, false).into_detection()
 }
 
+pub fn detect_input_with_osc(agent: Agent, input: DetectionInput<'_>) -> Option<InputPromptKind> {
+    let loaded = load_manifest(agent);
+    evaluate_input_rules(loaded.as_ref(), input).kind
+}
+
 pub fn explain(agent: Agent, screen_content: &str) -> DetectionExplain {
     explain_with_input(
         agent,
@@ -363,6 +428,9 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
             state: AgentState::Unknown,
             source: None,
             matched_rule: None,
+            matched_input_rule: None,
+            input_pending: false,
+            input_prompt_kind: None,
             screen_detection_skipped: false,
             visible_idle: false,
             visible_blocker: false,
@@ -371,6 +439,7 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
             skipped_update_reason: None,
             fallback_reason: Some("unknown_agent".to_string()),
             evaluated_rules: Vec::new(),
+            evaluated_input_rules: Vec::new(),
             warning: None,
             manifest_version: None,
             cached_remote_version: None,
@@ -417,6 +486,7 @@ fn evaluate_loaded_manifest(
     loaded: LoadedManifest,
     include_update_status: bool,
 ) -> DetectionExplain {
+    let input_evaluation = evaluate_input_rules(Some(&loaded), input);
     let mut matched: Option<(&ManifestRule, String)> = None;
     let mut evaluated_rules = Vec::new();
 
@@ -446,11 +516,13 @@ fn evaluate_loaded_manifest(
     }
 
     let Some((rule, region_name)) = matched else {
-        return fallback_explain(
+        let mut explain = fallback_explain(
             Some(agent),
             Some((loaded, evaluated_rules)),
             include_update_status,
         );
+        apply_input_evaluation(&mut explain, input_evaluation);
+        return explain;
     };
 
     let state = rule
@@ -465,7 +537,7 @@ fn evaluate_loaded_manifest(
         .then(|| remote_update_status(agent))
         .flatten();
 
-    DetectionExplain {
+    let mut explain = DetectionExplain {
         agent: Some(agent_label(agent).to_string()),
         state,
         source: Some(loaded.source),
@@ -475,6 +547,9 @@ fn evaluate_loaded_manifest(
             region: region_name,
             state,
         }),
+        matched_input_rule: None,
+        input_pending: false,
+        input_prompt_kind: None,
         screen_detection_skipped: false,
         visible_idle: rule.visible_idle && state == AgentState::Idle,
         visible_blocker: rule.visible_blocker && state == AgentState::Blocked,
@@ -483,6 +558,7 @@ fn evaluate_loaded_manifest(
         skipped_update_reason,
         fallback_reason: None,
         evaluated_rules,
+        evaluated_input_rules: Vec::new(),
         warning: loaded.warning,
         manifest_version: loaded.manifest.version.as_ref().map(ToString::to_string),
         cached_remote_version: loaded.cached_remote_version,
@@ -491,7 +567,9 @@ fn evaluate_loaded_manifest(
             .as_ref()
             .map(|status| status.last_result.clone()),
         remote_update_error: remote_update_status.and_then(|status| status.last_error),
-    }
+    };
+    apply_input_evaluation(&mut explain, input_evaluation);
+    explain
 }
 
 fn fallback_explain(
@@ -532,6 +610,9 @@ fn fallback_explain(
         },
         source,
         matched_rule: None,
+        matched_input_rule: None,
+        input_pending: false,
+        input_prompt_kind: None,
         screen_detection_skipped: false,
         visible_idle: false,
         visible_blocker: false,
@@ -540,6 +621,7 @@ fn fallback_explain(
         skipped_update_reason: None,
         fallback_reason: known_agent.then(|| DEFAULT_KNOWN_AGENT_IDLE_FALLBACK.to_string()),
         evaluated_rules,
+        evaluated_input_rules: Vec::new(),
         warning,
         manifest_version,
         cached_remote_version,
@@ -549,6 +631,145 @@ fn fallback_explain(
             .map(|status| status.last_result.clone()),
         remote_update_error: remote_update_status.and_then(|status| status.last_error),
     }
+}
+
+#[derive(Default)]
+struct InputEvaluation {
+    kind: Option<InputPromptKind>,
+    matched_rule: Option<MatchedInputRule>,
+    evaluated_rules: Vec<EvaluatedInputRule>,
+}
+
+fn apply_input_evaluation(explain: &mut DetectionExplain, evaluation: InputEvaluation) {
+    explain.input_pending = evaluation.kind.is_some();
+    explain.input_prompt_kind = evaluation.kind;
+    explain.matched_input_rule = evaluation.matched_rule;
+    explain.evaluated_input_rules = evaluation.evaluated_rules;
+}
+
+fn evaluate_input_rules(
+    agent_manifest: Option<&LoadedManifest>,
+    input: DetectionInput<'_>,
+) -> InputEvaluation {
+    let shared = shared_input_manifest();
+    let mut winner: Option<MatchedInputRule> = None;
+    let mut evaluated_rules = Vec::new();
+
+    if let Some(loaded) = agent_manifest {
+        evaluate_input_rule_set(
+            &loaded.manifest.input_rules,
+            &loaded.compiled_input_rules,
+            input,
+            false,
+            &mut winner,
+            &mut evaluated_rules,
+        );
+    }
+    evaluate_input_rule_set(
+        &shared.manifest.input_rules,
+        &shared.compiled_input_rules,
+        input,
+        true,
+        &mut winner,
+        &mut evaluated_rules,
+    );
+
+    InputEvaluation {
+        kind: winner.as_ref().map(|rule| rule.kind),
+        matched_rule: winner,
+        evaluated_rules,
+    }
+}
+
+fn evaluate_input_rule_set(
+    rules: &[InputManifestRule],
+    compiled_rules: &[CompiledRule],
+    input: DetectionInput<'_>,
+    shared: bool,
+    winner: &mut Option<MatchedInputRule>,
+    evaluated_rules: &mut Vec<EvaluatedInputRule>,
+) {
+    for (rule, compiled_rule) in rules.iter().zip(compiled_rules) {
+        // Claude's live select modal replaces the normal prompt box. If a
+        // prompt box is present, content above it is transcript/scrollback,
+        // not live dialog chrome.
+        let region_text = if rule.region.trim() == "above_prompt_box"
+            && prompt_box_body(input.screen).is_some()
+        {
+            ""
+        } else {
+            region(input, &rule.region)
+        };
+        let matched = compiled_rule_matches(compiled_rule, region_text);
+        evaluated_rules.push(EvaluatedInputRule {
+            id: rule.id.clone(),
+            priority: rule.priority,
+            region: rule.region.clone(),
+            evidence: input_rule_evidence(rule, region_text),
+            kind: rule.kind,
+            matched,
+            shared,
+        });
+        if !matched {
+            continue;
+        }
+        let should_replace = match winner {
+            None => true,
+            Some(previous) => {
+                rule.priority > previous.priority
+                    || (rule.priority == previous.priority && previous.shared && !shared)
+            }
+        };
+        if should_replace {
+            *winner = Some(MatchedInputRule {
+                id: rule.id.clone(),
+                priority: rule.priority,
+                region: rule.region.clone(),
+                kind: rule.kind,
+                shared,
+            });
+        }
+    }
+}
+
+fn shared_input_manifest() -> &'static LoadedManifest {
+    SHARED_INPUT_RULES.get_or_init(|| {
+        let manifest = parse_manifest(SHARED_INPUT_MANIFEST)
+            .unwrap_or_else(|err| panic!("bundled shared input manifest is invalid: {err}"));
+        loaded_manifest(manifest, ManifestSource::Bundled, None, None, false)
+            .unwrap_or_else(|err| panic!("bundled shared input manifest could not compile: {err}"))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptFingerprint([u8; 32]);
+
+pub fn prompt_fingerprint(text: &str) -> PromptFingerprint {
+    PromptFingerprint(Sha256::digest(normalize_prompt_text(text).as_bytes()).into())
+}
+
+pub fn composer_fingerprint(agent: Agent, input: DetectionInput<'_>) -> Option<PromptFingerprint> {
+    let loaded = load_manifest(agent)?;
+    let composer = loaded.manifest.composer.as_ref()?;
+    let text = normalize_composer_text(region(input, &composer.region));
+    (!text.is_empty()).then(|| PromptFingerprint(Sha256::digest(text.as_bytes()).into()))
+}
+
+fn normalize_prompt_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_composer_text(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines
+        .next()
+        .map(|line| line.strip_prefix('❯').unwrap_or(line).trim())
+        .unwrap_or("");
+    std::iter::once(first)
+        .chain(lines)
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn load_manifest(agent: Agent) -> Option<LoadedManifest> {
@@ -671,9 +892,11 @@ fn loaded_manifest(
     local_override_shadowing_remote: bool,
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?;
+    let compiled_input_rules = compile_input_manifest(&manifest)?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
+        compiled_input_rules,
         source,
         warning,
         cached_remote_version,
@@ -828,6 +1051,39 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
             })
         })
         .collect();
+    let matched_input_rule = explain.matched_input_rule.as_ref().map(|rule| {
+        serde_json::json!({
+            "id": rule.id,
+            "priority": rule.priority,
+            "region": rule.region,
+            "kind": input_prompt_kind_label(rule.kind),
+            "shared": rule.shared,
+        })
+    });
+    let evaluated_input_rules: Vec<_> = explain
+        .evaluated_input_rules
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "id": rule.id,
+                "priority": rule.priority,
+                "region": rule.region,
+                "kind": input_prompt_kind_label(rule.kind),
+                "matched": rule.matched,
+                "shared": rule.shared,
+                "evidence": {
+                    "contains": &rule.evidence.contains,
+                    "regex": &rule.evidence.regex,
+                    "line_regex": &rule.evidence.line_regex,
+                    "all_count": rule.evidence.all_count,
+                    "any_count": rule.evidence.any_count,
+                    "not_count": rule.evidence.not_count,
+                    "region_bytes": rule.evidence.region_bytes,
+                    "region_preview": &rule.evidence.region_preview,
+                },
+            })
+        })
+        .collect();
 
     serde_json::json!({
         "agent": explain.agent,
@@ -839,6 +1095,9 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
         "remote_update_status": &explain.remote_update_status,
         "remote_update_error": &explain.remote_update_error,
         "matched_rule": matched_rule,
+        "matched_input_rule": matched_input_rule,
+        "input_pending": explain.input_pending,
+        "input_prompt_kind": explain.input_prompt_kind.map(input_prompt_kind_label),
         "visible_idle": explain.visible_idle,
         "visible_blocker": explain.visible_blocker,
         "visible_working": explain.visible_working,
@@ -848,7 +1107,17 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
         "fallback_reason": explain.fallback_reason,
         "warning": explain.warning,
         "evaluated_rules": evaluated_rules,
+        "evaluated_input_rules": evaluated_input_rules,
     })
+}
+
+pub fn input_prompt_kind_label(kind: InputPromptKind) -> &'static str {
+    match kind {
+        InputPromptKind::Confirm => "confirm",
+        InputPromptKind::Select => "select",
+        InputPromptKind::FreeText => "free_text",
+        InputPromptKind::Unknown => "unknown",
+    }
 }
 
 pub(crate) struct ParsedRemoteManifest {
@@ -891,13 +1160,13 @@ pub(crate) fn parse_remote_manifest_for_agent(
 }
 
 fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
-    if manifest.rules.is_empty() {
-        return Err("manifest must contain at least one rule".to_string());
+    if manifest.rules.is_empty() && manifest.input_rules.is_empty() {
+        return Err("manifest must contain at least one rule or input rule".to_string());
     }
-    if manifest.rules.len() > MAX_RULES_PER_MANIFEST {
+    if manifest.rules.len() + manifest.input_rules.len() > MAX_RULES_PER_MANIFEST {
         return Err(format!(
             "manifest contains {} rules, max is {MAX_RULES_PER_MANIFEST}",
-            manifest.rules.len()
+            manifest.rules.len() + manifest.input_rules.len()
         ));
     }
 
@@ -935,6 +1204,19 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
         validate_rule_gate(rule, &mut complexity)
             .map_err(|err| format!("rule {} has invalid matcher gates: {err}", rule.id))?;
     }
+    for rule in &manifest.input_rules {
+        if rule.id.trim().is_empty() {
+            return Err("manifest input rule id must not be empty".to_string());
+        }
+        validate_region_name(&rule.region)
+            .map_err(|err| format!("input rule {} uses invalid region: {err}", rule.id))?;
+        validate_input_rule_gate(rule, &mut complexity)
+            .map_err(|err| format!("input rule {} has invalid matcher gates: {err}", rule.id))?;
+    }
+    if let Some(composer) = &manifest.composer {
+        validate_region_name(&composer.region)
+            .map_err(|err| format!("composer uses invalid region: {err}"))?;
+    }
 
     Ok(())
 }
@@ -950,6 +1232,18 @@ fn validate_rule_gate(
     complexity: &mut ManifestComplexity,
 ) -> Result<(), String> {
     validate_gate(&manifest_gate_from_rule(rule), "rule", 0, complexity)
+}
+
+fn validate_input_rule_gate(
+    rule: &InputManifestRule,
+    complexity: &mut ManifestComplexity,
+) -> Result<(), String> {
+    validate_gate(
+        &manifest_gate_from_input_rule(rule),
+        "input rule",
+        0,
+        complexity,
+    )
 }
 
 fn validate_gate(
@@ -1128,6 +1422,17 @@ fn manifest_gate_from_rule(rule: &ManifestRule) -> ManifestGate {
     }
 }
 
+fn manifest_gate_from_input_rule(rule: &InputManifestRule) -> ManifestGate {
+    ManifestGate {
+        all: rule.all.clone(),
+        any: rule.any.clone(),
+        not_gate: rule.not_gate.clone(),
+        contains: rule.contains.clone(),
+        regex: rule.regex.clone(),
+        line_regex: rule.line_regex.clone(),
+    }
+}
+
 fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
     manifest
         .rules
@@ -1136,6 +1441,18 @@ fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Strin
             compile_gate(&manifest_gate_from_rule(rule))
                 .map(|gate| CompiledRule { gate })
                 .map_err(|err| format!("rule {} could not be compiled: {err}", rule.id))
+        })
+        .collect()
+}
+
+fn compile_input_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
+    manifest
+        .input_rules
+        .iter()
+        .map(|rule| {
+            compile_gate(&manifest_gate_from_input_rule(rule))
+                .map(|gate| CompiledRule { gate })
+                .map_err(|err| format!("input rule {} could not be compiled: {err}", rule.id))
         })
         .collect()
 }
@@ -1181,6 +1498,19 @@ fn compiled_rule_matches(rule: &CompiledRule, text: &str) -> bool {
 }
 
 fn rule_evidence(rule: &ManifestRule, region_text: &str) -> RuleEvidence {
+    RuleEvidence {
+        contains: rule.contains.clone(),
+        regex: rule.regex.clone(),
+        line_regex: rule.line_regex.clone(),
+        all_count: rule.all.len(),
+        any_count: rule.any.len(),
+        not_count: rule.not_gate.len(),
+        region_bytes: region_text.len(),
+        region_preview: bounded_preview(region_text),
+    }
+}
+
+fn input_rule_evidence(rule: &InputManifestRule, region_text: &str) -> RuleEvidence {
     RuleEvidence {
         contains: rule.contains.clone(),
         regex: rule.regex.clone(),

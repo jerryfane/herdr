@@ -585,6 +585,8 @@ impl App {
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
+            || update.previous_input_pending != update.input_pending
+            || update.previous_input_prompt_kind != update.input_prompt_kind
         {
             let presentation = update.presentation.clone();
             self.emit_event(crate::api::schema::EventEnvelope {
@@ -593,6 +595,8 @@ impl App {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
                     agent_status,
+                    input_pending: update.input_pending,
+                    input_prompt_kind: update.input_prompt_kind,
                     agent: update.agent_label.clone(),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
@@ -2298,5 +2302,93 @@ mod tests {
             app.state.toast.as_ref().map(|toast| toast.context.as_str()),
             Some("__herdr_original__ · 1")
         );
+    }
+
+    #[test]
+    fn input_only_change_emits_status_event_without_changing_lifecycle_sequence() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("input");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Kimi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_hook_authority(
+                "herdr:kimi".to_string(),
+                "kimi".to_string(),
+                AgentState::Working,
+                None,
+                None,
+            );
+        let baseline_sequence = app.state.terminals[&terminal_id].last_agent_state_change_seq;
+        let baseline_event_sequence = event_hub.current_sequence();
+
+        app.handle_internal_event(AppEvent::InputStateChanged {
+            pane_id,
+            kind: Some(crate::detect::InputPromptKind::Select),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.last_agent_state_change_seq, baseline_sequence);
+        assert!(terminal.input_pending);
+        assert_eq!(
+            terminal.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Select)
+        );
+        let pane = app.pane_info(0, pane_id).expect("pane info");
+        assert!(pane.input_pending);
+        assert_eq!(
+            pane.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Select)
+        );
+        let agent = app.agent_info(0, pane_id).expect("agent info");
+        assert!(agent.input_pending);
+        assert_eq!(
+            agent.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Select)
+        );
+        let events = event_hub.events_after(baseline_event_sequence);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].1.data,
+            crate::api::schema::EventData::PaneAgentStatusChanged {
+                agent_status: crate::api::schema::AgentStatus::Working,
+                input_pending: true,
+                input_prompt_kind: Some(crate::detect::InputPromptKind::Select),
+                ..
+            }
+        ));
+
+        app.handle_internal_event(AppEvent::InputStateChanged {
+            pane_id,
+            kind: None,
+        });
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert_eq!(terminal.last_agent_state_change_seq, baseline_sequence);
+        assert!(!terminal.input_pending);
+        assert_eq!(terminal.input_prompt_kind, None);
     }
 }

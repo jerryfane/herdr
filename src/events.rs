@@ -66,6 +66,11 @@ pub enum AppEvent {
         process_exited: bool,
         observed_at: Instant,
     },
+    /// Orthogonal live input-prompt presence changed in a pane.
+    InputStateChanged {
+        pane_id: PaneId,
+        kind: Option<crate::detect::InputPromptKind>,
+    },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
         pane_id: PaneId,

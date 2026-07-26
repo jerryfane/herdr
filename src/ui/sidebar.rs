@@ -33,6 +33,8 @@ pub(crate) struct AgentPanelEntry {
     pub agent_kind_label: Option<String>,
     pub agent: Option<crate::detect::Agent>,
     pub state: AgentState,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: std::collections::HashMap<String, String>,
@@ -173,6 +175,8 @@ fn collect_agent_panel_entries_with_runtimes(
                         agent_kind_label: detail.agent_kind_label,
                         agent: detail.agent,
                         state: detail.state,
+                        input_pending: detail.input_pending,
+                        input_prompt_kind: detail.input_prompt_kind,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
                         state_labels: detail.state_labels,
@@ -550,11 +554,22 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
 }
 
 fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<ResolvedToken>> {
-    let label = entry
-        .state_labels
-        .get(agent_panel_status_key(entry.state, entry.seen))
-        .map(String::as_str)
-        .unwrap_or_else(|| state_label(entry.state, entry.seen));
+    let input_label;
+    let label = if entry.input_pending {
+        input_label = match entry.input_prompt_kind {
+            Some(crate::detect::InputPromptKind::Confirm) => "input waiting · confirm",
+            Some(crate::detect::InputPromptKind::Select) => "input waiting · select",
+            Some(crate::detect::InputPromptKind::FreeText) => "input waiting · free-text",
+            Some(crate::detect::InputPromptKind::Unknown) | None => "input waiting",
+        };
+        input_label
+    } else {
+        entry
+            .state_labels
+            .get(agent_panel_status_key(entry.state, entry.seen))
+            .map(String::as_str)
+            .unwrap_or_else(|| state_label(entry.state, entry.seen))
+    };
     tokens::agent_rows(&app.sidebar_agents, entry, label)
 }
 
