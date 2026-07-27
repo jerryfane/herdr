@@ -137,6 +137,12 @@ impl PtyIoActorHandle {
                 };
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
+            Err(mpsc::error::TrySendError::Full(
+                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+            )) => Err(mpsc::error::TrySendError::Full(bytes)),
+            Err(mpsc::error::TrySendError::Closed(
+                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+            )) => Err(mpsc::error::TrySendError::Closed(bytes)),
         }
     }
 
@@ -484,7 +490,11 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
-    fn enqueue_write(&mut self, bytes: Bytes) {
+    fn enqueue_write(
+        &mut self,
+        bytes: Bytes,
+        acknowledgement: Option<std_mpsc::Sender<std::io::Result<()>>>,
+    ) {
         if !bytes.is_empty() {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
@@ -638,7 +648,17 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes);
+                    self.enqueue_write(bytes, None);
+                }
+            }
+            PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply } => {
+                if self.state == ActorState::Running {
+                    self.enqueue_write(bytes, Some(reply));
+                } else {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "PTY actor is not running",
+                    )));
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
@@ -706,7 +726,10 @@ impl PtyIoActorRunner {
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
-                self.pending_writes.clear();
+                self.fail_pending_writes(
+                    std::io::ErrorKind::BrokenPipe,
+                    "PTY actor released before completing input",
+                );
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -853,7 +876,7 @@ impl PtyIoActorRunner {
             return;
         }
         for bytes in terminal_responses {
-            self.enqueue_write(bytes);
+            self.enqueue_write(bytes, None);
         }
     }
 

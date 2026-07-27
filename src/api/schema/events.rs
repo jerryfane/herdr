@@ -408,6 +408,10 @@ pub struct PaneAgentStatusChangedEvent {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub input_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +578,10 @@ pub enum EventData {
         pane_id: String,
         workspace_id: String,
         agent_status: AgentStatus,
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        input_pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_prompt_kind: Option<crate::detect::InputPromptKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -68,6 +68,14 @@ mod windows {
         Shutdown,
     }
 
+    enum PtyIoDataCommand {
+        WriteUserInput(Bytes),
+        WriteUserInputAcknowledged {
+            bytes: Bytes,
+            reply: std_mpsc::Sender<std::io::Result<()>>,
+        },
+    }
+
     #[derive(Clone)]
     pub(crate) struct PtyIoActorHandle {
         data_tx: mpsc::Sender<PtyIoDataCommand>,
@@ -78,6 +86,7 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+
         pub(crate) fn try_write_user_input(
             &self,
             bytes: Bytes,
@@ -246,6 +255,9 @@ mod windows {
                                 break;
                             }
                         }
+                    }
+                    if let Ok(mut accepting) = accepting.lock() {
+                        *accepting = false;
                     }
                     if let Some(on_reader_exit) = on_reader_exit {
                         on_reader_exit();

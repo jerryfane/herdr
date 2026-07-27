@@ -22,6 +22,8 @@ pub(crate) struct AgentPanelEntry {
     pub pane_id: crate::layout::PaneId,
     pub agent_kind_label: Option<String>,
     pub state: AgentState,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub tokens: std::collections::HashMap<String, String>,

@@ -567,6 +567,348 @@ fn all_bundled_manifests_parse_and_validate() {
 }
 
 #[test]
+fn claude_rewind_checkpoint_picker_sets_select_without_changing_lifecycle() {
+    let screen = "Restore the code and/or conversation to this checkpoint?\n\
+        Enter to continue · Esc to cancel\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert_eq!(explain.state, AgentState::Idle);
+    assert_eq!(
+        explain.fallback_reason.as_deref(),
+        Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
+    );
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Select));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("rewind_checkpoint_picker")
+    );
+}
+
+#[test]
+fn claude_dynamic_workflow_dialog_sets_confirm_with_blocked_lifecycle() {
+    let screen = "Run a dynamic workflow?\n\
+        This workflow can make changes while it runs.\n\
+        Esc to cancel\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert_eq!(explain.state, AgentState::Blocked);
+    assert!(explain.visible_blocker);
+    assert_eq!(
+        explain.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("dynamic_workflow_prompt")
+    );
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Confirm));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("dynamic_workflow_confirm")
+    );
+}
+
+#[test]
+fn claude_enumerated_select_matches_captured_switch_model_dialog() {
+    let screen = "Switch model?\nYour next response will be slower and use more tokens\n\nThis conversation is cached for the current model.\n\n❯ 1. Yes, switch to Sonnet 5\n  2. No, go back\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Select));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("claude_enumerated_select")
+    );
+    let selected = explain
+        .evaluated_input_rules
+        .iter()
+        .find(|rule| rule.id == "claude_enumerated_select")
+        .expect("enumerated rule");
+    assert!(selected.matched);
+}
+
+#[test]
+fn claude_enumerated_select_matches_later_rewind_restore_options() {
+    let screen = "Rewind\nChoose what to restore from this checkpoint\n\n❯ 1. Restore code and conversation\n  2. Restore conversation only\n  3. Cancel\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert_eq!(explain.state, AgentState::Idle);
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Select));
+    assert_eq!(
+        explain
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("claude_enumerated_select")
+    );
+}
+
+#[test]
+fn claude_enumerated_select_rejects_composer_numbered_lists() {
+    let prompt_box = |body: &str| {
+        format!(
+            "previous output\n\
+             ────────────────────────────────────────\n\
+             {body}\n\
+             ────────────────────────────────────────\n"
+        )
+    };
+    for screen in [
+        prompt_box("❯"),
+        prompt_box("❯ 1. summarize this file"),
+        prompt_box("❯ 1. fix the parser\n  2. add tests"),
+        format!(
+            "  2. the second approach\n{}",
+            prompt_box("❯ 1. go with that")
+        ),
+    ] {
+        let explain = explain(Agent::Claude, &screen);
+        assert!(
+            !explain.input_pending,
+            "composer screen matched {:?}",
+            explain.matched_input_rule
+        );
+    }
+}
+
+#[test]
+fn claude_dialog_copy_in_transcript_is_not_live_input() {
+    let screen = "Earlier transcript:\n❯ 1. Yes, switch model\n  2. No, go back\n────────────────────────────────────────\n❯ continue with the implementation\n────────────────────────────────────────\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert!(!explain.input_pending);
+}
+
+#[test]
+fn rewind_copy_outside_live_bottom_region_is_not_input() {
+    let screen = "Restore the code and/or conversation to this checkpoint?\n\
+        Enter to continue · Esc to cancel\n\
+        one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert!(!explain.input_pending);
+}
+
+#[test]
+fn per_agent_input_rule_beats_shared_fallback_and_shared_unknown_is_typed() {
+    let rewind = explain(
+        Agent::Claude,
+        "Restore the code and/or conversation to this checkpoint?\n\
+         Enter to continue · Esc to cancel\n",
+    );
+    assert_eq!(
+        rewind
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
+        Some(("rewind_checkpoint_picker", false, InputPromptKind::Select))
+    );
+
+    let generic = explain(
+        Agent::Claude,
+        "Provide a value\nPress Enter to continue\nEsc to cancel\n",
+    );
+    assert_eq!(
+        generic
+            .matched_input_rule
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
+        Some(("shared_enter_escape_footer", true, InputPromptKind::Unknown))
+    );
+}
+
+#[test]
+fn equal_priority_per_agent_input_rule_beats_shared_fallback() {
+    let manifest = parse_manifest(
+        r#"
+id = "claude"
+
+[[input_rules]]
+id = "agent_enter_escape_confirm"
+priority = 100
+region = "bottom_non_empty_lines(5)"
+kind = "confirm"
+all = [
+  { line_regex = ['(?i)\benter\b.+$'] },
+  { line_regex = ['(?i)\besc(?:ape)?\s+to\s+cancel\b'] },
+]
+"#,
+    )
+    .expect("parse equal-priority agent rule");
+    let loaded = loaded_manifest(manifest, ManifestSource::Bundled, None, None, false)
+        .expect("load equal-priority agent rule");
+
+    let input = DetectionInput {
+        screen: "Confirm deployment\nEnter to continue\nEsc to cancel\n",
+        osc_title: "",
+        osc_progress: "",
+    };
+    let shared = shared_input_manifest();
+    let mut winner = None;
+    let mut evaluated_rules = Vec::new();
+    evaluate_input_rule_set(
+        &shared.manifest.input_rules,
+        &shared.compiled_input_rules,
+        input,
+        true,
+        &mut winner,
+        &mut evaluated_rules,
+    );
+    assert_eq!(
+        winner
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.priority, rule.shared)),
+        Some(("shared_enter_escape_footer", 100, true)),
+        "precondition: the shared rule wins first at the same priority"
+    );
+    evaluate_input_rule_set(
+        &loaded.manifest.input_rules,
+        &loaded.compiled_input_rules,
+        input,
+        false,
+        &mut winner,
+        &mut evaluated_rules,
+    );
+
+    assert_eq!(
+        winner
+            .as_ref()
+            .map(|rule| (rule.id.as_str(), rule.shared, rule.kind)),
+        Some((
+            "agent_enter_escape_confirm",
+            false,
+            InputPromptKind::Confirm
+        ))
+    );
+}
+
+#[test]
+fn ordinary_claude_composer_is_not_free_text_input() {
+    let screen = "────────────────────────────────────────\n\
+        ❯ explain the parser without changing it\n\
+        ────────────────────────────────────────\n";
+    let explain = explain(Agent::Claude, screen);
+
+    assert!(!explain.input_pending);
+    assert_ne!(explain.input_prompt_kind, Some(InputPromptKind::FreeText));
+}
+
+#[test]
+fn claude_enumerated_rule_has_no_phrase_literals() {
+    fn matcher_text(gate: &ManifestGate, values: &mut Vec<String>) {
+        values.extend(gate.contains.iter().cloned());
+        values.extend(gate.regex.iter().cloned());
+        values.extend(gate.line_regex.iter().cloned());
+        for nested in gate.all.iter().chain(&gate.any).chain(&gate.not_gate) {
+            matcher_text(nested, values);
+        }
+    }
+
+    let manifest = bundled_manifest(Agent::Claude).expect("Claude manifest");
+    let rule = manifest
+        .input_rules
+        .iter()
+        .find(|rule| rule.id == "claude_enumerated_select")
+        .expect("enumerated select rule");
+    let mut values = Vec::new();
+    matcher_text(&manifest_gate_from_input_rule(rule), &mut values);
+    let matcher_text = values.join("\n");
+    for forbidden in ["switch model", "yes", "no", "restore", "enter", "esc"] {
+        let forbidden = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(forbidden))).unwrap();
+        assert!(
+            !forbidden.is_match(&matcher_text),
+            "found forbidden phrase in matcher gates: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn composer_fingerprint_normalizes_prompt_box_body_without_exposing_text() {
+    let screen = "────────────────────────────────────────\n\
+        ❯ fix   the parser\n\
+          and add tests\n\
+        ────────────────────────────────────────\n";
+    let observed = composer_fingerprint(
+        Agent::Claude,
+        DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        },
+    )
+    .expect("composer fingerprint");
+
+    assert_eq!(observed, prompt_fingerprint("fix the parser and add tests"));
+}
+
+#[test]
+fn devin_manifest_detects_idle_working_and_blocked_states() {
+    let idle = explain(
+        Agent::Devin,
+        "─────────────────────────────────────────────────────\n❭ Ask Devin to build features, fix bugs, or work on\n  your code\n─────────────────────────────────────────────────────\nSWE-1.6               Context: 16k / 200k tokens (7%)",
+    );
+    assert_eq!(idle.state, AgentState::Idle);
+    assert!(idle.visible_idle);
+
+    let live_footer_idle = explain(
+        Agent::Devin,
+        "Done.\n\n────────────────────────────────────────────────── (bypass permissions on) ─\n❭\n────────────────────────────────────────────────────────────────────────────\nClaude Opus 4.6 Thinking                                    Context: 38k / 200k tokens (18%)",
+    );
+    assert_eq!(live_footer_idle.state, AgentState::Idle);
+    assert_eq!(
+        live_footer_idle
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("live_prompt_footer")
+    );
+    assert!(live_footer_idle.visible_idle);
+
+    let welcome_footer_idle = explain(
+        Agent::Devin,
+        "⠀⠀⠀⠀⠀⣴⣾⣶⡄⠀⠀⠀⠀\n⠀⣴⣾⣶⡾⠛⠿⠟⠃⣴⣾⣶⡄  Devin CLI\n⠀⠛⠿⠟⠃⣴⣾⣶⡾⠛⠿⠟⠃  v2026.5.26-8\n⠀⣤⣶⣦⡄⠻⢿⠿⢷⣤⣶⣦⡄\n⠀⠻⢿⠿⢷⣤⣶⣦⡄⠻⢿⠿⠃  Hybrid\n⠀⠀⠀⠀⠀⠻⢿⠿⠃⠀⠀⠀⠀\n\n───────────────────────────\n❭ Ask Devin to build\n  features, fix bugs, or\n  work on your code\n───────────────────────────\nClaude Opus Looking for\n4.6 Thinkingplan mode? /\n            plan",
+    );
+    assert_eq!(welcome_footer_idle.state, AgentState::Idle);
+    assert_eq!(
+        welcome_footer_idle
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("welcome_prompt_footer")
+    );
+    assert!(welcome_footer_idle.visible_idle);
+
+    let working = explain(
+        Agent::Devin,
+        "◔ Reading shell 91b655\n  │ Timeout: 35s\n\n⠀⡆ Running tools · 27s (esc to interrupt)\n─────────────────────────────────────────────────────\n❭ Guide Devin while it works",
+    );
+    assert_eq!(working.state, AgentState::Working);
+    assert!(working.visible_working);
+
+    let trust_prompt = explain(
+        Agent::Devin,
+        "Do you trust the authors of this directory?\nFor security, devin should not be run in directories\nwith untrusted content.\n❭ 1 Yes, trust /private/tmp/devin-hook-probe\n· 2 No, exit",
+    );
+    assert_eq!(trust_prompt.state, AgentState::Blocked);
+    assert!(trust_prompt.visible_blocker);
+
+    let permission_prompt = explain(
+        Agent::Devin,
+        "⏺ Running command\n  └ $ sleep 30\n\n❭ 1 Yes  (Approve once)\n· 2 Yes, allow `sleep` commands\n· 3 Yes, always allow `sleep` commands\n· 4 No\n↑↓ select · ↵ confirm · esc cancel",
+    );
+    assert_eq!(permission_prompt.state, AgentState::Blocked);
+    assert!(permission_prompt.visible_blocker);
+}
+
+#[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(
         r#"

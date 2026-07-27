@@ -359,7 +359,7 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
+                    "Herdr first acknowledges the complete text+Enter PTY write. If a modal input request is already visible, it returns agent_input_pending without writing. With --wait, a settled agent's lifecycle advance or an observed composer clear proves delivery=submitted; persistent exact composer text returns agent_prompt_unsubmitted, and an otherwise unobservable disposition returns agent_prompt_stalled. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission: composer-clear evidence is required, otherwise delivery remains written_to_pty. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
                 ),
         )
         .subcommand(

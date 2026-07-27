@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -159,6 +159,20 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(agent_not_ready(id, &params.target));
         }
+        if terminal.input_pending {
+            let kind = terminal
+                .input_prompt_kind
+                .map(crate::detect::manifest::input_prompt_kind_label)
+                .unwrap_or("unknown");
+            return encode_error(
+                id,
+                "agent_input_pending",
+                format!(
+                    "agent {} has a pending {kind} input prompt; chat prompt was not written",
+                    params.target
+                ),
+            );
+        }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
@@ -276,30 +290,6 @@ impl App {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return agent_not_found(id, &target.target);
         };
-        if terminal.full_lifecycle_hook_authority_active() {
-            let explain = serde_json::json!({
-                "agent": terminal.effective_agent_label().unwrap_or("unknown"),
-                "state": crate::detect::manifest::agent_state_label(terminal.state),
-                "manifest_source": null,
-                "manifest_version": null,
-                "cached_remote_version": null,
-                "local_override_shadowing_remote": false,
-                "remote_update_status": null,
-                "remote_update_error": null,
-                "matched_rule": null,
-                "visible_idle": false,
-                "visible_blocker": false,
-                "visible_working": false,
-                "screen_detection_skipped": true,
-                "screen_detection_skip_reason": "full_lifecycle_hook_authority",
-                "skip_state_update": false,
-                "skipped_update_reason": null,
-                "fallback_reason": null,
-                "warning": null,
-                "evaluated_rules": [],
-            });
-            return encode_success(id, ResponseResult::AgentExplain { explain });
-        }
         let Some(agent) = terminal.effective_known_agent().or(terminal.detected_agent) else {
             return encode_error(
                 id,
@@ -322,7 +312,23 @@ impl App {
                 osc_progress: &osc_progress,
             },
         );
-        let value = crate::detect::manifest::explain_to_json_value(&explain);
+        let mut value = crate::detect::manifest::explain_to_json_value(&explain);
+        if terminal.full_lifecycle_hook_authority_active() {
+            value["state"] = serde_json::Value::String(
+                crate::detect::manifest::agent_state_label(terminal.state).to_string(),
+            );
+            value["matched_rule"] = serde_json::Value::Null;
+            value["visible_idle"] = serde_json::Value::Bool(false);
+            value["visible_blocker"] = serde_json::Value::Bool(false);
+            value["visible_working"] = serde_json::Value::Bool(false);
+            value["screen_detection_skipped"] = serde_json::Value::Bool(true);
+            value["screen_detection_skip_reason"] =
+                serde_json::Value::String("full_lifecycle_hook_authority".to_string());
+            value["skip_state_update"] = serde_json::Value::Bool(false);
+            value["skipped_update_reason"] = serde_json::Value::Null;
+            value["fallback_reason"] = serde_json::Value::Null;
+            value["evaluated_rules"] = serde_json::json!([]);
+        }
 
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }
@@ -572,10 +578,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission");
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+        let ResponseResult::AgentPrompted { agent, delivery } = success.result else {
             panic!("expected prompted response");
         };
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
+        assert_eq!(delivery, Some(AgentPromptDelivery::WrittenToPty));
         assert_eq!(
             rx.try_recv().unwrap(),
             Bytes::from_static(b"\x1b[200~A != B\x1b[201~")

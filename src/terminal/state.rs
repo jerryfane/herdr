@@ -251,6 +251,8 @@ pub struct TerminalState {
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
@@ -290,6 +292,8 @@ impl TerminalState {
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
+            input_pending: false,
+            input_prompt_kind: None,
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
@@ -2104,6 +2108,17 @@ impl TerminalState {
         }
     }
 
+    pub fn set_input_prompt_kind(&mut self, kind: Option<crate::detect::InputPromptKind>) -> bool {
+        let pending = kind.is_some();
+        if self.input_pending == pending && self.input_prompt_kind == kind {
+            return false;
+        }
+        self.input_pending = pending;
+        self.input_prompt_kind = kind;
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
     pub fn full_lifecycle_hook_authority_active(&self) -> bool {
         self.live_full_lifecycle_hook_authority()
     }
@@ -2343,6 +2358,8 @@ impl TerminalState {
         self.suppressed_full_lifecycle_hook_reports.clear();
         self.stale_full_lifecycle_hook_sessions.clear();
         self.state = AgentState::Unknown;
+        self.input_pending = false;
+        self.input_prompt_kind = None;
         self.last_agent_state_change_seq = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
@@ -6486,5 +6503,24 @@ mod tests {
             record.agent_session_path.as_deref(),
             Some("/tmp/pi-session.jsonl")
         );
+    }
+
+    #[test]
+    fn input_tuple_mutation_preserves_lifecycle_sequence_and_invariant() {
+        let mut terminal = test_terminal();
+        terminal.last_agent_state_change_seq = Some(41);
+
+        assert!(terminal.set_input_prompt_kind(Some(crate::detect::InputPromptKind::Select)));
+        assert!(terminal.input_pending);
+        assert_eq!(
+            terminal.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Select)
+        );
+        assert_eq!(terminal.last_agent_state_change_seq, Some(41));
+
+        assert!(terminal.set_input_prompt_kind(None));
+        assert!(!terminal.input_pending);
+        assert_eq!(terminal.input_prompt_kind, None);
+        assert_eq!(terminal.last_agent_state_change_seq, Some(41));
     }
 }
