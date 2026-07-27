@@ -6,6 +6,18 @@
 pub mod manifest;
 pub mod manifest_update;
 
+/// Best-effort classification of a live agent-owned input prompt.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPromptKind {
+    Confirm,
+    Select,
+    FreeText,
+    Unknown,
+}
+
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {

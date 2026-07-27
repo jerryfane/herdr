@@ -1,8 +1,42 @@
 id = "claude"
-version = "2026.07.13.1"
-min_engine_version = 2
-updated_at = "2026-07-13T00:00:00Z"
+version = "2026.07.26.1"
+min_engine_version = 4
+updated_at = "2026-07-26T00:00:00Z"
 aliases = ["claude-code"]
+
+[composer]
+region = "prompt_box_body"
+
+[[input_rules]]
+id = "claude_enumerated_select"
+priority = 1200
+region = "above_prompt_box"
+kind = "select"
+# Generalizes the cursor-plus-enumerator shape used by bash_permission_prompt
+# and generic_permission_prompt below: the phrase gate is removed and literal
+# 1/2 enumerators are widened to any numbered or lettered row ending in `.` or `)`.
+all = [
+  { line_regex = ['(?i)^\s*❯\s+[0-9a-z]+[.)]\s+\S'] },
+  { line_regex = ['(?i)^\s+[0-9a-z]+[.)]\s+\S'] },
+]
+
+[[input_rules]]
+id = "dynamic_workflow_confirm"
+priority = 1300
+region = "whole_recent"
+kind = "confirm"
+contains = ["run a dynamic workflow?", "esc to cancel"]
+
+[[input_rules]]
+id = "rewind_checkpoint_picker"
+priority = 1000
+region = "bottom_non_empty_lines(8)"
+kind = "select"
+contains = ["restore the code and/or conversation"]
+all = [
+  { any = [{ contains = ["enter to continue"] }, { contains = ["enter to select"] }] },
+  { contains = ["esc to cancel"] },
+]
 
 [[rules]]
 id = "osc_title_working"

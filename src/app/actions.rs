@@ -248,11 +248,15 @@ pub struct PaneStateUpdate {
     pub previous_state: AgentState,
     pub previous_seen: bool,
     pub previous_presentation: crate::terminal::EffectivePresentation,
+    pub previous_input_pending: bool,
+    pub previous_input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub agent_label: Option<String>,
     pub known_agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
     pub presentation: crate::terminal::EffectivePresentation,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub agent_name_changed: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
@@ -1041,6 +1045,10 @@ impl AppState {
                     .get_mut(&terminal_id)?
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
+                let (input_pending, input_prompt_kind) = self
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| (terminal.input_pending, terminal.input_prompt_kind))?;
                 let (turn, turn_epoch) = self
                     .terminals
                     .get(&terminal_id)
@@ -1056,11 +1064,15 @@ impl AppState {
                     previous_state: change.previous_state,
                     previous_seen,
                     previous_presentation: change.previous_presentation.clone(),
+                    previous_input_pending: input_pending,
+                    previous_input_prompt_kind: input_prompt_kind,
                     agent_label: change.agent_label.clone(),
                     known_agent: change.known_agent,
                     state: change.state,
                     seen,
                     presentation: change.presentation.clone(),
+                    input_pending,
+                    input_prompt_kind,
                     agent_name_changed: false,
                     agent_released: false,
                     agent_release_status: None,
@@ -2715,6 +2727,10 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::InputStateChanged { pane_id, kind } => self
+                .update_terminal_input_state(pane_id, kind)
+                .into_iter()
+                .collect(),
             AppEvent::HookStateReported {
                 pane_id,
                 source,
@@ -2880,10 +2896,14 @@ impl AppState {
             agent_name_changed,
             unchanged_change,
             previous_turn_context,
+            previous_input_pending,
+            previous_input_prompt_kind,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_turn_context = terminal.turn_completion_context();
             let previous_agent_name = terminal.agent_name.clone();
+            let previous_input_pending = terminal.input_pending;
+            let previous_input_prompt_kind = terminal.input_prompt_kind;
             let mutation = update(terminal)?;
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let agent_name_changed = terminal.agent_name != previous_agent_name;
@@ -2895,6 +2915,8 @@ impl AppState {
                 agent_name_changed,
                 unchanged_change,
                 previous_turn_context,
+                previous_input_pending,
+                previous_input_prompt_kind,
             )
         };
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
@@ -2933,11 +2955,15 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
+            previous_input_pending,
+            previous_input_prompt_kind,
             agent_label: change.agent_label.clone(),
             known_agent: change.known_agent,
             state: change.state,
             seen,
             presentation: change.presentation.clone(),
+            input_pending: self.terminals[&terminal_id].input_pending,
+            input_prompt_kind: self.terminals[&terminal_id].input_prompt_kind,
             agent_name_changed,
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
@@ -2946,6 +2972,73 @@ impl AppState {
             turn_epoch,
         };
         Some(update)
+    }
+
+    fn update_terminal_input_state(
+        &mut self,
+        pane_id: PaneId,
+        kind: Option<crate::detect::InputPromptKind>,
+    ) -> Option<PaneStateUpdate> {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.pane_state(pane_id).is_some())?;
+        let terminal_id = self.workspaces[ws_idx]
+            .pane_state(pane_id)?
+            .attached_terminal_id
+            .clone();
+        let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
+        let now = Instant::now();
+        let (
+            previous_input_pending,
+            previous_input_prompt_kind,
+            change,
+            input_pending,
+            input_prompt_kind,
+            turn,
+            turn_epoch,
+        ) = {
+            let terminal = self.terminals.get_mut(&terminal_id)?;
+            let previous_input_pending = terminal.input_pending;
+            let previous_input_prompt_kind = terminal.input_prompt_kind;
+            if !terminal.set_input_prompt_kind(kind) {
+                return None;
+            }
+            (
+                previous_input_pending,
+                previous_input_prompt_kind,
+                terminal.unchanged_effective_state_change_at(now),
+                terminal.input_pending,
+                terminal.input_prompt_kind,
+                terminal.turn,
+                terminal.turn_epoch,
+            )
+        };
+        let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+        Some(PaneStateUpdate {
+            pane_id,
+            ws_idx,
+            previous_agent_label: change.previous_agent_label.clone(),
+            previous_known_agent: change.previous_known_agent,
+            previous_state: change.previous_state,
+            previous_seen,
+            previous_presentation: change.previous_presentation.clone(),
+            previous_input_pending,
+            previous_input_prompt_kind,
+            agent_label: change.agent_label.clone(),
+            known_agent: change.known_agent,
+            state: change.state,
+            seen,
+            presentation: change.presentation,
+            input_pending,
+            input_prompt_kind,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            completed_turn: None,
+            turn: Some(turn),
+            turn_epoch: Some(turn_epoch),
+        })
     }
 
     pub(crate) fn next_managed_agent_deadline(&self) -> Option<Instant> {

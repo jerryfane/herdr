@@ -99,6 +99,8 @@ pub enum AgentViewField {
 #[serde(rename_all = "snake_case")]
 pub enum AgentViewBuiltinField {
     Status,
+    InputPending,
+    InputPromptKind,
     WorkspaceId,
     TabId,
     PaneId,
@@ -180,6 +182,13 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptDelivery {
+    WrittenToPty,
+    Submitted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
@@ -196,6 +205,10 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub input_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

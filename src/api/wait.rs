@@ -181,6 +181,26 @@ pub(super) fn prompt_agent(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    prompt_agent_with_effect_timeout(
+        request_id,
+        params,
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+    )
+}
+
+fn prompt_agent_with_effect_timeout(
+    request_id: String,
+    params: crate::api::schema::AgentPromptParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    effect_timeout_cap_ms: u64,
+) -> std::io::Result<Option<String>> {
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout(
             Request {
@@ -202,6 +222,8 @@ pub(super) fn prompt_agent(
         }
     };
     let target = params.target.clone();
+    let submitted_fingerprint = crate::detect::manifest::prompt_fingerprint(&params.text);
+    let initially_working = before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
     let prompt_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
@@ -225,54 +247,40 @@ pub(super) fn prompt_agent(
     let wait_started = std::time::Instant::now();
     let prompt_state_change_seq = prompted.state_change_seq;
     let until = agent_wait_statuses(wait.until);
-    let mut initial = prompted;
-    let mut after_state_change_seq = Some(prompt_state_change_seq);
-
-    if initial.agent_status != crate::api::schema::AgentStatus::Working {
-        let effect_timeout_ms = wait
-            .timeout_ms
-            .map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
-                timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-            });
-        let timeout_kind = if wait
-            .timeout_ms
-            .is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-        {
-            AgentWaitTimeoutKind::Status
-        } else {
-            AgentWaitTimeoutKind::PromptStalled {
-                baseline: prompt_state_change_seq,
-                timeout_ms: effect_timeout_ms,
-            }
-        };
-        let Some(outcome) = wait_for_resolved_agent(
-            request_id.clone(),
-            ResolvedAgentWait {
-                target: target.clone(),
-                until: all_agent_statuses(),
-                timeout_ms: Some(effect_timeout_ms),
-                initial,
-                last_event_sequence,
-                after_state_change_seq,
-                accept_transient_status: false,
-                timeout_kind,
-            },
-            stream,
-            api_tx,
-            event_hub,
-            running,
-        )?
-        else {
-            return Ok(None);
-        };
-        initial = match outcome {
-            AgentWaitOutcome::Matched(agent) => *agent,
-            AgentWaitOutcome::Response(response) => return Ok(Some(response)),
-        };
-        after_state_change_seq = None;
-        if agent_wait_matches(&initial, &until, None) {
-            return agent_prompt_success(request_id, initial).map(Some);
+    let effect_timeout_ms = wait.timeout_ms.map_or(effect_timeout_cap_ms, |timeout_ms| {
+        timeout_ms.min(effect_timeout_cap_ms)
+    });
+    let caller_timeout_is_effect_deadline = wait
+        .timeout_ms
+        .is_some_and(|timeout_ms| timeout_ms <= effect_timeout_cap_ms);
+    let Some(effect) = observe_prompt_effect(
+        &request_id,
+        &target,
+        &before_prompt,
+        prompted,
+        prompt_state_change_seq,
+        initially_working,
+        &submitted_fingerprint,
+        effect_timeout_ms,
+        caller_timeout_is_effect_deadline,
+        stream,
+        api_tx,
+        running,
+    )?
+    else {
+        return Ok(None);
+    };
+    let (initial, delivery) = match effect {
+        PromptEffectOutcome::Submitted(agent) => {
+            (agent, crate::api::schema::AgentPromptDelivery::Submitted)
         }
+        PromptEffectOutcome::WrittenToPty(agent) => {
+            (agent, crate::api::schema::AgentPromptDelivery::WrittenToPty)
+        }
+        PromptEffectOutcome::Response(response) => return Ok(Some(response)),
+    };
+    if agent_wait_matches(&initial, &until, None) {
+        return agent_prompt_success(request_id, initial, delivery).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -282,10 +290,8 @@ pub(super) fn prompt_agent(
             until,
             timeout_ms: remaining_timeout_ms(wait.timeout_ms, wait_started),
             initial,
-            // Replay from before submission so terminal lifecycle events consumed by
-            // the activity gate still terminate this settled-state wait.
             last_event_sequence,
-            after_state_change_seq,
+            after_state_change_seq: None,
             accept_transient_status: false,
             timeout_kind: AgentWaitTimeoutKind::Status,
         },
@@ -301,7 +307,7 @@ pub(super) fn prompt_agent(
         AgentWaitOutcome::Matched(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    agent_prompt_success(request_id, agent, delivery).map(Some)
 }
 
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {
@@ -314,10 +320,234 @@ fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> O
 fn agent_prompt_success(
     request_id: String,
     agent: crate::api::schema::AgentInfo,
+    delivery: crate::api::schema::AgentPromptDelivery,
 ) -> std::io::Result<String> {
     serde_json::to_string(&SuccessResponse {
         id: request_id,
-        result: ResponseResult::AgentPrompted { agent },
+        result: ResponseResult::AgentPrompted {
+            agent,
+            delivery: Some(delivery),
+        },
+    })
+    .map_err(std::io::Error::other)
+}
+
+enum PromptEffectOutcome {
+    Submitted(crate::api::schema::AgentInfo),
+    WrittenToPty(crate::api::schema::AgentInfo),
+    Response(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptObservationVerdict {
+    Submitted,
+    WrittenToPty,
+    Unsubmitted,
+    Stalled,
+    TimedOut,
+}
+
+enum ComposerObservation {
+    Unavailable,
+    Observed(Option<crate::detect::manifest::PromptFingerprint>),
+}
+
+fn classify_prompt_observation(
+    initially_working: bool,
+    baseline: u64,
+    current_sequence: u64,
+    composer_observed: bool,
+    composer_matches: bool,
+    timed_out: bool,
+    caller_timeout_is_effect_deadline: bool,
+) -> Option<PromptObservationVerdict> {
+    if composer_observed && !composer_matches {
+        return Some(PromptObservationVerdict::Submitted);
+    }
+    if !initially_working && current_sequence > baseline {
+        return Some(PromptObservationVerdict::Submitted);
+    }
+    if !timed_out {
+        return None;
+    }
+    if caller_timeout_is_effect_deadline {
+        return Some(PromptObservationVerdict::TimedOut);
+    }
+    if composer_matches {
+        return Some(PromptObservationVerdict::Unsubmitted);
+    }
+    if initially_working {
+        return Some(PromptObservationVerdict::WrittenToPty);
+    }
+    Some(PromptObservationVerdict::Stalled)
+}
+
+// The observation boundary keeps identity, evidence, timeout, and transport
+// inputs explicit so prompt attribution cannot accidentally reuse wait state.
+#[allow(clippy::too_many_arguments)]
+fn observe_prompt_effect(
+    request_id: &str,
+    target: &str,
+    before_prompt: &crate::api::schema::AgentInfo,
+    mut current: crate::api::schema::AgentInfo,
+    baseline: u64,
+    initially_working: bool,
+    submitted_fingerprint: &crate::detect::manifest::PromptFingerprint,
+    timeout_ms: u64,
+    caller_timeout_is_effect_deadline: bool,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<PromptEffectOutcome>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
+    let mut composer_observed = false;
+    let mut composer_matches = false;
+
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+        if !agent_wait_identity_matches(
+            &current,
+            &before_prompt.terminal_id,
+            expected_name,
+            before_prompt.agent.as_deref(),
+        ) {
+            return agent_wait_not_running(request_id.to_string())
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+        }
+
+        match agent_composer_fingerprint(request_id, target, &current, api_tx) {
+            ComposerObservation::Observed(composer) => {
+                composer_matches = composer.as_ref() == Some(submitted_fingerprint);
+                if composer_matches {
+                    composer_observed = true;
+                }
+            }
+            ComposerObservation::Unavailable => {
+                // An unavailable snapshot cannot prove that a previously
+                // observed composer cleared.
+            }
+        }
+
+        match classify_prompt_observation(
+            initially_working,
+            baseline,
+            current.state_change_seq,
+            composer_observed,
+            composer_matches,
+            std::time::Instant::now() >= deadline,
+            caller_timeout_is_effect_deadline,
+        ) {
+            Some(PromptObservationVerdict::Submitted) => {
+                return Ok(Some(PromptEffectOutcome::Submitted(current)));
+            }
+            Some(PromptObservationVerdict::WrittenToPty) => {
+                return Ok(Some(PromptEffectOutcome::WrittenToPty(current)));
+            }
+            Some(PromptObservationVerdict::Unsubmitted) => {
+                return agent_prompt_observation_error(
+                    request_id,
+                    "agent_prompt_unsubmitted",
+                    "agent prompt remains visible in the live composer after the PTY write",
+                )
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+            }
+            Some(PromptObservationVerdict::Stalled) => {
+                return agent_prompt_observation_error(
+                    request_id,
+                    "agent_prompt_stalled",
+                    "agent prompt was written to the PTY, but submission could not be observed",
+                )
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+            }
+            Some(PromptObservationVerdict::TimedOut) => {
+                return agent_wait_timeout(
+                    request_id.to_string(),
+                    AgentWaitTimeoutKind::Status,
+                    &current,
+                )
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+            }
+            None => {}
+        }
+
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        current = match agent_get(request_id, target, api_tx) {
+            Ok(agent) => agent,
+            Err(response) => {
+                return agent_wait_probe_error(response)
+                    .map(PromptEffectOutcome::Response)
+                    .map(Some);
+            }
+        };
+    }
+}
+
+fn agent_composer_fingerprint(
+    request_id: &str,
+    target: &str,
+    agent: &crate::api::schema::AgentInfo,
+    api_tx: &ApiRequestSender,
+) -> ComposerObservation {
+    let Some(known_agent) = agent
+        .agent
+        .as_deref()
+        .and_then(crate::detect::parse_agent_label)
+    else {
+        return ComposerObservation::Unavailable;
+    };
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:composer"),
+            method: Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: target.to_string(),
+                source: crate::api::schema::ReadSource::Detection,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return ComposerObservation::Unavailable;
+    };
+    if value.get("error").is_some() {
+        return ComposerObservation::Unavailable;
+    }
+    let Ok(read) = serde_json::from_value::<crate::api::schema::PaneReadResult>(
+        value["result"]["read"].clone(),
+    ) else {
+        return ComposerObservation::Unavailable;
+    };
+    ComposerObservation::Observed(crate::detect::manifest::composer_fingerprint(
+        known_agent,
+        crate::detect::manifest::DetectionInput {
+            screen: &read.text,
+            osc_title: "",
+            osc_progress: "",
+        },
+    ))
+}
+
+fn agent_prompt_observation_error(
+    request_id: &str,
+    code: &str,
+    message: &str,
+) -> std::io::Result<String> {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id.to_string(),
+        error: ErrorBody {
+            code: code.to_string(),
+            message: message.to_string(),
+        },
     })
     .map_err(std::io::Error::other)
 }
@@ -336,7 +566,6 @@ struct ResolvedAgentWait {
 #[derive(Clone, Copy)]
 enum AgentWaitTimeoutKind {
     Status,
-    PromptStalled { baseline: u64, timeout_ms: u64 },
 }
 
 enum AgentWaitOutcome {
@@ -496,17 +725,6 @@ fn wait_for_resolved_agent(
     }
 }
 
-fn all_agent_statuses() -> Vec<crate::api::schema::AgentStatus> {
-    // Keep this exhaustive: every status is evidence that the sequence advanced.
-    vec![
-        crate::api::schema::AgentStatus::Idle,
-        crate::api::schema::AgentStatus::Working,
-        crate::api::schema::AgentStatus::Blocked,
-        crate::api::schema::AgentStatus::Done,
-        crate::api::schema::AgentStatus::Unknown,
-    ]
-}
-
 fn agent_wait_statuses(
     until: Vec<crate::api::schema::AgentStatus>,
 ) -> Vec<crate::api::schema::AgentStatus> {
@@ -610,23 +828,11 @@ fn agent_wait_success(
 fn agent_wait_timeout(
     request_id: String,
     kind: AgentWaitTimeoutKind,
-    current: &crate::api::schema::AgentInfo,
+    _current: &crate::api::schema::AgentInfo,
 ) -> std::io::Result<String> {
     let (code, message) = match kind {
         AgentWaitTimeoutKind::Status => {
             ("timeout", "timed out waiting for agent status".to_string())
-        }
-        AgentWaitTimeoutKind::PromptStalled {
-            baseline,
-            timeout_ms,
-        } => {
-            let status = format!("{:?}", current.agent_status).to_ascii_lowercase();
-            (
-                "agent_prompt_stalled",
-                format!(
-                    "agent prompt produced no observed state change within {timeout_ms} ms; status is {status} and state_change_seq remained {baseline}"
-                ),
-            )
         }
     };
     serde_json::to_string(&ErrorResponse {
@@ -767,6 +973,8 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
                     pane_id: data.pane_id,
                     workspace_id: data.workspace_id,
                     agent_status: data.agent_status,
+                    input_pending: data.input_pending,
+                    input_prompt_kind: data.input_prompt_kind,
                     agent: data.agent,
                     title: data.title,
                     display_agent: data.display_agent,
@@ -783,6 +991,420 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    fn test_agent(
+        status: crate::api::schema::AgentStatus,
+        state_change_seq: u64,
+    ) -> crate::api::schema::AgentInfo {
+        crate::api::schema::AgentInfo {
+            terminal_id: "term_1".into(),
+            name: Some("reviewer".into()),
+            agent: Some("claude".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: status,
+            input_pending: false,
+            input_prompt_kind: None,
+            screen_detection_skipped: false,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            agent_session: None,
+            last_completed_turn: None,
+            turn: Some(1),
+            turn_epoch: Some(9),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            pane_id: "pane_1".into(),
+            focused: true,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    fn success_agent_response(
+        id: String,
+        agent: crate::api::schema::AgentInfo,
+        prompted: bool,
+    ) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id,
+            result: if prompted {
+                ResponseResult::AgentPrompted {
+                    agent,
+                    delivery: Some(crate::api::schema::AgentPromptDelivery::WrittenToPty),
+                }
+            } else {
+                ResponseResult::AgentInfo { agent }
+            },
+        })
+        .expect("serialize agent response")
+    }
+
+    fn pane_read_response(id: String, text: String) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id,
+            result: ResponseResult::PaneRead {
+                read: crate::api::schema::PaneReadResult {
+                    pane_id: "pane_1".into(),
+                    workspace_id: "ws_1".into(),
+                    tab_id: "tab_1".into(),
+                    source: crate::api::schema::ReadSource::Detection,
+                    format: crate::api::schema::ReadFormat::Text,
+                    text,
+                    revision: 1,
+                    truncated: false,
+                },
+            },
+        })
+        .expect("serialize pane read response")
+    }
+
+    fn local_stream_pair() -> (LocalStream, LocalStream, PathBuf) {
+        static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+        let file_name = format!(
+            "hpw-{:x}-{:x}.sock",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        #[cfg(unix)]
+        let path = PathBuf::from("/tmp").join(file_name);
+        #[cfg(windows)]
+        let path = std::env::temp_dir().join(file_name);
+        #[cfg(unix)]
+        assert!(
+            path.as_os_str().as_encoded_bytes().len() < 104,
+            "test socket path must fit macOS sockaddr_un.sun_path"
+        );
+        let listener = crate::ipc::bind_local_listener(&path).expect("bind local listener");
+        let client = crate::ipc::connect_local_stream(&path).expect("connect local stream");
+        let server = listener.accept().expect("accept local stream");
+        (client, server, path)
+    }
+
+    struct PromptHarness {
+        agents: VecDeque<crate::api::schema::AgentInfo>,
+        prompted: crate::api::schema::AgentInfo,
+        screens: VecDeque<String>,
+        last_screen: String,
+        prompt_error: Option<ErrorBody>,
+        composer_read_error_from: Option<usize>,
+    }
+
+    fn spawn_prompt_responder(
+        mut harness: PromptHarness,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut composer_read_count = 0;
+            while let Some(message) = api_rx.blocking_recv() {
+                let id = message.request.id;
+                let response = match message.request.method {
+                    Method::AgentGet(_) => success_agent_response(
+                        id,
+                        harness
+                            .agents
+                            .pop_front()
+                            .unwrap_or_else(|| harness.prompted.clone()),
+                        false,
+                    ),
+                    Method::AgentPrompt(_) => match harness.prompt_error.clone() {
+                        Some(error) => serde_json::to_string(&ErrorResponse { id, error })
+                            .expect("serialize prompt error"),
+                        None => success_agent_response(id, harness.prompted.clone(), true),
+                    },
+                    Method::AgentRead(_) => {
+                        composer_read_count += 1;
+                        if harness
+                            .composer_read_error_from
+                            .is_some_and(|first_error| composer_read_count >= first_error)
+                        {
+                            serde_json::to_string(&ErrorResponse {
+                                id,
+                                error: ErrorBody {
+                                    code: "server_unavailable".into(),
+                                    message: "composer snapshot unavailable".into(),
+                                },
+                            })
+                            .expect("serialize composer read error")
+                        } else {
+                            let text = harness
+                                .screens
+                                .pop_front()
+                                .unwrap_or_else(|| harness.last_screen.clone());
+                            pane_read_response(id, text)
+                        }
+                    }
+                    other => panic!("unexpected prompt observation request: {other:?}"),
+                };
+                message
+                    .respond_to
+                    .send(response)
+                    .expect("prompt observer still receiving");
+            }
+        });
+        (api_tx, responder)
+    }
+
+    fn run_prompt_harness(
+        name: &str,
+        text: &str,
+        until: crate::api::schema::AgentStatus,
+        effect_timeout_cap_ms: u64,
+        harness: PromptHarness,
+    ) -> serde_json::Value {
+        let (api_tx, responder) = spawn_prompt_responder(harness);
+        let (mut client, _server, path) = local_stream_pair();
+        let response = prompt_agent_with_effect_timeout(
+            name.into(),
+            crate::api::schema::AgentPromptParams {
+                target: "reviewer".into(),
+                text: text.into(),
+                wait: Some(crate::api::schema::AgentPromptWaitOptions {
+                    until: vec![until],
+                    timeout_ms: Some(10_000),
+                }),
+            },
+            &mut client,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            effect_timeout_cap_ms,
+        )
+        .expect("prompt wait succeeds")
+        .expect("connection remains active");
+        drop(api_tx);
+        responder.join().expect("prompt responder joins");
+        drop(client);
+        let _ = std::fs::remove_file(path);
+        serde_json::from_str(&response).expect("decode prompt response")
+    }
+
+    fn prompt_box(text: &str) -> String {
+        format!(
+            "────────────────────────────────────────\n\
+             ❯ {text}\n\
+             ────────────────────────────────────────\n"
+        )
+    }
+
+    #[test]
+    fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
+        assert_eq!(
+            classify_prompt_observation(false, 10, 11, false, false, false, false),
+            Some(PromptObservationVerdict::Submitted),
+            "settled lifecycle advance is attributable submission evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, true, false, false, false),
+            Some(PromptObservationVerdict::Submitted),
+            "composer observed then cleared is stronger submission evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, true, true, true, false),
+            Some(PromptObservationVerdict::Unsubmitted),
+            "persistent exact composer fingerprint is positive non-submission evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, false, false, true, false),
+            Some(PromptObservationVerdict::Stalled),
+            "settled unobservable disposition remains the residual stalled case"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 11, false, false, true, false),
+            Some(PromptObservationVerdict::WrittenToPty),
+            "an already-working completion is not attributable to the new prompt"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 11, true, false, false, false),
+            Some(PromptObservationVerdict::Submitted),
+            "already-working prompts still use composer-cleared evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, true, true, true, true),
+            Some(PromptObservationVerdict::TimedOut),
+            "caller deadlines at the observation boundary preserve ordinary timeout"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_reports_submitted_from_a_new_lifecycle_sequence() {
+        let response = run_prompt_harness(
+            "lifecycle-submitted",
+            "review the diff",
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    test_agent(crate::api::schema::AgentStatus::Working, 11),
+                ]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: "working".into(),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["result"]["type"], "agent_prompted",
+            "response: {response}"
+        );
+        assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_reports_submitted_when_the_exact_composer_clears() {
+        let text = "composer evidence";
+        let response = run_prompt_harness(
+            "composer-submitted",
+            text,
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    test_agent(crate::api::schema::AgentStatus::Working, 10),
+                ]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text), "working".into()]),
+                last_screen: "working".into(),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["result"]["type"], "agent_prompted",
+            "response: {response}"
+        );
+        assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_reports_unsubmitted_without_leaking_prompt_text() {
+        let text = "secret removal-sensitive prompt";
+        let response = run_prompt_harness(
+            "unsubmitted",
+            text,
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text)]),
+                last_screen: prompt_box(text),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
+        assert!(
+            !response.to_string().contains(text),
+            "prompt text must not leak into observation errors"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_does_not_treat_a_failed_composer_read_as_clear() {
+        let text = "composer read failure";
+        let response = run_prompt_harness(
+            "composer-read-failure",
+            text,
+            crate::api::schema::AgentStatus::Idle,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([prompt_box(text)]),
+                last_screen: prompt_box(text),
+                prompt_error: None,
+                composer_read_error_from: Some(2),
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_unsubmitted",
+            "an unavailable snapshot cannot prove the observed composer cleared: {response}"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_reports_stalled_without_composer_or_lifecycle_evidence() {
+        let response = run_prompt_harness(
+            "stalled",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: "idle".into(),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+    }
+
+    #[test]
+    fn prompt_agent_does_not_attribute_an_already_working_sequence_advance() {
+        let response = run_prompt_harness(
+            "already-working",
+            "follow-up prompt",
+            crate::api::schema::AgentStatus::Working,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Working, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Working, 11),
+                screens: VecDeque::new(),
+                last_screen: "working".into(),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(response["result"]["type"], "agent_prompted");
+        assert_eq!(response["result"]["delivery"], "written_to_pty");
+    }
+
+    #[test]
+    fn prompt_agent_preserves_the_not_received_verdict() {
+        let response = run_prompt_harness(
+            "write-failure",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::new(),
+                last_screen: String::new(),
+                prompt_error: Some(ErrorBody {
+                    code: "agent_prompt_not_received".into(),
+                    message: "agent prompt was not fully written to the pane PTY".into(),
+                }),
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_not_received");
+    }
 
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {

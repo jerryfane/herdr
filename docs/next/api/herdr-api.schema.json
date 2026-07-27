@@ -645,6 +645,19 @@
                     "null"
                   ]
                 },
+                "input_pending": {
+                  "type": "boolean"
+                },
+                "input_prompt_kind": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/InputPromptKind"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -798,6 +811,16 @@
           ],
           "type": "string"
         },
+        "InputPromptKind": {
+          "description": "Best-effort classification of a live agent-owned input prompt.",
+          "enum": [
+            "confirm",
+            "select",
+            "free_text",
+            "unknown"
+          ],
+          "type": "string"
+        },
         "LastCompletedTurn": {
           "properties": {
             "completed_unix_ms": {
@@ -864,6 +887,19 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "label": {
@@ -1499,6 +1535,8 @@
         "AgentViewBuiltinField": {
           "enum": [
             "status",
+            "input_pending",
+            "input_prompt_kind",
             "workspace_id",
             "tab_id",
             "pane_id",
@@ -5994,6 +6032,16 @@
           ],
           "type": "string"
         },
+        "InputPromptKind": {
+          "description": "Best-effort classification of a live agent-owned input prompt.",
+          "enum": [
+            "confirm",
+            "select",
+            "free_text",
+            "unknown"
+          ],
+          "type": "string"
+        },
         "LastCompletedTurn": {
           "properties": {
             "completed_unix_ms": {
@@ -6035,6 +6083,19 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "pane_id": {
@@ -6121,6 +6182,19 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "label": {
@@ -6500,6 +6574,19 @@
                 "null"
               ]
             },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "interactive_ready": {
               "type": "boolean"
             },
@@ -6672,6 +6759,13 @@
             "local_override_shadowing_remote"
           ],
           "type": "object"
+        },
+        "AgentPromptDelivery": {
+          "enum": [
+            "written_to_pty",
+            "submitted"
+          ],
+          "type": "string"
         },
         "AgentSessionInfo": {
           "properties": {
@@ -7295,6 +7389,19 @@
                     "null"
                   ]
                 },
+                "input_pending": {
+                  "type": "boolean"
+                },
+                "input_prompt_kind": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/InputPromptKind"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -7460,6 +7567,16 @@
             "pane_agent_status_changed",
             "pane_turn_completed",
             "layout_updated"
+          ],
+          "type": "string"
+        },
+        "InputPromptKind": {
+          "description": "Best-effort classification of a live agent-owned input prompt.",
+          "enum": [
+            "confirm",
+            "select",
+            "free_text",
+            "unknown"
           ],
           "type": "string"
         },
@@ -7871,6 +7988,19 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "label": {
@@ -9485,6 +9615,16 @@
               "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "delivery": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentPromptDelivery"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "type": {
                   "const": "agent_prompted",

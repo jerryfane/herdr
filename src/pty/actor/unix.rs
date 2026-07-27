@@ -72,6 +72,10 @@ pub(crate) struct PtyIoActorConfig {
 
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
+    WriteUserInputAcknowledged {
+        bytes: Bytes,
+        reply: std_mpsc::Sender<std::io::Result<()>>,
+    },
 }
 
 enum PtyIoControlCommand {
@@ -154,7 +158,53 @@ impl PtyIoActorHandle {
             Err(mpsc::error::TrySendError::Closed(PtyIoDataCommand::WriteUserInput(bytes))) => {
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
+            Err(mpsc::error::TrySendError::Full(
+                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+            )) => Err(mpsc::error::TrySendError::Full(bytes)),
+            Err(mpsc::error::TrySendError::Closed(
+                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
+            )) => Err(mpsc::error::TrySendError::Closed(bytes)),
         }
+    }
+
+    pub(crate) fn write_user_input_acknowledged(
+        &self,
+        bytes: Bytes,
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        let user_writes = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !user_writes.accepting {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PTY actor is not accepting input",
+            ));
+        }
+        let (reply, response) = std_mpsc::channel();
+        self.data_tx
+            .try_send(PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply })
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "PTY input queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY actor closed")
+                }
+            })?;
+        drop(user_writes);
+        self.wake_actor();
+        response.recv_timeout(timeout).map_err(|err| match err {
+            std_mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PTY write acknowledgement timed out",
+            ),
+            std_mpsc::RecvTimeoutError::Disconnected => std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PTY actor closed before acknowledging input",
+            ),
+        })?
     }
 
     pub(crate) fn resize(
@@ -398,7 +448,7 @@ struct PtyIoActorRunner {
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
-    pending_writes: VecDeque<Bytes>,
+    pending_writes: VecDeque<PendingWrite>,
     current_write_offset: usize,
     wake_read_fd: OwnedFd,
     controls: Arc<Mutex<SharedPtyControls>>,
@@ -407,10 +457,24 @@ struct PtyIoActorRunner {
     poll_observer: Option<std_mpsc::Sender<()>>,
 }
 
+struct PendingWrite {
+    bytes: Bytes,
+    acknowledgement: Option<std_mpsc::Sender<std::io::Result<()>>>,
+}
+
 impl PtyIoActorRunner {
-    fn enqueue_write(&mut self, bytes: Bytes) {
+    fn enqueue_write(
+        &mut self,
+        bytes: Bytes,
+        acknowledgement: Option<std_mpsc::Sender<std::io::Result<()>>>,
+    ) {
         if !bytes.is_empty() {
-            self.pending_writes.push_back(bytes);
+            self.pending_writes.push_back(PendingWrite {
+                bytes,
+                acknowledgement,
+            });
+        } else if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(Ok(()));
         }
     }
 
@@ -464,6 +528,10 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.fail_pending_writes(
+            std::io::ErrorKind::BrokenPipe,
+            "PTY actor exited before completing input",
+        );
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
             on_reader_exit();
         }
@@ -521,7 +589,17 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes);
+                    self.enqueue_write(bytes, None);
+                }
+            }
+            PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply } => {
+                if self.state == ActorState::Running {
+                    self.enqueue_write(bytes, Some(reply));
+                } else {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "PTY actor is not running",
+                    )));
                 }
             }
         }
@@ -563,7 +641,10 @@ impl PtyIoActorRunner {
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
-                self.pending_writes.clear();
+                self.fail_pending_writes(
+                    std::io::ErrorKind::BrokenPipe,
+                    "PTY actor released before completing input",
+                );
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -617,9 +698,23 @@ impl PtyIoActorRunner {
     }
 
     fn drain_pre_quiesce_commands(&mut self) {
-        while let Ok(PtyIoDataCommand::WriteUserInput(bytes)) = self.data_rx.try_recv() {
-            if self.state != ActorState::Released {
-                self.enqueue_write(bytes);
+        while let Ok(command) = self.data_rx.try_recv() {
+            match command {
+                PtyIoDataCommand::WriteUserInput(bytes) => {
+                    if self.state != ActorState::Released {
+                        self.enqueue_write(bytes, None);
+                    }
+                }
+                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply } => {
+                    if self.state != ActorState::Released {
+                        self.enqueue_write(bytes, Some(reply));
+                    } else {
+                        let _ = reply.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "PTY actor released before accepting input",
+                        )));
+                    }
+                }
             }
         }
     }
@@ -667,22 +762,41 @@ impl PtyIoActorRunner {
             return;
         }
         for bytes in terminal_responses {
-            self.enqueue_write(bytes);
+            self.enqueue_write(bytes, None);
         }
     }
 
     fn flush_pending_writes_once(&mut self) {
-        while let Some(bytes) = self.pending_writes.front() {
-            let chunk = &bytes[self.current_write_offset..];
+        while let Some(write) = self.pending_writes.front() {
+            let chunk = &write.bytes[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
                     warn!(pane = self.pane_id, "PTY actor write returned zero bytes");
+                    self.fail_pending_writes(
+                        std::io::ErrorKind::WriteZero,
+                        "PTY write returned zero bytes",
+                    );
                     return;
                 }
                 Ok(written) => {
                     self.current_write_offset += written;
-                    if self.current_write_offset >= bytes.len() {
-                        self.pending_writes.pop_front();
+                    if self.current_write_offset >= write.bytes.len() {
+                        if let Some(completed) = self.pending_writes.pop_front() {
+                            if let Some(acknowledgement) = completed.acknowledgement {
+                                let result = self.file.flush().map_err(|err| {
+                                    std::io::Error::new(err.kind(), "PTY flush failed")
+                                });
+                                let failed = result.is_err();
+                                let _ = acknowledgement.send(result);
+                                if failed {
+                                    self.fail_pending_writes(
+                                        std::io::ErrorKind::BrokenPipe,
+                                        "PTY flush failed",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         self.current_write_offset = 0;
                     }
                 }
@@ -690,13 +804,20 @@ impl PtyIoActorRunner {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
-                    self.pending_writes.clear();
-                    self.current_write_offset = 0;
+                    self.fail_pending_writes(err.kind(), "PTY write failed");
                     return;
                 }
             }
         }
-        let _ = self.file.flush();
+    }
+
+    fn fail_pending_writes(&mut self, kind: std::io::ErrorKind, message: &'static str) {
+        for pending in self.pending_writes.drain(..) {
+            if let Some(acknowledgement) = pending.acknowledgement {
+                let _ = acknowledgement.send(Err(std::io::Error::new(kind, message)));
+            }
+        }
+        self.current_write_offset = 0;
     }
 
     fn resize(&self, resize: PtyResize) {
@@ -862,6 +983,114 @@ mod tests {
         peer.read_exact(&mut buf).expect("peer receives write");
         assert_eq!(&buf, b"hello");
         handle.shutdown();
+    }
+
+    #[test]
+    fn acknowledged_write_completes_only_after_the_full_batch_is_written() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+        let payload = Bytes::from(vec![0xA5; 2 * 1024 * 1024]);
+        let expected_len = payload.len();
+        let writer_handle = handle.clone();
+        let write = std::thread::spawn(move || {
+            writer_handle.write_user_input_acknowledged(payload, Duration::from_secs(5))
+        });
+
+        let mut received = vec![0; expected_len];
+        peer.read_exact(&mut received[..4096])
+            .expect("peer receives initial partial write");
+        assert!(
+            !write.is_finished(),
+            "acknowledgement must wait for the complete batch"
+        );
+        peer.read_exact(&mut received[4096..])
+            .expect("peer receives remaining write");
+        write
+            .join()
+            .expect("writer thread joins")
+            .expect("full write is acknowledged");
+        assert!(received.iter().all(|byte| *byte == 0xA5));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn acknowledged_batch_completes_before_a_later_write_backpressures() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let (reply, response) = std_mpsc::channel();
+        runner.enqueue_write(Bytes::from_static(b"prompt"), Some(reply));
+        runner.enqueue_write(Bytes::from(vec![0xA5; 8 * 1024 * 1024]), None);
+
+        runner.flush_pending_writes_once();
+
+        response
+            .recv_timeout(Duration::from_millis(100))
+            .expect("completed batch must be acknowledged immediately")
+            .expect("completed batch flush succeeds");
+        assert_eq!(
+            runner.pending_writes.len(),
+            1,
+            "the later backpressured write must remain queued"
+        );
+        assert!(
+            runner.current_write_offset > 0,
+            "the later write should have made partial progress before backpressure"
+        );
+    }
+
+    #[test]
+    fn acknowledged_write_reports_closed_peer_and_actor_exit() {
+        let (closed_handle, peer, _read_rx) = actor_with_socket_pair(false);
+        drop(peer);
+        let closed = closed_handle
+            .write_user_input_acknowledged(Bytes::from_static(b"closed"), Duration::from_secs(1))
+            .expect_err("closed writer must not acknowledge");
+        assert!(matches!(
+            closed.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ));
+
+        let (exit_handle, _peer, _read_rx) = actor_with_socket_pair(false);
+        let writer_handle = exit_handle.clone();
+        let pending = std::thread::spawn(move || {
+            writer_handle.write_user_input_acknowledged(
+                Bytes::from(vec![0x5A; 2 * 1024 * 1024]),
+                Duration::from_secs(5),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        exit_handle.shutdown();
+        let exited = pending
+            .join()
+            .expect("writer thread joins")
+            .expect_err("actor exit must fail an incomplete write");
+        assert_eq!(exited.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn acknowledged_write_rejects_a_full_command_queue() {
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                b"fill",
+            )))
+            .expect("fill data queue");
+        let (wake, _wake_read_fd) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+        };
+
+        let err = handle
+            .write_user_input_acknowledged(Bytes::from_static(b"prompt"), Duration::from_secs(1))
+            .expect_err("full queue must reject acknowledged write");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]

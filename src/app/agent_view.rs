@@ -67,10 +67,7 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
     ) {
         entries.sort_by_key(|entry| {
             (
-                std::cmp::Reverse(super::api_helpers::tab_attention_priority(
-                    entry.state,
-                    entry.seen,
-                )),
+                std::cmp::Reverse(agent_entry_attention_priority(entry)),
                 std::cmp::Reverse(entry.last_agent_state_change_seq),
             )
         });
@@ -182,7 +179,12 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
         (_, AgentViewValue::Context { .. }) => {
             Err("agent view context type does not match the selected field".to_string())
         }
-        (AgentViewField::Builtin(AgentViewBuiltinField::Seen), AgentViewValue::Bool(_))
+        (
+            AgentViewField::Builtin(
+                AgentViewBuiltinField::Seen | AgentViewBuiltinField::InputPending,
+            ),
+            AgentViewValue::Bool(_),
+        )
         | (
             AgentViewField::Builtin(AgentViewBuiltinField::StateChangeSeq),
             AgentViewValue::Number(_),
@@ -190,6 +192,7 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
         (
             AgentViewField::Builtin(
                 AgentViewBuiltinField::Status
+                | AgentViewBuiltinField::InputPromptKind
                 | AgentViewBuiltinField::WorkspaceId
                 | AgentViewBuiltinField::TabId
                 | AgentViewBuiltinField::PaneId
@@ -311,6 +314,12 @@ fn builtin_field_value(
         AgentViewBuiltinField::Status => {
             Some(EvalValue::String(status_name(entry.state, entry.seen)))
         }
+        AgentViewBuiltinField::InputPending => Some(EvalValue::Bool(entry.input_pending)),
+        AgentViewBuiltinField::InputPromptKind => entry
+            .input_prompt_kind
+            .map(crate::detect::manifest::input_prompt_kind_label)
+            .map(str::to_string)
+            .map(EvalValue::String),
         AgentViewBuiltinField::WorkspaceId => app
             .workspaces
             .get(entry.ws_idx)
@@ -372,7 +381,7 @@ fn sort_value(
                 .and_then(|workspace| workspace.public_pane_number(entry.pane_id))
                 .map(|number| EvalValue::Number(number as u64)),
             AgentViewBuiltinSortField::Attention => Some(EvalValue::Number(u64::from(
-                super::api_helpers::tab_attention_priority(entry.state, entry.seen),
+                agent_entry_attention_priority(entry),
             ))),
             AgentViewBuiltinSortField::Status => {
                 Some(EvalValue::String(status_name(entry.state, entry.seen)))
@@ -385,6 +394,14 @@ fn sort_value(
                 entry.last_agent_state_change_seq.map(EvalValue::Number)
             }
         },
+    }
+}
+
+fn agent_entry_attention_priority(entry: &AgentPanelEntry) -> u8 {
+    if entry.input_pending {
+        5
+    } else {
+        super::api_helpers::tab_attention_priority(entry.state, entry.seen)
     }
 }
 
@@ -517,6 +534,59 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].ws_idx, 1);
         assert_eq!(entries[1].ws_idx, 0);
+    }
+
+    #[test]
+    fn input_tuple_fields_filter_and_outrank_blocked_attention() {
+        let mut state = state_with_agents();
+        let pending_pane = state.workspaces[0].tabs[0].root_pane;
+        let pending_terminal = state.workspaces[0].tabs[0].panes[&pending_pane]
+            .attached_terminal_id
+            .clone();
+        let pending = state.terminals.get_mut(&pending_terminal).unwrap();
+        pending.state = AgentState::Idle;
+        pending.set_input_prompt_kind(Some(crate::detect::InputPromptKind::Select));
+
+        let blocked_pane = state.workspaces[1].tabs[0].root_pane;
+        let blocked_terminal = state.workspaces[1].tabs[0].panes[&blocked_pane]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&blocked_terminal).unwrap().state = AgentState::Blocked;
+
+        let entries = crate::ui::agent_panel_entries(&state);
+        let pending_entry = entries
+            .iter()
+            .find(|entry| entry.pane_id == pending_pane)
+            .unwrap();
+        let blocked_entry = entries
+            .iter()
+            .find(|entry| entry.pane_id == blocked_pane)
+            .unwrap();
+        assert!(
+            agent_entry_attention_priority(pending_entry)
+                > agent_entry_attention_priority(blocked_entry)
+        );
+
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.input".to_string(),
+            label: None,
+            filter: Some(AgentViewFilter::All {
+                filters: vec![
+                    AgentViewFilter::Eq {
+                        field: AgentViewField::Builtin(AgentViewBuiltinField::InputPending),
+                        value: AgentViewValue::Bool(true),
+                    },
+                    AgentViewFilter::Eq {
+                        field: AgentViewField::Builtin(AgentViewBuiltinField::InputPromptKind),
+                        value: AgentViewValue::String("select".to_string()),
+                    },
+                ],
+            }),
+            sort: Vec::new(),
+        });
+        let filtered = crate::ui::agent_panel_entries(&state);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pane_id, pending_pane);
     }
 
     #[test]

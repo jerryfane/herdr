@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -81,6 +81,20 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return agent_not_ready(id, &params.target);
         }
+        if terminal.input_pending {
+            let kind = terminal
+                .input_prompt_kind
+                .map(crate::detect::manifest::input_prompt_kind_label)
+                .unwrap_or("unknown");
+            return encode_error(
+                id,
+                "agent_input_pending",
+                format!(
+                    "agent {} has a pending {kind} input prompt; chat prompt was not written",
+                    params.target
+                ),
+            );
+        }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -95,13 +109,29 @@ impl App {
             );
         }
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            return encode_error(id, "agent_prompt_failed", err.to_string());
+        let write_result = runtime
+            .write_bytes_acknowledged(Bytes::from(bytes), std::time::Duration::from_secs(5))
+            .is_ok();
+        // Revalidate the live PTY occupant after the blocking acknowledgement so
+        // a foreground identity change during the batch is never reported as
+        // receipt by the originally resolved agent.
+        if !write_result || !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+            return encode_error(
+                id,
+                "agent_prompt_not_received",
+                "agent prompt was not fully written to the pane PTY",
+            );
         }
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        encode_success(id, ResponseResult::AgentPrompted { agent })
+        encode_success(
+            id,
+            ResponseResult::AgentPrompted {
+                agent,
+                delivery: Some(AgentPromptDelivery::WrittenToPty),
+            },
+        )
     }
 
     pub(super) fn handle_agent_read(
@@ -165,30 +195,6 @@ impl App {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return agent_not_found(id, &target.target);
         };
-        if terminal.full_lifecycle_hook_authority_active() {
-            let explain = serde_json::json!({
-                "agent": terminal.effective_agent_label().unwrap_or("unknown"),
-                "state": crate::detect::manifest::agent_state_label(terminal.state),
-                "manifest_source": null,
-                "manifest_version": null,
-                "cached_remote_version": null,
-                "local_override_shadowing_remote": false,
-                "remote_update_status": null,
-                "remote_update_error": null,
-                "matched_rule": null,
-                "visible_idle": false,
-                "visible_blocker": false,
-                "visible_working": false,
-                "screen_detection_skipped": true,
-                "screen_detection_skip_reason": "full_lifecycle_hook_authority",
-                "skip_state_update": false,
-                "skipped_update_reason": null,
-                "fallback_reason": null,
-                "warning": null,
-                "evaluated_rules": [],
-            });
-            return encode_success(id, ResponseResult::AgentExplain { explain });
-        }
         let Some(agent) = terminal.effective_known_agent().or(terminal.detected_agent) else {
             return encode_error(
                 id,
@@ -211,7 +217,23 @@ impl App {
                 osc_progress: &osc_progress,
             },
         );
-        let value = crate::detect::manifest::explain_to_json_value(&explain);
+        let mut value = crate::detect::manifest::explain_to_json_value(&explain);
+        if terminal.full_lifecycle_hook_authority_active() {
+            value["state"] = serde_json::Value::String(
+                crate::detect::manifest::agent_state_label(terminal.state).to_string(),
+            );
+            value["matched_rule"] = serde_json::Value::Null;
+            value["visible_idle"] = serde_json::Value::Bool(false);
+            value["visible_blocker"] = serde_json::Value::Bool(false);
+            value["visible_working"] = serde_json::Value::Bool(false);
+            value["screen_detection_skipped"] = serde_json::Value::Bool(true);
+            value["screen_detection_skip_reason"] =
+                serde_json::Value::String("full_lifecycle_hook_authority".to_string());
+            value["skip_state_update"] = serde_json::Value::Bool(false);
+            value["skipped_update_reason"] = serde_json::Value::Null;
+            value["fallback_reason"] = serde_json::Value::Null;
+            value["evaluated_rules"] = serde_json::json!([]);
+        }
 
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }
@@ -338,10 +360,11 @@ mod tests {
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+        let ResponseResult::AgentPrompted { agent, delivery } = success.result else {
             panic!("expected prompted response");
         };
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
+        assert_eq!(delivery, Some(AgentPromptDelivery::WrittenToPty));
         assert_eq!(
             rx.try_recv().unwrap(),
             Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
@@ -375,6 +398,95 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_input_preflight_and_write_failure_are_non_receipt_verdicts() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_input_prompt_kind(Some(crate::detect::InputPromptKind::Select));
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let blocked = app.handle_agent_prompt(
+            "req-input".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "do not write this".into(),
+                wait: None,
+            },
+        );
+        let blocked: crate::api::schema::ErrorResponse = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked.error.code, "agent_input_pending");
+        assert!(blocked.error.message.contains("select"));
+        assert!(rx.try_recv().is_err(), "preflight must write zero bytes");
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_input_prompt_kind(None);
+        drop(rx);
+        let secret_prompt = "private prompt contents";
+        let failed_json = app.handle_agent_prompt(
+            "req-write".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: secret_prompt.into(),
+                wait: None,
+            },
+        );
+        let failed: crate::api::schema::ErrorResponse = serde_json::from_str(&failed_json).unwrap();
+        assert_eq!(failed.error.code, "agent_prompt_not_received");
+        assert!(!failed.error.message.contains(secret_prompt));
+        assert!(!failed_json.contains(secret_prompt));
+    }
+
+    #[test]
+    fn agent_get_and_list_expose_the_input_tuple() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_input_prompt_kind(Some(crate::detect::InputPromptKind::Confirm));
+
+        let get: SuccessResponse = serde_json::from_str(&app.handle_agent_get(
+            "get".into(),
+            AgentTarget {
+                target: "reviewer".into(),
+            },
+        ))
+        .unwrap();
+        let ResponseResult::AgentInfo { agent } = get.result else {
+            panic!("expected agent info");
+        };
+        assert!(agent.input_pending);
+        assert_eq!(
+            agent.input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Confirm)
+        );
+
+        let list: SuccessResponse =
+            serde_json::from_str(&app.handle_agent_list("list".into())).unwrap();
+        let ResponseResult::AgentList { agents } = list.result else {
+            panic!("expected agent list");
+        };
+        assert_eq!(agents.len(), 1);
+        assert!(agents[0].input_pending);
+        assert_eq!(
+            agents[0].input_prompt_kind,
+            Some(crate::detect::InputPromptKind::Confirm)
+        );
     }
 
     #[tokio::test]

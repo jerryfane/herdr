@@ -745,14 +745,24 @@ fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
     if let Some(tab_label) = entry.primary_tab_label.as_deref() {
         parts.push(tab_label.to_string());
     }
-    let status = entry
-        .state_labels
-        .get(super::sidebar::agent_panel_status_key(
-            entry.state,
-            entry.seen,
-        ))
-        .cloned()
-        .unwrap_or_else(|| super::status::state_label(entry.state, entry.seen).to_string());
+    let status = if entry.input_pending {
+        match entry.input_prompt_kind {
+            Some(crate::detect::InputPromptKind::Confirm) => "input waiting · confirm",
+            Some(crate::detect::InputPromptKind::Select) => "input waiting · select",
+            Some(crate::detect::InputPromptKind::FreeText) => "input waiting · free-text",
+            Some(crate::detect::InputPromptKind::Unknown) | None => "input waiting",
+        }
+        .to_string()
+    } else {
+        entry
+            .state_labels
+            .get(super::sidebar::agent_panel_status_key(
+                entry.state,
+                entry.seen,
+            ))
+            .cloned()
+            .unwrap_or_else(|| super::status::state_label(entry.state, entry.seen).to_string())
+    };
     parts.push(status);
     if let Some(agent_label) = entry.agent_label.as_deref() {
         parts.push(agent_label.to_string());
@@ -1169,6 +1179,8 @@ mod tests {
             agent_kind_label: agent_label.map(str::to_string),
             agent: agent_label.and_then(crate::detect::parse_agent_label),
             state: AgentState::Idle,
+            input_pending: false,
+            input_prompt_kind: None,
             seen: true,
             last_agent_state_change_seq: None,
             state_labels: std::collections::HashMap::new(),
@@ -1391,6 +1403,18 @@ mod tests {
         let entry = agent_entry(None, Some("pi"));
 
         assert_eq!(mobile_agent_detail(&entry), "  idle · pi");
+    }
+
+    #[test]
+    fn mobile_agent_detail_renders_input_waiting_distinct_from_lifecycle_status() {
+        let mut entry = agent_entry(None, Some("claude"));
+        entry.state = AgentState::Blocked;
+        entry.input_pending = true;
+        entry.input_prompt_kind = Some(crate::detect::InputPromptKind::Select);
+
+        let detail = mobile_agent_detail(&entry);
+        assert_eq!(detail, "  input waiting · select · claude");
+        assert!(!detail.contains("blocked"));
     }
 
     #[test]
