@@ -6,7 +6,7 @@ on:
 
 jobs:
   approve:
-    if: ${{ !github.event.issue.pull_request && github.event.comment.user.login != 'kangal-bot' }}
+    if: ${{ github.repository == 'ogulcancelik/herdr' && !github.event.issue.pull_request && github.event.comment.user.login != 'kangal-bot' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

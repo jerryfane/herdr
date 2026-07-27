@@ -13,6 +13,7 @@ env:
 
 jobs:
   close:
+    if: ${{ github.repository == 'ogulcancelik/herdr' }}
     runs-on: ubuntu-latest
 
     steps:

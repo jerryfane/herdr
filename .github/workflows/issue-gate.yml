@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   check-template:
-    if: ${{ !github.event.issue.pull_request }}
+    if: ${{ github.repository == 'ogulcancelik/herdr' && !github.event.issue.pull_request }}
     runs-on: ubuntu-latest
 
     steps:
