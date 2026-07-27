@@ -140,17 +140,34 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # Every native (non-cmdlet) command in THIS step must run through
+          # Invoke-Checked/Invoke-CargoWithZigCacheRecovery, never called bare.
+          # $PSNativeCommandUseErrorActionPreference disables PowerShell's
+          # default auto-throw-on-nonzero-exit for native commands so a
+          # failing check doesn't abort the ones after it; a bare call here
+          # would silently stop throwing too, with no exit-code capture to
+          # replace it. ADD NEW CHECKS BY CALLING Invoke-Checked (its
+          # $results entry drives both the summary and the final exit code
+          # automatically) — never add a parallel pass/fail list by hand.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $results = [ordered]@{}
+
           function Invoke-Checked {
-            param([string]$Command, [string[]]$Arguments)
-            & $Command @Arguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "command failed with exit code $LASTEXITCODE`: $Command $($Arguments -join ' ')"
+            param([string]$Name, [string]$Command, [string[]]$Arguments)
+            $exitCode = 1
+            try {
+              & $Command @Arguments
+              $exitCode = $LASTEXITCODE
+            } catch {
+              Write-Warning "unable to run $Name`: $($_.Exception.Message)"
             }
+            $script:results[$Name] = $exitCode
           }
+
           function Invoke-CargoWithZigCacheRecovery {
-            param([string[]]$Arguments)
-            & cargo @Arguments
-            if ($LASTEXITCODE -eq 0) {
+            param([string]$Name, [string[]]$Arguments)
+            Invoke-Checked $Name cargo $Arguments
+            if ($script:results[$Name] -eq 0) {
               return
             }
 
@@ -158,13 +175,30 @@ jobs:
             Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
             Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
             Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
-            Invoke-Checked cargo $Arguments
+            Invoke-Checked $Name cargo $Arguments
           }
-          Invoke-Checked cargo @("fmt", "--check")
-          Invoke-CargoWithZigCacheRecovery @("clippy", "--bin", "herdr", "--locked", "--target", "x86_64-pc-windows-msvc", "--", "-D", "warnings")
-          Invoke-Checked cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "windows_")
-          Invoke-Checked cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "server::client_transport::tests")
-          Invoke-Checked cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")
+
+          Invoke-Checked "fmt" cargo @("fmt", "--check")
+          Invoke-CargoWithZigCacheRecovery "clippy" @("clippy", "--bin", "herdr", "--locked", "--target", "x86_64-pc-windows-msvc", "--", "-D", "warnings")
+          Invoke-Checked "test windows_" cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "windows_")
+          Invoke-Checked "test client_transport" cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "server::client_transport::tests")
+          Invoke-Checked "build" cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")
+
+          $failed = @()
+          Write-Host "`nWindows checks summary:"
+          foreach ($result in $results.GetEnumerator()) {
+            if ($result.Value -eq 0) {
+              Write-Host "PASS: $($result.Key)"
+            } else {
+              Write-Host "FAIL: $($result.Key) (exit code $($result.Value))"
+              $failed += $result.Key
+            }
+          }
+
+          if ($failed.Count -gt 0) {
+            Write-Host "Windows checks failed: $($failed -join ', ')"
+            exit 1
+          }
 
       - name: Smoke ConPTY pane
         if: matrix.kind == 'windows'
