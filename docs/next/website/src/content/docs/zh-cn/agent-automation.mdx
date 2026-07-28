@@ -73,7 +73,9 @@ herdr agent rename w1:p2 reviewer
 
 窗格输入直接指定终端,不关心当前进程。智能体输入会解析实时智能体;如果该智能体已不再控制此窗格,操作会被拒绝。
 
-`agent prompt --wait` 会立即提交提示。智能体从非 working 状态开始时，Herdr 首先要求在五秒内观察到生命周期变化。如果状态序列没有前进，它会返回 `agent_prompt_stalled`，而不是无限等待；调用方设置的 `--timeout` 不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
+`agent prompt --wait` 会区分 Herdr 在 PTY 确认写入后能够证明的投递状态。对于最初处于 settled 状态的智能体，生命周期序列前进会返回 `delivery: "submitted"`。编辑器证据也能证明投递：规范化后的完整提示必须先出现、随后不再匹配；或者 Claude 的 `[Pasted text #N]` 这类由清单声明的 bracketed-paste 标记必须先出现、随后编辑器变为空。只有写入前的快照成功读出且当时没有既存 paste 标记，之后出现的标记才可归因于本次投递。完整提示或可归因标记持续存在时返回 `agent_prompt_unsubmitted`；无法读取的基线、既存标记，或被另一段非空文本取代的标记，都不是投递成功的正面证据。字节已经写入但无法观察到持久或可归因的提交证据时，Herdr 返回 `agent_prompt_stalled`。
+
+如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示：只有观察到编辑器内容随后清除才返回 `submitted`，否则成功状态仍是 `written_to_pty`。同一窗格内的并发投递仍存在基于界面出现时机的竞态；该机制将由 [#17](https://github.com/jerryfane/herdr/issues/17) 的写入侧来源证明取代。完成投递检查后，Herdr 会等待请求的 settled 状态。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
 
 `idle` 表示智能体正等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,但用于后台工作完成后,直到该标签页获得焦点或 `pane focus` / `agent focus` 指向它。仅通过 CLI 读取不会把它标记为已查看。`blocked` 表示 Herdr 识别到了审批或提问界面。`unknown` 表示智能体存在,但 Herdr 无法可靠判断其生命周期;它不代表工作成功完成。区别重要时,请指定精确的 `--until` 状态。
 

@@ -150,6 +150,7 @@ struct LoadedManifest {
     manifest: AgentManifest,
     compiled_rules: Vec<CompiledRule>,
     compiled_input_rules: Vec<CompiledRule>,
+    compiled_composer_paste_token: Option<Regex>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -236,6 +237,7 @@ struct InputManifestRule {
 #[serde(deny_unknown_fields)]
 struct ComposerManifest {
     region: String,
+    paste_token_regex: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -755,6 +757,24 @@ pub fn composer_fingerprint(agent: Agent, input: DetectionInput<'_>) -> Option<P
     (!text.is_empty()).then(|| PromptFingerprint(Sha256::digest(text.as_bytes()).into()))
 }
 
+pub(crate) fn composer_paste_token_configured(agent: Agent) -> bool {
+    load_manifest(agent).is_some_and(|loaded| loaded.compiled_composer_paste_token.is_some())
+}
+
+pub(crate) fn composer_has_paste_token(agent: Agent, input: DetectionInput<'_>) -> bool {
+    let Some(loaded) = load_manifest(agent) else {
+        return false;
+    };
+    let Some(composer) = loaded.manifest.composer.as_ref() else {
+        return false;
+    };
+    let Some(pattern) = loaded.compiled_composer_paste_token.as_ref() else {
+        return false;
+    };
+    let text = normalize_composer_text(region(input, &composer.region));
+    pattern.is_match(&text)
+}
+
 fn normalize_prompt_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -893,10 +913,18 @@ fn loaded_manifest(
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?;
     let compiled_input_rules = compile_input_manifest(&manifest)?;
+    let compiled_composer_paste_token = manifest
+        .composer
+        .as_ref()
+        .and_then(|composer| composer.paste_token_regex.as_deref())
+        .map(Regex::new)
+        .transpose()
+        .map_err(|err| format!("composer uses invalid paste_token_regex: {err}"))?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
         compiled_input_rules,
+        compiled_composer_paste_token,
         source,
         warning,
         cached_remote_version,
@@ -1216,6 +1244,24 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     if let Some(composer) = &manifest.composer {
         validate_region_name(&composer.region)
             .map_err(|err| format!("composer uses invalid region: {err}"))?;
+        if let Some(pattern) = composer.paste_token_regex.as_deref() {
+            if manifest
+                .min_engine_version
+                .is_some_and(|version| version < COMPOSER_PASTE_TOKEN_ENGINE_VERSION)
+            {
+                return Err(format!(
+                    "composer paste_token_regex requires min_engine_version \
+                     {COMPOSER_PASTE_TOKEN_ENGINE_VERSION}"
+                ));
+            }
+            if pattern.len() > MAX_MATCHER_CHARS {
+                return Err(format!(
+                    "composer paste_token_regex exceeds max length {MAX_MATCHER_CHARS}"
+                ));
+            }
+            Regex::new(pattern)
+                .map_err(|err| format!("composer uses invalid paste_token_regex: {err}"))?;
+        }
     }
 
     Ok(())
@@ -1628,6 +1674,7 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
         .and_then(|count| count.parse::<usize>().ok())
 }
 
+const COMPOSER_PASTE_TOKEN_ENGINE_VERSION: u32 = 5;
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
