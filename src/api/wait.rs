@@ -224,6 +224,8 @@ fn prompt_agent_with_effect_timeout(
     let target = params.target.clone();
     let submitted_fingerprint = crate::detect::manifest::prompt_fingerprint(&params.text);
     let initially_working = before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
+    let paste_token_attributable =
+        paste_token_attributable(&request_id, &target, &before_prompt, api_tx);
     let prompt_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
@@ -261,6 +263,7 @@ fn prompt_agent_with_effect_timeout(
         prompt_state_change_seq,
         initially_working,
         &submitted_fingerprint,
+        paste_token_attributable,
         effect_timeout_ms,
         caller_timeout_is_effect_deadline,
         stream,
@@ -349,7 +352,12 @@ enum PromptObservationVerdict {
 
 enum ComposerObservation {
     Unavailable,
-    Observed(Option<crate::detect::manifest::PromptFingerprint>),
+    Observed(ComposerEvidence),
+}
+
+struct ComposerEvidence {
+    fingerprint: Option<crate::detect::manifest::PromptFingerprint>,
+    has_paste_token: bool,
 }
 
 fn classify_prompt_observation(
@@ -393,6 +401,7 @@ fn observe_prompt_effect(
     baseline: u64,
     initially_working: bool,
     submitted_fingerprint: &crate::detect::manifest::PromptFingerprint,
+    paste_token_attributable: bool,
     timeout_ms: u64,
     caller_timeout_is_effect_deadline: bool,
     stream: &mut LocalStream,
@@ -419,9 +428,10 @@ fn observe_prompt_effect(
                 .map(Some);
         }
 
-        match agent_composer_fingerprint(request_id, target, &current, api_tx) {
+        match agent_composer_evidence(request_id, target, &current, api_tx) {
             ComposerObservation::Observed(composer) => {
-                composer_matches = composer.as_ref() == Some(submitted_fingerprint);
+                composer_matches = composer.fingerprint.as_ref() == Some(submitted_fingerprint)
+                    || (paste_token_attributable && composer.has_paste_token);
                 if composer_matches {
                     composer_observed = true;
                 }
@@ -489,7 +499,35 @@ fn observe_prompt_effect(
     }
 }
 
-fn agent_composer_fingerprint(
+fn paste_token_attributable(
+    request_id: &str,
+    target: &str,
+    agent: &crate::api::schema::AgentInfo,
+    api_tx: &ApiRequestSender,
+) -> bool {
+    let Some(known_agent) = agent
+        .agent
+        .as_deref()
+        .and_then(crate::detect::parse_agent_label)
+    else {
+        return false;
+    };
+    if !crate::detect::manifest::composer_paste_token_configured(known_agent) {
+        return false;
+    }
+    // A paste-token pattern identifies rendered paste syntax, not ownership.
+    // Only a successful pre-write snapshot without a token lets the following
+    // newly observed token be attributed to this acknowledged PTY write.
+    matches!(
+        agent_composer_evidence(request_id, target, agent, api_tx),
+        ComposerObservation::Observed(ComposerEvidence {
+            has_paste_token: false,
+            ..
+        })
+    )
+}
+
+fn agent_composer_evidence(
     request_id: &str,
     target: &str,
     agent: &crate::api::schema::AgentInfo,
@@ -527,14 +565,15 @@ fn agent_composer_fingerprint(
     ) else {
         return ComposerObservation::Unavailable;
     };
-    ComposerObservation::Observed(crate::detect::manifest::composer_fingerprint(
-        known_agent,
-        crate::detect::manifest::DetectionInput {
-            screen: &read.text,
-            osc_title: "",
-            osc_progress: "",
-        },
-    ))
+    let input = crate::detect::manifest::DetectionInput {
+        screen: &read.text,
+        osc_title: "",
+        osc_progress: "",
+    };
+    ComposerObservation::Observed(ComposerEvidence {
+        fingerprint: crate::detect::manifest::composer_fingerprint(known_agent, input),
+        has_paste_token: crate::detect::manifest::composer_has_paste_token(known_agent, input),
+    })
 }
 
 fn agent_prompt_observation_error(
@@ -1279,7 +1318,7 @@ mod tests {
                     test_agent(crate::api::schema::AgentStatus::Working, 10),
                 ]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([prompt_box(text), "working".into()]),
+                screens: VecDeque::from(["idle".into(), prompt_box(text), "working".into()]),
                 last_screen: "working".into(),
                 prompt_error: None,
                 composer_read_error_from: None,
@@ -1291,6 +1330,82 @@ mod tests {
             "response: {response}"
         );
         assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_observes_a_new_bracketed_paste_token_then_clear_as_submitted() {
+        let paste_token = prompt_box("[Pasted text #6]");
+        let response = run_prompt_harness(
+            "paste-token-submitted",
+            "a multiline prompt that Claude renders as a paste token",
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    test_agent(crate::api::schema::AgentStatus::Working, 10),
+                ]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from(["idle".into(), paste_token, "working".into()]),
+                last_screen: "working".into(),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["result"]["type"], "agent_prompted",
+            "response: {response}"
+        );
+        assert_eq!(response["result"]["delivery"], "submitted");
+    }
+
+    #[test]
+    fn prompt_agent_reports_a_persistent_new_bracketed_paste_token_as_unsubmitted() {
+        let paste_token = prompt_box("[Pasted text #6]");
+        let response = run_prompt_harness(
+            "paste-token-unsubmitted",
+            "a multiline prompt that remains in Claude's composer",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from(["idle".into(), paste_token.clone()]),
+                last_screen: paste_token,
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_unsubmitted",
+            "a landed paste token must not fall through to stalled: {response}"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_does_not_attribute_a_preexisting_paste_token() {
+        let paste_token = prompt_box("[Pasted text #5]");
+        let response = run_prompt_harness(
+            "preexisting-paste-token",
+            "a different delivery",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([paste_token.clone(), paste_token.clone()]),
+                last_screen: paste_token,
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_stalled",
+            "a paste token that predates this write is not evidence for this delivery: {response}"
+        );
     }
 
     #[test]
@@ -1329,10 +1444,10 @@ mod tests {
             PromptHarness {
                 agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([prompt_box(text)]),
+                screens: VecDeque::from(["idle".into(), prompt_box(text)]),
                 last_screen: prompt_box(text),
                 prompt_error: None,
-                composer_read_error_from: Some(2),
+                composer_read_error_from: Some(3),
             },
         );
 
