@@ -107,7 +107,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。
+`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。成功响应中的可选 `delivery` 在完整 text+Enter 批次确认写入后为 `written_to_pty`;在可归因的生命周期前进、规范化完整提示出现后清除,或可归因的清单 paste 标记出现后编辑器变为空时为 `submitted`。paste 标记归因要求写入前成功读出一个没有标记的快照;无法读取的基线、既存标记或另一段非空替代文本都不能证明投递。同一窗格内并发投递的归因明确推迟到 [#17](https://github.com/jerryfane/herdr/issues/17) 的写入侧来源证明。
 
 `session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅;读取后应订阅资源事件,并根据事件更新本地缓存。重新连接后或本地缓存可能已过期时,再次调用 `session.snapshot`。工作区记录也包含关联 worktree 的来源信息。完整的仓库 worktree 发现仍使用 `worktree.list`。
 

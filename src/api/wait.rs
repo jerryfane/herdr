@@ -364,12 +364,12 @@ fn classify_prompt_observation(
     initially_working: bool,
     baseline: u64,
     current_sequence: u64,
-    composer_observed: bool,
+    composer_clear_observed: bool,
     composer_matches: bool,
     timed_out: bool,
     caller_timeout_is_effect_deadline: bool,
 ) -> Option<PromptObservationVerdict> {
-    if composer_observed && !composer_matches {
+    if composer_clear_observed {
         return Some(PromptObservationVerdict::Submitted);
     }
     if !initially_working && current_sequence > baseline {
@@ -412,6 +412,7 @@ fn observe_prompt_effect(
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
     let mut composer_matches = false;
+    let mut paste_token_observed = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -428,13 +429,20 @@ fn observe_prompt_effect(
                 .map(Some);
         }
 
+        let mut composer_clear_observed = false;
         match agent_composer_evidence(request_id, target, &current, api_tx) {
             ComposerObservation::Observed(composer) => {
-                composer_matches = composer.fingerprint.as_ref() == Some(submitted_fingerprint)
-                    || (paste_token_attributable && composer.has_paste_token);
+                let exact_prompt_matches =
+                    composer.fingerprint.as_ref() == Some(submitted_fingerprint);
+                let paste_token_matches = paste_token_attributable && composer.has_paste_token;
+                composer_matches = exact_prompt_matches || paste_token_matches;
+                paste_token_observed |= paste_token_matches;
                 if composer_matches {
                     composer_observed = true;
                 }
+                composer_clear_observed = composer_observed
+                    && !composer_matches
+                    && (!paste_token_observed || composer.fingerprint.is_none());
             }
             ComposerObservation::Unavailable => {
                 // An unavailable snapshot cannot prove that a previously
@@ -446,7 +454,7 @@ fn observe_prompt_effect(
             initially_working,
             baseline,
             current.state_change_seq,
-            composer_observed,
+            composer_clear_observed,
             composer_matches,
             std::time::Instant::now() >= deadline,
             caller_timeout_is_effect_deadline,
@@ -1138,6 +1146,7 @@ mod tests {
         screens: VecDeque<String>,
         last_screen: String,
         prompt_error: Option<ErrorBody>,
+        // One-based read index used to inject a single unavailable snapshot.
         composer_read_error_from: Option<usize>,
     }
 
@@ -1167,7 +1176,7 @@ mod tests {
                         composer_read_count += 1;
                         if harness
                             .composer_read_error_from
-                            .is_some_and(|first_error| composer_read_count >= first_error)
+                            .is_some_and(|first_error| composer_read_count == first_error)
                         {
                             serde_json::to_string(&ErrorResponse {
                                 id,
@@ -1251,7 +1260,7 @@ mod tests {
             "composer observed then cleared is stronger submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, true, true, false),
+            classify_prompt_observation(false, 10, 10, false, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
             "persistent exact composer fingerprint is positive non-submission evidence"
         );
@@ -1271,7 +1280,7 @@ mod tests {
             "already-working prompts still use composer-cleared evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, true, true, true),
+            classify_prompt_observation(false, 10, 10, false, true, true, true),
             Some(PromptObservationVerdict::TimedOut),
             "caller deadlines at the observation boundary preserve ordinary timeout"
         );
@@ -1405,6 +1414,59 @@ mod tests {
         assert_eq!(
             response["error"]["code"], "agent_prompt_stalled",
             "a paste token that predates this write is not evidence for this delivery: {response}"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_does_not_attribute_a_token_after_baseline_read_failure() {
+        let paste_token = prompt_box("[Pasted text #6]");
+        let response = run_prompt_harness(
+            "unreadable-baseline",
+            "a delivery with no readable pre-write composer",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([paste_token.clone()]),
+                last_screen: paste_token,
+                prompt_error: None,
+                composer_read_error_from: Some(1),
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_stalled",
+            "an unreadable baseline cannot prove a later paste token belongs to this write: \
+             {response}"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_requires_an_empty_composer_to_clear_a_latched_paste_token() {
+        let paste_token = prompt_box("[Pasted text #6]");
+        let response = run_prompt_harness(
+            "paste-token-replaced",
+            "a delivery whose paste token is replaced by another draft",
+            crate::api::schema::AgentStatus::Idle,
+            200,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                screens: VecDeque::from([
+                    "idle".into(),
+                    paste_token,
+                    prompt_box("a different nonempty draft"),
+                ]),
+                last_screen: prompt_box("a different nonempty draft"),
+                prompt_error: None,
+                composer_read_error_from: None,
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_stalled",
+            "nonempty replacement text is not a cleared paste token: {response}"
         );
     }
 
