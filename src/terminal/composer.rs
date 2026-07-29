@@ -54,6 +54,9 @@ pub(crate) struct ComposerVisualObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ComposerAssessmentState {
+    // Reserved until Herdr has durable proof that an attributed draft was
+    // observed and subsequently cleared.
+    #[allow(dead_code)]
     Empty,
     DraftPresent,
     Unknown,
@@ -84,9 +87,12 @@ pub(crate) fn assess_composer(
     let source = write.map(|write| write.source);
     let attempt_id = write.map(|write| write.attempt_id.clone());
 
-    // Missing regions, incoherent frames, and style tripwires are deliberately
-    // loud. None of them may be rounded to a confident empty composer.
-    if !visual.frame_stable
+    // Provenance is volatile across daemon restart and live handoff. Its
+    // absence therefore means "we do not know", even when cursor geometry
+    // resembles a hosted suggestion. Missing regions, incoherent frames, and
+    // style tripwires are likewise deliberately loud.
+    if write.is_none()
+        || !visual.frame_stable
         || matches!(
             visual.region,
             ComposerRegionObservation::Missing | ComposerRegionObservation::Unavailable
@@ -104,13 +110,13 @@ pub(crate) fn assess_composer(
     }
 
     let state = match (write, visual.region, visual.cursor) {
-        (_, ComposerRegionObservation::Empty, _) => ComposerAssessmentState::Empty,
         (Some(_), ComposerRegionObservation::Text, ComposerCursorObservation::Draft) => {
             ComposerAssessmentState::DraftPresent
         }
-        (None, ComposerRegionObservation::Text, ComposerCursorObservation::Suggestion) => {
-            ComposerAssessmentState::Empty
-        }
+        // An empty frame cannot distinguish a tagged write that has not echoed
+        // from an observed draft that later cleared. The prompt wait keeps that
+        // history request-locally; a standalone snapshot must stay unknown.
+        (Some(_), ComposerRegionObservation::Empty, _) => ComposerAssessmentState::Unknown,
         // Provenance is the mechanism, but a visual cursor contradiction or a
         // missing corroborating cursor is uncertainty, not permission to guess.
         _ => ComposerAssessmentState::Unknown,
@@ -162,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_suggestion_without_writer_provenance_is_not_a_draft() {
+    fn composer_content_without_writer_provenance_is_unknown() {
         let assessment = assess_composer(
             None,
             visual(
@@ -170,7 +176,19 @@ mod tests {
                 ComposerCursorObservation::Suggestion,
             ),
         );
-        assert_eq!(assessment.state, ComposerAssessmentState::Empty);
+        assert_eq!(assessment.state, ComposerAssessmentState::Unknown);
+    }
+
+    #[test]
+    fn pending_write_with_empty_region_stays_unknown_after_unrelated_output() {
+        let assessment = assess_composer(
+            Some(&write()),
+            visual(
+                ComposerRegionObservation::Empty,
+                ComposerCursorObservation::Unavailable,
+            ),
+        );
+        assert_eq!(assessment.state, ComposerAssessmentState::Unknown);
     }
 
     #[test]

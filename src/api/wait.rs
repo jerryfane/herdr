@@ -421,10 +421,14 @@ fn observe_prompt_effect(
         if composer_matches {
             composer_observed = true;
         }
-        if same_attempt
-            && current.composer.state == crate::api::schema::ComposerState::Empty
-            && composer_observed
-        {
+        let stable_empty_region = current.composer.evidence.frame_stable
+            && current.composer.evidence.region
+                == crate::api::schema::ComposerRegionEvidence::Empty
+            && current.composer.evidence.cursor
+                != crate::api::schema::ComposerCursorEvidence::Conflict
+            && current.composer.evidence.style
+                != crate::api::schema::ComposerStyleEvidence::Conflict;
+        if same_attempt && stable_empty_region && composer_observed {
             composer_clear_observed = true;
         }
 
@@ -1014,6 +1018,18 @@ mod tests {
         agent
     }
 
+    fn with_composer_region(
+        agent: crate::api::schema::AgentInfo,
+        state: crate::api::schema::ComposerState,
+        attempt_id: Option<&str>,
+        region: crate::api::schema::ComposerRegionEvidence,
+    ) -> crate::api::schema::AgentInfo {
+        let mut agent = with_composer(agent, state, attempt_id);
+        agent.composer.evidence.region = region;
+        agent.composer.evidence.frame_stable = true;
+        agent
+    }
+
     fn success_agent_response(
         id: String,
         agent: crate::api::schema::AgentInfo,
@@ -1143,7 +1159,7 @@ mod tests {
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
-            "persistent exact composer fingerprint is positive non-submission evidence"
+            "persistent same-attempt composer evidence proves non-submission"
         );
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, false, true, false),
@@ -1219,10 +1235,11 @@ mod tests {
             crate::api::schema::ComposerState::DraftPresent,
             Some("attempt-clear"),
         );
-        let cleared = with_composer(
+        let cleared = with_composer_region(
             test_agent(crate::api::schema::AgentStatus::Working, 10),
-            crate::api::schema::ComposerState::Empty,
+            crate::api::schema::ComposerState::Unknown,
             Some("attempt-clear"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
         );
         let response = run_prompt_harness(
             "composer-submitted",
@@ -1242,7 +1259,38 @@ mod tests {
     }
 
     #[test]
-    fn prompt_agent_does_not_attribute_a_different_attempt() {
+    fn prompt_agent_does_not_attribute_another_attempt_clearing_our_draft() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-ours"),
+        );
+        let other_cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-other"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let response = run_prompt_harness(
+            "different-clear-attempt",
+            "our delivery",
+            crate::api::schema::AgentStatus::Idle,
+            250,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    other_cleared,
+                ]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_ne!(response["result"]["delivery"], "submitted");
+        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
+    }
+
+    #[test]
+    fn prompt_agent_does_not_use_another_attempts_draft_to_clear_ours() {
         let prompted = with_composer(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
             crate::api::schema::ComposerState::Unknown,
@@ -1253,15 +1301,22 @@ mod tests {
             crate::api::schema::ComposerState::DraftPresent,
             Some("attempt-other"),
         );
+        let ours_cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-ours"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
         let response = run_prompt_harness(
-            "different-attempt",
+            "different-draft-attempt",
             "our delivery",
             crate::api::schema::AgentStatus::Idle,
-            0,
+            250,
             PromptHarness {
                 agents: VecDeque::from([
                     test_agent(crate::api::schema::AgentStatus::Idle, 10),
                     other,
+                    ours_cleared,
                 ]),
                 prompted,
                 prompt_error: None,
