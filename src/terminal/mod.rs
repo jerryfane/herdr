@@ -1,4 +1,5 @@
 mod history_read;
+mod composer;
 mod id;
 mod runtime;
 mod runtime_registry;
@@ -6,6 +7,11 @@ pub mod state;
 mod title;
 
 pub(crate) use history_read::{merge_scrolled_up, snapshot_text, ScreenSnapshot, UpwardMerge};
+pub(crate) use composer::{
+    assess_composer, ComposerAssessment, ComposerAssessmentState, ComposerCursorObservation,
+    ComposerInputSource, ComposerRegionObservation, ComposerStyleObservation,
+    ComposerVisualObservation, ComposerWrite,
+};
 pub use id::TerminalId;
 pub use runtime::TerminalRuntime;
 pub(crate) use runtime_registry::TerminalRuntimeRegistry;

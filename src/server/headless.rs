@@ -2131,11 +2131,43 @@ impl HeadlessServer {
                     );
                     return false;
                 }
-                let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
-                else {
+                debug!(client_id, len = data.len(), "client input received");
+                if let Some(terminal_id) =
+                    self.clients
+                        .get(&client_id)
+                        .and_then(|client| match &client.mode {
+                            ClientConnectionMode::TerminalAttach { terminal_id } => {
+                                Some(terminal_id.clone())
+                            }
+                            _ => None,
+                        })
+                {
+                    let internal_terminal_id = self.terminal_id_by_string(&terminal_id);
+                    let write = self
+                        .runtime_for_terminal_id_string(&terminal_id)
+                        .map(|runtime| {
+                            let baseline = runtime.detection_content_seq();
+                            (baseline, apply_terminal_attach_input(runtime, data))
+                        });
+                    if let Some((baseline, result)) = write {
+                        if let Err(err) = result {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                        } else if let Some(internal_terminal_id) = internal_terminal_id.as_ref() {
+                            self.app.record_terminal_composer_write(
+                                internal_terminal_id,
+                                crate::terminal::ComposerInputSource::Human,
+                                baseline,
+                                true,
+                                false,
+                            );
+                        }
+                    }
+                    return true;
+                }
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalObserve { .. })
+                ) {
                     return false;
                 };
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {

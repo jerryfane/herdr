@@ -284,10 +284,11 @@ impl App {
             .workspaces
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
         else {
             return agent_not_found(id, &target.target);
         };
-        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &target.target);
         };
         let Some(agent) = terminal.effective_known_agent().or(terminal.detected_agent) else {
@@ -347,13 +348,14 @@ impl App {
             .workspaces
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
         else {
             return agent_not_found(id, &params.target);
         };
         let Some(expected_agent) = self
             .state
             .terminals
-            .get(terminal_id)
+            .get(&terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
             return agent_not_ready(id, &params.target);
@@ -371,11 +373,20 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        let composer_baseline = runtime.detection_content_seq();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
+        self.record_pane_composer_write(
+            resolved.ws_idx,
+            resolved.pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            false,
+            false,
+        );
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
-            if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.mark_turn_aborted();
             }
         }
@@ -583,6 +594,16 @@ mod tests {
         };
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
         assert_eq!(delivery, Some(AgentPromptDelivery::WrittenToPty));
+        let first_attempt = agent
+            .composer
+            .attempt_id
+            .as_deref()
+            .expect("acknowledged prompt should expose its writer attempt");
+        assert!(first_attempt.starts_with("cmp-"));
+        assert_eq!(
+            agent.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt
+        );
         assert_eq!(
             rx.try_recv().unwrap(),
             Bytes::from_static(b"\x1b[200~A != B\x1b[201~")
@@ -604,10 +625,17 @@ mod tests {
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
-        assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
+        assert!(matches!(&raw.result, ResponseResult::AgentPrompted { .. }));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
         assert!(raw_started.elapsed() >= AGENT_PROMPT_SUBMIT_DELAY);
+        let ResponseResult::AgentPrompted { agent, .. } = raw.result else {
+            panic!("expected prompted response");
+        };
+        assert_ne!(
+            agent.composer.attempt_id.as_deref(),
+            Some(foreign_attempt_id.as_str())
+        );
 
         let rejected = run_deferred_agent_prompt(
             &mut app,

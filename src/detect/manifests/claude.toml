@@ -6,7 +6,6 @@ aliases = ["claude-code"]
 
 [composer]
 region = "prompt_box_body"
-paste_token_regex = '^\[Pasted text #[0-9]+\]$'
 
 [[input_rules]]
 id = "claude_enumerated_select"

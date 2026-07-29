@@ -44,8 +44,9 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    TerminalComposerFrame, TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextMatch,
+    TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -3303,6 +3304,18 @@ impl PaneRuntime {
 
     pub fn detection_text(&self) -> String {
         self.terminal.detection_text()
+    }
+
+    pub(crate) fn composer_frame(&self) -> (TerminalComposerFrame, u64) {
+        let before = self.detection_content_seq.load(Ordering::Acquire);
+        let mut frame = self.terminal.composer_frame();
+        let after = self.detection_content_seq.load(Ordering::Acquire);
+        frame.frame_stable &= before == after;
+        (frame, after)
+    }
+
+    pub(crate) fn detection_content_seq(&self) -> u64 {
+        self.detection_content_seq.load(Ordering::Acquire)
     }
 
     pub fn terminal_title(&self) -> Option<String> {

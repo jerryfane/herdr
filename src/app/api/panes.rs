@@ -1871,10 +1871,19 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
         let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            true,
+            false,
+        );
         if aborts_turn {
             let terminal_id = self
                 .state
@@ -1904,6 +1913,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
         let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text)
             || super::super::api_helpers::api_keys_abort_turn(&params.keys);
         let bytes = match super::super::api_helpers::encode_api_input(
@@ -1917,6 +1927,14 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            !params.text.is_empty(),
+            false,
+        );
         if aborts_turn {
             let terminal_id = self
                 .state
@@ -2018,6 +2036,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
@@ -2027,6 +2046,14 @@ impl App {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
         }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            false,
+            false,
+        );
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
             let terminal_id = self
                 .state

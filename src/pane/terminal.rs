@@ -106,6 +106,13 @@ pub struct TerminalCursorState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalComposerFrame {
+    pub(crate) screen: String,
+    pub(crate) cursor: Option<TerminalCursorState>,
+    pub(crate) frame_stable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalDirtyPatch {
     pub rows: Vec<(u16, Vec<CellData>)>,
 }
@@ -492,6 +499,12 @@ impl PaneTerminal {
 
     pub(crate) fn try_compression_activity(&self) -> Result<Option<u64>, crate::ghostty::Error> {
         self.ghostty.try_compression_activity()
+    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
+        self.ghostty.composer_frame()
+    }
+
+    pub fn recent_text(&self, lines: usize) -> String {
+        self.ghostty.recent_text(lines)
     }
 
     pub(crate) fn try_compress_incremental_if_activity(
@@ -2188,6 +2201,28 @@ impl GhosttyPaneTerminal {
         core.terminal
             .compress_incremental()
             .map(TerminalCompressionStep::Compressed)
+    }
+
+    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
+        let Ok(mut core) = self.core.lock() else {
+            return TerminalComposerFrame {
+                screen: String::new(),
+                cursor: None,
+                frame_stable: false,
+            };
+        };
+        let synchronized_output_active = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false);
+        let screen = ghostty_detection_text(&core).unwrap_or_default();
+        let current = current_cursor_state(&mut core);
+        let cursor = effective_cursor_state(&mut core, current);
+        TerminalComposerFrame {
+            screen,
+            cursor,
+            frame_stable: !synchronized_output_active,
+        }
     }
 
     #[cfg(test)]

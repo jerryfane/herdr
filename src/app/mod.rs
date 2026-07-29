@@ -980,6 +980,239 @@ impl App {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Input routing for headless server mode
+// ---------------------------------------------------------------------------
+
+impl App {
+    /// Routes raw input bytes from a client through the existing input pipeline.
+    ///
+    /// The input bytes are parsed into `RawInputEvent`s and then processed.
+    /// In terminal mode, keys are routed through the same semantic
+    /// key-handling path as monolithic herdr so they are re-encoded for the
+    /// focused pane's negotiated keyboard protocol instead of passing host
+    /// terminal escape sequences through unchanged.
+    #[cfg(test)]
+    pub(crate) fn route_client_input(&mut self, data: Vec<u8>) {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+        self.route_client_events(events, true);
+    }
+
+    pub(crate) fn route_client_events(
+        &mut self,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) {
+        self.route_client_events_from(LOCAL_INPUT_SOURCE, events, apply_host_terminal_theme);
+    }
+
+    pub(crate) fn route_client_events_from(
+        &mut self,
+        source_id: InputSourceId,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) {
+        for event in events {
+            let previous_mode = self.state.mode;
+            match event {
+                crate::raw_input::RawInputEvent::Key(key) => {
+                    let pressed_key_id = pressed_key_identity(source_id, &key);
+                    match key.kind {
+                        crossterm::event::KeyEventKind::Press => {
+                            if self.state.popup_pane.is_some() || self.state.mode == Mode::Terminal
+                            {
+                                self.suppressed_repeat_keys.remove(&pressed_key_id);
+                                if let Some(target) = self.handle_terminal_key_headless(key) {
+                                    if !key.is_text_commit {
+                                        self.pressed_terminal_keys.insert(
+                                            pressed_key_id,
+                                            PressedTerminalKey { target, key },
+                                        );
+                                    }
+                                } else {
+                                    self.pressed_terminal_keys.remove(&pressed_key_id);
+                                }
+                            } else {
+                                self.pressed_terminal_keys.remove(&pressed_key_id);
+                                self.suppressed_repeat_keys.insert(pressed_key_id);
+                                self.handle_non_terminal_key_headless(key);
+                            }
+                        }
+                        crossterm::event::KeyEventKind::Repeat => {
+                            if let Some(pressed) =
+                                self.pressed_terminal_keys.get(&pressed_key_id).cloned()
+                            {
+                                if !self
+                                    .forward_terminal_key_to_target_headless(&pressed.target, key)
+                                {
+                                    self.pressed_terminal_keys.remove(&pressed_key_id);
+                                }
+                            } else if (self.state.popup_pane.is_some()
+                                || self.state.mode == Mode::Terminal)
+                                && !self.suppressed_repeat_keys.contains(&pressed_key_id)
+                            {
+                                let _ = self.handle_terminal_key_headless(key);
+                            }
+                        }
+                        crossterm::event::KeyEventKind::Release => {
+                            self.suppressed_repeat_keys.remove(&pressed_key_id);
+                            if let Some(pressed) =
+                                self.pressed_terminal_keys.remove(&pressed_key_id)
+                            {
+                                let _ = self
+                                    .forward_terminal_key_to_target_headless(&pressed.target, key);
+                            }
+                        }
+                    }
+                }
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    if self.state.popup_pane.is_some() || self.state.mouse_capture {
+                        self.handle_mouse_event_headless(mouse);
+                    } else {
+                        self.state
+                            .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
+                    }
+                }
+                crate::raw_input::RawInputEvent::Paste(text) => {
+                    if self.try_route_paste_to_popup(&text) {
+                    } else if self.state.mode != Mode::Terminal {
+                        self.paste_into_active_text_input(&text);
+                    } else {
+                        if let Some(ws_idx) = self.state.active {
+                            if let Some(ws) = self.state.workspaces.get(ws_idx) {
+                                if let Some(focused) = ws.focused_pane_id() {
+                                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                                        &self.terminal_runtimes,
+                                        ws_idx,
+                                        focused,
+                                    ) {
+                                        let baseline = runtime.detection_content_seq();
+                                        if runtime.try_send_paste(text).is_ok() {
+                                            self.record_pane_composer_write(
+                                                ws_idx,
+                                                focused,
+                                                crate::terminal::ComposerInputSource::Human,
+                                                baseline,
+                                                true,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::raw_input::RawInputEvent::OuterFocusGained => {
+                    self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);
+                }
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    self.release_input_source_headless(source_id);
+                    self.send_outer_focus_event(crate::ghostty::FocusEvent::Lost);
+                }
+                crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
+                    if apply_host_terminal_theme {
+                        self.update_host_terminal_theme(kind, color);
+                    }
+                }
+                crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
+                    if apply_host_terminal_theme {
+                        self.set_host_terminal_appearance(appearance, true);
+                    }
+                }
+                crate::raw_input::RawInputEvent::Unsupported => {}
+            }
+            self.sync_prefix_input_source(previous_mode);
+        }
+    }
+
+    pub(crate) fn clear_input_source(&mut self, source_id: InputSourceId) {
+        self.release_input_source_headless(source_id);
+    }
+
+    /// Handles a key event in non-terminal mode for the headless server.
+    ///
+    /// Uses the standalone handler functions that work on `&mut AppState`
+    /// since the server doesn't have the async context of the monolithic App.
+    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
+        let key_event = key.as_key_event();
+        if input::modal_paste_target_active(&self.state)
+            && input::is_modal_paste_shortcut(&key_event)
+        {
+            if let Some(text) = crate::platform::read_clipboard_text() {
+                self.paste_into_active_text_input(&text);
+            }
+            return;
+        }
+
+        match self.state.mode {
+            Mode::Prefix => {
+                self.handle_prefix_key(key);
+            }
+            Mode::Navigate => {
+                self.handle_navigate_key(key);
+            }
+            Mode::Copy => {
+                self.handle_copy_mode_key(key);
+            }
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                self.handle_rename_key_via_api(key_event);
+            }
+            Mode::NewLinkedWorktree => {
+                self.handle_worktree_create_key(key_event);
+            }
+            Mode::OpenExistingWorktree => {
+                self.handle_worktree_open_key(key_event);
+            }
+            Mode::ConfirmRemoveWorktree => {
+                self.handle_worktree_remove_key(key_event);
+            }
+            Mode::Resize => {
+                self.handle_resize_key_via_api(key);
+            }
+            Mode::ConfirmClose => {
+                self.handle_confirm_close_key_via_api(key_event);
+            }
+            Mode::ContextMenu => {
+                self.handle_context_menu_key_via_api(key_event);
+            }
+            Mode::KeybindHelp => {
+                input::handle_keybind_help_key(&mut self.state, key_event);
+            }
+            Mode::GlobalMenu => {
+                input::handle_global_menu_key(&mut self.state, key_event);
+            }
+            Mode::Onboarding => {
+                self.handle_onboarding_key(key_event);
+            }
+            Mode::ReleaseNotes => {
+                self.handle_release_notes_key(key_event);
+            }
+            Mode::ProductAnnouncement => {
+                self.handle_product_announcement_key(key_event);
+            }
+            Mode::Settings => {
+                self.handle_settings_key(key_event);
+            }
+            Mode::Navigator => {
+                input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
+            }
+            Mode::Terminal => {
+                // Should not be called in terminal mode.
+            }
+        }
+    }
+
+    /// Handles a mouse event for the headless server.
+    ///
+    /// Delegates to the same mouse handling logic used in the monolithic
+    /// mode (hit-testing against the rendered UI), which works because
+    /// the server's AppState maintains view geometry from virtual rendering.
+    fn handle_mouse_event_headless(&mut self, mouse: crossterm::event::MouseEvent) {
+        self.handle_mouse(mouse);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
