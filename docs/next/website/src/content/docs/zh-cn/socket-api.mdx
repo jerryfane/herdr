@@ -107,7 +107,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
+`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。成功响应中的可选 `delivery` 在完整 text+Enter 批次确认写入后为 `written_to_pty`;在可归因的生命周期前进、规范化完整提示出现后清除,或可归因的清单 paste 标记出现后编辑器变为空时为 `submitted`。paste 标记归因要求写入前成功读出一个没有标记的快照;无法读取的基线、既存标记或另一段非空替代文本都不能证明投递。同一窗格内并发投递的归因明确推迟到 [#17](https://github.com/jerryfane/herdr/issues/17) 的写入侧来源证明。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 
