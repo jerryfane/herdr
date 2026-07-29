@@ -289,9 +289,9 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
-`agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working 也会原子地提交文本和编码后的 Enter。使用 `--wait` 时，最初处于 settled 状态的智能体若生命周期序列前进，会返回 `delivery: "submitted"`。规范化后的完整提示先出现、随后不再匹配，也会返回 `submitted`。对于 Claude 的 `[Pasted text #N]` 这类由清单声明的 bracketed-paste 标记，写入前的快照必须成功读出且没有既存标记；投递后标记必须出现，随后编辑器必须变为空。
+`agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working 也会原子地提交文本和编码后的 Enter。使用 `--wait` 时，最初处于 settled 状态的智能体若生命周期序列前进，会返回 `delivery: "submitted"`。Herdr 会给 PTY 批次附加不透明的 composer attempt id。同一个 attempt 留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`，被观察到后清空时返回 `submitted`。bracketed paste 不依赖渲染后的 token 文本。
 
-完整提示或可归因的 paste 标记持续存在时返回 `agent_prompt_unsubmitted`。无法读取的基线、既存标记，或被另一段非空文本取代的标记都不能证明投递；没有其他证据时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示，必须有编辑器清除证据才能返回 `submitted`。同一窗格内并发投递的界面时序竞态明确推迟到 [#17](https://github.com/jerryfane/herdr/issues/17) 的写入侧来源证明。此后 Herdr 会等待请求的 settled 状态。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。此后 Herdr 会等待请求的 settled 状态。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
 
 `idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 

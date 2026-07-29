@@ -109,6 +109,7 @@ impl App {
             );
         }
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
+        let composer_baseline = runtime.detection_content_seq();
         let write_result = runtime
             .write_bytes_acknowledged(Bytes::from(bytes), std::time::Duration::from_secs(5))
             .is_ok();
@@ -122,6 +123,14 @@ impl App {
                 "agent prompt was not fully written to the pane PTY",
             );
         }
+        self.record_pane_composer_write(
+            resolved.ws_idx,
+            resolved.pane_id,
+            crate::terminal::ComposerInputSource::AgentPrompt,
+            composer_baseline,
+            true,
+            true,
+        );
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -189,10 +198,11 @@ impl App {
             .workspaces
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
         else {
             return agent_not_found(id, &target.target);
         };
-        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &target.target);
         };
         let Some(agent) = terminal.effective_known_agent().or(terminal.detected_agent) else {
@@ -252,13 +262,14 @@ impl App {
             .workspaces
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
         else {
             return agent_not_found(id, &params.target);
         };
         let Some(expected_agent) = self
             .state
             .terminals
-            .get(terminal_id)
+            .get(&terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
             return agent_not_ready(id, &params.target);
@@ -276,11 +287,20 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        let composer_baseline = runtime.detection_content_seq();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
+        self.record_pane_composer_write(
+            resolved.ws_idx,
+            resolved.pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            false,
+            false,
+        );
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
-            if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.mark_turn_aborted();
             }
         }
@@ -365,6 +385,16 @@ mod tests {
         };
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
         assert_eq!(delivery, Some(AgentPromptDelivery::WrittenToPty));
+        let first_attempt = agent
+            .composer
+            .attempt_id
+            .as_deref()
+            .expect("acknowledged prompt should expose its writer attempt");
+        assert!(first_attempt.starts_with("cmp-"));
+        assert_eq!(
+            agent.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt
+        );
         assert_eq!(
             rx.try_recv().unwrap(),
             Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
@@ -383,7 +413,14 @@ mod tests {
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
-        assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
+        let ResponseResult::AgentPrompted { agent, .. } = raw.result else {
+            panic!("expected prompted response");
+        };
+        assert_ne!(
+            agent.composer.attempt_id.as_deref(),
+            Some(first_attempt),
+            "each agent prompt PTY batch needs a fresh opaque attempt"
+        );
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B\r"));
         assert!(rx.try_recv().is_err());
 

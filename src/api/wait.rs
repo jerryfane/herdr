@@ -222,10 +222,7 @@ fn prompt_agent_with_effect_timeout(
         }
     };
     let target = params.target.clone();
-    let submitted_fingerprint = crate::detect::manifest::prompt_fingerprint(&params.text);
     let initially_working = before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
-    let paste_token_attributable =
-        paste_token_attributable(&request_id, &target, &before_prompt, api_tx);
     let prompt_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
@@ -245,6 +242,7 @@ fn prompt_agent_with_effect_timeout(
     ) {
         return agent_wait_not_running(request_id).map(Some);
     }
+    let composer_attempt_id = prompted.composer.attempt_id.clone();
 
     let wait_started = std::time::Instant::now();
     let prompt_state_change_seq = prompted.state_change_seq;
@@ -262,8 +260,7 @@ fn prompt_agent_with_effect_timeout(
         prompted,
         prompt_state_change_seq,
         initially_working,
-        &submitted_fingerprint,
-        paste_token_attributable,
+        composer_attempt_id.as_deref(),
         effect_timeout_ms,
         caller_timeout_is_effect_deadline,
         stream,
@@ -350,16 +347,6 @@ enum PromptObservationVerdict {
     TimedOut,
 }
 
-enum ComposerObservation {
-    Unavailable,
-    Observed(ComposerEvidence),
-}
-
-struct ComposerEvidence {
-    fingerprint: Option<crate::detect::manifest::PromptFingerprint>,
-    has_paste_token: bool,
-}
-
 fn classify_prompt_observation(
     initially_working: bool,
     baseline: u64,
@@ -400,8 +387,7 @@ fn observe_prompt_effect(
     mut current: crate::api::schema::AgentInfo,
     baseline: u64,
     initially_working: bool,
-    submitted_fingerprint: &crate::detect::manifest::PromptFingerprint,
-    paste_token_attributable: bool,
+    composer_attempt_id: Option<&str>,
     timeout_ms: u64,
     caller_timeout_is_effect_deadline: bool,
     stream: &mut LocalStream,
@@ -411,8 +397,6 @@ fn observe_prompt_effect(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
-    let mut composer_matches = false;
-    let mut paste_token_observed = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -430,24 +414,22 @@ fn observe_prompt_effect(
         }
 
         let mut composer_clear_observed = false;
-        match agent_composer_evidence(request_id, target, &current, api_tx) {
-            ComposerObservation::Observed(composer) => {
-                let exact_prompt_matches =
-                    composer.fingerprint.as_ref() == Some(submitted_fingerprint);
-                let paste_token_matches = paste_token_attributable && composer.has_paste_token;
-                composer_matches = exact_prompt_matches || paste_token_matches;
-                paste_token_observed |= paste_token_matches;
-                if composer_matches {
-                    composer_observed = true;
-                }
-                composer_clear_observed = composer_observed
-                    && !composer_matches
-                    && (!paste_token_observed || composer.fingerprint.is_none());
-            }
-            ComposerObservation::Unavailable => {
-                // An unavailable snapshot cannot prove that a previously
-                // observed composer cleared.
-            }
+        let same_attempt = composer_attempt_id.is_some()
+            && current.composer.attempt_id.as_deref() == composer_attempt_id;
+        let composer_matches = same_attempt
+            && current.composer.state == crate::api::schema::ComposerState::DraftPresent;
+        if composer_matches {
+            composer_observed = true;
+        }
+        let stable_empty_region = current.composer.evidence.frame_stable
+            && current.composer.evidence.region
+                == crate::api::schema::ComposerRegionEvidence::Empty
+            && current.composer.evidence.cursor
+                != crate::api::schema::ComposerCursorEvidence::Conflict
+            && current.composer.evidence.style
+                != crate::api::schema::ComposerStyleEvidence::Conflict;
+        if same_attempt && stable_empty_region && composer_observed {
+            composer_clear_observed = true;
         }
 
         match classify_prompt_observation(
@@ -505,83 +487,6 @@ fn observe_prompt_effect(
             }
         };
     }
-}
-
-fn paste_token_attributable(
-    request_id: &str,
-    target: &str,
-    agent: &crate::api::schema::AgentInfo,
-    api_tx: &ApiRequestSender,
-) -> bool {
-    let Some(known_agent) = agent
-        .agent
-        .as_deref()
-        .and_then(crate::detect::parse_agent_label)
-    else {
-        return false;
-    };
-    if !crate::detect::manifest::composer_paste_token_configured(known_agent) {
-        return false;
-    }
-    // A paste-token pattern identifies rendered paste syntax, not ownership.
-    // Only a successful pre-write snapshot without a token lets the following
-    // newly observed token be attributed to this acknowledged PTY write.
-    matches!(
-        agent_composer_evidence(request_id, target, agent, api_tx),
-        ComposerObservation::Observed(ComposerEvidence {
-            has_paste_token: false,
-            ..
-        })
-    )
-}
-
-fn agent_composer_evidence(
-    request_id: &str,
-    target: &str,
-    agent: &crate::api::schema::AgentInfo,
-    api_tx: &ApiRequestSender,
-) -> ComposerObservation {
-    let Some(known_agent) = agent
-        .agent
-        .as_deref()
-        .and_then(crate::detect::parse_agent_label)
-    else {
-        return ComposerObservation::Unavailable;
-    };
-    let response = dispatch_to_app_with_timeout(
-        Request {
-            id: format!("{request_id}:composer"),
-            method: Method::AgentRead(crate::api::schema::AgentReadParams {
-                target: target.to_string(),
-                source: crate::api::schema::ReadSource::Detection,
-                lines: None,
-                format: crate::api::schema::ReadFormat::Text,
-                strip_ansi: true,
-            }),
-        },
-        api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
-    );
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
-        return ComposerObservation::Unavailable;
-    };
-    if value.get("error").is_some() {
-        return ComposerObservation::Unavailable;
-    }
-    let Ok(read) = serde_json::from_value::<crate::api::schema::PaneReadResult>(
-        value["result"]["read"].clone(),
-    ) else {
-        return ComposerObservation::Unavailable;
-    };
-    let input = crate::detect::manifest::DetectionInput {
-        screen: &read.text,
-        osc_title: "",
-        osc_progress: "",
-    };
-    ComposerObservation::Observed(ComposerEvidence {
-        fingerprint: crate::detect::manifest::composer_fingerprint(known_agent, input),
-        has_paste_token: crate::detect::manifest::composer_has_paste_token(known_agent, input),
-    })
 }
 
 fn agent_prompt_observation_error(
@@ -1059,6 +964,7 @@ mod tests {
             agent_status: status,
             input_pending: false,
             input_prompt_kind: None,
+            composer: Default::default(),
             screen_detection_skipped: false,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
@@ -1079,6 +985,51 @@ mod tests {
         }
     }
 
+    fn with_composer(
+        mut agent: crate::api::schema::AgentInfo,
+        state: crate::api::schema::ComposerState,
+        attempt_id: Option<&str>,
+    ) -> crate::api::schema::AgentInfo {
+        agent.composer = crate::api::schema::ComposerInfo {
+            state,
+            attempt_id: attempt_id.map(str::to_string),
+            evidence: crate::api::schema::ComposerEvidence {
+                provenance: if attempt_id.is_some() {
+                    crate::api::schema::ComposerProvenance::AgentPrompt
+                } else {
+                    crate::api::schema::ComposerProvenance::None
+                },
+                region: match state {
+                    crate::api::schema::ComposerState::Empty => {
+                        crate::api::schema::ComposerRegionEvidence::Empty
+                    }
+                    crate::api::schema::ComposerState::DraftPresent => {
+                        crate::api::schema::ComposerRegionEvidence::Text
+                    }
+                    crate::api::schema::ComposerState::Unknown => {
+                        crate::api::schema::ComposerRegionEvidence::Unavailable
+                    }
+                },
+                cursor: crate::api::schema::ComposerCursorEvidence::Unavailable,
+                style: crate::api::schema::ComposerStyleEvidence::Unavailable,
+                frame_stable: state != crate::api::schema::ComposerState::Unknown,
+            },
+        };
+        agent
+    }
+
+    fn with_composer_region(
+        agent: crate::api::schema::AgentInfo,
+        state: crate::api::schema::ComposerState,
+        attempt_id: Option<&str>,
+        region: crate::api::schema::ComposerRegionEvidence,
+    ) -> crate::api::schema::AgentInfo {
+        let mut agent = with_composer(agent, state, attempt_id);
+        agent.composer.evidence.region = region;
+        agent.composer.evidence.frame_stable = true;
+        agent
+    }
+
     fn success_agent_response(
         id: String,
         agent: crate::api::schema::AgentInfo,
@@ -1096,25 +1047,6 @@ mod tests {
             },
         })
         .expect("serialize agent response")
-    }
-
-    fn pane_read_response(id: String, text: String) -> String {
-        serde_json::to_string(&SuccessResponse {
-            id,
-            result: ResponseResult::PaneRead {
-                read: crate::api::schema::PaneReadResult {
-                    pane_id: "pane_1".into(),
-                    workspace_id: "ws_1".into(),
-                    tab_id: "tab_1".into(),
-                    source: crate::api::schema::ReadSource::Detection,
-                    format: crate::api::schema::ReadFormat::Text,
-                    text,
-                    revision: 1,
-                    truncated: false,
-                },
-            },
-        })
-        .expect("serialize pane read response")
     }
 
     fn local_stream_pair() -> (LocalStream, LocalStream, PathBuf) {
@@ -1143,11 +1075,7 @@ mod tests {
     struct PromptHarness {
         agents: VecDeque<crate::api::schema::AgentInfo>,
         prompted: crate::api::schema::AgentInfo,
-        screens: VecDeque<String>,
-        last_screen: String,
         prompt_error: Option<ErrorBody>,
-        // One-based read index used to inject a single unavailable snapshot.
-        composer_read_error_from: Option<usize>,
     }
 
     fn spawn_prompt_responder(
@@ -1155,7 +1083,6 @@ mod tests {
     ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
-            let mut composer_read_count = 0;
             while let Some(message) = api_rx.blocking_recv() {
                 let id = message.request.id;
                 let response = match message.request.method {
@@ -1172,28 +1099,6 @@ mod tests {
                             .expect("serialize prompt error"),
                         None => success_agent_response(id, harness.prompted.clone(), true),
                     },
-                    Method::AgentRead(_) => {
-                        composer_read_count += 1;
-                        if harness
-                            .composer_read_error_from
-                            .is_some_and(|first_error| composer_read_count == first_error)
-                        {
-                            serde_json::to_string(&ErrorResponse {
-                                id,
-                                error: ErrorBody {
-                                    code: "server_unavailable".into(),
-                                    message: "composer snapshot unavailable".into(),
-                                },
-                            })
-                            .expect("serialize composer read error")
-                        } else {
-                            let text = harness
-                                .screens
-                                .pop_front()
-                                .unwrap_or_else(|| harness.last_screen.clone());
-                            pane_read_response(id, text)
-                        }
-                    }
                     other => panic!("unexpected prompt observation request: {other:?}"),
                 };
                 message
@@ -1239,14 +1144,6 @@ mod tests {
         serde_json::from_str(&response).expect("decode prompt response")
     }
 
-    fn prompt_box(text: &str) -> String {
-        format!(
-            "────────────────────────────────────────\n\
-             ❯ {text}\n\
-             ────────────────────────────────────────\n"
-        )
-    }
-
     #[test]
     fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
         assert_eq!(
@@ -1262,7 +1159,7 @@ mod tests {
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
-            "persistent exact composer fingerprint is positive non-submission evidence"
+            "persistent same-attempt composer evidence proves non-submission"
         );
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, false, true, false),
@@ -1299,10 +1196,7 @@ mod tests {
                     test_agent(crate::api::schema::AgentStatus::Working, 11),
                 ]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::new(),
-                last_screen: "working".into(),
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
 
@@ -1314,165 +1208,131 @@ mod tests {
     }
 
     #[test]
-    fn prompt_agent_reports_submitted_when_the_exact_composer_clears() {
-        let text = "composer evidence";
+    fn prompt_agent_uses_attempt_provenance_for_bracketed_paste_without_rendered_token() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-paste"),
+        );
+        let response = run_prompt_harness(
+            "paste-provenance",
+            "multiline input whose rendered form is intentionally irrelevant",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
+    }
+
+    #[test]
+    fn prompt_agent_accepts_only_the_same_attempt_clearing() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-clear"),
+        );
+        let cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Working, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-clear"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
         let response = run_prompt_harness(
             "composer-submitted",
-            text,
+            "composer evidence",
             crate::api::schema::AgentStatus::Working,
             2_000,
             PromptHarness {
                 agents: VecDeque::from([
                     test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                    test_agent(crate::api::schema::AgentStatus::Working, 10),
+                    cleared,
                 ]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from(["idle".into(), prompt_box(text), "working".into()]),
-                last_screen: "working".into(),
+                prompted,
                 prompt_error: None,
-                composer_read_error_from: None,
             },
-        );
-
-        assert_eq!(
-            response["result"]["type"], "agent_prompted",
-            "response: {response}"
         );
         assert_eq!(response["result"]["delivery"], "submitted");
     }
 
     #[test]
-    fn prompt_agent_observes_a_new_bracketed_paste_token_then_clear_as_submitted() {
-        let paste_token = prompt_box("[Pasted text #6]");
+    fn prompt_agent_does_not_attribute_another_attempt_clearing_our_draft() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-ours"),
+        );
+        let other_cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-other"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
         let response = run_prompt_harness(
-            "paste-token-submitted",
-            "a multiline prompt that Claude renders as a paste token",
-            crate::api::schema::AgentStatus::Working,
-            2_000,
+            "different-clear-attempt",
+            "our delivery",
+            crate::api::schema::AgentStatus::Idle,
+            250,
             PromptHarness {
                 agents: VecDeque::from([
                     test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                    test_agent(crate::api::schema::AgentStatus::Working, 10),
+                    other_cleared,
                 ]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from(["idle".into(), paste_token, "working".into()]),
-                last_screen: "working".into(),
+                prompted,
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
-
-        assert_eq!(
-            response["result"]["type"], "agent_prompted",
-            "response: {response}"
-        );
-        assert_eq!(response["result"]["delivery"], "submitted");
+        assert_ne!(response["result"]["delivery"], "submitted");
+        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
     }
 
     #[test]
-    fn prompt_agent_reports_a_persistent_new_bracketed_paste_token_as_unsubmitted() {
-        let paste_token = prompt_box("[Pasted text #6]");
+    fn prompt_agent_does_not_use_another_attempts_draft_to_clear_ours() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-ours"),
+        );
+        let other = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-other"),
+        );
+        let ours_cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-ours"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
         let response = run_prompt_harness(
-            "paste-token-unsubmitted",
-            "a multiline prompt that remains in Claude's composer",
+            "different-draft-attempt",
+            "our delivery",
             crate::api::schema::AgentStatus::Idle,
-            0,
+            250,
             PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from(["idle".into(), paste_token.clone()]),
-                last_screen: paste_token,
-                prompt_error: None,
-                composer_read_error_from: None,
-            },
-        );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_unsubmitted",
-            "a landed paste token must not fall through to stalled: {response}"
-        );
-    }
-
-    #[test]
-    fn prompt_agent_does_not_attribute_a_preexisting_paste_token() {
-        let paste_token = prompt_box("[Pasted text #5]");
-        let response = run_prompt_harness(
-            "preexisting-paste-token",
-            "a different delivery",
-            crate::api::schema::AgentStatus::Idle,
-            0,
-            PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([paste_token.clone(), paste_token.clone()]),
-                last_screen: paste_token,
-                prompt_error: None,
-                composer_read_error_from: None,
-            },
-        );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_stalled",
-            "a paste token that predates this write is not evidence for this delivery: {response}"
-        );
-    }
-
-    #[test]
-    fn prompt_agent_does_not_attribute_a_token_after_baseline_read_failure() {
-        let paste_token = prompt_box("[Pasted text #6]");
-        let response = run_prompt_harness(
-            "unreadable-baseline",
-            "a delivery with no readable pre-write composer",
-            crate::api::schema::AgentStatus::Idle,
-            0,
-            PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([paste_token.clone()]),
-                last_screen: paste_token,
-                prompt_error: None,
-                composer_read_error_from: Some(1),
-            },
-        );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_stalled",
-            "an unreadable baseline cannot prove a later paste token belongs to this write: \
-             {response}"
-        );
-    }
-
-    #[test]
-    fn prompt_agent_requires_an_empty_composer_to_clear_a_latched_paste_token() {
-        let paste_token = prompt_box("[Pasted text #6]");
-        let response = run_prompt_harness(
-            "paste-token-replaced",
-            "a delivery whose paste token is replaced by another draft",
-            crate::api::schema::AgentStatus::Idle,
-            200,
-            PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([
-                    "idle".into(),
-                    paste_token,
-                    prompt_box("a different nonempty draft"),
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    other,
+                    ours_cleared,
                 ]),
-                last_screen: prompt_box("a different nonempty draft"),
+                prompted,
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_stalled",
-            "nonempty replacement text is not a cleared paste token: {response}"
-        );
+        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
     }
 
     #[test]
     fn prompt_agent_reports_unsubmitted_without_leaking_prompt_text() {
         let text = "secret removal-sensitive prompt";
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-secret"),
+        );
         let response = run_prompt_harness(
             "unsubmitted",
             text,
@@ -1480,11 +1340,8 @@ mod tests {
             0,
             PromptHarness {
                 agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from([prompt_box(text)]),
-                last_screen: prompt_box(text),
+                prompted,
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
 
@@ -1492,30 +1349,6 @@ mod tests {
         assert!(
             !response.to_string().contains(text),
             "prompt text must not leak into observation errors"
-        );
-    }
-
-    #[test]
-    fn prompt_agent_does_not_treat_a_failed_composer_read_as_clear() {
-        let text = "composer read failure";
-        let response = run_prompt_harness(
-            "composer-read-failure",
-            text,
-            crate::api::schema::AgentStatus::Idle,
-            2_000,
-            PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::from(["idle".into(), prompt_box(text)]),
-                last_screen: prompt_box(text),
-                prompt_error: None,
-                composer_read_error_from: Some(3),
-            },
-        );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_unsubmitted",
-            "an unavailable snapshot cannot prove the observed composer cleared: {response}"
         );
     }
 
@@ -1529,10 +1362,7 @@ mod tests {
             PromptHarness {
                 agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::new(),
-                last_screen: "idle".into(),
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
 
@@ -1549,10 +1379,7 @@ mod tests {
             PromptHarness {
                 agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Working, 10)]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Working, 11),
-                screens: VecDeque::new(),
-                last_screen: "working".into(),
                 prompt_error: None,
-                composer_read_error_from: None,
             },
         );
 
@@ -1570,13 +1397,10 @@ mod tests {
             PromptHarness {
                 agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
                 prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                screens: VecDeque::new(),
-                last_screen: String::new(),
                 prompt_error: Some(ErrorBody {
                     code: "agent_prompt_not_received".into(),
                     message: "agent prompt was not fully written to the pane PTY".into(),
                 }),
-                composer_read_error_from: None,
             },
         );
 

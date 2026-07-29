@@ -30,6 +30,54 @@ pub(crate) fn resolve_new_terminal_cwd(
     }
 }
 
+fn composer_info_from_assessment(
+    assessment: crate::terminal::ComposerAssessment,
+) -> crate::api::schema::ComposerInfo {
+    use crate::api::schema::{
+        ComposerCursorEvidence as Cursor, ComposerProvenance as Provenance,
+        ComposerRegionEvidence as Region, ComposerState as State, ComposerStyleEvidence as Style,
+    };
+    use crate::terminal::{
+        ComposerAssessmentState, ComposerCursorObservation, ComposerInputSource,
+        ComposerRegionObservation, ComposerStyleObservation,
+    };
+
+    crate::api::schema::ComposerInfo {
+        state: match assessment.state {
+            ComposerAssessmentState::Empty => State::Empty,
+            ComposerAssessmentState::DraftPresent => State::DraftPresent,
+            ComposerAssessmentState::Unknown => State::Unknown,
+        },
+        attempt_id: assessment.attempt_id,
+        evidence: crate::api::schema::ComposerEvidence {
+            provenance: match assessment.source {
+                Some(ComposerInputSource::Human) => Provenance::Human,
+                Some(ComposerInputSource::Api) => Provenance::Api,
+                Some(ComposerInputSource::AgentPrompt) => Provenance::AgentPrompt,
+                None => Provenance::None,
+            },
+            region: match assessment.visual.region {
+                ComposerRegionObservation::Empty => Region::Empty,
+                ComposerRegionObservation::Text => Region::Text,
+                ComposerRegionObservation::Missing => Region::Missing,
+                ComposerRegionObservation::Unavailable => Region::Unavailable,
+            },
+            cursor: match assessment.visual.cursor {
+                ComposerCursorObservation::Draft => Cursor::Draft,
+                ComposerCursorObservation::Suggestion => Cursor::Suggestion,
+                ComposerCursorObservation::Conflict => Cursor::Conflict,
+                ComposerCursorObservation::Unavailable => Cursor::Unavailable,
+            },
+            style: match assessment.visual.style {
+                ComposerStyleObservation::Neutral => Style::Neutral,
+                ComposerStyleObservation::Conflict => Style::Conflict,
+                ComposerStyleObservation::Unavailable => Style::Unavailable,
+            },
+            frame_stable: assessment.visual.frame_stable,
+        },
+    }
+}
+
 pub(super) fn launch_cwd_for_terminal(
     terminal_id: &crate::terminal::TerminalId,
     terminals: &std::collections::HashMap<
@@ -49,6 +97,47 @@ pub(super) fn launch_cwd_for_terminal(
 }
 
 impl App {
+    pub(crate) fn record_pane_composer_write(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        source: crate::terminal::ComposerInputSource,
+        baseline_content_seq: u64,
+        create_if_absent: bool,
+        force_new_attempt: bool,
+    ) -> Option<String> {
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .terminal_id(pane_id)?
+            .clone();
+        self.record_terminal_composer_write(
+            &terminal_id,
+            source,
+            baseline_content_seq,
+            create_if_absent,
+            force_new_attempt,
+        )
+    }
+
+    pub(crate) fn record_terminal_composer_write(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        source: crate::terminal::ComposerInputSource,
+        baseline_content_seq: u64,
+        create_if_absent: bool,
+        force_new_attempt: bool,
+    ) -> Option<String> {
+        let terminal = self.state.terminals.get_mut(terminal_id)?;
+        if terminal.composer_write.is_none() && !create_if_absent {
+            return None;
+        }
+        terminal.is_agent_terminal().then(|| {
+            terminal.record_composer_write(source, baseline_content_seq, force_new_attempt)
+        })
+    }
+
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         self.state
             .workspaces
@@ -440,6 +529,26 @@ impl App {
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        let composer = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(|runtime| {
+                terminal.effective_known_agent().map(|agent| {
+                    let (frame, content_seq) = runtime.composer_frame();
+                    crate::terminal::assess_composer(
+                        terminal.composer_write.as_ref(),
+                        crate::detect::manifest::composer_visual_observation(
+                            agent,
+                            &frame.screen,
+                            frame.cursor,
+                            frame.frame_stable,
+                            content_seq,
+                        ),
+                    )
+                })
+            })
+            .map(composer_info_from_assessment)
+            .unwrap_or_default();
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
@@ -461,6 +570,7 @@ impl App {
             agent_status: pane_agent_status(terminal.state, pane.seen),
             input_pending: terminal.input_pending,
             input_prompt_kind: terminal.input_prompt_kind,
+            composer,
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),

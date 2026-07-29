@@ -13,6 +13,7 @@ struct PreparedPaneInput {
     target: TerminalInputTarget,
     bytes: Bytes,
     aborts_turn: bool,
+    starts_composer_attempt: bool,
 }
 
 enum PreparedPopupInput {
@@ -46,9 +47,24 @@ impl App {
         }
 
         let input = self.prepare_terminal_key_forward(key)?;
+        let composer_baseline = self
+            .lookup_runtime_sender(input.ws_idx, input.pane_id)
+            .map(|runtime| runtime.detection_content_seq());
         let sent = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
+        if sent {
+            if let Some(composer_baseline) = composer_baseline {
+                self.record_pane_composer_write(
+                    input.ws_idx,
+                    input.pane_id,
+                    crate::terminal::ComposerInputSource::Human,
+                    composer_baseline,
+                    input.starts_composer_attempt,
+                    false,
+                );
+            }
+        }
         if sent && input.aborts_turn {
             self.mark_pane_turn_aborted(input.ws_idx, input.pane_id);
         }
@@ -225,6 +241,16 @@ impl App {
                         && key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL))),
+            starts_composer_attempt: key_event.kind != crossterm::event::KeyEventKind::Release
+                && (key.is_text_commit
+                    || matches!(key_event.code, KeyCode::Char(_))
+                        && !key_event.modifiers.intersects(
+                            crossterm::event::KeyModifiers::CONTROL
+                                | crossterm::event::KeyModifiers::ALT
+                                | crossterm::event::KeyModifiers::SUPER
+                                | crossterm::event::KeyModifiers::HYPER
+                                | crossterm::event::KeyModifiers::META,
+                        )),
         })
     }
 
@@ -389,11 +415,26 @@ impl App {
         }
 
         let input = self.prepare_terminal_key_forward(key)?;
+        let composer_baseline = self
+            .lookup_runtime_sender(input.ws_idx, input.pane_id)
+            .map(|runtime| runtime.detection_content_seq());
         let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
             false
         };
+        if sent {
+            if let Some(composer_baseline) = composer_baseline {
+                self.record_pane_composer_write(
+                    input.ws_idx,
+                    input.pane_id,
+                    crate::terminal::ComposerInputSource::Human,
+                    composer_baseline,
+                    input.starts_composer_attempt,
+                    false,
+                );
+            }
+        }
         if sent && input.aborts_turn {
             self.mark_pane_turn_aborted(input.ws_idx, input.pane_id);
         }

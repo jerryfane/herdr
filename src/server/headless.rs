@@ -1595,15 +1595,30 @@ impl HeadlessServer {
     }
 
     fn paste_client_clipboard_image_path(&mut self, client_id: u64, path: String) -> bool {
-        if let Some(ClientConnection {
-            mode: ClientConnectionMode::TerminalAttach { terminal_id },
-            ..
-        }) = self.clients.get(&client_id)
+        if let Some(terminal_id) =
+            self.clients
+                .get(&client_id)
+                .and_then(|client| match &client.mode {
+                    ClientConnectionMode::TerminalAttach { terminal_id } => {
+                        Some(terminal_id.clone())
+                    }
+                    _ => None,
+                })
         {
-            if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+            let internal_terminal_id = self.terminal_id_by_string(&terminal_id);
+            if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                let baseline = runtime.detection_content_seq();
                 let payload = paste_payload_for_runtime(runtime, &path);
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
                     warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                } else if let Some(internal_terminal_id) = internal_terminal_id.as_ref() {
+                    self.app.record_terminal_composer_write(
+                        internal_terminal_id,
+                        crate::terminal::ComposerInputSource::Human,
+                        baseline,
+                        true,
+                        false,
+                    );
                 }
             }
             return true;
@@ -2752,14 +2767,34 @@ impl HeadlessServer {
                     return false;
                 }
                 debug!(client_id, len = data.len(), "client input received");
-                if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
+                if let Some(terminal_id) =
+                    self.clients
+                        .get(&client_id)
+                        .and_then(|client| match &client.mode {
+                            ClientConnectionMode::TerminalAttach { terminal_id } => {
+                                Some(terminal_id.clone())
+                            }
+                            _ => None,
+                        })
                 {
-                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                        if let Err(err) = apply_terminal_attach_input(runtime, data) {
+                    let internal_terminal_id = self.terminal_id_by_string(&terminal_id);
+                    let write = self
+                        .runtime_for_terminal_id_string(&terminal_id)
+                        .map(|runtime| {
+                            let baseline = runtime.detection_content_seq();
+                            (baseline, apply_terminal_attach_input(runtime, data))
+                        });
+                    if let Some((baseline, result)) = write {
+                        if let Err(err) = result {
                             warn!(client_id, terminal_id = %terminal_id, err = %err);
+                        } else if let Some(internal_terminal_id) = internal_terminal_id.as_ref() {
+                            self.app.record_terminal_composer_write(
+                                internal_terminal_id,
+                                crate::terminal::ComposerInputSource::Human,
+                                baseline,
+                                true,
+                                false,
+                            );
                         }
                     }
                     return true;

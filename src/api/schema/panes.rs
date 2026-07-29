@@ -429,6 +429,10 @@ pub struct PaneInfo {
     pub input_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
+    /// Best-effort composer state. Older daemons omit this field; consumers
+    /// must treat that as `unknown`, never as an empty composer.
+    #[serde(default)]
+    pub composer: ComposerInfo,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -447,6 +451,95 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerState {
+    Empty,
+    DraftPresent,
+    #[default]
+    Unknown,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerProvenance {
+    None,
+    Human,
+    Api,
+    AgentPrompt,
+    #[default]
+    Unknown,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerRegionEvidence {
+    Empty,
+    Text,
+    Missing,
+    #[default]
+    Unavailable,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerCursorEvidence {
+    Draft,
+    Suggestion,
+    Conflict,
+    #[default]
+    Unavailable,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerStyleEvidence {
+    Neutral,
+    Conflict,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ComposerEvidence {
+    pub provenance: ComposerProvenance,
+    pub region: ComposerRegionEvidence,
+    pub cursor: ComposerCursorEvidence,
+    pub style: ComposerStyleEvidence,
+    pub frame_stable: bool,
+}
+
+impl Default for ComposerEvidence {
+    fn default() -> Self {
+        Self {
+            provenance: ComposerProvenance::Unknown,
+            region: ComposerRegionEvidence::Unavailable,
+            cursor: ComposerCursorEvidence::Unavailable,
+            style: ComposerStyleEvidence::Unavailable,
+            frame_stable: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct ComposerInfo {
+    pub state: ComposerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub evidence: ComposerEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

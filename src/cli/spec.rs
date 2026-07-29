@@ -357,7 +357,7 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "Herdr first acknowledges the complete text+Enter PTY write. If a modal input request is already visible, it returns agent_input_pending without writing. With --wait, a settled agent's lifecycle advance or an observed composer clear proves delivery=submitted; persistent exact composer text returns agent_prompt_unsubmitted, and an otherwise unobservable disposition returns agent_prompt_stalled. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission: composer-clear evidence is required, otherwise delivery remains written_to_pty. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
+                    "Herdr first acknowledges the complete text+Enter PTY write. If a modal input request is already visible, it returns agent_input_pending without writing. With --wait, a settled agent's lifecycle advance or the same writer-attributed composer attempt being observed and then cleared proves delivery=submitted; a persistent attributed attempt returns agent_prompt_unsubmitted, and an otherwise unobservable disposition returns agent_prompt_stalled. Bracketed paste does not depend on rendered token text. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
                 ),
         )
         .subcommand(

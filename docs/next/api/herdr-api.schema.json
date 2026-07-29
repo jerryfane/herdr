@@ -79,6 +79,104 @@
           ],
           "type": "string"
         },
+        "ComposerCursorEvidence": {
+          "enum": [
+            "draft",
+            "suggestion",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerEvidence": {
+          "properties": {
+            "cursor": {
+              "$ref": "#/schemas/event/$defs/ComposerCursorEvidence"
+            },
+            "frame_stable": {
+              "type": "boolean"
+            },
+            "provenance": {
+              "$ref": "#/schemas/event/$defs/ComposerProvenance"
+            },
+            "region": {
+              "$ref": "#/schemas/event/$defs/ComposerRegionEvidence"
+            },
+            "style": {
+              "$ref": "#/schemas/event/$defs/ComposerStyleEvidence"
+            }
+          },
+          "required": [
+            "provenance",
+            "region",
+            "cursor",
+            "style",
+            "frame_stable"
+          ],
+          "type": "object"
+        },
+        "ComposerInfo": {
+          "properties": {
+            "attempt_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "$ref": "#/schemas/event/$defs/ComposerEvidence",
+              "default": {
+                "cursor": "unavailable",
+                "frame_stable": false,
+                "provenance": "unknown",
+                "region": "unavailable",
+                "style": "unavailable"
+              }
+            },
+            "state": {
+              "$ref": "#/schemas/event/$defs/ComposerState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "ComposerProvenance": {
+          "enum": [
+            "none",
+            "human",
+            "api",
+            "agent_prompt",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerRegionEvidence": {
+          "enum": [
+            "empty",
+            "text",
+            "missing",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerState": {
+          "enum": [
+            "empty",
+            "draft_present",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerStyleEvidence": {
+          "enum": [
+            "neutral",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
         "EventData": {
           "oneOf": [
             {
@@ -867,6 +965,20 @@
             },
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "composer": {
+              "$ref": "#/schemas/event/$defs/ComposerInfo",
+              "default": {
+                "evidence": {
+                  "cursor": "unavailable",
+                  "frame_stable": false,
+                  "provenance": "unknown",
+                  "region": "unavailable",
+                  "style": "unavailable"
+                },
+                "state": "unknown"
+              },
+              "description": "Best-effort composer state. Older daemons omit this field; consumers\nmust treat that as `unknown`, never as an empty composer."
             },
             "cwd": {
               "type": [
@@ -6032,6 +6144,104 @@
           ],
           "type": "string"
         },
+        "ComposerCursorEvidence": {
+          "enum": [
+            "draft",
+            "suggestion",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerEvidence": {
+          "properties": {
+            "cursor": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerCursorEvidence"
+            },
+            "frame_stable": {
+              "type": "boolean"
+            },
+            "provenance": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerProvenance"
+            },
+            "region": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerRegionEvidence"
+            },
+            "style": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerStyleEvidence"
+            }
+          },
+          "required": [
+            "provenance",
+            "region",
+            "cursor",
+            "style",
+            "frame_stable"
+          ],
+          "type": "object"
+        },
+        "ComposerInfo": {
+          "properties": {
+            "attempt_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerEvidence",
+              "default": {
+                "cursor": "unavailable",
+                "frame_stable": false,
+                "provenance": "unknown",
+                "region": "unavailable",
+                "style": "unavailable"
+              }
+            },
+            "state": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "ComposerProvenance": {
+          "enum": [
+            "none",
+            "human",
+            "api",
+            "agent_prompt",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerRegionEvidence": {
+          "enum": [
+            "empty",
+            "text",
+            "missing",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerState": {
+          "enum": [
+            "empty",
+            "draft_present",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerStyleEvidence": {
+          "enum": [
+            "neutral",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
         "InputPromptKind": {
           "description": "Best-effort classification of a live agent-owned input prompt.",
           "enum": [
@@ -6162,6 +6372,20 @@
             },
             "agent_status": {
               "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "composer": {
+              "$ref": "#/schemas/subscription_event/$defs/ComposerInfo",
+              "default": {
+                "evidence": {
+                  "cursor": "unavailable",
+                  "frame_stable": false,
+                  "provenance": "unknown",
+                  "region": "unavailable",
+                  "style": "unavailable"
+                },
+                "state": "unknown"
+              },
+              "description": "Best-effort composer state. Older daemons omit this field; consumers\nmust treat that as `unknown`, never as an empty composer."
             },
             "cwd": {
               "type": [
@@ -6553,6 +6777,19 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "composer": {
+              "$ref": "#/schemas/success_response/$defs/ComposerInfo",
+              "default": {
+                "evidence": {
+                  "cursor": "unavailable",
+                  "frame_stable": false,
+                  "provenance": "unknown",
+                  "region": "unavailable",
+                  "style": "unavailable"
+                },
+                "state": "unknown"
+              }
+            },
             "cwd": {
               "type": [
                 "string",
@@ -6812,6 +7049,104 @@
             "set",
             "cleared",
             "no_foreground_client"
+          ],
+          "type": "string"
+        },
+        "ComposerCursorEvidence": {
+          "enum": [
+            "draft",
+            "suggestion",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerEvidence": {
+          "properties": {
+            "cursor": {
+              "$ref": "#/schemas/success_response/$defs/ComposerCursorEvidence"
+            },
+            "frame_stable": {
+              "type": "boolean"
+            },
+            "provenance": {
+              "$ref": "#/schemas/success_response/$defs/ComposerProvenance"
+            },
+            "region": {
+              "$ref": "#/schemas/success_response/$defs/ComposerRegionEvidence"
+            },
+            "style": {
+              "$ref": "#/schemas/success_response/$defs/ComposerStyleEvidence"
+            }
+          },
+          "required": [
+            "provenance",
+            "region",
+            "cursor",
+            "style",
+            "frame_stable"
+          ],
+          "type": "object"
+        },
+        "ComposerInfo": {
+          "properties": {
+            "attempt_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "$ref": "#/schemas/success_response/$defs/ComposerEvidence",
+              "default": {
+                "cursor": "unavailable",
+                "frame_stable": false,
+                "provenance": "unknown",
+                "region": "unavailable",
+                "style": "unavailable"
+              }
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/ComposerState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "ComposerProvenance": {
+          "enum": [
+            "none",
+            "human",
+            "api",
+            "agent_prompt",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerRegionEvidence": {
+          "enum": [
+            "empty",
+            "text",
+            "missing",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerState": {
+          "enum": [
+            "empty",
+            "draft_present",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerStyleEvidence": {
+          "enum": [
+            "neutral",
+            "conflict",
+            "unavailable"
           ],
           "type": "string"
         },
@@ -7968,6 +8303,20 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "composer": {
+              "$ref": "#/schemas/success_response/$defs/ComposerInfo",
+              "default": {
+                "evidence": {
+                  "cursor": "unavailable",
+                  "frame_stable": false,
+                  "provenance": "unknown",
+                  "region": "unavailable",
+                  "style": "unavailable"
+                },
+                "state": "unknown"
+              },
+              "description": "Best-effort composer state. Older daemons omit this field; consumers\nmust treat that as `unknown`, never as an empty composer."
             },
             "cwd": {
               "type": [

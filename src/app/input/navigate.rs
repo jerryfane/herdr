@@ -740,6 +740,14 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return false;
         };
+        let Some(pane_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.focused_pane_id())
+        else {
+            return false;
+        };
         let Some(rt) = self
             .state
             .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
@@ -748,9 +756,28 @@ impl App {
         };
 
         let bytes = rt.encode_terminal_key(key);
+        let baseline = rt.detection_content_seq();
         if bytes.is_empty() || rt.try_send_bytes(Bytes::from(bytes)).is_err() {
             return false;
         }
+        let starts_composer_attempt = key.kind != crossterm::event::KeyEventKind::Release
+            && (key.is_text_commit
+                || matches!(key.code, crossterm::event::KeyCode::Char(_))
+                    && !key.modifiers.intersects(
+                        crossterm::event::KeyModifiers::CONTROL
+                            | crossterm::event::KeyModifiers::ALT
+                            | crossterm::event::KeyModifiers::SUPER
+                            | crossterm::event::KeyModifiers::HYPER
+                            | crossterm::event::KeyModifiers::META,
+                    ));
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Human,
+            baseline,
+            starts_composer_attempt,
+            false,
+        );
 
         self.state.mode = Mode::Terminal;
         true

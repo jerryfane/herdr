@@ -2,6 +2,38 @@ use std::collections::HashMap;
 
 use super::*;
 
+#[test]
+fn pane_info_without_composer_deserializes_as_unknown() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "term_1",
+        "workspace_id": "ws_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 1
+    }))
+    .expect("old pane shape remains readable");
+    assert_eq!(pane.composer.state, ComposerState::Unknown);
+    assert!(!pane.composer.evidence.frame_stable);
+}
+
+#[test]
+fn agent_info_without_composer_deserializes_as_unknown() {
+    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "idle",
+        "workspace_id": "ws_1",
+        "tab_id": "tab_1",
+        "pane_id": "pane_1",
+        "focused": true,
+        "revision": 1
+    }))
+    .expect("old agent shape remains readable");
+    assert_eq!(agent.composer.state, ComposerState::Unknown);
+    assert!(!agent.composer.evidence.frame_stable);
+}
+
 fn protocol_schema_entry<T: schemars::JsonSchema>(name: &str) -> serde_json::Value {
     let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
     rewrite_schema_refs(&mut schema, name);
@@ -892,6 +924,7 @@ fn worktree_request_and_response_round_trip() {
                 agent_status: AgentStatus::Unknown,
                 input_pending: false,
                 input_prompt_kind: None,
+                composer: Default::default(),
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
@@ -1311,6 +1344,7 @@ fn create_response_round_trips_with_root_pane() {
                 agent_status: AgentStatus::Unknown,
                 input_pending: false,
                 input_prompt_kind: None,
+                composer: Default::default(),
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,

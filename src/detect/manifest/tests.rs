@@ -565,90 +565,62 @@ fn claude_enumerated_rule_has_no_phrase_literals() {
 }
 
 #[test]
-fn composer_fingerprint_normalizes_prompt_box_body_without_exposing_text() {
+fn composer_visual_evidence_uses_cursor_without_text_equality() {
     let screen = "────────────────────────────────────────\n\
-        ❯ fix   the parser\n\
-          and add tests\n\
-        ────────────────────────────────────────\n";
-    let observed = composer_fingerprint(
+❯ [Pasted text #6]\n\
+────────────────────────────────────────\n";
+    let observation = composer_visual_observation(
         Agent::Claude,
-        DetectionInput {
-            screen,
-            osc_title: "",
-            osc_progress: "",
-        },
-    )
-    .expect("composer fingerprint");
-
-    assert_eq!(observed, prompt_fingerprint("fix the parser and add tests"));
+        screen,
+        Some(crate::pane::TerminalCursorState {
+            x: 18,
+            y: 1,
+            visible: true,
+            shape: 0,
+        }),
+        true,
+        7,
+    );
+    assert_eq!(
+        observation.region,
+        crate::terminal::ComposerRegionObservation::Text
+    );
+    assert_eq!(
+        observation.cursor,
+        crate::terminal::ComposerCursorObservation::Draft
+    );
 }
 
 #[test]
-fn claude_composer_paste_token_is_manifest_declared_and_region_scoped() {
-    let paste_token = "────────────────────────────────────────\n\
-        ❯ [Pasted text #6]\n\
-        ────────────────────────────────────────\n";
-    assert!(composer_paste_token_configured(Agent::Claude));
-    assert!(composer_has_paste_token(
+fn composer_visual_evidence_distinguishes_suggestion_right_of_cursor() {
+    let screen = "────────────────────────────────────────\n\
+❯  suggestion\n\
+────────────────────────────────────────\n";
+    let observation = composer_visual_observation(
         Agent::Claude,
-        DetectionInput {
-            screen: paste_token,
-            osc_title: "",
-            osc_progress: "",
-        },
-    ));
-
-    let unrelated_composer = "────────────────────────────────────────\n\
-        ❯ explain [Pasted text #6]\n\
-        ────────────────────────────────────────\n";
-    assert!(!composer_has_paste_token(
-        Agent::Claude,
-        DetectionInput {
-            screen: unrelated_composer,
-            osc_title: "",
-            osc_progress: "",
-        },
-    ));
-
-    let transcript_only = "[Pasted text #6]\n\
-        ────────────────────────────────────────\n\
-        ❯\n\
-        ────────────────────────────────────────\n";
-    assert!(!composer_has_paste_token(
-        Agent::Claude,
-        DetectionInput {
-            screen: transcript_only,
-            osc_title: "",
-            osc_progress: "",
-        },
-    ));
+        screen,
+        Some(crate::pane::TerminalCursorState {
+            x: 2,
+            y: 1,
+            visible: true,
+            shape: 0,
+        }),
+        true,
+        7,
+    );
+    assert_eq!(
+        observation.cursor,
+        crate::terminal::ComposerCursorObservation::Suggestion
+    );
 }
 
 #[test]
-fn composer_paste_token_requires_engine_five_and_a_valid_regex() {
-    let manifest = r#"
-id = "claude"
-version = "1"
-min_engine_version = 4
-
-[composer]
-region = "prompt_box_body"
-paste_token_regex = '^\[Pasted text #[0-9]+\]$'
-
-[[rules]]
-id = "idle"
-state = "idle"
-contains = ["ready"]
-"#;
-    assert!(parse_manifest(manifest).is_err());
-
-    let invalid_regex = manifest
-        .replace("min_engine_version = 4", "min_engine_version = 5")
-        .replace(
-            r"paste_token_regex = '^\[Pasted text #[0-9]+\]$'",
-            "paste_token_regex = '['",
-        );
-    assert!(parse_manifest(&invalid_regex).is_err());
+fn missing_composer_region_is_explicit() {
+    let observation = composer_visual_observation(Agent::Claude, "no prompt box", None, true, 7);
+    assert_eq!(
+        observation.region,
+        crate::terminal::ComposerRegionObservation::Missing
+    );
 }
 
 #[test]

@@ -1683,7 +1683,17 @@ impl App {
                                         ws_idx,
                                         focused,
                                     ) {
-                                        let _ = runtime.try_send_paste(text);
+                                        let baseline = runtime.detection_content_seq();
+                                        if runtime.try_send_paste(text).is_ok() {
+                                            self.record_pane_composer_write(
+                                                ws_idx,
+                                                focused,
+                                                crate::terminal::ComposerInputSource::Human,
+                                                baseline,
+                                                true,
+                                                false,
+                                            );
+                                        }
                                     }
                                 }
                             }

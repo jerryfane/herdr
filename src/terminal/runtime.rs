@@ -318,6 +318,14 @@ impl TerminalRuntime {
         self.0.detection_text()
     }
 
+    pub(crate) fn composer_frame(&self) -> (crate::pane::TerminalComposerFrame, u64) {
+        self.0.composer_frame()
+    }
+
+    pub(crate) fn detection_content_seq(&self) -> u64 {
+        self.0.detection_content_seq()
+    }
+
     pub fn terminal_title(&self) -> Option<String> {
         self.0.terminal_title()
     }

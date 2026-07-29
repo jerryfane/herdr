@@ -380,6 +380,7 @@ impl App {
             agent_status: pane.agent_status,
             input_pending: pane.input_pending,
             input_prompt_kind: pane.input_prompt_kind,
+            composer: pane.composer,
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,

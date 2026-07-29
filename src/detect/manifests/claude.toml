@@ -1,12 +1,11 @@
 id = "claude"
-version = "2026.07.28.1"
-min_engine_version = 5
-updated_at = "2026-07-28T00:00:00Z"
+version = "2026.07.29.1"
+min_engine_version = 4
+updated_at = "2026-07-29T00:00:00Z"
 aliases = ["claude-code"]
 
 [composer]
 region = "prompt_box_body"
-paste_token_regex = '^\[Pasted text #[0-9]+\]$'
 
 [[input_rules]]
 id = "claude_enumerated_select"

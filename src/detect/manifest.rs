@@ -5,7 +5,7 @@ use std::{
 
 use regex::Regex;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use unicode_width::UnicodeWidthChar;
 
 use super::{
     agent_label, manifest_update::ManifestVersion, parse_agent_label, Agent, AgentDetection,
@@ -150,7 +150,6 @@ struct LoadedManifest {
     manifest: AgentManifest,
     compiled_rules: Vec<CompiledRule>,
     compiled_input_rules: Vec<CompiledRule>,
-    compiled_composer_paste_token: Option<Regex>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -237,7 +236,6 @@ struct InputManifestRule {
 #[serde(deny_unknown_fields)]
 struct ComposerManifest {
     region: String,
-    paste_token_regex: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -743,53 +741,68 @@ fn shared_input_manifest() -> &'static LoadedManifest {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptFingerprint([u8; 32]);
+pub(crate) fn composer_visual_observation(
+    agent: Agent,
+    screen: &str,
+    cursor: Option<crate::pane::TerminalCursorState>,
+    frame_stable: bool,
+    content_seq: u64,
+) -> crate::terminal::ComposerVisualObservation {
+    use crate::terminal::{
+        ComposerCursorObservation as Cursor, ComposerRegionObservation as Region,
+        ComposerStyleObservation as Style, ComposerVisualObservation,
+    };
 
-pub fn prompt_fingerprint(text: &str) -> PromptFingerprint {
-    PromptFingerprint(Sha256::digest(normalize_prompt_text(text).as_bytes()).into())
-}
-
-pub fn composer_fingerprint(agent: Agent, input: DetectionInput<'_>) -> Option<PromptFingerprint> {
-    let loaded = load_manifest(agent)?;
-    let composer = loaded.manifest.composer.as_ref()?;
-    let text = normalize_composer_text(region(input, &composer.region));
-    (!text.is_empty()).then(|| PromptFingerprint(Sha256::digest(text.as_bytes()).into()))
-}
-
-pub(crate) fn composer_paste_token_configured(agent: Agent) -> bool {
-    load_manifest(agent).is_some_and(|loaded| loaded.compiled_composer_paste_token.is_some())
-}
-
-pub(crate) fn composer_has_paste_token(agent: Agent, input: DetectionInput<'_>) -> bool {
     let Some(loaded) = load_manifest(agent) else {
-        return false;
+        return ComposerVisualObservation {
+            region: Region::Unavailable,
+            cursor: Cursor::Unavailable,
+            style: Style::Unavailable,
+            frame_stable,
+            content_seq,
+        };
     };
     let Some(composer) = loaded.manifest.composer.as_ref() else {
-        return false;
+        return ComposerVisualObservation {
+            region: Region::Unavailable,
+            cursor: Cursor::Unavailable,
+            style: Style::Unavailable,
+            frame_stable,
+            content_seq,
+        };
     };
-    let Some(pattern) = loaded.compiled_composer_paste_token.as_ref() else {
-        return false;
+    let Some((region_text, start_row, end_row)) =
+        composer_region_with_rows(screen, &composer.region)
+    else {
+        return ComposerVisualObservation {
+            region: Region::Missing,
+            cursor: Cursor::Unavailable,
+            style: Style::Unavailable,
+            frame_stable,
+            content_seq,
+        };
     };
-    let text = normalize_composer_text(region(input, &composer.region));
-    pattern.is_match(&text)
-}
-
-fn normalize_prompt_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn normalize_composer_text(text: &str) -> String {
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let first = lines
-        .next()
-        .map(|line| line.strip_prefix('❯').unwrap_or(line).trim())
-        .unwrap_or("");
-    std::iter::once(first)
-        .chain(lines)
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let has_text = region_text
+        .chars()
+        .any(|ch| !ch.is_whitespace() && ch != '│' && ch != '❯');
+    ComposerVisualObservation {
+        region: if has_text {
+            Region::Text
+        } else {
+            Region::Empty
+        },
+        cursor: if has_text {
+            composer_cursor_observation(screen, start_row, end_row, cursor)
+        } else {
+            Cursor::Unavailable
+        },
+        // Colour never establishes a verdict. There is no theme-independent
+        // suggestion style role, so style remains an explicit unavailable
+        // tripwire instead of becoming appearance truth.
+        style: Style::Unavailable,
+        frame_stable,
+        content_seq,
+    }
 }
 
 fn load_manifest(agent: Agent) -> Option<LoadedManifest> {
@@ -913,18 +926,10 @@ fn loaded_manifest(
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?;
     let compiled_input_rules = compile_input_manifest(&manifest)?;
-    let compiled_composer_paste_token = manifest
-        .composer
-        .as_ref()
-        .and_then(|composer| composer.paste_token_regex.as_deref())
-        .map(Regex::new)
-        .transpose()
-        .map_err(|err| format!("composer uses invalid paste_token_regex: {err}"))?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
         compiled_input_rules,
-        compiled_composer_paste_token,
         source,
         warning,
         cached_remote_version,
@@ -1244,24 +1249,6 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     if let Some(composer) = &manifest.composer {
         validate_region_name(&composer.region)
             .map_err(|err| format!("composer uses invalid region: {err}"))?;
-        if let Some(pattern) = composer.paste_token_regex.as_deref() {
-            if manifest
-                .min_engine_version
-                .is_some_and(|version| version < COMPOSER_PASTE_TOKEN_ENGINE_VERSION)
-            {
-                return Err(format!(
-                    "composer paste_token_regex requires min_engine_version \
-                     {COMPOSER_PASTE_TOKEN_ENGINE_VERSION}"
-                ));
-            }
-            if pattern.len() > MAX_MATCHER_CHARS {
-                return Err(format!(
-                    "composer paste_token_regex exceeds max length {MAX_MATCHER_CHARS}"
-                ));
-            }
-            Regex::new(pattern)
-                .map_err(|err| format!("composer uses invalid paste_token_regex: {err}"))?;
-        }
     }
 
     Ok(())
@@ -1674,7 +1661,6 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
         .and_then(|count| count.parse::<usize>().ok())
 }
 
-const COMPOSER_PASTE_TOKEN_ENGINE_VERSION: u32 = 5;
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
@@ -1808,6 +1794,73 @@ fn prompt_box_body(content: &str) -> Option<&str> {
         .unwrap_or(lines.len());
     let end = line_start_offset(content, &lines, end_index);
     Some(&content[start.min(content.len())..end.min(content.len())])
+}
+
+fn composer_region_with_rows<'a>(
+    content: &'a str,
+    region_name: &str,
+) -> Option<(&'a str, usize, usize)> {
+    if region_name != "prompt_box_body" {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let top = prompt_box_top_border_index(&lines)?;
+    let start_row = top + 1;
+    let end_row = lines[start_row..]
+        .iter()
+        .position(|line| is_horizontal_rule(line))
+        .map(|relative| start_row + relative)
+        .unwrap_or(lines.len());
+    let start = line_start_offset(content, &lines, start_row);
+    let end = line_start_offset(content, &lines, end_row);
+    Some((
+        &content[start.min(content.len())..end.min(content.len())],
+        start_row,
+        end_row,
+    ))
+}
+
+fn composer_cursor_observation(
+    content: &str,
+    start_row: usize,
+    end_row: usize,
+    cursor: Option<crate::pane::TerminalCursorState>,
+) -> crate::terminal::ComposerCursorObservation {
+    use crate::terminal::ComposerCursorObservation as Cursor;
+
+    let Some(cursor) = cursor.filter(|cursor| cursor.visible) else {
+        return Cursor::Unavailable;
+    };
+    let cursor_row = usize::from(cursor.y);
+    if cursor_row < start_row || cursor_row >= end_row {
+        return Cursor::Conflict;
+    }
+    let mut left = false;
+    let mut right = false;
+    let mut at = false;
+    for (row, line) in content.lines().enumerate().take(end_row).skip(start_row) {
+        let mut col = 0usize;
+        for ch in line.chars() {
+            let width = ch.width().unwrap_or(0);
+            if !ch.is_whitespace() && ch != '│' && ch != '❯' {
+                if row < cursor_row || (row == cursor_row && col < usize::from(cursor.x)) {
+                    left = true;
+                } else if row == cursor_row && col == usize::from(cursor.x) {
+                    at = true;
+                } else {
+                    right = true;
+                }
+            }
+            col = col.saturating_add(width);
+        }
+    }
+    if left {
+        Cursor::Draft
+    } else if right && !at {
+        Cursor::Suggestion
+    } else {
+        Cursor::Conflict
+    }
 }
 
 fn above_prompt_box(content: &str) -> &str {
