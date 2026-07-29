@@ -289,7 +289,9 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 
-`agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストとエンコード済み Enter をアトミックに送信します。`--wait` を使う場合、non-working 状態から送信したプロンプトは 5 秒以内に観測可能なライフサイクル変化を起こす必要があり、変化がなければ Herdr は `agent_prompt_stalled` を返します。呼び出し側のタイムアウトが 5 秒以下なら、通常の `timeout` エラーを維持します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+`agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストとエンコード済み Enter をアトミックに送信します。`--wait` では、最初に settled だったエージェントのライフサイクルシーケンスが進むと `delivery: "submitted"` になります。正規化されたプロンプトそのものが表示された後に一致しなくなる場合も `submitted` です。Claude の `[Pasted text #N]` のようなマニフェスト定義の bracketed-paste トークンでは、書き込み前の正常なスナップショットに既存トークンがなく、配送後にトークンが表示され、その後コンポーザーが空になる必要があります。
+
+正確なプロンプトまたは帰属可能な paste トークンが残れば `agent_prompt_unsubmitted` になります。読み取り不能なベースライン、既存トークン、または別の空でないテキストに置き換わったトークンは配送を証明せず、ほかの証拠もなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されず、`submitted` にはコンポーザーがクリアされた証拠が必要です。同じペインへの並行配送に残る表示ベースの競合は [#17](https://github.com/jerryfane/herdr/issues/17) の writer-side provenance へ延期されています。その後 Herdr は要求された settled 状態を待ちます。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
 
 `idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 
