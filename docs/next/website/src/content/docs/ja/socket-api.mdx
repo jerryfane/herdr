@@ -107,7 +107,9 @@ herdr pane read w1:p2 --source recent --lines 50
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。成功時の省略可能な `delivery` は、text+Enter 全体の書き込み確認後に `written_to_pty`、帰属可能なライフサイクル進行、正確なコンポーザー内容の観測後のクリア、または帰属可能なマニフェスト定義の paste トークンを観測した後にコンポーザーが空になった場合に `submitted` です。paste トークンの帰属には、書き込み前に正常に読み取れたトークンのないスナップショットが必要です。読み取り不能なベースライン、既存トークン、または別の空でないテキストは配送を証明しません。同じペインへの並行配送の帰属は [#17](https://github.com/jerryfane/herdr/issues/17) の writer-side provenance へ延期されています。
+`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。成功時の `delivery` は、text+Enter 全体の書き込み確認後に `written_to_pty`、帰属可能なライフサイクル進行、または同じ writer-attributed composer attempt の観測後の消去で `submitted` です。残存する帰属入力は `agent_prompt_unsubmitted`、不確かな行方は `agent_prompt_stalled` です。bracketed paste は表示 token に依存しません。
+
+`pane.get` は `composer` オブジェクトを返します。`state` は `empty`、`draft_present`、`unknown` で、任意の `attempt_id` と provenance、領域、カーソル、style、frame stability の証拠を含みます。領域欠落、再描画途中、矛盾、またはこのフィールドを持たない古い応答は `unknown` です。style は信頼度を下げる tripwire にしか使いません。
 
 `session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。取得後はリソースイベントを購読し、そのイベントでローカルキャッシュを更新してください。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
 

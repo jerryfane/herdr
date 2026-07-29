@@ -209,6 +209,8 @@ pub struct AgentInfo {
     pub input_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
+    #[serde(default)]
+    pub composer: super::panes::ComposerInfo,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

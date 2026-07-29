@@ -134,11 +134,32 @@ impl App {
         }
 
         if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
+            let pane_id = self
                 .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                let baseline = self
+                    .lookup_runtime_sender(ws_idx, pane_id)
+                    .map(|runtime| runtime.detection_content_seq());
+                let sent = if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
+                    runtime.send_paste(text).await.is_ok()
+                } else {
+                    false
+                };
+                if sent {
+                    if let Some(baseline) = baseline {
+                        self.record_pane_composer_write(
+                            ws_idx,
+                            pane_id,
+                            crate::terminal::ComposerInputSource::Human,
+                            baseline,
+                            true,
+                            false,
+                        );
+                    }
+                }
             }
         }
     }

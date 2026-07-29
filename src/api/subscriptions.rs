@@ -771,6 +771,7 @@ mod tests {
             agent_status: AgentStatus::Unknown,
             input_pending: false,
             input_prompt_kind: None,
+            composer: Default::default(),
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,

@@ -85,6 +85,13 @@ pub struct TerminalCursorState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalComposerFrame {
+    pub(crate) screen: String,
+    pub(crate) cursor: Option<TerminalCursorState>,
+    pub(crate) frame_stable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalDirtyPatch {
     pub rows: Vec<(u16, Vec<CellData>)>,
 }
@@ -381,6 +388,10 @@ impl PaneTerminal {
 
     pub fn detection_text(&self) -> String {
         self.ghostty.detection_text()
+    }
+
+    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
+        self.ghostty.composer_frame()
     }
 
     pub fn recent_text(&self, lines: usize) -> String {
@@ -1690,6 +1701,28 @@ impl GhosttyPaneTerminal {
             .ok()
             .and_then(|core| ghostty_detection_text(&core).ok())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
+        let Ok(mut core) = self.core.lock() else {
+            return TerminalComposerFrame {
+                screen: String::new(),
+                cursor: None,
+                frame_stable: false,
+            };
+        };
+        let synchronized_output_active = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false);
+        let screen = ghostty_detection_text(&core).unwrap_or_default();
+        let current = current_cursor_state(&mut core);
+        let cursor = effective_cursor_state(&mut core, current);
+        TerminalComposerFrame {
+            screen,
+            cursor,
+            frame_stable: !synchronized_output_active,
+        }
     }
 
     pub fn recent_text(&self, lines: usize) -> String {

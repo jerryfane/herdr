@@ -230,6 +230,7 @@ pub struct TerminalState {
     pub state: AgentState,
     pub input_pending: bool,
     pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
+    pub(crate) composer_write: Option<super::ComposerWrite>,
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
@@ -268,6 +269,7 @@ impl TerminalState {
             state: AgentState::Unknown,
             input_pending: false,
             input_prompt_kind: None,
+            composer_write: None,
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
@@ -279,6 +281,32 @@ impl TerminalState {
             recent_agent_process_exit_at: None,
             pending_agent_resume_plan: None,
         }
+    }
+
+    pub(crate) fn record_composer_write(
+        &mut self,
+        source: super::ComposerInputSource,
+        baseline_content_seq: u64,
+        force_new_attempt: bool,
+    ) -> String {
+        if !force_new_attempt
+            && self
+                .composer_write
+                .as_ref()
+                .is_some_and(|write| write.source == source)
+        {
+            if let Some(write) = self.composer_write.as_mut() {
+                write.baseline_content_seq = baseline_content_seq;
+                return write.attempt_id.clone();
+            }
+        }
+        let attempt_id = super::composer::fresh_composer_attempt_id();
+        self.composer_write = Some(super::ComposerWrite {
+            attempt_id: attempt_id.clone(),
+            source,
+            baseline_content_seq,
+        });
+        attempt_id
     }
 
     pub(crate) fn reset_turn_counter(&mut self, path: TurnCounterResetPath) {
@@ -559,6 +587,9 @@ impl TerminalState {
                 agent_released: false,
             };
         }
+        if previous_detected_agent != agent {
+            self.composer_write = None;
+        }
         self.detected_agent = agent;
         if let Some(agent) = agent {
             let agent_label = crate::detect::agent_label(agent);
@@ -629,6 +660,7 @@ impl TerminalState {
             self.persisted_agent_session = durable_session;
         }
         if agent_released {
+            self.composer_write = None;
             self.clear_agent_name();
         }
         TerminalStateMutation {
@@ -1542,6 +1574,7 @@ impl TerminalState {
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
         self.hook_authority = None;
+        self.composer_write = None;
         self.clear_agent_name();
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
@@ -1809,6 +1842,7 @@ impl TerminalState {
         self.state = AgentState::Unknown;
         self.input_pending = false;
         self.input_prompt_kind = None;
+        self.composer_write = None;
         self.last_agent_state_change_seq = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
