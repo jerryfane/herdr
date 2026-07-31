@@ -637,6 +637,7 @@ mod tests {
             Some(foreign_attempt_id.as_str())
         );
 
+
         let rejected = run_deferred_agent_prompt(
             &mut app,
             "req-label",
