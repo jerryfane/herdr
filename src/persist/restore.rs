@@ -1008,7 +1008,7 @@ mod tests {
             true,
             events,
             Arc::new(Notify::new()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(RenderSignal::new()),
         );
         let restored_epoch = terminals.values().next().unwrap().turn_epoch;
 
@@ -1037,7 +1037,7 @@ mod tests {
             &mut imports,
             mpsc::channel(4).0,
             Arc::new(Notify::new()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(RenderSignal::new()),
         )
         .unwrap();
         let restored_epoch = terminals.values().next().unwrap().turn_epoch;
