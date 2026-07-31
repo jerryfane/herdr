@@ -2343,17 +2343,28 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
-        app.state
-            .terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .set_hook_authority(
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("kimi-session")
+            .expect("test session id should be valid");
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:kimi".to_string(),
+                "kimi".to_string(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".to_string()),
+            )
+            .expect("session start should anchor full-lifecycle authority");
+        terminal
+            .set_hook_authority_with_session_ref(
                 "herdr:kimi".to_string(),
                 "kimi".to_string(),
                 AgentState::Working,
                 None,
-                None,
-            );
+                Some(session_ref),
+                Some(2),
+            )
+            .expect("anchored hook report should be accepted");
         let baseline_sequence = app.state.terminals[&terminal_id].last_agent_state_change_seq;
         let baseline_event_sequence = event_hub.current_sequence();
 

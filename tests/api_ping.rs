@@ -2120,11 +2120,22 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         thread::sleep(Duration::from_millis(100));
     }
 
+    let session_path = base.join("clear-session.jsonl");
+    let session = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_clear_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
+            pane_id,
+            session_path.display()
+        ),
+    );
+    assert_eq!(session["result"]["type"], "ok");
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle"}}}}"#,
-            pane_id
+            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle","agent_session_path":"{}","seq":2}}}}"#,
+            pane_id,
+            session_path.display()
         ),
     );
     assert_eq!(hook["result"]["type"], "ok");
@@ -2132,7 +2143,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let cleared = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"herdr:pi"}}}}"#,
+            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"herdr:pi","seq":3}}}}"#,
             pane_id
         ),
     );

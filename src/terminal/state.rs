@@ -1954,11 +1954,13 @@ impl TerminalState {
             agent_label,
             FullLifecycleHookSuppressionReason::HookClear,
         );
+        // A release invalidates detector activity evidence even when the live process still
+        // owns the agent identity. Fresh detector evidence must restore the fallback state.
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_observed_at = None;
         if !process_owns_agent {
             self.detected_agent = None;
-            self.fallback_state = AgentState::Unknown;
-            self.fallback_visible_blocker = false;
-            self.fallback_observed_at = None;
             self.clear_agent_name();
         }
         self.hook_authority = None;
@@ -5273,9 +5275,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_release_preserves_process_owned_agent_state() {
+    fn custom_release_preserves_process_owned_identity_but_resets_activity() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_agent_name("reviewer".into());
         terminal
             .set_hook_authority(
                 "custom:pi".into(),
@@ -5294,7 +5297,8 @@ mod tests {
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
-        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.state, AgentState::Unknown);
     }
 
     #[test]

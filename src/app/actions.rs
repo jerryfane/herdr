@@ -6053,14 +6053,23 @@ mod tests {
         let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
 
         transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("pi-session")
+            .expect("test session id should be valid");
         let _ = state.update_terminal_state(pane_id, |terminal| {
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".into()),
+            )?;
             terminal.set_hook_authority_with_session_ref(
                 "herdr:pi".into(),
                 "pi".into(),
                 AgentState::Working,
                 None,
-                None,
-                Some(1),
+                Some(session_ref.clone()),
+                Some(2),
             )
         });
         let completed = state
@@ -6070,8 +6079,8 @@ mod tests {
                     "pi".into(),
                     AgentState::Idle,
                     None,
-                    None,
-                    Some(2),
+                    Some(session_ref),
+                    Some(3),
                 )
             })
             .expect("hook idle should complete turn N");
@@ -6082,7 +6091,7 @@ mod tests {
 
         state
             .update_terminal_state(pane_id, |terminal| {
-                terminal.clear_hook_authority_with_mutation(Some("herdr:pi"), Some(3))
+                terminal.clear_hook_authority_with_mutation(Some("herdr:pi"), Some(4))
             })
             .expect("clearing hook authority should reset effective state");
         let detector_idle =
