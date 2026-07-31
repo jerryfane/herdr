@@ -43,6 +43,9 @@ pub(super) enum MouseAction {
         source_ws_idx: usize,
         insert_idx: usize,
     },
+    MoveWorkspaceBlock {
+        params: crate::api::schema::WorkspaceMoveBlockParams,
+    },
     MoveTab {
         ws_idx: usize,
         source_tab_idx: usize,
@@ -561,9 +564,8 @@ impl AppState {
                         self.view.workspace_card_areas.clone()
                     };
                     if let Some(card) = cards.iter().find(|card| {
-                        mouse.row == card.rect.y
-                            && mouse.column == card.rect.x
-                            && mouse.column < card.rect.x + card.rect.width
+                        let chevron = crate::ui::workspace_group_chevron_rect(card);
+                        mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
                     }) {
                         if let Some((key, collapsed)) =
                             crate::ui::workspace_parent_group_state(self, card.ws_idx)
@@ -671,21 +673,21 @@ impl AppState {
                     }
                 }
 
-                let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
+                let workspace_drop_target = self.workspace_drop_target_at_row(mouse.row);
                 let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
                         let delta_row = mouse.row.abs_diff(press.start_row);
-                        let can_reorder = self
-                            .workspaces
-                            .get(press.ws_idx)
-                            .is_some_and(|ws| ws.worktree_space().is_none());
+                        let can_reorder = self.workspaces.get(press.ws_idx).is_some_and(|ws| {
+                            ws.worktree_space()
+                                .is_none_or(|space| !space.is_linked_worktree)
+                        });
                         if can_reorder && delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
                             self.drag = Some(DragState {
                                 target: DragTarget::WorkspaceReorder {
                                     source_ws_idx: press.ws_idx,
-                                    insert_idx: workspace_drop_index,
+                                    drop_target: workspace_drop_target,
                                 },
                             });
                         }
@@ -705,10 +707,10 @@ impl AppState {
                 }
 
                 if let Some(DragState {
-                    target: DragTarget::WorkspaceReorder { insert_idx, .. },
+                    target: DragTarget::WorkspaceReorder { drop_target, .. },
                 }) = &mut self.drag
                 {
-                    *insert_idx = workspace_drop_index;
+                    *drop_target = workspace_drop_target;
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
@@ -796,7 +798,7 @@ impl AppState {
 
             MouseEventKind::Up(MouseButton::Left) => {
                 // Mouse-up either finishes a drag selection or releases after a
-                // double-click copy; the latter is already finalized.
+                // double-click word selection; the latter is already finalized.
                 if let Some(selection) = self.selection.as_ref() {
                     let was_click = selection.was_just_click();
                     let was_finalized = selection.is_finalized();
@@ -808,7 +810,7 @@ impl AppState {
                     if was_click {
                         self.selection = None;
                     } else if was_finalized {
-                        // Double-click copy already finalized this selection.
+                        // Double-click already finalized this word selection.
                     } else if self.copy_on_select {
                         self.copy_selection(terminal_runtimes);
                     } else if let Some(selection) = self.selection.as_mut() {
@@ -837,13 +839,33 @@ impl AppState {
                         target:
                             DragTarget::WorkspaceReorder {
                                 source_ws_idx,
-                                insert_idx: Some(insert_idx),
+                                drop_target: Some(drop_target),
                             },
                     }) => {
-                        return Some(MouseAction::MoveWorkspace {
-                            source_ws_idx,
-                            insert_idx,
-                        });
+                        if let Some(params) =
+                            self.workspace_move_block_params(source_ws_idx, drop_target)
+                        {
+                            if self
+                                .workspaces
+                                .get(source_ws_idx)
+                                .is_some_and(|workspace| workspace.worktree_space().is_some())
+                            {
+                                return Some(MouseAction::MoveWorkspaceBlock { params });
+                            }
+                            let insert_idx = params
+                                .before_workspace_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.workspaces
+                                        .iter()
+                                        .position(|workspace| workspace.id == *id)
+                                })
+                                .unwrap_or(self.workspaces.len());
+                            return Some(MouseAction::MoveWorkspace {
+                                source_ws_idx,
+                                insert_idx,
+                            });
+                        }
                     }
                     Some(DragState {
                         target:

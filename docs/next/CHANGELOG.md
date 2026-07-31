@@ -3,11 +3,27 @@
 ## Unreleased
 
 ### Changed
+- Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Detached Windows servers and pane processes now survive logout from the OpenSSH session that started them. (#2008)
+- Windows `agent start` now launches agents without native arguments instead of timing out on an invalid empty PowerShell argument list. (#2072)
+- Headless servers now resume restored agent sessions without waiting for a TUI client to attach. (#2064)
+- Vibe and other Kitty-keyboard pane applications now receive shifted letters and punctuation when they request associated text. (#2020)
+- Linux runtimes without terminal foreground process groups can opt into child-group agent detection with `HERDR_PROCESS_DETECTION=child-groups`. (#1982)
+- Installing the Herdr agent skill with the `skills` CLI no longer copies the entire repository. (#2022)
+- Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
+- Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)
+- Plain mouse movement no longer triggers continuous full renders while preserving Herdr menu hover and pane application mouse tracking. (#1865)
+- `ui.copy_on_select = false` now retains drag and double-click word selections without copying; `Ctrl+C`, or `Cmd+C` when the host terminal forwards it, copies and clears the selection.
+- Pane and agent read responses now report `truncated: true` when older terminal rows were omitted. (#1717)
+- Pane applications that query OSC 4 palette colors now inherit the host terminal palette. (#1752)
+- Ctrl-clicking a pane URL no longer forwards an unmatched mouse release to alternate-screen applications, preventing duplicate browser tabs. (#1761)
+- Known-agent integrations now leave pane ownership to confirmed process exit, so restarting Pi with the same saved session restores lifecycle state even with custom working UI. (#1792)
 - OMP integration install, status, and uninstall now respect `PI_CONFIG_DIR` when `PI_CODING_AGENT_DIR` is not set, and installation refuses extension-directory collisions with Pi. (#1696)
 - Physical Escape key records on native Windows now bypass raw VT report framing, so pane applications receive Escape immediately and reliably. (#1736)
+- Windows now shows `system` notifications and completes MP3 notification sounds without leaving PowerShell players waiting for a timeout. (#1330)
 
 ## [0.7.5] - 2026-07-21
 
@@ -74,7 +90,7 @@
 
 ### Fixed
 - Collapsed Agent sidebar rows now follow the same ordering and click targets as the expanded panel, and their shortcut numbers are assigned by visible list position instead of repeating across workspaces. (#1168, #1344)
-- Shifted indexed bindings such as `prefix+shift+1..9` now match terminals that report the corresponding punctuation characters. (#1184)
+- On Kitty-keyboard hosts, prefix and navigate modes now request layout-aware input, so shifted bindings and indexed ranges such as `prefix+shift+1..9` match non-US keys while retaining legacy US punctuation support. (#1184, #1870)
 - Plugin-driven tab renames now immediately refresh tab-bar geometry and labels. (#1111, #1179, thanks @kovalov)
 - New tabs, splits, layouts, and workspaces configured to follow the foreground directory now start from the focused pane's current working directory. (#1245)
 - Amp, Codex, and Claude Code detection now recognizes current active-turn UI variants, including reordered Codex title spinners and Claude `/btw` turns. (#1208, #1281, #1366)
@@ -121,6 +137,7 @@
 - Added `herdr terminal session control` for bridge processes that need live ANSI frames plus input, resize, scroll, release, and takeover authority.
 - Added `ui.hide_tab_bar_when_single_tab` to hide the tab row when a workspace has one tab. (#448)
 - Added Japanese and Simplified Chinese website docs.
+- Added `herdr integration install grok` for Grok CLI (Grok Build) hooks that report session ids through Herdr's socket API. Grok state stays screen-detected. When native agent session restore is enabled, Herdr can resume Grok panes with `grok --resume <id>`.
 
 ### Changed
 - The mobile switcher now starts from an agents-first summary and renders worktrees as a tree, making narrow terminals easier to scan.

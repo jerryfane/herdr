@@ -1,7 +1,7 @@
 #!/bin/sh
 # managed by herdr; reinstalling the integration replaces this file.
 # HERDR_INTEGRATION_ID=kimi
-# HERDR_INTEGRATION_VERSION=5
+# HERDR_INTEGRATION_VERSION=6
 
 action="${1:-}"
 case "$action" in
@@ -42,6 +42,7 @@ if action == "session":
     if session_id is None:
         raise SystemExit(0)
     method = "pane.report_agent_session"
+    params["session_start_source"] = "startup"
 else:
     method = "pane.report_agent"
     params["state"] = action
