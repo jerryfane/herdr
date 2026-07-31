@@ -502,6 +502,14 @@ fn event_envelope_round_trips() {
             },
         },
         EventEnvelope {
+            event: EventKind::WorkspaceReordered,
+            data: EventData::WorkspaceReordered {
+                workspace_ids: vec!["w_1".into(), "w_2".into()],
+                before_workspace_id: Some("w_3".into()),
+                workspaces: vec![],
+            },
+        },
+        EventEnvelope {
             event: EventKind::TabMoved,
             data: EventData::TabMoved {
                 tab_id: "w_1:1".into(),
@@ -1258,6 +1266,18 @@ fn authority_mutation_requests_round_trip() {
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, workspace_move);
 
+    let workspace_move_block = Request {
+        id: "move_ws_block".into(),
+        method: Method::WorkspaceMoveBlock(WorkspaceMoveBlockParams {
+            workspace_ids: vec!["w1".into(), "w2".into()],
+            before_workspace_id: Some("w3".into()),
+        }),
+    };
+    let json = serde_json::to_value(&workspace_move_block).unwrap();
+    assert_eq!(json["method"], "workspace.move_block");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, workspace_move_block);
+
     let tab_move = Request {
         id: "move_tab".into(),
         method: Method::TabMove(TabMoveParams {
@@ -1300,6 +1320,7 @@ fn authority_mutation_requests_round_trip() {
         method: Method::EventsSubscribe(EventsSubscribeParams {
             subscriptions: vec![
                 Subscription::WorkspaceMoved {},
+                Subscription::WorkspaceReordered {},
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
@@ -1307,6 +1328,7 @@ fn authority_mutation_requests_round_trip() {
     };
     let json = serde_json::to_string(&subscription).unwrap();
     assert!(json.contains("\"type\":\"workspace.moved\""));
+    assert!(json.contains("\"type\":\"workspace.reordered\""));
     assert!(json.contains("\"type\":\"tab.moved\""));
     assert!(json.contains("\"type\":\"layout.updated\""));
     let restored: Request = serde_json::from_str(&json).unwrap();

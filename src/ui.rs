@@ -52,6 +52,8 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
+#[cfg(test)]
+pub(crate) use self::sidebar::workspace_drop_indicator_row;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
@@ -79,11 +81,13 @@ pub(crate) use self::{
         agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
         expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
-        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
-        workspace_parent_group_state, AgentPanelEntry, WorkspaceListEntry,
+        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
+        workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
+        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
+        WorkspaceListEntry,
     },
 };
+
 pub(crate) use self::{
     keybind_help::keybind_help_lines,
     mobile::{
@@ -100,15 +104,6 @@ use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
-
-// Braille spinner frames — smooth rotation
-const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Map spinner_tick (incremented every frame at ~60fps) to a spinner frame.
-/// We want ~8 updates/sec so divide by 8.
-pub(super) fn spinner_frame(tick: u32) -> &'static str {
-    SPINNERS[(tick as usize / 8) % SPINNERS.len()]
-}
 
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
@@ -394,19 +389,10 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
-    let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    if app.view.layout == ViewLayout::Mobile {
-        render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
-    } else if sidebar_area.width > 0 {
-        if app.sidebar_collapsed {
-            render_sidebar_collapsed(app, frame, sidebar_area);
-        } else {
-            render_sidebar(app, terminal_runtimes, frame, sidebar_area);
-        }
-    }
+    render_navigation_chrome(app, terminal_runtimes, frame);
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
@@ -454,6 +440,22 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
+    }
+}
+
+fn render_navigation_chrome(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
+    if app.view.layout == ViewLayout::Mobile {
+        render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
+    } else if app.view.sidebar_rect.width > 0 {
+        if app.sidebar_collapsed {
+            render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
+        } else {
+            render_sidebar(app, terminal_runtimes, frame, app.view.sidebar_rect);
+        }
     }
 }
 

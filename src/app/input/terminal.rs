@@ -3,7 +3,7 @@ use crossterm::event::KeyCode;
 use tracing::{debug, warn};
 
 use crate::{
-    app::{App, Mode, TerminalInputTarget},
+    app::{App, InputSourceId, Mode, TerminalInputTarget},
     input::TerminalKey,
 };
 
@@ -30,8 +30,17 @@ fn is_modifier_only_key(code: &KeyCode) -> bool {
 }
 
 impl App {
+    #[cfg(test)]
     pub(crate) fn handle_terminal_key_headless(
         &mut self,
+        key: TerminalKey,
+    ) -> Option<TerminalInputTarget> {
+        self.handle_terminal_key_headless_from(crate::app::LOCAL_INPUT_SOURCE, key)
+    }
+
+    pub(crate) fn handle_terminal_key_headless_from(
+        &mut self,
+        source_id: InputSourceId,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
         match self.prepare_popup_key_forward(key) {
@@ -46,10 +55,14 @@ impl App {
             }
         }
 
+<<<<<<< HEAD
         let input = self.prepare_terminal_key_forward(key)?;
         let composer_baseline = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .map(|runtime| runtime.detection_content_seq());
+=======
+        let input = self.prepare_terminal_key_forward(source_id, key)?;
+>>>>>>> upstream/master
         let sent = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
@@ -71,12 +84,19 @@ impl App {
         sent.then_some(input.target)
     }
 
-    fn prepare_terminal_key_forward(&mut self, key: TerminalKey) -> Option<PreparedPaneInput> {
+    fn prepare_terminal_key_forward(
+        &mut self,
+        source_id: InputSourceId,
+        key: TerminalKey,
+    ) -> Option<PreparedPaneInput> {
+        let key_event = key.as_key_event();
+        if self.try_copy_retained_selection(source_id, key) {
+            return None;
+        }
+
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
-
-        let key_event = key.as_key_event();
 
         if let Some(action) = super::terminal_direct_non_indexed_navigation_action(&self.state, key)
         {
@@ -299,6 +319,12 @@ impl App {
     }
 
     pub(crate) fn host_keyboard_report_all_requested(&self) -> bool {
+        if self.state.popup_pane.is_none()
+            && matches!(self.state.mode, Mode::Prefix | Mode::Navigate)
+        {
+            return true;
+        }
+
         let runtime = if self.state.popup_pane.is_some() {
             self.popup_runtime()
         } else if self.state.mode == Mode::Terminal {
@@ -379,6 +405,7 @@ impl App {
     }
 
     pub(crate) fn release_input_source_headless(&mut self, source_id: crate::app::InputSourceId) {
+        self.pending_url_click_sources.remove(&source_id);
         for pressed in self.take_pressed_keys_for_source(source_id) {
             let release = pressed
                 .key
@@ -388,6 +415,7 @@ impl App {
     }
 
     pub(crate) async fn release_input_source(&mut self, source_id: crate::app::InputSourceId) {
+        self.pending_url_click_sources.remove(&source_id);
         for pressed in self.take_pressed_keys_for_source(source_id) {
             let release = pressed
                 .key
@@ -414,10 +442,14 @@ impl App {
             }
         }
 
+<<<<<<< HEAD
         let input = self.prepare_terminal_key_forward(key)?;
         let composer_baseline = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .map(|runtime| runtime.detection_content_seq());
+=======
+        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
+>>>>>>> upstream/master
         let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
@@ -781,7 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_on_select_disabled_keeps_explicit_double_click_copy() {
+    async fn copy_on_select_disabled_retains_double_clicked_word_until_shortcut() {
         let (mut app, info) = app_with_screen_bytes(b"alpha beta");
         app.state.copy_on_select = false;
         let col = info.inner_rect.x + 2;
@@ -789,16 +821,22 @@ mod tests {
 
         double_click(&mut app, col, row);
 
-        assert_eq!(clipboard_write_content(&mut app), b"alpha");
         assert_visible_selection(&app);
-        assert!(app.selection_highlight_clear_deadline.is_some());
+        assert!(app.selection_highlight_clear_deadline.is_none());
         assert!(app.event_rx.try_recv().is_err());
+
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_eq!(clipboard_write_content(&mut app), b"alpha");
+        assert!(app.state.selection.is_none());
     }
 
     #[tokio::test]
     async fn new_drag_cancels_stale_double_click_highlight_deadline() {
         let (mut app, info) = app_with_screen_bytes(b"alpha beta");
-        app.state.copy_on_select = false;
         let row = info.inner_rect.y;
         let word_col = info.inner_rect.x + 2;
 
@@ -807,6 +845,7 @@ mod tests {
         let stale_deadline = app
             .selection_highlight_clear_deadline
             .expect("double-click highlight deadline");
+        app.state.copy_on_select = false;
 
         let start_col = info.inner_rect.x + 6;
         let end_col = info.inner_rect.x + 9;
@@ -915,8 +954,56 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ctrl_click_url_does_not_forward_release_to_mouse_reporting_pane() {
+        let line = "see https://github.com/herdrdev/herdr/issues/1761";
+        let col = line.find("github").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let screen = format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h{line}");
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                screen.as_bytes(),
+                4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        install_test_link_handler(&mut app);
+        let mut send_mouse = |source_id, kind, column, modifiers| {
+            app.handle_mouse_from_input_source(
+                source_id,
+                modified_mouse(kind, column, info.inner_rect.y, modifiers),
+            );
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let url_x = info.inner_rect.x + col;
+
+        send_mouse(41, down, url_x, KeyModifiers::CONTROL);
+        send_mouse(42, down, info.inner_rect.x, KeyModifiers::empty());
+        send_mouse(42, up, info.inner_rect.x, KeyModifiers::empty());
+        send_mouse(41, up, url_x, KeyModifiers::empty());
+
+        assert_eq!(app.state.plugin_command_logs.len(), 1);
+        assert_eq!(
+            input_rx.try_recv().expect("other source mouse down"),
+            Bytes::from_static(b"\x1b[<0;1;1M")
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("other source mouse up"),
+            Bytes::from_static(b"\x1b[<0;1;1m")
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "handled URL click must not leave an unmatched release for the pane"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
-        let line = "see https://github.com/ogulcancelik/herdr/issues/398";
+        let line = "see https://github.com/herdrdev/herdr/issues/398";
         let col = line.find("github").expect("url host") as u16;
 
         let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());

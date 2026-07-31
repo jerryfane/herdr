@@ -444,6 +444,19 @@ pub struct CellData {
     pub hyperlink: Option<u32>,
 }
 
+impl CellData {
+    pub(crate) fn from_ratatui_cell(cell: &ratatui::buffer::Cell) -> Self {
+        Self {
+            symbol: cell.symbol().to_owned(),
+            fg: color_to_u32(cell.fg),
+            bg: color_to_u32(cell.bg),
+            modifier: modifier_to_u16(cell.modifier),
+            skip: cell.skip,
+            hyperlink: None,
+        }
+    }
+}
+
 /// Cursor shape encoded as a DECSCUSR parameter.
 ///
 /// 0 = terminal default, 1 = blinking block, 2 = steady block,
@@ -527,14 +540,9 @@ impl FrameData {
                             index
                         }))
                     });
-                cells.push(CellData {
-                    symbol: cell.symbol().to_owned(),
-                    fg: color_to_u32(cell.fg),
-                    bg: color_to_u32(cell.bg),
-                    modifier: modifier_to_u16(cell.modifier),
-                    skip: cell.skip,
-                    hyperlink,
-                });
+                let mut cell = CellData::from_ratatui_cell(cell);
+                cell.hyperlink = hyperlink;
+                cells.push(cell);
             }
         }
 

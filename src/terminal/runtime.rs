@@ -1,4 +1,6 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
+
+use crate::render_signal::RenderSignal;
 
 use bytes::Bytes;
 use ratatui::{layout::Rect, Frame};
@@ -64,7 +66,7 @@ impl TerminalRuntime {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::from_handoff_fd(
             import,
@@ -88,7 +90,7 @@ impl TerminalRuntime {
         launch_env: &crate::pane::PaneLaunchEnv,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::spawn(
             pane_id,
@@ -120,7 +122,7 @@ impl TerminalRuntime {
         initial_history_ansi: Option<&str>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::spawn_with_initial_history(
             pane_id,
@@ -153,7 +155,7 @@ impl TerminalRuntime {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::spawn_shell_command(
             pane_id,
@@ -186,7 +188,7 @@ impl TerminalRuntime {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::spawn_argv_command(
             pane_id,
@@ -342,16 +344,31 @@ impl TerminalRuntime {
         self.0.recent_text(lines)
     }
 
-    pub fn recent_ansi(&self, lines: usize) -> String {
-        self.0.recent_ansi(lines)
+    pub(crate) fn recent_text_snapshot(&self, lines: usize) -> crate::pane::TerminalReadSnapshot {
+        self.0.recent_text_snapshot(lines)
     }
 
+    pub(crate) fn recent_ansi_snapshot(&self, lines: usize) -> crate::pane::TerminalReadSnapshot {
+        self.0.recent_ansi_snapshot(lines)
+    }
+
+    #[cfg(test)]
     pub fn recent_unwrapped_text(&self, lines: usize) -> String {
-        self.0.recent_unwrapped_text(lines)
+        self.0.recent_unwrapped_text_snapshot(lines).text
     }
 
-    pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
-        self.0.recent_unwrapped_ansi(lines)
+    pub(crate) fn recent_unwrapped_text_snapshot(
+        &self,
+        lines: usize,
+    ) -> crate::pane::TerminalReadSnapshot {
+        self.0.recent_unwrapped_text_snapshot(lines)
+    }
+
+    pub(crate) fn recent_unwrapped_ansi_snapshot(
+        &self,
+        lines: usize,
+    ) -> crate::pane::TerminalReadSnapshot {
+        self.0.recent_unwrapped_ansi_snapshot(lines)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {
@@ -404,12 +421,17 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+<<<<<<< HEAD
     pub fn write_bytes_acknowledged(
         &self,
         bytes: Bytes,
         timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         self.0.write_bytes_acknowledged(bytes, timeout)
+=======
+    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        self.0.send_bytes_after(bytes, delay);
+>>>>>>> upstream/master
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

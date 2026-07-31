@@ -1699,10 +1699,19 @@ fn pane_report_agent_updates_effective_state() {
     }
 
     let session_path = base.join("pi-session.jsonl");
+    let session = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_hook_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
+            pane_id,
+            session_path.display()
+        ),
+    );
+    assert_eq!(session["result"]["type"], "ok");
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_hook_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","message":"thinking","agent_session_path":"{}"}}}}"#,
+            r#"{{"id":"req_hook_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","message":"thinking","agent_session_path":"{}","seq":2}}}}"#,
             pane_id,
             session_path.display()
         ),
@@ -1875,7 +1884,7 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
+fn official_release_waits_for_confirmed_process_exit() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1960,11 +1969,22 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
         thread::sleep(Duration::from_millis(100));
     }
 
+    let session_path = base.join("release-session.jsonl");
+    let session = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_release_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
+            pane_id,
+            session_path.display()
+        ),
+    );
+    assert_eq!(session["result"]["type"], "ok");
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_release_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working"}}}}"#,
-            pane_id
+            r#"{{"id":"req_release_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","agent_session_path":"{}","seq":2}}}}"#,
+            pane_id,
+            session_path.display()
         ),
     );
     assert_eq!(hook["result"]["type"], "ok");
@@ -1978,8 +1998,8 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     );
     assert_eq!(released["result"]["type"], "ok");
 
-    let suppression_deadline = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < suppression_deadline {
+    let release_observation_deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < release_observation_deadline {
         let pane = send_request(
             &socket_path,
             &format!(
@@ -1987,11 +2007,11 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
                 pane_id
             ),
         );
-        assert!(
-            pane["result"]["pane"]["agent"].is_null(),
-            "pane reacquired pi during graceful release: {pane}"
+        assert_eq!(
+            pane["result"]["pane"]["agent"], "pi",
+            "official release hid the live Pi process: {pane}"
         );
-        assert_eq!(pane["result"]["pane"]["agent_status"], "unknown");
+        assert_eq!(pane["result"]["pane"]["agent_status"], "working");
         thread::sleep(Duration::from_millis(50));
     }
 
@@ -2013,7 +2033,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
         }
         assert!(
             Instant::now() < cleared_deadline,
-            "pi agent was not cleared promptly after release: {pane}"
+            "pi agent was not cleared promptly after process exit: {pane}"
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -2435,7 +2455,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let report_agent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_2","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working"}}}}"#,
+            r#"{{"id":"req_meta_sub_2","method":"pane.report_agent","params":{{"pane_id":"{}","source":"custom:pi","agent":"pi","state":"working"}}}}"#,
             pane_id
         ),
     );
@@ -2455,7 +2475,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let metadata = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_3","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"herdr:pi","title":"filtered out"}}}}"#,
+            r#"{{"id":"req_meta_sub_3","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"custom:pi","title":"filtered out"}}}}"#,
             pane_id
         ),
     );
@@ -2481,7 +2501,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let metadata = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_4","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"herdr:pi","title":"short lived","ttl_ms":100}}}}"#,
+            r#"{{"id":"req_meta_sub_4","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"custom:pi","title":"short lived","ttl_ms":100}}}}"#,
             pane_id
         ),
     );

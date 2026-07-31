@@ -135,9 +135,8 @@ impl ClientConnection {
         }
     }
 
-    pub(crate) fn request_full_redraw(&mut self) {
-        self.render_state.reset_baseline();
-        self.graphics_surface_reset_pending = true;
+    pub(crate) fn request_repaint(&mut self) {
+        self.render_state.request_repaint();
         self.pane_graphics_render_pending = false;
     }
 
@@ -196,6 +195,11 @@ impl ClientConnection {
                     {
                         changed |=
                             self.set_host_appearance(Some(color.inferred_appearance()), false);
+                    }
+                }
+                crate::raw_input::RawInputEvent::HostPaletteColors { colors } => {
+                    for &(index, color) in colors {
+                        next_theme = next_theme.with_palette_color(index, color);
                     }
                 }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
