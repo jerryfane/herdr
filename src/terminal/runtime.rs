@@ -421,17 +421,16 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-<<<<<<< HEAD
     pub fn write_bytes_acknowledged(
         &self,
         bytes: Bytes,
         timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         self.0.write_bytes_acknowledged(bytes, timeout)
-=======
+    }
+
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         self.0.send_bytes_after(bytes, delay);
->>>>>>> upstream/master
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

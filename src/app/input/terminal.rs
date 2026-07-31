@@ -55,14 +55,10 @@ impl App {
             }
         }
 
-<<<<<<< HEAD
-        let input = self.prepare_terminal_key_forward(key)?;
+        let input = self.prepare_terminal_key_forward(source_id, key)?;
         let composer_baseline = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .map(|runtime| runtime.detection_content_seq());
-=======
-        let input = self.prepare_terminal_key_forward(source_id, key)?;
->>>>>>> upstream/master
         let sent = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
@@ -442,14 +438,10 @@ impl App {
             }
         }
 
-<<<<<<< HEAD
-        let input = self.prepare_terminal_key_forward(key)?;
+        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
         let composer_baseline = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
             .map(|runtime| runtime.detection_content_seq());
-=======
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
->>>>>>> upstream/master
         let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {

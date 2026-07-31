@@ -3049,12 +3049,8 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
-<<<<<<< HEAD
             previous_input_pending,
             previous_input_prompt_kind,
-            agent_label: change.agent_label.clone(),
-            known_agent: change.known_agent,
-=======
             agent_label: if agent_released {
                 change.previous_agent_label.clone()
             } else {
@@ -3065,7 +3061,6 @@ impl AppState {
             } else {
                 change.known_agent
             },
->>>>>>> upstream/master
             state: change.state,
             seen,
             presentation: change.presentation.clone(),

@@ -140,7 +140,6 @@ jobs:
       - name: Run Windows checks
         if: matrix.kind == 'windows'
         shell: pwsh
-<<<<<<< HEAD
         run: |
           $ErrorActionPreference = "Stop"
           # Every native (non-cmdlet) command in THIS step must run through
@@ -207,9 +206,6 @@ jobs:
             Write-Host "Windows checks failed: $($failed -join ', ')"
             exit 1
           }
-=======
-        run: .\scripts\windows_check.ps1 -Mode check
->>>>>>> upstream/master
 
       - name: Smoke ConPTY pane
         if: matrix.kind == 'windows'

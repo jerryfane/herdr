@@ -112,11 +112,11 @@ impl App {
                 ),
             );
         }
-<<<<<<< HEAD
-        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
+        let (text, enter) =
+            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         let composer_baseline = runtime.detection_content_seq();
         let write_result = runtime
-            .write_bytes_acknowledged(Bytes::from(bytes), std::time::Duration::from_secs(5))
+            .write_bytes_acknowledged(Bytes::from(text), std::time::Duration::from_secs(5))
             .is_ok();
         // Revalidate the live PTY occupant after the blocking acknowledgement so
         // a foreground identity change during the batch is never reported as
@@ -128,6 +128,7 @@ impl App {
                 "agent prompt was not fully written to the pane PTY",
             );
         }
+        runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
         self.record_pane_composer_write(
             resolved.ws_idx,
             resolved.pane_id,
@@ -136,14 +137,6 @@ impl App {
             true,
             true,
         );
-=======
-        let (text, enter) =
-            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
-            return encode_error(id, "agent_prompt_failed", err.to_string());
-        }
-        runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
->>>>>>> upstream/master
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -436,7 +429,6 @@ mod tests {
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
-<<<<<<< HEAD
         let ResponseResult::AgentPrompted { agent, .. } = raw.result else {
             panic!("expected prompted response");
         };
@@ -445,11 +437,7 @@ mod tests {
             Some(first_attempt),
             "each agent prompt PTY batch needs a fresh opaque attempt"
         );
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B\r"));
-=======
-        assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
->>>>>>> upstream/master
         assert!(rx.try_recv().is_err());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), rx.recv())

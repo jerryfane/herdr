@@ -42,12 +42,8 @@ use self::agent_detection::{
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-<<<<<<< HEAD
-    TerminalComposerFrame, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalTextMatch,
-=======
-    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
->>>>>>> upstream/master
-    TerminalTextPoint, TerminalWordMotion,
+    TerminalComposerFrame, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
+    TerminalTextMatch, TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -1181,7 +1177,6 @@ impl PaneRuntimeIo {
         }
     }
 
-<<<<<<< HEAD
     fn write_bytes_acknowledged(
         &self,
         bytes: Bytes,
@@ -1193,7 +1188,9 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::TestChannel { sender, .. } => sender
                 .try_send(bytes)
                 .map_err(|err| std::io::Error::other(err.to_string())),
-=======
+        }
+    }
+
     fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
@@ -1213,7 +1210,6 @@ impl PaneRuntimeIo {
                     let _ = sender.send(bytes).await;
                 });
             }
->>>>>>> upstream/master
         }
     }
 }
@@ -2792,17 +2788,16 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
-<<<<<<< HEAD
     pub fn write_bytes_acknowledged(
         &self,
         bytes: Bytes,
         timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         self.io.write_bytes_acknowledged(bytes, timeout)
-=======
+    }
+
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         self.io.send_bytes_after(bytes, delay);
->>>>>>> upstream/master
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

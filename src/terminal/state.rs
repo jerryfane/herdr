@@ -1962,11 +1962,7 @@ impl TerminalState {
             self.clear_agent_name();
         }
         self.hook_authority = None;
-<<<<<<< HEAD
         self.composer_write = None;
-        self.clear_agent_name();
-=======
->>>>>>> upstream/master
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
         }
