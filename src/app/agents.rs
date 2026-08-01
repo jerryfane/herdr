@@ -439,8 +439,11 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 }
 
 fn live_agent_for_pid(pid: u32) -> Option<crate::detect::Agent> {
-    let job = crate::detect::foreground_job(pid)?;
-    crate::detect::identify_agent_in_job(&job)
+    live_agent_in_job(&crate::detect::foreground_job(pid)?)
+}
+
+fn live_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<crate::detect::Agent> {
+    crate::detect::identify_agent_in_job(job)
         .map(|(agent, _)| agent)
         .or_else(|| {
             job.processes
@@ -449,20 +452,32 @@ fn live_agent_for_pid(pid: u32) -> Option<crate::detect::Agent> {
         })
 }
 
-/// Builds a guard that re-answers "does this pane still host the expected
-/// agent?" at the moment it is called.
+/// Builds a guard that re-answers "is this still the SAME agent process?" at the
+/// moment it is called.
 ///
-/// `runtime_hosts_agent` answers that question once, for the caller's instant.
-/// A delayed write needs it answered again when the write actually happens, so
-/// the guard captures only the pid and the expected identity and re-reads the
-/// foreground job on each call.
+/// Comparing agent *kind* is not enough. A pane whose agent exits and restarts
+/// inside the delay window hosts a different process that identifies as the same
+/// kind, so a kind-only check passes and the submitting key lands in a fresh
+/// session that never received the prompt text. The foreground process group id
+/// distinguishes instances: a restarted agent gets a new one.
 pub(super) fn runtime_agent_guard(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
 ) -> Box<dyn Fn() -> bool + Send + Sync> {
     let pid = runtime.child_pid();
+    let expected_group =
+        pid.and_then(|pid| crate::detect::foreground_job(pid).map(|job| job.process_group_id));
     Box::new(move || match pid {
-        Some(pid) => live_agent_for_pid(pid) == Some(expected),
+        Some(pid) => {
+            let Some(job) = crate::detect::foreground_job(pid) else {
+                return false;
+            };
+            // Same process group AND same agent kind. Either alone lets a
+            // restart through: the group can be reused in principle, and the
+            // kind is identical across a restart by definition.
+            let same_instance = expected_group == Some(job.process_group_id);
+            same_instance && live_agent_in_job(&job) == Some(expected)
+        }
         // Only the test harness has a runtime without a child pid; a real pane
         // always has one, so its absence in production cannot confirm occupancy.
         None => cfg!(test),
