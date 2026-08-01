@@ -146,7 +146,12 @@ impl App {
         // an occupant change inside the window would otherwise deliver a bare
         // Enter to whatever inherited the pane, submitting whatever sits in its
         // line buffer, after the caller was already told the prompt was received.
-        let submit_abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A fresh watch per prompt. Reusing the previous one would let an
+        // abandoned submit from an earlier attempt keep reporting against this
+        // one — a field that stays true after it stops being true is how #31's
+        // misattribution happened in the first place.
+        let submit_abandoned =
+            std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
         runtime.send_bytes_after_guarded(
             Bytes::from(enter),
             AGENT_PROMPT_SUBMIT_DELAY,
@@ -508,7 +513,7 @@ mod tests {
         // delayed Enter fires — exactly the #26 window.
         let still_hosting = Arc::new(AtomicBool::new(true));
         let guard_flag = Arc::clone(&still_hosting);
-        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(crate::terminal::PromptSubmitWatch::default());
 
         runtime
             .write_bytes_acknowledged(
@@ -540,7 +545,7 @@ mod tests {
             "a bare Enter reached a pane whose occupant had changed: {late:?}"
         );
         assert!(
-            abandoned.load(Ordering::SeqCst),
+            abandoned.abandoned.load(Ordering::SeqCst),
             "withholding the Enter must be observable, not silent"
         );
     }
@@ -557,7 +562,7 @@ mod tests {
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80, 24, 0, b"", 1,
             );
-        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(crate::terminal::PromptSubmitWatch::default());
         runtime.send_bytes_after_guarded(
             Bytes::from_static(b"\r"),
             AGENT_PROMPT_SUBMIT_DELAY,
@@ -569,7 +574,94 @@ mod tests {
             .expect("Enter should arrive")
             .expect("channel open");
         assert_eq!(delivered, Bytes::from_static(b"\r"));
-        assert!(!abandoned.load(Ordering::SeqCst));
+        assert!(!abandoned.abandoned.load(Ordering::SeqCst));
+        assert!(
+            abandoned.submitted.load(Ordering::SeqCst),
+            "a delivered Enter must record that the prompt submitted"
+        );
+    }
+
+    /// #31 acceptance, behavioural, with today's behaviour as the mutant.
+    ///
+    /// Submit a prompt via the API so the composer empties, then introduce
+    /// composer content that did NOT come from that prompt. The report must not
+    /// credit the submitted prompt.
+    ///
+    /// The trap #31 names explicitly: asserting merely that some provenance
+    /// value is present PASSES ON THE BUG, because the bug supplies a confident
+    /// wrong value. So this asserts the negative — the spent attempt must be
+    /// gone — not just that a field is populated.
+    #[tokio::test]
+    async fn submitted_prompt_stops_owning_the_composer_it_already_emptied() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 1,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target: public_pane_id.clone(),
+                text: "api prompt".into(),
+                wait: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+            panic!("expected prompted response");
+        };
+        let submitted_attempt = agent
+            .composer
+            .attempt_id
+            .clone()
+            .expect("the prompt should expose its attempt");
+        assert_eq!(
+            agent.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt
+        );
+
+        // Let the delayed Enter land; the prompt is now submitted and the
+        // composer it wrote into has been emptied by that submission.
+        let _ = rx.try_recv();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let watch = terminal
+            .prompt_submit_abandoned
+            .as_ref()
+            .expect("the prompt should register a submit watch");
+        assert!(
+            watch.submitted.load(Ordering::SeqCst),
+            "the Enter was written, so the prompt submitted"
+        );
+
+        // Whatever appears in the composer from here did not come from that
+        // prompt. It must not be credited to it.
+        let after = app.agent_info(0, pane_id).expect("agent info");
+        assert_ne!(
+            after.composer.attempt_id.as_deref(),
+            Some(submitted_attempt.as_str()),
+            "a submitted prompt must stop being reported as the current attempt"
+        );
+        assert_ne!(
+            after.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt,
+            "keyboard-origin composer text must not inherit the last prompter's identity"
+        );
     }
 
     #[tokio::test]

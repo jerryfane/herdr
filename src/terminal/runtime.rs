@@ -434,7 +434,7 @@ impl TerminalRuntime {
         bytes: Bytes,
         delay: std::time::Duration,
         guard: Box<dyn Fn() -> bool + Send + Sync>,
-        abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        abandoned: Option<std::sync::Arc<crate::terminal::PromptSubmitWatch>>,
     ) {
         self.0
             .send_bytes_after_guarded(bytes, delay, guard, abandoned);

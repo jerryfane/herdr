@@ -79,6 +79,20 @@
           ],
           "type": "string"
         },
+        "ComposerAuthor": {
+          "oneOf": [
+            {
+              "const": "human",
+              "description": "Typed or pasted at the keyboard by a person.",
+              "type": "string"
+            },
+            {
+              "const": "api_client",
+              "description": "Written by a client through the JSON API.",
+              "type": "string"
+            }
+          ]
+        },
         "ComposerCursorEvidence": {
           "enum": [
             "draft",
@@ -122,6 +136,17 @@
                 "string",
                 "null"
               ]
+            },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/ComposerAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who put this text here, as distinct from `provenance`, which says only\nhow it arrived. `provenance: agent_prompt` names a channel and was\nroutinely read as naming a sender; that inference is what misattributed\neleven keyboard-typed messages to the last API prompter (#31)."
             },
             "evidence": {
               "$ref": "#/schemas/event/$defs/ComposerEvidence",
@@ -6230,6 +6255,20 @@
           ],
           "type": "string"
         },
+        "ComposerAuthor": {
+          "oneOf": [
+            {
+              "const": "human",
+              "description": "Typed or pasted at the keyboard by a person.",
+              "type": "string"
+            },
+            {
+              "const": "api_client",
+              "description": "Written by a client through the JSON API.",
+              "type": "string"
+            }
+          ]
+        },
         "ComposerCursorEvidence": {
           "enum": [
             "draft",
@@ -6273,6 +6312,17 @@
                 "string",
                 "null"
               ]
+            },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/ComposerAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who put this text here, as distinct from `provenance`, which says only\nhow it arrived. `provenance: agent_prompt` names a channel and was\nroutinely read as naming a sender; that inference is what misattributed\neleven keyboard-typed messages to the last API prompter (#31)."
             },
             "evidence": {
               "$ref": "#/schemas/subscription_event/$defs/ComposerEvidence",
@@ -7142,6 +7192,20 @@
           ],
           "type": "string"
         },
+        "ComposerAuthor": {
+          "oneOf": [
+            {
+              "const": "human",
+              "description": "Typed or pasted at the keyboard by a person.",
+              "type": "string"
+            },
+            {
+              "const": "api_client",
+              "description": "Written by a client through the JSON API.",
+              "type": "string"
+            }
+          ]
+        },
         "ComposerCursorEvidence": {
           "enum": [
             "draft",
@@ -7185,6 +7249,17 @@
                 "string",
                 "null"
               ]
+            },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ComposerAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who put this text here, as distinct from `provenance`, which says only\nhow it arrived. `provenance: agent_prompt` names a channel and was\nroutinely read as naming a sender; that inference is what misattributed\neleven keyboard-typed messages to the last API prompter (#31)."
             },
             "evidence": {
               "$ref": "#/schemas/success_response/$defs/ComposerEvidence",

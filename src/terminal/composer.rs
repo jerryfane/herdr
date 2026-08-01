@@ -70,6 +70,20 @@ pub(crate) struct ComposerAssessment {
     pub(crate) visual: ComposerVisualObservation,
 }
 
+/// What a delayed agent-prompt submission learned when its moment arrived.
+///
+/// Both facts matter and they are not opposites. `abandoned` means the guard
+/// refused to write because the pane changed hands, so text is stranded in a
+/// composer with no turn. `submitted` means the key was written, so the
+/// composer emptied — and therefore any text seen there afterwards belongs to
+/// someone else, which is what stops a spent prompt from being credited with a
+/// human's keystrokes.
+#[derive(Debug, Default)]
+pub struct PromptSubmitWatch {
+    pub abandoned: std::sync::atomic::AtomicBool,
+    pub submitted: std::sync::atomic::AtomicBool,
+}
+
 pub(crate) fn fresh_composer_attempt_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let clock = SystemTime::now()

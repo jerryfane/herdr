@@ -6,7 +6,7 @@ pub mod state;
 mod title;
 
 pub(crate) use composer::{
-    assess_composer, ComposerAssessment, ComposerAssessmentState, ComposerCursorObservation,
+    assess_composer, ComposerAssessment, PromptSubmitWatch, ComposerAssessmentState, ComposerCursorObservation,
     ComposerInputSource, ComposerRegionObservation, ComposerStyleObservation,
     ComposerVisualObservation, ComposerWrite,
 };

@@ -546,6 +546,21 @@ pub struct ComposerInfo {
     /// prompt was received, so this is the only place that fact surfaces.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub submit_abandoned: bool,
+    /// Who put this text here, as distinct from `provenance`, which says only
+    /// how it arrived. `provenance: agent_prompt` names a channel and was
+    /// routinely read as naming a sender; that inference is what misattributed
+    /// eleven keyboard-typed messages to the last API prompter (#31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<ComposerAuthor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerAuthor {
+    /// Typed or pasted at the keyboard by a person.
+    Human,
+    /// Written by a client through the JSON API.
+    ApiClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

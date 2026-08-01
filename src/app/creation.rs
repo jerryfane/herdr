@@ -44,6 +44,13 @@ fn composer_info_from_assessment(
 
     crate::api::schema::ComposerInfo {
         submit_abandoned: false,
+        author: match assessment.source {
+            Some(ComposerInputSource::Human) => Some(crate::api::schema::ComposerAuthor::Human),
+            Some(ComposerInputSource::Api) | Some(ComposerInputSource::AgentPrompt) => {
+                Some(crate::api::schema::ComposerAuthor::ApiClient)
+            }
+            None => None,
+        },
         state: match assessment.state {
             ComposerAssessmentState::Empty => State::Empty,
             ComposerAssessmentState::DraftPresent => State::DraftPresent,
@@ -128,7 +135,7 @@ impl App {
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
-        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        flag: std::sync::Arc<crate::terminal::PromptSubmitWatch>,
     ) {
         let Some(terminal_id) = self
             .state
@@ -581,11 +588,26 @@ impl App {
             })
             .map(composer_info_from_assessment)
             .map(|mut composer| {
+                use std::sync::atomic::Ordering;
+                let watch = terminal.prompt_submit_abandoned.as_ref();
+                // Union of both lines: master's displaced-watch signal (#32 F2)
+                // OR this watch's own abandonment.
                 composer.submit_abandoned = terminal.displaced_submit_unknown
-                    || terminal
-                        .prompt_submit_abandoned
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                    || watch.is_some_and(|watch| watch.abandoned.load(Ordering::SeqCst));
+
+                // #31: a submitted prompt empties the composer, so it cannot be
+                // the author of text seen afterwards. Without this, keyboard
+                // input inherits the last prompter's identity and a stale
+                // attempt_id — reported confidently, and wrongly.
+                let spent = watch.is_some_and(|watch| watch.submitted.load(Ordering::SeqCst));
+                if spent
+                    && composer.evidence.provenance
+                        == crate::api::schema::ComposerProvenance::AgentPrompt
+                {
+                    composer.evidence.provenance = crate::api::schema::ComposerProvenance::None;
+                    composer.attempt_id = None;
+                    composer.author = None;
+                }
                 composer
             })
             .unwrap_or_default();

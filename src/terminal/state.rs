@@ -256,7 +256,7 @@ pub struct TerminalState {
     /// because the pane's occupant changed inside the submit delay. The prompt
     /// text is in the composer and no turn was started, so the caller's earlier
     /// success response is now known to be incomplete.
-    pub(crate) prompt_submit_abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) prompt_submit_abandoned: Option<std::sync::Arc<super::PromptSubmitWatch>>,
     /// A prompt watch was displaced while still armed, so its outcome is
     /// unknowable. Reported as abandonment because "we cannot tell" must never
     /// read as "it submitted".
