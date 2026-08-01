@@ -10,7 +10,7 @@ pub(crate) use history_read::{merge_scrolled_up, snapshot_text, ScreenSnapshot, 
 pub(crate) use composer::{
     assess_composer, ComposerAssessment, ComposerAssessmentState, ComposerCursorObservation,
     ComposerInputSource, ComposerRegionObservation, ComposerStyleObservation,
-    ComposerVisualObservation, ComposerWrite,
+    ComposerVisualObservation, ComposerWrite, PromptSubmitWatch,
 };
 pub use id::TerminalId;
 pub use runtime::TerminalRuntime;
