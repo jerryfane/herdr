@@ -150,8 +150,7 @@ impl App {
         // abandoned submit from an earlier attempt keep reporting against this
         // one — a field that stays true after it stops being true is how #31's
         // misattribution happened in the first place.
-        let submit_abandoned =
-            std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
+        let submit_abandoned = std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
         // Baseline the turn counter at write time. Without this the counter reads
         // zero and the retirement test degenerates to "this pane has ever
         // completed a turn", which is true almost always — i.e. back to the

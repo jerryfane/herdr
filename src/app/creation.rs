@@ -153,7 +153,12 @@ impl App {
             // exists to make loss visible. Displacing an ARMED watch is itself
             // an unknown outcome, so record it rather than dropping it.
             if let Some(previous) = terminal.prompt_submit_abandoned.replace(flag) {
-                if !previous.load(std::sync::atomic::Ordering::SeqCst) {
+                // "Unresolved" now means neither outcome was recorded: the
+                // watch grew a second flag in #31, so checking abandonment
+                // alone would treat a SUBMITTED prompt as displaced-unknown.
+                let resolved = previous.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+                    || previous.submitted.load(std::sync::atomic::Ordering::SeqCst);
+                if !resolved {
                     terminal.displaced_submit_unknown = true;
                 }
             }
