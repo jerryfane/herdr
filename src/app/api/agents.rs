@@ -151,19 +151,6 @@ impl App {
         // one — a field that stays true after it stops being true is how #31's
         // misattribution happened in the first place.
         let submit_abandoned = std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
-        // Baseline the turn counter at write time. Without this the counter reads
-        // zero and the retirement test degenerates to "this pane has ever
-        // completed a turn", which is true almost always — i.e. back to the
-        // original defect. It has now been lost twice to merge/rebase and caught
-        // twice by verification rather than by a test noticing.
-        submit_abandoned.turn_at_write.store(
-            self.state
-                .terminals
-                .get(&terminal_id)
-                .map(|terminal| terminal.turn)
-                .unwrap_or(0),
-            std::sync::atomic::Ordering::SeqCst,
-        );
         runtime.send_bytes_after_guarded(
             Bytes::from(enter),
             AGENT_PROMPT_SUBMIT_DELAY,
@@ -682,14 +669,17 @@ mod tests {
         );
     }
 
-    /// The turn baseline must be captured AT WRITE TIME, not left at zero.
+    /// #31 acceptance, driven through the PRODUCTION path.
     ///
-    /// A pane that has completed turns before the prompt already has turn > 0.
-    /// With no baseline the retirement test degenerates to "has this pane ever
-    /// completed a turn", which is true almost always — silently restoring the
-    /// original defect. Review caught that; no test did, so this is that test.
+    /// The previous version mutated terminal.turn directly and asserted
+    /// retirement — manufacturing a state production cannot reach, because
+    /// record_completed_turn_at increments the turn and destroys the watch in
+    /// the same call. It passed while the incident still reproduced.
+    ///
+    /// This drives the real sequence: prompt, let the key land, then complete a
+    /// turn the way the runtime does. Reverting resolve-at-clear kills it.
     #[tokio::test]
-    async fn the_turn_baseline_is_captured_at_write_time() {
+    async fn a_completed_turn_retires_the_submitted_prompts_claim() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -698,9 +688,6 @@ mod tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.set_agent_name("reviewer".into());
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
-        // This pane has history — exactly the common case.
-        terminal.turn = 5;
-
         let (runtime, mut rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80, 24, 0, b"", 8,
@@ -712,7 +699,7 @@ mod tests {
             "req".into(),
             AgentPromptParams {
                 target,
-                text: "with history".into(),
+                text: "api prompt".into(),
                 wait: None,
             },
         );
@@ -721,20 +708,41 @@ mod tests {
             panic!("expected prompted response");
         };
         let attempt = agent.composer.attempt_id.clone().expect("attempt id");
+        assert_eq!(
+            agent.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt
+        );
 
+        // Let the delayed key land so the watch records submitted.
         let _ = rx.try_recv();
         tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("Enter should arrive")
             .expect("channel open");
 
-        // No NEW turn has completed since the write, so the claim must stand
-        // despite the pane's pre-existing turn count.
+        // Complete a turn exactly as the runtime does — this is the call that
+        // both increments the turn and discards the watch.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .record_completed_turn(0, Default::default());
+
         let after = app.agent_info(0, pane_id).expect("agent info");
-        assert_eq!(
+        assert_ne!(
             after.composer.attempt_id.as_deref(),
             Some(attempt.as_str()),
-            "pre-existing turn history must not retire a fresh prompt's claim"
+            "a submitted prompt whose turn completed must stop being the current attempt"
+        );
+        assert_ne!(
+            after.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt,
+            "composer text must not inherit the last prompter's identity"
+        );
+        // F2: author derives from the same condemned source, so it must clear too.
+        assert!(
+            after.composer.author.is_none(),
+            "author must not report api_client for text the prompt did not write"
         );
     }
 

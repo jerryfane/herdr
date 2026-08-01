@@ -618,10 +618,10 @@ impl App {
                 // not holding a true claim slightly too long. A stranded prompt
                 // never completes a turn, so it keeps its draft forever, which
                 // is correct.
-                let spent = watch.is_some_and(|watch| {
-                    watch.submitted.load(Ordering::SeqCst)
-                        && terminal.turn > watch.turn_at_write.load(Ordering::SeqCst)
-                });
+                // Set by record_completed_turn_at when a SUBMITTED watch was
+                // discarded. Reading it here cannot race the clear, because the
+                // clear is what produces it.
+                let spent = terminal.prompt_claim_retired;
                 if spent
                     && composer.evidence.provenance
                         == crate::api::schema::ComposerProvenance::AgentPrompt

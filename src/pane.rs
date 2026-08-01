@@ -1232,7 +1232,19 @@ impl PaneRuntimeIo {
                                     .store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
-                        Err(err) => warn!(error = %err, "failed to send delayed PTY input"),
+                        Err(err) => {
+                            // A post-guard write failure strands the prompt just
+                            // as surely as a refused guard: text sits in the
+                            // composer, no turn starts, and the caller was
+                            // already told the prompt was received. Recording
+                            // neither outcome made that silent (#33 review F3).
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            warn!(error = %err, "failed to send delayed PTY input");
+                        }
                     }
                 });
             }

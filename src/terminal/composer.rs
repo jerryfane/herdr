@@ -82,15 +82,6 @@ pub(crate) struct ComposerAssessment {
 pub struct PromptSubmitWatch {
     pub abandoned: std::sync::atomic::AtomicBool,
     pub submitted: std::sync::atomic::AtomicBool,
-    /// The pane's turn counter at the moment the prompt was written.
-    ///
-    /// `submitted` says only that the key reached the PTY, which is NOT proof a
-    /// turn began — herdr#18 is exactly the case where the key was written and
-    /// the draft stranded anyway. Retiring on `submitted` alone therefore erases
-    /// attribution from a genuinely stranded prompt, which trades one wrong
-    /// answer for another. A turn counter that has since advanced is positive
-    /// evidence the composer really did empty.
-    pub turn_at_write: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn fresh_composer_attempt_id() -> String {
