@@ -600,9 +600,19 @@ impl App {
                 // input inherits the last prompter's identity and a stale
                 // attempt_id — reported confidently, and wrongly.
                 // Retire the prompt's claim only when the key was written AND a
-                // turn has since begun. Writing the key alone leaves the #18
-                // case — a stranded draft that IS the prompt's — wrongly
-                // reported as unattributed.
+                // turn has COMPLETED since. `turn` increments in
+                // record_completed_turn_at (src/terminal/state.rs:388), so it
+                // counts completions, not starts — an earlier comment here
+                // claimed "a turn has begun" and was wrong.
+                //
+                // Completion is a conservative proxy: it lags, so a prompt that
+                // submitted but whose turn is still running keeps its claim for
+                // longer than strictly necessary. That errs toward RETAINING
+                // attribution, which is the safe direction — the failure this
+                // issue exists to fix is claiming authorship we cannot support,
+                // not holding a true claim slightly too long. A stranded prompt
+                // never completes a turn, so it keeps its draft forever, which
+                // is correct.
                 let spent = watch.is_some_and(|watch| {
                     watch.submitted.load(Ordering::SeqCst)
                         && terminal.turn > watch.turn_at_write.load(Ordering::SeqCst)

@@ -152,6 +152,19 @@ impl App {
         // misattribution happened in the first place.
         let submit_abandoned =
             std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
+        // Baseline the turn counter at write time. Without this the counter reads
+        // zero and the retirement test degenerates to "this pane has ever
+        // completed a turn", which is true almost always — i.e. back to the
+        // original defect. It has now been lost twice to merge/rebase and caught
+        // twice by verification rather than by a test noticing.
+        submit_abandoned.turn_at_write.store(
+            self.state
+                .terminals
+                .get(&terminal_id)
+                .map(|terminal| terminal.turn)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         runtime.send_bytes_after_guarded(
             Bytes::from(enter),
             AGENT_PROMPT_SUBMIT_DELAY,
@@ -555,7 +568,7 @@ mod tests {
     /// fix (upstream bb29eedb).
     #[tokio::test]
     async fn delayed_enter_is_delivered_when_the_pane_is_unchanged() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::Ordering;
         use std::sync::Arc;
 
         let (runtime, mut rx) =
@@ -667,6 +680,62 @@ mod tests {
             after.composer.evidence.provenance,
             crate::api::schema::ComposerProvenance::AgentPrompt,
             "keyboard-origin composer text must not inherit the last prompter's identity"
+        );
+    }
+
+    /// The turn baseline must be captured AT WRITE TIME, not left at zero.
+    ///
+    /// A pane that has completed turns before the prompt already has turn > 0.
+    /// With no baseline the retirement test degenerates to "has this pane ever
+    /// completed a turn", which is true almost always — silently restoring the
+    /// original defect. Review caught that; no test did, so this is that test.
+    #[tokio::test]
+    async fn the_turn_baseline_is_captured_at_write_time() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        // This pane has history — exactly the common case.
+        terminal.turn = 5;
+
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target,
+                text: "with history".into(),
+                wait: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+            panic!("expected prompted response");
+        };
+        let attempt = agent.composer.attempt_id.clone().expect("attempt id");
+
+        let _ = rx.try_recv();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+
+        // No NEW turn has completed since the write, so the claim must stand
+        // despite the pane's pre-existing turn count.
+        let after = app.agent_info(0, pane_id).expect("agent info");
+        assert_eq!(
+            after.composer.attempt_id.as_deref(),
+            Some(attempt.as_str()),
+            "pre-existing turn history must not retire a fresh prompt's claim"
         );
     }
 
