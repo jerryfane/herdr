@@ -256,11 +256,15 @@ pub struct TerminalState {
     /// because the pane's occupant changed inside the submit delay. The prompt
     /// text is in the composer and no turn was started, so the caller's earlier
     /// success response is now known to be incomplete.
-    pub(crate) prompt_submit_abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) prompt_submit_abandoned: Option<std::sync::Arc<super::PromptSubmitWatch>>,
     /// A prompt watch was displaced while still armed, so its outcome is
     /// unknowable. Reported as abandonment because "we cannot tell" must never
     /// read as "it submitted".
     pub(crate) displaced_submit_unknown: bool,
+    /// A submitted prompt's turn has completed, so that prompt can no longer be
+    /// the author of composer text. Durable because the fact is only observable
+    /// at the moment the watch is discarded.
+    pub(crate) prompt_claim_retired: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
@@ -303,6 +307,7 @@ impl TerminalState {
             composer_write: None,
             prompt_submit_abandoned: None,
             displaced_submit_unknown: false,
+            prompt_claim_retired: false,
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
@@ -394,7 +399,20 @@ impl TerminalState {
         // A completed turn is the recovery point: whatever the last prompt's
         // fate was, it is no longer the pane's current state. Without this a
         // stale `true` outlives operator recovery forever (#26 review F3).
-        self.prompt_submit_abandoned = None;
+        //
+        // RESOLVE HERE, not at report time. The previous design asked the
+        // reporting path for "watch present AND turn > turn_at_write", but this
+        // function increments the turn and destroys the watch in the same
+        // synchronous call — so mid-turn the predicate was false by design and
+        // post-completion the watch was gone. The state it needed was
+        // unreachable in production, and the #31 incident still reproduced.
+        // The submitted fact is only knowable at the instant it is discarded, so
+        // it is converted into a durable one right here.
+        if let Some(watch) = self.prompt_submit_abandoned.take() {
+            if watch.submitted.load(std::sync::atomic::Ordering::SeqCst) {
+                self.prompt_claim_retired = true;
+            }
+        }
         self.displaced_submit_unknown = false;
         let current_context = self.turn_completion_context();
         let message = current_context.message.or(fallback_context.message);

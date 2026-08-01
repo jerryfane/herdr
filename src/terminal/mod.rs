@@ -8,7 +8,7 @@ mod title;
 pub(crate) use composer::{
     assess_composer, ComposerAssessment, ComposerAssessmentState, ComposerCursorObservation,
     ComposerInputSource, ComposerRegionObservation, ComposerStyleObservation,
-    ComposerVisualObservation, ComposerWrite,
+    ComposerVisualObservation, ComposerWrite, PromptSubmitWatch,
 };
 pub use id::TerminalId;
 pub use runtime::TerminalRuntime;

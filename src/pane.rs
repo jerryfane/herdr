@@ -1206,7 +1206,7 @@ impl PaneRuntimeIo {
         bytes: Bytes,
         delay: std::time::Duration,
         guard: Box<dyn Fn() -> bool + Send + Sync>,
-        abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        abandoned: Option<std::sync::Arc<crate::terminal::PromptSubmitWatch>>,
     ) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
@@ -1214,16 +1214,37 @@ impl PaneRuntimeIo {
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     if !guard() {
-                        if let Some(flag) = abandoned {
-                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(watch) = abandoned {
+                            watch
+                                .abandoned
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         warn!(
                             "delayed PTY input withheld: pane occupant changed during the submit delay"
                         );
                         return;
                     }
-                    if let Err(err) = actor.write_user_input(bytes).await {
-                        warn!(error = %err, "failed to send delayed PTY input");
+                    match actor.write_user_input(bytes).await {
+                        Ok(()) => {
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .submitted
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        Err(err) => {
+                            // A post-guard write failure strands the prompt just
+                            // as surely as a refused guard: text sits in the
+                            // composer, no turn starts, and the caller was
+                            // already told the prompt was received. Recording
+                            // neither outcome made that silent (#33 review F3).
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            warn!(error = %err, "failed to send delayed PTY input");
+                        }
                     }
                 });
             }
@@ -1233,12 +1254,32 @@ impl PaneRuntimeIo {
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     if !guard() {
-                        if let Some(flag) = abandoned {
-                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(watch) = abandoned {
+                            watch
+                                .abandoned
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         return;
                     }
-                    let _ = sender.send(bytes).await;
+                    match sender.send(bytes).await {
+                        Ok(()) => {
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .submitted
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        // Mirrors the Actor arm. Without this the F3 failure path
+                        // was unreachable from any test, which is how it stayed
+                        // silent through two rounds.
+                        Err(_) => {
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -2832,7 +2873,7 @@ impl PaneRuntime {
         bytes: Bytes,
         delay: std::time::Duration,
         guard: Box<dyn Fn() -> bool + Send + Sync>,
-        abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        abandoned: Option<std::sync::Arc<crate::terminal::PromptSubmitWatch>>,
     ) {
         self.io
             .send_bytes_after_guarded(bytes, delay, guard, abandoned);
