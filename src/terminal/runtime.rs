@@ -429,10 +429,6 @@ impl TerminalRuntime {
         self.0.write_bytes_acknowledged(bytes, timeout)
     }
 
-    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.0.send_bytes_after(bytes, delay);
-    }
-
     pub fn send_bytes_after_guarded(
         &self,
         bytes: Bytes,

@@ -1191,10 +1191,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.send_bytes_after_guarded(bytes, delay, Box::new(|| true), None);
-    }
-
     /// Send after a delay, but only if `guard` still holds when the delay expires.
     ///
     /// An unguarded delayed write is not safe on an agent submit path: the write
@@ -2829,10 +2825,6 @@ impl PaneRuntime {
         timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         self.io.write_bytes_acknowledged(bytes, timeout)
-    }
-
-    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.io.send_bytes_after(bytes, delay);
     }
 
     pub fn send_bytes_after_guarded(
