@@ -135,6 +135,10 @@
             },
             "state": {
               "$ref": "#/schemas/event/$defs/ComposerState"
+            },
+            "submit_abandoned": {
+              "description": "True when a delayed prompt submission was withheld because the pane's\noccupant changed before the submitting key could be written. The text is\nin the composer and no turn started; the caller was already told the\nprompt was received, so this is the only place that fact surfaces.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -6282,6 +6286,10 @@
             },
             "state": {
               "$ref": "#/schemas/subscription_event/$defs/ComposerState"
+            },
+            "submit_abandoned": {
+              "description": "True when a delayed prompt submission was withheld because the pane's\noccupant changed before the submitting key could be written. The text is\nin the composer and no turn started; the caller was already told the\nprompt was received, so this is the only place that fact surfaces.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -7190,6 +7198,10 @@
             },
             "state": {
               "$ref": "#/schemas/success_response/$defs/ComposerState"
+            },
+            "submit_abandoned": {
+              "description": "True when a delayed prompt submission was withheld because the pane's\noccupant changed before the submitting key could be written. The text is\nin the composer and no turn started; the caller was already told the\nprompt was received, so this is the only place that fact surfaces.",
+              "type": "boolean"
             }
           },
           "required": [
