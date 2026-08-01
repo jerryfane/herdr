@@ -205,6 +205,12 @@ impl App {
                 return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
             }
         }
+        // Bind the occupant baseline HERE, before a single byte is written.
+        // Capturing it after the blocking acknowledgement would adopt whatever
+        // occupies the pane by then as the expected occupant, so a same-kind
+        // swap during the write/ack window would be baselined as legitimate and
+        // the delayed key would land in a session that never received the text.
+        let expected_group = super::super::agents::capture_occupant_group(runtime);
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         #[cfg(windows)]
@@ -650,6 +656,92 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
+    }
+
+    /// #26: the submitting Enter is scheduled, not sent, when the identity check
+    /// runs. If the pane's occupant changes inside the delay window, an
+    /// unguarded delayed write delivers a bare Enter to whatever inherited the
+    /// pane — submitting whatever sits in its line buffer — after the caller was
+    /// already told the prompt was received.
+    ///
+    /// Asserts on what reached the PTY, not on a log line. Remove the guard
+    /// argument from the scheduling call and this must fail.
+    #[tokio::test]
+    async fn delayed_enter_is_withheld_when_the_pane_occupant_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 1,
+            );
+
+        // Occupant is unchanged when the text is written, then changes before the
+        // delayed Enter fires — exactly the #26 window.
+        let still_hosting = Arc::new(AtomicBool::new(true));
+        let guard_flag = Arc::clone(&still_hosting);
+        let abandoned = Arc::new(AtomicBool::new(false));
+
+        runtime
+            .write_bytes_acknowledged(
+                Bytes::from_static(b"prompt text"),
+                std::time::Duration::from_secs(5),
+            )
+            .expect("text should reach the PTY");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"prompt text"));
+
+        runtime.send_bytes_after_guarded(
+            Bytes::from_static(b"\r"),
+            AGENT_PROMPT_SUBMIT_DELAY,
+            Box::new(move || guard_flag.load(Ordering::SeqCst)),
+            Some(Arc::clone(&abandoned)),
+        );
+
+        // The pane changes hands while the Enter is still pending.
+        still_hosting.store(false, Ordering::SeqCst);
+
+        // Nothing further may reach the PTY. Wait well past the delay so a
+        // delivered Enter would have arrived.
+        let late = tokio::time::timeout(
+            AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(400),
+            rx.recv(),
+        )
+        .await;
+        assert!(
+            late.is_err(),
+            "a bare Enter reached a pane whose occupant had changed: {late:?}"
+        );
+        assert!(
+            abandoned.load(Ordering::SeqCst),
+            "withholding the Enter must be observable, not silent"
+        );
+    }
+
+    /// The guard must not withhold the Enter when the occupant is unchanged —
+    /// otherwise every prompt would strand, which is the bug the delay exists to
+    /// fix (upstream bb29eedb).
+    #[tokio::test]
+    async fn delayed_enter_is_delivered_when_the_pane_is_unchanged() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 1,
+            );
+        let abandoned = Arc::new(AtomicBool::new(false));
+        runtime.send_bytes_after_guarded(
+            Bytes::from_static(b"\r"),
+            AGENT_PROMPT_SUBMIT_DELAY,
+            Box::new(|| true),
+            Some(Arc::clone(&abandoned)),
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+        assert_eq!(delivered, Bytes::from_static(b"\r"));
+        assert!(!abandoned.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
