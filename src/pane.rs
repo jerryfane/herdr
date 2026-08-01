@@ -2842,7 +2842,8 @@ impl PaneRuntime {
         guard: Box<dyn Fn() -> bool + Send + Sync>,
         abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) {
-        self.io.send_bytes_after_guarded(bytes, delay, guard, abandoned);
+        self.io
+            .send_bytes_after_guarded(bytes, delay, guard, abandoned);
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
