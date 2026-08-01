@@ -152,6 +152,13 @@ impl App {
             // unobservable — a silent-loss channel in the very mechanism that
             // exists to make loss visible. Displacing an ARMED watch is itself
             // an unknown outcome, so record it rather than dropping it.
+            // A retirement belongs to the prompt that earned it. Arming a NEW
+            // watch means a new claim exists, so the old verdict must not be
+            // applied to it — left sticky, `spent` degenerates into
+            // "has this pane ever retired", and every later prompt is stripped
+            // of provenance, attempt_id and author at report time. That is the
+            // same degeneration family as the dead turn_at_write predicate.
+            terminal.prompt_claim_retired = false;
             if let Some(previous) = terminal.prompt_submit_abandoned.replace(flag) {
                 // "Unresolved" now means neither outcome was recorded: the
                 // watch grew a second flag in #31, so checking abandonment

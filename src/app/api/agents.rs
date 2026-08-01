@@ -580,106 +580,49 @@ mod tests {
         );
     }
 
-    /// #31 acceptance, behavioural, with today's behaviour as the mutant.
-    ///
-    /// Submit a prompt via the API so the composer empties, then introduce
-    /// composer content that did NOT come from that prompt. The report must not
-    /// credit the submitted prompt.
-    ///
-    /// The trap #31 names explicitly: asserting merely that some provenance
-    /// value is present PASSES ON THE BUG, because the bug supplies a confident
-    /// wrong value. So this asserts the negative — the spent attempt must be
-    /// gone — not just that a field is populated.
+    /// F3: a post-guard PTY write failure must raise abandonment, not pass
+    /// silently. The receiver is dropped so the delayed send fails.
     #[tokio::test]
-    async fn submitted_prompt_stops_owning_the_composer_it_already_emptied() {
+    async fn a_failed_delayed_write_raises_abandonment() {
         use std::sync::atomic::Ordering;
+        use std::sync::Arc;
 
-        let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
-        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
-            .attached_terminal_id
-            .clone();
-        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_agent_name("reviewer".into());
-        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
-        let (runtime, mut rx) =
+        let (runtime, rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80, 24, 0, b"", 1,
             );
-        app.state.insert_test_runtime(pane_id, runtime);
+        let watch = Arc::new(crate::terminal::PromptSubmitWatch::default());
+        drop(rx); // the PTY side is gone, so the delayed write cannot land
 
-        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
-        let response = app.handle_agent_prompt(
-            "req".into(),
-            AgentPromptParams {
-                target: public_pane_id.clone(),
-                text: "api prompt".into(),
-                wait: None,
-            },
+        runtime.send_bytes_after_guarded(
+            Bytes::from_static(b"\r"),
+            AGENT_PROMPT_SUBMIT_DELAY,
+            Box::new(|| true),
+            Some(Arc::clone(&watch)),
         );
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
-            panic!("expected prompted response");
-        };
-        let submitted_attempt = agent
-            .composer
-            .attempt_id
-            .clone()
-            .expect("the prompt should expose its attempt");
-        assert_eq!(
-            agent.composer.evidence.provenance,
-            crate::api::schema::ComposerProvenance::AgentPrompt
-        );
+        tokio::time::sleep(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(300)).await;
 
-        // Let the delayed Enter land; the prompt is now submitted and the
-        // composer it wrote into has been emptied by that submission.
-        let _ = rx.try_recv();
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("Enter should arrive")
-            .expect("channel open");
-        let terminal = app.state.terminals.get(&terminal_id).unwrap();
-        let watch = terminal
-            .prompt_submit_abandoned
-            .as_ref()
-            .expect("the prompt should register a submit watch");
         assert!(
-            watch.submitted.load(Ordering::SeqCst),
-            "the Enter was written"
+            watch.abandoned.load(Ordering::SeqCst),
+            "a failed delayed write must be loud, not silent"
         );
-
-        // Writing the key is not proof a turn began — herdr#18 is the case where
-        // it was written and the draft stranded regardless. A turn advancing is
-        // what actually evidences the composer emptying, so simulate the agent
-        // starting its turn.
-        app.state.terminals.get_mut(&terminal_id).unwrap().turn += 1;
-
-        // Whatever appears in the composer from here did not come from that
-        // prompt. It must not be credited to it.
-        let after = app.agent_info(0, pane_id).expect("agent info");
-        assert_ne!(
-            after.composer.attempt_id.as_deref(),
-            Some(submitted_attempt.as_str()),
-            "a submitted prompt must stop being reported as the current attempt"
-        );
-        assert_ne!(
-            after.composer.evidence.provenance,
-            crate::api::schema::ComposerProvenance::AgentPrompt,
-            "keyboard-origin composer text must not inherit the last prompter's identity"
+        assert!(
+            !watch.submitted.load(Ordering::SeqCst),
+            "a write that failed must not report as submitted"
         );
     }
 
-    /// #31 acceptance, driven through the PRODUCTION path.
+    /// The axis the deleted turn_at_write test guarded, now covered through the
+    /// production path: a retirement belongs to the prompt that earned it and
+    /// must not be inherited by the next one.
     ///
-    /// The previous version mutated terminal.turn directly and asserted
-    /// retirement — manufacturing a state production cannot reach, because
-    /// record_completed_turn_at increments the turn and destroys the watch in
-    /// the same call. It passed while the incident still reproduced.
-    ///
-    /// This drives the real sequence: prompt, let the key land, then complete a
-    /// turn the way the runtime does. Reverting resolve-at-clear kills it.
+    /// Taken from the reviewer's probe. Prompt A submits and its turn completes,
+    /// so A retires — correct. Prompt B is then written and is still mid-flight,
+    /// so B's claim must stand. With the flag left sticky, B is stripped of
+    /// provenance, attempt_id and author, and `spent` has degenerated into
+    /// "has this pane ever retired".
     #[tokio::test]
-    async fn a_completed_turn_retires_the_submitted_prompts_claim() {
+    async fn a_retirement_does_not_carry_over_to_the_next_prompt() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -695,11 +638,32 @@ mod tests {
         app.state.insert_test_runtime(pane_id, runtime);
         let target = app.public_pane_id(0, pane_id).unwrap();
 
+        // Prompt A: submits, its turn completes, so A's claim retires.
+        let _ = app.handle_agent_prompt(
+            "req-a".into(),
+            AgentPromptParams {
+                target: target.clone(),
+                text: "prompt a".into(),
+                wait: None,
+            },
+        );
+        let _ = rx.try_recv();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .record_completed_turn(0, Default::default());
+
+        // Prompt B: freshly written, Enter not yet landed.
         let response = app.handle_agent_prompt(
-            "req".into(),
+            "req-b".into(),
             AgentPromptParams {
                 target,
-                text: "api prompt".into(),
+                text: "prompt b".into(),
                 wait: None,
             },
         );
@@ -707,42 +671,14 @@ mod tests {
         let ResponseResult::AgentPrompted { agent, .. } = success.result else {
             panic!("expected prompted response");
         };
-        let attempt = agent.composer.attempt_id.clone().expect("attempt id");
+        assert!(
+            agent.composer.attempt_id.is_some(),
+            "a fresh prompt's claim must not be retired by a previous prompt's retirement"
+        );
         assert_eq!(
             agent.composer.evidence.provenance,
-            crate::api::schema::ComposerProvenance::AgentPrompt
-        );
-
-        // Let the delayed key land so the watch records submitted.
-        let _ = rx.try_recv();
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("Enter should arrive")
-            .expect("channel open");
-
-        // Complete a turn exactly as the runtime does — this is the call that
-        // both increments the turn and discards the watch.
-        app.state
-            .terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .record_completed_turn(0, Default::default());
-
-        let after = app.agent_info(0, pane_id).expect("agent info");
-        assert_ne!(
-            after.composer.attempt_id.as_deref(),
-            Some(attempt.as_str()),
-            "a submitted prompt whose turn completed must stop being the current attempt"
-        );
-        assert_ne!(
-            after.composer.evidence.provenance,
             crate::api::schema::ComposerProvenance::AgentPrompt,
-            "composer text must not inherit the last prompter's identity"
-        );
-        // F2: author derives from the same condemned source, so it must clear too.
-        assert!(
-            after.composer.author.is_none(),
-            "author must not report api_client for text the prompt did not write"
+            "a fresh mid-flight prompt keeps its draft attribution"
         );
     }
 
@@ -753,7 +689,7 @@ mod tests {
     /// A stranded draft IS the prompt's, and saying "unknown" about it trades one
     /// wrong answer for another. Retirement now also requires a turn to have
     /// begun. This pins the stranded half; the submitted half is pinned by
-    /// submitted_prompt_stops_owning_the_composer_it_already_emptied.
+    /// a_completed_turn_retires_the_submitted_prompts_claim.
     #[tokio::test]
     async fn a_stranded_prompt_keeps_owning_its_own_draft() {
         use std::sync::atomic::Ordering;

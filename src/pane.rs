@@ -1261,11 +1261,23 @@ impl PaneRuntimeIo {
                         }
                         return;
                     }
-                    if sender.send(bytes).await.is_ok() {
-                        if let Some(watch) = abandoned {
-                            watch
-                                .submitted
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                    match sender.send(bytes).await {
+                        Ok(()) => {
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .submitted
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        // Mirrors the Actor arm. Without this the F3 failure path
+                        // was unreachable from any test, which is how it stayed
+                        // silent through two rounds.
+                        Err(_) => {
+                            if let Some(watch) = abandoned {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
                         }
                     }
                 });
