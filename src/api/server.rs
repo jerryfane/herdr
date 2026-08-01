@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -518,7 +518,7 @@ fn read_initial_request_line_with_limits(
 mod windows_tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc::{self, Receiver};
 
     fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
@@ -903,7 +903,7 @@ mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{Mutex, OnceLock};
