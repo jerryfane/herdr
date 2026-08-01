@@ -599,7 +599,14 @@ impl App {
                 // the author of text seen afterwards. Without this, keyboard
                 // input inherits the last prompter's identity and a stale
                 // attempt_id — reported confidently, and wrongly.
-                let spent = watch.is_some_and(|watch| watch.submitted.load(Ordering::SeqCst));
+                // Retire the prompt's claim only when the key was written AND a
+                // turn has since begun. Writing the key alone leaves the #18
+                // case — a stranded draft that IS the prompt's — wrongly
+                // reported as unattributed.
+                let spent = watch.is_some_and(|watch| {
+                    watch.submitted.load(Ordering::SeqCst)
+                        && terminal.turn > watch.turn_at_write.load(Ordering::SeqCst)
+                });
                 if spent
                     && composer.evidence.provenance
                         == crate::api::schema::ComposerProvenance::AgentPrompt

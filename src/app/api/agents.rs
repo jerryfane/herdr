@@ -646,8 +646,14 @@ mod tests {
             .expect("the prompt should register a submit watch");
         assert!(
             watch.submitted.load(Ordering::SeqCst),
-            "the Enter was written, so the prompt submitted"
+            "the Enter was written"
         );
+
+        // Writing the key is not proof a turn began — herdr#18 is the case where
+        // it was written and the draft stranded regardless. A turn advancing is
+        // what actually evidences the composer emptying, so simulate the agent
+        // starting its turn.
+        app.state.terminals.get_mut(&terminal_id).unwrap().turn += 1;
 
         // Whatever appears in the composer from here did not come from that
         // prompt. It must not be credited to it.
@@ -661,6 +667,81 @@ mod tests {
             after.composer.evidence.provenance,
             crate::api::schema::ComposerProvenance::AgentPrompt,
             "keyboard-origin composer text must not inherit the last prompter's identity"
+        );
+    }
+
+    /// Reviewer finding on #33: retiring on "the key was written" alone erases
+    /// attribution from a genuinely STRANDED prompt — the herdr#18 case, where
+    /// the Enter reached the PTY and the draft sat in the composer anyway.
+    ///
+    /// A stranded draft IS the prompt's, and saying "unknown" about it trades one
+    /// wrong answer for another. Retirement now also requires a turn to have
+    /// begun. This pins the stranded half; the submitted half is pinned by
+    /// submitted_prompt_stops_owning_the_composer_it_already_emptied.
+    #[tokio::test]
+    async fn a_stranded_prompt_keeps_owning_its_own_draft() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target,
+                text: "stranded text".into(),
+                wait: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+            panic!("expected prompted response");
+        };
+        let attempt = agent.composer.attempt_id.clone().expect("attempt id");
+
+        // The Enter is written — but no turn ever starts, which is what stranding
+        // looks like from the server's side.
+        let _ = rx.try_recv();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+        let watch = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .prompt_submit_abandoned
+            .as_ref()
+            .expect("submit watch")
+            .clone();
+        assert!(
+            watch.submitted.load(Ordering::SeqCst),
+            "the key was written"
+        );
+
+        let after = app.agent_info(0, pane_id).expect("agent info");
+        assert_eq!(
+            after.composer.attempt_id.as_deref(),
+            Some(attempt.as_str()),
+            "a stranded prompt must keep owning the draft it wrote"
+        );
+        assert_eq!(
+            after.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt,
+            "attribution must not be erased when no turn started"
         );
     }
 
