@@ -612,6 +612,83 @@ mod tests {
         );
     }
 
+    /// #31 acceptance, driven through the PRODUCTION path.
+    ///
+    /// The previous version mutated terminal.turn directly and asserted
+    /// retirement — manufacturing a state production cannot reach, because
+    /// record_completed_turn_at increments the turn and destroys the watch in
+    /// the same call. It passed while the incident still reproduced.
+    ///
+    /// This drives the real sequence: prompt, let the key land, then complete a
+    /// turn the way the runtime does. Reverting resolve-at-clear kills it.
+    #[tokio::test]
+    async fn a_completed_turn_retires_the_submitted_prompts_claim() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target,
+                text: "api prompt".into(),
+                wait: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+            panic!("expected prompted response");
+        };
+        let attempt = agent.composer.attempt_id.clone().expect("attempt id");
+        assert_eq!(
+            agent.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt
+        );
+
+        // Let the delayed key land so the watch records submitted.
+        let _ = rx.try_recv();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Enter should arrive")
+            .expect("channel open");
+
+        // Complete a turn exactly as the runtime does — this is the call that
+        // both increments the turn and discards the watch.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .record_completed_turn(0, Default::default());
+
+        let after = app.agent_info(0, pane_id).expect("agent info");
+        assert_ne!(
+            after.composer.attempt_id.as_deref(),
+            Some(attempt.as_str()),
+            "a submitted prompt whose turn completed must stop being the current attempt"
+        );
+        assert_ne!(
+            after.composer.evidence.provenance,
+            crate::api::schema::ComposerProvenance::AgentPrompt,
+            "composer text must not inherit the last prompter's identity"
+        );
+        // F2: author derives from the same condemned source, so it must clear too.
+        assert!(
+            after.composer.author.is_none(),
+            "author must not report api_client for text the prompt did not write"
+        );
+    }
+
     /// The axis the deleted turn_at_write test guarded, now covered through the
     /// production path: a retirement belongs to the prompt that earned it and
     /// must not be inherited by the next one.
