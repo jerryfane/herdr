@@ -452,6 +452,29 @@ fn live_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<crate::dete
         })
 }
 
+/// Decides whether the pane still hosts the same agent process.
+///
+/// Split out from the guard closure deliberately: the closure short-circuits on
+/// `child_pid() == None`, which is always the case in the harness, so the real
+/// comparison had no test at all — a reviewer removed the `same_instance`
+/// conjunction and every test still passed.
+///
+/// Both conditions are required. The kind is identical across a restart by
+/// definition, so kind alone lets a restarted agent through. The group alone
+/// would accept a different agent adopted into the same group. Neither is
+/// sufficient, and together they are still only a narrowing — a wrapper that
+/// restarts the agent inside the existing group defeats both (see #26 review).
+pub(super) fn occupant_unchanged(
+    expected_group: Option<u32>,
+    expected: crate::detect::Agent,
+    job: Option<&crate::platform::ForegroundJob>,
+) -> bool {
+    // No readable foreground job means we cannot confirm occupancy, and an
+    // unconfirmed occupant must not receive a submitting key.
+    let Some(job) = job else { return false };
+    expected_group == Some(job.process_group_id) && live_agent_in_job(job) == Some(expected)
+}
+
 /// Builds a guard that re-answers "is this still the SAME agent process?" at the
 /// moment it is called.
 ///
@@ -468,16 +491,11 @@ pub(super) fn runtime_agent_guard(
     let expected_group =
         pid.and_then(|pid| crate::detect::foreground_job(pid).map(|job| job.process_group_id));
     Box::new(move || match pid {
-        Some(pid) => {
-            let Some(job) = crate::detect::foreground_job(pid) else {
-                return false;
-            };
-            // Same process group AND same agent kind. Either alone lets a
-            // restart through: the group can be reused in principle, and the
-            // kind is identical across a restart by definition.
-            let same_instance = expected_group == Some(job.process_group_id);
-            same_instance && live_agent_in_job(&job) == Some(expected)
-        }
+        Some(pid) => occupant_unchanged(
+            expected_group,
+            expected,
+            crate::detect::foreground_job(pid).as_ref(),
+        ),
         // Only the test harness has a runtime without a child pid; a real pane
         // always has one, so its absence in production cannot confirm occupancy.
         None => cfg!(test),
@@ -512,6 +530,73 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::platform::{ForegroundJob, ForegroundProcess};
+
+    fn job(group: u32, pid: u32, name: &str) -> ForegroundJob {
+        ForegroundJob {
+            process_group_id: group,
+            processes: vec![ForegroundProcess {
+                pid,
+                name: name.to_string(),
+                argv0: Some(name.to_string()),
+                argv: Some(vec![name.to_string()]),
+                cmdline: Some(name.to_string()),
+            }],
+        }
+    }
+
+    /// The #26 guard's actual decision, which previously had NO test: the guard
+    /// closure short-circuits on child_pid() == None, always true in the
+    /// harness, so a reviewer deleted the same_instance conjunction and every
+    /// test still passed.
+    #[test]
+    fn occupant_unchanged_requires_both_group_and_kind() {
+        let agent = crate::detect::Agent::Claude;
+        let original = job(4242, 4242, "claude");
+
+        // Same group, same kind — the only case that may receive the key.
+        assert!(super::occupant_unchanged(
+            Some(4242),
+            agent,
+            Some(&original)
+        ));
+
+        // Agent restarted into a NEW group: same kind, different instance.
+        // A kind-only check passes this; the guard must not.
+        assert!(
+            !super::occupant_unchanged(Some(4242), agent, Some(&job(5555, 5555, "claude"))),
+            "a restarted agent in a new process group must not receive the key"
+        );
+
+        // A different agent adopted into the SAME group. A group-only check
+        // passes this; the guard must not.
+        assert!(
+            !super::occupant_unchanged(Some(4242), agent, Some(&job(4242, 4242, "bash"))),
+            "a different occupant in the same group must not receive the key"
+        );
+    }
+
+    /// An unreadable foreground job is not permission to write. This is the
+    /// fallback-platform path, where refusing is the safe answer.
+    #[test]
+    fn occupant_unchanged_refuses_when_the_job_cannot_be_read() {
+        assert!(!super::occupant_unchanged(
+            Some(4242),
+            crate::detect::Agent::Claude,
+            None
+        ));
+    }
+
+    /// Nothing captured at schedule time means nothing to compare against.
+    #[test]
+    fn occupant_unchanged_refuses_without_a_captured_group() {
+        assert!(!super::occupant_unchanged(
+            None,
+            crate::detect::Agent::Claude,
+            Some(&job(4242, 4242, "claude"))
+        ));
+    }
     use super::valid_agent_name;
 
     #[test]
