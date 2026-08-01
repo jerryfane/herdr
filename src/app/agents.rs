@@ -483,13 +483,35 @@ pub(super) fn occupant_unchanged(
 /// kind, so a kind-only check passes and the submitting key lands in a fresh
 /// session that never received the prompt text. The foreground process group id
 /// distinguishes instances: a restarted agent gets a new one.
+pub(super) fn capture_occupant_group(runtime: &crate::terminal::TerminalRuntime) -> Option<u32> {
+    crate::detect::foreground_job(runtime.child_pid()?).map(|job| job.process_group_id)
+}
+
+/// Re-answers the occupancy question for an ALREADY CAPTURED baseline.
+///
+/// Used for the post-write revalidation so that check compares instance, not
+/// merely kind, against the same baseline the delayed guard will use.
+pub(super) fn runtime_hosts_same_occupant(
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: crate::detect::Agent,
+    expected_group: Option<u32>,
+) -> bool {
+    match runtime.child_pid() {
+        Some(pid) => occupant_unchanged(
+            expected_group,
+            expected,
+            crate::detect::foreground_job(pid).as_ref(),
+        ),
+        None => cfg!(test),
+    }
+}
+
 pub(super) fn runtime_agent_guard(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
+    expected_group: Option<u32>,
 ) -> Box<dyn Fn() -> bool + Send + Sync> {
     let pid = runtime.child_pid();
-    let expected_group =
-        pid.and_then(|pid| crate::detect::foreground_job(pid).map(|job| job.process_group_id));
     Box::new(move || match pid {
         Some(pid) => occupant_unchanged(
             expected_group,

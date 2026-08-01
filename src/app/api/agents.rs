@@ -112,6 +112,12 @@ impl App {
                 ),
             );
         }
+        // Bind the occupant baseline HERE, before a single byte is written.
+        // Capturing it after the blocking acknowledgement would adopt whatever
+        // occupies the pane by then as the expected occupant, so a same-kind
+        // swap during the write/ack window would be baselined as legitimate and
+        // the delayed key would land in a session that never received the text.
+        let expected_group = super::super::agents::capture_occupant_group(runtime);
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         let composer_baseline = runtime.detection_content_seq();
@@ -121,7 +127,13 @@ impl App {
         // Revalidate the live PTY occupant after the blocking acknowledgement so
         // a foreground identity change during the batch is never reported as
         // receipt by the originally resolved agent.
-        if !write_result || !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        if !write_result
+            || !super::super::agents::runtime_hosts_same_occupant(
+                runtime,
+                expected_agent,
+                expected_group,
+            )
+        {
             return encode_error(
                 id,
                 "agent_prompt_not_received",
@@ -138,7 +150,7 @@ impl App {
         runtime.send_bytes_after_guarded(
             Bytes::from(enter),
             AGENT_PROMPT_SUBMIT_DELAY,
-            super::super::agents::runtime_agent_guard(runtime, expected_agent),
+            super::super::agents::runtime_agent_guard(runtime, expected_agent, expected_group),
             Some(std::sync::Arc::clone(&submit_abandoned)),
         );
         self.record_pane_prompt_submit_watch(resolved.ws_idx, resolved.pane_id, submit_abandoned);

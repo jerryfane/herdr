@@ -257,6 +257,10 @@ pub struct TerminalState {
     /// text is in the composer and no turn was started, so the caller's earlier
     /// success response is now known to be incomplete.
     pub(crate) prompt_submit_abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A prompt watch was displaced while still armed, so its outcome is
+    /// unknowable. Reported as abandonment because "we cannot tell" must never
+    /// read as "it submitted".
+    pub(crate) displaced_submit_unknown: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
@@ -298,6 +302,7 @@ impl TerminalState {
             input_prompt_kind: None,
             composer_write: None,
             prompt_submit_abandoned: None,
+            displaced_submit_unknown: false,
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
@@ -386,6 +391,11 @@ impl TerminalState {
         now: Instant,
     ) -> TurnRecord {
         self.turn = self.turn.saturating_add(1);
+        // A completed turn is the recovery point: whatever the last prompt's
+        // fate was, it is no longer the pane's current state. Without this a
+        // stale `true` outlives operator recovery forever (#26 review F3).
+        self.prompt_submit_abandoned = None;
+        self.displaced_submit_unknown = false;
         let current_context = self.turn_completion_context();
         let message = current_context.message.or(fallback_context.message);
         let (message, message_truncated) = message

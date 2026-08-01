@@ -140,7 +140,16 @@ impl App {
             return;
         };
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.prompt_submit_abandoned = Some(flag);
+            // A second prompt inside the delay window would otherwise orphan the
+            // first watch, and any abandonment it later raises becomes
+            // unobservable — a silent-loss channel in the very mechanism that
+            // exists to make loss visible. Displacing an ARMED watch is itself
+            // an unknown outcome, so record it rather than dropping it.
+            if let Some(previous) = terminal.prompt_submit_abandoned.replace(flag) {
+                if !previous.load(std::sync::atomic::Ordering::SeqCst) {
+                    terminal.displaced_submit_unknown = true;
+                }
+            }
         }
     }
 
@@ -572,10 +581,11 @@ impl App {
             })
             .map(composer_info_from_assessment)
             .map(|mut composer| {
-                composer.submit_abandoned = terminal
-                    .prompt_submit_abandoned
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                composer.submit_abandoned = terminal.displaced_submit_unknown
+                    || terminal
+                        .prompt_submit_abandoned
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
                 composer
             })
             .unwrap_or_default();
