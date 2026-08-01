@@ -991,6 +991,7 @@ mod tests {
         attempt_id: Option<&str>,
     ) -> crate::api::schema::AgentInfo {
         agent.composer = crate::api::schema::ComposerInfo {
+            submit_abandoned: false,
             state,
             attempt_id: attempt_id.map(str::to_string),
             evidence: crate::api::schema::ComposerEvidence {

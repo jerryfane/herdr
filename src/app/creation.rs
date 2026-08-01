@@ -43,6 +43,7 @@ fn composer_info_from_assessment(
     };
 
     crate::api::schema::ComposerInfo {
+        submit_abandoned: false,
         state: match assessment.state {
             ComposerAssessmentState::Empty => State::Empty,
             ComposerAssessmentState::DraftPresent => State::DraftPresent,
@@ -119,6 +120,28 @@ impl App {
             create_if_absent,
             force_new_attempt,
         )
+    }
+
+    /// Remember the flag a delayed submission will raise if its guard refuses to
+    /// write, so `agent get` can report that the prompt never submitted.
+    pub(crate) fn record_pane_prompt_submit_watch(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.prompt_submit_abandoned = Some(flag);
+        }
     }
 
     pub(crate) fn record_terminal_composer_write(
@@ -548,6 +571,13 @@ impl App {
                 })
             })
             .map(composer_info_from_assessment)
+            .map(|mut composer| {
+                composer.submit_abandoned = terminal
+                    .prompt_submit_abandoned
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                composer
+            })
             .unwrap_or_default();
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,

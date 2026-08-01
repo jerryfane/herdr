@@ -435,7 +435,11 @@ pub(super) fn runtime_hosts_agent(
 }
 
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
-    let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+    live_agent_for_pid(runtime.child_pid()?)
+}
+
+fn live_agent_for_pid(pid: u32) -> Option<crate::detect::Agent> {
+    let job = crate::detect::foreground_job(pid)?;
     crate::detect::identify_agent_in_job(&job)
         .map(|(agent, _)| agent)
         .or_else(|| {
@@ -443,6 +447,26 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
                 .iter()
                 .find_map(|process| crate::platform::process_agent_hint(process.pid))
         })
+}
+
+/// Builds a guard that re-answers "does this pane still host the expected
+/// agent?" at the moment it is called.
+///
+/// `runtime_hosts_agent` answers that question once, for the caller's instant.
+/// A delayed write needs it answered again when the write actually happens, so
+/// the guard captures only the pid and the expected identity and re-reads the
+/// foreground job on each call.
+pub(super) fn runtime_agent_guard(
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: crate::detect::Agent,
+) -> Box<dyn Fn() -> bool + Send + Sync> {
+    let pid = runtime.child_pid();
+    Box::new(move || match pid {
+        Some(pid) => live_agent_for_pid(pid) == Some(expected),
+        // Only the test harness has a runtime without a child pid; a real pane
+        // always has one, so its absence in production cannot confirm occupancy.
+        None => cfg!(test),
+    })
 }
 
 pub(super) enum AgentStartError {

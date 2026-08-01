@@ -1192,11 +1192,40 @@ impl PaneRuntimeIo {
     }
 
     fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        self.send_bytes_after_guarded(bytes, delay, Box::new(|| true), None);
+    }
+
+    /// Send after a delay, but only if `guard` still holds when the delay expires.
+    ///
+    /// An unguarded delayed write is not safe on an agent submit path: the write
+    /// is scheduled while one process occupies the pane and lands however much
+    /// later, by which time the occupant may have changed. The guard is
+    /// evaluated immediately before the write, not when it is scheduled.
+    ///
+    /// When the guard fails the bytes are dropped and `abandoned` is raised, so
+    /// the outcome is observable rather than silent — text left in a composer
+    /// with no submission is exactly the stranding this delay exists to avoid.
+    fn send_bytes_after_guarded(
+        &self,
+        bytes: Bytes,
+        delay: std::time::Duration,
+        guard: Box<dyn Fn() -> bool + Send + Sync>,
+        abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 let actor = actor.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
+                    if !guard() {
+                        if let Some(flag) = abandoned {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        warn!(
+                            "delayed PTY input withheld: pane occupant changed during the submit delay"
+                        );
+                        return;
+                    }
                     if let Err(err) = actor.write_user_input(bytes).await {
                         warn!(error = %err, "failed to send delayed PTY input");
                     }
@@ -1207,6 +1236,12 @@ impl PaneRuntimeIo {
                 let sender = sender.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
+                    if !guard() {
+                        if let Some(flag) = abandoned {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        return;
+                    }
                     let _ = sender.send(bytes).await;
                 });
             }
@@ -2798,6 +2833,16 @@ impl PaneRuntime {
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         self.io.send_bytes_after(bytes, delay);
+    }
+
+    pub fn send_bytes_after_guarded(
+        &self,
+        bytes: Bytes,
+        delay: std::time::Duration,
+        guard: Box<dyn Fn() -> bool + Send + Sync>,
+        abandoned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.io.send_bytes_after_guarded(bytes, delay, guard, abandoned);
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

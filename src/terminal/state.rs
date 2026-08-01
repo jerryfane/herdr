@@ -252,6 +252,12 @@ pub struct TerminalState {
     pub input_pending: bool,
     pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub(crate) composer_write: Option<super::ComposerWrite>,
+    /// Raised by a delayed agent-prompt submission whose guard refused to write
+    /// because the pane's occupant changed inside the submit delay. The prompt
+    /// text is in the composer and no turn was started, so the caller's earlier
+    /// success response is now known to be incomplete.
+    pub(crate) prompt_submit_abandoned:
+        Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
@@ -292,6 +298,7 @@ impl TerminalState {
             input_pending: false,
             input_prompt_kind: None,
             composer_write: None,
+            prompt_submit_abandoned: None,
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),

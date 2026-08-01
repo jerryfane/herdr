@@ -540,6 +540,12 @@ pub struct ComposerInfo {
     pub attempt_id: Option<String>,
     #[serde(default)]
     pub evidence: ComposerEvidence,
+    /// True when a delayed prompt submission was withheld because the pane's
+    /// occupant changed before the submitting key could be written. The text is
+    /// in the composer and no turn started; the caller was already told the
+    /// prompt was received, so this is the only place that fact surfaces.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub submit_abandoned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
