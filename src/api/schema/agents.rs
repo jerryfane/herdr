@@ -182,6 +182,95 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAcpEndpointParams {
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAcpRegisterParams {
+    pub name: String,
+    pub kind: String,
+    pub pane_id: String,
+    pub cwd: String,
+    pub session: AcpSessionInfo,
+    /// Server-populated adapter evidence. This is never accepted from or
+    /// serialized to an API client.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) adapter_version: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) adapter_command: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) adapter_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAcpAttachParams {
+    pub target: String,
+    pub generation: u64,
+    pub ticket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAcpDetachParams {
+    pub target: String,
+    pub generation: u64,
+    pub lease: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpSessionMode {
+    New,
+    Load,
+    Resume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcpEndpointLaunch {
+    pub transport: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// Version of Herdr's endpoint/attach contract, not the negotiated ACP wire version.
+    pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcpWorkerInfo {
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub name: String,
+    pub agent: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcpAdapterInfo {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcpSessionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub mode: AcpSessionMode,
+}
+
+/// Private launch material returned only after an ACP attach ticket is consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcpAdapterLaunch {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub lease: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPromptDelivery {

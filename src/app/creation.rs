@@ -414,7 +414,7 @@ impl App {
                 self.state
                     .terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| (terminal.projected_agent_state(), pane.seen))
             })
             .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
             .unwrap_or((crate::detect::AgentState::Unknown, true));
@@ -567,7 +567,7 @@ impl App {
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status: pane_agent_status(terminal.projected_agent_state(), pane.seen),
             input_pending: terminal.input_pending,
             input_prompt_kind: terminal.input_prompt_kind,
             composer,

@@ -79,6 +79,26 @@ impl ApiClient {
             id: "api-client:status".into(),
             method: Method::Ping(PingParams::default()),
         })?;
+        Self::runtime_status(response)
+    }
+
+    pub fn status_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<crate::api::RuntimeStatus, ApiClientError> {
+        let value = self.request_value_with_timeout(
+            &Request {
+                id: "api-client:status".into(),
+                method: Method::Ping(PingParams::default()),
+            },
+            timeout,
+        )?;
+        Self::runtime_status(parse_response_value(value)?)
+    }
+
+    fn runtime_status(
+        response: SuccessResponse,
+    ) -> Result<crate::api::RuntimeStatus, ApiClientError> {
         match response.result {
             ResponseResult::Pong {
                 version,

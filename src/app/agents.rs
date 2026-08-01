@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use super::{terminal_targets::TerminalTargetError, App};
-use crate::api::schema::AgentStartParams;
+use crate::api::schema::{AgentAcpRegisterParams, AgentStartParams};
 
 const DEFAULT_AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_AGENT_START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -18,6 +18,149 @@ fn valid_agent_name(name: &str) -> bool {
 }
 
 impl App {
+    pub(super) fn register_acp_worker(
+        &mut self,
+        params: AgentAcpRegisterParams,
+    ) -> Result<crate::api::schema::AgentInfo, crate::api::schema::ErrorBody> {
+        if params.session.mode != crate::api::schema::AcpSessionMode::New
+            || params.session.id.is_some()
+        {
+            return Err(acp_register_error(
+                "acp_session_mode_unsupported",
+                "new ACP-owned workers must start with mode new and no session id",
+            ));
+        }
+        if !valid_agent_name(&params.name) {
+            return Err(acp_register_error(
+                "invalid_agent_name",
+                INVALID_AGENT_NAME_MESSAGE,
+            ));
+        }
+        let Some(kind) = crate::detect::parse_agent_label(&params.kind) else {
+            return Err(acp_register_error(
+                "acp_adapter_unsupported",
+                format!("agent {} has no configured ACP adapter", params.kind),
+            ));
+        };
+        let agent = crate::detect::agent_label(kind);
+        let Some(adapter) = crate::acp::adapter_for(agent) else {
+            return Err(acp_register_error(
+                "acp_adapter_unsupported",
+                format!("agent {agent} has no configured ACP adapter"),
+            ));
+        };
+        let adapter_version = params.adapter_version.ok_or_else(|| {
+            acp_register_error(
+                "acp_adapter_unavailable",
+                format!("ACP adapter {} is unavailable", adapter.name),
+            )
+        })?;
+        let adapter_command = params
+            .adapter_command
+            .map(std::path::PathBuf::from)
+            .filter(|command| command.is_absolute())
+            .ok_or_else(|| {
+                acp_register_error(
+                    "acp_adapter_unavailable",
+                    format!("ACP adapter {} is unavailable", adapter.name),
+                )
+            })?;
+        let adapter_sha256 = params.adapter_sha256.ok_or_else(|| {
+            acp_register_error(
+                "acp_adapter_unavailable",
+                format!("ACP adapter {} is unavailable", adapter.name),
+            )
+        })?;
+        if self
+            .collect_agent_infos()
+            .iter()
+            .any(|worker| worker.name.as_deref() == Some(&params.name))
+        {
+            return Err(acp_register_error(
+                "agent_name_taken",
+                "ACP worker name is already in use",
+            ));
+        }
+        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
+            return Err(acp_register_error(
+                "pane_not_found",
+                "ACP placeholder pane was not found",
+            ));
+        };
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+            .ok_or_else(|| {
+                acp_register_error("pane_not_found", "ACP placeholder pane was not found")
+            })?;
+        let terminal = self.state.terminals.get(&terminal_id).ok_or_else(|| {
+            acp_register_error("pane_not_found", "ACP placeholder pane was not found")
+        })?;
+        if terminal.is_agent_terminal()
+            || terminal.detected_agent.is_some()
+            || terminal.managed_agent_kind().is_some()
+        {
+            return Err(acp_register_error(
+                "acp_placeholder_busy",
+                "ACP registration requires a shell-only pane with no agent owner",
+            ));
+        }
+        let runtime = self.terminal_runtimes.get(&terminal_id).ok_or_else(|| {
+            acp_register_error(
+                "acp_placeholder_unavailable",
+                "ACP placeholder pane runtime is unavailable",
+            )
+        })?;
+        if available_shell_name(runtime).is_none() {
+            return Err(acp_register_error(
+                "acp_placeholder_busy",
+                "ACP registration requires the shell to own the placeholder pane",
+            ));
+        }
+        let cwd = std::path::PathBuf::from(&params.cwd);
+        let observed_cwd = runtime
+            .foreground_cwd()
+            .unwrap_or_else(|| terminal.cwd.clone());
+        if !cwd.is_absolute() || cwd != observed_cwd {
+            return Err(acp_register_error(
+                "acp_cwd_mismatch",
+                "ACP registration cwd must exactly match the placeholder pane cwd",
+            ));
+        }
+        let pane = self.pane_info(ws_idx, pane_id).ok_or_else(|| {
+            acp_register_error("pane_not_found", "ACP placeholder pane was not found")
+        })?;
+        let identity = crate::acp::AcpWorkerIdentity {
+            terminal_id: pane.terminal_id,
+            workspace_id: pane.workspace_id,
+            tab_id: pane.tab_id,
+            pane_id: pane.pane_id,
+            name: params.name,
+            agent: agent.to_string(),
+            session_id: params.session.id,
+            session_mode: params.session.mode,
+            cwd,
+        };
+        self.state
+            .terminals
+            .get_mut(&terminal_id)
+            .ok_or_else(|| {
+                acp_register_error("pane_not_found", "ACP placeholder pane disappeared")
+            })?
+            .register_acp_owned_worker(identity, adapter_command, adapter_version, adapter_sha256)
+            .map_err(|message| acp_register_error("acp_registration_invalid", message))?;
+        self.emit_pane_updated(ws_idx, pane_id);
+        self.agent_info(ws_idx, pane_id).ok_or_else(|| {
+            acp_register_error(
+                "acp_registration_failed",
+                "registered ACP worker is unavailable",
+            )
+        })
+    }
+
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
@@ -415,7 +558,17 @@ impl App {
     }
 }
 
-fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
+fn acp_register_error(
+    code: &'static str,
+    message: impl Into<String>,
+) -> crate::api::schema::ErrorBody {
+    crate::api::schema::ErrorBody {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+pub(super) fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
     #[cfg(test)]
     if runtime.child_pid().is_none() {
         return Some("sh".into());

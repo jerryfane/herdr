@@ -262,6 +262,8 @@ pub struct TerminalState {
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    pub(crate) acp_attach_ticket: Option<crate::acp::AcpAttachTicket>,
+    pub(crate) acp_owned_worker: Option<crate::acp::AcpOwnedWorker>,
 }
 
 impl TerminalState {
@@ -302,7 +304,58 @@ impl TerminalState {
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
             pending_agent_resume_plan: None,
+            acp_attach_ticket: None,
+            acp_owned_worker: None,
         }
+    }
+
+    /// Registers a worker whose adapter process and ACP session lifecycle are
+    /// owned by Herdr. Normal PTY-detected agents must never call this path.
+    pub(crate) fn register_acp_owned_worker(
+        &mut self,
+        identity: crate::acp::AcpWorkerIdentity,
+        adapter_command: PathBuf,
+        adapter_version: String,
+        adapter_sha256: [u8; 32],
+    ) -> Result<(), &'static str> {
+        let session_valid = match identity.session_mode {
+            crate::api::schema::AcpSessionMode::New => identity.session_id.is_none(),
+            crate::api::schema::AcpSessionMode::Load
+            | crate::api::schema::AcpSessionMode::Resume => identity
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.is_empty()),
+        };
+        if !session_valid || !adapter_command.is_absolute() || adapter_version.trim().is_empty() {
+            return Err("invalid ACP ownership metadata");
+        }
+        if self.detected_agent.is_some()
+            || self.hook_authority.is_some()
+            || self.managed_agent.is_some()
+            || self.acp_owned_worker.is_some()
+        {
+            return Err("terminal already has an agent owner");
+        }
+        self.acp_attach_ticket = None;
+        self.agent_name = Some(identity.name.clone());
+        self.agent_name_owner = Some(AgentNameOwner {
+            agent_label: identity.agent.clone(),
+            session_ref: None,
+        });
+        self.acp_owned_worker = Some(crate::acp::AcpOwnedWorker {
+            identity,
+            adapter_command,
+            adapter_version,
+            adapter_sha256,
+            lifecycle: crate::acp::AcpOwnedLifecycle::Ready,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn revoke_acp_owned_worker(&mut self) {
+        self.acp_attach_ticket = None;
+        self.acp_owned_worker = None;
+        self.clear_agent_name();
     }
 
     pub(crate) fn record_composer_write(
@@ -564,6 +617,9 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
+        if self.acp_owned_worker.is_some() && agent.is_some() {
+            self.revoke_acp_owned_worker();
+        }
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
@@ -948,6 +1004,10 @@ impl TerminalState {
         }
         if !self.accept_hook_report(&source, seq) {
             return None;
+        }
+
+        if self.acp_owned_worker.is_some() {
+            self.revoke_acp_owned_worker();
         }
 
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -1748,6 +1808,9 @@ impl TerminalState {
             return None;
         }
 
+        if self.acp_owned_worker.is_some() {
+            self.revoke_acp_owned_worker();
+        }
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
@@ -1990,16 +2053,33 @@ impl TerminalState {
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
-        self.hook_authority
+        self.acp_owned_worker
             .as_ref()
-            .filter(|authority| self.hook_authority_is_effective(authority))
-            .map(|authority| authority.agent_label.as_str())
+            .map(|owned| owned.identity.agent.as_str())
             .or_else(|| {
-                self.recent_agent_process_exit
-                    .is_none()
-                    .then(|| self.detected_agent.map(crate::detect::agent_label))
-                    .flatten()
+                self.hook_authority
+                    .as_ref()
+                    .filter(|authority| self.hook_authority_is_effective(authority))
+                    .map(|authority| authority.agent_label.as_str())
+                    .or_else(|| {
+                        self.recent_agent_process_exit
+                            .is_none()
+                            .then(|| self.detected_agent.map(crate::detect::agent_label))
+                            .flatten()
+                    })
             })
+    }
+
+    /// ACP ownership is an authoritative live worker state even though its
+    /// adapter runs outside the placeholder PTY. Prompt activity is observed
+    /// through ACP itself, so Herdr projects availability as idle without
+    /// weakening ordinary screen/hook detection.
+    pub(crate) fn projected_agent_state(&self) -> AgentState {
+        if self.acp_owned_worker.is_some() {
+            AgentState::Idle
+        } else {
+            self.state
+        }
     }
 
     pub fn effective_known_agent(&self) -> Option<Agent> {
@@ -2233,6 +2313,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.revoke_acp_owned_worker();
         self.reset_turn_counter(TurnCounterResetPath::PaneRespawn);
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;

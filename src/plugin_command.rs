@@ -1,7 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) fn command_for_argv_in_dir(program: &str, args: &[String], cwd: &Path) -> Command {
@@ -9,6 +7,36 @@ pub(crate) fn command_for_argv_in_dir(program: &str, args: &[String], cwd: &Path
     let mut command = command_for_program(&program);
     command.args(args).current_dir(cwd);
     command
+}
+
+pub(crate) fn resolve_program_path(program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    let resolved = if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
+        path.is_file().then(|| path.to_path_buf())
+    } else {
+        resolve_program_on_path(path.as_os_str())
+    }?;
+    resolved.canonicalize().ok()
+}
+
+#[cfg(not(windows))]
+fn resolve_program_on_path(program: &OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::env::var_os("PATH").and_then(|path_var| {
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(program))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+    })
+}
+
+#[cfg(windows)]
+fn resolve_program_on_path(program: &OsStr) -> Option<PathBuf> {
+    resolve_windows_program(program)
 }
 
 fn program_for_cwd(program: &str, cwd: &Path) -> OsString {

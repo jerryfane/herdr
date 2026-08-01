@@ -102,12 +102,14 @@ herdr pane read w1:p2 --source recent --lines 50
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.acp_register`、`agent.acp_endpoint`、`agent.acp_status`、`agent.acp_attach`、`agent.acp_detach` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。成功時の `delivery` は、text+Enter 全体の書き込み確認後に `written_to_pty`、帰属可能なライフサイクル進行、または同じ writer-attributed composer attempt の観測後の消去で `submitted` です。残存する帰属入力は `agent_prompt_unsubmitted`、不確かな行方は `agent_prompt_stalled` です。bracketed paste は表示 token に依存しません。
+
+`agent.acp_*` メソッドはローカルの非公開 coordinator 境界を構成します。`agent.acp_register` は固定 adapter、cwd、identity を検証した後、空の shell pane を新しい ACP 所有 worker として確保します。`agent.acp_endpoint` はこの所有クラスに限り、10 秒有効で一度だけ使える `herdr agent acp-attach` 起動 ticket を返します。通常の PTY agent は `acp_ownership_required` になります。`agent.acp_status` は ticket を発行しない readiness check で、ticket、lease、adapter command を公開しません。endpoint、status、attach、detach は placeholder が引き続き shell 所有であることを再検証します。attach と detach は非公開 credential を消費し、すべての操作を worker generation で fence し、foreground ownership、identity、cwd、topology、lifecycle が変われば fail closed になります。これらのメソッドによってネイティブ PTY session id が新しい adapter process に移植可能になることはありません。
 
 `pane.get` は `composer` オブジェクトを返します。`state` は `empty`、`draft_present`、`unknown` で、任意の `attempt_id` と provenance、領域、カーソル、style、frame stability の証拠を含みます。領域欠落、再描画途中、矛盾、またはこのフィールドを持たない古い応答は `unknown` です。style は信頼度を下げる tripwire にしか使いません。
 

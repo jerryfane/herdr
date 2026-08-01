@@ -47,6 +47,11 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentViewClear(_)
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
+            | Method::AgentAcpRegister(_)
+            | Method::AgentAcpEndpoint(_)
+            | Method::AgentAcpStatus(_)
+            | Method::AgentAcpAttach(_)
+            | Method::AgentAcpDetach(_)
             | Method::AgentPrompt(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
@@ -89,4 +94,51 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_acp_request_is_classified_as_ui_changing() {
+        let requests = [
+            serde_json::json!({
+                "id": "register",
+                "method": "agent.acp_register",
+                "params": {
+                    "name": "worker",
+                    "kind": "codex",
+                    "pane_id": "w1:p1",
+                    "cwd": "/work",
+                    "session": {"mode": "new"}
+                }
+            }),
+            serde_json::json!({
+                "id": "endpoint",
+                "method": "agent.acp_endpoint",
+                "params": {"target": "worker"}
+            }),
+            serde_json::json!({
+                "id": "status",
+                "method": "agent.acp_status",
+                "params": {"target": "worker"}
+            }),
+            serde_json::json!({
+                "id": "attach",
+                "method": "agent.acp_attach",
+                "params": {"target": "worker", "generation": 1, "ticket": "ticket"}
+            }),
+            serde_json::json!({
+                "id": "detach",
+                "method": "agent.acp_detach",
+                "params": {"target": "worker", "generation": 1, "lease": "lease"}
+            }),
+        ];
+
+        for value in requests {
+            let request: Request = serde_json::from_value(value).unwrap();
+            assert!(request_changes_ui(&request));
+        }
+    }
 }

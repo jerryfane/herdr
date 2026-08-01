@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, Method,
-    ReadFormat, ReadSource, Request,
+    AcpSessionInfo, AcpSessionMode, AgentAcpAttachParams, AgentAcpDetachParams,
+    AgentAcpRegisterParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
+    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, Method, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -22,6 +23,9 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
+        "acp-attach" => agent_acp_attach(&args[1..]),
+        "acp-register" => agent_acp_register(&args[1..]),
+        "acp-status" => agent_acp_status(&args[1..]),
         "start" => agent_start(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -33,6 +37,183 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn agent_acp_status(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("usage: herdr agent acp-status <target>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: herdr agent acp-status <target>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:acp-status".into(),
+        method: Method::AgentAcpStatus(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
+fn agent_acp_register(args: &[String]) -> std::io::Result<i32> {
+    let Some(name) = args.first().cloned() else {
+        print_acp_register_usage();
+        return Ok(2);
+    };
+    let mut kind = None;
+    let mut pane_id = None;
+    let mut cwd = None;
+    let mut session_mode = None;
+    let mut index = 1;
+    while index < args.len() {
+        let slot = match args[index].as_str() {
+            "--kind" => &mut kind,
+            "--pane" => &mut pane_id,
+            "--cwd" => &mut cwd,
+            "--session-mode" => &mut session_mode,
+            _ => {
+                print_acp_register_usage();
+                return Ok(2);
+            }
+        };
+        let Some(value) = args.get(index + 1) else {
+            print_acp_register_usage();
+            return Ok(2);
+        };
+        *slot = Some(value.clone());
+        index += 2;
+    }
+    let (Some(kind), Some(pane_id), Some(cwd), Some(mode)) = (kind, pane_id, cwd, session_mode)
+    else {
+        print_acp_register_usage();
+        return Ok(2);
+    };
+    let mode = match mode.as_str() {
+        "new" => AcpSessionMode::New,
+        _ => {
+            print_acp_register_usage();
+            return Ok(2);
+        }
+    };
+    let registration_timeout = crate::detect::parse_agent_label(&kind)
+        .and_then(|agent| crate::acp::adapter_for(crate::detect::agent_label(agent)))
+        .map_or(crate::acp::ACP_DEFAULT_REGISTRATION_TIMEOUT, |adapter| {
+            crate::acp::registration_timeout_for(&adapter)
+        });
+    let response = super::send_request_with_timeout(
+        &Request {
+            id: "cli:agent:acp-register".into(),
+            method: Method::AgentAcpRegister(AgentAcpRegisterParams {
+                name,
+                kind,
+                pane_id,
+                cwd,
+                session: AcpSessionInfo { id: None, mode },
+                adapter_version: None,
+                adapter_command: None,
+                adapter_sha256: None,
+            }),
+        },
+        registration_timeout,
+    )?;
+    super::print_response(&response)
+}
+
+fn print_acp_register_usage() {
+    eprintln!(
+        "usage: herdr agent acp-register <name> --kind KIND --pane ID --cwd PATH \
+         --session-mode new"
+    );
+}
+
+fn agent_acp_attach(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first().cloned() else {
+        eprintln!("usage: herdr agent acp-attach <target> --generation N --ticket TOKEN");
+        return Ok(2);
+    };
+    let mut generation = None;
+    let mut ticket = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--generation" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --generation");
+                    return Ok(2);
+                };
+                generation = value.parse::<u64>().ok();
+                if generation.is_none() {
+                    eprintln!("invalid --generation");
+                    return Ok(2);
+                }
+                index += 2;
+            }
+            "--ticket" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --ticket");
+                    return Ok(2);
+                };
+                ticket = Some(value.clone());
+                index += 2;
+            }
+            _ => {
+                eprintln!("usage: herdr agent acp-attach <target> --generation N --ticket TOKEN");
+                return Ok(2);
+            }
+        }
+    }
+    let (Some(generation), Some(ticket)) = (generation, ticket) else {
+        eprintln!("usage: herdr agent acp-attach <target> --generation N --ticket TOKEN");
+        return Ok(2);
+    };
+    let response = super::send_request(&Request {
+        id: "cli:agent:acp-attach".into(),
+        method: Method::AgentAcpAttach(AgentAcpAttachParams {
+            target: target.clone(),
+            generation,
+            ticket,
+        }),
+    })?;
+    if response.get("error").is_some() {
+        eprintln!("ACP attach was rejected");
+        return Ok(1);
+    }
+    let launch = &response["result"]["launch"];
+    let Some(command) = launch["command"].as_str() else {
+        eprintln!("ACP attach response omitted the adapter command");
+        return Ok(1);
+    };
+    let Some(cwd) = launch["cwd"].as_str() else {
+        eprintln!("ACP attach response omitted the adapter cwd");
+        return Ok(1);
+    };
+    let Some(lease) = launch["lease"].as_str().map(str::to_string) else {
+        eprintln!("ACP attach response omitted the ownership lease");
+        return Ok(1);
+    };
+    let adapter_args = launch["args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let result = crate::acp::run_adapter(command, &adapter_args, std::path::Path::new(cwd));
+    let detach = super::send_request(&Request {
+        id: "cli:agent:acp-detach".into(),
+        method: Method::AgentAcpDetach(AgentAcpDetachParams {
+            target,
+            generation,
+            lease,
+        }),
+    });
+    match detach {
+        Ok(response) if response.get("error").is_none() => {}
+        Ok(_) | Err(_) => eprintln!("ACP adapter exited but ownership detach failed"),
+    }
+    result
 }
 
 fn agent_explain(args: &[String]) -> std::io::Result<i32> {
@@ -797,6 +978,12 @@ fn print_agent_help() {
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
+    eprintln!("  herdr agent acp-attach <target> --generation N --ticket TOKEN");
+    eprintln!(
+        "  herdr agent acp-register <name> --kind KIND --pane ID --cwd PATH \
+         --session-mode new"
+    );
+    eprintln!("  herdr agent acp-status <target>");
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );

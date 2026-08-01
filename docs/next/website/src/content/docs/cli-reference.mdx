@@ -294,6 +294,8 @@ herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
 herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
+herdr agent acp-register <name> --kind KIND --pane ID --cwd PATH --session-mode new
+herdr agent acp-status <target>
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
@@ -303,6 +305,10 @@ Agent targets are either a unique live agent name or the pane ID that currently 
 `agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, and `maki`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
 
 Start returns only after the expected agent owns the same terminal and is ready for interactive input. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
+
+`agent acp-register` is the explicit bootstrap for an ACP-owned worker. The pane must be an otherwise unowned shell at the exact absolute `--cwd`, and the selected adapter (`codex-acp`, `claude-agent-acp`, `gemini --acp`, or `hermes acp`) must be installed. The API server probes and hashes the fixed adapter command before registration enters the app runtime; Hermes also receives a separately bounded `hermes acp --help` capability check because its base version command does not prove that the ACP extra is installed. Attach rechecks the digest and requires re-registration if the executable changed. Clients should allow at least thirteen seconds for ordinary adapters and forty-five seconds for Hermes. Only `--session-mode new` without a session id is accepted: a native PTY session id cannot be resumed safely by a separate ACP adapter process. Registration is runtime-only and must be repeated after a Herdr restart. `agent acp-status` reports the non-secret ownership state and generation. The ticketed `agent acp-attach` command is private launch machinery for a trusted local coordinator, not an operator command.
+
+Herdr never creates an ACP sidecar for an ordinary detected PTY agent. ACP endpoint discovery fails closed unless the worker was explicitly registered, the placeholder remains shell-owned, and the worker still matches the same terminal, pane topology, name, agent kind, cwd, and lifecycle generation.
 
 `agent prompt` honors live bracketed-paste mode and writes text plus encoded Enter atomically, including while the agent is working. Herdr acknowledges only after the complete batch reaches the pane PTY; non-wait success reports `delivery: "written_to_pty"`. If a modal `input_pending` request is already visible, it returns `agent_input_pending` and writes zero bytes.
 
