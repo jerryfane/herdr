@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -221,12 +221,24 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 /// Bridges stdio to the JSON API socket for a remote (mobile) client.
 ///
 /// Unlike `run_remote_client_bridge`, which pumps one long-lived TUI-socket
-/// connection as a raw byte stream, the API socket is single-shot: it reads one
-/// request per connection then closes (streaming responses such as
-/// `events.subscribe` are the exception and hold their connection open). So this
-/// reads newline-delimited JSON request lines from stdin and opens a fresh API
-/// connection per line, forwarding each reply line to stdout. Replies already
-/// carry `id`, so the client correlates them and the bridge adds no framing.
+/// connection as a raw byte stream, the API socket is single-shot: one request
+/// per connection.
+///
+/// ONE REQUEST PER INVOCATION. The client opens one SSH channel — one
+/// `herdr api-bridge` exec — per API call, multiplexing at the SSH-channel level
+/// over its single held connection, which is where multiplexing belongs. So this
+/// reads exactly one request line from stdin, forwards it to a fresh API
+/// connection, and streams every reply line back until the connection closes.
+/// A round-trip yields one reply and exits; an `events.subscribe` streams until
+/// the client drops the channel. That makes each process handle exactly one
+/// request/response or one subscription, so replies never share stdout (no
+/// identity ambiguity for streamed events, which carry no request id), there is
+/// no unbounded fan-out, and stdin EOF has nothing to join or hang on.
+///
+/// An earlier version multiplexed many stdin lines over one process, which gave
+/// concurrent subscriptions indistinguishable output, an unbounded thread per
+/// line, and a stdin-EOF join that hung on an active stream. Channel-level
+/// multiplexing removes all three.
 ///
 /// Reached only over the same SSH authentication that already gates
 /// `remote-client-bridge`; it opens no network listener.
@@ -235,79 +247,81 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
     // status.protocol == CURRENT_PROTOCOL, an exact TUI-protocol-version lock
     // that is fatal for a shipped client which cannot move in lockstep with
     // every server it connects to. The JSON API is versioned by its schema, not
-    // that byte, so this connects directly and lets the first request surface a
-    // clear error if no server is listening. A down server means no agents to
-    // read, which the client reports as not-connected rather than auto-starting
-    // a server the user did not ask for over an SSH exec.
+    // that byte, so this connects directly and surfaces a clear error if no
+    // server is listening rather than auto-starting one over an SSH exec.
     let socket_path = crate::api::socket_path();
 
-    // Serializes whole-line writes from the concurrent per-request readers, so a
-    // streaming reply and a round-trip reply never interleave mid-line on stdout.
-    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let mut request_line = String::new();
+    if io::stdin().lock().read_line(&mut request_line)? == 0 {
+        return Ok(()); // stdin closed with no request
+    }
+    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
 
-    let stdin = io::stdin();
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let socket_path = socket_path.clone();
-        let stdout = Arc::clone(&stdout);
-        handles.push(thread::spawn(move || {
-            if let Err(err) = forward_api_request(&socket_path, &line, &stdout) {
-                tracing::debug!(%err, "api-bridge request ended");
-            }
-        }));
-    }
-    // stdin reached EOF. Wait for in-flight requests to finish flushing their
-    // replies before returning, so a client that sends a request and then
-    // half-closes stdin still receives the response rather than having the
-    // process exit out from under the reader thread. A streaming request keeps
-    // its channel — and thus stdin — open for the session, so at genuine
-    // teardown there is nothing left to join.
-    for handle in handles {
-        let _ = handle.join();
-    }
-    Ok(())
+    let mut stdout = io::stdout().lock();
+    forward_api_request(&socket_path, request_line, &mut stdout)
 }
 
 /// Opens one API-socket connection, sends `request_line`, and forwards every
-/// reply line to `out`. Generic over the writer so the forwarding and framing
-/// can be tested against a fake socket without a live server.
+/// reply line to `out`. On any transport failure it emits a correlated NDJSON
+/// error to `out` — rather than exiting silently and leaving the client waiting
+/// forever — because this subcommand initializes no tracing subscriber, so a
+/// logged error would reach no one. Generic over the writer so it is testable
+/// against a fake socket.
 fn forward_api_request<W: Write>(
     socket_path: &Path,
     request_line: &str,
-    out: &Mutex<W>,
+    out: &mut W,
 ) -> io::Result<()> {
-    let mut conn = UnixStream::connect(socket_path).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "api-bridge: failed to connect to API socket {}: {err}",
-                socket_path.display()
-            ),
-        )
-    })?;
-    conn.write_all(request_line.as_bytes())?;
-    conn.write_all(b"\n")?;
-    conn.flush()?;
+    let mut conn = match UnixStream::connect(socket_path) {
+        Ok(conn) => conn,
+        Err(err) => return emit_transport_error(out, request_line, &err),
+    };
+    let sent = conn
+        .write_all(request_line.as_bytes())
+        .and_then(|()| conn.write_all(b"\n"))
+        .and_then(|()| conn.flush());
+    if let Err(err) = sent {
+        return emit_transport_error(out, request_line, &err);
+    }
 
     let reader = io::BufReader::new(conn);
     for reply in reader.lines() {
-        let reply = reply?;
-        write_reply_line(out, &reply)?;
+        match reply {
+            Ok(line) => {
+                out.write_all(line.as_bytes())?;
+                out.write_all(b"\n")?;
+                out.flush()?;
+            }
+            Err(err) => return emit_transport_error(out, request_line, &err),
+        }
     }
     Ok(())
 }
 
-/// Writes one complete reply line under the lock. A poisoned lock (a peer reader
-/// panicked) is recovered rather than propagated: dropping one reply is better
-/// than killing every other in-flight request.
-fn write_reply_line<W: Write>(out: &Mutex<W>, line: &str) -> io::Result<()> {
-    let mut out = out.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
+/// Emits an NDJSON transport error carrying the originating request's `id`, so a
+/// client waiting on that id is released rather than hanging. Best-effort id
+/// extraction: a request that was not valid JSON gets a null id, which is the
+/// most the bridge can honestly say.
+fn emit_transport_error<W: Write>(
+    out: &mut W,
+    request_line: &str,
+    err: &io::Error,
+) -> io::Result<()> {
+    let id = serde_json::from_str::<serde_json::Value>(request_line)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let envelope = serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "transport_error",
+            "message": format!("api-bridge: {err}"),
+        }
+    });
+    writeln!(out, "{envelope}")?;
     out.flush()
 }
 
@@ -3206,7 +3220,7 @@ mod tests {
 #[cfg(test)]
 mod api_bridge_tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write as _};
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
     /// forward_api_request must deliver the request line verbatim (with a
@@ -3238,9 +3252,10 @@ mod api_bridge_tests {
             request
         });
 
-        let out = Mutex::new(Vec::<u8>::new());
-        forward_api_request(&sock, "{\"id\":\"1\",\"method\":\"ping\"}", &out).expect("forward");
-        let written = String::from_utf8(out.into_inner().expect("lock")).expect("utf8");
+        let mut out = Vec::<u8>::new();
+        forward_api_request(&sock, "{\"id\":\"1\",\"method\":\"ping\"}", &mut out)
+            .expect("forward");
+        let written = String::from_utf8(out).expect("utf8");
         let request_seen = server.join().expect("join");
 
         assert_eq!(
@@ -3253,5 +3268,38 @@ mod api_bridge_tests {
         );
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A transport failure (here: no socket at the path) must emit a correlated
+    /// NDJSON error carrying the request's id, not exit silently — otherwise a
+    /// client waiting on that id hangs forever, and the subcommand has no tracing
+    /// subscriber so a logged error reaches no one.
+    #[test]
+    fn transport_failure_emits_correlated_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "herdr-apibridge-missing-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+
+        let mut out = Vec::<u8>::new();
+        forward_api_request(
+            &missing,
+            "{\"id\":\"req-7\",\"method\":\"agent.list\"}",
+            &mut out,
+        )
+        .expect("error path should not itself fail");
+        let written = String::from_utf8(out).expect("utf8");
+
+        let value: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("emitted valid JSON");
+        assert_eq!(
+            value["id"], "req-7",
+            "the error was not correlated to the request id"
+        );
+        assert_eq!(
+            value["error"]["code"], "transport_error",
+            "wrong error code"
+        );
     }
 }
