@@ -255,30 +255,39 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
     if io::stdin().lock().read_line(&mut request_line)? == 0 {
         return Ok(()); // stdin closed with no request
     }
-    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    let request_line = request_line.trim_end_matches(['\r', '\n']).to_owned();
     if request_line.trim().is_empty() {
         return Ok(());
     }
 
     let mut stdout = io::stdout().lock();
-    forward_api_request(&socket_path, request_line, &mut stdout)
+    forward_api_request(&socket_path, &request_line, &mut stdout)
 }
 
-/// Opens one API-socket connection, sends `request_line`, and forwards every
-/// reply line to `out`. On any transport failure it emits a correlated NDJSON
-/// error to `out` — rather than exiting silently and leaving the client waiting
-/// forever — because this subcommand initializes no tracing subscriber, so a
-/// logged error would reach no one. Generic over the writer so it is testable
-/// against a fake socket.
+/// Connects to the API socket and forwards the request/reply. The testable core:
+/// no stdin, no teardown watcher, so a fake socket exercises it directly. On any
+/// transport failure it emits a correlated NDJSON error rather than exiting
+/// silently and leaving the client waiting — the subcommand initializes no
+/// tracing subscriber, so a logged error would reach no one.
 fn forward_api_request<W: Write>(
     socket_path: &Path,
     request_line: &str,
     out: &mut W,
 ) -> io::Result<()> {
-    let mut conn = match UnixStream::connect(socket_path) {
+    let conn = match UnixStream::connect(socket_path) {
         Ok(conn) => conn,
         Err(err) => return emit_transport_error(out, request_line, &err),
     };
+    send_and_stream(conn, request_line, out)
+}
+
+/// Sends `request_line` on an established connection and forwards every reply
+/// line to `out`, emitting a correlated transport error on failure.
+fn send_and_stream<W: Write>(
+    mut conn: UnixStream,
+    request_line: &str,
+    out: &mut W,
+) -> io::Result<()> {
     let sent = conn
         .write_all(request_line.as_bytes())
         .and_then(|()| conn.write_all(b"\n"))
@@ -302,9 +311,12 @@ fn forward_api_request<W: Write>(
 }
 
 /// Emits an NDJSON transport error carrying the originating request's `id`, so a
-/// client waiting on that id is released rather than hanging. Best-effort id
-/// extraction: a request that was not valid JSON gets a null id, which is the
-/// most the bridge can honestly say.
+/// client waiting on that id is released rather than hanging.
+///
+/// `ErrorResponse.id` is a `String`, so only a STRING id is schema-valid. A
+/// numeric id, or a request that is not valid JSON, falls back to the server's
+/// own empty-string convention rather than emitting `null` or a number, which
+/// the client's typed decoder would reject.
 fn emit_transport_error<W: Write>(
     out: &mut W,
     request_line: &str,
@@ -312,8 +324,13 @@ fn emit_transport_error<W: Write>(
 ) -> io::Result<()> {
     let id = serde_json::from_str::<serde_json::Value>(request_line)
         .ok()
-        .and_then(|value| value.get("id").cloned())
-        .unwrap_or(serde_json::Value::Null);
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     let envelope = serde_json::json!({
         "id": id,
         "error": {
@@ -3300,6 +3317,44 @@ mod api_bridge_tests {
         assert_eq!(
             value["error"]["code"], "transport_error",
             "wrong error code"
+        );
+    }
+
+    /// The emitted error id must be a STRING (ErrorResponse.id is String). A
+    /// numeric id or an unparseable request falls back to "" — never null or a
+    /// number, which a typed client decoder would reject.
+    #[test]
+    fn transport_error_id_is_always_a_string() {
+        let missing = std::env::temp_dir().join(format!(
+            "herdr-apibridge-idcheck-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+
+        let mut out = Vec::<u8>::new();
+        forward_api_request(&missing, "{\"id\":7,\"method\":\"x\"}", &mut out).expect("no fail");
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        assert!(
+            v["id"].is_string(),
+            "a numeric request id produced a non-string id"
+        );
+        assert_eq!(
+            v["id"], "",
+            "a numeric request id was not normalised to empty string"
+        );
+
+        let mut out2 = Vec::<u8>::new();
+        forward_api_request(&missing, "not json at all", &mut out2).expect("no fail");
+        let v2: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out2).unwrap().trim()).unwrap();
+        assert!(
+            v2["id"].is_string(),
+            "an unparseable request produced a non-string id"
+        );
+        assert_eq!(
+            v2["id"], "",
+            "an unparseable request did not fall back to empty string id"
         );
     }
 }
