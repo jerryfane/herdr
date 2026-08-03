@@ -289,11 +289,15 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
 /// the process exits. Separated and fd-parameterised so a test can drive it with
 /// a pipe instead of the real stdout.
 fn wait_for_output_hangup_then_shutdown(output_fd: std::os::unix::io::RawFd, teardown: UnixStream) {
-    // events is 0: POLLHUP/POLLERR/POLLNVAL are reported regardless of the mask,
-    // so poll blocks until the output peer hangs up (or the fd goes invalid).
+    // Request POLLIN so poll() actually WAKES on hangup across platforms.
+    // POLLHUP/POLLERR/POLLNVAL are reported in revents regardless of the mask,
+    // but with events=0 macOS/BSD poll() does not wake on them (Linux does) —
+    // caught by the macOS CI, which the Linux-only `just check` cannot see. A
+    // write-only stdout is never POLLIN-readable, so POLLIN never fires
+    // spuriously; it only makes poll return when the read peer disappears.
     let mut pfd = libc::pollfd {
         fd: output_fd,
-        events: 0,
+        events: libc::POLLIN,
         revents: 0,
     };
     loop {
