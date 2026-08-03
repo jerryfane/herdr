@@ -256,6 +256,17 @@ pub(crate) fn run_api_client_bridge(encoded_request: Option<&str>) -> io::Result
     // request through the remote shell without needing to write the channel's
     // stdin, and base64 keeps arbitrary JSON off the shell's quoting rules.
     // Stdin remains the fallback so `printf … | herdr api-bridge` still works.
+    //
+    // SIZE LIMIT, and it is the CLIENT's to enforce, not the bridge's. The
+    // kernel caps a single argv string at MAX_ARG_STRLEN (32 pages, ~128 KiB on
+    // a 4-KiB-page host) and returns E2BIG from execve BEFORE this process
+    // starts — so an oversized request fails with no bridge running to emit a
+    // correlated error. base64's 4/3 expansion caps the raw JSON at ~98 KiB. API
+    // methods with unbounded text (agent.prompt, pane.send_text/send_input) can
+    // exceed that, so a client using the argument form MUST enforce a portable
+    // maximum below MAX_ARG_STRLEN and fall back to the stdin form (which has no
+    // such limit) for larger requests. The bridge cannot enforce this — E2BIG
+    // fires before it runs — so it is stated as the client's contract.
     let request_line = match encoded_request {
         Some(encoded) => decode_request_arg(encoded)?,
         None => {
@@ -3507,9 +3518,22 @@ mod api_bridge_tests {
             decode_request_arg(&with_nl).expect("decode"),
             "{\"id\":\"7\"}"
         );
-        assert!(
-            decode_request_arg("not valid base64 !!!").is_err(),
-            "garbage base64 was accepted"
+        // Invalid base64 -> InvalidInput, exactly.
+        let bad_b64 =
+            decode_request_arg("not valid base64 !!!").expect_err("garbage base64 accepted");
+        assert_eq!(
+            bad_b64.kind(),
+            io::ErrorKind::InvalidInput,
+            "wrong kind for invalid base64"
+        );
+
+        // Valid base64 of invalid UTF-8 (0xFF) -> InvalidData, exactly, never a
+        // lossy-decoded request. base64([0xff]) is "/w==".
+        let bad_utf8 = decode_request_arg("/w==").expect_err("invalid UTF-8 accepted");
+        assert_eq!(
+            bad_utf8.kind(),
+            io::ErrorKind::InvalidData,
+            "wrong kind for invalid UTF-8"
         );
     }
 }
