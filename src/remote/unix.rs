@@ -260,15 +260,64 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
         return Ok(());
     }
 
+    let conn = match UnixStream::connect(&socket_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            let mut stdout = io::stdout().lock();
+            return emit_transport_error(&mut stdout, &request_line, &err);
+        }
+    };
+
+    // TEARDOWN VIA STDOUT HANGUP, not stdin EOF. A round-trip client half-closes
+    // stdin right after its request while still awaiting the reply, so watching
+    // stdin EOF tore the reply out from under it (reproduced, reverted). The
+    // output peer is the honest signal: when the SSH channel's read side closes,
+    // fd 1 reports POLLHUP/POLLERR, and unlike a stdin half-close that only
+    // happens when the client is genuinely gone. So a quiet subscription whose
+    // client vanished is torn down, while a round-trip's half-close is not.
+    if let Ok(teardown) = conn.try_clone() {
+        let output_fd = std::os::unix::io::AsRawFd::as_raw_fd(&io::stdout());
+        thread::spawn(move || wait_for_output_hangup_then_shutdown(output_fd, teardown));
+    }
+
     let mut stdout = io::stdout().lock();
-    forward_api_request(&socket_path, &request_line, &mut stdout)
+    send_and_stream(conn, &request_line, &mut stdout)
 }
 
-/// Connects to the API socket and forwards the request/reply. The testable core:
-/// no stdin, no teardown watcher, so a fake socket exercises it directly. On any
-/// transport failure it emits a correlated NDJSON error rather than exiting
-/// silently and leaving the client waiting — the subcommand initializes no
-/// tracing subscriber, so a logged error would reach no one.
+/// Blocks until `output_fd` reports POLLHUP/POLLERR (its read peer disappeared),
+/// then shuts down `teardown` so a reader blocked on the API socket wakes and
+/// the process exits. Separated and fd-parameterised so a test can drive it with
+/// a pipe instead of the real stdout.
+fn wait_for_output_hangup_then_shutdown(output_fd: std::os::unix::io::RawFd, teardown: UnixStream) {
+    // events is 0: POLLHUP/POLLERR/POLLNVAL are reported regardless of the mask,
+    // so poll blocks until the output peer hangs up (or the fd goes invalid).
+    let mut pfd = libc::pollfd {
+        fd: output_fd,
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        pfd.revents = 0;
+        let result = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break; // poll itself failed; give up watching rather than spin
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            let _ = teardown.shutdown(std::net::Shutdown::Both);
+            break;
+        }
+    }
+}
+
+/// Connects to the API socket and forwards the request/reply. The testable core
+/// (connect + `send_and_stream`) without the stdin read or the teardown watcher,
+/// so a fake socket exercises the forwarding and error paths directly. Only used
+/// by tests now that `run_api_client_bridge` owns the connection to wire the
+/// hangup watcher.
+#[cfg(test)]
 fn forward_api_request<W: Write>(
     socket_path: &Path,
     request_line: &str,
@@ -3237,7 +3286,7 @@ mod tests {
 #[cfg(test)]
 mod api_bridge_tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read as _};
     use std::os::unix::net::UnixListener;
 
     /// forward_api_request must deliver the request line verbatim (with a
@@ -3356,5 +3405,43 @@ mod api_bridge_tests {
             v2["id"], "",
             "an unparseable request did not fall back to empty string id"
         );
+    }
+
+    /// The teardown watcher fires on OUTPUT hangup and not before. Closing the
+    /// output fd's read peer (the client's read side gone) shuts the API
+    /// connection; while the output stays open (a round-trip client half-closing
+    /// stdin, output still connected) it does NOT fire, so the reply is not torn
+    /// out — the distinction the stdin-EOF approach could not make.
+    #[test]
+    fn output_hangup_tears_down_api_connection_but_open_output_does_not() {
+        let (a, mut b) = UnixStream::pair().expect("pair");
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let handle = thread::spawn(move || wait_for_output_hangup_then_shutdown(write_fd, a));
+
+        // Output still open: the watcher must NOT have torn down the connection,
+        // so a read on `b` times out rather than returning EOF.
+        b.set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        assert!(
+            b.read(&mut buf).is_err(),
+            "connection was torn down while output was still open (would break round-trips)"
+        );
+
+        // Client's read side goes away: the write fd hangs up, the watcher fires.
+        assert_eq!(unsafe { libc::close(read_fd) }, 0, "close read_fd");
+        b.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            b.read(&mut buf).expect("read after teardown"),
+            0,
+            "the API connection was not shut down on output hangup"
+        );
+
+        let _ = handle.join();
+        unsafe { libc::close(write_fd) };
     }
 }
