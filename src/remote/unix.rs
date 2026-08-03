@@ -242,7 +242,7 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 ///
 /// Reached only over the same SSH authentication that already gates
 /// `remote-client-bridge`; it opens no network listener.
-pub(crate) fn run_api_client_bridge() -> io::Result<()> {
+pub(crate) fn run_api_client_bridge(encoded_request: Option<&str>) -> io::Result<()> {
     // Deliberately does NOT call ensure_remote_server_running(): that gates on
     // status.protocol == CURRENT_PROTOCOL, an exact TUI-protocol-version lock
     // that is fatal for a shipped client which cannot move in lockstep with
@@ -251,11 +251,32 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
     // server is listening rather than auto-starting one over an SSH exec.
     let socket_path = crate::api::socket_path();
 
-    let mut request_line = String::new();
-    if io::stdin().lock().read_line(&mut request_line)? == 0 {
-        return Ok(()); // stdin closed with no request
-    }
-    let request_line = request_line.trim_end_matches(['\r', '\n']).to_owned();
+    // The request may arrive as a base64 ARGUMENT or on stdin. The argument form
+    // is what an SSH-exec client uses: `herdr api-bridge <base64(json)>` runs the
+    // request through the remote shell without needing to write the channel's
+    // stdin, and base64 keeps arbitrary JSON off the shell's quoting rules.
+    // Stdin remains the fallback so `printf … | herdr api-bridge` still works.
+    //
+    // SIZE LIMIT, and it is the CLIENT's to enforce, not the bridge's. The
+    // kernel caps a single argv string at MAX_ARG_STRLEN (32 pages, ~128 KiB on
+    // a 4-KiB-page host) and returns E2BIG from execve BEFORE this process
+    // starts — so an oversized request fails with no bridge running to emit a
+    // correlated error. base64's 4/3 expansion caps the raw JSON at ~98 KiB. API
+    // methods with unbounded text (agent.prompt, pane.send_text/send_input) can
+    // exceed that, so a client using the argument form MUST enforce a portable
+    // maximum below MAX_ARG_STRLEN and fall back to the stdin form (which has no
+    // such limit) for larger requests. The bridge cannot enforce this — E2BIG
+    // fires before it runs — so it is stated as the client's contract.
+    let request_line = match encoded_request {
+        Some(encoded) => decode_request_arg(encoded)?,
+        None => {
+            let mut line = String::new();
+            if io::stdin().lock().read_line(&mut line)? == 0 {
+                return Ok(()); // stdin closed with no request
+            }
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
     if request_line.trim().is_empty() {
         return Ok(());
     }
@@ -314,6 +335,29 @@ fn wait_for_output_hangup_then_shutdown(output_fd: std::os::unix::io::RawFd, tea
             break;
         }
     }
+}
+
+/// Decodes the base64 request argument into a single JSON request line. A
+/// decode or UTF-8 failure is a client bug (the transport controls the
+/// encoding), surfaced as an io error rather than silently forwarding garbage.
+fn decode_request_arg(encoded: &str) -> io::Result<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("api-bridge: request argument is not valid base64: {err}"),
+            )
+        })?;
+    String::from_utf8(bytes)
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("api-bridge: request is not valid UTF-8: {err}"),
+            )
+        })
+        .map(|line| line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// Connects to the API socket and forwards the request/reply. The testable core
@@ -3458,5 +3502,38 @@ mod api_bridge_tests {
         drop(a_keep);
         let _ = handle.join();
         unsafe { libc::close(write_fd) };
+    }
+
+    /// The base64 request argument decodes back to the exact JSON line, and
+    /// invalid base64 is a clean error rather than a forwarded-garbage request.
+    #[test]
+    fn request_arg_decodes_base64_and_rejects_garbage() {
+        use base64::Engine as _;
+        let request = "{\"id\":\"7\",\"method\":\"agent.list\",\"params\":{}}";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(request);
+        assert_eq!(decode_request_arg(&encoded).expect("decode"), request);
+        // trailing newline in the encoded payload is trimmed, matching stdin.
+        let with_nl = base64::engine::general_purpose::STANDARD.encode("{\"id\":\"7\"}\n");
+        assert_eq!(
+            decode_request_arg(&with_nl).expect("decode"),
+            "{\"id\":\"7\"}"
+        );
+        // Invalid base64 -> InvalidInput, exactly.
+        let bad_b64 =
+            decode_request_arg("not valid base64 !!!").expect_err("garbage base64 accepted");
+        assert_eq!(
+            bad_b64.kind(),
+            io::ErrorKind::InvalidInput,
+            "wrong kind for invalid base64"
+        );
+
+        // Valid base64 of invalid UTF-8 (0xFF) -> InvalidData, exactly, never a
+        // lossy-decoded request. base64([0xff]) is "/w==".
+        let bad_utf8 = decode_request_arg("/w==").expect_err("invalid UTF-8 accepted");
+        assert_eq!(
+            bad_utf8.kind(),
+            io::ErrorKind::InvalidData,
+            "wrong kind for invalid UTF-8"
+        );
     }
 }
