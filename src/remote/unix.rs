@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, BufRead as _, IsTerminal, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -216,6 +216,99 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     });
 
     copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
+/// Bridges stdio to the JSON API socket for a remote (mobile) client.
+///
+/// Unlike `run_remote_client_bridge`, which pumps one long-lived TUI-socket
+/// connection as a raw byte stream, the API socket is single-shot: it reads one
+/// request per connection then closes (streaming responses such as
+/// `events.subscribe` are the exception and hold their connection open). So this
+/// reads newline-delimited JSON request lines from stdin and opens a fresh API
+/// connection per line, forwarding each reply line to stdout. Replies already
+/// carry `id`, so the client correlates them and the bridge adds no framing.
+///
+/// Reached only over the same SSH authentication that already gates
+/// `remote-client-bridge`; it opens no network listener.
+pub(crate) fn run_api_client_bridge() -> io::Result<()> {
+    // Deliberately does NOT call ensure_remote_server_running(): that gates on
+    // status.protocol == CURRENT_PROTOCOL, an exact TUI-protocol-version lock
+    // that is fatal for a shipped client which cannot move in lockstep with
+    // every server it connects to. The JSON API is versioned by its schema, not
+    // that byte, so this connects directly and lets the first request surface a
+    // clear error if no server is listening. A down server means no agents to
+    // read, which the client reports as not-connected rather than auto-starting
+    // a server the user did not ask for over an SSH exec.
+    let socket_path = crate::api::socket_path();
+
+    // Serializes whole-line writes from the concurrent per-request readers, so a
+    // streaming reply and a round-trip reply never interleave mid-line on stdout.
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+
+    let stdin = io::stdin();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let socket_path = socket_path.clone();
+        let stdout = Arc::clone(&stdout);
+        handles.push(thread::spawn(move || {
+            if let Err(err) = forward_api_request(&socket_path, &line, &stdout) {
+                tracing::debug!(%err, "api-bridge request ended");
+            }
+        }));
+    }
+    // stdin reached EOF. Wait for in-flight requests to finish flushing their
+    // replies before returning, so a client that sends a request and then
+    // half-closes stdin still receives the response rather than having the
+    // process exit out from under the reader thread. A streaming request keeps
+    // its channel — and thus stdin — open for the session, so at genuine
+    // teardown there is nothing left to join.
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
+/// Opens one API-socket connection, sends `request_line`, and forwards every
+/// reply line to `out`. Generic over the writer so the forwarding and framing
+/// can be tested against a fake socket without a live server.
+fn forward_api_request<W: Write>(
+    socket_path: &Path,
+    request_line: &str,
+    out: &Mutex<W>,
+) -> io::Result<()> {
+    let mut conn = UnixStream::connect(socket_path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "api-bridge: failed to connect to API socket {}: {err}",
+                socket_path.display()
+            ),
+        )
+    })?;
+    conn.write_all(request_line.as_bytes())?;
+    conn.write_all(b"\n")?;
+    conn.flush()?;
+
+    let reader = io::BufReader::new(conn);
+    for reply in reader.lines() {
+        let reply = reply?;
+        write_reply_line(out, &reply)?;
+    }
+    Ok(())
+}
+
+/// Writes one complete reply line under the lock. A poisoned lock (a peer reader
+/// panicked) is recovered rather than propagated: dropping one reply is better
+/// than killing every other in-flight request.
+fn write_reply_line<W: Write>(out: &Mutex<W>, line: &str) -> io::Result<()> {
+    let mut out = out.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()
 }
 
 fn ensure_remote_server_running() -> io::Result<()> {
@@ -3107,5 +3200,58 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod api_bridge_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    /// forward_api_request must deliver the request line verbatim (with a
+    /// trailing newline) and forward every reply line back, in order, one line
+    /// at a time — the multiplex/framing contract, proven against a fake socket
+    /// with no live server.
+    #[test]
+    fn forwards_request_and_reply_lines_verbatim() {
+        let dir = std::env::temp_dir().join(format!("herdr-apibridge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sock = dir.join("api.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind");
+
+        // Fake API server: read one request line, then emit two reply lines and
+        // close — a one-shot reply plus a streamed follow-up on one connection.
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("read request");
+            let mut writer = conn;
+            writer
+                .write_all(b"{\"id\":\"1\",\"result\":1}\n")
+                .expect("reply 1");
+            writer
+                .write_all(b"{\"id\":\"1\",\"stream\":\"x\"}\n")
+                .expect("reply 2");
+            request
+        });
+
+        let out = Mutex::new(Vec::<u8>::new());
+        forward_api_request(&sock, "{\"id\":\"1\",\"method\":\"ping\"}", &out).expect("forward");
+        let written = String::from_utf8(out.into_inner().expect("lock")).expect("utf8");
+        let request_seen = server.join().expect("join");
+
+        assert_eq!(
+            request_seen, "{\"id\":\"1\",\"method\":\"ping\"}\n",
+            "the request line was not delivered verbatim with its newline"
+        );
+        assert_eq!(
+            written, "{\"id\":\"1\",\"result\":1}\n{\"id\":\"1\",\"stream\":\"x\"}\n",
+            "reply lines were not forwarded in order, one per line"
+        );
+
+        let _ = std::fs::remove_file(&sock);
     }
 }

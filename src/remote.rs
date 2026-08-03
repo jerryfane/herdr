@@ -147,6 +147,14 @@ pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
     ))
 }
 
+#[cfg(windows)]
+pub(crate) fn run_api_client_bridge() -> std::io::Result<()> {
+    debug_assert!(!crate::platform::capabilities().remote_attach);
+    Err(std::io::Error::other(
+        "api bridge is not supported on Windows yet",
+    ))
+}
+
 pub(crate) fn print_remote_error_hint(err: &std::io::Error, target: &str) {
     if is_remote_auth_error(err) {
         eprintln!(
