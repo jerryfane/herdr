@@ -3415,6 +3415,14 @@ mod api_bridge_tests {
     #[test]
     fn output_hangup_tears_down_api_connection_but_open_output_does_not() {
         let (a, mut b) = UnixStream::pair().expect("pair");
+        // KEEP A SECOND HANDLE TO THE SAME SOCKET ALIVE through the final
+        // assertion. Without it the watcher owns the only `a` fd, so its return
+        // drops the socket and `b` gets EOF from that drop alone — the reviewer
+        // showed deleting the production shutdown() then left this test green.
+        // With `a_keep` open, the socket is not closed by the watcher returning,
+        // so `b`'s EOF can only come from shutdown() propagating across the live
+        // connection.
+        let a_keep = a.try_clone().expect("clone a");
         let mut fds = [0 as libc::c_int; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
         let (read_fd, write_fd) = (fds[0], fds[1]);
@@ -3441,6 +3449,9 @@ mod api_bridge_tests {
             "the API connection was not shut down on output hangup"
         );
 
+        // Held open until AFTER the EOF assertion so that EOF proves shutdown,
+        // not a drop.
+        drop(a_keep);
         let _ = handle.join();
         unsafe { libc::close(write_fd) };
     }
