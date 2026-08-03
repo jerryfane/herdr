@@ -242,7 +242,7 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 ///
 /// Reached only over the same SSH authentication that already gates
 /// `remote-client-bridge`; it opens no network listener.
-pub(crate) fn run_api_client_bridge() -> io::Result<()> {
+pub(crate) fn run_api_client_bridge(encoded_request: Option<&str>) -> io::Result<()> {
     // Deliberately does NOT call ensure_remote_server_running(): that gates on
     // status.protocol == CURRENT_PROTOCOL, an exact TUI-protocol-version lock
     // that is fatal for a shipped client which cannot move in lockstep with
@@ -251,11 +251,21 @@ pub(crate) fn run_api_client_bridge() -> io::Result<()> {
     // server is listening rather than auto-starting one over an SSH exec.
     let socket_path = crate::api::socket_path();
 
-    let mut request_line = String::new();
-    if io::stdin().lock().read_line(&mut request_line)? == 0 {
-        return Ok(()); // stdin closed with no request
-    }
-    let request_line = request_line.trim_end_matches(['\r', '\n']).to_owned();
+    // The request may arrive as a base64 ARGUMENT or on stdin. The argument form
+    // is what an SSH-exec client uses: `herdr api-bridge <base64(json)>` runs the
+    // request through the remote shell without needing to write the channel's
+    // stdin, and base64 keeps arbitrary JSON off the shell's quoting rules.
+    // Stdin remains the fallback so `printf … | herdr api-bridge` still works.
+    let request_line = match encoded_request {
+        Some(encoded) => decode_request_arg(encoded)?,
+        None => {
+            let mut line = String::new();
+            if io::stdin().lock().read_line(&mut line)? == 0 {
+                return Ok(()); // stdin closed with no request
+            }
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
     if request_line.trim().is_empty() {
         return Ok(());
     }
@@ -314,6 +324,29 @@ fn wait_for_output_hangup_then_shutdown(output_fd: std::os::unix::io::RawFd, tea
             break;
         }
     }
+}
+
+/// Decodes the base64 request argument into a single JSON request line. A
+/// decode or UTF-8 failure is a client bug (the transport controls the
+/// encoding), surfaced as an io error rather than silently forwarding garbage.
+fn decode_request_arg(encoded: &str) -> io::Result<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("api-bridge: request argument is not valid base64: {err}"),
+            )
+        })?;
+    String::from_utf8(bytes)
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("api-bridge: request is not valid UTF-8: {err}"),
+            )
+        })
+        .map(|line| line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// Connects to the API socket and forwards the request/reply. The testable core
@@ -3458,5 +3491,25 @@ mod api_bridge_tests {
         drop(a_keep);
         let _ = handle.join();
         unsafe { libc::close(write_fd) };
+    }
+
+    /// The base64 request argument decodes back to the exact JSON line, and
+    /// invalid base64 is a clean error rather than a forwarded-garbage request.
+    #[test]
+    fn request_arg_decodes_base64_and_rejects_garbage() {
+        use base64::Engine as _;
+        let request = "{\"id\":\"7\",\"method\":\"agent.list\",\"params\":{}}";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(request);
+        assert_eq!(decode_request_arg(&encoded).expect("decode"), request);
+        // trailing newline in the encoded payload is trimmed, matching stdin.
+        let with_nl = base64::engine::general_purpose::STANDARD.encode("{\"id\":\"7\"}\n");
+        assert_eq!(
+            decode_request_arg(&with_nl).expect("decode"),
+            "{\"id\":\"7\"}"
+        );
+        assert!(
+            decode_request_arg("not valid base64 !!!").is_err(),
+            "garbage base64 was accepted"
+        );
     }
 }

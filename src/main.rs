@@ -503,7 +503,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("api-bridge") {
-        return remote::run_api_client_bridge();
+        return remote::run_api_client_bridge(args.get(2).map(|s| s.as_str()));
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
