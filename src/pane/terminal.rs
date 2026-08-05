@@ -180,6 +180,11 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Raw-output firehose for `pane.stream`, present only while at least one
+    /// viewer is attached. Guarded by the core lock, so the `is_none()` check on
+    /// the read hot path is the zero-cost no-subscriber fast path, and the tap's
+    /// offset advance is serialized with the screen mutation.
+    output_ring: Option<Arc<super::output_ring::OutputRing>>,
 }
 
 pub(crate) struct PaneTerminal {
@@ -211,6 +216,28 @@ impl PaneTerminal {
     ) -> Vec<Bytes> {
         self.ghostty
             .resize(rows, cols, cell_width_px, cell_height_px)
+    }
+
+    pub(super) fn attach_output_ring(
+        &self,
+        ring: Arc<super::output_ring::OutputRing>,
+    ) -> Arc<super::output_ring::OutputRing> {
+        self.ghostty.attach_output_ring(ring)
+    }
+
+    pub(super) fn detach_output_ring(&self) -> usize {
+        self.ghostty.detach_output_ring()
+    }
+
+    pub(super) fn mark_output_ring_closed(&self) {
+        self.ghostty.mark_output_ring_closed();
+    }
+
+    pub(super) fn output_snapshot(
+        &self,
+        ring: &super::output_ring::OutputRing,
+    ) -> Option<super::output_ring::OutputSnapshot> {
+        self.ghostty.output_snapshot(ring)
     }
 
     pub fn scroll_up(&self, lines: usize) {
@@ -945,6 +972,7 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                output_ring: None,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1165,6 +1193,16 @@ impl GhosttyPaneTerminal {
         #[cfg(windows)]
         windows_recent_fallback::update(&mut core);
         crate::render_prof::duration_since("pty.ghostty_write", write_started);
+
+        // `pane.stream` byte tap. Zero-cost when no viewer is attached (the
+        // `Option` is `None`). We append the *raw* pre-filter `bytes` the child
+        // wrote — never `terminal_responses`, which are host->child replies. The
+        // append advances the ring offset inside this same core-lock critical
+        // section as the screen mutation above, so a viewer's captured
+        // `(visible_ansi, offset)` seed is always a gap/overlap-free cut.
+        if let Some(ring) = &core.output_ring {
+            ring.append(bytes);
+        }
 
         let has_kitty_graphics_sequence = crate::kitty_graphics::is_enabled()
             && contains_kitty_graphics_sequence(filtered_bytes.as_ref());
@@ -1440,6 +1478,12 @@ impl GhosttyPaneTerminal {
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            // Record an in-band `pane.stream` resize marker at the current offset
+            // (under the same core lock, so it is ordered against surrounding
+            // data appends). No-op when no viewer is attached.
+            if let Some(ring) = &core.output_ring {
+                ring.note_resize(cols, rows);
+            }
             let terminal_responses = self.drain_pending_pty_responses();
 
             let bottom_is_blank = ghostty_detection_text(&core)
@@ -1467,6 +1511,69 @@ impl GhosttyPaneTerminal {
         } else {
             Vec::new()
         }
+    }
+
+    /// Attach a `pane.stream` viewer. Installs `ring` as the pane's output ring
+    /// on the first subscribe (so the read hot path starts tapping) and returns
+    /// the effective shared ring — an already-installed ring wins so co-viewers
+    /// share one buffer. The offered `ring` is dropped when one already exists.
+    pub(super) fn attach_output_ring(
+        &self,
+        ring: Arc<super::output_ring::OutputRing>,
+    ) -> Arc<super::output_ring::OutputRing> {
+        let mut core = match self.core.lock() {
+            Ok(core) => core,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let effective = core.output_ring.get_or_insert(ring).clone();
+        effective.add_subscriber();
+        effective
+    }
+
+    /// Detach a `pane.stream` viewer. Clears the ring once the last viewer
+    /// leaves, restoring the zero-cost no-subscriber read path. Returns the
+    /// remaining subscriber count.
+    pub(super) fn detach_output_ring(&self) -> usize {
+        let mut core = match self.core.lock() {
+            Ok(core) => core,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(ring) = core.output_ring.as_ref() else {
+            return 0;
+        };
+        let remaining = ring.remove_subscriber();
+        if remaining == 0 {
+            core.output_ring = None;
+        }
+        remaining
+    }
+
+    /// Signal any attached `pane.stream` viewers that the runtime is gone.
+    pub(super) fn mark_output_ring_closed(&self) {
+        if let Ok(core) = self.core.lock() {
+            if let Some(ring) = core.output_ring.as_ref() {
+                ring.mark_closed();
+            }
+        }
+    }
+
+    /// Capture a full-screen ANSI seed paired atomically with the ring offset it
+    /// reflects. Rendered under the core lock and reading the ring offset in the
+    /// same critical section, so the pair is a consistent, gap/overlap-free cut.
+    pub(super) fn output_snapshot(
+        &self,
+        ring: &super::output_ring::OutputRing,
+    ) -> Option<super::output_ring::OutputSnapshot> {
+        let core = self.core.lock().ok()?;
+        let ansi = ghostty_visible_ansi(&core).ok()?;
+        let (cursor, resize_id, cols, rows) = ring.capture_offsets();
+        Some(super::output_ring::OutputSnapshot {
+            ansi,
+            cursor,
+            resize_id,
+            cols,
+            rows,
+        })
     }
 
     pub fn scroll_up(&self, lines: usize) {

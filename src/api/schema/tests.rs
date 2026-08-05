@@ -532,6 +532,60 @@ fn pane_set_pty_size_request_and_response_round_trip() {
 }
 
 #[test]
+fn pane_stream_request_round_trips_and_defaults() {
+    let request = Request {
+        id: "req_stream".into(),
+        method: Method::PaneStream(PaneStreamParams {
+            pane_id: "w1:p1".into(),
+            include_history: true,
+            resume_from: Some(918_273),
+            epoch: Some(7),
+            max_frame_bytes: Some(65_536),
+            scrollback_lines: Some(200),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.stream");
+    assert_eq!(json["params"]["pane_id"], "w1:p1");
+    assert_eq!(json["params"]["max_frame_bytes"], 65_536);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    // Only pane_id is required; include_history defaults to true and the resume
+    // axis is optional on the wire.
+    let minimal: Request =
+        serde_json::from_str(r#"{"id":"req_2","method":"pane.stream","params":{"pane_id":"p"}}"#)
+            .unwrap();
+    let Method::PaneStream(params) = minimal.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!(params.pane_id, "p");
+    assert!(params.include_history);
+    assert_eq!(params.resume_from, None);
+    assert_eq!(params.epoch, None);
+    assert_eq!(params.max_frame_bytes, None);
+}
+
+#[test]
+fn stream_started_response_round_trips() {
+    let response = SuccessResponse {
+        id: "req_stream".into(),
+        result: ResponseResult::StreamStarted {
+            pane_id: "w1:p1".into(),
+            epoch: 7,
+            cols: 80,
+            rows: 24,
+            base_seq: 918_273,
+            resync: true,
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"stream_started\""));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn event_envelope_round_trips() {
     let events = [
         EventEnvelope {

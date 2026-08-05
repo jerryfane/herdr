@@ -342,6 +342,38 @@ pub struct PaneGraphicsStreamParams {
     pub owner: String,
 }
 
+fn default_include_history() -> bool {
+    true
+}
+
+/// Subscription parameters for `pane.stream`, the persistent server->client raw
+/// PTY byte firehose used by remote clients (the mobile app) to drive a live
+/// VT emulator. `seq` on the wire is an absolute byte offset and `epoch`
+/// identifies the runtime generation; both are carried so gap-free resume can
+/// be added later without a wire change (v1 always re-seeds a fresh reset).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamParams {
+    pub pane_id: String,
+    /// Whether the initial reset seed should include windowed scrollback history
+    /// (v1 seeds the visible screen; reserved for a later history-aware seed).
+    #[serde(default = "default_include_history")]
+    pub include_history: bool,
+    /// Absolute byte offset to resume from. Carried on the wire for a later
+    /// gap-free resume; v1 ignores it and always sends a fresh reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<u64>,
+    /// Runtime epoch the client last saw. Carried for resume; v1 always resyncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    /// Maximum decoded bytes per `data` frame. Oversize deltas are split across
+    /// frames. Defaults to a server-chosen chunk size when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    /// Number of scrollback lines to window into the reset seed (reserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_lines: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,
