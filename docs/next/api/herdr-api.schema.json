@@ -3343,6 +3343,55 @@
           ],
           "type": "object"
         },
+        "PaneSetPtySizeParams": {
+          "description": "Sets the real PTY window size (cols/rows) of a pane and takes or releases\ngeometry ownership so a remote client can drive the pane size. Distinct from\n`pane.resize`, which changes the layout split ratio rather than the winsize.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "lock": {
+              "default": false,
+              "description": "When true, take geometry ownership: the desktop TUI stops re-asserting\nlayout-driven winsize for this pane. When false, release it so the TUI\nreclaims the size on its next render.",
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
         "PaneSplitParams": {
           "properties": {
             "cwd": {
@@ -5617,6 +5666,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneResizeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.set_pty_size",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetPtySizeParams"
             }
           },
           "required": [
@@ -10492,6 +10557,40 @@
               "required": [
                 "type",
                 "resize"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "cols": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "locked": {
+                  "type": "boolean"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "rows": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_pty_size",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "cols",
+                "rows",
+                "locked"
               ],
               "type": "object"
             },

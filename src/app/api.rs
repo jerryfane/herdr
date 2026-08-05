@@ -1086,6 +1086,9 @@ impl App {
                 return self.handle_pane_focus_direction(request.id, params);
             }
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
+            Method::PaneSetPtySize(params) => {
+                return self.handle_pane_set_pty_size(request.id, params);
+            }
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),

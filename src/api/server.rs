@@ -398,6 +398,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneEdges(_) => "pane.edges",
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
+        Method::PaneSetPtySize(_) => "pane.set_pty_size",
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",

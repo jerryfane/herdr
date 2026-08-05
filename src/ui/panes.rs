@@ -182,7 +182,7 @@ pub(super) fn resize_tab_panes(
             };
             let pane_inner = pane_inner_rect(area, borders);
             let inner_rect = stable_terminal_inner_rect(pane_inner);
-            if !app.direct_attach_resize_locks.contains(terminal_id) {
+            if !app.pty_geometry_externally_owned(terminal_id) {
                 rt.resize(
                     inner_rect.height,
                     inner_rect.width,
@@ -199,7 +199,7 @@ pub(super) fn resize_tab_panes(
 
         if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, info.id) {
             let inner_rect = stable_terminal_inner_rect(pane_inner);
-            if !app.direct_attach_resize_locks.contains(terminal_id) {
+            if !app.pty_geometry_externally_owned(terminal_id) {
                 rt.resize(
                     inner_rect.height,
                     inner_rect.width,
@@ -241,9 +241,9 @@ pub(super) fn compute_pane_infos(
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
             if resize_panes
-                && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
+                && ws
+                    .terminal_id(focused_id)
+                    .is_some_and(|terminal_id| !app.pty_geometry_externally_owned(terminal_id))
             {
                 rt.resize(
                     inner_rect.height,
@@ -273,9 +273,9 @@ pub(super) fn compute_pane_infos(
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
             if resize_panes
-                && ws.terminal_id(info.id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
+                && ws
+                    .terminal_id(info.id)
+                    .is_some_and(|terminal_id| !app.pty_geometry_externally_owned(terminal_id))
             {
                 rt.resize(
                     inner_rect.height,
@@ -385,7 +385,7 @@ pub(super) fn resize_popup_pane(
     let Some((_outer, inner)) = popup_pane_rects(app, area) else {
         return;
     };
-    if app.direct_attach_resize_locks.contains(&popup.terminal_id) {
+    if app.pty_geometry_externally_owned(&popup.terminal_id) {
         return;
     }
     if let Some(rt) = terminal_runtimes.get(&popup.terminal_id) {

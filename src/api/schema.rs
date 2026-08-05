@@ -153,6 +153,8 @@ pub enum Method {
     PaneFocusDirection(PaneFocusDirectionParams),
     #[serde(rename = "pane.resize")]
     PaneResize(PaneResizeParams),
+    #[serde(rename = "pane.set_pty_size")]
+    PaneSetPtySize(PaneSetPtySizeParams),
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
     #[serde(rename = "pane.current")]
