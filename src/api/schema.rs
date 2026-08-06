@@ -193,6 +193,15 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamClose(PaneGraphicsStreamParams),
+    #[serde(rename = "pane.stream")]
+    #[schemars(skip)]
+    PaneStream(PaneStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamOpen(PaneStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamClose(PaneStreamParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]

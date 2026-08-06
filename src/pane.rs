@@ -29,9 +29,14 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+mod output_ring;
 mod state;
 mod terminal;
 mod xtgettcap;
+
+pub(crate) use output_ring::{
+    clamp_max_frame_bytes, OutputDrain, OutputRing, OutputWait, OUTPUT_RING_CAPACITY_BYTES,
+};
 
 use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
@@ -1044,8 +1049,20 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// Monotonic generation id for this runtime. Put on the `pane.stream` wire so
+    /// a reconnecting client can tell whether the runtime it last saw is still
+    /// the same one (a changed epoch forces a resync).
+    epoch: u64,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+/// Source of per-runtime `pane.stream` epochs. A fresh epoch per runtime
+/// construction means any handoff/respawn presents as a new generation.
+static NEXT_PANE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_pane_epoch() -> u64 {
+    NEXT_PANE_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 enum PaneRuntimeIo {
@@ -1295,6 +1312,9 @@ pub enum WheelRouting {
 
 impl Drop for PaneRuntime {
     fn drop(&mut self) {
+        // Tell any attached `pane.stream` viewers the runtime is gone so they
+        // emit `exited` and close, rather than blocking until an idle timeout.
+        self.terminal.mark_output_ring_closed();
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
         if let Some(handle) = &self.detect_handle {
@@ -2040,6 +2060,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            epoch: next_pane_epoch(),
             detect_handle: Some(detect_handle),
         })
     }
@@ -2597,6 +2618,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            epoch: next_pane_epoch(),
             detect_handle,
         })
     }
@@ -2637,6 +2659,27 @@ impl PaneRuntime {
     pub(crate) fn current_size(&self) -> (u16, u16) {
         let (rows, cols, _, _) = self.current_size.get();
         (rows, cols)
+    }
+
+    /// Attach a `pane.stream` viewer, lazily creating this pane's bounded output
+    /// ring on the first subscribe. Returns the shared `Arc<OutputRing>` so the
+    /// connection thread can drain it without routing bytes through the app loop.
+    pub(crate) fn attach_output_stream(&self, capacity: usize) -> Arc<OutputRing> {
+        let (rows, cols) = self.current_size();
+        let candidate = OutputRing::new(
+            self.epoch,
+            capacity,
+            cols,
+            rows,
+            Arc::downgrade(&self.terminal),
+        );
+        self.terminal.attach_output_ring(candidate)
+    }
+
+    /// Detach a `pane.stream` viewer. Returns the remaining subscriber count; the
+    /// ring is torn down (restoring the zero-cost read path) when it reaches zero.
+    pub(crate) fn detach_output_stream(&self) -> usize {
+        self.terminal.detach_output_ring()
     }
 
     /// Resize if the dimensions actually changed.
@@ -3108,6 +3151,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                epoch: next_pane_epoch(),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3616,6 +3660,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            epoch: next_pane_epoch(),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -3647,6 +3692,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            epoch: next_pane_epoch(),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

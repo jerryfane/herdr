@@ -10596,6 +10596,52 @@
             },
             {
               "properties": {
+                "base_seq": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cols": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "resync": {
+                  "type": "boolean"
+                },
+                "rows": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "stream_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "epoch",
+                "cols",
+                "rows",
+                "base_seq",
+                "resync"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "read": {
                   "$ref": "#/schemas/success_response/$defs/PaneReadResult"
                 },

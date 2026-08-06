@@ -170,6 +170,14 @@ pub enum ResponseResult {
         rows: u16,
         locked: bool,
     },
+    StreamStarted {
+        pane_id: String,
+        epoch: u64,
+        cols: u16,
+        rows: u16,
+        base_seq: u64,
+        resync: bool,
+    },
     PaneRead {
         read: PaneReadResult,
     },

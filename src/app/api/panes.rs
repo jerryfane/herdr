@@ -10,9 +10,9 @@ use crate::api::schema::{
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSetPtySizeParams,
-    PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneTurnRecord,
-    PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult,
-    ResponseResult,
+    PaneSplitParams, PaneStreamParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget,
+    PaneTurnRecord, PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason,
+    PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -564,6 +564,57 @@ impl App {
                 locked: params.lock,
             },
         )
+    }
+
+    /// Internal open for `pane.stream` (dispatched by the stream server, not a
+    /// public method). Lazily creates the pane's bounded output ring, registers
+    /// one viewer, and publishes the ring so the connection thread can drain it
+    /// off the app loop. The seed frame and ack are produced by the server from
+    /// the ring, so this only needs to succeed the attach.
+    pub(super) fn handle_pane_stream_open(
+        &mut self,
+        id: String,
+        params: PaneStreamParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        else {
+            return pane_not_found(id, &public_pane_id);
+        };
+        let ring = runtime.attach_output_stream(crate::pane::OUTPUT_RING_CAPACITY_BYTES);
+        crate::api::output_registry::register(&params.pane_id, &ring);
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Internal close for `pane.stream`: detaches one viewer and, once the last
+    /// leaves, unpublishes the ring (which also stops the read hot-path tap).
+    pub(super) fn handle_pane_stream_close(
+        &mut self,
+        id: String,
+        params: PaneStreamParams,
+    ) -> String {
+        match self.parse_pane_id(&params.pane_id) {
+            Some((ws_idx, pane_id)) => {
+                let remaining = self
+                    .state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                    .map(|runtime| runtime.detach_output_stream());
+                // Unregister when the last viewer left, or when the runtime is
+                // already gone (the pane was closed out from under the stream).
+                if remaining.is_none_or(|count| count == 0) {
+                    crate::api::output_registry::unregister(&params.pane_id);
+                }
+            }
+            None => crate::api::output_registry::unregister(&params.pane_id),
+        }
+        encode_success(id, ResponseResult::Ok {})
     }
 
     pub(super) fn handle_pane_swap(&mut self, id: String, params: PaneSwapParams) -> String {

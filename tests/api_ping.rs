@@ -661,6 +661,142 @@ fn pane_set_pty_size_round_trips_over_socket() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
+fn pane_stream_firehose_over_socket() {
+    use base64::Engine;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"stream_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Open the firehose on its own long-lived connection.
+    let mut stream = open_subscription(
+        &socket_path,
+        &format!(
+            r#"{{"id":"stream_1","method":"pane.stream","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+
+    // First line: the stream_started ack carrying geometry + epoch + base_seq.
+    let ack = stream.read_json_line(Duration::from_secs(5));
+    assert_eq!(ack["id"], "stream_1");
+    assert_eq!(ack["result"]["type"], "stream_started");
+    assert_eq!(ack["result"]["pane_id"], pane_id);
+    assert_eq!(ack["result"]["resync"], true);
+    let epoch = ack["result"]["epoch"].as_u64().unwrap();
+    assert!(ack["result"]["cols"].as_u64().unwrap() >= 4);
+    assert!(ack["result"]["rows"].as_u64().unwrap() >= 2);
+    let base_seq = ack["result"]["base_seq"].as_u64().unwrap();
+
+    // Second line: the reset seed frame (base64 full-screen ANSI at base_seq).
+    let reset = stream.read_json_line(Duration::from_secs(5));
+    assert_eq!(reset["stream"], "pane.bytes");
+    assert_eq!(reset["frame"], "reset");
+    assert_eq!(reset["epoch"].as_u64().unwrap(), epoch);
+    assert_eq!(reset["seq"].as_u64().unwrap(), base_seq);
+    let seed_b64 = reset["data_b64"].as_str().expect("reset carries data_b64");
+    base64::engine::general_purpose::STANDARD
+        .decode(seed_b64)
+        .expect("reset seed decodes as base64");
+
+    // Drive output on a separate connection so the stream keeps reading. The
+    // shell echoes the typed bytes, so the marker lands in the raw firehose.
+    let marker = "streamtest_marker_9137";
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"txt","method":"pane.send_text","params":{{"pane_id":"{}","text":"echo {}\n"}}}}"#,
+            pane_id, marker
+        ),
+    );
+
+    // Accumulate decoded `data` frames until the marker bytes appear.
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut last_seq = base_seq;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut found = false;
+    while Instant::now() < deadline {
+        let Some(frame) = stream.try_read_json_line(Duration::from_millis(500)) else {
+            continue;
+        };
+        assert_eq!(frame["stream"], "pane.bytes");
+        assert_eq!(frame["epoch"].as_u64().unwrap(), epoch);
+        match frame["frame"].as_str() {
+            Some("data") => {
+                // seq is the absolute byte offset of the frame's first byte and
+                // must be monotonic and gap-free with the running total.
+                assert_eq!(frame["seq"].as_u64().unwrap(), last_seq);
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(frame["data_b64"].as_str().unwrap())
+                    .expect("data frame decodes as base64");
+                last_seq += bytes.len() as u64;
+                decoded.extend_from_slice(&bytes);
+                if decoded
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+                {
+                    found = true;
+                    break;
+                }
+            }
+            Some("reset") => {
+                // A mid-stream resync re-bases the byte cursor.
+                last_seq = frame["seq"].as_u64().unwrap();
+            }
+            Some("resize") | Some("ping") => {}
+            other => panic!("unexpected stream frame: {other:?}"),
+        }
+    }
+    assert!(
+        found,
+        "marker never arrived in a data frame; decoded so far: {:?}",
+        String::from_utf8_lossy(&decoded)
+    );
+
+    // Closing the pane drops the runtime, which must deliver an `exited` frame.
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"close","method":"pane.close","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        let Some(frame) = stream.try_read_json_line(Duration::from_millis(500)) else {
+            continue;
+        };
+        if frame["frame"] == "exited" {
+            assert_eq!(frame["stream"], "pane.bytes");
+            exited = true;
+            break;
+        }
+    }
+    assert!(exited, "expected an exited frame after closing the pane");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
 fn tab_methods_round_trip_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();

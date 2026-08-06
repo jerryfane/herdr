@@ -23,6 +23,7 @@ use crate::ipc::{
 };
 
 mod pane_graphics_stream;
+mod pane_output_stream;
 pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -182,6 +183,22 @@ fn handle_connection(
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::PaneStream(params) => {
+            let result =
+                pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -416,6 +433,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneStream(_) => "pane.stream",
+        Method::PaneStreamOpen(_) => "pane.stream.open",
+        Method::PaneStreamClose(_) => "pane.stream.close",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",

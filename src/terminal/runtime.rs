@@ -235,6 +235,17 @@ impl TerminalRuntime {
         self.0.set_full_lifecycle_authority_active(active);
     }
 
+    pub(crate) fn attach_output_stream(
+        &self,
+        capacity: usize,
+    ) -> std::sync::Arc<crate::pane::OutputRing> {
+        self.0.attach_output_stream(capacity)
+    }
+
+    pub(crate) fn detach_output_stream(&self) -> usize {
+        self.0.detach_output_stream()
+    }
+
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
