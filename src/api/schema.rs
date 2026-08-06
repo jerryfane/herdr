@@ -173,6 +173,8 @@ pub enum Method {
     PaneCopyMotion(PaneCopyMotionParams),
     #[serde(rename = "pane.copy_search")]
     PaneCopySearch(PaneCopySearchParams),
+    #[serde(rename = "pane.set_pty_size")]
+    PaneSetPtySize(PaneSetPtySizeParams),
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
     #[serde(rename = "pane.current")]

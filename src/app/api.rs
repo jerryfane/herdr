@@ -1136,6 +1136,8 @@ impl App {
             }
             Method::PaneCopySearch(params) => {
                 return self.handle_pane_copy_search(request.id, params);
+            Method::PaneSetPtySize(params) => {
+                return self.handle_pane_set_pty_size(request.id, params);
             }
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
