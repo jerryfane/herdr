@@ -164,6 +164,12 @@ pub enum ResponseResult {
     PaneResize {
         resize: PaneResizeResult,
     },
+    PanePtySize {
+        pane_id: String,
+        cols: u16,
+        rows: u16,
+        locked: bool,
+    },
     PaneRead {
         read: PaneReadResult,
     },

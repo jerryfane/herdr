@@ -209,6 +209,26 @@ pub struct PaneResizeParams {
     pub amount: Option<f32>,
 }
 
+/// Sets the real PTY window size (cols/rows) of a pane and takes or releases
+/// geometry ownership so a remote client can drive the pane size. Distinct from
+/// `pane.resize`, which changes the layout split ratio rather than the winsize.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSetPtySizeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_width_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_height_px: Option<u32>,
+    /// When true, take geometry ownership: the desktop TUI stops re-asserting
+    /// layout-driven winsize for this pane. When false, release it so the TUI
+    /// reclaims the size on its next render.
+    #[serde(default)]
+    pub lock: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

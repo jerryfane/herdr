@@ -596,6 +596,71 @@ fn workspace_list_and_create_round_trip() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
+fn pane_set_pty_size_round_trips_over_socket() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // lock=true drives the real winsize and reports the applied size.
+    let locked = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_lock","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":100,"rows":40,"lock":true}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(locked["result"]["type"], "pane_pty_size");
+    assert_eq!(locked["result"]["pane_id"], pane_id);
+    assert_eq!(locked["result"]["cols"], 100);
+    assert_eq!(locked["result"]["rows"], 40);
+    assert_eq!(locked["result"]["locked"], true);
+
+    // Zero dimensions clamp to the runtime minimums (rows >= 2, cols >= 4).
+    let clamped = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_clamp","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":0,"rows":0,"lock":true}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(clamped["result"]["cols"], 4);
+    assert_eq!(clamped["result"]["rows"], 2);
+    assert_eq!(clamped["result"]["locked"], true);
+
+    // lock=false releases geometry ownership back to the TUI.
+    let released = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_release","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":120,"rows":50,"lock":false}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(released["result"]["locked"], false);
+    assert_eq!(released["result"]["cols"], 120);
+    assert_eq!(released["result"]["rows"], 50);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
 fn tab_methods_round_trip_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();

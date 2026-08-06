@@ -1419,6 +1419,11 @@ pub struct AppState {
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Terminal ids whose size is currently owned by an API `pane.set_pty_size`
+    /// caller. Tracked separately from `direct_attach_resize_locks` so the two
+    /// ownership sources cannot clear each other's locks (a direct attach client
+    /// connecting/disconnecting must not drop an API lock, and vice versa).
+    pub api_pty_size_locks: std::collections::HashSet<crate::terminal::TerminalId>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
@@ -1693,6 +1698,14 @@ impl AppState {
         }
     }
 
+    /// Whether the pty geometry for a terminal is owned by an external client
+    /// (a direct attach client or an API `pane.set_pty_size` caller), meaning the
+    /// desktop TUI must not re-assert its layout-driven winsize for that pane.
+    pub fn pty_geometry_externally_owned(&self, terminal_id: &crate::terminal::TerminalId) -> bool {
+        self.direct_attach_resize_locks.contains(terminal_id)
+            || self.api_pty_size_locks.contains(terminal_id)
+    }
+
     /// Returns true when the given (workspace, tab, pane) refers to the
     /// currently focused pane in the active workspace's active tab.
     pub(crate) fn runtime_for_pane_in_workspace<'a>(
@@ -1794,6 +1807,7 @@ impl AppState {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            api_pty_size_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),

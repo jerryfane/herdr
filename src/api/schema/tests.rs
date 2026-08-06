@@ -483,6 +483,55 @@ fn pane_process_info_request_round_trips() {
 }
 
 #[test]
+fn pane_set_pty_size_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_set_pty_size".into(),
+        method: Method::PaneSetPtySize(PaneSetPtySizeParams {
+            pane_id: Some("w1-1".into()),
+            cols: 100,
+            rows: 40,
+            cell_width_px: Some(8),
+            cell_height_px: Some(16),
+            lock: true,
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.set_pty_size");
+    assert_eq!(json["params"]["cols"], 100);
+    assert_eq!(json["params"]["rows"], 40);
+    assert_eq!(json["params"]["lock"], true);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    // cell_*_px and lock are optional/defaulted on the wire.
+    let minimal: Request = serde_json::from_str(
+        r#"{"id":"req_2","method":"pane.set_pty_size","params":{"cols":80,"rows":24}}"#,
+    )
+    .unwrap();
+    let Method::PaneSetPtySize(params) = minimal.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!((params.cols, params.rows), (80, 24));
+    assert_eq!(params.cell_width_px, None);
+    assert_eq!(params.cell_height_px, None);
+    assert!(!params.lock);
+
+    let response = SuccessResponse {
+        id: "req_set_pty_size".into(),
+        result: ResponseResult::PanePtySize {
+            pane_id: "w1-1".into(),
+            cols: 100,
+            rows: 40,
+            locked: true,
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"pane_pty_size\""));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn event_envelope_round_trips() {
     let events = [
         EventEnvelope {

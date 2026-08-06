@@ -9,9 +9,10 @@ use crate::api::schema::{
     PaneProcessInfo, PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTurnRecord, PaneTurnsParams, PaneTurnsResult,
-    PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSetPtySizeParams,
+    PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneTurnRecord,
+    PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult,
+    ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -496,6 +497,71 @@ impl App {
                     focused_pane_id,
                     layout,
                 },
+            },
+        )
+    }
+
+    pub(super) fn handle_pane_set_pty_size(
+        &mut self,
+        id: String,
+        params: PaneSetPtySizeParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let Some(pane_public_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return pane_not_found(id, &pane_public_id);
+        };
+
+        // Drive the real PTY winsize through the same runtime call the TUI uses,
+        // BEFORE touching any ownership lock. If the pane resolves but has no
+        // runtime the request fails, and it must leave the lock set untouched
+        // (otherwise `lock=true` would strand a stale lock and `lock=false` would
+        // release an existing lock despite the request failing).
+        // `PaneRuntime::resize` clamps to its minimum (rows >= 2, cols >= 4) and
+        // early-returns when unchanged; read the size back to report the applied
+        // (clamped) dimensions. The scope drops the immutable `self.state` borrow
+        // taken by `runtime_for_pane_in_workspace` before the lock is mutated.
+        let (applied_rows, applied_cols) = {
+            let Some(runtime) =
+                self.state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            else {
+                return pane_not_found(id, &pane_public_id);
+            };
+            runtime.resize(
+                params.rows,
+                params.cols,
+                params.cell_width_px.unwrap_or(0),
+                params.cell_height_px.unwrap_or(0),
+            );
+            runtime.current_size()
+        };
+
+        // Take or release geometry ownership only after the resize succeeds. While
+        // a terminal is in this set the desktop TUI stops re-asserting
+        // layout-driven winsize for it (`ui::panes` gates its resize on the
+        // geometry not being externally owned), so a remote client can own the pane
+        // size. This set is API-owned and kept separate from
+        // `direct_attach_resize_locks` so a direct attach client
+        // connecting/disconnecting cannot clear an API lock and vice versa.
+        // Releasing lets the TUI reclaim the size on its next render.
+        if params.lock {
+            self.state.api_pty_size_locks.insert(terminal_id.clone());
+        } else {
+            self.state.api_pty_size_locks.remove(&terminal_id);
+        }
+
+        encode_success(
+            id,
+            ResponseResult::PanePtySize {
+                pane_id: pane_public_id,
+                cols: applied_cols,
+                rows: applied_rows,
+                locked: params.lock,
             },
         )
     }
@@ -2170,6 +2236,238 @@ mod tests {
         assert_eq!(pane.turn, Some(0));
         assert_eq!(pane.turn_epoch, Some(epoch));
         assert!(pane.last_completed_turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_pane_set_pty_size_locks_clamps_and_releases() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // lock=true drives the real winsize and takes geometry ownership.
+        let response = app.handle_pane_set_pty_size(
+            "lock".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 100,
+                rows: 40,
+                cell_width_px: Some(8),
+                cell_height_px: Some(16),
+                lock: true,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize {
+            pane_id: reported_pane_id,
+            cols,
+            rows,
+            locked,
+        } = success.result
+        else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!(reported_pane_id, public_pane_id);
+        assert_eq!((cols, rows), (100, 40));
+        assert!(locked);
+        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
+        assert_eq!(
+            app.state
+                .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+                .unwrap()
+                .current_size(),
+            (40, 100)
+        );
+
+        // Zero dimensions clamp to the runtime minimums (rows >= 2, cols >= 4).
+        let response = app.handle_pane_set_pty_size(
+            "clamp".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 0,
+                rows: 0,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: true,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize {
+            cols, rows, locked, ..
+        } = success.result
+        else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows), (4, 2));
+        assert!(locked);
+
+        // lock=false reclaims geometry ownership for the TUI.
+        let response = app.handle_pane_set_pty_size(
+            "release".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 120,
+                rows: 50,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize { locked, .. } = success.result else {
+            panic!("expected pane pty size response");
+        };
+        assert!(!locked);
+        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn api_pane_set_pty_size_missing_runtime_lock_true_leaves_locks_unchanged() {
+        // A pane with terminal metadata but no runtime must fail without minting
+        // a stale lock.
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        assert!(app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .is_none());
+
+        let response = app.handle_pane_set_pty_size(
+            "lock-no-runtime".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 100,
+                rows: 40,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: true,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
+        assert!(app.state.api_pty_size_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_pane_set_pty_size_missing_runtime_lock_false_leaves_locks_unchanged() {
+        // A failing lock=false request must not release an existing lock.
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        app.state.api_pty_size_locks.insert(terminal_id.clone());
+        assert!(app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .is_none());
+
+        let response = app.handle_pane_set_pty_size(
+            "release-no-runtime".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 120,
+                rows: 50,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: false,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+        // The pre-existing lock survives because the request failed.
+        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn api_pty_size_lock_survives_direct_attach_client_churn() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // API takes geometry ownership in its own set.
+        let response = app.handle_pane_set_pty_size(
+            "api-lock".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 100,
+                rows: 40,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: true,
+            },
+        );
+        let _success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
+        assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // A direct-attach client connects then disconnects: the headless
+        // `remove_client` path clears the terminal from `direct_attach_resize_locks`.
+        // The API lock lives in a separate set and must survive.
+        app.state
+            .direct_attach_resize_locks
+            .insert(terminal_id.clone());
+        app.state.direct_attach_resize_locks.remove(&terminal_id);
+        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn api_pty_size_release_does_not_touch_direct_attach_lock() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // An active direct-attach client owns the size.
+        app.state
+            .direct_attach_resize_locks
+            .insert(terminal_id.clone());
+
+        let response = app.handle_pane_set_pty_size(
+            "api-release".into(),
+            PaneSetPtySizeParams {
+                pane_id: Some(public_pane_id.clone()),
+                cols: 120,
+                rows: 50,
+                cell_width_px: None,
+                cell_height_px: None,
+                lock: false,
+            },
+        );
+        let _success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        // Only the API set is cleared; the direct-attach lock is untouched, so
+        // geometry remains externally owned.
+        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
+        assert!(app.state.direct_attach_resize_locks.contains(&terminal_id));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[test]
+    fn pty_geometry_externally_owned_is_true_if_either_set_contains_id() {
+        let mut state = crate::app::state::AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
+
+        // Direct-attach ownership alone.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // API ownership alone.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        state.api_pty_size_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Both sources at once.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Neither: the two sets are independent and clearing both drops ownership.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        state.api_pty_size_locks.remove(&terminal_id);
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
     }
 
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
