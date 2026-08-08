@@ -87,6 +87,23 @@ pub struct NotificationShowParams {
     pub sound: NotificationShowSound,
 }
 
+/// Register (or update) a mobile device for remote push notifications.
+///
+/// Field names match the iOS client's `RegisterDeviceParams` contract. The
+/// `notify_*` preferences default to `false` so a partial payload never fails
+/// deserialization; the client sends explicit values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NotificationsRegisterDeviceParams {
+    pub device_token: String,
+    pub platform: String,
+    #[serde(default)]
+    pub notify_needs_input: bool,
+    #[serde(default)]
+    pub notify_dies: bool,
+    #[serde(default)]
+    pub notify_finishes: bool,
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
 )]

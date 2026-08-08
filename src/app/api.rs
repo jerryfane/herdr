@@ -188,6 +188,7 @@ impl App {
                 self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                 self.emit_pane_state_update(&update);
                 self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
+                self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
             }
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)
@@ -299,6 +300,7 @@ impl App {
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
         }
+        self.emit_apns_agent_notifications(&pane_updates, false);
         self.sync_agent_metadata_deadline();
         if let Some((
             overlay,
@@ -719,6 +721,95 @@ impl App {
         }
     }
 
+    /// Deliver agent-state transitions to registered remote devices via APNs.
+    ///
+    /// A sibling of `emit_terminal_or_system_agent_notifications`, but with its
+    /// own guard (`crate::push::enabled`), independent of `local_terminal_
+    /// notifications` and `ToastDelivery`: a remote device wants push even when
+    /// local toasts are Off/Herdr and even on the focused active tab (so
+    /// active-tab suppression is intentionally not applied here). Delivery is
+    /// detached and best-effort — it never blocks the app loop or holds a lock
+    /// across the curl. `from_pane_death` maps every produced alert to the
+    /// pane-died kind; otherwise the alert kind follows the toast kind.
+    fn emit_apns_agent_notifications(
+        &self,
+        pane_updates: &[crate::app::actions::PaneStateUpdate],
+        from_pane_death: bool,
+    ) {
+        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+            return;
+        }
+
+        let mut notifications = Vec::new();
+        for update in pane_updates {
+            // Pass `false`: remote push is not suppressed on the active tab. A
+            // pane death is an event, not a state transition, so `push_kind_for`
+            // yields a Died push even when the toast predicate returns None
+            // (e.g. an already-idle pane whose process exits).
+            let toast_kind =
+                crate::app::actions::notification_toast_for_pane_state_update(false, update);
+            let Some(push_kind) = push_kind_for(from_pane_death, toast_kind) else {
+                continue;
+            };
+            let Some(ws) = self.state.workspaces.get(update.ws_idx) else {
+                continue;
+            };
+            let Some(pane) = ws
+                .tabs
+                .iter()
+                .find_map(|tab| tab.panes.get(&update.pane_id))
+            else {
+                continue;
+            };
+            let Some(agent_label) = self
+                .state
+                .terminals
+                .get(&pane.attached_terminal_id)
+                .and_then(|terminal| terminal.effective_agent_label())
+            else {
+                continue;
+            };
+            let Some(public_pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+                continue;
+            };
+            let event_text = match push_kind {
+                crate::push::PushKind::NeedsInput => "needs attention",
+                crate::push::PushKind::Finished => "finished",
+                crate::push::PushKind::Died => "exited",
+            };
+            let workspace_label =
+                ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
+            notifications.push(crate::push::PushNotification {
+                title: format!("{agent_label} {event_text}"),
+                body: crate::app::actions::notification_context(
+                    ws,
+                    &workspace_label,
+                    update.ws_idx,
+                    update.pane_id,
+                ),
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(update.ws_idx),
+                kind: push_kind,
+            });
+        }
+
+        if notifications.is_empty() {
+            return;
+        }
+
+        // Detached + best-effort: never block the app loop on curl or disk. A
+        // named Builder means a thread-creation failure (EAGAIN) is handled
+        // instead of panicking the app-loop thread. Bounding fan-out with a
+        // single worker queue is a follow-up.
+        let cfg = self.state.push_config.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("herdr-push".to_string())
+            .spawn(move || crate::push::deliver(cfg, notifications))
+        {
+            tracing::warn!(error = %err, "failed to spawn push sender thread; dropping batch");
+        }
+    }
+
     pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
@@ -986,6 +1077,9 @@ impl App {
             }
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
+            }
+            Method::NotificationsRegisterDevice(params) => {
+                return self.handle_notifications_register_device(request.id, params);
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
@@ -1285,6 +1379,47 @@ impl App {
         )
     }
 
+    fn handle_notifications_register_device(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsRegisterDeviceParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let device_token = params.device_token.trim();
+        if !is_valid_apns_device_token(device_token) {
+            return responses::encode_error(
+                id,
+                "invalid_params",
+                "device_token must be 32-200 hexadecimal characters",
+            );
+        }
+        let platform = params.platform.trim();
+        if platform.is_empty() {
+            return responses::encode_error(id, "invalid_params", "platform is empty");
+        }
+
+        // No-session/monolithic mode has no shared device registry to persist
+        // to; acknowledge without touching disk, mirroring the plugin handlers.
+        if self.no_session {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+
+        let device = crate::persist::devices::RegisteredDevice {
+            device_token: device_token.to_string(),
+            platform: platform.to_string(),
+            notify_needs_input: params.notify_needs_input,
+            notify_dies: params.notify_dies,
+            notify_finishes: params.notify_finishes,
+            registered_unix_ms: unix_millis_now(),
+        };
+
+        match crate::persist::devices::upsert(device) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => responses::encode_error(id, "device_registry_save_failed", err.to_string()),
+        }
+    }
+
     fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
         if !self.state.local_sound_playback || !self.state.sound.allows(None) {
             return;
@@ -1301,6 +1436,37 @@ impl App {
 
     pub(crate) fn mark_api_notification_shown(&mut self, now: Instant) {
         self.last_api_notification_at = Some(now);
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// An APNs device token is lower/upper hex; bound the length so a garbage
+/// registration cannot bloat the store.
+fn is_valid_apns_device_token(token: &str) -> bool {
+    (32..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Map a pane update to the push kind to deliver, if any.
+///
+/// A process exit (`from_pane_death`) is an event, not a state transition, so it
+/// always yields `Died` — even when the toast predicate returned `None` because
+/// the pane was already Idle when its process exited. Otherwise the push kind
+/// follows the toast kind; `UpdateInstalled` and `None` are not agent
+/// transitions and produce no push.
+fn push_kind_for(from_pane_death: bool, kind: Option<ToastKind>) -> Option<crate::push::PushKind> {
+    if from_pane_death {
+        return Some(crate::push::PushKind::Died);
+    }
+    match kind {
+        Some(ToastKind::NeedsAttention) => Some(crate::push::PushKind::NeedsInput),
+        Some(ToastKind::Finished) => Some(crate::push::PushKind::Finished),
+        Some(ToastKind::UpdateInstalled) | None => None,
     }
 }
 
@@ -1380,6 +1546,45 @@ pub(super) mod test_support {
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
+
+    #[test]
+    fn push_kind_for_maps_events_and_transitions() {
+        use crate::push::PushKind;
+
+        // A process exit is an event: Died even when the toast predicate is None
+        // (the idle-pane-exits case that would otherwise drop the notify_dies
+        // push entirely).
+        assert_eq!(push_kind_for(true, None), Some(PushKind::Died));
+        assert_eq!(
+            push_kind_for(true, Some(ToastKind::Finished)),
+            Some(PushKind::Died)
+        );
+
+        // Otherwise the push kind follows the toast kind.
+        assert_eq!(
+            push_kind_for(false, Some(ToastKind::NeedsAttention)),
+            Some(PushKind::NeedsInput)
+        );
+        assert_eq!(
+            push_kind_for(false, Some(ToastKind::Finished)),
+            Some(PushKind::Finished)
+        );
+        // UpdateInstalled and None are not agent transitions.
+        assert_eq!(push_kind_for(false, Some(ToastKind::UpdateInstalled)), None);
+        assert_eq!(push_kind_for(false, None), None);
+    }
+
+    #[test]
+    fn apns_device_token_validation_bounds_and_hex() {
+        let valid = "a".repeat(64);
+        assert!(is_valid_apns_device_token(&valid));
+        assert!(is_valid_apns_device_token(&"F0".repeat(16))); // upper hex, 32 chars
+        assert!(!is_valid_apns_device_token("")); // empty
+        assert!(!is_valid_apns_device_token(&"a".repeat(31))); // too short
+        assert!(!is_valid_apns_device_token(&"a".repeat(201))); // too long
+        assert!(!is_valid_apns_device_token(&"g".repeat(64))); // non-hex
+        assert!(!is_valid_apns_device_token(&format!("{} ", "a".repeat(63)))); // whitespace
+    }
 
     #[cfg(unix)]
     fn init_repo(path: &std::path::Path) {

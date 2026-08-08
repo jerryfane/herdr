@@ -1555,6 +1555,9 @@ pub struct AppState {
     pub sound: SoundConfig,
     pub local_sound_playback: bool,
     pub toast_config: ToastConfig,
+    /// Remote push (APNs) configuration. Independent of `toast_config` — a
+    /// registered device receives push even when local toasts are Off.
+    pub push_config: crate::config::PushConfig,
     pub keybinds: Keybinds,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
@@ -1931,6 +1934,7 @@ impl AppState {
             },
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
+            push_config: crate::config::PushConfig::default(),
             keybinds: Keybinds::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),

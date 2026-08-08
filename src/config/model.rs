@@ -298,6 +298,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub push: PushConfig,
 }
 
 #[derive(Debug)]
@@ -876,6 +877,29 @@ impl Default for RemoteConfig {
     }
 }
 
+/// Remote push notifications (APNs) for registered mobile devices.
+///
+/// The `.p8` signing key at `key_path` is read only when a push is sent; its
+/// contents are never persisted to Herdr state and never logged. `key_id`,
+/// `team_id`, and `topic` are Apple developer identifiers (not secrets) but are
+/// still host configuration rather than repository constants.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PushConfig {
+    /// Master switch for remote push delivery. Default: false.
+    pub enabled: bool,
+    /// Filesystem path to the APNs auth key (`.p8`, PKCS#8 PEM). Read at send time only.
+    pub key_path: Option<String>,
+    /// APNs auth key ID (the 10-character Key ID issued by Apple).
+    pub key_id: Option<String>,
+    /// Apple developer Team ID used as the JWT issuer.
+    pub team_id: Option<String>,
+    /// APNs topic — the app bundle identifier, e.g. com.example.herdr.
+    pub topic: Option<String>,
+    /// Deliver through the APNs sandbox host instead of production. Default: false.
+    pub sandbox: bool,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
@@ -1130,6 +1154,34 @@ manifest_check = false
         assert_eq!(config.update.channel.as_str(), "preview");
         assert!(!config.update.version_check);
         assert!(!config.update.manifest_check);
+    }
+
+    #[test]
+    fn push_config_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.push.enabled);
+        assert!(default_config.push.key_path.is_none());
+        assert!(!default_config.push.sandbox);
+
+        let toml = r#"
+[push]
+enabled = true
+key_path = "~/secrets/AuthKey_ABC123DEFG.p8"
+key_id = "ABC123DEFG"
+team_id = "TEAM123456"
+topic = "com.example.herdr"
+sandbox = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.push.enabled);
+        assert_eq!(
+            config.push.key_path.as_deref(),
+            Some("~/secrets/AuthKey_ABC123DEFG.p8")
+        );
+        assert_eq!(config.push.key_id.as_deref(), Some("ABC123DEFG"));
+        assert_eq!(config.push.team_id.as_deref(), Some("TEAM123456"));
+        assert_eq!(config.push.topic.as_deref(), Some("com.example.herdr"));
+        assert!(config.push.sandbox);
     }
 
     #[cfg(windows)]
