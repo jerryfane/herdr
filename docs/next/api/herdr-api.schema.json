@@ -2707,6 +2707,34 @@
           ],
           "type": "string"
         },
+        "NotificationsRegisterDeviceParams": {
+          "description": "Register (or update) a mobile device for remote push notifications.\n\nField names match the iOS client's `RegisterDeviceParams` contract. The\n`notify_*` preferences default to `false` so a partial payload never fails\ndeserialization; the client sends explicit values.",
+          "properties": {
+            "device_token": {
+              "type": "string"
+            },
+            "notify_dies": {
+              "default": false,
+              "type": "boolean"
+            },
+            "notify_finishes": {
+              "default": false,
+              "type": "boolean"
+            },
+            "notify_needs_input": {
+              "default": false,
+              "type": "boolean"
+            },
+            "platform": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_token",
+            "platform"
+          ],
+          "type": "object"
+        },
         "OutputMatch": {
           "oneOf": [
             {

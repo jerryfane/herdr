@@ -508,6 +508,7 @@ impl App {
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             sound: config.ui.sound.clone(),
             toast_config: config.ui.toast.clone(),
+            push_config: config.push.clone(),
             keybinds: config.keybinds(),
             palette: theme_palette,
             theme_name,
@@ -867,6 +868,9 @@ impl App {
                 "terminal.kitty_graphics changes require restarting Herdr; kept current setting"
                     .into(),
             );
+        }
+        if !invalid_section("push") {
+            self.state.push_config = config.push.clone();
         }
 
         if !invalid_section("experimental") {
