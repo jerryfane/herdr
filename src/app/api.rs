@@ -779,14 +779,28 @@ impl App {
             };
             let workspace_label =
                 ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
-            notifications.push(crate::push::PushNotification {
-                title: format!("{agent_label} {event_text}"),
-                body: crate::app::actions::notification_context(
+            // Bound the alert text so the JSON payload stays well under Apple's 4096-byte
+            // limit — workspace/tab names are user-controlled and unbounded, and an oversized
+            // payload is a 413 that would be silently dropped. Reuse the local toast path's
+            // sanitize+truncate (title 80, body 240); a title that sanitizes away is skipped.
+            let Some(title) =
+                sanitized_notification_text(&format!("{agent_label} {event_text}"), 80)
+            else {
+                continue;
+            };
+            let body = sanitized_notification_text(
+                &crate::app::actions::notification_context(
                     ws,
                     &workspace_label,
                     update.ws_idx,
                     update.pane_id,
                 ),
+                240,
+            )
+            .unwrap_or_default();
+            notifications.push(crate::push::PushNotification {
+                title,
+                body,
                 pane_id: public_pane_id,
                 workspace_id: self.public_workspace_id(update.ws_idx),
                 kind: push_kind,
