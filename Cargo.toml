@@ -29,6 +29,10 @@ crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 interprocess = "2.4.2"
 libc = "0.2"
+# ES256 JWT signing for APNs push auth (see src/push). Pure-Rust (RustCrypto, same family as sha2);
+# no TLS/socket stack — push delivery shells out to curl like `herdr update` does, so this adds crypto
+# only, not in-process networking.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 portable-pty = "=0.9.0"
 png = "0.17"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

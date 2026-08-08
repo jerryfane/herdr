@@ -1116,6 +1116,48 @@
           "description": "While prefix mode is active, temporarily switch the host input source to an ASCII-capable mode so prefix commands are read as ASCII even when an IME is active, then restore the previous input source when prefix mode exits. On macOS this selects the ASCII-capable keyboard layout; on Windows it switches the IME to English (ASCII) input. Windows support is currently limited to the Korean IME; with an IME for any other language, the input source is left unchanged. macOS and Windows only; a no-op elsewhere and a best-effort no-op if the switch fails."
         }
       ]
+    },
+    {
+      "id": "push",
+      "title": "Push notifications",
+      "keys": [
+        {
+          "key": "push.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Master switch for remote APNs push delivery to registered mobile devices. Requires key_path, key_id, team_id, and topic to also be set."
+        },
+        {
+          "key": "push.key_path",
+          "type": "string",
+          "default": "unset",
+          "description": "Filesystem path to the APNs auth key (.p8, PKCS#8 PEM). Read only when a push is sent; its contents are never persisted to Herdr state and never logged."
+        },
+        {
+          "key": "push.key_id",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs auth key ID (the 10-character Key ID issued by Apple)."
+        },
+        {
+          "key": "push.team_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Apple developer Team ID used as the push token JWT issuer."
+        },
+        {
+          "key": "push.topic",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs topic — the app bundle identifier, e.g. com.example.herdr."
+        },
+        {
+          "key": "push.sandbox",
+          "type": "boolean",
+          "default": "false",
+          "description": "Deliver through the APNs sandbox host instead of production."
+        }
+      ]
     }
   ]
 }
