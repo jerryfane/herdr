@@ -40,6 +40,11 @@ const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
 /// module agree on one limit.
 pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 
+/// Maximum bytes of a persisted label (`from`, `to`, `grabbed_by`). These are
+/// agent identities, not free text; capping them keeps a caller-supplied override
+/// from bypassing the text budget and bloating the store.
+pub const MAX_LABEL_BYTES: usize = 128;
+
 /// Whether a message flows from an agent to the owner or the other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,30 +159,42 @@ fn save_json_to_path<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> st
     Ok(())
 }
 
-/// Read-modify-write the store under the lock in `dir`, returning the mutation's
-/// result and the persisted (sorted, capped) list. The public [`update`] targets
-/// the real config dir; tests pass a temp dir to exercise the real lock + disk.
-fn update_in<T>(
+/// Read-modify-write the store under the lock in `dir`. The mutation returns its
+/// result plus a `changed` flag; the list is normalized and rewritten only when
+/// `changed`, so a no-op (a lost grab race, a redundant mark-read) does not
+/// rewrite the file or evict messages via the caps. Tests pass a temp dir to
+/// exercise the real lock + disk.
+fn update_in_checked<T>(
     dir: &Path,
-    mutation: impl FnOnce(&mut Vec<GramItem>) -> T,
+    mutation: impl FnOnce(&mut Vec<GramItem>) -> (T, bool),
 ) -> std::io::Result<(T, Vec<GramItem>)> {
     with_registry_lock_in(dir, || {
         let path = registry_path_in(dir);
         let mut items = load_from_path_strict(&path)?;
-        let result = mutation(&mut items);
-        normalize(&mut items);
-        save_json_to_path(&path, &items)?;
+        let (result, changed) = mutation(&mut items);
+        if changed {
+            normalize(&mut items);
+            save_json_to_path(&path, &items)?;
+        }
         Ok((result, items))
     })
 }
 
-/// Read-modify-write the store under the lock, returning the mutation's result
-/// and the persisted (sorted, capped) list. All mutating operations funnel
-/// through here so the lock is never bypassed.
-pub fn update<T>(
+fn update_in<T>(
+    dir: &Path,
     mutation: impl FnOnce(&mut Vec<GramItem>) -> T,
 ) -> std::io::Result<(T, Vec<GramItem>)> {
-    update_in(&config_base(), mutation)
+    update_in_checked(dir, |items| (mutation(items), true))
+}
+
+/// Read-modify-write the store under the lock. The mutation reports whether it
+/// changed anything; the file is rewritten only when it did, so a no-op does not
+/// churn the store or evict messages via the caps. All mutating operations funnel
+/// through here (or [`append`]) so the lock is never bypassed.
+pub fn update_if_changed<T>(
+    mutation: impl FnOnce(&mut Vec<GramItem>) -> (T, bool),
+) -> std::io::Result<(T, Vec<GramItem>)> {
+    update_in_checked(&config_base(), mutation)
 }
 
 /// Sort oldest-first, then drop the oldest until both the count cap and the
@@ -322,6 +339,28 @@ mod tests {
         assert!(!items.is_empty());
         // Newest survive: the last id must still be present.
         assert_eq!(items.last().unwrap().id, "id-299");
+    }
+
+    #[test]
+    fn update_if_changed_skips_save_on_no_change() {
+        let dir = unique_temp_dir("nochange");
+        let path = registry_path_in(&dir);
+        // Write a compact (non-canonical) file; any save rewrites it pretty.
+        std::fs::write(&path, serde_json::to_string(&[item("x", 1)]).unwrap()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // A no-op mutation must not rewrite the file.
+        update_in_checked(&dir, |_items| ((), false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A real change rewrites it (to pretty JSON).
+        update_in_checked(&dir, |items| {
+            items[0].read_by_owner = true;
+            ((), true)
+        })
+        .unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5,13 +5,13 @@
 //! `gram.grab` (first-wins claim of a shared item), and `gram.mark_read`.
 //!
 //! Identity: there is no per-connection identity, so the caller passes its
-//! `HERDR_PANE_ID` as `caller_pane_id` and the server resolves it to that agent's
-//! identity (see [`App::caller_agent_identity`]) — the UNIQUE per-agent name when
-//! one is set, else the agent-kind label. Preferring the unique name is what lets
-//! the grab queue partition work between two panes of the same kind. The owner's
-//! app has no pane, so a `gram.list` with no `caller_pane_id` is the owner view;
-//! a `caller_pane_id` that is supplied but does not resolve is an error, not a
-//! silent fall-through to the owner view.
+//! `HERDR_PANE_ID` as `caller_pane_id` and the server resolves it to a UNIQUE
+//! identity (see [`App::caller_agent_identity`]) — the per-agent name when one is
+//! set, else the pane's public id. Both are unique per pane, so two same-kind
+//! panes never collapse to one identity. The owner's app sends no `caller_pane_id`
+//! (owner view = everything); a `caller_pane_id` that is present but names no live
+//! pane is an error, not a silent fall-through to the owner view. Sender/owner
+//! attribution is advisory, not authenticated — the trust domain is already flat.
 
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
@@ -19,7 +19,9 @@ use crate::api::schema::{
     GramPostParams, GramSendParams, ResponseResult,
 };
 use crate::app::App;
-use crate::persist::gram::{new_id, GramDirection as StoredDirection, GramItem, MAX_TEXT_BYTES};
+use crate::persist::gram::{
+    new_id, GramDirection as StoredDirection, GramItem, MAX_LABEL_BYTES, MAX_TEXT_BYTES,
+};
 
 /// Why a claim could not be completed.
 enum GrabError {
@@ -35,6 +37,9 @@ impl App {
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
         let text = params.text.trim();
         if let Some(err) = validate_text(&id, text) {
+            return err;
+        }
+        if let Some(err) = validate_label(&id, "from", params.from.as_deref()) {
             return err;
         }
         if self.no_session {
@@ -72,6 +77,9 @@ impl App {
     pub(super) fn handle_gram_post(&mut self, id: String, params: GramPostParams) -> String {
         let text = params.text.trim();
         if let Some(err) = validate_text(&id, text) {
+            return err;
+        }
+        if let Some(err) = validate_label(&id, "to", params.to.as_deref()) {
             return err;
         }
         if self.no_session {
@@ -138,7 +146,7 @@ impl App {
                     return encode_error(
                         id,
                         "unknown_caller",
-                        "caller_pane_id did not resolve to an agent",
+                        "caller_pane_id is not a known pane; omit it to read as the owner",
                     );
                 };
                 filter_agent_view(&items, &agent, params.only_queue)
@@ -155,6 +163,9 @@ impl App {
     pub(super) fn handle_gram_grab(&mut self, id: String, params: GramGrabParams) -> String {
         if self.no_session {
             return gram_unavailable(id);
+        }
+        if let Some(err) = validate_label(&id, "grabbed_by", params.grabbed_by.as_deref()) {
+            return err;
         }
 
         let who = params
@@ -173,7 +184,7 @@ impl App {
             return encode_error(
                 id,
                 "unknown_caller",
-                "could not resolve the grabbing agent; pass caller_pane_id or grabbed_by",
+                "could not resolve the grabbing agent; pass a valid caller_pane_id or grabbed_by",
             );
         };
 
@@ -181,20 +192,25 @@ impl App {
         let now = super::unix_millis_now();
         // The claim runs under the store's advisory lock, and the app loop
         // serializes API requests, so this check-then-set is atomic across both
-        // threads and processes — first grab wins.
-        let outcome = crate::persist::gram::update(move |items| {
-            let Some(item) = items.iter_mut().find(|item| item.id == target_id) else {
-                return Err(GrabError::NotFound);
-            };
-            if item.direction != StoredDirection::OwnerToAgent || item.to.is_some() {
-                return Err(GrabError::NotGrabbable);
-            }
-            if let Some(existing) = &item.grabbed_by {
-                return Err(GrabError::AlreadyGrabbed(existing.clone()));
-            }
-            item.grabbed_by = Some(who.clone());
-            item.grabbed_unix_ms = Some(now);
-            Ok(item.clone())
+        // threads and processes — first grab wins. A lost race changes nothing, so
+        // it does not rewrite the store (update_if_changed).
+        let outcome = crate::persist::gram::update_if_changed(move |items| {
+            let result = (|| {
+                let Some(item) = items.iter_mut().find(|item| item.id == target_id) else {
+                    return Err(GrabError::NotFound);
+                };
+                if item.direction != StoredDirection::OwnerToAgent || item.to.is_some() {
+                    return Err(GrabError::NotGrabbable);
+                }
+                if let Some(existing) = &item.grabbed_by {
+                    return Err(GrabError::AlreadyGrabbed(existing.clone()));
+                }
+                item.grabbed_by = Some(who.clone());
+                item.grabbed_unix_ms = Some(now);
+                Ok(item.clone())
+            })();
+            let changed = result.is_ok();
+            (result, changed)
         });
 
         match outcome {
@@ -229,13 +245,16 @@ impl App {
         }
 
         let target_id = params.id.clone();
-        let outcome = crate::persist::gram::update(move |items| {
+        // Returns (found, changed); a re-mark of an already-read message is found
+        // but changes nothing, so it does not rewrite the store.
+        let outcome = crate::persist::gram::update_if_changed(move |items| {
             match items.iter_mut().find(|item| item.id == target_id) {
                 Some(item) => {
+                    let changed = !item.read_by_owner;
                     item.read_by_owner = true;
-                    true
+                    (true, changed)
                 }
-                None => false,
+                None => (false, false),
             }
         });
         match outcome {
@@ -255,19 +274,26 @@ impl App {
             .unwrap_or_else(|| "agent".to_string())
     }
 
-    /// Resolve a public pane id (an agent's `HERDR_PANE_ID`) to that agent's
-    /// identity: the UNIQUE per-agent name if set (so two panes of the same kind
-    /// are distinguishable — the grab queue depends on it), else the agent-kind
-    /// label. `None` when the pane is unknown or has no agent.
+    /// Resolve a public pane id (an agent's `HERDR_PANE_ID`) to a UNIQUE identity:
+    /// the per-agent name if one is set, else the pane's public id. Both are unique
+    /// per pane, so two same-kind panes never collapse to one identity — the
+    /// agent-kind label would, breaking the grab-queue view. `None` only when the
+    /// pane id is not a known pane.
     fn caller_agent_identity(&self, caller_pane_id: &str) -> Option<String> {
         let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
-        let terminal = self.state.terminals.get(terminal_id)?;
-        terminal
-            .agent_name
-            .clone()
+        if let Some(name) = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.agent_name.clone())
             .filter(|name| !name.trim().is_empty())
-            .or_else(|| terminal.effective_agent_label().map(str::to_string))
+        {
+            return Some(name);
+        }
+        // A detected agent (or a plain shell) has no unique name; its pane id is a
+        // stable, collision-free identity for the queue view.
+        self.public_pane_id(ws_idx, pane_id)
     }
 
     /// Whether some live terminal has this exact unique agent name. Used to reject
@@ -325,6 +351,19 @@ fn validate_text(id: &str, text: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Reject a persisted label override (`from`, `to`, `grabbed_by`) longer than
+/// [`MAX_LABEL_BYTES`], so a caller cannot bypass the text budget through them.
+fn validate_label(id: &str, field: &str, value: Option<&str>) -> Option<String> {
+    match value {
+        Some(value) if value.len() > MAX_LABEL_BYTES => Some(encode_error(
+            id.to_string(),
+            "invalid_params",
+            format!("{field} exceeds {MAX_LABEL_BYTES} bytes"),
+        )),
+        _ => None,
+    }
 }
 
 fn gram_unavailable(id: String) -> String {
@@ -496,5 +535,13 @@ mod tests {
         assert!(validate_text("id", &big).is_some());
         let ok = "x".repeat(MAX_TEXT_BYTES);
         assert!(validate_text("id", &ok).is_none());
+    }
+
+    #[test]
+    fn validate_label_caps_length() {
+        assert!(validate_label("id", "from", None).is_none());
+        assert!(validate_label("id", "from", Some("alpha")).is_none());
+        let big = "x".repeat(MAX_LABEL_BYTES + 1);
+        assert!(validate_label("id", "grabbed_by", Some(&big)).is_some());
     }
 }

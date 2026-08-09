@@ -327,7 +327,8 @@ fn gram_command() -> Command {
             Command::new("list")
                 .about("List gram messages")
                 .arg(flag("queue").help("Only the shared, unclaimed queue"))
-                .arg(flag("unread").help("Only unread messages (owner view)")),
+                .arg(flag("unread").help("Only unread messages (owner view)"))
+                .arg(flag("owner").help("Read as the owner (omit this pane)")),
         )
         .subcommand(
             Command::new("grab")

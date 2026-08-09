@@ -75,7 +75,7 @@ fn gram_post(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn gram_list(args: &[String]) -> std::io::Result<i32> {
-    let (only_queue, unread_only) = match parse_list_args(args) {
+    let (only_queue, unread_only, owner) = match parse_list_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -83,10 +83,17 @@ fn gram_list(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    // Default: attach this pane's id for the agent/pane view. `--owner` (and
+    // `--unread`, which is an owner-only view) omit it so the server returns the
+    // owner view — otherwise the owner view would be unreachable from any pane,
+    // since HERDR_PANE_ID is set on every managed pane.
+    let owner_view = owner || unread_only;
+    let caller_pane_id = if owner_view { None } else { env_pane_id() };
+
     super::print_response(&super::send_request(&Request {
         id: "cli:gram:list".into(),
         method: Method::GramList(GramListParams {
-            caller_pane_id: env_pane_id(),
+            caller_pane_id,
             only_queue,
             unread_only,
         }),
@@ -186,23 +193,26 @@ fn parse_post_args(args: &[String]) -> Result<(String, Option<String>), String> 
     Ok((text, to))
 }
 
-/// `list [--queue] [--unread]` -> (only_queue, unread_only). The two are mutually
-/// exclusive: `--queue` is the agent's ungrabbed-work view, `--unread` the owner's
-/// unread view.
-fn parse_list_args(args: &[String]) -> Result<(bool, bool), String> {
+/// `list [--queue] [--unread] [--owner]` -> (only_queue, unread_only, owner).
+/// `--queue` (shared unclaimed work) and `--unread` (owner's unread inbox) are
+/// mutually exclusive. `--owner` reads as the owner (omits the caller pane);
+/// `--unread` implies it.
+fn parse_list_args(args: &[String]) -> Result<(bool, bool, bool), String> {
     let mut only_queue = false;
     let mut unread_only = false;
+    let mut owner = false;
     for arg in args {
         match arg.as_str() {
             "--queue" => only_queue = true,
             "--unread" => unread_only = true,
+            "--owner" => owner = true,
             other => return Err(format!("unknown option: {other}")),
         }
     }
     if only_queue && unread_only {
         return Err("--queue and --unread cannot be combined".into());
     }
-    Ok((only_queue, unread_only))
+    Ok((only_queue, unread_only, owner))
 }
 
 /// `grab <id> [--as LABEL]` -> (id, grabbed_by).
@@ -247,7 +257,7 @@ fn is_flag(value: &str) -> bool {
 fn print_gram_help() {
     eprintln!("herdr gram commands:");
     eprintln!("  herdr gram send <text> [--from LABEL]   message the owner (push-notified)");
-    eprintln!("  herdr gram list [--queue] [--unread]    list messages (--queue: unclaimed work)");
+    eprintln!("  herdr gram list [--queue] [--unread] [--owner]   list messages (--owner: read as the owner)");
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
     eprintln!("  herdr gram mark-read <id>                owner: mark an agent message read");
@@ -294,12 +304,19 @@ mod tests {
 
     #[test]
     fn list_flags_are_exclusive() {
-        assert_eq!(parse_list_args(&args(&["--queue"])).unwrap(), (true, false));
+        assert_eq!(
+            parse_list_args(&args(&["--queue"])).unwrap(),
+            (true, false, false)
+        );
         assert_eq!(
             parse_list_args(&args(&["--unread"])).unwrap(),
-            (false, true)
+            (false, true, false)
         );
-        assert_eq!(parse_list_args(&args(&[])).unwrap(), (false, false));
+        assert_eq!(
+            parse_list_args(&args(&["--owner"])).unwrap(),
+            (false, false, true)
+        );
+        assert_eq!(parse_list_args(&args(&[])).unwrap(), (false, false, false));
         assert!(parse_list_args(&args(&["--queue", "--unread"])).is_err());
         assert!(parse_list_args(&args(&["--nope"])).is_err());
     }
