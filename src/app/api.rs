@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod gram;
 mod integrations;
 mod layouts;
 mod pane_graphics;
@@ -776,6 +777,10 @@ impl App {
                 crate::push::PushKind::NeedsInput => "needs attention",
                 crate::push::PushKind::Finished => "finished",
                 crate::push::PushKind::Died => "exited",
+                // Gram alerts are built in `emit_apns_gram_message`, never from a
+                // pane-state update, so this arm is unreachable here; it only
+                // keeps the match exhaustive.
+                crate::push::PushKind::Gram => "sent a message",
             };
             let workspace_label =
                 ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
@@ -1094,6 +1099,13 @@ impl App {
             }
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
+            }
+            Method::GramSend(params) => return self.handle_gram_send(request.id, params),
+            Method::GramPost(params) => return self.handle_gram_post(request.id, params),
+            Method::GramList(params) => return self.handle_gram_list(request.id, params),
+            Method::GramGrab(params) => return self.handle_gram_grab(request.id, params),
+            Method::GramMarkRead(params) => {
+                return self.handle_gram_mark_read(request.id, params);
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
@@ -1425,6 +1437,7 @@ impl App {
             notify_needs_input: params.notify_needs_input,
             notify_dies: params.notify_dies,
             notify_finishes: params.notify_finishes,
+            notify_gram: params.notify_gram,
             registered_unix_ms: unix_millis_now(),
         };
 

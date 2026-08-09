@@ -29,6 +29,8 @@ pub(crate) enum PushKind {
     Finished,
     /// Agent pane process exited.
     Died,
+    /// An agent sent the owner a gram message.
+    Gram,
 }
 
 /// One agent-state transition to deliver as an APNs alert. `pane_id` and
@@ -65,6 +67,7 @@ fn device_wants(device: &RegisteredDevice, kind: PushKind) -> bool {
         PushKind::NeedsInput => device.notify_needs_input,
         PushKind::Finished => device.notify_finishes,
         PushKind::Died => device.notify_dies,
+        PushKind::Gram => device.notify_gram,
     }
 }
 
@@ -213,6 +216,7 @@ mod tests {
             notify_needs_input: needs_input,
             notify_dies: dies,
             notify_finishes: finishes,
+            notify_gram: false,
             registered_unix_ms: 0,
         }
     }
@@ -243,5 +247,15 @@ mod tests {
         assert!(device_wants(&d, PushKind::Died));
         assert!(device_wants(&d, PushKind::Finished));
         assert!(!device_wants(&d, PushKind::NeedsInput));
+        // notify_gram is independent of the agent-transition prefs.
+        assert!(!device_wants(&d, PushKind::Gram));
+    }
+
+    #[test]
+    fn device_wants_gram_follows_notify_gram() {
+        let mut d = device(false, false, false);
+        assert!(!device_wants(&d, PushKind::Gram));
+        d.notify_gram = true;
+        assert!(device_wants(&d, PushKind::Gram));
     }
 }

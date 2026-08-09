@@ -2413,6 +2413,106 @@
           ],
           "type": "object"
         },
+        "GramGrabParams": {
+          "description": "`gram.grab` — an agent claims a shared-queue item. The claimant label is\nresolved from `caller_pane_id` (or `grabbed_by` when the caller is not a\npane). Fails if the item is missing, not a shared item, or already grabbed.",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "grabbed_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "GramListParams": {
+          "description": "`gram.list` — read messages. The audience is inferred from `caller_pane_id`:\na caller that resolves to an agent gets that agent's view (its direct items,\nthe shared ungrabbed queue, its own grabs, and its own sent items); a caller\nwith no resolvable pane gets the owner view (everything).",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "only_queue": {
+              "default": false,
+              "description": "Agent view only: restrict to the shared, still-ungrabbed queue.",
+              "type": "boolean"
+            },
+            "unread_only": {
+              "default": false,
+              "description": "Owner view only: restrict to unread agent->owner messages.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "GramMarkReadParams": {
+          "description": "`gram.mark_read` — the owner marks an agent->owner message read.",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "GramPostParams": {
+          "description": "`gram.post` — the owner posts a message to agents (from the app).\n\n`to: Some(agent)` addresses one agent directly (not grabbable); `to: None`\nposts to the shared grab-queue any agent can claim.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        "GramSendParams": {
+          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label (`from`) is resolved server-side from `caller_pane_id`\n(the agent's `HERDR_PANE_ID`); `from` overrides that when the caller cannot be\nresolved to a pane (e.g. a script outside a Herdr pane).",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "from": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2663,6 +2763,10 @@
               "type": "boolean"
             },
             "notify_finishes": {
+              "default": false,
+              "type": "boolean"
+            },
+            "notify_gram": {
               "default": false,
               "type": "boolean"
             },
@@ -4942,6 +5046,86 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/NotificationsRegisterDeviceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.send",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramSendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.post",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramPostParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.grab",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramGrabParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.mark_read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramMarkReadParams"
             }
           },
           "required": [
@@ -8216,6 +8400,68 @@
           ],
           "type": "string"
         },
+        "GramDirection": {
+          "description": "Direction of a gram message on the wire. Mirrors\n[`crate::persist::gram::GramDirection`]; the handler maps between them so the\nstorage record and the public contract can evolve independently.",
+          "enum": [
+            "agent_to_owner",
+            "owner_to_agent"
+          ],
+          "type": "string"
+        },
+        "GramMessageInfo": {
+          "description": "A gram message as returned to clients.",
+          "properties": {
+            "created_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "direction": {
+              "$ref": "#/schemas/success_response/$defs/GramDirection"
+            },
+            "from": {
+              "type": "string"
+            },
+            "grabbed_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "grabbed_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "read_by_owner": {
+              "default": false,
+              "type": "boolean"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "direction",
+            "from",
+            "text",
+            "created_unix_ms"
+          ],
+          "type": "object"
+        },
         "InputPromptKind": {
           "description": "Best-effort classification of a live agent-owned input prompt.",
           "enum": [
@@ -11147,6 +11393,57 @@
                 "type",
                 "status",
                 "diagnostics"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
+                },
+                "type": {
+                  "const": "gram_sent",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "messages": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "gram_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "messages"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
+                },
+                "type": {
+                  "const": "gram_grabbed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
               ],
               "type": "object"
             },

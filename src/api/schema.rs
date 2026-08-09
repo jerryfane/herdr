@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod agents;
 pub mod common;
 pub mod events;
+pub mod gram;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
@@ -16,6 +17,7 @@ pub mod worktrees;
 pub use agents::*;
 pub use common::*;
 pub use events::*;
+pub use gram::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
@@ -59,6 +61,16 @@ pub enum Method {
     NotificationShow(NotificationShowParams),
     #[serde(rename = "notifications.register_device")]
     NotificationsRegisterDevice(NotificationsRegisterDeviceParams),
+    #[serde(rename = "gram.send")]
+    GramSend(GramSendParams),
+    #[serde(rename = "gram.post")]
+    GramPost(GramPostParams),
+    #[serde(rename = "gram.list")]
+    GramList(GramListParams),
+    #[serde(rename = "gram.grab")]
+    GramGrab(GramGrabParams),
+    #[serde(rename = "gram.mark_read")]
+    GramMarkRead(GramMarkReadParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]
