@@ -12,9 +12,11 @@ pub enum GramDirection {
 
 /// `gram.send` — an agent sends the owner a push-notified message.
 ///
-/// The sender label (`from`) is resolved server-side from `caller_pane_id`
-/// (the agent's `HERDR_PANE_ID`); `from` overrides that when the caller cannot be
-/// resolved to a pane (e.g. a script outside a Herdr pane).
+/// The sender label is `from` when provided; otherwise it is resolved
+/// server-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that
+/// agent's identity — the unique per-agent name if set, else the agent kind. An
+/// explicit `from` always wins. `text` is capped server-side (~8 KiB); send
+/// large content as a file, not a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramSendParams {
     pub text: String,
@@ -26,8 +28,10 @@ pub struct GramSendParams {
 
 /// `gram.post` — the owner posts a message to agents (from the app).
 ///
-/// `to: Some(agent)` addresses one agent directly (not grabbable); `to: None`
-/// posts to the shared grab-queue any agent can claim.
+/// `to: Some(agent)` addresses one agent directly by its unique agent name (not
+/// grabbable); the name must match a live agent or the call is rejected. `to:
+/// None` posts to the shared grab-queue any agent can claim. `text` is capped
+/// server-side (~8 KiB).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramPostParams {
     pub text: String,
@@ -35,15 +39,16 @@ pub struct GramPostParams {
     pub to: Option<String>,
 }
 
-/// `gram.list` — read messages. The audience is inferred from `caller_pane_id`:
-/// a caller that resolves to an agent gets that agent's view (its direct items,
-/// the shared ungrabbed queue, its own grabs, and its own sent items); a caller
-/// with no resolvable pane gets the owner view (everything).
+/// `gram.list` — read messages. The audience is chosen by `caller_pane_id`:
+/// omit it for the owner view (everything); supply it for that agent's view (its
+/// direct items, the shared ungrabbed queue, its own grabs, and its own sent
+/// items). A `caller_pane_id` that is supplied but does not resolve to an agent
+/// is an error, not a fall-through to the owner view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct GramListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pane_id: Option<String>,
-    /// Agent view only: restrict to the shared, still-ungrabbed queue.
+    /// Restrict to the shared, still-ungrabbed queue (either audience).
     #[serde(default)]
     pub only_queue: bool,
     /// Owner view only: restrict to unread agent->owner messages.
@@ -51,9 +56,10 @@ pub struct GramListParams {
     pub unread_only: bool,
 }
 
-/// `gram.grab` — an agent claims a shared-queue item. The claimant label is
-/// resolved from `caller_pane_id` (or `grabbed_by` when the caller is not a
-/// pane). Fails if the item is missing, not a shared item, or already grabbed.
+/// `gram.grab` — an agent claims a shared-queue item. The claimant is
+/// `grabbed_by` when provided, otherwise resolved from `caller_pane_id` to that
+/// agent's identity. Fails if the item is missing, not a shared item, or already
+/// grabbed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramGrabParams {
     pub id: String,

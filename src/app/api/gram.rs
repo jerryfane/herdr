@@ -5,9 +5,13 @@
 //! `gram.grab` (first-wins claim of a shared item), and `gram.mark_read`.
 //!
 //! Identity: there is no per-connection identity, so the caller passes its
-//! `HERDR_PANE_ID` as `caller_pane_id` and the server resolves it to the agent's
-//! effective label (see [`App::caller_agent_label`]). The owner's app has no
-//! pane, so a caller that does not resolve to an agent is treated as the owner.
+//! `HERDR_PANE_ID` as `caller_pane_id` and the server resolves it to that agent's
+//! identity (see [`App::caller_agent_identity`]) — the UNIQUE per-agent name when
+//! one is set, else the agent-kind label. Preferring the unique name is what lets
+//! the grab queue partition work between two panes of the same kind. The owner's
+//! app has no pane, so a `gram.list` with no `caller_pane_id` is the owner view;
+//! a `caller_pane_id` that is supplied but does not resolve is an error, not a
+//! silent fall-through to the owner view.
 
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
@@ -15,7 +19,7 @@ use crate::api::schema::{
     GramPostParams, GramSendParams, ResponseResult,
 };
 use crate::app::App;
-use crate::persist::gram::{new_id, GramDirection as StoredDirection, GramItem};
+use crate::persist::gram::{new_id, GramDirection as StoredDirection, GramItem, MAX_TEXT_BYTES};
 
 /// Why a claim could not be completed.
 enum GrabError {
@@ -23,15 +27,15 @@ enum GrabError {
     /// The item is not a shared, still-open queue item (direct message, wrong
     /// direction, or already claimed by name below).
     NotGrabbable,
-    /// Already claimed; carries the current owner's label.
+    /// Already claimed; carries the current grabber's identity.
     AlreadyGrabbed(String),
 }
 
 impl App {
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
         let text = params.text.trim();
-        if text.is_empty() {
-            return encode_error(id, "invalid_params", "text is empty");
+        if let Some(err) = validate_text(&id, text) {
+            return err;
         }
         if self.no_session {
             return gram_unavailable(id);
@@ -67,8 +71,8 @@ impl App {
 
     pub(super) fn handle_gram_post(&mut self, id: String, params: GramPostParams) -> String {
         let text = params.text.trim();
-        if text.is_empty() {
-            return encode_error(id, "invalid_params", "text is empty");
+        if let Some(err) = validate_text(&id, text) {
+            return err;
         }
         if self.no_session {
             return gram_unavailable(id);
@@ -80,6 +84,21 @@ impl App {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        // A direct message must name a live agent, else it would be visible to no
+        // one and never expire — a silent black hole. Omit `to` for the shared
+        // queue instead.
+        if let Some(target) = &to {
+            if !self.is_live_agent_name(target) {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    format!(
+                        "no live agent named '{target}'; omit --to to post to the shared queue"
+                    ),
+                );
+            }
+        }
+
         let item = GramItem {
             id: new_id(),
             direction: StoredDirection::OwnerToAgent,
@@ -106,18 +125,26 @@ impl App {
 
     pub(super) fn handle_gram_list(&mut self, id: String, params: GramListParams) -> String {
         if self.no_session {
-            return encode_success(id, ResponseResult::GramList { messages: vec![] });
+            return gram_unavailable(id);
         }
 
         let items = crate::persist::gram::load();
-        let caller = params
-            .caller_pane_id
-            .as_deref()
-            .and_then(|pane| self.caller_agent_label(pane));
-
-        let filtered = match caller {
-            Some(agent) => filter_agent_view(&items, &agent, params.only_queue),
-            None => filter_owner_view(&items, params.unread_only),
+        let filtered = match params.caller_pane_id.as_deref() {
+            // A supplied caller pane must resolve to an agent; failing open to the
+            // full owner view (as an earlier version did) leaks every message and
+            // silently drops `only_queue`. Mirrors `pane.current`'s pane_not_found.
+            Some(pane) => {
+                let Some(agent) = self.caller_agent_identity(pane) else {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "caller_pane_id did not resolve to an agent",
+                    );
+                };
+                filter_agent_view(&items, &agent, params.only_queue)
+            }
+            // No caller pane: the owner (app) view.
+            None => filter_owner_view(&items, params.only_queue, params.unread_only),
         };
         // Store order is oldest-first; clients want newest-first.
         let messages: Vec<GramMessageInfo> =
@@ -140,7 +167,7 @@ impl App {
                 params
                     .caller_pane_id
                     .as_deref()
-                    .and_then(|pane| self.caller_agent_label(pane))
+                    .and_then(|pane| self.caller_agent_identity(pane))
             });
         let Some(who) = who else {
             return encode_error(
@@ -219,23 +246,37 @@ impl App {
     }
 
     /// Resolve the label to record as `from` for an agent->owner message:
-    /// an explicit override, else the caller pane's agent label, else "agent".
+    /// an explicit override, else the caller pane's agent identity, else "agent".
     fn resolve_sender_label(&self, from: Option<&str>, caller_pane_id: Option<&str>) -> String {
         from.map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .or_else(|| caller_pane_id.and_then(|pane| self.caller_agent_label(pane)))
+            .or_else(|| caller_pane_id.and_then(|pane| self.caller_agent_identity(pane)))
             .unwrap_or_else(|| "agent".to_string())
     }
 
     /// Resolve a public pane id (an agent's `HERDR_PANE_ID`) to that agent's
-    /// effective label, mirroring the pane -> terminal -> agent path the push
-    /// notifier uses. Returns `None` when the pane is unknown or has no agent.
-    fn caller_agent_label(&self, caller_pane_id: &str) -> Option<String> {
+    /// identity: the UNIQUE per-agent name if set (so two panes of the same kind
+    /// are distinguishable — the grab queue depends on it), else the agent-kind
+    /// label. `None` when the pane is unknown or has no agent.
+    fn caller_agent_identity(&self, caller_pane_id: &str) -> Option<String> {
         let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         let terminal = self.state.terminals.get(terminal_id)?;
-        terminal.effective_agent_label().map(str::to_string)
+        terminal
+            .agent_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| terminal.effective_agent_label().map(str::to_string))
+    }
+
+    /// Whether some live terminal has this exact unique agent name. Used to reject
+    /// a direct `gram.post` to a nonexistent agent instead of black-holing it.
+    fn is_live_agent_name(&self, name: &str) -> bool {
+        self.state
+            .terminals
+            .values()
+            .any(|terminal| terminal.agent_name.as_deref() == Some(name))
     }
 
     /// Deliver one gram alert to registered devices that opted into gram push.
@@ -266,6 +307,26 @@ impl App {
     }
 }
 
+/// Reject an empty or over-long message before it reaches the store. Returns the
+/// encoded error response, or `None` when the text is acceptable.
+fn validate_text(id: &str, text: &str) -> Option<String> {
+    if text.is_empty() {
+        return Some(encode_error(
+            id.to_string(),
+            "invalid_params",
+            "text is empty",
+        ));
+    }
+    if text.len() > MAX_TEXT_BYTES {
+        return Some(encode_error(
+            id.to_string(),
+            "invalid_params",
+            format!("text exceeds {MAX_TEXT_BYTES} bytes; send large content as a file"),
+        ));
+    }
+    None
+}
+
 fn gram_unavailable(id: String) -> String {
     encode_error(
         id,
@@ -291,6 +352,13 @@ fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
     }
 }
 
+/// True for a shared, still-open queue item any agent may claim.
+fn is_open_shared_queue(item: &GramItem) -> bool {
+    item.direction == StoredDirection::OwnerToAgent
+        && item.to.is_none()
+        && item.grabbed_by.is_none()
+}
+
 /// The agent's view: the shared ungrabbed queue, items addressed to it, items it
 /// grabbed, and its own sent messages. `only_queue` narrows to just the shared,
 /// still-open queue so an agent can quickly scan available work.
@@ -298,32 +366,32 @@ fn filter_agent_view(items: &[GramItem], agent: &str, only_queue: bool) -> Vec<G
     items
         .iter()
         .filter(|item| {
-            let is_shared_open = item.direction == StoredDirection::OwnerToAgent
-                && item.to.is_none()
-                && item.grabbed_by.is_none();
             if only_queue {
-                return is_shared_open;
+                return is_open_shared_queue(item);
             }
             let addressed_to_me = item.direction == StoredDirection::OwnerToAgent
                 && item.to.as_deref() == Some(agent);
             let grabbed_by_me = item.grabbed_by.as_deref() == Some(agent);
             let sent_by_me = item.direction == StoredDirection::AgentToOwner && item.from == agent;
-            is_shared_open || addressed_to_me || grabbed_by_me || sent_by_me
+            is_open_shared_queue(item) || addressed_to_me || grabbed_by_me || sent_by_me
         })
         .cloned()
         .collect()
 }
 
-/// The owner's view: everything, or just unread agent->owner messages.
-fn filter_owner_view(items: &[GramItem], unread_only: bool) -> Vec<GramItem> {
+/// The owner's view: the shared open queue (`only_queue`), just unread
+/// agent->owner messages (`unread_only`), or everything.
+fn filter_owner_view(items: &[GramItem], only_queue: bool, unread_only: bool) -> Vec<GramItem> {
     items
         .iter()
         .filter(|item| {
-            if unread_only {
-                item.direction == StoredDirection::AgentToOwner && !item.read_by_owner
-            } else {
-                true
+            if only_queue {
+                return is_open_shared_queue(item);
             }
+            if unread_only {
+                return item.direction == StoredDirection::AgentToOwner && !item.read_by_owner;
+            }
+            true
         })
         .cloned()
         .collect()
@@ -392,21 +460,41 @@ mod tests {
     }
 
     #[test]
-    fn owner_view_unread_only_is_unread_agent_messages() {
+    fn owner_view_default_unread_and_queue() {
         let mut unread = owner_shared("unread");
         unread.direction = StoredDirection::AgentToOwner;
         unread.read_by_owner = false;
         let mut read = owner_shared("read");
         read.direction = StoredDirection::AgentToOwner;
         read.read_by_owner = true;
+        let mut grabbed = owner_shared("grabbed");
+        grabbed.grabbed_by = Some("beta".to_string());
 
-        let items = vec![owner_shared("owner-post"), unread, read];
-        let all = filter_owner_view(&items, false);
-        assert_eq!(all.len(), 3);
-        let ids: Vec<String> = filter_owner_view(&items, true)
+        let items = vec![owner_shared("open"), unread, read, grabbed];
+
+        // Default: everything.
+        assert_eq!(filter_owner_view(&items, false, false).len(), 4);
+        // unread_only: just the unread agent->owner message.
+        let unread_ids: Vec<String> = filter_owner_view(&items, false, true)
             .into_iter()
             .map(|item| item.id)
             .collect();
-        assert_eq!(ids, vec!["unread".to_string()]);
+        assert_eq!(unread_ids, vec!["unread".to_string()]);
+        // only_queue: just the shared, still-open item (not the grabbed one).
+        let queue_ids: Vec<String> = filter_owner_view(&items, true, false)
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(queue_ids, vec!["open".to_string()]);
+    }
+
+    #[test]
+    fn validate_text_rejects_empty_and_oversized() {
+        assert!(validate_text("id", "").is_some());
+        assert!(validate_text("id", "hello").is_none());
+        let big = "x".repeat(MAX_TEXT_BYTES + 1);
+        assert!(validate_text("id", &big).is_some());
+        let ok = "x".repeat(MAX_TEXT_BYTES);
+        assert!(validate_text("id", &ok).is_none());
     }
 }

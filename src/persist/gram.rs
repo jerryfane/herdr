@@ -11,6 +11,10 @@
 //! advisory lock, so a claim's check-then-set cannot interleave with another
 //! process. Within one process the app loop already serializes API requests, so
 //! the two layers together make "first grab wins" exact.
+//!
+//! The store is bounded on two axes (see [`normalize`]): a message-count cap and
+//! a total-text-bytes budget. Per-message text is capped by the caller (see
+//! [`MAX_TEXT_BYTES`]) so a single message cannot bloat the file.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -21,10 +25,20 @@ use tracing::warn;
 
 const GRAM_LOCK_FILE: &str = ".gram.lock";
 
-/// Keep the store bounded: a personal channel never needs unbounded history, and
-/// an ever-growing file would slow every read-modify-write. On save the oldest
-/// messages beyond this many are dropped (grab/read state does not exempt them).
+/// Keep the store bounded by message count: a personal channel never needs
+/// unbounded history, and an ever-growing file would slow every
+/// read-modify-write. On save the oldest messages beyond this many are dropped.
 const MAX_ITEMS: usize = 1000;
+
+/// Total budget for the sum of all stored message texts. Bounds the file size
+/// even if every message is near [`MAX_TEXT_BYTES`]; the oldest are dropped first.
+const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Maximum bytes of a single message's text. Enforced by the API handler before
+/// a message reaches the store (a message is a notification, not a document —
+/// large payloads belong in a file transfer). Exposed so the handler and this
+/// module agree on one limit.
+pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 
 /// Whether a message flows from an agent to the owner or the other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +58,7 @@ pub struct GramItem {
     /// Opaque, unique message id (minted by [`new_id`]).
     pub id: String,
     pub direction: GramDirection,
-    /// Sender label: an agent's effective label for `agent_to_owner`, or
+    /// Sender label: an agent's effective identity for `agent_to_owner`, or
     /// `"owner"` for `owner_to_agent`.
     pub from: String,
     /// For `owner_to_agent`: `Some(agent)` addresses one agent directly (not
@@ -65,29 +79,47 @@ pub struct GramItem {
     pub read_by_owner: bool,
 }
 
-/// Mint a process-unique message id. The wall-clock millis keep ids roughly
-/// time-ordered for humans; the monotonic counter guarantees uniqueness even for
-/// messages minted in the same millisecond.
+impl GramItem {
+    /// A shared, still-open queue item any agent may claim.
+    fn is_open_shared_queue(&self) -> bool {
+        self.direction == GramDirection::OwnerToAgent
+            && self.to.is_none()
+            && self.grabbed_by.is_none()
+    }
+}
+
+/// Mint a unique message id. The wall-clock millis keep ids roughly time-ordered
+/// for humans; the process id makes ids unique across herdr processes that might
+/// share a config dir, and the monotonic counter guarantees uniqueness within a
+/// process even inside one millisecond.
 pub fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    let pid = std::process::id();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("gram-{millis:x}-{seq:x}")
+    format!("gram-{millis:x}-{pid:x}-{seq:x}")
 }
 
-fn registry_path() -> PathBuf {
-    crate::config::config_dir().join("gram.json")
+fn config_base() -> PathBuf {
+    crate::config::config_dir()
 }
 
-fn registry_lock_path() -> PathBuf {
-    crate::config::config_dir().join(GRAM_LOCK_FILE)
+fn registry_path_in(dir: &Path) -> PathBuf {
+    dir.join("gram.json")
 }
 
-fn with_registry_lock<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    let lock_path = registry_lock_path();
+fn registry_lock_path_in(dir: &Path) -> PathBuf {
+    dir.join(GRAM_LOCK_FILE)
+}
+
+fn with_registry_lock_in<T>(
+    dir: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let lock_path = registry_lock_path_in(dir);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -122,51 +154,75 @@ fn save_json_to_path<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> st
     Ok(())
 }
 
+/// Read-modify-write the store under the lock in `dir`, returning the mutation's
+/// result and the persisted (sorted, capped) list. The public [`update`] targets
+/// the real config dir; tests pass a temp dir to exercise the real lock + disk.
+fn update_in<T>(
+    dir: &Path,
+    mutation: impl FnOnce(&mut Vec<GramItem>) -> T,
+) -> std::io::Result<(T, Vec<GramItem>)> {
+    with_registry_lock_in(dir, || {
+        let path = registry_path_in(dir);
+        let mut items = load_from_path_strict(&path)?;
+        let result = mutation(&mut items);
+        normalize(&mut items);
+        save_json_to_path(&path, &items)?;
+        Ok((result, items))
+    })
+}
+
 /// Read-modify-write the store under the lock, returning the mutation's result
 /// and the persisted (sorted, capped) list. All mutating operations funnel
 /// through here so the lock is never bypassed.
 pub fn update<T>(
     mutation: impl FnOnce(&mut Vec<GramItem>) -> T,
 ) -> std::io::Result<(T, Vec<GramItem>)> {
-    with_registry_lock(|| {
-        let mut items = load_from_path_strict(&registry_path())?;
-        let result = mutation(&mut items);
-        normalize(&mut items);
-        save_json_to_path(&registry_path(), &items)?;
-        Ok((result, items))
-    })
+    update_in(&config_base(), mutation)
 }
 
-/// Sort oldest-first by creation time and drop the oldest beyond [`MAX_ITEMS`].
+/// Sort oldest-first, then drop the oldest until both the count cap and the
+/// total-text-bytes budget are satisfied. Dropping an unclaimed shared item or
+/// an unread owner message is surprising, so those are logged.
 fn normalize(items: &mut Vec<GramItem>) {
     items.sort_by(|left, right| {
         left.created_unix_ms
             .cmp(&right.created_unix_ms)
             .then_with(|| left.id.cmp(&right.id))
     });
-    if items.len() > MAX_ITEMS {
-        let overflow = items.len() - MAX_ITEMS;
-        items.drain(0..overflow);
+    let mut total_text: usize = items.iter().map(|item| item.text.len()).sum();
+    while items.len() > MAX_ITEMS || (items.len() > 1 && total_text > MAX_TOTAL_TEXT_BYTES) {
+        let dropped = items.remove(0);
+        total_text = total_text.saturating_sub(dropped.text.len());
+        if dropped.is_open_shared_queue() {
+            warn!(id = %dropped.id, "gram store dropped an unclaimed shared-queue item at the cap");
+        } else if dropped.direction == GramDirection::AgentToOwner && !dropped.read_by_owner {
+            warn!(id = %dropped.id, "gram store dropped an unread owner message at the cap");
+        }
     }
+}
+
+fn append_in(dir: &Path, item: GramItem) -> std::io::Result<Vec<GramItem>> {
+    let (_, items) = update_in(dir, move |items| items.push(item))?;
+    Ok(items)
 }
 
 /// Append a new message and return the persisted list.
 pub fn append(item: GramItem) -> std::io::Result<Vec<GramItem>> {
-    let (_, items) = update(move |items| items.push(item))?;
-    Ok(items)
+    append_in(&config_base(), item)
 }
 
-pub fn try_load() -> std::io::Result<Vec<GramItem>> {
-    with_registry_lock(|| load_from_path_strict(&registry_path()))
+fn try_load_in(dir: &Path) -> std::io::Result<Vec<GramItem>> {
+    with_registry_lock_in(dir, || load_from_path_strict(&registry_path_in(dir)))
 }
 
 /// Load the store. Returns an empty vec on failure so a corrupt or missing file
 /// never blocks reads; mutations still use strict reads under the lock.
 pub fn load() -> Vec<GramItem> {
-    match try_load() {
+    let dir = config_base();
+    match try_load_in(&dir) {
         Ok(items) => items,
         Err(err) => {
-            warn!(path = %registry_path().display(), err = %err, "failed to load gram store");
+            warn!(path = %registry_path_in(&dir).display(), err = %err, "failed to load gram store");
             Vec::new()
         }
     }
@@ -199,6 +255,20 @@ mod tests {
         }
     }
 
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-gram-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn new_id_is_unique_within_a_millisecond() {
         let a = new_id();
@@ -219,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_sorts_oldest_first_and_caps() {
+    fn normalize_sorts_oldest_first_and_caps_count() {
         let mut items = vec![item("c", 30), item("a", 10), item("b", 20)];
         normalize(&mut items);
         assert_eq!(
@@ -232,28 +302,61 @@ mod tests {
             .collect();
         normalize(&mut many);
         assert_eq!(many.len(), MAX_ITEMS);
-        // The five oldest (0..5) were dropped; the newest survive.
         assert_eq!(many.first().unwrap().created_unix_ms, 5);
     }
 
     #[test]
-    fn grab_claim_is_first_wins_in_memory() {
-        // Exercise the claim mutation directly (no disk / lock) — the same
-        // check-then-set `update` runs under the lock in production.
-        let mut items = vec![item("shared", 1)];
-        let claim = |items: &mut Vec<GramItem>, who: &str| -> Result<(), &'static str> {
-            let target = items
-                .iter_mut()
-                .find(|i| i.id == "shared")
-                .ok_or("not_found")?;
-            if target.grabbed_by.is_some() {
-                return Err("already_grabbed");
-            }
-            target.grabbed_by = Some(who.to_string());
-            Ok(())
-        };
-        assert!(claim(&mut items, "agent-a").is_ok());
-        assert_eq!(claim(&mut items, "agent-b"), Err("already_grabbed"));
-        assert_eq!(items[0].grabbed_by.as_deref(), Some("agent-a"));
+    fn normalize_enforces_total_byte_budget() {
+        let big = "x".repeat(MAX_TEXT_BYTES);
+        let mut items: Vec<GramItem> = (0..300u64)
+            .map(|n| {
+                let mut it = item(&format!("id-{n}"), n);
+                it.text = big.clone();
+                it
+            })
+            .collect();
+        // 300 * 8 KiB = 2.4 MiB > 1 MiB budget; oldest dropped until under budget.
+        normalize(&mut items);
+        let total: usize = items.iter().map(|i| i.text.len()).sum();
+        assert!(total <= MAX_TOTAL_TEXT_BYTES, "total {total} over budget");
+        assert!(!items.is_empty());
+        // Newest survive: the last id must still be present.
+        assert_eq!(items.last().unwrap().id, "id-299");
+    }
+
+    #[test]
+    fn concurrent_grabs_are_first_wins_on_disk() {
+        let dir = unique_temp_dir("grab");
+        let mut seed = item("shared", 1);
+        seed.read_by_owner = true;
+        append_in(&dir, seed).unwrap();
+
+        fn try_claim(dir: &Path, who: &str) -> std::io::Result<bool> {
+            let who = who.to_string();
+            let (claimed, _) = update_in(dir, move |items| {
+                match items.iter_mut().find(|item| item.id == "shared") {
+                    Some(item) if item.grabbed_by.is_none() => {
+                        item.grabbed_by = Some(who);
+                        true
+                    }
+                    _ => false,
+                }
+            })?;
+            Ok(claimed)
+        }
+
+        let d1 = dir.clone();
+        let d2 = dir.clone();
+        let h1 = std::thread::spawn(move || try_claim(&d1, "agent-a").unwrap());
+        let h2 = std::thread::spawn(move || try_claim(&d2, "agent-b").unwrap());
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        // Exactly one claim wins; the real lock + disk serialize the two.
+        assert!(r1 ^ r2, "exactly one grab must win (a={r1}, b={r2})");
+        let persisted = try_load_in(&dir).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted[0].grabbed_by.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

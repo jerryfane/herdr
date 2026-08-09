@@ -2414,7 +2414,7 @@
           "type": "object"
         },
         "GramGrabParams": {
-          "description": "`gram.grab` — an agent claims a shared-queue item. The claimant label is\nresolved from `caller_pane_id` (or `grabbed_by` when the caller is not a\npane). Fails if the item is missing, not a shared item, or already grabbed.",
+          "description": "`gram.grab` — an agent claims a shared-queue item. The claimant is\n`grabbed_by` when provided, otherwise resolved from `caller_pane_id` to that\nagent's identity. Fails if the item is missing, not a shared item, or already\ngrabbed.",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -2438,7 +2438,7 @@
           "type": "object"
         },
         "GramListParams": {
-          "description": "`gram.list` — read messages. The audience is inferred from `caller_pane_id`:\na caller that resolves to an agent gets that agent's view (its direct items,\nthe shared ungrabbed queue, its own grabs, and its own sent items); a caller\nwith no resolvable pane gets the owner view (everything).",
+          "description": "`gram.list` — read messages. The audience is chosen by `caller_pane_id`:\nomit it for the owner view (everything); supply it for that agent's view (its\ndirect items, the shared ungrabbed queue, its own grabs, and its own sent\nitems). A `caller_pane_id` that is supplied but does not resolve to an agent\nis an error, not a fall-through to the owner view.",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -2448,7 +2448,7 @@
             },
             "only_queue": {
               "default": false,
-              "description": "Agent view only: restrict to the shared, still-ungrabbed queue.",
+              "description": "Restrict to the shared, still-ungrabbed queue (either audience).",
               "type": "boolean"
             },
             "unread_only": {
@@ -2472,7 +2472,7 @@
           "type": "object"
         },
         "GramPostParams": {
-          "description": "`gram.post` — the owner posts a message to agents (from the app).\n\n`to: Some(agent)` addresses one agent directly (not grabbable); `to: None`\nposts to the shared grab-queue any agent can claim.",
+          "description": "`gram.post` — the owner posts a message to agents (from the app).\n\n`to: Some(agent)` addresses one agent directly by its unique agent name (not\ngrabbable); the name must match a live agent or the call is rejected. `to:\nNone` posts to the shared grab-queue any agent can claim. `text` is capped\nserver-side (~8 KiB).",
           "properties": {
             "text": {
               "type": "string"
@@ -2490,7 +2490,7 @@
           "type": "object"
         },
         "GramSendParams": {
-          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label (`from`) is resolved server-side from `caller_pane_id`\n(the agent's `HERDR_PANE_ID`); `from` overrides that when the caller cannot be\nresolved to a pane (e.g. a script outside a Herdr pane).",
+          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label is `from` when provided; otherwise it is resolved\nserver-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that\nagent's identity — the unique per-agent name if set, else the agent kind. An\nexplicit `from` always wins. `text` is capped server-side (~8 KiB); send\nlarge content as a file, not a message.",
           "properties": {
             "caller_pane_id": {
               "type": [
