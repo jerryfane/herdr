@@ -102,6 +102,8 @@ pub struct NotificationsRegisterDeviceParams {
     pub notify_dies: bool,
     #[serde(default)]
     pub notify_finishes: bool,
+    #[serde(default)]
+    pub notify_gram: bool,
 }
 
 #[derive(

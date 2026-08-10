@@ -37,6 +37,7 @@ pub(super) fn command() -> Command {
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(notification_command())
+        .subcommand(gram_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
         .subcommand(terminal_command())
@@ -310,6 +311,44 @@ fn notification_command() -> Command {
                     "bottom-right",
                 ]))
                 .arg(option("sound", "SOUND").value_parser(["none", "done", "request"])),
+        )
+}
+
+fn gram_command() -> Command {
+    Command::new("gram")
+        .about("Message the owner and pick up owner-queued work (Herdr app channel)")
+        .subcommand(
+            Command::new("send")
+                .about("Send the owner a push-notified message")
+                .arg(required("text", "TEXT"))
+                .arg(
+                    option("from", "LABEL")
+                        .help("Attribute the message to LABEL instead of your own identity"),
+                ),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List gram messages")
+                .arg(flag("queue").help("Only the shared, unclaimed queue"))
+                .arg(flag("unread").help("Only unread messages (owner view)"))
+                .arg(flag("owner").help("Read as the owner (omit this pane)")),
+        )
+        .subcommand(
+            Command::new("grab")
+                .about("Claim a shared queue item")
+                .arg(required("id", "ID"))
+                .arg(option("as", "LABEL")),
+        )
+        .subcommand(
+            Command::new("post")
+                .about("Owner: post to the shared queue or one agent")
+                .arg(required("text", "TEXT"))
+                .arg(option("to", "AGENT")),
+        )
+        .subcommand(
+            Command::new("mark-read")
+                .about("Owner: mark an agent message read")
+                .arg(required("id", "ID")),
         )
 }
 

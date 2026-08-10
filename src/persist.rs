@@ -5,6 +5,7 @@
 //! Installed plugins are persisted separately at `plugins.json`.
 
 pub mod devices;
+pub mod gram;
 mod io;
 pub mod plugin_registry;
 mod restore;

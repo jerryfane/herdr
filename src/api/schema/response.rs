@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::agents::{AgentInfo, AgentPromptDelivery};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
+use super::gram::GramMessageInfo;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
@@ -263,6 +264,15 @@ pub enum ResponseResult {
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
+    },
+    GramSent {
+        message: GramMessageInfo,
+    },
+    GramList {
+        messages: Vec<GramMessageInfo>,
+    },
+    GramGrabbed {
+        message: GramMessageInfo,
     },
     Ok {},
 }

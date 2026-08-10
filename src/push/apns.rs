@@ -14,7 +14,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
-use super::PushNotification;
+use super::{PushKind, PushNotification};
 
 const PROD_HOST: &str = "https://api.push.apple.com";
 const SANDBOX_HOST: &str = "https://api.sandbox.push.apple.com";
@@ -40,7 +40,7 @@ pub(super) enum DeliveryOutcome {
 /// Map a Herdr agent transition to the APNs alert body. `pane_id`/`workspace_id`
 /// are the public API ids so the mobile client can deep-link.
 pub(super) fn payload_body(notification: &PushNotification) -> String {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "aps": {
             "alert": {
                 "title": notification.title,
@@ -50,8 +50,14 @@ pub(super) fn payload_body(notification: &PushNotification) -> String {
         },
         "pane_id": notification.pane_id,
         "workspace_id": notification.workspace_id,
-    })
-    .to_string()
+    });
+    // A gram alert deep-links to the app's Gram page, not a pane. The `gram`
+    // marker lets the client branch on tap; `pane_id`/`workspace_id` are empty
+    // for these and must be ignored when `gram` is present.
+    if notification.kind == PushKind::Gram {
+        payload["gram"] = serde_json::Value::Bool(true);
+    }
+    payload.to_string()
 }
 
 fn device_url(sandbox: bool, device_token: &str) -> String {
@@ -245,6 +251,19 @@ mod tests {
         assert_eq!(payload["aps"]["sound"], "default");
         assert_eq!(payload["pane_id"], "w1-1");
         assert_eq!(payload["workspace_id"], "w_1");
+        // Agent-transition alerts carry no gram marker.
+        assert!(payload.get("gram").is_none());
+    }
+
+    #[test]
+    fn payload_body_marks_gram_alerts() {
+        let mut notification = sample_notification();
+        notification.kind = PushKind::Gram;
+        notification.pane_id = String::new();
+        notification.workspace_id = String::new();
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_body(&notification)).unwrap();
+        assert_eq!(payload["gram"], serde_json::Value::Bool(true));
     }
 
     #[test]
