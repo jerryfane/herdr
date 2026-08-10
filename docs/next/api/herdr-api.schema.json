@@ -2414,7 +2414,7 @@
           "type": "object"
         },
         "GramGrabParams": {
-          "description": "`gram.grab` — an agent claims a shared-queue item. The claimant is\n`grabbed_by` when provided, otherwise resolved from `caller_pane_id` to that\nagent's identity. Fails if the item is missing, not a shared item, or already\ngrabbed.",
+          "description": "`gram.grab` — an agent claims a shared-queue item. The claim is first-wins and\natomic at the storage layer, so no two agents can ever hold the same item —\nthis holds regardless of identity. The claimant label is `grabbed_by` when\nprovided, otherwise resolved from `caller_pane_id` to the agent's identity;\nthat label carries the same name-semantics as `gram.send`'s `from` (a rename\nor reuse moves which items show as \"mine\", but never lets a second agent\nclaim one). Fails if the item is missing, not a shared item, or already\ngrabbed.",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -2490,7 +2490,7 @@
           "type": "object"
         },
         "GramSendParams": {
-          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label is `from` when provided; otherwise it is resolved\nserver-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that\nagent's display identity — the unique per-agent name if set, else the pane's\npublic id. An explicit `from` always wins for display, but the message is\nstill matched to its sender by a stable internal key, so a `from` override\nnever hides it from the sender's own view. `text` is capped server-side\n(~8 KiB); send large content as a file, not a message.",
+          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender identity is `from` when provided; otherwise it is resolved\nserver-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to the agent's\nname (else the pane's public id). The agent name is the durable identity — it\nsurvives a restart or live-handoff — but it is a name: it can be renamed,\ncleared, or reused, so attribution and the \"sent by me\" view follow the\nidentity as it stands, not a fixed token. An explicit `from` overrides\nattribution entirely. `text` is capped server-side (~8 KiB); send large\ncontent as a file, not a message.",
           "properties": {
             "caller_pane_id": {
               "type": [

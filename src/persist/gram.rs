@@ -74,22 +74,11 @@ pub struct GramItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     pub text: String,
-    /// Stable, immutable identity of the sender (the terminal id), used for
-    /// "is this mine" matching in the agent view. Unlike `from` (a display label
-    /// that can be renamed or overridden), the key does not change on rename,
-    /// clear, or pane move, and is never reused — so a message stays visible in
-    /// its sender's own view. `None` for legacy items and owner posts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_key: Option<String>,
     /// The agent that claimed a shared-queue item; `None` while unclaimed. Only
-    /// meaningful for shared `owner_to_agent` items. This is a display label; see
-    /// `grabbed_by_key` for the stable match key.
+    /// meaningful for shared `owner_to_agent` items. This is the claimant's
+    /// identity label at grab time (see the handler module for its semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grabbed_by: Option<String>,
-    /// Stable, immutable identity of the claimant (the terminal id). Matching a
-    /// grabbed item to "me" uses this, not the mutable `grabbed_by` label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grabbed_by_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grabbed_unix_ms: Option<u64>,
     pub created_unix_ms: u64,
@@ -277,11 +266,9 @@ mod tests {
             id: id.to_string(),
             direction: GramDirection::OwnerToAgent,
             from: "owner".to_string(),
-            from_key: None,
             to: None,
             text: "hello".to_string(),
             grabbed_by: None,
-            grabbed_by_key: None,
             grabbed_unix_ms: None,
             created_unix_ms: created,
             read_by_owner: false,

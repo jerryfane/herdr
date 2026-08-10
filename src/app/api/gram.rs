@@ -4,16 +4,25 @@
 //! queue or direct), `gram.list` (audience inferred from the caller pane),
 //! `gram.grab` (first-wins claim of a shared item), and `gram.mark_read`.
 //!
-//! Identity: there is no per-connection identity, so the caller passes its
-//! `HERDR_PANE_ID` as `caller_pane_id` and the server resolves it (see
-//! [`App::caller_identity`]) to a `(display, key)` pair: `display` is the agent
-//! name or the pane's public id (human-readable attribution), and `key` is the
-//! terminal id — stable across rename / clear / pane-move and never reused, so it
-//! is the durable identity used to match a message or claim back to its owner
-//! (see `identity_matches`). The owner's app sends no `caller_pane_id` (owner view
-//! = everything); a `caller_pane_id` that names no live pane is an error, not a
-//! silent fall-through to the owner view. Sender/owner attribution is advisory,
-//! not authenticated — the trust domain is already flat.
+//! Identity and its guarantees. There is no per-connection identity, so the
+//! caller passes its `HERDR_PANE_ID` as `caller_pane_id` and the server resolves
+//! it (see [`App::caller_identity`]) to a single label: the agent's **name** when
+//! one is set, else the pane's public id. The agent name is the durable choice —
+//! it is persisted in the session snapshot and restored across a restart or a
+//! live-handoff (the deploy path), which the terminal id is not. It is, however,
+//! a NAME: renaming or clearing an agent, moving an unnamed pane between
+//! workspaces, or reusing a freed name changes or transfers the identity, and a
+//! message or claim is attributed to the identity at the moment it was written.
+//! That is deliberate name-semantics, not a safety property: **the grab is
+//! first-wins atomic at the storage layer regardless of identity, so no two
+//! agents can ever claim the same item.** Identity affects only which items a
+//! caller sees as "mine" in the agent view. A durable, immutable, non-reusable
+//! identity is tracked as a follow-up.
+//!
+//! The owner's app sends no `caller_pane_id` (owner view = everything); a
+//! `caller_pane_id` that names no live pane is an error, not a silent
+//! fall-through to the owner view. Sender/owner attribution is advisory, not
+//! authenticated — the trust domain is already flat.
 
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
@@ -48,17 +57,14 @@ impl App {
             return gram_unavailable(id);
         }
 
-        let (from, from_key) =
-            self.resolve_sender(params.from.as_deref(), params.caller_pane_id.as_deref());
+        let from = self.resolve_sender(params.from.as_deref(), params.caller_pane_id.as_deref());
         let item = GramItem {
             id: new_id(),
             direction: StoredDirection::AgentToOwner,
             from: from.clone(),
-            from_key,
             to: None,
             text: text.to_string(),
             grabbed_by: None,
-            grabbed_by_key: None,
             grabbed_unix_ms: None,
             created_unix_ms: super::unix_millis_now(),
             read_by_owner: false,
@@ -115,11 +121,9 @@ impl App {
             id: new_id(),
             direction: StoredDirection::OwnerToAgent,
             from: "owner".to_string(),
-            from_key: None,
             to,
             text: text.to_string(),
             grabbed_by: None,
-            grabbed_by_key: None,
             grabbed_unix_ms: None,
             created_unix_ms: super::unix_millis_now(),
             // The owner's own message is not an unread inbox item for the owner.
@@ -159,14 +163,14 @@ impl App {
                         "unread_only is only valid in the owner view; omit caller_pane_id",
                     );
                 }
-                let Some((display, key)) = self.caller_identity(pane) else {
+                let Some(identity) = self.caller_identity(pane) else {
                     return encode_error(
                         id,
                         "unknown_caller",
                         "caller_pane_id is not a known pane; omit it to read as the owner",
                     );
                 };
-                filter_agent_view(&items, &display, Some(&key), params.only_queue)
+                filter_agent_view(&items, &identity, params.only_queue)
             }
             // No caller pane: the owner (app) view.
             None => filter_owner_view(&items, params.only_queue, params.unread_only),
@@ -185,22 +189,20 @@ impl App {
             return gram_unavailable(id);
         }
 
-        // Display label = explicit --as override, else the caller's display
-        // identity. The stable key comes only from the caller pane (an explicit
-        // override has no pane), and matching in the view prefers the key.
-        let explicit = params
+        // Claimant = explicit --as override, else the caller pane's identity.
+        let who = params
             .grabbed_by
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let caller = params
-            .caller_pane_id
-            .as_deref()
-            .and_then(|pane| self.caller_identity(pane));
-        let who_display = explicit.or_else(|| caller.as_ref().map(|(display, _)| display.clone()));
-        let who_key = caller.map(|(_, key)| key);
-        let Some(who_display) = who_display else {
+            .map(str::to_string)
+            .or_else(|| {
+                params
+                    .caller_pane_id
+                    .as_deref()
+                    .and_then(|pane| self.caller_identity(pane))
+            });
+        let Some(who) = who else {
             return encode_error(
                 id,
                 "unknown_caller",
@@ -212,8 +214,8 @@ impl App {
         let now = super::unix_millis_now();
         // The claim runs under the store's advisory lock, and the app loop
         // serializes API requests, so this check-then-set is atomic across both
-        // threads and processes — first grab wins. A lost race changes nothing, so
-        // it does not rewrite the store (update_if_changed).
+        // threads and processes — first grab wins, independent of identity. A lost
+        // race changes nothing, so it does not rewrite the store.
         let outcome = crate::persist::gram::update_if_changed(move |items| {
             let result = (|| {
                 let Some(item) = items.iter_mut().find(|item| item.id == target_id) else {
@@ -225,8 +227,7 @@ impl App {
                 if let Some(existing) = &item.grabbed_by {
                     return Err(GrabError::AlreadyGrabbed(existing.clone()));
                 }
-                item.grabbed_by = Some(who_display.clone());
-                item.grabbed_by_key = who_key.clone();
+                item.grabbed_by = Some(who.clone());
                 item.grabbed_unix_ms = Some(now);
                 Ok(item.clone())
             })();
@@ -285,46 +286,32 @@ impl App {
         }
     }
 
-    /// Resolve `(display, key)` for an agent->owner message's sender. `display` is
-    /// an explicit `from` override, else the caller's display identity, else
-    /// "agent". `key` is the caller's stable terminal-id key (`None` when there is
-    /// no caller pane), used for "is this mine" matching regardless of the display
-    /// label — so a `--from` override never hides the sender's own message.
-    fn resolve_sender(
-        &self,
-        from: Option<&str>,
-        caller_pane_id: Option<&str>,
-    ) -> (String, Option<String>) {
-        let caller = caller_pane_id.and_then(|pane| self.caller_identity(pane));
-        let display = from
-            .map(str::trim)
+    /// Resolve the label to record as `from` for an agent->owner message: an
+    /// explicit override, else the caller pane's identity, else "agent". An
+    /// explicit `from` overrides attribution entirely (the message is then
+    /// attributed to that label, not the caller), which the CLI help notes.
+    fn resolve_sender(&self, from: Option<&str>, caller_pane_id: Option<&str>) -> String {
+        from.map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .or_else(|| caller.as_ref().map(|(display, _)| display.clone()))
-            .unwrap_or_else(|| "agent".to_string());
-        (display, caller.map(|(_, key)| key))
+            .or_else(|| caller_pane_id.and_then(|pane| self.caller_identity(pane)))
+            .unwrap_or_else(|| "agent".to_string())
     }
 
-    /// Resolve a public pane id (an agent's `HERDR_PANE_ID`) to `(display, key)`.
-    /// `display` is the per-agent name if set, else the pane's public id (both
-    /// unique per pane, for human-readable attribution). `key` is the terminal id,
-    /// which is stable across rename / clear / pane-move and never reused (it is
-    /// minted from wall-clock micros + a counter), so it is the durable identity
-    /// used to match a message or claim back to its owner. `None` only when the
-    /// pane id names no known pane.
-    fn caller_identity(&self, caller_pane_id: &str) -> Option<(String, String)> {
+    /// Resolve a public pane id (an agent's `HERDR_PANE_ID`) to its identity: the
+    /// per-agent name if set (durable across restart / live-handoff, since it is
+    /// snapshotted and restored), else the pane's public id. `None` only when the
+    /// pane id names no known pane. See the module header for the name-semantics
+    /// this identity carries.
+    fn caller_identity(&self, caller_pane_id: &str) -> Option<String> {
         let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
-        let key = terminal_id.to_string();
-        let display = self
-            .state
+        self.state
             .terminals
             .get(terminal_id)
             .and_then(|terminal| terminal.agent_name.clone())
             .filter(|name| !name.trim().is_empty())
             .or_else(|| self.public_pane_id(ws_idx, pane_id))
-            .unwrap_or_else(|| key.clone());
-        Some((display, key))
     }
 
     /// Whether some live terminal has this exact unique agent name. Used to reject
@@ -430,33 +417,11 @@ fn is_open_shared_queue(item: &GramItem) -> bool {
         && item.grabbed_by.is_none()
 }
 
-/// Does a stored item belong to the caller? Prefer the stable key (present on
-/// items written by this build); fall back to the display label for legacy items
-/// or a caller with no pane. Matching on the key means a rename, an agent-name
-/// clear, a pane move, or a `--from`/`--as` display override never hides an item
-/// from its true owner, nor reveals it to a later agent that reused the label.
-fn identity_matches(
-    stored_key: Option<&str>,
-    stored_display: &str,
-    my_display: &str,
-    my_key: Option<&str>,
-) -> bool {
-    match (stored_key, my_key) {
-        (Some(stored_key), Some(my_key)) => stored_key == my_key,
-        _ => stored_display == my_display,
-    }
-}
-
 /// The agent's view: the shared ungrabbed queue, items addressed to it, items it
 /// grabbed, and its own sent messages. `only_queue` narrows to just the shared,
-/// still-open queue so an agent can quickly scan available work. `key` is the
-/// caller's stable identity; "grabbed by me" / "sent by me" match on it.
-fn filter_agent_view(
-    items: &[GramItem],
-    display: &str,
-    key: Option<&str>,
-    only_queue: bool,
-) -> Vec<GramItem> {
+/// still-open queue so an agent can quickly scan available work. Membership is by
+/// the caller's current identity (see the module header for the name-semantics).
+fn filter_agent_view(items: &[GramItem], identity: &str, only_queue: bool) -> Vec<GramItem> {
     items
         .iter()
         .filter(|item| {
@@ -464,12 +429,10 @@ fn filter_agent_view(
                 return is_open_shared_queue(item);
             }
             let addressed_to_me = item.direction == StoredDirection::OwnerToAgent
-                && item.to.as_deref() == Some(display);
-            let grabbed_by_me = item.grabbed_by.as_deref().is_some_and(|grabbed_by| {
-                identity_matches(item.grabbed_by_key.as_deref(), grabbed_by, display, key)
-            });
-            let sent_by_me = item.direction == StoredDirection::AgentToOwner
-                && identity_matches(item.from_key.as_deref(), &item.from, display, key);
+                && item.to.as_deref() == Some(identity);
+            let grabbed_by_me = item.grabbed_by.as_deref() == Some(identity);
+            let sent_by_me =
+                item.direction == StoredDirection::AgentToOwner && item.from == identity;
             is_open_shared_queue(item) || addressed_to_me || grabbed_by_me || sent_by_me
         })
         .cloned()
@@ -503,11 +466,9 @@ mod tests {
             id: id.to_string(),
             direction: StoredDirection::OwnerToAgent,
             from: "owner".to_string(),
-            from_key: None,
             to: None,
             text: "shared task".to_string(),
             grabbed_by: None,
-            grabbed_by_key: None,
             grabbed_unix_ms: None,
             created_unix_ms: 1,
             read_by_owner: true,
@@ -534,7 +495,7 @@ mod tests {
             grabbed_by_other,
             my_send,
         ];
-        let ids: Vec<String> = filter_agent_view(&items, "alpha", None, false)
+        let ids: Vec<String> = filter_agent_view(&items, "alpha", false)
             .into_iter()
             .map(|item| item.id)
             .collect();
@@ -547,36 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_view_matches_on_stable_key_across_rename_and_reuse() {
-        // Item grabbed by key "k-alpha" while the agent displayed as "alpha".
-        let mut grabbed = owner_shared("mine");
-        grabbed.grabbed_by = Some("alpha".to_string());
-        grabbed.grabbed_by_key = Some("k-alpha".to_string());
-        let items = vec![grabbed];
-
-        // The same agent, now renamed to "alpha-2" but still key "k-alpha", still
-        // sees its claim (key match, display changed).
-        let seen: Vec<String> = filter_agent_view(&items, "alpha-2", Some("k-alpha"), false)
-            .into_iter()
-            .map(|item| item.id)
-            .collect();
-        assert_eq!(seen, vec!["mine".to_string()]);
-
-        // A different agent that reused the old display name "alpha" but has a
-        // different key does NOT see the claim.
-        let other: Vec<String> = filter_agent_view(&items, "alpha", Some("k-beta"), false)
-            .into_iter()
-            .map(|item| item.id)
-            .collect();
-        assert!(other.is_empty());
-    }
-
-    #[test]
     fn agent_view_only_queue_is_shared_and_open() {
         let mut grabbed = owner_shared("grabbed");
         grabbed.grabbed_by = Some("beta".to_string());
         let items = vec![owner_shared("open"), grabbed];
-        let ids: Vec<String> = filter_agent_view(&items, "alpha", None, true)
+        let ids: Vec<String> = filter_agent_view(&items, "alpha", true)
             .into_iter()
             .map(|item| item.id)
             .collect();

@@ -97,6 +97,20 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 
 `notification show` 使用配置的 `[ui.toast]` 投递方式。`--position` 只影响 Herdr 应用内的 toast。`--sound` 默认为 `none`;`done` 和 `request` 只在通知实际显示时播放已有的完成音和需要关注音。
 
+## Gram
+
+Gram 是在 Herdr 应用中呈现的所有者↔智能体消息通道。
+
+```bash
+herdr gram send "<text>" [--from LABEL]         # 给所有者发消息(推送通知)
+herdr gram list [--queue] [--unread] [--owner]  # --owner 以所有者身份查看
+herdr gram grab <id> [--as LABEL]               # 认领共享队列中的一项(先到先得)
+herdr gram post "<text>" [--to AGENT]           # 所有者:共享队列,或指定某个智能体
+herdr gram mark-read <id>                       # 所有者:将消息标记为已读
+```
+
+智能体的身份来自 `HERDR_PANE_ID`,解析为其智能体名称(没有名称则为窗格 id)。该名称在重启或部署交接后仍然保持,但它是一个名称:重命名、清除或复用它会改变 `gram list` 中显示为“我的”的项。认领(grab)本身始终是先到先得且原子的,与身份无关——两个智能体永远无法认领同一项。归属信息(`from` 以及所有者发布的消息)仅供参考,并非经过认证。
+
 ## 会话
 
 ```bash

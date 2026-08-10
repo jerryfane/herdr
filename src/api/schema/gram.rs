@@ -12,13 +12,14 @@ pub enum GramDirection {
 
 /// `gram.send` — an agent sends the owner a push-notified message.
 ///
-/// The sender label is `from` when provided; otherwise it is resolved
-/// server-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that
-/// agent's display identity — the unique per-agent name if set, else the pane's
-/// public id. An explicit `from` always wins for display, but the message is
-/// still matched to its sender by a stable internal key, so a `from` override
-/// never hides it from the sender's own view. `text` is capped server-side
-/// (~8 KiB); send large content as a file, not a message.
+/// The sender identity is `from` when provided; otherwise it is resolved
+/// server-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to the agent's
+/// name (else the pane's public id). The agent name is the durable identity — it
+/// survives a restart or live-handoff — but it is a name: it can be renamed,
+/// cleared, or reused, so attribution and the "sent by me" view follow the
+/// identity as it stands, not a fixed token. An explicit `from` overrides
+/// attribution entirely. `text` is capped server-side (~8 KiB); send large
+/// content as a file, not a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramSendParams {
     pub text: String,
@@ -59,9 +60,13 @@ pub struct GramListParams {
     pub unread_only: bool,
 }
 
-/// `gram.grab` — an agent claims a shared-queue item. The claimant is
-/// `grabbed_by` when provided, otherwise resolved from `caller_pane_id` to that
-/// agent's identity. Fails if the item is missing, not a shared item, or already
+/// `gram.grab` — an agent claims a shared-queue item. The claim is first-wins and
+/// atomic at the storage layer, so no two agents can ever hold the same item —
+/// this holds regardless of identity. The claimant label is `grabbed_by` when
+/// provided, otherwise resolved from `caller_pane_id` to the agent's identity;
+/// that label carries the same name-semantics as `gram.send`'s `from` (a rename
+/// or reuse moves which items show as "mine", but never lets a second agent
+/// claim one). Fails if the item is missing, not a shared item, or already
 /// grabbed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramGrabParams {
