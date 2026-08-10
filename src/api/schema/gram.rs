@@ -14,9 +14,11 @@ pub enum GramDirection {
 ///
 /// The sender label is `from` when provided; otherwise it is resolved
 /// server-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that
-/// agent's identity — the unique per-agent name if set, else the agent kind. An
-/// explicit `from` always wins. `text` is capped server-side (~8 KiB); send
-/// large content as a file, not a message.
+/// agent's display identity — the unique per-agent name if set, else the pane's
+/// public id. An explicit `from` always wins for display, but the message is
+/// still matched to its sender by a stable internal key, so a `from` override
+/// never hides it from the sender's own view. `text` is capped server-side
+/// (~8 KiB); send large content as a file, not a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramSendParams {
     pub text: String,
@@ -40,10 +42,11 @@ pub struct GramPostParams {
 }
 
 /// `gram.list` — read messages. The audience is chosen by `caller_pane_id`:
-/// omit it for the owner view (everything); supply it for that agent's view (its
-/// direct items, the shared ungrabbed queue, its own grabs, and its own sent
-/// items). A `caller_pane_id` that is supplied but does not resolve to an agent
-/// is an error, not a fall-through to the owner view.
+/// omit it for the owner view (everything); supply it for that pane's agent view
+/// (its direct items, the shared ungrabbed queue, its own grabs, and its own sent
+/// items). A `caller_pane_id` that names no live pane is an error, not a
+/// fall-through to the owner view. `unread_only` is an owner-view filter and is
+/// rejected when `caller_pane_id` is present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct GramListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

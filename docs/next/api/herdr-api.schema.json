@@ -2438,7 +2438,7 @@
           "type": "object"
         },
         "GramListParams": {
-          "description": "`gram.list` — read messages. The audience is chosen by `caller_pane_id`:\nomit it for the owner view (everything); supply it for that agent's view (its\ndirect items, the shared ungrabbed queue, its own grabs, and its own sent\nitems). A `caller_pane_id` that is supplied but does not resolve to an agent\nis an error, not a fall-through to the owner view.",
+          "description": "`gram.list` — read messages. The audience is chosen by `caller_pane_id`:\nomit it for the owner view (everything); supply it for that pane's agent view\n(its direct items, the shared ungrabbed queue, its own grabs, and its own sent\nitems). A `caller_pane_id` that names no live pane is an error, not a\nfall-through to the owner view. `unread_only` is an owner-view filter and is\nrejected when `caller_pane_id` is present.",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -2490,7 +2490,7 @@
           "type": "object"
         },
         "GramSendParams": {
-          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label is `from` when provided; otherwise it is resolved\nserver-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that\nagent's identity — the unique per-agent name if set, else the agent kind. An\nexplicit `from` always wins. `text` is capped server-side (~8 KiB); send\nlarge content as a file, not a message.",
+          "description": "`gram.send` — an agent sends the owner a push-notified message.\n\nThe sender label is `from` when provided; otherwise it is resolved\nserver-side from `caller_pane_id` (the agent's `HERDR_PANE_ID`) to that\nagent's display identity — the unique per-agent name if set, else the pane's\npublic id. An explicit `from` always wins for display, but the message is\nstill matched to its sender by a stable internal key, so a `from` override\nnever hides it from the sender's own view. `text` is capped server-side\n(~8 KiB); send large content as a file, not a message.",
           "properties": {
             "caller_pane_id": {
               "type": [
