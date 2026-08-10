@@ -274,6 +274,12 @@ pub enum ResponseResult {
     GramGrabbed {
         message: GramMessageInfo,
     },
+    GramFileContent {
+        name: String,
+        mime: String,
+        size: u64,
+        data_base64: String,
+    },
     Ok {},
 }
 

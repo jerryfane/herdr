@@ -24,14 +24,17 @@
 //! fall-through to the owner view. Sender/owner attribution is advisory, not
 //! authenticated — the trust domain is already flat.
 
+use base64::Engine as _;
+
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
-    GramDirection, GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo,
-    GramPostParams, GramSendParams, ResponseResult,
+    GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileParams,
+    GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo, GramPostParams,
+    GramSendParams, GramUploadChunkParams, ResponseResult,
 };
 use crate::app::App;
 use crate::persist::gram::{
-    new_id, GramDirection as StoredDirection, GramItem, MAX_LABEL_BYTES, MAX_TEXT_BYTES,
+    new_id, GramDirection as StoredDirection, GramFile, GramItem, MAX_LABEL_BYTES, MAX_TEXT_BYTES,
 };
 
 /// Why a claim could not be completed.
@@ -44,10 +47,23 @@ enum GrabError {
     AlreadyGrabbed(String),
 }
 
+/// The result of a delete attempt, decided under the store lock.
+enum DeleteOutcome {
+    /// The message was removed. Carries its id so the handler can also delete any
+    /// attached file bytes on disk once file attachments exist.
+    Deleted(String),
+    /// No message with that id.
+    NotFound,
+    /// The message exists but the calling agent is not involved in it.
+    Forbidden,
+}
+
 impl App {
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
         let text = params.text.trim();
-        if let Some(err) = validate_text(&id, text) {
+        // A file-only message (no caption) is fine; an empty text-only message is
+        // not.
+        if let Some(err) = validate_text(&id, text, params.file.is_some()) {
             return err;
         }
         if let Some(err) = validate_label(&id, "from", params.from.as_deref()) {
@@ -58,8 +74,13 @@ impl App {
         }
 
         let from = self.resolve_sender(params.from.as_deref(), params.caller_pane_id.as_deref());
+        let message_id = new_id();
+        let file = match attach_file(&id, &message_id, params.file) {
+            Ok(file) => file,
+            Err(err) => return err,
+        };
         let item = GramItem {
-            id: new_id(),
+            id: message_id,
             direction: StoredDirection::AgentToOwner,
             from: from.clone(),
             to: None,
@@ -68,11 +89,12 @@ impl App {
             grabbed_unix_ms: None,
             created_unix_ms: super::unix_millis_now(),
             read_by_owner: false,
+            file,
         };
 
         match crate::persist::gram::append(item.clone()) {
             Ok(_) => {
-                self.emit_apns_gram_message(&from, text);
+                self.emit_apns_gram_message(&from, text, item.file.as_ref());
                 encode_success(
                     id,
                     ResponseResult::GramSent {
@@ -80,13 +102,17 @@ impl App {
                     },
                 )
             }
-            Err(err) => encode_error(id, "gram_store_save_failed", err.to_string()),
+            Err(err) => {
+                // The record didn't persist; don't leave orphaned attachment bytes.
+                crate::persist::gram_files::remove_message_files(&item.id);
+                encode_error(id, "gram_store_save_failed", err.to_string())
+            }
         }
     }
 
     pub(super) fn handle_gram_post(&mut self, id: String, params: GramPostParams) -> String {
         let text = params.text.trim();
-        if let Some(err) = validate_text(&id, text) {
+        if let Some(err) = validate_text(&id, text, params.file.is_some()) {
             return err;
         }
         if let Some(err) = validate_label(&id, "to", params.to.as_deref()) {
@@ -117,8 +143,13 @@ impl App {
             }
         }
 
+        let message_id = new_id();
+        let file = match attach_file(&id, &message_id, params.file) {
+            Ok(file) => file,
+            Err(err) => return err,
+        };
         let item = GramItem {
-            id: new_id(),
+            id: message_id,
             direction: StoredDirection::OwnerToAgent,
             from: "owner".to_string(),
             to,
@@ -128,6 +159,7 @@ impl App {
             created_unix_ms: super::unix_millis_now(),
             // The owner's own message is not an unread inbox item for the owner.
             read_by_owner: true,
+            file,
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -137,7 +169,10 @@ impl App {
                     message: gram_item_to_info(item),
                 },
             ),
-            Err(err) => encode_error(id, "gram_store_save_failed", err.to_string()),
+            Err(err) => {
+                crate::persist::gram_files::remove_message_files(&item.id);
+                encode_error(id, "gram_store_save_failed", err.to_string())
+            }
         }
     }
 
@@ -286,6 +321,134 @@ impl App {
         }
     }
 
+    pub(super) fn handle_gram_delete(&mut self, id: String, params: GramDeleteParams) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+
+        // Resolve the caller's authority. The owner's app sends no caller pane and
+        // may delete anything; an agent supplies its pane and may delete only a
+        // message it is involved in. A caller pane that names no live pane is an
+        // error, mirroring `gram.list` — not a silent fall-through to owner power.
+        let identity = match params.caller_pane_id.as_deref() {
+            Some(pane) => match self.caller_identity(pane) {
+                Some(identity) => Some(identity),
+                None => {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "caller_pane_id is not a known pane; omit it to delete as the owner",
+                    );
+                }
+            },
+            None => None,
+        };
+
+        let target_id = params.id.clone();
+        // The decision (find, authorize, remove) is pure over the list so it is
+        // unit-tested without an App; the store is rewritten only when a message
+        // was actually removed, so a not-found / forbidden delete does not churn
+        // the file.
+        let outcome = crate::persist::gram::update_if_changed(move |items| {
+            apply_delete(items, &target_id, identity.as_deref())
+        });
+
+        match outcome {
+            Ok((DeleteOutcome::Deleted(removed_id), _)) => {
+                // Remove the attachment bytes too, so a secret (a temporary API key
+                // sent as a file) does not outlive the record it was deleted with.
+                crate::persist::gram_files::remove_message_files(&removed_id);
+                encode_success(id, ResponseResult::Ok {})
+            }
+            Ok((DeleteOutcome::NotFound, _)) => {
+                encode_error(id, "not_found", "no gram message with that id")
+            }
+            Ok((DeleteOutcome::Forbidden, _)) => encode_error(
+                id,
+                "forbidden",
+                "you can only delete a gram message you sent, grabbed, or that is addressed to you",
+            ),
+            Err(err) => encode_error(id, "gram_store_save_failed", err.to_string()),
+        }
+    }
+
+    pub(super) fn handle_gram_upload_chunk(
+        &mut self,
+        id: String,
+        params: GramUploadChunkParams,
+    ) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD
+            .decode(params.data_base64.as_bytes())
+        {
+            Ok(bytes) => bytes,
+            Err(_) => return encode_error(id, "invalid_params", "data_base64 is not valid base64"),
+        };
+        match crate::persist::gram_files::append_chunk(&params.upload_id, params.offset, &bytes) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                encode_error(id, "invalid_params", err.to_string())
+            }
+            Err(err) => encode_error(id, "gram_file_error", err.to_string()),
+        }
+    }
+
+    pub(super) fn handle_gram_get_file(&mut self, id: String, params: GramGetFileParams) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        // Resolve the caller's authority: the owner (no caller pane) may download
+        // any file; an agent may download only a file on a message it can see.
+        let identity = match params.caller_pane_id.as_deref() {
+            Some(pane) => match self.caller_identity(pane) {
+                Some(identity) => Some(identity),
+                None => {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "caller_pane_id is not a known pane; omit it to read as the owner",
+                    );
+                }
+            },
+            None => None,
+        };
+        let Some(item) = crate::persist::gram::load()
+            .into_iter()
+            .find(|item| item.id == params.id)
+        else {
+            return encode_error(id, "not_found", "no gram message with that id");
+        };
+        if let Some(identity) = &identity {
+            if !agent_can_see(&item, identity) {
+                return encode_error(
+                    id,
+                    "forbidden",
+                    "you can only download a file on a message you can see",
+                );
+            }
+        }
+        let Some(file) = item.file else {
+            return encode_error(id, "no_file", "that message has no attached file");
+        };
+        match crate::persist::gram_files::read_message_file(&item.id, &file.name) {
+            Ok(bytes) => {
+                let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                encode_success(
+                    id,
+                    ResponseResult::GramFileContent {
+                        name: file.name,
+                        mime: file.mime,
+                        size: file.size,
+                        data_base64,
+                    },
+                )
+            }
+            Err(err) => encode_error(id, "gram_file_error", format!("failed to read file: {err}")),
+        }
+    }
+
     /// Resolve the label to record as `from` for an agent->owner message: an
     /// explicit override, else the caller pane's identity, else "agent". An
     /// explicit `from` overrides attribution entirely (the message is then
@@ -327,13 +490,23 @@ impl App {
     /// A sibling of `emit_apns_agent_notifications`: detached, best-effort, guarded
     /// by `crate::push::enabled`. The alert deep-links to the app's Gram page, so
     /// it carries no pane/workspace id (the payload's `gram` marker signals this).
-    fn emit_apns_gram_message(&self, from: &str, text: &str) {
+    fn emit_apns_gram_message(&self, from: &str, text: &str, file: Option<&GramFile>) {
         if self.no_session || !crate::push::enabled(&self.state.push_config) {
             return;
         }
         let title =
             super::sanitized_notification_text(from, 80).unwrap_or_else(|| "New gram".to_string());
-        let body = super::sanitized_notification_text(text, 240).unwrap_or_default();
+        let mut body = super::sanitized_notification_text(text, 240).unwrap_or_default();
+        // Note an attachment so a file-only (or captioned) gram reads sensibly on
+        // the lock screen. The name is already a sanitized basename.
+        if let Some(file) = file {
+            let hint = format!("📎 {}", file.name);
+            body = if body.is_empty() {
+                hint
+            } else {
+                format!("{body}\n{hint}")
+            };
+        }
         let notification = crate::push::PushNotification {
             title,
             body,
@@ -351,10 +524,11 @@ impl App {
     }
 }
 
-/// Reject an empty or over-long message before it reaches the store. Returns the
-/// encoded error response, or `None` when the text is acceptable.
-fn validate_text(id: &str, text: &str) -> Option<String> {
-    if text.is_empty() {
+/// Reject an over-long message, and an empty one unless a file is attached (a
+/// file with no caption is fine). Returns the encoded error response, or `None`
+/// when the text is acceptable.
+fn validate_text(id: &str, text: &str, allow_empty: bool) -> Option<String> {
+    if text.is_empty() && !allow_empty {
         return Some(encode_error(
             id.to_string(),
             "invalid_params",
@@ -369,6 +543,46 @@ fn validate_text(id: &str, text: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Assemble a staged upload onto `message_id`, returning its metadata for the
+/// record. No file → `Ok(None)`. A bad upload (missing/oversized/invalid id or
+/// name) returns an encoded error response so the caller can return it directly.
+fn attach_file(
+    request_id: &str,
+    message_id: &str,
+    upload: Option<GramFileUpload>,
+) -> Result<Option<GramFile>, String> {
+    let Some(upload) = upload else {
+        return Ok(None);
+    };
+    if upload.name.trim().is_empty() {
+        return Err(encode_error(
+            request_id.to_string(),
+            "invalid_params",
+            "file.name is empty",
+        ));
+    }
+    match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
+        Ok(finalized) => Ok(Some(GramFile {
+            name: finalized.name,
+            size: finalized.size,
+            mime: upload.mime,
+            sha256: finalized.sha256,
+        })),
+        // A malformed upload (unknown id, empty or oversized staging, bad name) is
+        // the caller's mistake; anything else is a real I/O failure.
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Err(encode_error(
+            request_id.to_string(),
+            "invalid_params",
+            err.to_string(),
+        )),
+        Err(err) => Err(encode_error(
+            request_id.to_string(),
+            "gram_file_error",
+            err.to_string(),
+        )),
+    }
 }
 
 /// Reject a persisted label override (`from`, `to`, `grabbed_by`) longer than
@@ -407,6 +621,12 @@ fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
         grabbed_unix_ms: item.grabbed_unix_ms,
         created_unix_ms: item.created_unix_ms,
         read_by_owner: item.read_by_owner,
+        file: item.file.map(|file| GramFileInfo {
+            name: file.name,
+            size: file.size,
+            mime: file.mime,
+            sha256: file.sha256,
+        }),
     }
 }
 
@@ -415,6 +635,55 @@ fn is_open_shared_queue(item: &GramItem) -> bool {
     item.direction == StoredDirection::OwnerToAgent
         && item.to.is_none()
         && item.grabbed_by.is_none()
+}
+
+/// Whether an agent identity may delete a message: it sent it, it is addressed to
+/// it, or it grabbed it. The owner (no caller pane) bypasses this check entirely.
+/// This is the same "involved in it" relation the agent view uses for membership,
+/// minus the shared open queue — an agent should not be able to delete unclaimed
+/// work it never touched out from under the owner.
+fn agent_may_delete(item: &GramItem, identity: &str) -> bool {
+    let sent_by_me = item.direction == StoredDirection::AgentToOwner && item.from == identity;
+    let addressed_to_me =
+        item.direction == StoredDirection::OwnerToAgent && item.to.as_deref() == Some(identity);
+    let grabbed_by_me = item.grabbed_by.as_deref() == Some(identity);
+    sent_by_me || addressed_to_me || grabbed_by_me
+}
+
+/// Decide and apply a delete against the in-memory list. `identity` is `None` for
+/// the owner (may delete any message) or `Some(agent)` (may delete only a message
+/// it is involved in). Returns the outcome plus whether the list changed, matching
+/// [`crate::persist::gram::update_if_changed`]'s mutation contract — the store is
+/// rewritten only on an actual removal. Pure over the list so the find/authorize/
+/// remove logic is unit-tested without an App or the store.
+fn apply_delete(
+    items: &mut Vec<GramItem>,
+    id: &str,
+    identity: Option<&str>,
+) -> (DeleteOutcome, bool) {
+    let Some(pos) = items.iter().position(|item| item.id == id) else {
+        return (DeleteOutcome::NotFound, false);
+    };
+    if let Some(identity) = identity {
+        if !agent_may_delete(&items[pos], identity) {
+            return (DeleteOutcome::Forbidden, false);
+        }
+    }
+    let removed = items.remove(pos);
+    (DeleteOutcome::Deleted(removed.id), true)
+}
+
+/// Whether a message belongs in an agent's view: the shared ungrabbed queue, an
+/// item addressed to it, one it grabbed, or one it sent. This is the audience
+/// boundary — an agent may list and download the files of what it can see, but not
+/// another agent's direct message (which is how a secret is sent). The owner (no
+/// caller pane) can see everything.
+fn agent_can_see(item: &GramItem, identity: &str) -> bool {
+    let addressed_to_me =
+        item.direction == StoredDirection::OwnerToAgent && item.to.as_deref() == Some(identity);
+    let grabbed_by_me = item.grabbed_by.as_deref() == Some(identity);
+    let sent_by_me = item.direction == StoredDirection::AgentToOwner && item.from == identity;
+    is_open_shared_queue(item) || addressed_to_me || grabbed_by_me || sent_by_me
 }
 
 /// The agent's view: the shared ungrabbed queue, items addressed to it, items it
@@ -428,12 +697,7 @@ fn filter_agent_view(items: &[GramItem], identity: &str, only_queue: bool) -> Ve
             if only_queue {
                 return is_open_shared_queue(item);
             }
-            let addressed_to_me = item.direction == StoredDirection::OwnerToAgent
-                && item.to.as_deref() == Some(identity);
-            let grabbed_by_me = item.grabbed_by.as_deref() == Some(identity);
-            let sent_by_me =
-                item.direction == StoredDirection::AgentToOwner && item.from == identity;
-            is_open_shared_queue(item) || addressed_to_me || grabbed_by_me || sent_by_me
+            agent_can_see(item, identity)
         })
         .cloned()
         .collect()
@@ -472,6 +736,7 @@ mod tests {
             grabbed_unix_ms: None,
             created_unix_ms: 1,
             read_by_owner: true,
+            file: None,
         }
     }
 
@@ -549,13 +814,115 @@ mod tests {
     }
 
     #[test]
+    fn agent_may_delete_only_own_involvement() {
+        // A shared, still-open queue item the agent never touched: not deletable
+        // by an agent (only the owner may remove unclaimed work).
+        assert!(!agent_may_delete(&owner_shared("open"), "alpha"));
+
+        let mut direct = owner_shared("direct");
+        direct.to = Some("alpha".to_string());
+        assert!(agent_may_delete(&direct, "alpha"));
+        assert!(!agent_may_delete(&direct, "beta"));
+
+        let mut grabbed = owner_shared("grabbed");
+        grabbed.grabbed_by = Some("alpha".to_string());
+        assert!(agent_may_delete(&grabbed, "alpha"));
+        assert!(!agent_may_delete(&grabbed, "beta"));
+
+        let mut sent = owner_shared("sent");
+        sent.direction = StoredDirection::AgentToOwner;
+        sent.from = "alpha".to_string();
+        assert!(agent_may_delete(&sent, "alpha"));
+        assert!(!agent_may_delete(&sent, "beta"));
+    }
+
+    /// Deleted-id label used by `apply_delete` on success.
+    fn deleted_id(outcome: &DeleteOutcome) -> Option<&str> {
+        match outcome {
+            DeleteOutcome::Deleted(id) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn apply_delete_owner_removes_any_message() {
+        let mut items = vec![owner_shared("a"), owner_shared("b")];
+        let (outcome, changed) = apply_delete(&mut items, "a", None);
+        assert_eq!(deleted_id(&outcome), Some("a"));
+        assert!(changed);
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn apply_delete_agent_only_its_own() {
+        let mut direct = owner_shared("direct");
+        direct.to = Some("alpha".to_string());
+        let mut items = vec![owner_shared("open"), direct];
+
+        // A shared item the agent never touched: forbidden, list unchanged.
+        let (outcome, changed) = apply_delete(&mut items, "open", Some("alpha"));
+        assert!(matches!(outcome, DeleteOutcome::Forbidden));
+        assert!(!changed);
+        assert_eq!(items.len(), 2);
+
+        // A message addressed to the agent: removed.
+        let (outcome, changed) = apply_delete(&mut items, "direct", Some("alpha"));
+        assert_eq!(deleted_id(&outcome), Some("direct"));
+        assert!(changed);
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["open"]
+        );
+    }
+
+    #[test]
+    fn agent_can_see_matches_view_membership() {
+        // Shared open queue: visible to any agent.
+        assert!(agent_can_see(&owner_shared("open"), "alpha"));
+
+        // A direct message is visible only to its addressee — the audience wall
+        // that keeps a secret sent to one agent from another.
+        let mut direct = owner_shared("direct");
+        direct.to = Some("alpha".to_string());
+        assert!(agent_can_see(&direct, "alpha"));
+        assert!(!agent_can_see(&direct, "beta"));
+
+        let mut grabbed = owner_shared("grabbed");
+        grabbed.grabbed_by = Some("alpha".to_string());
+        assert!(agent_can_see(&grabbed, "alpha"));
+        assert!(!agent_can_see(&grabbed, "beta"));
+
+        let mut sent = owner_shared("sent");
+        sent.direction = StoredDirection::AgentToOwner;
+        sent.from = "alpha".to_string();
+        assert!(agent_can_see(&sent, "alpha"));
+        assert!(!agent_can_see(&sent, "beta"));
+    }
+
+    #[test]
+    fn apply_delete_missing_id_is_not_found_and_no_change() {
+        let mut items = vec![owner_shared("a")];
+        let (outcome, changed) = apply_delete(&mut items, "nope", None);
+        assert!(matches!(outcome, DeleteOutcome::NotFound));
+        assert!(!changed);
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
     fn validate_text_rejects_empty_and_oversized() {
-        assert!(validate_text("id", "").is_some());
-        assert!(validate_text("id", "hello").is_none());
+        assert!(validate_text("id", "", false).is_some());
+        // Empty is allowed when a file is attached (a caption-less file).
+        assert!(validate_text("id", "", true).is_none());
+        assert!(validate_text("id", "hello", false).is_none());
         let big = "x".repeat(MAX_TEXT_BYTES + 1);
-        assert!(validate_text("id", &big).is_some());
+        assert!(validate_text("id", &big, false).is_some());
+        // Even with a file, an over-long caption is rejected.
+        assert!(validate_text("id", &big, true).is_some());
         let ok = "x".repeat(MAX_TEXT_BYTES);
-        assert!(validate_text("id", &ok).is_none());
+        assert!(validate_text("id", &ok, false).is_none());
     }
 
     #[test]

@@ -102,14 +102,18 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 Gram は Herdr アプリに表示される、オーナーとエージェント間のメッセージチャネルです。
 
 ```bash
-herdr gram send "<text>" [--from LABEL]         # オーナーにメッセージを送る(プッシュ通知)
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # オーナーにメッセージを送る(プッシュ通知)
 herdr gram list [--queue] [--unread] [--owner]  # --owner はオーナーとして読む
 herdr gram grab <id> [--as LABEL]               # 共有キューの項目を取得する(先着順)
+herdr gram get-file <id> -o PATH                # メッセージの添付ファイルをダウンロードする
 herdr gram post "<text>" [--to AGENT]           # オーナー:共有キュー、または特定のエージェント宛
 herdr gram mark-read <id>                       # オーナー:メッセージを既読にする
+herdr gram delete <id> [--owner]                # メッセージ(と添付ファイル)を完全に削除する
 ```
 
 エージェントの識別子は `HERDR_PANE_ID` から解決され、エージェント名(名前がなければペイン id)になります。この名前は再起動やデプロイのハンドオフをまたいでも保持されますが、あくまで「名前」です。名前の変更・クリア・再利用により、`gram list` で「自分のもの」として表示される項目が変わります。取得(grab)自体は識別子に関わらず常に先着順でアトミックであり、2 つのエージェントが同じ項目を取得することはありません。属性表示(`from` やオーナー投稿のメッセージ)は参考情報であり、認証されたものではありません。
+
+`send --file` はファイルを添付し(キャプションは任意)、リクエストサイズの上限に収まるようチャンク単位でアップロードします。`get-file` はダウンロードします。`delete` はメッセージと添付データを完全に削除します。使い捨ての機密情報(一時的な API キーなど)を一度だけ送って破棄する用途に便利です。削除できるのは自分が送った・取得した・自分宛てのメッセージで、`--owner` は任意のメッセージを削除します。
 
 ## セッション
 

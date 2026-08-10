@@ -320,10 +320,13 @@ fn gram_command() -> Command {
         .subcommand(
             Command::new("send")
                 .about("Send the owner a push-notified message")
-                .arg(required("text", "TEXT"))
+                .arg(required("text", "TEXT").required(false))
                 .arg(
                     option("from", "LABEL")
                         .help("Attribute the message to LABEL instead of your own identity"),
+                )
+                .arg(
+                    option("file", "PATH").help("Attach a file (text becomes an optional caption)"),
                 ),
         )
         .subcommand(
@@ -340,6 +343,16 @@ fn gram_command() -> Command {
                 .arg(option("as", "LABEL")),
         )
         .subcommand(
+            Command::new("get-file")
+                .about("Download a message's attached file")
+                .arg(required("id", "ID"))
+                .arg(
+                    option("out", "PATH")
+                        .short('o')
+                        .help("Write the file to PATH"),
+                ),
+        )
+        .subcommand(
             Command::new("post")
                 .about("Owner: post to the shared queue or one agent")
                 .arg(required("text", "TEXT"))
@@ -349,6 +362,12 @@ fn gram_command() -> Command {
             Command::new("mark-read")
                 .about("Owner: mark an agent message read")
                 .arg(required("id", "ID")),
+        )
+        .subcommand(
+            Command::new("delete")
+                .about("Delete a message (and any attached file) for good")
+                .arg(required("id", "ID"))
+                .arg(flag("owner").help("Delete any message (owner authority)")),
         )
 }
 

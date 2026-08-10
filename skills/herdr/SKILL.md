@@ -46,6 +46,13 @@ app. Use `herdr gram send "<text>"` to send the owner a push-notified message,
 `herdr gram grab <id>` to claim one (first-wins; grab before you start so no
 other agent duplicates it). Identity comes from `HERDR_PANE_ID` automatically.
 
+Attach a file with `herdr gram send --file <path> "<caption>"` (the caption is
+optional), and download one the owner sent you with `herdr gram get-file <id> -o
+<path>`. Delete a message and any attached file for good with `herdr gram delete
+<id>` — you can delete a message you sent, grabbed, or that is addressed to you.
+Deletion purges the bytes, so when the owner sends you a short-lived secret (a
+temporary API key) as a message or file, use it and then delete it.
+
 Your identity is your agent name (or your pane id if you have no name). It is
 stable across a restart or deploy, but it is a name: if an agent is renamed,
 cleared, or its name is reused, which items show as "mine" in `gram list` follows

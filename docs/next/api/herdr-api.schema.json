@@ -2413,6 +2413,62 @@
           ],
           "type": "object"
         },
+        "GramDeleteParams": {
+          "description": "`gram.delete` — remove a message from the store for good.\n\nDeletion is deliberately destructive: the record (and any attached file bytes)\nare gone, which is what makes gram safe for a short-lived secret like a\ntemporary API key — send it, use it, delete it. Authority follows the caller:\nthe owner's app sends no `caller_pane_id` and may delete any message; an agent\nsupplies its `caller_pane_id` and may delete only a message it is involved in\n(one it sent, one addressed to it, or one it grabbed), else the call is\nrejected. A `caller_pane_id` that names no live pane is an error, not a\nfall-through to owner authority.",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "GramFileUpload": {
+          "description": "A staged file to attach to a `gram.send`/`gram.post`. Its bytes must already be\nuploaded in chunks via `gram.upload_chunk` under this `upload_id`; the handler\nassembles them onto the newly minted message and clears the staging file.\n`name` is the display name (sanitized to a safe basename server-side) and\n`mime` is an advisory content type.",
+          "properties": {
+            "mime": {
+              "default": "",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "upload_id",
+            "name"
+          ],
+          "type": "object"
+        },
+        "GramGetFileParams": {
+          "description": "`gram.get_file` — download the file attached to a message. The bytes come back\ninline as base64 in one reply (the response path is not size-capped). The owner\n(no `caller_pane_id`) may download any file; an agent supplies its\n`caller_pane_id` and may download only a file on a message it can see (the same\naudience as `gram.list`).",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
         "GramGrabParams": {
           "description": "`gram.grab` — an agent claims a shared-queue item. The claim is first-wins and\natomic at the storage layer, so no two agents can ever hold the same item —\nthis holds regardless of identity. The claimant label is `grabbed_by` when\nprovided, otherwise resolved from `caller_pane_id` to the agent's identity;\nthat label carries the same name-semantics as `gram.send`'s `from` (a rename\nor reuse moves which items show as \"mine\", but never lets a second agent\nclaim one). Fails if the item is missing, not a shared item, or already\ngrabbed.",
           "properties": {
@@ -2474,6 +2530,17 @@
         "GramPostParams": {
           "description": "`gram.post` — the owner posts a message to agents (from the app).\n\n`to: Some(agent)` addresses one agent directly by its unique agent name (not\ngrabbable); the name must match a live agent or the call is rejected. `to:\nNone` posts to the shared grab-queue any agent can claim. `text` is capped\nserver-side (~8 KiB).",
           "properties": {
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/GramFileUpload"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "An optional file to attach, previously uploaded in chunks via\n`gram.upload_chunk` under `file.upload_id`."
+            },
             "text": {
               "type": "string"
             },
@@ -2498,6 +2565,17 @@
                 "null"
               ]
             },
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/GramFileUpload"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "An optional file to attach, previously uploaded in chunks via\n`gram.upload_chunk` under `file.upload_id`."
+            },
             "from": {
               "type": [
                 "string",
@@ -2510,6 +2588,28 @@
           },
           "required": [
             "text"
+          ],
+          "type": "object"
+        },
+        "GramUploadChunkParams": {
+          "description": "`gram.upload_chunk` — append one chunk of a file being uploaded.\n\nFiles are sent in chunks because a single request is size-capped (the app's SSH\npath near 65 KiB, the daemon at 1 MiB). `upload_id` groups the chunks of one\nfile; `offset` is the byte position this chunk starts at — the current staged\nsize — so a dropped or reordered chunk is caught, and `offset: 0` (re)starts the\nupload. Attach the assembled file by passing the same `upload_id` in a\n`gram.send`/`gram.post` `file`.",
+          "properties": {
+            "data_base64": {
+              "type": "string"
+            },
+            "offset": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "upload_id",
+            "offset",
+            "data_base64"
           ],
           "type": "object"
         },
@@ -5126,6 +5226,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GramMarkReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.delete",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramDeleteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.upload_chunk",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramUploadChunkParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.get_file",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramGetFileParams"
             }
           },
           "required": [
@@ -8408,6 +8556,32 @@
           ],
           "type": "string"
         },
+        "GramFileInfo": {
+          "description": "File attached to a gram message, as returned to clients. Metadata only — fetch\nthe bytes with `gram.get_file`.",
+          "properties": {
+            "mime": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "size",
+            "mime",
+            "sha256"
+          ],
+          "type": "object"
+        },
         "GramMessageInfo": {
           "description": "A gram message as returned to clients.",
           "properties": {
@@ -8418,6 +8592,17 @@
             },
             "direction": {
               "$ref": "#/schemas/success_response/$defs/GramDirection"
+            },
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/GramFileInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Metadata for an attached file, or absent. Fetch the bytes with\n`gram.get_file`."
             },
             "from": {
               "type": "string"
@@ -11444,6 +11629,36 @@
               "required": [
                 "type",
                 "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data_base64": {
+                  "type": "string"
+                },
+                "mime": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "size": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "gram_file_content",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "name",
+                "mime",
+                "size",
+                "data_base64"
               ],
               "type": "object"
             },
