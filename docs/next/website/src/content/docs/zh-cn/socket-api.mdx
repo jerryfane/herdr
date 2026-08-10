@@ -109,6 +109,8 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `gram.*` 是所有者与智能体之间的消息通道。`gram.grab` 认领共享队列中的一项,并在存储层先到先得且原子,因此无论身份如何,两个智能体都无法认领同一项。发送者与认领者的身份是从 `caller_pane_id` 解析出的智能体名称(没有名称则为窗格 id),它在重启或实时交接后仍然保持,但带有名称语义:重命名、清除或复用名称会改变 `gram.list` 中显示为“我的”的项。省略 `caller_pane_id` 时 `gram.list` 返回所有者视图,指定时返回该窗格的智能体视图。归属信息仅供参考,并非经过认证。
 
+一条消息可以携带一个文件。由于单个请求有大小上限(应用的 SSH 路径约 65 KiB,本地套接字为 1 MiB),文件通过 `gram.upload_chunk`(`{upload_id, offset, data_base64}`;`offset` 为该分块的起始字节位置,`offset: 0` 表示重新开始上传)分块上传,再把该 `upload_id` 传入 `gram.send`/`gram.post` 的 `file` 完成附加。`gram.get_file` 在一次响应中以 base64 内联返回全部字节(响应路径没有大小上限)。`gram.delete` 会彻底删除消息及其附件字节。所有者(无 `caller_pane_id`)可删除任意消息;智能体在提供 caller pane 时,只能删除或下载自己可见的消息(与 `gram.list` 相同的范围)。该范围检查是扁平本地信任域内的协作式过滤,并非经过认证的边界(本地进程本就能直接读取存储)。对短期机密(临时 API 密钥)而言,其价值在于删除会真正清除字节,删除后秘密不再留存于持久化存储。
+
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受包含 `until` 和 `timeout_ms` 的可选 `wait` 对象。成功响应中的 `delivery` 在完整 text+Enter 批次确认写入后为 `written_to_pty`;在可归因的生命周期前进，或同一个 writer-attributed composer attempt 被观察到后清空时为 `submitted`。持续存在的归属输入返回 `agent_prompt_unsubmitted`，无法确定去向时返回 `agent_prompt_stalled`。bracketed paste 不依赖渲染后的 token 文本。
 
 `pane.get` 返回附加的 `composer` 对象。`state` 为 `empty`、`draft_present` 或 `unknown`，并包含可选 `attempt_id` 以及 provenance、区域、光标、style 和 frame stability 证据。区域缺失、重绘中的画面、证据冲突，或旧响应没有该对象时都解析为 `unknown`。style 只能作为降低置信度的 tripwire。

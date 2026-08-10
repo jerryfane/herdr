@@ -27,6 +27,23 @@ pub struct GramSendParams {
     pub caller_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// An optional file to attach, previously uploaded in chunks via
+    /// `gram.upload_chunk` under `file.upload_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
+}
+
+/// A staged file to attach to a `gram.send`/`gram.post`. Its bytes must already be
+/// uploaded in chunks via `gram.upload_chunk` under this `upload_id`; the handler
+/// assembles them onto the newly minted message and clears the staging file.
+/// `name` is the display name (sanitized to a safe basename server-side) and
+/// `mime` is an advisory content type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramFileUpload {
+    pub upload_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
 }
 
 /// `gram.post` — the owner posts a message to agents (from the app).
@@ -40,6 +57,10 @@ pub struct GramPostParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// An optional file to attach, previously uploaded in chunks via
+    /// `gram.upload_chunk` under `file.upload_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
 }
 
 /// `gram.list` — read messages. The audience is chosen by `caller_pane_id`:
@@ -83,6 +104,60 @@ pub struct GramMarkReadParams {
     pub id: String,
 }
 
+/// `gram.delete` — remove a message from the store for good.
+///
+/// Deletion is deliberately destructive: the record (and any attached file bytes)
+/// are gone, which is what makes gram safe for a short-lived secret like a
+/// temporary API key — send it, use it, delete it. Authority follows the caller:
+/// the owner's app sends no `caller_pane_id` and may delete any message; an agent
+/// supplies its `caller_pane_id` and may delete only a message it is involved in
+/// (one it sent, one addressed to it, or one it grabbed), else the call is
+/// rejected. A `caller_pane_id` that names no live pane is an error, not a
+/// fall-through to owner authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramDeleteParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
+
+/// `gram.upload_chunk` — append one chunk of a file being uploaded.
+///
+/// Files are sent in chunks because a single request is size-capped (the app's SSH
+/// path near 65 KiB, the daemon at 1 MiB). `upload_id` groups the chunks of one
+/// file; `offset` is the byte position this chunk starts at — the current staged
+/// size — so a dropped or reordered chunk is caught, and `offset: 0` (re)starts the
+/// upload. Attach the assembled file by passing the same `upload_id` in a
+/// `gram.send`/`gram.post` `file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramUploadChunkParams {
+    pub upload_id: String,
+    pub offset: u64,
+    pub data_base64: String,
+}
+
+/// `gram.get_file` — download the file attached to a message. The bytes come back
+/// inline as base64 in one reply (the response path is not size-capped). The owner
+/// (no `caller_pane_id`) may download any file; an agent supplies its
+/// `caller_pane_id` and may download only a file on a message it can see (the same
+/// audience as `gram.list`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramGetFileParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
+
+/// File attached to a gram message, as returned to clients. Metadata only — fetch
+/// the bytes with `gram.get_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramFileInfo {
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: String,
+}
+
 /// A gram message as returned to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramMessageInfo {
@@ -99,4 +174,8 @@ pub struct GramMessageInfo {
     pub created_unix_ms: u64,
     #[serde(default)]
     pub read_by_owner: bool,
+    /// Metadata for an attached file, or absent. Fetch the bytes with
+    /// `gram.get_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileInfo>,
 }

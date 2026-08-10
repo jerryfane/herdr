@@ -1107,6 +1107,11 @@ impl App {
             Method::GramMarkRead(params) => {
                 return self.handle_gram_mark_read(request.id, params);
             }
+            Method::GramDelete(params) => return self.handle_gram_delete(request.id, params),
+            Method::GramUploadChunk(params) => {
+                return self.handle_gram_upload_chunk(request.id, params);
+            }
+            Method::GramGetFile(params) => return self.handle_gram_get_file(request.id, params),
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
                     request.id,

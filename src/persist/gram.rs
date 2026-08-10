@@ -12,9 +12,13 @@
 //! process. Within one process the app loop already serializes API requests, so
 //! the two layers together make "first grab wins" exact.
 //!
-//! The store is bounded on two axes (see [`normalize`]): a message-count cap and
-//! a total-text-bytes budget. Per-message text is capped by the caller (see
-//! [`MAX_TEXT_BYTES`]) so a single message cannot bloat the file.
+//! The store is bounded on three axes (see [`normalize`]): a message-count cap, a
+//! total-text-bytes budget, and a total-attachment-bytes budget. Per-message text
+//! is capped by the caller (see [`MAX_TEXT_BYTES`]) so a single message cannot
+//! bloat the file, and each attachment is size-capped at upload time; the
+//! aggregate file budget bounds the FINALIZED blobs on disk. In-progress upload
+//! staging is bounded separately (a per-upload size cap, an aggregate cap, and a
+//! TTL sweep) in [`crate::persist::gram_files`].
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -36,6 +40,13 @@ const MAX_ITEMS: usize = 1000;
 /// whole file stays comfortably bounded.
 const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Budget for the sum of all stored attachment BYTES on disk. Without it, up to
+/// [`MAX_ITEMS`] messages each holding a max-size file could pin gigabytes in the
+/// blob store; once exceeded, the oldest messages (and their files) are evicted.
+/// This is an aggregate disk bound, separate from the per-file cap the blob store
+/// enforces at upload time.
+const MAX_TOTAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Maximum bytes of a single message's text. Enforced by the API handler before
 /// a message reaches the store (a message is a notification, not a document —
 /// large payloads belong in a file transfer). Exposed so the handler and this
@@ -47,6 +58,13 @@ pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 /// from bypassing the text budget and bloating the store.
 pub const MAX_LABEL_BYTES: usize = 128;
 
+/// Maximum bytes of a file's persisted `mime`. A real content type is short
+/// (`application/octet-stream` is 24 bytes); capping it keeps a caller from
+/// smuggling large data through the one attachment field the text budget does not
+/// account for. The name is bounded by the blob store's basename sanitizer and the
+/// sha256 is fixed-width, so this is the last unbounded per-file field.
+pub const MAX_MIME_BYTES: usize = 255;
+
 /// Whether a message flows from an agent to the owner or the other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +73,21 @@ pub enum GramDirection {
     AgentToOwner,
     /// The owner posted a message to the shared queue or a specific agent.
     OwnerToAgent,
+}
+
+/// Metadata for a file attached to a gram message. The bytes live in the blob
+/// store ([`crate::persist::gram_files`]) at `gram-files/<message-id>/<name>`; this
+/// record carries only what a client needs to show, download, and verify it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GramFile {
+    /// Sanitized file name, as stored on disk and shown to the user.
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// MIME type supplied by the sender (advisory).
+    pub mime: String,
+    /// Hex SHA-256 of the bytes, so a client can verify the download.
+    pub sha256: String,
 }
 
 /// One stored gram message. Field order is the wire/JSON order; new optional
@@ -85,6 +118,10 @@ pub struct GramItem {
     /// Owner has viewed this `agent_to_owner` message (clears the app badge).
     #[serde(default)]
     pub read_by_owner: bool,
+    /// A file attached to this message, or `None`. The bytes are in the blob store
+    /// keyed by this message's id; this is only the metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFile>,
 }
 
 impl GramItem {
@@ -176,8 +213,13 @@ fn update_in_checked<T>(
         let mut items = load_from_path_strict(&path)?;
         let (result, changed) = mutation(&mut items);
         if changed {
-            normalize(&mut items);
+            let dropped_ids = normalize(&mut items);
             save_json_to_path(&path, &items)?;
+            // Only after the record eviction is durable do we remove the bytes,
+            // so a failed save never leaves a message pointing at a deleted file.
+            for id in &dropped_ids {
+                crate::persist::gram_files::remove_message_files_in(dir, id);
+            }
         }
         Ok((result, items))
     })
@@ -200,25 +242,42 @@ pub fn update_if_changed<T>(
     update_in_checked(&config_base(), mutation)
 }
 
-/// Sort oldest-first, then drop the oldest until both the count cap and the
-/// total-text-bytes budget are satisfied. Dropping an unclaimed shared item or
-/// an unread owner message is surprising, so those are logged.
-fn normalize(items: &mut Vec<GramItem>) {
+/// Sort oldest-first, then drop the oldest until the count cap, the total-text
+/// budget, and the total-attachment-bytes budget are all satisfied. Dropping an
+/// unclaimed shared item or an unread owner message is surprising, so those are
+/// logged. Returns the ids of the dropped messages so the caller can remove their
+/// file bytes from the blob store (the caps count metadata here; an attachment
+/// must not outlive its record, and the on-disk bytes need bounding too).
+#[must_use]
+fn normalize(items: &mut Vec<GramItem>) -> Vec<String> {
     items.sort_by(|left, right| {
         left.created_unix_ms
             .cmp(&right.created_unix_ms)
             .then_with(|| left.id.cmp(&right.id))
     });
     let mut total_text: usize = items.iter().map(|item| item.text.len()).sum();
-    while items.len() > MAX_ITEMS || (items.len() > 1 && total_text > MAX_TOTAL_TEXT_BYTES) {
+    let mut total_file: u64 = items
+        .iter()
+        .filter_map(|item| item.file.as_ref().map(|file| file.size))
+        .sum();
+    let mut dropped_ids = Vec::new();
+    while items.len() > MAX_ITEMS
+        || (items.len() > 1 && total_text > MAX_TOTAL_TEXT_BYTES)
+        || (items.len() > 1 && total_file > MAX_TOTAL_FILE_BYTES)
+    {
         let dropped = items.remove(0);
         total_text = total_text.saturating_sub(dropped.text.len());
+        if let Some(file) = &dropped.file {
+            total_file = total_file.saturating_sub(file.size);
+        }
         if dropped.is_open_shared_queue() {
             warn!(id = %dropped.id, "gram store dropped an unclaimed shared-queue item at the cap");
         } else if dropped.direction == GramDirection::AgentToOwner && !dropped.read_by_owner {
             warn!(id = %dropped.id, "gram store dropped an unread owner message at the cap");
         }
+        dropped_ids.push(dropped.id);
     }
+    dropped_ids
 }
 
 fn append_in(dir: &Path, item: GramItem) -> std::io::Result<Vec<GramItem>> {
@@ -272,6 +331,7 @@ mod tests {
             grabbed_unix_ms: None,
             created_unix_ms: created,
             read_by_owner: false,
+            file: None,
         }
     }
 
@@ -311,7 +371,7 @@ mod tests {
     #[test]
     fn normalize_sorts_oldest_first_and_caps_count() {
         let mut items = vec![item("c", 30), item("a", 10), item("b", 20)];
-        normalize(&mut items);
+        let _ = normalize(&mut items);
         assert_eq!(
             items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
@@ -320,7 +380,7 @@ mod tests {
         let mut many: Vec<GramItem> = (0..(MAX_ITEMS + 5) as u64)
             .map(|n| item(&format!("id-{n}"), n))
             .collect();
-        normalize(&mut many);
+        let _ = normalize(&mut many);
         assert_eq!(many.len(), MAX_ITEMS);
         assert_eq!(many.first().unwrap().created_unix_ms, 5);
     }
@@ -336,12 +396,43 @@ mod tests {
             })
             .collect();
         // 300 * 8 KiB = 2.4 MiB > 1 MiB budget; oldest dropped until under budget.
-        normalize(&mut items);
+        let _ = normalize(&mut items);
         let total: usize = items.iter().map(|i| i.text.len()).sum();
         assert!(total <= MAX_TOTAL_TEXT_BYTES, "total {total} over budget");
         assert!(!items.is_empty());
         // Newest survive: the last id must still be present.
         assert_eq!(items.last().unwrap().id, "id-299");
+    }
+
+    #[test]
+    fn normalize_enforces_total_file_budget() {
+        // Six messages each holding a quarter-cap file = 1.5x the aggregate budget;
+        // the oldest are evicted (with their files) until the total is under it.
+        let quarter = MAX_TOTAL_FILE_BYTES / 4;
+        let mut items: Vec<GramItem> = (0..6u64)
+            .map(|n| {
+                let mut it = item(&format!("id-{n}"), n);
+                it.file = Some(GramFile {
+                    name: "f.bin".to_string(),
+                    size: quarter,
+                    mime: "application/octet-stream".to_string(),
+                    sha256: "0".repeat(64),
+                });
+                it
+            })
+            .collect();
+        let dropped = normalize(&mut items);
+        let total: u64 = items
+            .iter()
+            .filter_map(|i| i.file.as_ref().map(|f| f.size))
+            .sum();
+        assert!(
+            total <= MAX_TOTAL_FILE_BYTES,
+            "total {total} over file budget"
+        );
+        assert!(!dropped.is_empty(), "some messages must be evicted");
+        // Newest survive.
+        assert_eq!(items.last().unwrap().id, "id-5");
     }
 
     #[test]

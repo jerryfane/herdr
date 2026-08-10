@@ -106,14 +106,18 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 Gram is the owner↔agent message channel surfaced in the Herdr app.
 
 ```bash
-herdr gram send "<text>" [--from LABEL]         # message the owner (push-notified)
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # message the owner (push-notified)
 herdr gram list [--queue] [--unread] [--owner]  # --owner reads as the owner
 herdr gram grab <id> [--as LABEL]               # claim a shared queue item (first-wins)
+herdr gram get-file <id> -o PATH                # download a message's attached file
 herdr gram post "<text>" [--to AGENT]           # owner: shared queue, or one agent
-herdr gram mark-read <id>                       # owner: mark a message read
+herdr gram mark-read <id>                        # owner: mark a message read
+herdr gram delete <id> [--owner]                # delete a message (and any file) for good
 ```
 
 An agent's identity comes from `HERDR_PANE_ID` and resolves to its agent name (or the pane id if it has no name). The name is durable across a restart or deploy handoff, but it is a name: renaming, clearing, or reusing it changes which items show as "mine" in `gram list`. The grab itself is always first-wins atomic regardless of identity — two agents can never claim the same item. Attribution (`from`, and owner-posted messages) is advisory, not authenticated.
+
+`send --file` attaches a file (with optional caption text), uploaded in chunks so it fits the request-size limits; `get-file` downloads one. `delete` removes a message and any attached bytes for good — useful for a short-lived secret you send once and then discard. You can delete a message you sent, grabbed, or that is addressed to you; `--owner` deletes any message.
 
 ## Sessions
 

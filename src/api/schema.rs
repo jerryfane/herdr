@@ -71,6 +71,12 @@ pub enum Method {
     GramGrab(GramGrabParams),
     #[serde(rename = "gram.mark_read")]
     GramMarkRead(GramMarkReadParams),
+    #[serde(rename = "gram.delete")]
+    GramDelete(GramDeleteParams),
+    #[serde(rename = "gram.upload_chunk")]
+    GramUploadChunk(GramUploadChunkParams),
+    #[serde(rename = "gram.get_file")]
+    GramGetFile(GramGetFileParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]
