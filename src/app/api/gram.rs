@@ -577,12 +577,8 @@ fn attach_file(
     // The mime is caller-supplied and persisted in gram.json, which the store's
     // byte budget does NOT count (it budgets text). Cap it so a caller cannot
     // smuggle large data through this field and bloat the store past its budget.
-    if upload.mime.len() > MAX_MIME_BYTES {
-        return Err(encode_error(
-            request_id.to_string(),
-            "invalid_params",
-            format!("file.mime exceeds {MAX_MIME_BYTES} bytes"),
-        ));
+    if let Some(err) = validate_mime(request_id, &upload.mime) {
+        return Err(err);
     }
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
         Ok(finalized) => Ok(Some(GramFile {
@@ -604,6 +600,21 @@ fn attach_file(
             err.to_string(),
         )),
     }
+}
+
+/// Reject a persisted `mime` longer than [`MAX_MIME_BYTES`], so a caller cannot
+/// smuggle large data through the one attachment field the store's text budget
+/// does not count. Separate from [`validate_label`] because mime has its own,
+/// larger bound.
+fn validate_mime(id: &str, mime: &str) -> Option<String> {
+    if mime.len() > MAX_MIME_BYTES {
+        return Some(encode_error(
+            id.to_string(),
+            "invalid_params",
+            format!("file.mime exceeds {MAX_MIME_BYTES} bytes"),
+        ));
+    }
+    None
 }
 
 /// Reject a persisted label override (`from`, `to`, `grabbed_by`) longer than
@@ -952,5 +963,12 @@ mod tests {
         assert!(validate_label("id", "from", Some("alpha")).is_none());
         let big = "x".repeat(MAX_LABEL_BYTES + 1);
         assert!(validate_label("id", "grabbed_by", Some(&big)).is_some());
+    }
+
+    #[test]
+    fn validate_mime_caps_length() {
+        assert!(validate_mime("id", "image/png").is_none());
+        assert!(validate_mime("id", &"x".repeat(MAX_MIME_BYTES)).is_none());
+        assert!(validate_mime("id", &"x".repeat(MAX_MIME_BYTES + 1)).is_some());
     }
 }

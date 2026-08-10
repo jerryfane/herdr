@@ -17,9 +17,18 @@
 //! as a file), so every directory is `0o700`, every file `0o600`, upload ids and
 //! message ids are validated to a safe single path component, the display name is
 //! reduced to a sanitized basename (no traversal), and deleting a message removes
-//! its bytes. Stale staging files (an upload whose send never arrived) are swept
-//! after a TTL. The trust domain is otherwise flat — the same as gram.json — so
-//! read access is bounded by filesystem ownership, not per-caller authorization.
+//! its bytes. The trust domain is otherwise flat — the same as gram.json — so read
+//! access is bounded by filesystem ownership, not per-caller authorization.
+//!
+//! Disk bounds. Staging is bounded three ways: each upload is capped at
+//! [`MAX_FILE_BYTES`]; stale staging (an upload whose send never arrived) is swept
+//! after [`STAGING_MAX_AGE`] on any upload or finalize; and a NEW upload is refused
+//! once aggregate staging fills [`MAX_TOTAL_STAGING_BYTES`]. Finalized blobs are
+//! bounded by the message store's aggregate file budget, which evicts them with
+//! their records. RESIDUAL: a crash in the microsecond window between a finalize
+//! rename and the message append leaves an orphaned finalized dir that no path
+//! reconciles; a startup reconciler is a follow-up (tracked with the identity work
+//! in issue #49).
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -41,6 +50,12 @@ pub const MAX_CHUNK_BYTES: usize = 512 * 1024;
 
 /// Staging files older than this are swept — an upload whose send never arrived.
 const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Aggregate cap on all in-progress staging bytes. A NEW upload is refused when
+/// pending staging already fills this, so many distinct abandoned uploads cannot
+/// pin unbounded disk until their TTL expires. (An in-progress upload is still
+/// bounded per-file by [`MAX_FILE_BYTES`].)
+const MAX_TOTAL_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Longest accepted path component (upload id, message id, stored file name).
 const MAX_COMPONENT_LEN: usize = 128;
@@ -143,6 +158,13 @@ fn append_chunk_in(dir: &Path, upload_id: &str, offset: u64, bytes: &[u8]) -> io
     let staging = staging_dir_in(dir);
     ensure_dir_restricted(&staging)?;
     cleanup_stale(&staging);
+
+    // Bound aggregate staging at the start of a NEW upload (the sweep above ran
+    // first): if pending staging already fills the budget, refuse rather than let
+    // many distinct abandoned uploads pin unbounded disk until their TTL.
+    if offset == 0 && staging_total_bytes(&staging) >= MAX_TOTAL_STAGING_BYTES {
+        return Err(invalid("too many pending uploads; retry shortly"));
+    }
 
     let current = match fs::metadata(&path) {
         Ok(metadata) => metadata.len(),
@@ -277,6 +299,18 @@ fn sha256_of_file(path: &Path) -> io::Result<String> {
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+/// Sum the sizes of all files in the staging dir, for the aggregate-staging bound.
+fn staging_total_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 fn cleanup_stale(dir: &Path) {
@@ -429,6 +463,16 @@ mod tests {
             err.to_string().contains("size limit"),
             "expected a size-cap error, got: {err}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_total_bytes_sums_pending_uploads() {
+        let dir = unique_temp_dir("stagesum");
+        append_chunk_in(&dir, "a", 0, b"12345").unwrap();
+        append_chunk_in(&dir, "b", 0, b"678").unwrap();
+        // The aggregate-staging bound measures the sum of all pending upload files.
+        assert_eq!(staging_total_bytes(&staging_dir_in(&dir)), 8);
         let _ = fs::remove_dir_all(&dir);
     }
 

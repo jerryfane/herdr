@@ -16,7 +16,9 @@
 //! total-text-bytes budget, and a total-attachment-bytes budget. Per-message text
 //! is capped by the caller (see [`MAX_TEXT_BYTES`]) so a single message cannot
 //! bloat the file, and each attachment is size-capped at upload time; the
-//! aggregate file budget bounds the blob store on disk.
+//! aggregate file budget bounds the FINALIZED blobs on disk. In-progress upload
+//! staging is bounded separately (a per-upload size cap, an aggregate cap, and a
+//! TTL sweep) in [`crate::persist::gram_files`].
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};

@@ -577,22 +577,39 @@ fn gram_file_rejects_oversized_mime_and_unknown_caller() {
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
-    // An over-long mime is rejected before anything is stored (the mime cap
-    // precedes finalize), so it cannot bloat the store past its byte budget.
+    // An over-long mime is rejected. Crucially, use a VALID staged upload so the
+    // ONLY thing that can reject the post is the mime cap — otherwise the finalize
+    // step would reject an unknown upload_id with the same invalid_params code and
+    // the test would pass even if the mime cap were removed.
+    let chunk = base64::engine::general_purpose::STANDARD.encode(b"secret-key");
+    let up_mime = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"um","method":"gram.upload_chunk","params":{{"upload_id":"mimecap","offset":0,"data_base64":"{chunk}"}}}}"#
+        ),
+    );
+    assert_eq!(
+        up_mime["result"]["type"], "ok",
+        "mime-cap upload: {up_mime}"
+    );
     let big_mime = "x".repeat(300);
     let bad_mime = api_request(
         &api_socket,
         &format!(
-            r#"{{"id":"m","method":"gram.post","params":{{"text":"","file":{{"upload_id":"nope","name":"x.txt","mime":"{big_mime}"}}}}}}"#
+            r#"{{"id":"m","method":"gram.post","params":{{"text":"","file":{{"upload_id":"mimecap","name":"x.txt","mime":"{big_mime}"}}}}}}"#
         ),
     );
     assert_eq!(
         bad_mime["error"]["code"], "invalid_params",
         "an oversized mime must be rejected: {bad_mime}"
     );
+    let mime_msg = bad_mime["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        mime_msg.contains("mime"),
+        "the rejection must be the mime cap, not a different invalid_params: {bad_mime}"
+    );
 
     // Upload + post a real file to get a message id.
-    let chunk = base64::engine::general_purpose::STANDARD.encode(b"secret-key");
     let up = api_request(
         &api_socket,
         &format!(
