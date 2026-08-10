@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::agents::{AgentInfo, AgentPromptDelivery};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
+use super::gram::GramMessageInfo;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
@@ -322,6 +323,15 @@ pub enum ResponseResult {
     ClientShellSurfaceSet {
         active: bool,
         projection_revision: u64,
+    },
+    GramSent {
+        message: GramMessageInfo,
+    },
+    GramList {
+        messages: Vec<GramMessageInfo>,
+    },
+    GramGrabbed {
+        message: GramMessageInfo,
     },
     Ok {},
 }

@@ -98,6 +98,7 @@ Raw socket method names use dot notation:
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
 | Notification | `notification.show`, `notifications.register_device` |
+| Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
@@ -110,6 +111,8 @@ Raw socket method names use dot notation:
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
+
+`gram.*` is the owner↔agent message channel. `gram.grab` claims a shared queue item and is first-wins atomic at the storage layer, so no two agents can ever claim the same item — regardless of identity. Sender and claimant identity is the caller's agent name (or pane id if it has no name), resolved from `caller_pane_id`; it is durable across a restart or live-handoff but carries name-semantics: renaming, clearing, or reusing a name changes which items an agent sees as its own in `gram.list`. `gram.list` returns the owner view when `caller_pane_id` is omitted and that pane's agent view otherwise. Attribution is advisory, not authenticated.
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. Successful prompts include optional `delivery` evidence: `written_to_pty` after the complete text+Enter batch is acknowledged, or `submitted` after an attributable lifecycle advance or after the same writer-attributed composer attempt is observed and clears. Persistent attributed input returns `agent_prompt_unsubmitted`; uncertain disposition returns `agent_prompt_stalled`. Bracketed paste uses writer provenance and does not depend on rendered token text. A visible modal returns `agent_input_pending` before any bytes are written.
 

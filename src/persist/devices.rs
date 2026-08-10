@@ -27,6 +27,9 @@ pub struct RegisteredDevice {
     pub notify_dies: bool,
     /// Deliver a push when an agent finishes a turn.
     pub notify_finishes: bool,
+    /// Deliver a push when an agent sends the owner a gram message.
+    #[serde(default)]
+    pub notify_gram: bool,
     /// Registration time in Unix milliseconds.
     pub registered_unix_ms: u64,
 }
@@ -160,6 +163,7 @@ mod tests {
             notify_needs_input: true,
             notify_dies: true,
             notify_finishes: false,
+            notify_gram: false,
             registered_unix_ms: 1_700_000_000_000,
         }
     }
