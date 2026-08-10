@@ -261,6 +261,8 @@ fn print_gram_help() {
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
     eprintln!("  herdr gram mark-read <id>                owner: mark an agent message read");
+    eprintln!();
+    eprintln!("--from/--as override the attribution label (default: your agent name).");
 }
 
 #[cfg(test)]

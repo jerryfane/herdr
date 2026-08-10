@@ -321,7 +321,10 @@ fn gram_command() -> Command {
             Command::new("send")
                 .about("Send the owner a push-notified message")
                 .arg(required("text", "TEXT"))
-                .arg(option("from", "LABEL")),
+                .arg(
+                    option("from", "LABEL")
+                        .help("Attribute the message to LABEL instead of your own identity"),
+                ),
         )
         .subcommand(
             Command::new("list")
