@@ -564,6 +564,80 @@ fn gram_file_round_trip_upload_download_delete() {
 }
 
 #[test]
+fn gram_file_rejects_oversized_mime_and_unknown_caller() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // An over-long mime is rejected before anything is stored (the mime cap
+    // precedes finalize), so it cannot bloat the store past its byte budget.
+    let big_mime = "x".repeat(300);
+    let bad_mime = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"m","method":"gram.post","params":{{"text":"","file":{{"upload_id":"nope","name":"x.txt","mime":"{big_mime}"}}}}}}"#
+        ),
+    );
+    assert_eq!(
+        bad_mime["error"]["code"], "invalid_params",
+        "an oversized mime must be rejected: {bad_mime}"
+    );
+
+    // Upload + post a real file to get a message id.
+    let chunk = base64::engine::general_purpose::STANDARD.encode(b"secret-key");
+    let up = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"u","method":"gram.upload_chunk","params":{{"upload_id":"u1","offset":0,"data_base64":"{chunk}"}}}}"#
+        ),
+    );
+    assert_eq!(up["result"]["type"], "ok", "upload: {up}");
+    let post = api_request(
+        &api_socket,
+        r#"{"id":"p","method":"gram.post","params":{"text":"","file":{"upload_id":"u1","name":"k.txt","mime":"text/plain"}}}"#,
+    );
+    let message_id = post["result"]["message"]["id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+
+    // A caller_pane_id that names no live pane is rejected as unknown_caller — NOT
+    // silently treated as the owner — so an agent cannot bypass the audience check
+    // by supplying a bogus pane. (An omitted caller_pane_id is still the owner;
+    // that cooperative-filtering boundary is documented, not authenticated.)
+    let denied = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"d","method":"gram.get_file","params":{{"id":"{message_id}","caller_pane_id":"w9:p9"}}}}"#
+        ),
+    );
+    assert_eq!(
+        denied["error"]["code"], "unknown_caller",
+        "a bogus caller pane must not fall through to owner authority: {denied}"
+    );
+
+    // The owner (no caller pane) can still read it.
+    let owner = api_request(
+        &api_socket,
+        &format!(r#"{{"id":"o","method":"gram.get_file","params":{{"id":"{message_id}"}}}}"#),
+    );
+    assert_eq!(
+        owner["result"]["type"], "gram_file_content",
+        "the owner can read the file: {owner}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
 fn server_removes_client_socket_on_exit() {
     let _lock = test_lock();
     let base = unique_test_dir();

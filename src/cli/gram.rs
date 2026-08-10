@@ -184,7 +184,9 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
                 "server returned invalid base64",
             )
         })?;
-    std::fs::write(&out, &bytes)?;
+    // Write owner-only (0600): a downloaded file may be a secret (a temporary API
+    // key), and the default umask would otherwise leave it world-readable.
+    write_private(&out, &bytes)?;
 
     let name = response
         .pointer("/result/name")
@@ -192,6 +194,28 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
         .unwrap_or("file");
     eprintln!("saved {name} ({} bytes) to {out}", bytes.len());
     Ok(0)
+}
+
+/// Write a downloaded file with owner-only permissions so a secret is not left
+/// world-readable at the default umask. Enforces the mode even if the target
+/// already existed with looser permissions.
+#[cfg(unix)]
+fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 /// Best-effort MIME type from a file's extension. Advisory only — the server

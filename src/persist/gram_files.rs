@@ -199,6 +199,13 @@ fn finalize_in(
         return Err(invalid("invalid message id"));
     };
 
+    // Sweep abandoned staging on send too, not only on the next upload chunk, so
+    // any gram file activity — an upload OR a completed send — bounds how long a
+    // never-finished upload's bytes linger. (A store with zero further gram file
+    // activity, or a crash between this rename and the message append, can still
+    // strand bytes; a startup reconciler is tracked as a follow-up.)
+    cleanup_stale(&staging_dir_in(dir));
+
     let metadata = fs::metadata(&staging).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             invalid("no staged upload with that id; upload the file chunks first")
@@ -390,15 +397,38 @@ mod tests {
     }
 
     #[test]
-    fn oversize_rejected_by_chunk_and_total() {
-        let dir = unique_temp_dir("size");
+    fn chunk_larger_than_cap_is_rejected() {
+        let dir = unique_temp_dir("chunkcap");
         let too_big = vec![0_u8; MAX_CHUNK_BYTES + 1];
-        assert!(append_chunk_in(&dir, "up-3", 0, &too_big).is_err());
-
-        // A chunk that fits but pushes the total past MAX_FILE_BYTES is rejected.
-        let near_max = MAX_FILE_BYTES - 1;
-        let err = append_chunk_in(&dir, "up-4", near_max, b"xx").unwrap_err();
+        let err = append_chunk_in(&dir, "up-3", 0, &too_big).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_size_cap_rejects_exceeding_max_file_bytes() {
+        let dir = unique_temp_dir("totalcap");
+        // Fill the staged file exactly to the cap in MAX_CHUNK_BYTES steps, each at
+        // the matching offset (MAX_FILE_BYTES is an exact multiple of the chunk).
+        let chunk = vec![0_u8; MAX_CHUNK_BYTES];
+        let mut offset: u64 = 0;
+        while offset < MAX_FILE_BYTES {
+            append_chunk_in(&dir, "big", offset, &chunk).unwrap();
+            offset += MAX_CHUNK_BYTES as u64;
+        }
+        assert_eq!(
+            offset, MAX_FILE_BYTES,
+            "the cap must be a whole number of chunks"
+        );
+        // One more byte, at the offset that MATCHES the staged size, so this hits
+        // the total-size check — not the offset-continuation check — and is
+        // rejected as exceeding the limit.
+        let err = append_chunk_in(&dir, "big", MAX_FILE_BYTES, b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("size limit"),
+            "expected a size-cap error, got: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

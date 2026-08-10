@@ -23,6 +23,16 @@
 //! `caller_pane_id` that names no live pane is an error, not a silent
 //! fall-through to the owner view. Sender/owner attribution is advisory, not
 //! authenticated — the trust domain is already flat.
+//!
+//! The `gram.delete` and `gram.get_file` audience checks carry the same caveat:
+//! an agent that supplies its caller pane may only delete or download a message
+//! it can see, but "owner" is simply the ABSENCE of a caller pane, so a local
+//! caller that omits it acts with owner authority. This is COOPERATIVE FILTERING
+//! within a flat trust domain — every local process can already read `gram.json`
+//! and the blob files directly — not authenticated isolation, and it must not be
+//! relied on to hide a secret from a determined co-resident agent. A
+//! capability-bound identity that would make it a real boundary is the
+//! durable-identity follow-up (issue #49).
 
 use base64::Engine as _;
 
@@ -34,7 +44,8 @@ use crate::api::schema::{
 };
 use crate::app::App;
 use crate::persist::gram::{
-    new_id, GramDirection as StoredDirection, GramFile, GramItem, MAX_LABEL_BYTES, MAX_TEXT_BYTES,
+    new_id, GramDirection as StoredDirection, GramFile, GramItem, MAX_LABEL_BYTES, MAX_MIME_BYTES,
+    MAX_TEXT_BYTES,
 };
 
 /// Why a claim could not be completed.
@@ -561,6 +572,16 @@ fn attach_file(
             request_id.to_string(),
             "invalid_params",
             "file.name is empty",
+        ));
+    }
+    // The mime is caller-supplied and persisted in gram.json, which the store's
+    // byte budget does NOT count (it budgets text). Cap it so a caller cannot
+    // smuggle large data through this field and bloat the store past its budget.
+    if upload.mime.len() > MAX_MIME_BYTES {
+        return Err(encode_error(
+            request_id.to_string(),
+            "invalid_params",
+            format!("file.mime exceeds {MAX_MIME_BYTES} bytes"),
         ));
     }
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
