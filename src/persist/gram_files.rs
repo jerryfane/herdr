@@ -22,13 +22,14 @@
 //!
 //! Disk bounds. Staging is bounded three ways: each upload is capped at
 //! [`MAX_FILE_BYTES`]; stale staging (an upload whose send never arrived) is swept
-//! after [`STAGING_MAX_AGE`] on any upload or finalize; and a NEW upload is refused
-//! once aggregate staging fills [`MAX_TOTAL_STAGING_BYTES`]. Finalized blobs are
-//! bounded by the message store's aggregate file budget, which evicts them with
-//! their records. RESIDUAL: a crash in the microsecond window between a finalize
-//! rename and the message append leaves an orphaned finalized dir that no path
-//! reconciles; a startup reconciler is a follow-up (tracked with the identity work
-//! in issue #49).
+//! after [`STAGING_MAX_AGE`] on any upload or finalize; and any chunk — opening or
+//! growth — is refused once it would push aggregate staging past
+//! [`MAX_TOTAL_STAGING_BYTES`], so no number of uploads opened small can then grow
+//! past the budget. Finalized blobs are bounded by the message store's aggregate
+//! file budget, which evicts them with their records. RESIDUAL: a crash in the
+//! microsecond window between a finalize rename and the message append leaves an
+//! orphaned finalized dir that no path reconciles; a startup reconciler is a
+//! follow-up (tracked with the identity work in issue #49).
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -51,10 +52,10 @@ pub const MAX_CHUNK_BYTES: usize = 512 * 1024;
 /// Staging files older than this are swept — an upload whose send never arrived.
 const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Aggregate cap on all in-progress staging bytes. A NEW upload is refused when
-/// pending staging already fills this, so many distinct abandoned uploads cannot
-/// pin unbounded disk until their TTL expires. (An in-progress upload is still
-/// bounded per-file by [`MAX_FILE_BYTES`].)
+/// Aggregate cap on all in-progress staging bytes across every upload. Enforced on
+/// EVERY chunk (opening and growth), so a chunk that would push the running total
+/// over is refused — no number of uploads opened small can then grow past it. (An
+/// in-progress upload is also bounded per-file by [`MAX_FILE_BYTES`].)
 const MAX_TOTAL_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Longest accepted path component (upload id, message id, stored file name).
@@ -159,13 +160,6 @@ fn append_chunk_in(dir: &Path, upload_id: &str, offset: u64, bytes: &[u8]) -> io
     ensure_dir_restricted(&staging)?;
     cleanup_stale(&staging);
 
-    // Bound aggregate staging at the start of a NEW upload (the sweep above ran
-    // first): if pending staging already fills the budget, refuse rather than let
-    // many distinct abandoned uploads pin unbounded disk until their TTL.
-    if offset == 0 && staging_total_bytes(&staging) >= MAX_TOTAL_STAGING_BYTES {
-        return Err(invalid("too many pending uploads; retry shortly"));
-    }
-
     let current = match fs::metadata(&path) {
         Ok(metadata) => metadata.len(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
@@ -178,6 +172,17 @@ fn append_chunk_in(dir: &Path, upload_id: &str, offset: u64, bytes: &[u8]) -> io
     }
     if offset.saturating_add(bytes.len() as u64) > MAX_FILE_BYTES {
         return Err(invalid("file exceeds the size limit"));
+    }
+    // Bound TOTAL staging across all uploads, checked on EVERY chunk (the sweep
+    // above ran first). A growth chunk (offset != 0) must be checked too, else
+    // many uploads opened at 1 byte could each grow unbounded and blow the budget.
+    if would_exceed_staging_budget(
+        staging_total_bytes(&staging),
+        current,
+        offset,
+        bytes.len() as u64,
+    ) {
+        return Err(invalid("upload staging is full; retry shortly"));
     }
 
     let mut options = fs::OpenOptions::new();
@@ -299,6 +304,21 @@ fn sha256_of_file(path: &Path) -> io::Result<String> {
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+/// Whether appending `chunk_len` bytes at `offset` would push aggregate staging
+/// past [`MAX_TOTAL_STAGING_BYTES`], given the current total across all uploads
+/// (`total`, which already counts this file at its present size `current`). A
+/// growth chunk (`offset != 0`) adds `chunk_len`; an opening chunk (`offset == 0`)
+/// truncates this file, so it replaces `current` with `chunk_len`. Pure, so the
+/// bound is unit-tested without staging hundreds of megabytes.
+fn would_exceed_staging_budget(total: u64, current: u64, offset: u64, chunk_len: u64) -> bool {
+    let projected = if offset == 0 {
+        total.saturating_sub(current).saturating_add(chunk_len)
+    } else {
+        total.saturating_add(chunk_len)
+    };
+    projected > MAX_TOTAL_STAGING_BYTES
 }
 
 /// Sum the sizes of all files in the staging dir, for the aggregate-staging bound.
@@ -473,6 +493,42 @@ mod tests {
         append_chunk_in(&dir, "b", 0, b"678").unwrap();
         // The aggregate-staging bound measures the sum of all pending upload files.
         assert_eq!(staging_total_bytes(&staging_dir_in(&dir)), 8);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_budget_bounds_growth_chunks_not_just_opens() {
+        let cap = MAX_TOTAL_STAGING_BYTES;
+        // A GROWTH chunk (offset != 0) that would push the total over is rejected —
+        // this is the bypass where many 1-byte opens grow unbounded. The opening
+        // check alone (offset == 0) would have missed it.
+        assert!(would_exceed_staging_budget(cap, 1, 1, 1));
+        assert!(would_exceed_staging_budget(cap, 5_000, 5_000, 1));
+        // Under budget stays accepted.
+        assert!(!would_exceed_staging_budget(cap - 10, 5, 5, 3));
+        // An opening chunk (offset == 0) replaces this file's current bytes, so
+        // truncating the only (full) file to a few bytes is fine...
+        assert!(!would_exceed_staging_budget(cap, cap, 0, 5));
+        // ...but a brand-new file opened on an already-full budget is rejected.
+        assert!(would_exceed_staging_budget(cap, 0, 0, 5));
+    }
+
+    #[test]
+    fn append_chunk_rejects_growth_that_would_exceed_aggregate() {
+        let dir = unique_temp_dir("agggrow");
+        // Open a small upload (its opening chunk passes — staging is nearly empty).
+        append_chunk_in(&dir, "u", 0, b"12345").unwrap();
+        // Fill staging to the budget with a SPARSE file (reports full size with ~no
+        // disk write), so now ONLY a growth chunk can trip the aggregate cap.
+        let staging = staging_dir_in(&dir);
+        let hog = fs::File::create(staging.join("hog")).unwrap();
+        hog.set_len(MAX_TOTAL_STAGING_BYTES).unwrap();
+        drop(hog);
+        // A GROWTH chunk (offset != 0) must be rejected. The earlier opening-only
+        // check would have accepted this — this is the closed bypass.
+        let err = append_chunk_in(&dir, "u", 5, b"more").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("staging is full"), "got: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
