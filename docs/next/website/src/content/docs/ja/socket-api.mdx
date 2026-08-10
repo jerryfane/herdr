@@ -109,6 +109,8 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `gram.*` はオーナーとエージェント間のメッセージチャネルです。`gram.grab` は共有キューの項目を取得し、ストレージ層で先着順かつアトミックなので、識別子に関わらず 2 つのエージェントが同じ項目を取得することはありません。送信者・取得者の識別子は `caller_pane_id` から解決されるエージェント名(名前がなければペイン id)で、再起動やライブハンドオフをまたいでも保持されますが、名前のセマンティクスを持ちます。名前の変更・クリア・再利用により、`gram.list` で「自分のもの」として表示される項目が変わります。`gram.list` は `caller_pane_id` を省略するとオーナービューを、指定するとそのペインのエージェントビューを返します。属性表示は参考情報であり、認証されたものではありません。
 
+メッセージは 1 つのファイルを持てます。1 リクエストのサイズには上限があるため(アプリの SSH 経路で約 65 KiB、ローカルソケットで 1 MiB)、ファイルは `gram.upload_chunk`(`{upload_id, offset, data_base64}`。`offset` はこのチャンクの開始バイト位置で、`offset: 0` はアップロードをやり直す)でチャンク単位にアップロードし、その `upload_id` を `gram.send`/`gram.post` の `file` に渡して添付します。`gram.get_file` はレスポンス経路にサイズ上限がないため、バイト列を base64 として 1 回の応答でインライン返却します。`gram.delete` はメッセージと添付バイトを完全に削除します。オーナー(`caller_pane_id` なし)は任意のメッセージを、エージェントは caller pane を渡した場合に自分が見られるメッセージ(`gram.list` と同じ範囲)のみを削除・取得できます。この範囲チェックはフラットなローカル信頼ドメイン内の協調的フィルタリングであり、認証された境界ではありません(ローカルプロセスはストアを直接読めます)。短期的な機密(一時的な API キー)にとっての利点は、削除がバイト列を確実に消去し、削除後は永続ストアに秘密が残らないことです。
+
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。成功時の `delivery` は、text+Enter 全体の書き込み確認後に `written_to_pty`、帰属可能なライフサイクル進行、または同じ writer-attributed composer attempt の観測後の消去で `submitted` です。残存する帰属入力は `agent_prompt_unsubmitted`、不確かな行方は `agent_prompt_stalled` です。bracketed paste は表示 token に依存しません。
 
 `pane.get` は `composer` オブジェクトを返します。`state` は `empty`、`draft_present`、`unknown` で、任意の `attempt_id` と provenance、領域、カーソル、style、frame stability の証拠を含みます。領域欠落、再描画途中、矛盾、またはこのフィールドを持たない古い応答は `unknown` です。style は信頼度を下げる tripwire にしか使いません。

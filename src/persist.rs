@@ -6,6 +6,7 @@
 
 pub mod devices;
 pub mod gram;
+pub mod gram_files;
 mod io;
 pub mod plugin_registry;
 mod restore;
