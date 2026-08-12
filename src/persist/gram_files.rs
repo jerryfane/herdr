@@ -38,9 +38,10 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-/// Hard cap on a single attachment. Large enough for screenshots, logs, and small
-/// docs; small enough that assembling one in memory for download stays cheap.
-pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// Hard cap on a single attachment. Large enough for short screen recordings and
+/// sizable logs; the daemon reads a whole file into memory to hash it and to serve
+/// a download, so 100 MiB is the ceiling we accept for that transient allocation.
+pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Upper bound on one upload chunk's decoded payload, enforced server-side so a
 /// client cannot bypass it. Chosen so the base64-encoded request line stays under
@@ -56,7 +57,7 @@ const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// EVERY chunk (opening and growth), so a chunk that would push the running total
 /// over is refused — no number of uploads opened small can then grow past it. (An
 /// in-progress upload is also bounded per-file by [`MAX_FILE_BYTES`].)
-const MAX_TOTAL_STAGING_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Longest accepted path component (upload id, message id, stored file name).
 const MAX_COMPONENT_LEN: usize = 128;
@@ -293,7 +294,8 @@ pub fn remove_message_files_in(dir: &Path, message_id: &str) {
 }
 
 fn sha256_of_file(path: &Path) -> io::Result<String> {
-    // Attachments are capped at MAX_FILE_BYTES, so reading one to hash is cheap.
+    // Attachments are capped at MAX_FILE_BYTES (100 MiB), so reading one to hash
+    // is a bounded allocation.
     let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);

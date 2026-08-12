@@ -45,7 +45,7 @@ const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
 /// blob store; once exceeded, the oldest messages (and their files) are evicted.
 /// This is an aggregate disk bound, separate from the per-file cap the blob store
 /// enforces at upload time.
-const MAX_TOTAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Maximum bytes of a single message's text. Enforced by the API handler before
 /// a message reaches the store (a message is a notification, not a document —
