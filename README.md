@@ -55,13 +55,16 @@ run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches
 
 ## the Herdrup fork
 
-This fork adds the daemon features the [Herdrup](https://herdrup.themartian.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. To run the Herdrup backend, build this fork from source:
+This fork adds the daemon features the [Herdrup](https://herdrup.themartian.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. To run the Herdrup backend, build this fork from source.
+
+You need a recent **Rust** toolchain ([rustup](https://rustup.rs)) and **Zig 0.15+** (`brew install zig`, or from [ziglang.org](https://ziglang.org/download/)). The build uses Zig to compile the vendored libghostty-vt.
 
 ```bash
 git clone https://github.com/jerryfane/herdr
 cd herdr
 cargo build --release
-install -m 0755 target/release/herdr ~/.local/bin/herdr   # or anywhere on your PATH
+mkdir -p ~/.local/bin
+install -m 0755 target/release/herdr ~/.local/bin/herdr   # make sure ~/.local/bin is on your PATH
 ```
 
 Then run herdr where your agents live:
@@ -71,7 +74,7 @@ herdr          # the interactive TUI
 # or: herdr server   for a headless server
 ```
 
-Now open the Herdrup app and connect to this machine over SSH: enter the host, a username, and an ed25519 private key. You need a recent Rust toolchain ([rustup](https://rustup.rs)) to build.
+Now open the Herdrup app and connect to this machine over SSH: enter the host, a username, and an ed25519 private key.
 
 ## docs
 
