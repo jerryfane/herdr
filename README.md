@@ -57,7 +57,7 @@ run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches
 
 This fork adds the daemon features the [Herdrup](https://herdrup.themartian.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. To run the Herdrup backend, build this fork from source.
 
-You need a recent **Rust** toolchain ([rustup](https://rustup.rs)) and **Zig 0.15+** (`brew install zig`, or from [ziglang.org](https://ziglang.org/download/)). The build uses Zig to compile the vendored libghostty-vt.
+You need a recent **Rust** toolchain ([rustup](https://rustup.rs)) and **Zig 0.15.2** exactly (the version the vendored libghostty-vt pins; the build rejects others). Grab it from [ziglang.org/download](https://ziglang.org/download/). The build uses Zig to compile that vendored terminal library.
 
 ```bash
 git clone https://github.com/jerryfane/herdr
