@@ -53,6 +53,29 @@ herdr
 
 run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
 
+## the Herdrup fork
+
+This fork adds the daemon features the [Herdrup](https://herdrup.themartian.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. To run the Herdrup backend, build this fork from source.
+
+You need a recent **Rust** toolchain ([rustup](https://rustup.rs)) and **Zig 0.15.2 or newer in the 0.15 series** (the vendored libghostty-vt pins that minimum; 0.16 is not accepted). Grab it from [ziglang.org/download](https://ziglang.org/download/). The build uses Zig to compile that vendored terminal library.
+
+```bash
+git clone https://github.com/jerryfane/herdr
+cd herdr
+cargo build --release
+mkdir -p ~/.local/bin
+install -m 0755 target/release/herdr ~/.local/bin/herdr   # make sure ~/.local/bin is on your PATH
+```
+
+Then run herdr where your agents live:
+
+```bash
+herdr          # the interactive TUI
+# or: herdr server   for a headless server
+```
+
+Now open the Herdrup app and connect to this machine over SSH: enter the host, a username, and an ed25519 private key.
+
 ## docs
 
 everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
