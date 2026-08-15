@@ -14,11 +14,19 @@ mod apns;
 mod jwt;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::PushConfig;
 use crate::persist::devices::RegisteredDevice;
 
 use self::apns::DeliveryOutcome;
+
+/// Whether any iOS Live Activity is currently registered. A cheap gate the app loop reads
+/// instead of touching `activities.json` on every agent-status change (that disk read must
+/// not sit on the hot loop). Set true by `notifications.register_activity`; cleared here when
+/// a send finds the store empty. Defaults true so activities persisted across a daemon
+/// restart are not missed before the app re-registers.
+pub(crate) static LIVE_ACTIVITY_PRESENT: AtomicBool = AtomicBool::new(true);
 
 /// Which agent transition triggered a push, used to match per-device prefs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +207,11 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
 /// [`deliver`]: read the activity store, mint/reuse one JWT, POST to each token with
 /// `apns-push-type: liveactivity` on the widget sub-topic, and prune any token APNs reports
 /// as gone (410). Best-effort; intended to run on a detached thread.
-pub(crate) fn deliver_live_activity(cfg: PushConfig, content_state: serde_json::Value) {
+pub(crate) fn deliver_live_activity(
+    cfg: PushConfig,
+    content_state: serde_json::Value,
+    timestamp: u64,
+) {
     if !enabled(&cfg) {
         return;
     }
@@ -215,6 +227,9 @@ pub(crate) fn deliver_live_activity(cfg: PushConfig, content_state: serde_json::
 
     let activities = crate::persist::activities::load();
     if activities.is_empty() {
+        // Nothing registered — tell the app loop to stop spawning senders until a new
+        // registration flips the gate back on.
+        LIVE_ACTIVITY_PRESENT.store(false, Ordering::Relaxed);
         return;
     }
 
@@ -243,7 +258,9 @@ pub(crate) fn deliver_live_activity(cfg: PushConfig, content_state: serde_json::
     // The Live Activity topic is a distinct sub-topic of the app bundle id, and the whole
     // session shares ONE content-state, so build the payload once.
     let la_topic = format!("{topic}.push-type.liveactivity");
-    let payload = apns::live_activity_payload(&content_state, unix_secs_now());
+    // The timestamp is assigned by the caller in SOURCE ORDER (see emit_live_activity_updates),
+    // not here per-thread, so out-of-order sender threads can't let a stale snapshot win.
+    let payload = apns::live_activity_payload(&content_state, timestamp);
 
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
     for activity in &activities {

@@ -836,18 +836,47 @@ impl App {
     /// same sites as `emit_apns_agent_notifications` (i.e. whenever agent status changes).
     /// Best-effort + detached; a no-op when push is off or no Live Activity is registered.
     fn emit_live_activity_updates(&self) {
+        use std::sync::atomic::Ordering;
+
         if self.no_session || !crate::push::enabled(&self.state.push_config) {
             return;
         }
-        // Skip the aggregate + the thread entirely when no Live Activity is registered.
-        if crate::persist::activities::load().is_empty() {
+        // Cheap gate (no disk on the hot loop): nothing registered → nothing to do.
+        if !crate::push::LIVE_ACTIVITY_PRESENT.load(Ordering::Relaxed) {
             return;
         }
+
         let content_state = live_activity_content_state(&self.collect_agent_infos());
+
+        // Dedup: skip when the aggregate is unchanged since the last dispatch. Status-change
+        // events fire often without altering the widget's content (e.g. a git refresh), and
+        // Live Activity push budgets are small, so unchanged states must not hit APNs.
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            content_state.to_string().hash(&mut hasher);
+            hasher.finish()
+        };
+        if LAST_LIVE_ACTIVITY_HASH.load(Ordering::Relaxed) == hash {
+            return;
+        }
+
+        // Monotonic, source-ordered timestamp (seconds), assigned HERE on the single app loop
+        // rather than per-thread, so reordered sender threads can't let a stale snapshot
+        // overwrite a newer one — APNs keeps the highest aps.timestamp.
+        let now_secs = unix_millis_now() / 1000;
+        let timestamp = {
+            let previous = LAST_LIVE_ACTIVITY_TS.load(Ordering::Relaxed);
+            let next = now_secs.max(previous + 1);
+            LAST_LIVE_ACTIVITY_TS.store(next, Ordering::Relaxed);
+            next
+        };
+        LAST_LIVE_ACTIVITY_HASH.store(hash, Ordering::Relaxed);
+
         let cfg = self.state.push_config.clone();
         if let Err(err) = std::thread::Builder::new()
             .name("herdr-liveactivity".to_string())
-            .spawn(move || crate::push::deliver_live_activity(cfg, content_state))
+            .spawn(move || crate::push::deliver_live_activity(cfg, content_state, timestamp))
         {
             tracing::warn!(error = %err, "failed to spawn live-activity sender thread; dropping update");
         }
@@ -1509,7 +1538,14 @@ impl App {
             registered_unix_ms: unix_millis_now(),
         };
         match crate::persist::activities::upsert(activity) {
-            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Ok(_) => {
+                // A widget is registered again: re-open the app-loop gate and reset the dedup
+                // hash so the next status change is delivered to the newly-registered activity.
+                crate::push::LIVE_ACTIVITY_PRESENT
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                LAST_LIVE_ACTIVITY_HASH.store(0, std::sync::atomic::Ordering::Relaxed);
+                responses::encode_success(id, ResponseResult::Ok {})
+            }
             Err(err) => {
                 responses::encode_error(id, "activity_registry_save_failed", err.to_string())
             }
@@ -1572,6 +1608,12 @@ fn is_valid_apns_device_token(token: &str) -> bool {
 fn is_valid_apns_activity_token(token: &str) -> bool {
     (32..=512).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+/// Source-ordered, strictly-increasing timestamp (Unix seconds) of the last Live Activity
+/// update dispatched. Assigned on the single app loop so reordered sender threads keep order.
+static LAST_LIVE_ACTIVITY_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Hash of the last content-state dispatched, so an unchanged aggregate is not re-sent.
+static LAST_LIVE_ACTIVITY_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Aggregate a session's agents into the Live Activity content-state the widget renders.
 /// Keys MUST match the app's `AgentActivityAttributes.State` (camelCase). The status +
