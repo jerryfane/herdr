@@ -190,6 +190,7 @@ impl App {
                 self.emit_pane_state_update(&update);
                 self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
                 self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
+                self.emit_live_activity_updates();
             }
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)
@@ -302,6 +303,7 @@ impl App {
             self.emit_pane_state_update(update);
         }
         self.emit_apns_agent_notifications(&pane_updates, false);
+        self.emit_live_activity_updates();
         self.sync_agent_metadata_deadline();
         if let Some((
             overlay,
@@ -829,6 +831,56 @@ impl App {
         }
     }
 
+    /// Push the session's aggregate agent status to every registered Live Activity, so the
+    /// lock-screen / Dynamic Island widget refreshes while the app is closed. Fired from the
+    /// same sites as `emit_apns_agent_notifications` (i.e. whenever agent status changes).
+    /// Best-effort + detached; a no-op when push is off or no Live Activity is registered.
+    fn emit_live_activity_updates(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+            return;
+        }
+
+        // The aggregate is computed from in-memory state (no disk on the hot loop). The
+        // activity-store read + the send happen off-loop in the spawned thread below; the
+        // dedup + monotonic-timestamp bookkeeping here is all lock-free on this one thread.
+        let content_state = live_activity_content_state(&self.collect_agent_infos());
+
+        // Dedup: skip when the aggregate is unchanged since the last dispatch. Status-change
+        // events fire often without altering the widget's content (e.g. a git refresh), and
+        // Live Activity push budgets are small, so unchanged states must not hit APNs.
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            content_state.to_string().hash(&mut hasher);
+            hasher.finish()
+        };
+        if LAST_LIVE_ACTIVITY_HASH.load(Ordering::Relaxed) == hash {
+            return;
+        }
+
+        // Monotonic, source-ordered timestamp (seconds), assigned HERE on the single app loop
+        // rather than per-thread, so reordered sender threads can't let a stale snapshot
+        // overwrite a newer one — APNs keeps the highest aps.timestamp.
+        let now_secs = unix_millis_now() / 1000;
+        let timestamp = {
+            let previous = LAST_LIVE_ACTIVITY_TS.load(Ordering::Relaxed);
+            let next = now_secs.max(previous + 1);
+            LAST_LIVE_ACTIVITY_TS.store(next, Ordering::Relaxed);
+            next
+        };
+        LAST_LIVE_ACTIVITY_HASH.store(hash, Ordering::Relaxed);
+
+        let cfg = self.state.push_config.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("herdr-liveactivity".to_string())
+            .spawn(move || crate::push::deliver_live_activity(cfg, content_state, timestamp))
+        {
+            tracing::warn!(error = %err, "failed to spawn live-activity sender thread; dropping update");
+        }
+    }
+
     pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
@@ -1099,6 +1151,12 @@ impl App {
             }
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
+            }
+            Method::NotificationsRegisterActivity(params) => {
+                return self.handle_notifications_register_activity(request.id, params);
+            }
+            Method::NotificationsUnregisterActivity(params) => {
+                return self.handle_notifications_unregister_activity(request.id, params);
             }
             Method::GramSend(params) => return self.handle_gram_send(request.id, params),
             Method::GramPost(params) => return self.handle_gram_post(request.id, params),
@@ -1452,6 +1510,66 @@ impl App {
         }
     }
 
+    fn handle_notifications_register_activity(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsRegisterActivityParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.activity_push_token.trim();
+        if !is_valid_apns_activity_token(token) {
+            return responses::encode_error(
+                id,
+                "invalid_params",
+                "activity_push_token must be 32-512 hexadecimal characters",
+            );
+        }
+
+        // No-session/monolithic mode has no shared registry to persist to; ack without disk,
+        // mirroring handle_notifications_register_device.
+        if self.no_session {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+
+        let activity = crate::persist::activities::RegisteredActivity {
+            activity_push_token: token.to_string(),
+            registered_unix_ms: unix_millis_now(),
+        };
+        match crate::persist::activities::upsert(activity) {
+            Ok(_) => {
+                // Reset the dedup hash so the next status change is delivered to the
+                // newly-registered activity even if the aggregate is unchanged since the
+                // last send.
+                LAST_LIVE_ACTIVITY_HASH.store(0, std::sync::atomic::Ordering::Relaxed);
+                responses::encode_success(id, ResponseResult::Ok {})
+            }
+            Err(err) => {
+                responses::encode_error(id, "activity_registry_save_failed", err.to_string())
+            }
+        }
+    }
+
+    fn handle_notifications_unregister_activity(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsRegisterActivityParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.activity_push_token.trim();
+        // Best-effort: nothing to prune in no-session mode or for an empty token.
+        if self.no_session || token.is_empty() {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+        match crate::persist::activities::remove_token(token) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => {
+                responses::encode_error(id, "activity_registry_save_failed", err.to_string())
+            }
+        }
+    }
+
     fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
         if !self.state.local_sound_playback || !self.state.sound.allows(None) {
             return;
@@ -1482,6 +1600,129 @@ fn unix_millis_now() -> u64 {
 /// registration cannot bloat the store.
 fn is_valid_apns_device_token(token: &str) -> bool {
     (32..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Live Activity push tokens are hex like device tokens but LONGER, so allow a wider range.
+fn is_valid_apns_activity_token(token: &str) -> bool {
+    (32..=512).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Source-ordered, strictly-increasing timestamp (Unix seconds) of the last Live Activity
+/// update dispatched. Assigned on the single app loop so reordered sender threads keep order.
+static LAST_LIVE_ACTIVITY_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Hash of the last content-state dispatched, so an unchanged aggregate is not re-sent.
+static LAST_LIVE_ACTIVITY_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Aggregate a session's agents into the Live Activity content-state the widget renders.
+/// Keys MUST match the app's `AgentActivityAttributes.State` (camelCase). The status +
+/// priority mirror the iOS `AgentGroup` / `LiveActivityController` mapping so the background
+/// (push) and foreground (in-app) computations agree: needs-you (blocked/unknown) outranks
+/// working, which outranks idle; a dead pane simply drops off this live list.
+fn live_activity_content_state(agents: &[crate::api::schema::AgentInfo]) -> serde_json::Value {
+    use crate::api::schema::AgentStatus;
+
+    fn rank(status: AgentStatus) -> u8 {
+        match status {
+            AgentStatus::Blocked => 0,
+            AgentStatus::Unknown => 2,
+            AgentStatus::Working => 3,
+            AgentStatus::Idle | AgentStatus::Done => 4,
+        }
+    }
+    fn status_str(status: AgentStatus) -> &'static str {
+        match status {
+            AgentStatus::Blocked | AgentStatus::Unknown => "needsYou",
+            AgentStatus::Working => "working",
+            AgentStatus::Idle | AgentStatus::Done => "idle",
+        }
+    }
+
+    let needs_you_count = agents
+        .iter()
+        .filter(|agent| agent.agent_status == AgentStatus::Blocked)
+        .count();
+    let working_count = agents
+        .iter()
+        .filter(|agent| agent.agent_status == AgentStatus::Working)
+        .count();
+
+    let lead = agents.iter().min_by_key(|agent| rank(agent.agent_status));
+    let (headline, status) = match lead {
+        Some(agent) => (
+            agent
+                .name
+                .clone()
+                .or_else(|| agent.terminal_title_stripped.clone())
+                .or_else(|| agent.agent.clone())
+                .unwrap_or_else(|| "agent".to_string()),
+            status_str(agent.agent_status),
+        ),
+        None => ("No agents".to_string(), "idle"),
+    };
+
+    serde_json::json!({
+        "headline": headline,
+        "status": status,
+        "needsYouCount": needs_you_count,
+        "workingCount": working_count,
+        "totalCount": agents.len(),
+    })
+}
+
+#[cfg(test)]
+mod live_activity_content_state_tests {
+    use super::live_activity_content_state;
+    use crate::api::schema::AgentInfo;
+
+    fn agent(status: &str, name: Option<&str>) -> AgentInfo {
+        let mut value = serde_json::json!({
+            "terminal_id": "t",
+            "agent_status": status,
+            "workspace_id": "ws",
+            "tab_id": "tab",
+            "pane_id": "pane",
+            "focused": false,
+            "revision": 1,
+        });
+        if let Some(name) = name {
+            value["name"] = serde_json::Value::String(name.to_string());
+        }
+        serde_json::from_value(value).expect("agent info deserializes")
+    }
+
+    #[test]
+    fn empty_session_reports_no_agents_idle() {
+        let cs = live_activity_content_state(&[]);
+        assert_eq!(cs["headline"], "No agents");
+        assert_eq!(cs["status"], "idle");
+        assert_eq!(cs["totalCount"], 0);
+        assert_eq!(cs["needsYouCount"], 0);
+        assert_eq!(cs["workingCount"], 0);
+    }
+
+    #[test]
+    fn blocked_leads_and_counts_are_reported() {
+        // Blocked (needs you) outranks working and idle regardless of list order.
+        let agents = [
+            agent("working", Some("builder")),
+            agent("blocked", Some("reviewer")),
+            agent("idle", Some("idler")),
+        ];
+        let cs = live_activity_content_state(&agents);
+        assert_eq!(cs["headline"], "reviewer");
+        assert_eq!(cs["status"], "needsYou");
+        assert_eq!(cs["needsYouCount"], 1);
+        assert_eq!(cs["workingCount"], 1);
+        assert_eq!(cs["totalCount"], 3);
+    }
+
+    #[test]
+    fn working_leads_when_nothing_needs_you() {
+        let agents = [agent("idle", Some("a")), agent("working", Some("b"))];
+        let cs = live_activity_content_state(&agents);
+        assert_eq!(cs["headline"], "b");
+        assert_eq!(cs["status"], "working");
+    }
 }
 
 /// Map a pane update to the push kind to deliver, if any.

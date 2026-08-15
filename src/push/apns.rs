@@ -91,10 +91,18 @@ fn quote_config_value(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Build the curl config document (one directive per line) that carries the
-/// url, method, headers (including the bearer JWT), and JSON body. Pure: no I/O,
-/// so the escaping and header set can be asserted directly.
-pub(super) fn build_curl_config(url: &str, jwt: &str, topic: &str, payload: &str) -> String {
+/// Build the curl config document (one directive per line) that carries the url, method,
+/// headers (including the bearer JWT + `apns-push-type` / `apns-priority`), and JSON body.
+/// Pure: no I/O, so the escaping and header set can be asserted directly. An alert uses
+/// `"alert"` / `"10"`; a Live Activity UPDATE uses `"liveactivity"` / `"5"`.
+pub(super) fn build_curl_config_typed(
+    url: &str,
+    jwt: &str,
+    topic: &str,
+    push_type: &str,
+    priority: &str,
+    payload: &str,
+) -> String {
     let mut config = String::new();
     config.push_str(&format!("url = {}\n", quote_config_value(url)));
     config.push_str("request = \"POST\"\n");
@@ -106,10 +114,31 @@ pub(super) fn build_curl_config(url: &str, jwt: &str, topic: &str, payload: &str
         "header = {}\n",
         quote_config_value(&format!("apns-topic: {topic}"))
     ));
-    config.push_str("header = \"apns-push-type: alert\"\n");
-    config.push_str("header = \"apns-priority: 10\"\n");
+    config.push_str(&format!(
+        "header = {}\n",
+        quote_config_value(&format!("apns-push-type: {push_type}"))
+    ));
+    config.push_str(&format!(
+        "header = {}\n",
+        quote_config_value(&format!("apns-priority: {priority}"))
+    ));
     config.push_str(&format!("data = {}\n", quote_config_value(payload)));
     config
+}
+
+/// The APNs payload for a Live Activity UPDATE push. `content_state` is the widget's
+/// dynamic ContentState — its keys must match the app's `AgentActivityAttributes.State`
+/// (headline / status / needsYouCount / workingCount / totalCount). `timestamp` is Unix
+/// seconds; Apple uses it to order updates and drop stale ones.
+pub(super) fn live_activity_payload(content_state: &serde_json::Value, timestamp: u64) -> String {
+    serde_json::json!({
+        "aps": {
+            "timestamp": timestamp,
+            "event": "update",
+            "content-state": content_state,
+        }
+    })
+    .to_string()
 }
 
 /// Split curl's combined stdout into `(body, status)`. `stdout` is
@@ -166,8 +195,23 @@ pub(super) fn deliver_one(
     sandbox: bool,
     payload: &str,
 ) -> DeliveryOutcome {
+    deliver_one_typed(device_token, jwt, topic, sandbox, "alert", "10", payload)
+}
+
+/// Like [`deliver_one`] but with an explicit `apns-push-type` + `apns-priority`, so a
+/// Live Activity update (`"liveactivity"` / `"5"`) reuses the exact same curl/stdin
+/// delivery + status classification as an alert.
+pub(super) fn deliver_one_typed(
+    device_token: &str,
+    jwt: &str,
+    topic: &str,
+    sandbox: bool,
+    push_type: &str,
+    priority: &str,
+    payload: &str,
+) -> DeliveryOutcome {
     let url = device_url(sandbox, device_token);
-    let config = build_curl_config(&url, jwt, topic, payload);
+    let config = build_curl_config_typed(&url, jwt, topic, push_type, priority, payload);
 
     let mut child = match crate::noninteractive_process::curl_command()
         .args(build_curl_argv())
@@ -267,6 +311,34 @@ mod tests {
     }
 
     #[test]
+    fn live_activity_payload_carries_event_timestamp_and_content_state() {
+        let content_state = serde_json::json!({ "headline": "claude", "status": "working" });
+        let payload: serde_json::Value =
+            serde_json::from_str(&live_activity_payload(&content_state, 1_700_000_000)).unwrap();
+        assert_eq!(payload["aps"]["event"], "update");
+        assert_eq!(payload["aps"]["timestamp"], 1_700_000_000u64);
+        assert_eq!(payload["aps"]["content-state"]["headline"], "claude");
+        assert_eq!(payload["aps"]["content-state"]["status"], "working");
+    }
+
+    #[test]
+    fn build_curl_config_typed_sets_live_activity_headers() {
+        let config = build_curl_config_typed(
+            "https://api.push.apple.com/3/device/tok",
+            "jwt",
+            "com.example.herdr.push-type.liveactivity",
+            "liveactivity",
+            "5",
+            "{}",
+        );
+        assert!(config.contains("header = \"apns-push-type: liveactivity\""));
+        assert!(config.contains("header = \"apns-priority: 5\""));
+        assert!(
+            config.contains("header = \"apns-topic: com.example.herdr.push-type.liveactivity\"")
+        );
+    }
+
+    #[test]
     fn quote_config_value_escapes_backslash_before_quote() {
         // Backslash must be escaped first; escaping the quote first would then
         // double-escape the inserted backslash.
@@ -277,7 +349,14 @@ mod tests {
     fn curl_config_carries_secrets_and_argv_does_not() {
         let payload = payload_body(&sample_notification());
         let url = device_url(false, "dev-token");
-        let config = build_curl_config(&url, "jwt-abc", "com.example.herdr", &payload);
+        let config = build_curl_config_typed(
+            &url,
+            "jwt-abc",
+            "com.example.herdr",
+            "alert",
+            "10",
+            &payload,
+        );
 
         assert!(config.contains(&format!("url = \"{url}\"")));
         assert!(config.contains("request = \"POST\""));

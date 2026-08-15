@@ -368,6 +368,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::NotificationShow(_) => "notification.show",
         Method::NotificationsRegisterDevice(_) => "notifications.register_device",
+        Method::NotificationsRegisterActivity(_) => "notifications.register_activity",
+        Method::NotificationsUnregisterActivity(_) => "notifications.unregister_activity",
         Method::GramSend(_) => "gram.send",
         Method::GramPost(_) => "gram.post",
         Method::GramList(_) => "gram.list",
