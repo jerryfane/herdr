@@ -3,8 +3,10 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
-    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
+    AcpAdapterInfo, AcpAdapterLaunch, AcpEndpointLaunch, AcpSessionInfo, AcpWorkerInfo,
+    AgentAcpAttachParams, AgentAcpDetachParams, AgentAcpEndpointParams, AgentPromptDelivery,
+    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
+    PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -13,6 +15,387 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
 impl App {
+    pub(super) fn handle_agent_acp_status(&mut self, id: String, target: AgentTarget) -> String {
+        let (terminal_id, worker, identity, adapter, turn_epoch) =
+            match self.resolve_acp_worker(&target.target) {
+                Ok(worker) => worker,
+                Err(error) => return encode_error_body(id, error),
+            };
+        let Some(owned) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.acp_owned_worker.as_ref())
+        else {
+            return encode_error(
+                id,
+                "acp_ownership_required",
+                "worker is not owned by Herdr ACP",
+            );
+        };
+        let lifecycle = match &owned.lifecycle {
+            crate::acp::AcpOwnedLifecycle::Ready => "acp_owned_ready",
+            crate::acp::AcpOwnedLifecycle::Attached { .. } => "acp_owned_attached",
+        };
+        encode_success(
+            id,
+            ResponseResult::AgentAcpStatus {
+                worker: AcpWorkerInfo {
+                    terminal_id: worker.terminal_id,
+                    workspace_id: worker.workspace_id,
+                    tab_id: worker.tab_id,
+                    pane_id: worker.pane_id,
+                    name: identity.name.clone(),
+                    agent: identity.agent.clone(),
+                    generation: identity.generation(turn_epoch),
+                },
+                adapter: AcpAdapterInfo {
+                    name: adapter.name.into(),
+                    version: owned.adapter_version.clone(),
+                },
+                session: AcpSessionInfo {
+                    id: identity.session_id,
+                    mode: identity.session_mode,
+                },
+                cwd: identity.cwd.display().to_string(),
+                lifecycle: lifecycle.into(),
+            },
+        )
+    }
+
+    pub(super) fn handle_agent_acp_register(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAcpRegisterParams,
+    ) -> String {
+        match self.register_acp_worker(params) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentAcpRegistered { agent }),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    pub(super) fn handle_agent_acp_endpoint(
+        &mut self,
+        id: String,
+        params: AgentAcpEndpointParams,
+    ) -> String {
+        let target_value = params.target;
+        let (terminal_id, worker, identity, adapter, turn_epoch) =
+            match self.resolve_acp_worker(&target_value) {
+                Ok(worker) => worker,
+                Err(error) => return encode_error_body(id, error),
+            };
+        let (version, lifecycle_ready) = match self.state.terminals.get(&terminal_id) {
+            Some(terminal) => match terminal.acp_owned_worker.as_ref() {
+                Some(owned) if owned.identity == identity => (
+                    owned.adapter_version.clone(),
+                    matches!(&owned.lifecycle, crate::acp::AcpOwnedLifecycle::Ready),
+                ),
+                _ => {
+                    return encode_error(
+                        id,
+                        "acp_ownership_required",
+                        "worker is owned by a PTY lifecycle, not Herdr ACP",
+                    )
+                }
+            },
+            None => return encode_error(id, "agent_not_found", "ACP worker disappeared"),
+        };
+        if !lifecycle_ready {
+            return encode_error(id, "acp_worker_attached", "ACP worker already has an owner");
+        }
+        let generation = identity.generation(turn_epoch);
+        let ticket = match crate::acp::AcpAttachTicket::mint(
+            identity.clone(),
+            generation,
+            std::time::Instant::now(),
+        ) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                return encode_error(
+                    id,
+                    "acp_ticket_unavailable",
+                    "secure ACP attach ticket generation failed",
+                )
+            }
+        };
+        let ticket_token = ticket.token.clone();
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return encode_error(id, "agent_not_found", "ACP worker disappeared");
+        };
+        terminal.acp_attach_ticket = Some(ticket);
+
+        encode_success(
+            id,
+            ResponseResult::AgentAcpEndpoint {
+                endpoint: AcpEndpointLaunch {
+                    transport: "stdio".into(),
+                    command: "herdr".into(),
+                    args: vec![
+                        "agent".into(),
+                        "acp-attach".into(),
+                        target_value,
+                        "--generation".into(),
+                        generation.to_string(),
+                        "--ticket".into(),
+                        ticket_token,
+                    ],
+                    protocol_version: crate::acp::ACP_ENDPOINT_PROTOCOL_VERSION,
+                },
+                worker: AcpWorkerInfo {
+                    terminal_id: worker.terminal_id,
+                    workspace_id: worker.workspace_id,
+                    tab_id: worker.tab_id,
+                    pane_id: worker.pane_id,
+                    name: identity.name.clone(),
+                    agent: identity.agent.clone(),
+                    generation,
+                },
+                adapter: AcpAdapterInfo {
+                    name: adapter.name.into(),
+                    version,
+                },
+                session: AcpSessionInfo {
+                    id: identity.session_id.clone(),
+                    mode: identity.session_mode,
+                },
+                cwd: identity.cwd.display().to_string(),
+                lifecycle: "acp_owned_ready".into(),
+            },
+        )
+    }
+
+    pub(super) fn handle_agent_acp_attach(
+        &mut self,
+        id: String,
+        params: AgentAcpAttachParams,
+    ) -> String {
+        let (terminal_id, _worker, identity, adapter, turn_epoch) =
+            match self.resolve_acp_worker(&params.target) {
+                Ok(worker) => worker,
+                Err(error) => return encode_error_body(id, error),
+            };
+        let generation = identity.generation(turn_epoch);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return encode_error(id, "agent_not_found", "ACP worker disappeared");
+        };
+        if !terminal.acp_owned_worker.as_ref().is_some_and(|owned| {
+            owned.identity == identity
+                && matches!(&owned.lifecycle, crate::acp::AcpOwnedLifecycle::Ready)
+        }) {
+            return encode_error(
+                id,
+                "acp_ownership_required",
+                "worker is not ready under Herdr ACP ownership",
+            );
+        }
+        let adapter_command = terminal
+            .acp_owned_worker
+            .as_ref()
+            .map(|owned| owned.adapter_command.display().to_string())
+            .unwrap_or_default();
+        let Some(ticket) = terminal.acp_attach_ticket.as_ref() else {
+            return encode_error(id, "acp_ticket_invalid", "ACP attach ticket is invalid");
+        };
+        let validation = ticket.validates(
+            &params.ticket,
+            &identity,
+            params.generation,
+            std::time::Instant::now(),
+        );
+        if !matches!(validation, Err(crate::acp::TicketValidationError::Invalid)) {
+            terminal.acp_attach_ticket = None;
+        }
+        match validation {
+            Ok(()) if params.generation == generation => {}
+            Ok(()) | Err(crate::acp::TicketValidationError::Stale) => {
+                return encode_error(id, "acp_endpoint_stale", "ACP endpoint generation is stale")
+            }
+            Err(crate::acp::TicketValidationError::Expired) => {
+                return encode_error(id, "acp_ticket_expired", "ACP attach ticket expired")
+            }
+            Err(crate::acp::TicketValidationError::Invalid) => {
+                return encode_error(id, "acp_ticket_invalid", "ACP attach ticket is invalid")
+            }
+        }
+
+        let adapter_unchanged = terminal.acp_owned_worker.as_ref().is_some_and(|owned| {
+            crate::acp::adapter_sha256(&owned.adapter_command)
+                .is_ok_and(|sha256| sha256 == owned.adapter_sha256)
+        });
+        if !adapter_unchanged {
+            terminal.revoke_acp_owned_worker();
+            return encode_error(
+                id,
+                "acp_adapter_changed",
+                "ACP adapter changed after registration; register the worker again",
+            );
+        }
+
+        let lease = match crate::acp::fresh_lease_token() {
+            Ok(lease) => lease,
+            Err(_) => {
+                return encode_error(
+                    id,
+                    "acp_lease_unavailable",
+                    "secure ACP ownership lease generation failed",
+                )
+            }
+        };
+        if let Some(owned) = terminal.acp_owned_worker.as_mut() {
+            owned.lifecycle = crate::acp::AcpOwnedLifecycle::Attached {
+                lease: lease.clone(),
+                generation,
+            };
+        }
+
+        encode_success(
+            id,
+            ResponseResult::AgentAcpAttached {
+                launch: AcpAdapterLaunch {
+                    command: adapter_command,
+                    args: adapter.args.iter().map(|arg| (*arg).into()).collect(),
+                    cwd: identity.cwd.display().to_string(),
+                    lease,
+                },
+            },
+        )
+    }
+
+    pub(super) fn handle_agent_acp_detach(
+        &mut self,
+        id: String,
+        params: AgentAcpDetachParams,
+    ) -> String {
+        let (terminal_id, _worker, identity, _adapter, turn_epoch) =
+            match self.resolve_acp_worker(&params.target) {
+                Ok(worker) => worker,
+                Err(error) => return encode_error_body(id, error),
+            };
+        let generation = identity.generation(turn_epoch);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return encode_error(id, "agent_not_found", "ACP worker disappeared");
+        };
+        let valid = terminal.acp_owned_worker.as_ref().is_some_and(|owned| {
+            owned.identity == identity
+                && matches!(
+                    &owned.lifecycle,
+                    crate::acp::AcpOwnedLifecycle::Attached {
+                        lease,
+                        generation: attached_generation,
+                    } if *attached_generation == generation
+                        && params.generation == generation
+                        && lease == &params.lease
+                )
+        });
+        if !valid {
+            return encode_error(id, "acp_lease_invalid", "ACP ownership lease is invalid");
+        }
+        if let Some(owned) = terminal.acp_owned_worker.as_mut() {
+            owned.lifecycle = crate::acp::AcpOwnedLifecycle::Ready;
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    fn resolve_acp_worker(
+        &mut self,
+        target: &str,
+    ) -> Result<
+        (
+            crate::terminal::TerminalId,
+            crate::api::schema::AgentInfo,
+            crate::acp::AcpWorkerIdentity,
+            crate::acp::AcpAdapterSpec,
+            u64,
+        ),
+        crate::api::schema::ErrorBody,
+    > {
+        let resolved = self
+            .resolve_terminal_target(target)
+            .map_err(|error| self.agent_target_error_body(error))?;
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+            .ok_or_else(|| acp_error("agent_not_found", "ACP worker does not exist"))?;
+        let worker = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .ok_or_else(|| acp_error("agent_not_found", "ACP worker does not exist"))?;
+        let Some(name) = worker.name.clone() else {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.revoke_acp_owned_worker();
+            }
+            return Err(acp_error(
+                "acp_worker_unauthenticated",
+                "ACP endpoint requires an authoritative named Herdr agent",
+            ));
+        };
+        let Some(agent) = worker.agent.clone() else {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.revoke_acp_owned_worker();
+            }
+            return Err(acp_error(
+                "acp_worker_unauthenticated",
+                "ACP endpoint requires an authoritative agent identity",
+            ));
+        };
+        let adapter = crate::acp::adapter_for(&agent).ok_or_else(|| {
+            acp_error(
+                "acp_adapter_unsupported",
+                format!("agent {agent} has no configured ACP adapter"),
+            )
+        })?;
+        let cwd = worker
+            .foreground_cwd
+            .as_deref()
+            .or(worker.cwd.as_deref())
+            .map(std::path::PathBuf::from)
+            .filter(|cwd| cwd.is_absolute())
+            .ok_or_else(|| acp_error("acp_cwd_unavailable", "ACP worker cwd is unavailable"))?;
+        let terminal = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .ok_or_else(|| acp_error("agent_not_found", "ACP worker disappeared"))?;
+        let placeholder_shell_owned = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(super::super::agents::available_shell_name)
+            .is_some();
+        let turn_epoch = terminal.turn_epoch;
+        let identity = terminal
+            .acp_owned_worker
+            .as_ref()
+            .map(|owned| owned.identity.clone())
+            .ok_or_else(|| {
+                acp_error(
+                    "acp_ownership_required",
+                    "worker is owned by a PTY lifecycle, not Herdr ACP",
+                )
+            })?;
+        let ownership_stale = terminal.detected_agent.is_some()
+            || !placeholder_shell_owned
+            || identity.terminal_id != worker.terminal_id
+            || identity.workspace_id != worker.workspace_id
+            || identity.tab_id != worker.tab_id
+            || identity.pane_id != worker.pane_id
+            || identity.name != name
+            || identity.agent != agent
+            || identity.cwd != cwd;
+        if ownership_stale {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.revoke_acp_owned_worker();
+            }
+            return Err(acp_error(
+                "acp_endpoint_stale",
+                "ACP ownership no longer matches the live worker",
+            ));
+        }
+        Ok((terminal_id, worker, identity, adapter, turn_epoch))
+    }
+
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
         encode_success(
             id,
@@ -344,6 +727,13 @@ impl App {
     }
 }
 
+fn acp_error(code: &'static str, message: impl Into<String>) -> crate::api::schema::ErrorBody {
+    crate::api::schema::ErrorBody {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
 fn agent_not_ready(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -386,6 +776,409 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    fn test_adapter_command() -> std::path::PathBuf {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("herdr-acp-stable-adapter-{}", std::process::id()));
+            std::fs::write(&path, b"stable test adapter").unwrap();
+            path
+        })
+        .clone()
+    }
+
+    fn configure_codex_worker(
+        app: &mut App,
+        acp_owned: bool,
+    ) -> (String, crate::terminal::TerminalId) {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let pane_target = app.public_pane_id(0, pane_id).unwrap();
+        if acp_owned {
+            let cwd = app.state.terminals[&terminal_id].cwd.display().to_string();
+            let adapter_command = test_adapter_command();
+            let adapter_sha256 = crate::acp::adapter_sha256(&adapter_command).unwrap();
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+            app.register_acp_worker(crate::api::schema::AgentAcpRegisterParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: pane_target,
+                cwd,
+                session: crate::api::schema::AcpSessionInfo {
+                    id: None,
+                    mode: crate::api::schema::AcpSessionMode::New,
+                },
+                adapter_version: Some("codex-acp test".into()),
+                adapter_command: Some(adapter_command.display().to_string()),
+                adapter_sha256: Some(adapter_sha256),
+            })
+            .unwrap();
+        } else {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        }
+        (terminal_id.to_string(), terminal_id)
+    }
+
+    fn mint_endpoint(
+        app: &mut App,
+        target: &str,
+    ) -> (
+        crate::api::schema::AcpEndpointLaunch,
+        crate::api::schema::AcpWorkerInfo,
+        crate::api::schema::AcpSessionInfo,
+        String,
+        String,
+    ) {
+        let response = app.handle_agent_acp_endpoint(
+            "endpoint".into(),
+            AgentAcpEndpointParams {
+                target: target.into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentAcpEndpoint {
+            endpoint,
+            worker,
+            session,
+            lifecycle,
+            ..
+        } = success.result
+        else {
+            panic!("expected ACP endpoint response");
+        };
+        let ticket = endpoint.args.last().unwrap().clone();
+        (endpoint, worker, session, lifecycle, ticket)
+    }
+
+    #[test]
+    fn acp_endpoint_rejects_normal_live_pty_workers() {
+        let mut app = app_with_agent();
+        let (target, _) = configure_codex_worker(&mut app, false);
+        let response =
+            app.handle_agent_acp_endpoint("endpoint".into(), AgentAcpEndpointParams { target });
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "acp_ownership_required");
+    }
+
+    #[tokio::test]
+    async fn acp_owned_endpoint_is_one_shot_and_detaches_back_to_ready() {
+        let mut app = app_with_agent();
+        let (target, _) = configure_codex_worker(&mut app, true);
+        let (endpoint, worker, session, lifecycle, ticket) = mint_endpoint(&mut app, &target);
+        assert_eq!(lifecycle, "acp_owned_ready");
+        assert_eq!(endpoint.protocol_version, 1);
+        assert_eq!(session.mode, crate::api::schema::AcpSessionMode::New);
+        assert!(session.id.is_none());
+        assert_eq!(endpoint.args[2], target);
+        assert_eq!(endpoint.args[4], worker.generation.to_string());
+
+        let attach_params = AgentAcpAttachParams {
+            target: target.clone(),
+            generation: worker.generation,
+            ticket,
+        };
+        let attached = app.handle_agent_acp_attach("attach".into(), attach_params.clone());
+        let attached: SuccessResponse = serde_json::from_str(&attached).unwrap();
+        let ResponseResult::AgentAcpAttached { launch } = attached.result else {
+            panic!("expected ACP attach response");
+        };
+        assert_eq!(launch.command, test_adapter_command().display().to_string());
+
+        let status = app.handle_agent_acp_status(
+            "status".into(),
+            AgentTarget {
+                target: target.clone(),
+            },
+        );
+        assert!(status.contains("\"lifecycle\":\"acp_owned_attached\""));
+        assert!(!status.contains(&launch.lease));
+        assert!(!status.contains("ticket"));
+        assert!(!status.contains("launch"));
+        let repeated_status = app.handle_agent_acp_status(
+            "status-2".into(),
+            AgentTarget {
+                target: target.clone(),
+            },
+        );
+        assert!(repeated_status.contains("\"lifecycle\":\"acp_owned_attached\""));
+
+        let replay = app.handle_agent_acp_attach("replay".into(), attach_params);
+        let replay: crate::api::schema::ErrorResponse = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay.error.code, "acp_ownership_required");
+
+        let detached = app.handle_agent_acp_detach(
+            "detach".into(),
+            AgentAcpDetachParams {
+                target: target.clone(),
+                generation: worker.generation,
+                lease: launch.lease,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&detached).is_ok());
+        assert_eq!(mint_endpoint(&mut app, &target).3, "acp_owned_ready");
+    }
+
+    #[tokio::test]
+    async fn acp_attach_revokes_worker_when_registered_adapter_changes() {
+        let mut app = app_with_agent();
+        let (target, terminal_id) = configure_codex_worker(&mut app, true);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let adapter_path =
+            std::env::temp_dir().join(format!("herdr-acp-adapter-{}-{nonce}", std::process::id()));
+        std::fs::write(&adapter_path, b"registered adapter").unwrap();
+        let registered_sha256 = crate::acp::adapter_sha256(&adapter_path).unwrap();
+        let owned = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .acp_owned_worker
+            .as_mut()
+            .unwrap();
+        owned.adapter_command = adapter_path.clone();
+        owned.adapter_sha256 = registered_sha256;
+
+        let (_endpoint, worker, _session, _lifecycle, ticket) = mint_endpoint(&mut app, &target);
+        std::fs::write(&adapter_path, b"replaced adapter").unwrap();
+        let response = app.handle_agent_acp_attach(
+            "attach".into(),
+            AgentAcpAttachParams {
+                target,
+                generation: worker.generation,
+                ticket,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "acp_adapter_changed");
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.acp_owned_worker.is_none());
+        assert!(terminal.acp_attach_ticket.is_none());
+        std::fs::remove_file(adapter_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_owned_worker_projects_idle_before_and_after_attach() {
+        let mut app = app_with_agent();
+        let (target, _) = configure_codex_worker(&mut app, true);
+        let list: SuccessResponse =
+            serde_json::from_str(&app.handle_agent_list("ready-list".into())).unwrap();
+        let ResponseResult::AgentList { agents } = list.result else {
+            panic!("expected agent list");
+        };
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_status, AgentStatus::Idle);
+
+        let (_endpoint, worker, _session, _lifecycle, ticket) = mint_endpoint(&mut app, &target);
+        let attached = app.handle_agent_acp_attach(
+            "attach".into(),
+            AgentAcpAttachParams {
+                target,
+                generation: worker.generation,
+                ticket,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&attached).is_ok());
+        let list: SuccessResponse =
+            serde_json::from_str(&app.handle_agent_list("attached-list".into())).unwrap();
+        let ResponseResult::AgentList { agents } = list.result else {
+            panic!("expected agent list");
+        };
+        assert_eq!(agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn acp_register_rejects_a_detected_agent_pane() {
+        let mut app = app_with_agent();
+        let (_target, terminal_id) = configure_codex_worker(&mut app, false);
+        let cwd = app.state.terminals[&terminal_id].cwd.display().to_string();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_target = app.public_pane_id(0, pane_id).unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let error = app
+            .register_acp_worker(crate::api::schema::AgentAcpRegisterParams {
+                name: "second".into(),
+                kind: "codex".into(),
+                pane_id: pane_target,
+                cwd,
+                session: crate::api::schema::AcpSessionInfo {
+                    id: None,
+                    mode: crate::api::schema::AcpSessionMode::New,
+                },
+                adapter_version: Some("codex-acp test".into()),
+                adapter_command: Some("/validated/codex-acp".into()),
+                adapter_sha256: Some([0; 32]),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "acp_placeholder_busy");
+    }
+
+    #[test]
+    fn acp_register_rejects_resume_and_load_sessions() {
+        for mode in [
+            crate::api::schema::AcpSessionMode::Load,
+            crate::api::schema::AcpSessionMode::Resume,
+        ] {
+            let mut app = app_with_agent();
+            let error = app
+                .register_acp_worker(crate::api::schema::AgentAcpRegisterParams {
+                    name: "reviewer".into(),
+                    kind: "codex".into(),
+                    pane_id: "w1:p1".into(),
+                    cwd: "/work".into(),
+                    session: crate::api::schema::AcpSessionInfo {
+                        id: Some("native-session-id".into()),
+                        mode,
+                    },
+                    adapter_version: Some("codex-acp test".into()),
+                    adapter_command: Some("/validated/codex-acp".into()),
+                    adapter_sha256: Some([0; 32]),
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "acp_session_mode_unsupported");
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_status_revokes_ownership_after_cwd_change() {
+        let mut app = app_with_agent();
+        let (target, terminal_id) = configure_codex_worker(&mut app, true);
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = "/different".into();
+        let status = app.handle_agent_acp_status("status".into(), AgentTarget { target });
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&status).unwrap();
+        assert_eq!(error.error.code, "acp_endpoint_stale");
+        assert!(app.state.terminals[&terminal_id].acp_owned_worker.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_status_revokes_ownership_when_placeholder_runtime_disappears() {
+        let mut app = app_with_agent();
+        let (target, terminal_id) = configure_codex_worker(&mut app, true);
+        app.terminal_runtimes.remove(&terminal_id);
+
+        let status = app.handle_agent_acp_status("status".into(), AgentTarget { target });
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&status).unwrap();
+        assert_eq!(error.error.code, "acp_endpoint_stale");
+        assert!(app.state.terminals[&terminal_id].acp_owned_worker.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_status_revokes_ownership_after_name_authority_is_cleared() {
+        let mut app = app_with_agent();
+        let (target, terminal_id) = configure_codex_worker(&mut app, true);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .clear_agent_name();
+
+        let status = app.handle_agent_acp_status("status".into(), AgentTarget { target });
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&status).unwrap();
+        assert_eq!(error.error.code, "acp_worker_unauthenticated");
+        assert!(app.state.terminals[&terminal_id].acp_owned_worker.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_endpoint_serialization_matches_tendwire_contract() {
+        let mut app = app_with_agent();
+        let (target, _) = configure_codex_worker(&mut app, true);
+        let response = app.handle_agent_acp_endpoint(
+            "tw:acp:endpoint".into(),
+            AgentAcpEndpointParams {
+                target: target.clone(),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let result = value["result"].as_object().unwrap();
+        assert_eq!(
+            result
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "adapter",
+                "cwd",
+                "endpoint",
+                "lifecycle",
+                "session",
+                "type",
+                "worker",
+            ])
+        );
+        assert_eq!(result["endpoint"]["command"], "herdr");
+        assert_eq!(result["endpoint"]["args"][2], target);
+        assert_eq!(result["endpoint"]["protocol_version"], 1);
+        assert_eq!(result["session"], serde_json::json!({"mode": "new"}));
+    }
+
+    #[tokio::test]
+    async fn acp_ticket_rejects_expiry_wrong_target_and_generation() {
+        let mut app = app_with_agent();
+        let (target, terminal_id) = configure_codex_worker(&mut app, true);
+        let (_endpoint, worker, _session, _lifecycle, ticket) = mint_endpoint(&mut app, &target);
+        let wrong_target = app.handle_agent_acp_attach(
+            "wrong-target".into(),
+            AgentAcpAttachParams {
+                target: "missing-worker".into(),
+                generation: worker.generation,
+                ticket: ticket.clone(),
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&wrong_target).is_ok());
+
+        let stale = app.handle_agent_acp_attach(
+            "stale".into(),
+            AgentAcpAttachParams {
+                target: target.clone(),
+                generation: worker.generation.wrapping_add(1),
+                ticket,
+            },
+        );
+        let stale: crate::api::schema::ErrorResponse = serde_json::from_str(&stale).unwrap();
+        assert_eq!(stale.error.code, "acp_endpoint_stale");
+
+        let (_endpoint, worker, _session, _lifecycle, ticket) = mint_endpoint(&mut app, &target);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .acp_attach_ticket
+            .as_mut()
+            .unwrap()
+            .expires_at = std::time::Instant::now();
+        let expired = app.handle_agent_acp_attach(
+            "expired".into(),
+            AgentAcpAttachParams {
+                target,
+                generation: worker.generation,
+                ticket,
+            },
+        );
+        let expired: crate::api::schema::ErrorResponse = serde_json::from_str(&expired).unwrap();
+        assert_eq!(expired.error.code, "acp_ticket_expired");
+    }
+
+    #[tokio::test]
+    async fn acp_secrets_never_leak_through_agent_list() {
+        let mut app = app_with_agent();
+        let (target, _) = configure_codex_worker(&mut app, true);
+        let (_, _, _, _, ticket) = mint_endpoint(&mut app, &target);
+        let list = app.handle_agent_list("list".into());
+        assert!(!list.contains(&ticket));
+        assert!(!list.contains("acp_attach_ticket"));
+        assert!(!list.contains("acp_owned_worker"));
     }
 
     #[tokio::test]

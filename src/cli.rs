@@ -750,6 +750,20 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
         .map_err(api_client_error_to_io)
 }
 
+pub(super) fn send_request_with_timeout(
+    request: &Request,
+    timeout: std::time::Duration,
+) -> std::io::Result<serde_json::Value> {
+    let client = ApiClient::local();
+    let status = client
+        .status_with_timeout(timeout)
+        .map_err(api_client_error_to_io)?;
+    ensure_server_protocol_status_compatible(status, &request.id)?;
+    client
+        .request_value_with_timeout(request, timeout)
+        .map_err(api_client_error_to_io)
+}
+
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
     ApiClient::local()
         .request_value(request)
@@ -758,6 +772,13 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
 
 fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
     let status = client.status().map_err(api_client_error_to_io)?;
+    ensure_server_protocol_status_compatible(status, request_id)
+}
+
+fn ensure_server_protocol_status_compatible(
+    status: crate::api::RuntimeStatus,
+    request_id: &str,
+) -> std::io::Result<()> {
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;

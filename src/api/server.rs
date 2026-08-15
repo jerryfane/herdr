@@ -29,6 +29,7 @@ pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const ACP_REGISTER_APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -349,12 +350,73 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
+        Method::AgentAcpRegister(mut params) => {
+            preflight_acp_registration(&mut params);
+            dispatch_to_app_with_timeout_and_write_completion(
+                Request {
+                    id: request.id,
+                    method: Method::AgentAcpRegister(params),
+                },
+                api_tx,
+                Some(ACP_REGISTER_APP_RESPONSE_TIMEOUT),
+                response_write_complete,
+            )
+        }
         _ => dispatch_to_app_with_timeout_and_write_completion(
             request,
             api_tx,
             None,
             response_write_complete,
         ),
+    }
+}
+
+fn preflight_acp_registration(params: &mut crate::api::schema::AgentAcpRegisterParams) {
+    preflight_acp_registration_with(params, |adapter| {
+        let command = crate::plugin_command::resolve_program_path(adapter.command)
+            .ok_or_else(|| std::io::Error::other("ACP adapter executable was not found"))?;
+        let sha256 = crate::acp::adapter_sha256(&command)?;
+        let version = crate::acp::probe_adapter_version_at(adapter, &command)?;
+        crate::acp::probe_adapter_capability_at(adapter, &command)?;
+        if crate::acp::adapter_sha256(&command)? != sha256 {
+            return Err(std::io::Error::other(
+                "ACP adapter changed while it was being validated",
+            ));
+        }
+        Ok((command, version, sha256))
+    });
+}
+
+fn preflight_acp_registration_with(
+    params: &mut crate::api::schema::AgentAcpRegisterParams,
+    probe: impl FnOnce(&crate::acp::AcpAdapterSpec) -> std::io::Result<(PathBuf, String, [u8; 32])>,
+) {
+    let valid_name = {
+        let mut chars = params.name.chars();
+        matches!(chars.next(), Some('a'..='z'))
+            && params.name.len() <= 32
+            && chars
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+    };
+    if !valid_name
+        || params.session.mode != crate::api::schema::AcpSessionMode::New
+        || params.session.id.is_some()
+    {
+        return;
+    }
+    let Some(agent) = crate::detect::parse_agent_label(&params.kind) else {
+        return;
+    };
+    let Some(adapter) = crate::acp::adapter_for(crate::detect::agent_label(agent)) else {
+        return;
+    };
+    // This connection thread owns the bounded subprocess wait. The request
+    // enters the app actor only after the probe, so rendering and terminal
+    // state remain available while a slow adapter reports its version.
+    if let Ok((command, version, sha256)) = probe(&adapter) {
+        params.adapter_command = command.to_str().map(str::to_string);
+        params.adapter_version = params.adapter_command.as_ref().map(|_| version);
+        params.adapter_sha256 = params.adapter_command.as_ref().map(|_| sha256);
     }
 }
 
@@ -413,6 +475,11 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
+        Method::AgentAcpEndpoint(_) => "agent.acp_endpoint",
+        Method::AgentAcpStatus(_) => "agent.acp_status",
+        Method::AgentAcpRegister(_) => "agent.acp_register",
+        Method::AgentAcpAttach(_) => "agent.acp_attach",
+        Method::AgentAcpDetach(_) => "agent.acp_detach",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
         Method::PaneMove(_) => "pane.move",
@@ -861,6 +928,50 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn acp_register_params() -> crate::api::schema::AgentAcpRegisterParams {
+        crate::api::schema::AgentAcpRegisterParams {
+            name: "reviewer".into(),
+            kind: "codex".into(),
+            pane_id: "w1:p1".into(),
+            cwd: "/work".into(),
+            session: crate::api::schema::AcpSessionInfo {
+                id: None,
+                mode: crate::api::schema::AcpSessionMode::New,
+            },
+            adapter_version: None,
+            adapter_command: None,
+            adapter_sha256: None,
+        }
+    }
+
+    #[test]
+    fn acp_registration_preflight_adds_server_owned_adapter_evidence() {
+        let mut params = acp_register_params();
+        preflight_acp_registration_with(&mut params, |_| {
+            Ok((
+                PathBuf::from("/validated/codex-acp"),
+                "codex-acp test".into(),
+                [7; 32],
+            ))
+        });
+        assert_eq!(params.adapter_version.as_deref(), Some("codex-acp test"));
+        assert_eq!(
+            params.adapter_command.as_deref(),
+            Some("/validated/codex-acp")
+        );
+        assert_eq!(params.adapter_sha256, Some([7; 32]));
+    }
+
+    #[test]
+    fn invalid_acp_registration_does_not_run_adapter_preflight() {
+        let mut params = acp_register_params();
+        params.name = "INVALID".into();
+        preflight_acp_registration_with(&mut params, |_| panic!("invalid request was probed"));
+        assert!(params.adapter_version.is_none());
+        assert!(params.adapter_command.is_none());
+        assert!(params.adapter_sha256.is_none());
     }
 
     fn unique_test_path(name: &str) -> PathBuf {

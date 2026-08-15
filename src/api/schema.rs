@@ -151,6 +151,16 @@ pub enum Method {
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
+    #[serde(rename = "agent.acp_endpoint")]
+    AgentAcpEndpoint(AgentAcpEndpointParams),
+    #[serde(rename = "agent.acp_status")]
+    AgentAcpStatus(AgentTarget),
+    #[serde(rename = "agent.acp_register")]
+    AgentAcpRegister(AgentAcpRegisterParams),
+    #[serde(rename = "agent.acp_attach")]
+    AgentAcpAttach(AgentAcpAttachParams),
+    #[serde(rename = "agent.acp_detach")]
+    AgentAcpDetach(AgentAcpDetachParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]

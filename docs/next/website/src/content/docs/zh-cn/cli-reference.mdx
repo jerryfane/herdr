@@ -297,6 +297,8 @@ herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
 herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
+herdr agent acp-register <name> --kind KIND --pane ID --cwd PATH --session-mode new
+herdr agent acp-status <target>
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
@@ -306,6 +308,10 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 `agent start` 会在现有可用 shell 窗格中启动智能体:交互式 shell 必须占用前台,不能有正在前台运行的命令、编辑器或智能体。拓扑必须单独创建。名称在实时智能体中必须唯一,并匹配 `[a-z][a-z0-9_-]{0,31}`。支持的 kind 是 `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli` 和 `maki`。名称属于当前窗格占用者,在该智能体退出、release 或被替换时清除;短暂的检测不确定不会清除它。
 
 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
+
+`agent acp-register` 用于显式初始化 ACP 所有的 worker。窗格必须是位于指定绝对 `--cwd` 的未占用 shell，并且必须安装对应的固定 adapter（`codex-acp`、`claude-agent-acp`、`gemini --acp` 或 `hermes acp`）。API 服务器会在注册进入 app runtime 前探测准确的 adapter 可执行文件并记录 hash。Hermes 的基础 version command 无法证明 ACP extra 已安装，因此还会执行单独的、有期限的 `hermes acp --help` capability check。attach 会重新验证 digest，可执行文件变化时要求重新注册。客户端应为普通 adapter 预留至少 13 秒，为 Hermes 预留 45 秒。原生 PTY 会话 ID 无法安全地由独立 ACP adapter 进程续用，所以只接受不带会话 ID 的 `--session-mode new`。注册仅存在于 runtime 中，Herdr 重启后必须重新执行。`agent acp-status` 返回不含秘密的所有权状态和 generation。会签发 ticket 的 `agent acp-attach` 是供受信任本地 coordinator 使用的私有启动机制，不是运维命令。
+
+Herdr 不会为普通的已检测 PTY 智能体创建 ACP sidecar。只有 worker 被显式注册、placeholder 仍由 shell 占用，且 terminal、pane topology、名称、agent kind、cwd 和 lifecycle generation 都保持一致时，ACP endpoint discovery 才会成功。
 
 `agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working 也会原子地提交文本和编码后的 Enter。使用 `--wait` 时，最初处于 settled 状态的智能体若生命周期序列前进，会返回 `delivery: "submitted"`。Herdr 会给 PTY 批次附加不透明的 composer attempt id。同一个 attempt 留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`，被观察到后清空时返回 `submitted`。bracketed paste 不依赖渲染后的 token 文本。
 

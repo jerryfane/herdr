@@ -1245,6 +1245,21 @@ impl App {
                     "agent.wait is handled by the api server",
                 );
             }
+            Method::AgentAcpEndpoint(params) => {
+                return self.handle_agent_acp_endpoint(request.id, params)
+            }
+            Method::AgentAcpStatus(params) => {
+                return self.handle_agent_acp_status(request.id, params)
+            }
+            Method::AgentAcpRegister(params) => {
+                return self.handle_agent_acp_register(request.id, params)
+            }
+            Method::AgentAcpAttach(params) => {
+                return self.handle_agent_acp_attach(request.id, params)
+            }
+            Method::AgentAcpDetach(params) => {
+                return self.handle_agent_acp_detach(request.id, params)
+            }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSendKeys(params) => {

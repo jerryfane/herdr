@@ -155,6 +155,122 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn acp_worker_requests_round_trip() {
+    let register = Request {
+        id: "register".into(),
+        method: Method::AgentAcpRegister(AgentAcpRegisterParams {
+            name: "reviewer".into(),
+            kind: "codex".into(),
+            pane_id: "w1:p2".into(),
+            cwd: "/work".into(),
+            session: AcpSessionInfo {
+                id: None,
+                mode: AcpSessionMode::New,
+            },
+            adapter_version: None,
+            adapter_command: None,
+            adapter_sha256: None,
+        }),
+    };
+    let endpoint = Request {
+        id: "endpoint".into(),
+        method: Method::AgentAcpEndpoint(AgentAcpEndpointParams {
+            target: "term_abc".into(),
+        }),
+    };
+    let status = Request {
+        id: "status".into(),
+        method: Method::AgentAcpStatus(AgentTarget {
+            target: "term_abc".into(),
+        }),
+    };
+    for request in [register, endpoint, status] {
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+    }
+}
+
+#[test]
+fn acp_registration_adapter_evidence_cannot_cross_the_wire() {
+    let value = serde_json::json!({
+        "id": "register",
+        "method": "agent.acp_register",
+        "params": {
+            "name": "reviewer",
+            "kind": "codex",
+            "pane_id": "w1:p2",
+            "cwd": "/work",
+            "session": {"mode": "new"},
+            "adapter_version": "caller-controlled",
+            "adapter_command": "/tmp/caller-controlled",
+            "adapter_sha256": [1, 2, 3]
+        }
+    });
+    let request: Request = serde_json::from_value(value).unwrap();
+    let Method::AgentAcpRegister(params) = &request.method else {
+        panic!("expected ACP register request");
+    };
+    assert!(params.adapter_version.is_none());
+    assert!(params.adapter_command.is_none());
+    assert!(params.adapter_sha256.is_none());
+    let serialized = serde_json::to_value(request).unwrap();
+    assert!(serialized["params"].get("adapter_version").is_none());
+    assert!(serialized["params"].get("adapter_command").is_none());
+    assert!(serialized["params"].get("adapter_sha256").is_none());
+}
+
+#[test]
+fn tendwire_acp_contract_fixture_matches_wire_schema() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/herdr_acp_contract_v1.json"
+    ))
+    .unwrap();
+    let request = Request {
+        id: "tw:acp:endpoint".into(),
+        method: Method::AgentAcpEndpoint(AgentAcpEndpointParams {
+            target: "term_abc".into(),
+        }),
+    };
+    let result = ResponseResult::AgentAcpEndpoint {
+        endpoint: AcpEndpointLaunch {
+            transport: "stdio".into(),
+            command: "herdr".into(),
+            args: vec![
+                "agent".into(),
+                "acp-attach".into(),
+                "term_abc".into(),
+                "--generation".into(),
+                "42".into(),
+                "--ticket".into(),
+                "1234567890123456789012345678901234567890123".into(),
+            ],
+            protocol_version: 1,
+        },
+        worker: AcpWorkerInfo {
+            terminal_id: "term_abc".into(),
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: "w1:p1".into(),
+            name: "reviewer".into(),
+            agent: "codex".into(),
+            generation: 42,
+        },
+        adapter: AcpAdapterInfo {
+            name: "codex-acp".into(),
+            version: "0.13.3".into(),
+        },
+        session: AcpSessionInfo {
+            id: None,
+            mode: AcpSessionMode::New,
+        },
+        cwd: "/work".into(),
+        lifecycle: "acp_owned_ready".into(),
+    };
+    assert_eq!(fixture["request"], serde_json::to_value(request).unwrap());
+    assert_eq!(fixture["result"], serde_json::to_value(result).unwrap());
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {

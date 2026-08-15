@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::{AgentInfo, AgentPromptDelivery};
+use super::agents::{AcpAdapterLaunch, AgentInfo, AgentPromptDelivery};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::gram::GramMessageInfo;
@@ -109,6 +109,27 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    AgentAcpEndpoint {
+        endpoint: super::agents::AcpEndpointLaunch,
+        worker: super::agents::AcpWorkerInfo,
+        adapter: super::agents::AcpAdapterInfo,
+        session: super::agents::AcpSessionInfo,
+        cwd: String,
+        lifecycle: String,
+    },
+    AgentAcpStatus {
+        worker: super::agents::AcpWorkerInfo,
+        adapter: super::agents::AcpAdapterInfo,
+        session: super::agents::AcpSessionInfo,
+        cwd: String,
+        lifecycle: String,
+    },
+    AgentAcpRegistered {
+        agent: AgentInfo,
+    },
+    AgentAcpAttached {
+        launch: AcpAdapterLaunch,
     },
     AgentView {
         active: bool,

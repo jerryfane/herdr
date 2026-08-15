@@ -297,6 +297,8 @@ herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
 herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
+herdr agent acp-register <name> --kind KIND --pane ID --cwd PATH --session-mode new
+herdr agent acp-status <target>
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
@@ -306,6 +308,10 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 `agent start` は既存の利用可能なシェルペインを起動対象にします。対話シェル自身がフォアグラウンドを所有し、フォアグラウンドのコマンド、エディタ、エージェントが動いていない必要があります。トポロジーは別に作成します。名前はライブエージェント間で一意で、`[a-z][a-z0-9_-]{0,31}` に一致する必要があります。対応する kind は `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`maki` です。名前は現在のペイン占有者に属し、そのエージェントの終了、release、置換で消えます。一時的に検出できないだけでは消えません。
 
 start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
+
+`agent acp-register` は ACP 所有ワーカーを明示的に初期化します。ペインは指定された絶対 `--cwd` にある未所有のシェルでなければならず、対応する固定アダプター（`codex-acp`、`claude-agent-acp`、`gemini --acp`、`hermes acp`）が必要です。API サーバーは app runtime に登録する前に、正確なアダプター実行ファイルを検証して hash を記録します。Hermes では基本の version command だけでは ACP extra の存在を証明できないため、別途期限付きの `hermes acp --help` capability check も行います。attach は digest を再検証し、実行ファイルが変わっていれば再登録を要求します。クライアントは通常の adapter では少なくとも 13 秒、Hermes では 45 秒を許容してください。ネイティブ PTY セッション ID を別の ACP プロセスへ安全に引き継げないため、セッション ID なしの `--session-mode new` のみを受け付けます。登録は runtime 限定で、Herdr の再起動後に繰り返す必要があります。`agent acp-status` は秘密情報を含まない所有状態と generation を返します。ticket を発行する `agent acp-attach` は信頼されたローカル coordinator 向けの非公開起動機構であり、運用者向けコマンドではありません。
+
+Herdr は通常の検出済み PTY エージェントに ACP sidecar を作成しません。明示的に登録され、placeholder が引き続きシェル所有であり、同じ terminal、pane topology、名前、agent kind、cwd、lifecycle generation に一致する場合に限って ACP endpoint discovery が成功します。
 
 `agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストとエンコード済み Enter をアトミックに送信します。`--wait` では、最初に settled だったエージェントのライフサイクルシーケンスが進むと `delivery: "submitted"` になります。Herdr は PTY バッチに不透明な composer attempt id を付けます。同じ attempt がカーソルで裏付けられたコンポーザーに残れば `agent_prompt_unsubmitted`、観測後に消えれば `submitted` です。bracketed paste は表示された token の文字列に依存しません。
 
