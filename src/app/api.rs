@@ -764,14 +764,16 @@ impl App {
             else {
                 continue;
             };
-            let Some(agent_label) = self
-                .state
-                .terminals
-                .get(&pane.attached_terminal_id)
-                .and_then(|terminal| terminal.effective_agent_label())
-            else {
+            let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
                 continue;
             };
+            // Only agent panes notify — an unrecognised terminal has no effective label.
+            let Some(agent_label) = terminal.effective_agent_label() else {
+                continue;
+            };
+            // Prefer the human agent name in the alert title ("jarvis needs attention");
+            // fall back to the detected tool label ("claude") when the agent is unnamed.
+            let agent_display = push_title_agent(terminal.agent_name.as_deref(), agent_label);
             let Some(public_pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
                 continue;
             };
@@ -791,7 +793,7 @@ impl App {
             // payload is a 413 that would be silently dropped. Reuse the local toast path's
             // sanitize+truncate (title 80, body 240); a title that sanitizes away is skipped.
             let Some(title) =
-                sanitized_notification_text(&format!("{agent_label} {event_text}"), 80)
+                sanitized_notification_text(&format!("{agent_display} {event_text}"), 80)
             else {
                 continue;
             };
@@ -1743,6 +1745,17 @@ fn push_kind_for(from_pane_death: bool, kind: Option<ToastKind>) -> Option<crate
     }
 }
 
+/// The name to put in a push-notification title: the human agent name when the
+/// user has set one, otherwise the detected tool label. So "jarvis needs
+/// attention" for a named agent, falling back to "claude needs attention" when
+/// it is unnamed. A blank or whitespace-only name is treated as unset.
+fn push_title_agent<'a>(agent_name: Option<&'a str>, agent_label: &'a str) -> &'a str {
+    agent_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(agent_label)
+}
+
 fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
     let mut sanitized = String::new();
     let mut previous_space = false;
@@ -1819,6 +1832,19 @@ pub(super) mod test_support {
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
+
+    #[test]
+    fn push_title_agent_prefers_name_over_label() {
+        // Named agent → the human name leads the title.
+        assert_eq!(push_title_agent(Some("jarvis"), "claude"), "jarvis");
+        // Unnamed → fall back to the detected tool label.
+        assert_eq!(push_title_agent(None, "claude"), "claude");
+        // A blank or whitespace-only name is not a name — fall back, and the
+        // returned name is trimmed when it is used.
+        assert_eq!(push_title_agent(Some(""), "codex"), "codex");
+        assert_eq!(push_title_agent(Some("   "), "codex"), "codex");
+        assert_eq!(push_title_agent(Some("  jarvis  "), "claude"), "jarvis");
+    }
 
     #[test]
     fn push_kind_for_maps_events_and_transitions() {
