@@ -1100,6 +1100,12 @@ impl App {
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
             }
+            Method::NotificationsRegisterActivity(params) => {
+                return self.handle_notifications_register_activity(request.id, params);
+            }
+            Method::NotificationsUnregisterActivity(params) => {
+                return self.handle_notifications_unregister_activity(request.id, params);
+            }
             Method::GramSend(params) => return self.handle_gram_send(request.id, params),
             Method::GramPost(params) => return self.handle_gram_post(request.id, params),
             Method::GramList(params) => return self.handle_gram_list(request.id, params),
@@ -1452,6 +1458,60 @@ impl App {
         }
     }
 
+    fn handle_notifications_register_activity(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsRegisterActivityParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.activity_push_token.trim();
+        if !is_valid_apns_activity_token(token) {
+            return responses::encode_error(
+                id,
+                "invalid_params",
+                "activity_push_token must be 32-512 hexadecimal characters",
+            );
+        }
+
+        // No-session/monolithic mode has no shared registry to persist to; ack without disk,
+        // mirroring handle_notifications_register_device.
+        if self.no_session {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+
+        let activity = crate::persist::activities::RegisteredActivity {
+            activity_push_token: token.to_string(),
+            registered_unix_ms: unix_millis_now(),
+        };
+        match crate::persist::activities::upsert(activity) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => {
+                responses::encode_error(id, "activity_registry_save_failed", err.to_string())
+            }
+        }
+    }
+
+    fn handle_notifications_unregister_activity(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsRegisterActivityParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.activity_push_token.trim();
+        // Best-effort: nothing to prune in no-session mode or for an empty token.
+        if self.no_session || token.is_empty() {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+        match crate::persist::activities::remove_token(token) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => {
+                responses::encode_error(id, "activity_registry_save_failed", err.to_string())
+            }
+        }
+    }
+
     fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
         if !self.state.local_sound_playback || !self.state.sound.allows(None) {
             return;
@@ -1482,6 +1542,11 @@ fn unix_millis_now() -> u64 {
 /// registration cannot bloat the store.
 fn is_valid_apns_device_token(token: &str) -> bool {
     (32..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Live Activity push tokens are hex like device tokens but LONGER, so allow a wider range.
+fn is_valid_apns_activity_token(token: &str) -> bool {
+    (32..=512).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Map a pane update to the push kind to deliver, if any.

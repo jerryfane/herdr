@@ -4,6 +4,7 @@
 //! Optional pane screen history is stored separately at `session-history.json`.
 //! Installed plugins are persisted separately at `plugins.json`.
 
+pub mod activities;
 pub mod devices;
 pub mod gram;
 pub mod gram_files;

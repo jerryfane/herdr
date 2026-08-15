@@ -106,6 +106,14 @@ pub struct NotificationsRegisterDeviceParams {
     pub notify_gram: bool,
 }
 
+/// Register / unregister an iOS Live Activity push token for BACKGROUND widget updates.
+/// The field name matches the iOS client's `RegisterActivityParams` contract; the same
+/// struct serves both `notifications.register_activity` and `.unregister_activity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NotificationsRegisterActivityParams {
+    pub activity_push_token: String,
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
 )]
