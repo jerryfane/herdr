@@ -69,6 +69,10 @@ pub enum Method {
     CommandInvoke(CommandInvokeParams),
     #[serde(rename = "notifications.register_device")]
     NotificationsRegisterDevice(NotificationsRegisterDeviceParams),
+    #[serde(rename = "notifications.register_activity")]
+    NotificationsRegisterActivity(NotificationsRegisterActivityParams),
+    #[serde(rename = "notifications.unregister_activity")]
+    NotificationsUnregisterActivity(NotificationsRegisterActivityParams),
     #[serde(rename = "gram.send")]
     GramSend(GramSendParams),
     #[serde(rename = "gram.post")]

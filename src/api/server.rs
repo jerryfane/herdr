@@ -426,6 +426,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
         Method::CommandInvoke(_) => "command.invoke",
         Method::NotificationsRegisterDevice(_) => "notifications.register_device",
+        Method::NotificationsRegisterActivity(_) => "notifications.register_activity",
+        Method::NotificationsUnregisterActivity(_) => "notifications.unregister_activity",
         Method::GramSend(_) => "gram.send",
         Method::GramPost(_) => "gram.post",
         Method::GramList(_) => "gram.list",
