@@ -14,19 +14,11 @@ mod apns;
 mod jwt;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::PushConfig;
 use crate::persist::devices::RegisteredDevice;
 
 use self::apns::DeliveryOutcome;
-
-/// Whether any iOS Live Activity is currently registered. A cheap gate the app loop reads
-/// instead of touching `activities.json` on every agent-status change (that disk read must
-/// not sit on the hot loop). Set true by `notifications.register_activity`; cleared here when
-/// a send finds the store empty. Defaults true so activities persisted across a daemon
-/// restart are not missed before the app re-registers.
-pub(crate) static LIVE_ACTIVITY_PRESENT: AtomicBool = AtomicBool::new(true);
 
 /// Which agent transition triggered a push, used to match per-device prefs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,9 +219,6 @@ pub(crate) fn deliver_live_activity(
 
     let activities = crate::persist::activities::load();
     if activities.is_empty() {
-        // Nothing registered — tell the app loop to stop spawning senders until a new
-        // registration flips the gate back on.
-        LIVE_ACTIVITY_PRESENT.store(false, Ordering::Relaxed);
         return;
     }
 

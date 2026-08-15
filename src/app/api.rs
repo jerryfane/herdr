@@ -841,11 +841,10 @@ impl App {
         if self.no_session || !crate::push::enabled(&self.state.push_config) {
             return;
         }
-        // Cheap gate (no disk on the hot loop): nothing registered → nothing to do.
-        if !crate::push::LIVE_ACTIVITY_PRESENT.load(Ordering::Relaxed) {
-            return;
-        }
 
+        // The aggregate is computed from in-memory state (no disk on the hot loop). The
+        // activity-store read + the send happen off-loop in the spawned thread below; the
+        // dedup + monotonic-timestamp bookkeeping here is all lock-free on this one thread.
         let content_state = live_activity_content_state(&self.collect_agent_infos());
 
         // Dedup: skip when the aggregate is unchanged since the last dispatch. Status-change
@@ -1539,10 +1538,9 @@ impl App {
         };
         match crate::persist::activities::upsert(activity) {
             Ok(_) => {
-                // A widget is registered again: re-open the app-loop gate and reset the dedup
-                // hash so the next status change is delivered to the newly-registered activity.
-                crate::push::LIVE_ACTIVITY_PRESENT
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Reset the dedup hash so the next status change is delivered to the
+                // newly-registered activity even if the aggregate is unchanged since the
+                // last send.
                 LAST_LIVE_ACTIVITY_HASH.store(0, std::sync::atomic::Ordering::Relaxed);
                 responses::encode_success(id, ResponseResult::Ok {})
             }
