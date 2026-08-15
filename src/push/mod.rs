@@ -71,6 +71,13 @@ fn device_wants(device: &RegisteredDevice, kind: PushKind) -> bool {
     }
 }
 
+/// True when the owner has muted this notification's pane on this device.
+/// A blank `pane_id` (gram pushes carry none) is never muted, so gram alerts
+/// are unaffected by per-agent mutes.
+fn device_muted(device: &RegisteredDevice, pane_id: &str) -> bool {
+    !pane_id.is_empty() && device.muted_panes.iter().any(|muted| muted == pane_id)
+}
+
 fn unix_secs_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -140,6 +147,9 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
                 continue;
             }
             if !device_wants(device, notification.kind) {
+                continue;
+            }
+            if device_muted(device, &notification.pane_id) {
                 continue;
             }
             let mut outcome =
@@ -334,6 +344,7 @@ mod tests {
             notify_dies: dies,
             notify_finishes: finishes,
             notify_gram: false,
+            muted_panes: Vec::new(),
             registered_unix_ms: 0,
         }
     }
@@ -374,5 +385,21 @@ mod tests {
         assert!(!device_wants(&d, PushKind::Gram));
         d.notify_gram = true;
         assert!(device_wants(&d, PushKind::Gram));
+    }
+
+    #[test]
+    fn device_muted_skips_only_muted_panes() {
+        let mut d = device(true, true, true);
+        d.muted_panes = vec!["w1:p2".to_string(), "w1:p5".to_string()];
+
+        assert!(device_muted(&d, "w1:p2")); // muted
+        assert!(device_muted(&d, "w1:p5")); // muted
+        assert!(!device_muted(&d, "w1:p3")); // a different pane is not muted
+                                             // Gram pushes carry an empty pane id and are never muted.
+        assert!(!device_muted(&d, ""));
+
+        // No mutes → nothing skipped.
+        let clear = device(true, true, true);
+        assert!(!device_muted(&clear, "w1:p2"));
     }
 }

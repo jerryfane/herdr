@@ -104,6 +104,11 @@ pub struct NotificationsRegisterDeviceParams {
     pub notify_finishes: bool,
     #[serde(default)]
     pub notify_gram: bool,
+    /// Public pane ids the owner has muted on this device. Pushes for a muted
+    /// pane are skipped for this device. The client owns the set and sends the
+    /// full list on each change; absent on older clients.
+    #[serde(default)]
+    pub muted_panes: Vec<String>,
 }
 
 /// Register / unregister an iOS Live Activity push token for BACKGROUND widget updates.

@@ -2870,6 +2870,14 @@
             "device_token": {
               "type": "string"
             },
+            "muted_panes": {
+              "default": [],
+              "description": "Public pane ids the owner has muted on this device. Pushes for a muted\npane are skipped for this device. The client owns the set and sends the\nfull list on each change; absent on older clients.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "notify_dies": {
               "default": false,
               "type": "boolean"
