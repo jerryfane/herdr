@@ -1668,12 +1668,25 @@ fn live_activity_content_state(agents: &[crate::api::schema::AgentInfo]) -> serd
         None => ("No agents".to_string(), "idle"),
     };
 
+    // Only the working state carries a start time (Unix SECONDS) — the lead agent's
+    // last completed-turn boundary ≈ its current turn's start. The iOS widget drives a
+    // live `Text(_, style:.timer)` off it, the one thing a Live Activity actually
+    // animates, so the working state shows real motion even on a locked phone. Null
+    // otherwise. Key is camelCase to match the client's `ContentState` Codable.
+    let working_since = if status == "working" {
+        lead.and_then(|agent| agent.last_completed_turn.as_ref())
+            .map(|turn| turn.completed_unix_ms as f64 / 1000.0)
+    } else {
+        None
+    };
+
     serde_json::json!({
         "headline": headline,
         "status": status,
         "needsYouCount": needs_you_count,
         "workingCount": working_count,
         "totalCount": agents.len(),
+        "workingSince": working_since,
     })
 }
 
@@ -1730,6 +1743,31 @@ mod live_activity_content_state_tests {
         let cs = live_activity_content_state(&agents);
         assert_eq!(cs["headline"], "b");
         assert_eq!(cs["status"], "working");
+    }
+
+    #[test]
+    fn working_since_is_turn_boundary_in_seconds_only_while_working() {
+        fn working_with_turn(ms: u64) -> AgentInfo {
+            let value = serde_json::json!({
+                "terminal_id": "t", "agent_status": "working", "workspace_id": "ws",
+                "tab_id": "tab", "pane_id": "pane", "focused": false, "revision": 1,
+                "name": "b",
+                "last_completed_turn": { "turn": 1, "turn_epoch": 1, "completed_unix_ms": ms },
+            });
+            serde_json::from_value(value).expect("agent info deserializes")
+        }
+        // Working lead with a completed-turn boundary → workingSince in SECONDS.
+        let cs = live_activity_content_state(&[working_with_turn(1_700_000_000_000)]);
+        assert_eq!(cs["status"], "working");
+        assert_eq!(cs["workingSince"], 1_700_000_000.0);
+
+        // Working but no completed turn yet → null (nothing to count from).
+        let cs = live_activity_content_state(&[agent("working", Some("b"))]);
+        assert!(cs["workingSince"].is_null());
+
+        // Non-working lead → null regardless of any turn boundary.
+        let cs = live_activity_content_state(&[agent("idle", Some("a"))]);
+        assert!(cs["workingSince"].is_null());
     }
 }
 
