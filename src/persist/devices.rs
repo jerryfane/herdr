@@ -30,6 +30,12 @@ pub struct RegisteredDevice {
     /// Deliver a push when an agent sends the owner a gram message.
     #[serde(default)]
     pub notify_gram: bool,
+    /// Public pane ids the owner has muted on this device. A push whose
+    /// `pane_id` is in this set is skipped for this device (agent/gram pushes
+    /// unaffected — gram pushes carry no pane id). Muting is per-pane, so a
+    /// newly opened agent starts un-muted. Empty for legacy records.
+    #[serde(default)]
+    pub muted_panes: Vec<String>,
     /// Registration time in Unix milliseconds.
     pub registered_unix_ms: u64,
 }
@@ -164,6 +170,7 @@ mod tests {
             notify_dies: true,
             notify_finishes: false,
             notify_gram: false,
+            muted_panes: Vec::new(),
             registered_unix_ms: 1_700_000_000_000,
         }
     }
@@ -190,6 +197,21 @@ mod tests {
             std::env::temp_dir().join(format!("herdr-devices-missing-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(load_from_path(&path).is_empty());
+    }
+
+    #[test]
+    fn legacy_record_without_muted_panes_decodes_to_empty() {
+        // A devices.json written before per-agent mute existed has no
+        // `muted_panes` field; #[serde(default)] must decode it to an empty set
+        // (never fail the load) so muting is simply off for legacy records.
+        let legacy = r#"[{"device_token":"abc","platform":"ios",
+            "notify_needs_input":true,"notify_dies":true,"notify_finishes":false,
+            "registered_unix_ms":1700000000000}]"#;
+        let devices: Vec<RegisteredDevice> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].muted_panes.is_empty());
+        // notify_gram (also #[serde(default)]) likewise defaults.
+        assert!(!devices[0].notify_gram);
     }
 
     #[test]

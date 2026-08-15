@@ -1494,6 +1494,20 @@ impl App {
             return responses::encode_success(id, ResponseResult::Ok {});
         }
 
+        // The client owns the mute set and re-sends it whole on each change;
+        // store a tidied copy (blank entries dropped, sorted, de-duplicated) so
+        // the on-disk record stays bounded and deterministic.
+        let muted_panes = {
+            let mut panes: Vec<String> = params
+                .muted_panes
+                .into_iter()
+                .filter(|pane| !pane.trim().is_empty())
+                .collect();
+            panes.sort();
+            panes.dedup();
+            panes
+        };
+
         let device = crate::persist::devices::RegisteredDevice {
             device_token: device_token.to_string(),
             platform: platform.to_string(),
@@ -1501,6 +1515,7 @@ impl App {
             notify_dies: params.notify_dies,
             notify_finishes: params.notify_finishes,
             notify_gram: params.notify_gram,
+            muted_panes,
             registered_unix_ms: unix_millis_now(),
         };
 
