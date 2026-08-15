@@ -2852,6 +2852,18 @@
           ],
           "type": "string"
         },
+        "NotificationsRegisterActivityParams": {
+          "description": "Register / unregister an iOS Live Activity push token for BACKGROUND widget updates.\nThe field name matches the iOS client's `RegisterActivityParams` contract; the same\nstruct serves both `notifications.register_activity` and `.unregister_activity`.",
+          "properties": {
+            "activity_push_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "activity_push_token"
+          ],
+          "type": "object"
+        },
         "NotificationsRegisterDeviceParams": {
           "description": "Register (or update) a mobile device for remote push notifications.\n\nField names match the iOS client's `RegisterDeviceParams` contract. The\n`notify_*` preferences default to `false` so a partial payload never fails\ndeserialization; the client sends explicit values.",
           "properties": {
@@ -5146,6 +5158,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/NotificationsRegisterDeviceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "notifications.register_activity",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/NotificationsRegisterActivityParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "notifications.unregister_activity",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/NotificationsRegisterActivityParams"
             }
           },
           "required": [

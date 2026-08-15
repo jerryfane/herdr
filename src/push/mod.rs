@@ -194,6 +194,117 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
     }
 }
 
+/// Deliver ONE Live Activity content-state update to every registered activity push token,
+/// so the lock-screen / Dynamic Island widget refreshes while the app is closed. Mirrors
+/// [`deliver`]: read the activity store, mint/reuse one JWT, POST to each token with
+/// `apns-push-type: liveactivity` on the widget sub-topic, and prune any token APNs reports
+/// as gone (410). Best-effort; intended to run on a detached thread.
+pub(crate) fn deliver_live_activity(cfg: PushConfig, content_state: serde_json::Value) {
+    if !enabled(&cfg) {
+        return;
+    }
+    // `enabled` guarantees these are all `Some`.
+    let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
+        cfg.key_path.as_deref(),
+        cfg.key_id.as_deref(),
+        cfg.team_id.as_deref(),
+        cfg.topic.as_deref(),
+    ) else {
+        return;
+    };
+
+    let activities = crate::persist::activities::load();
+    if activities.is_empty() {
+        return;
+    }
+
+    let resolved_key_path = crate::worktree::expand_tilde_path(key_path);
+    let pem = match std::fs::read_to_string(&resolved_key_path) {
+        Ok(pem) => pem,
+        Err(err) => {
+            tracing::warn!(
+                path = %resolved_key_path.display(),
+                error = %err,
+                "failed to read APNs signing key; skipping live-activity push"
+            );
+            return;
+        }
+    };
+
+    let mut jwt = match jwt::auth_token(&pem, key_id, team_id, unix_secs_now()) {
+        Ok(jwt) => jwt,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to build APNs auth token; skipping live-activity push");
+            return;
+        }
+    };
+    let mut reminted = false;
+
+    // The Live Activity topic is a distinct sub-topic of the app bundle id, and the whole
+    // session shares ONE content-state, so build the payload once.
+    let la_topic = format!("{topic}.push-type.liveactivity");
+    let payload = apns::live_activity_payload(&content_state, unix_secs_now());
+
+    let mut tokens_to_prune: HashSet<String> = HashSet::new();
+    for activity in &activities {
+        if tokens_to_prune.contains(&activity.activity_push_token) {
+            continue;
+        }
+        let mut outcome = apns::deliver_one_typed(
+            &activity.activity_push_token,
+            &jwt,
+            &la_topic,
+            cfg.sandbox,
+            "liveactivity",
+            "5",
+            &payload,
+        );
+        if outcome == DeliveryOutcome::AuthExpired && !reminted {
+            reminted = true;
+            jwt::clear_cache();
+            match jwt::auth_token(&pem, key_id, team_id, unix_secs_now()) {
+                Ok(fresh) => {
+                    jwt = fresh;
+                    outcome = apns::deliver_one_typed(
+                        &activity.activity_push_token,
+                        &jwt,
+                        &la_topic,
+                        cfg.sandbox,
+                        "liveactivity",
+                        "5",
+                        &payload,
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to re-mint APNs auth token; aborting live-activity batch");
+                    break;
+                }
+            }
+        }
+        match outcome {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::PruneToken => {
+                tokens_to_prune.insert(activity.activity_push_token.clone());
+            }
+            DeliveryOutcome::AuthExpired => {
+                tracing::warn!(
+                    "apns auth token rejected (403) after re-mint; aborting live-activity batch"
+                );
+                break;
+            }
+            DeliveryOutcome::Failed => {}
+        }
+    }
+
+    for token in tokens_to_prune {
+        match crate::persist::activities::remove_token(&token) {
+            Ok(true) => tracing::info!("pruned an unregistered live-activity token"),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(error = %err, "failed to prune live-activity token"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

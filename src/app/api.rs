@@ -190,6 +190,7 @@ impl App {
                 self.emit_pane_state_update(&update);
                 self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
                 self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
+                self.emit_live_activity_updates();
             }
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)
@@ -302,6 +303,7 @@ impl App {
             self.emit_pane_state_update(update);
         }
         self.emit_apns_agent_notifications(&pane_updates, false);
+        self.emit_live_activity_updates();
         self.sync_agent_metadata_deadline();
         if let Some((
             overlay,
@@ -826,6 +828,28 @@ impl App {
             .spawn(move || crate::push::deliver(cfg, notifications))
         {
             tracing::warn!(error = %err, "failed to spawn push sender thread; dropping batch");
+        }
+    }
+
+    /// Push the session's aggregate agent status to every registered Live Activity, so the
+    /// lock-screen / Dynamic Island widget refreshes while the app is closed. Fired from the
+    /// same sites as `emit_apns_agent_notifications` (i.e. whenever agent status changes).
+    /// Best-effort + detached; a no-op when push is off or no Live Activity is registered.
+    fn emit_live_activity_updates(&self) {
+        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+            return;
+        }
+        // Skip the aggregate + the thread entirely when no Live Activity is registered.
+        if crate::persist::activities::load().is_empty() {
+            return;
+        }
+        let content_state = live_activity_content_state(&self.collect_agent_infos());
+        let cfg = self.state.push_config.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("herdr-liveactivity".to_string())
+            .spawn(move || crate::push::deliver_live_activity(cfg, content_state))
+        {
+            tracing::warn!(error = %err, "failed to spawn live-activity sender thread; dropping update");
         }
     }
 
@@ -1547,6 +1571,118 @@ fn is_valid_apns_device_token(token: &str) -> bool {
 /// Live Activity push tokens are hex like device tokens but LONGER, so allow a wider range.
 fn is_valid_apns_activity_token(token: &str) -> bool {
     (32..=512).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Aggregate a session's agents into the Live Activity content-state the widget renders.
+/// Keys MUST match the app's `AgentActivityAttributes.State` (camelCase). The status +
+/// priority mirror the iOS `AgentGroup` / `LiveActivityController` mapping so the background
+/// (push) and foreground (in-app) computations agree: needs-you (blocked/unknown) outranks
+/// working, which outranks idle; a dead pane simply drops off this live list.
+fn live_activity_content_state(agents: &[crate::api::schema::AgentInfo]) -> serde_json::Value {
+    use crate::api::schema::AgentStatus;
+
+    fn rank(status: AgentStatus) -> u8 {
+        match status {
+            AgentStatus::Blocked => 0,
+            AgentStatus::Unknown => 2,
+            AgentStatus::Working => 3,
+            AgentStatus::Idle | AgentStatus::Done => 4,
+        }
+    }
+    fn status_str(status: AgentStatus) -> &'static str {
+        match status {
+            AgentStatus::Blocked | AgentStatus::Unknown => "needsYou",
+            AgentStatus::Working => "working",
+            AgentStatus::Idle | AgentStatus::Done => "idle",
+        }
+    }
+
+    let needs_you_count = agents
+        .iter()
+        .filter(|agent| agent.agent_status == AgentStatus::Blocked)
+        .count();
+    let working_count = agents
+        .iter()
+        .filter(|agent| agent.agent_status == AgentStatus::Working)
+        .count();
+
+    let lead = agents.iter().min_by_key(|agent| rank(agent.agent_status));
+    let (headline, status) = match lead {
+        Some(agent) => (
+            agent
+                .name
+                .clone()
+                .or_else(|| agent.terminal_title_stripped.clone())
+                .or_else(|| agent.agent.clone())
+                .unwrap_or_else(|| "agent".to_string()),
+            status_str(agent.agent_status),
+        ),
+        None => ("No agents".to_string(), "idle"),
+    };
+
+    serde_json::json!({
+        "headline": headline,
+        "status": status,
+        "needsYouCount": needs_you_count,
+        "workingCount": working_count,
+        "totalCount": agents.len(),
+    })
+}
+
+#[cfg(test)]
+mod live_activity_content_state_tests {
+    use super::live_activity_content_state;
+    use crate::api::schema::AgentInfo;
+
+    fn agent(status: &str, name: Option<&str>) -> AgentInfo {
+        let mut value = serde_json::json!({
+            "terminal_id": "t",
+            "agent_status": status,
+            "workspace_id": "ws",
+            "tab_id": "tab",
+            "pane_id": "pane",
+            "focused": false,
+            "revision": 1,
+        });
+        if let Some(name) = name {
+            value["name"] = serde_json::Value::String(name.to_string());
+        }
+        serde_json::from_value(value).expect("agent info deserializes")
+    }
+
+    #[test]
+    fn empty_session_reports_no_agents_idle() {
+        let cs = live_activity_content_state(&[]);
+        assert_eq!(cs["headline"], "No agents");
+        assert_eq!(cs["status"], "idle");
+        assert_eq!(cs["totalCount"], 0);
+        assert_eq!(cs["needsYouCount"], 0);
+        assert_eq!(cs["workingCount"], 0);
+    }
+
+    #[test]
+    fn blocked_leads_and_counts_are_reported() {
+        // Blocked (needs you) outranks working and idle regardless of list order.
+        let agents = [
+            agent("working", Some("builder")),
+            agent("blocked", Some("reviewer")),
+            agent("idle", Some("idler")),
+        ];
+        let cs = live_activity_content_state(&agents);
+        assert_eq!(cs["headline"], "reviewer");
+        assert_eq!(cs["status"], "needsYou");
+        assert_eq!(cs["needsYouCount"], 1);
+        assert_eq!(cs["workingCount"], 1);
+        assert_eq!(cs["totalCount"], 3);
+    }
+
+    #[test]
+    fn working_leads_when_nothing_needs_you() {
+        let agents = [agent("idle", Some("a")), agent("working", Some("b"))];
+        let cs = live_activity_content_state(&agents);
+        assert_eq!(cs["headline"], "b");
+        assert_eq!(cs["status"], "working");
+    }
 }
 
 /// Map a pane update to the push kind to deliver, if any.
