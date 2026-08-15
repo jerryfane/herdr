@@ -1497,18 +1497,9 @@ impl App {
         }
 
         // The client owns the mute set and re-sends it whole on each change;
-        // store a tidied copy (blank entries dropped, sorted, de-duplicated) so
-        // the on-disk record stays bounded and deterministic.
-        let muted_panes = {
-            let mut panes: Vec<String> = params
-                .muted_panes
-                .into_iter()
-                .filter(|pane| !pane.trim().is_empty())
-                .collect();
-            panes.sort();
-            panes.dedup();
-            panes
-        };
+        // store a normalised copy (trimmed, blanks dropped, sorted, de-duplicated,
+        // count-capped) so the on-disk record is deterministic and truly bounded.
+        let muted_panes = sanitize_muted_panes(params.muted_panes);
 
         let device = crate::persist::devices::RegisteredDevice {
             device_token: device_token.to_string(),
@@ -1771,6 +1762,25 @@ fn push_title_agent<'a>(agent_name: Option<&'a str>, agent_label: &'a str) -> &'
         .unwrap_or(agent_label)
 }
 
+/// The largest muted-pane set we persist per device. A defensive bound so a
+/// malformed client cannot bloat `devices.json` — a real owner mutes a handful.
+const MAX_MUTED_PANES: usize = 512;
+
+/// Normalise a client-supplied muted-pane set for storage: TRIM each id (so a
+/// padded id still matches `push::device_muted`'s exact-equality skip rather than
+/// silently never matching), drop blanks, sort + de-duplicate, and cap the count.
+fn sanitize_muted_panes(panes: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = panes
+        .into_iter()
+        .map(|pane| pane.trim().to_string())
+        .filter(|pane| !pane.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_MUTED_PANES);
+    out
+}
+
 fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
     let mut sanitized = String::new();
     let mut previous_space = false;
@@ -1859,6 +1869,27 @@ mod tests {
         assert_eq!(push_title_agent(Some(""), "codex"), "codex");
         assert_eq!(push_title_agent(Some("   "), "codex"), "codex");
         assert_eq!(push_title_agent(Some("  jarvis  "), "claude"), "jarvis");
+    }
+
+    #[test]
+    fn sanitize_muted_panes_trims_dedups_drops_blanks_and_caps() {
+        // A padded id is TRIMMED so it still matches device_muted's exact compare
+        // (instead of being stored padded and silently never matching); blanks are
+        // dropped and the set is de-duplicated.
+        let out = sanitize_muted_panes(vec![
+            " w1:p2 ".into(),
+            "w1:p2".into(),
+            "   ".into(),
+            String::new(),
+            "w1:p5".into(),
+        ]);
+        assert_eq!(out, vec!["w1:p2".to_string(), "w1:p5".to_string()]);
+
+        // The count is capped, so a malformed client can't bloat devices.json.
+        let many: Vec<String> = (0..(MAX_MUTED_PANES + 50))
+            .map(|i| format!("w1:p{i}"))
+            .collect();
+        assert_eq!(sanitize_muted_panes(many).len(), MAX_MUTED_PANES);
     }
 
     #[test]
