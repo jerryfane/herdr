@@ -16,8 +16,10 @@ pub fn encode_key(key: KeyEvent, protocol: KeyboardProtocol) -> Vec<u8> {
 }
 
 pub fn encode_terminal_key(key: TerminalKey, protocol: KeyboardProtocol) -> Vec<u8> {
-    if key.is_text_commit {
-        return encode_text_input(&key).unwrap_or_default();
+    if key.kind != crossterm::event::KeyEventKind::Release {
+        if let Some(text) = &key.generated_text {
+            return text.as_bytes().to_vec();
+        }
     }
 
     // A release event only produces bytes when the pane protocol reports event
@@ -123,7 +125,7 @@ fn encode_mouse_cb(
     encoding: MouseProtocolEncoding,
 ) -> Option<Vec<u8>> {
     let mut cb = match (encoding, release) {
-        (MouseProtocolEncoding::Sgr, true) => base_button,
+        (MouseProtocolEncoding::Sgr | MouseProtocolEncoding::SgrPixels, true) => base_button,
         (_, true) => 3,
         (_, false) => base_button,
     };
@@ -141,7 +143,7 @@ fn encode_mouse_cb(
     let row = row as u32 + 1;
 
     match encoding {
-        MouseProtocolEncoding::Sgr => Some(
+        MouseProtocolEncoding::Sgr | MouseProtocolEncoding::SgrPixels => Some(
             format!(
                 "\x1b[<{cb};{column};{row}{}",
                 if release { 'm' } else { 'M' }
@@ -282,10 +284,7 @@ fn encode_legacy(key: TerminalKey) -> Vec<u8> {
 
     // Alt modifier on character keys: prefix with ESC
     if mods.contains(KeyModifiers::ALT) {
-        let inner = TerminalKey {
-            modifiers: mods.difference(KeyModifiers::ALT),
-            ..key
-        };
+        let inner = key.with_modifiers(mods.difference(KeyModifiers::ALT));
         let mut bytes = vec![0x1b];
         bytes.extend(encode_legacy_inner(inner));
         return bytes;
@@ -948,6 +947,13 @@ mod tests {
         );
         assert_eq!(
             encode_key(release, KeyboardProtocol::Kitty { flags: 3 }),
+            b"\x1b[106;1:3u"
+        );
+
+        let mut malformed_release = TerminalKey::from(release);
+        malformed_release.generated_text = Some("j".to_owned());
+        assert_eq!(
+            encode_terminal_key(malformed_release, KeyboardProtocol::Kitty { flags: 3 }),
             b"\x1b[106;1:3u"
         );
     }

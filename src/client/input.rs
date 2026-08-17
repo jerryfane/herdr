@@ -39,11 +39,20 @@ pub fn stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
+    host_cell_size_query_sent: bool,
     host_mouse_capture_active: Arc<AtomicBool>,
+    host_sgr_pixels_active: Arc<AtomicBool>,
+    #[cfg(unix)] direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
+    #[cfg(unix)] direct_response_active: Arc<AtomicBool>,
 ) {
     #[cfg(windows)]
     {
-        let _ = (host_color_query_sent, host_mouse_capture_active);
+        let _ = (
+            host_color_query_sent,
+            host_cell_size_query_sent,
+            host_mouse_capture_active,
+            host_sgr_pixels_active,
+        );
         windows_stdin_reader_loop(event_tx, should_quit);
     }
 
@@ -52,7 +61,11 @@ pub fn stdin_reader_loop(
         event_tx,
         should_quit,
         host_color_query_sent,
+        host_cell_size_query_sent,
         host_mouse_capture_active,
+        host_sgr_pixels_active,
+        direct_response,
+        direct_response_active,
     );
 }
 
@@ -61,7 +74,11 @@ fn unix_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
+    host_cell_size_query_sent: bool,
     host_mouse_capture_active: Arc<AtomicBool>,
+    host_sgr_pixels_active: Arc<AtomicBool>,
+    direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
+    direct_response_active: Arc<AtomicBool>,
 ) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -70,17 +87,77 @@ fn unix_stdin_reader_loop(
     if host_color_query_sent {
         framer.host_color_query_sent();
         framer.enable_host_color_scheme_change_tracking();
+        framer.enable_host_appearance_query_on_focus();
+    }
+    if host_cell_size_query_sent {
+        framer.host_cell_size_query_sent();
     }
     let mut pending_palette = Vec::new();
+    let mut pending_mode = None;
+    let mut last_geometry = None;
+    let mut direct_filter = super::direct_graphics::InputFilter::default();
 
     while !should_quit.load(Ordering::Acquire) {
+        if direct_filter.has_pending()
+            && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+                == Some(false)
+        {
+            let released = direct_response
+                .lock()
+                .ok()
+                .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher));
+            if let Some(data) = released {
+                if event_tx
+                    .blocking_send(ClientLoopEvent::StdinInput(data))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            continue;
+        }
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {
+                let sgr_pixels = *pending_mode
+                    .get_or_insert_with(|| host_sgr_pixels_active.load(Ordering::Acquire));
+                if sgr_pixels {
+                    last_geometry = retain_geometry(
+                        last_geometry,
+                        crate::input::mouse::HostGeometry::current(),
+                    );
+                }
+                let filtered = filter_direct_input(
+                    &scratch[..n],
+                    &mut direct_filter,
+                    &direct_response,
+                    &direct_response_active,
+                );
+                let chunks = if let Some((raw_chunks, responses)) = filtered {
+                    for response in responses {
+                        if event_tx
+                            .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    raw_chunks
+                        .into_iter()
+                        .flat_map(|chunk| framer.push(&chunk))
+                        .collect()
+                } else {
+                    framer.push(&scratch[..n])
+                };
+                if !framer.has_pending_input() {
+                    pending_mode = None;
+                }
                 if !send_unix_input_chunks(
-                    framer.push(&scratch[..n]),
+                    chunks,
                     &event_tx,
                     &mut pending_palette,
+                    sgr_pixels,
+                    last_geometry,
                 ) {
                     return;
                 }
@@ -93,8 +170,18 @@ fn unix_stdin_reader_loop(
                     let had_pending = framer.has_pending_input();
                     let chunks = framer.flush_timeout();
                     let held_escape = had_pending && chunks.is_empty();
-                    if !send_unix_input_chunks(chunks, &event_tx, &mut pending_palette)
-                        || !flush_unix_palette_input(&event_tx, &mut pending_palette)
+                    let sgr_pixels = pending_mode
+                        .unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
+                    if !framer.has_pending_input() {
+                        pending_mode = None;
+                    }
+                    if !send_unix_input_chunks(
+                        chunks,
+                        &event_tx,
+                        &mut pending_palette,
+                        sgr_pixels,
+                        last_geometry,
+                    ) || !flush_unix_palette_input(&event_tx, &mut pending_palette)
                     {
                         return;
                     }
@@ -103,13 +190,20 @@ fn unix_stdin_reader_loop(
                             &reader,
                             crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS,
                         ) == Some(false)
-                        && !send_unix_input_chunks(
-                            framer.flush_timeout(),
+                    {
+                        let chunks = framer.flush_timeout();
+                        if !framer.has_pending_input() {
+                            pending_mode = None;
+                        }
+                        if !send_unix_input_chunks(
+                            chunks,
                             &event_tx,
                             &mut pending_palette,
-                        )
-                    {
-                        return;
+                            sgr_pixels,
+                            last_geometry,
+                        ) {
+                            return;
+                        }
                     }
                 }
             }
@@ -124,10 +218,30 @@ fn unix_stdin_reader_loop(
 }
 
 #[cfg(unix)]
+fn filter_direct_input(
+    bytes: &[u8],
+    filter: &mut super::direct_graphics::InputFilter,
+    response: &std::sync::Mutex<super::direct_graphics::ResponseMatcher>,
+    active: &AtomicBool,
+) -> Option<(Vec<Vec<u8>>, Vec<super::direct_graphics::Response>)> {
+    if !active.load(Ordering::Acquire) && !filter.has_pending() {
+        return None;
+    }
+    Some(
+        response
+            .lock()
+            .map(|mut matcher| filter.push(bytes, &mut matcher))
+            .unwrap_or_else(|_| (vec![bytes.to_vec()], Vec::new())),
+    )
+}
+
+#[cfg(unix)]
 fn send_unix_input_chunks(
     chunks: Vec<Vec<u8>>,
     event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
+    sgr_pixels: bool,
+    geometry: Option<crate::input::mouse::HostGeometry>,
 ) -> bool {
     for data in chunks {
         let palette_response = std::str::from_utf8(&data)
@@ -149,14 +263,34 @@ fn send_unix_input_chunks(
         if !default_color_response && !flush_unix_palette_input(event_tx, pending_palette) {
             return false;
         }
-        if event_tx
-            .blocking_send(ClientLoopEvent::StdinInput(data))
-            .is_err()
-        {
+        let Some(event) = classify_unix_input(data, sgr_pixels, geometry) else {
+            continue;
+        };
+        if event_tx.blocking_send(event).is_err() {
             return false;
         }
     }
     true
+}
+
+#[cfg(unix)]
+fn retain_geometry(
+    last: Option<crate::input::mouse::HostGeometry>,
+    observed: Option<crate::input::mouse::HostGeometry>,
+) -> Option<crate::input::mouse::HostGeometry> {
+    observed.or(last)
+}
+
+#[cfg(unix)]
+fn classify_unix_input(
+    data: Vec<u8>,
+    sgr_pixels: bool,
+    geometry: Option<crate::input::mouse::HostGeometry>,
+) -> Option<ClientLoopEvent> {
+    if sgr_pixels && crate::input::mouse::parse_report(&data).is_some() {
+        return geometry.map(|geometry| ClientLoopEvent::PixelMouse(data, geometry));
+    }
+    Some(ClientLoopEvent::StdinInput(data))
 }
 
 #[cfg(unix)]
@@ -179,7 +313,7 @@ fn idle_flush_timeout_ms(
     host_mouse_capture_active: bool,
 ) -> i32 {
     if host_mouse_capture_active
-        && (framer.has_pending_lone_escape() || framer.has_pending_incomplete_sgr_mouse_sequence())
+        && (framer.has_pending_lone_escape() || framer.has_pending_incomplete_mouse_sequence())
     {
         crate::raw_input::MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS
     } else {
@@ -281,7 +415,16 @@ fn windows_crossterm_input_event(
             code: crate::protocol::ClientKeyCode::Char(codepoint),
             modifiers: 0,
             kind: crate::protocol::ClientKeyKind::Press,
-        } => Some(crate::protocol::ClientInputEvent::Text { codepoint }),
+            source,
+            ..
+        } => Some(crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char(codepoint),
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: 1,
+            generated_text: Some(codepoint.to_string()),
+            source,
+        }),
         event => Some(event),
     }
 }
@@ -368,20 +511,29 @@ fn windows_client_input_event_from_raw(
     event: crate::raw_input::RawInputEvent,
 ) -> Option<crate::protocol::ClientInputEvent> {
     match event {
-        crate::raw_input::RawInputEvent::Key(key) if key.is_text_commit => {
-            let crossterm::event::KeyCode::Char(codepoint) = key.code else {
-                return None;
-            };
-            Some(crate::protocol::ClientInputEvent::Text { codepoint })
-        }
+        crate::raw_input::RawInputEvent::Text(text) => Some(
+            crate::protocol::ClientInputEvent::TextCommit(text.into_string()),
+        ),
         crate::raw_input::RawInputEvent::Key(key) => {
             let code = crate::protocol::ClientKeyCode::from_crossterm(key.code)?;
             let modifiers = key.modifiers.bits();
             let kind = crate::protocol::ClientKeyKind::from_crossterm(key.kind);
+            let source = if let Some(bytes) = key.vt_bytes() {
+                crate::protocol::ClientKeySource::Vt {
+                    bytes: bytes.to_vec(),
+                }
+            } else if let Some(record) = key.windows_record() {
+                crate::protocol::ClientKeySource::WindowsConsole { record }
+            } else {
+                crate::protocol::ClientKeySource::Synthesized
+            };
             Some(crate::protocol::ClientInputEvent::Key {
                 code,
                 modifiers,
                 kind,
+                repeat_count: key.repeat_count,
+                generated_text: key.generated_text.clone(),
+                source,
             })
         }
         crate::raw_input::RawInputEvent::Mouse(mouse) => {
@@ -404,6 +556,7 @@ fn windows_client_input_event_from_raw(
         crate::raw_input::RawInputEvent::HostDefaultColor { .. }
         | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
         | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
+        | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }
@@ -466,6 +619,50 @@ mod tests {
     }
 
     #[test]
+    fn inactive_direct_input_bypasses_filter() {
+        let response =
+            std::sync::Mutex::new(super::super::direct_graphics::ResponseMatcher::default());
+        let active = response.lock().unwrap().active_handle();
+        let mut filter = super::super::direct_graphics::InputFilter::default();
+        assert!(filter_direct_input(b"typed", &mut filter, &response, &active).is_none());
+        assert!(!filter.has_pending());
+    }
+
+    #[test]
+    fn pixel_mouse_classification_is_narrow_and_uses_read_geometry() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let report = b"\x1b[<35;321;241M".to_vec();
+        let Some(ClientLoopEvent::PixelMouse(data, captured)) =
+            classify_unix_input(report.clone(), true, Some(geometry))
+        else {
+            panic!("expected dedicated pixel mouse event");
+        };
+        assert_eq!(data, report);
+        assert_eq!(captured, geometry);
+        assert!(classify_unix_input(report, true, None).is_none());
+
+        for raw in [
+            b"key".as_slice(),
+            b"\x1b[200~paste\x1b[201~".as_slice(),
+            b"\x1b_Gi=7;unrelated\x1b\\".as_slice(),
+            b"\x1b[<35;2;3Mtail".as_slice(),
+        ] {
+            let Some(ClientLoopEvent::StdinInput(data)) =
+                classify_unix_input(raw.to_vec(), true, Some(geometry))
+            else {
+                panic!("unrelated input must remain raw");
+            };
+            assert_eq!(data, raw);
+        }
+    }
+
+    #[test]
+    fn transient_geometry_failure_keeps_last_real_value() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        assert_eq!(retain_geometry(Some(geometry), None), Some(geometry));
+    }
+
+    #[test]
     fn palette_replies_are_forwarded_as_one_input_batch() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut pending = Vec::new();
@@ -476,6 +673,8 @@ mod tests {
             ],
             &tx,
             &mut pending,
+            false,
+            None,
         ));
         assert!(rx.try_recv().is_err());
 
@@ -514,18 +713,20 @@ mod tests {
     fn mouse_active_escape_sequences_get_longer_reassembly_window() {
         let mut escape = crate::raw_input::RawInputByteFramer::default();
         assert!(escape.push(b"\x1b").is_empty());
-        let mut mouse = crate::raw_input::RawInputByteFramer::default();
-        assert!(mouse.push(b"\x1b[<3").is_empty());
+        let mut sgr_mouse = crate::raw_input::RawInputByteFramer::default();
+        assert!(sgr_mouse.push(b"\x1b[<3").is_empty());
+        let mut default_mouse = crate::raw_input::RawInputByteFramer::default();
+        assert!(default_mouse.push(b"\x1b[MC").is_empty());
         let mut unrelated = crate::raw_input::RawInputByteFramer::default();
         assert!(unrelated.push(b"\x1b[49:33;2:").is_empty());
 
-        for framer in [&escape, &mouse, &unrelated] {
+        for framer in [&escape, &sgr_mouse, &default_mouse, &unrelated] {
             assert_eq!(
                 idle_flush_timeout_ms(framer, false),
                 crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS
             );
         }
-        for framer in [&escape, &mouse] {
+        for framer in [&escape, &sgr_mouse, &default_mouse] {
             assert_eq!(
                 idle_flush_timeout_ms(framer, true),
                 crate::raw_input::MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS
@@ -573,12 +774,19 @@ mod windows_tests {
     }
 
     #[test]
-    fn windows_crossterm_printable_press_is_text() {
+    fn windows_crossterm_printable_press_keeps_key_semantics_and_text() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('你'), KeyModifiers::empty()));
 
         assert_eq!(
             windows_crossterm_input_event(event),
-            Some(crate::protocol::ClientInputEvent::Text { codepoint: '你' })
+            Some(crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('你'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: Some("你".to_string()),
+                source: crate::protocol::ClientKeySource::Synthesized,
+            })
         );
     }
 
@@ -673,6 +881,9 @@ mod windows_tests {
                 code: crate::protocol::ClientKeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL.bits(),
                 kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Vt { bytes: vec![4] },
             }
         );
     }
@@ -693,6 +904,11 @@ mod windows_tests {
                 code: crate::protocol::ClientKeyCode::Up,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Vt {
+                    bytes: b"\x1b[A".to_vec()
+                },
             }
         );
     }
@@ -712,6 +928,9 @@ mod windows_tests {
                 code: crate::protocol::ClientKeyCode::Esc,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Vt { bytes: vec![0x1b] },
             }
         );
     }

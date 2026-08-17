@@ -41,6 +41,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
+/// Maximum encoded mouse report accepted with pixel geometry.
+const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
@@ -51,115 +53,99 @@ pub(crate) struct ClientWriter {
     pub(crate) render: ClientRenderWriter,
 }
 
-#[cfg(test)]
 impl ClientWriter {
+    pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
+        self.render.queue.replace_with_cleanup(data);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fill_render(&self, data: Vec<u8>) {
+        self.render.try_send(data).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_close(&self) {
+        self.render.queue.close_writer();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_channel(
         control: std::sync::mpsc::Sender<Vec<u8>>,
         render: std::sync::mpsc::SyncSender<Vec<u8>>,
     ) -> Self {
-        Self {
-            control: ClientControlWriter {
-                target: ClientControlTarget::Channel(control),
-            },
-            render: ClientRenderWriter {
-                target: ClientRenderTarget::Channel(render),
-            },
-        }
+        let queue = ClientWriterQueue::new();
+        let drain = queue.clone();
+        let control_writer = ClientControlWriter::queue(queue.clone());
+        let mut render_writer = ClientRenderWriter::queue(queue);
+        render_writer.test_render = Some(render.clone());
+        let writer = Self {
+            control: control_writer,
+            render: render_writer,
+        };
+        std::thread::spawn(move || {
+            while let Some(item) = drain.recv() {
+                let sent = match item {
+                    ClientWriteItem::Control(data) => control.send(data).is_ok(),
+                    ClientWriteItem::Render(data) => render.send(data).is_ok(),
+                };
+                if !sent {
+                    break;
+                }
+            }
+            drain.close_writer();
+        });
+        writer
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ClientControlWriter {
-    target: ClientControlTarget,
-}
-
-#[derive(Debug)]
-enum ClientControlTarget {
-    Queue(Arc<ClientWriterQueue>),
+    queue: Arc<ClientWriterQueue>,
     #[cfg(test)]
-    Channel(std::sync::mpsc::Sender<Vec<u8>>),
+    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ClientRenderWriter {
-    target: ClientRenderTarget,
-}
-
-#[derive(Debug)]
-enum ClientRenderTarget {
-    Queue(Arc<ClientWriterQueue>),
+    queue: Arc<ClientWriterQueue>,
     #[cfg(test)]
-    Channel(std::sync::mpsc::SyncSender<Vec<u8>>),
+    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
-impl Clone for ClientControlWriter {
-    fn clone(&self) -> Self {
-        match &self.target {
-            ClientControlTarget::Queue(queue) => {
-                queue.add_sender();
+macro_rules! writer_handle {
+    ($type:ty) => {
+        impl Clone for $type {
+            fn clone(&self) -> Self {
+                self.queue.add_sender();
                 Self {
-                    target: ClientControlTarget::Queue(queue.clone()),
+                    queue: self.queue.clone(),
+                    #[cfg(test)]
+                    test_render: self.test_render.clone(),
                 }
             }
-            #[cfg(test)]
-            ClientControlTarget::Channel(sender) => Self {
-                target: ClientControlTarget::Channel(sender.clone()),
-            },
         }
-    }
-}
-
-impl Drop for ClientControlWriter {
-    fn drop(&mut self) {
-        match &self.target {
-            ClientControlTarget::Queue(queue) => queue.remove_sender(),
-            #[cfg(test)]
-            ClientControlTarget::Channel(_) => {}
+        impl Drop for $type {
+            fn drop(&mut self) {
+                self.queue.remove_sender();
+            }
         }
-    }
+    };
 }
+writer_handle!(ClientControlWriter);
+writer_handle!(ClientRenderWriter);
 
 impl ClientControlWriter {
     fn queue(queue: Arc<ClientWriterQueue>) -> Self {
         queue.add_sender();
         Self {
-            target: ClientControlTarget::Queue(queue),
+            queue,
+            #[cfg(test)]
+            test_render: None,
         }
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
-        match &self.target {
-            ClientControlTarget::Queue(queue) => queue.send_control(data),
-            #[cfg(test)]
-            ClientControlTarget::Channel(sender) => sender.send(data),
-        }
-    }
-}
-
-impl Clone for ClientRenderWriter {
-    fn clone(&self) -> Self {
-        match &self.target {
-            ClientRenderTarget::Queue(queue) => {
-                queue.add_sender();
-                Self {
-                    target: ClientRenderTarget::Queue(queue.clone()),
-                }
-            }
-            #[cfg(test)]
-            ClientRenderTarget::Channel(sender) => Self {
-                target: ClientRenderTarget::Channel(sender.clone()),
-            },
-        }
-    }
-}
-
-impl Drop for ClientRenderWriter {
-    fn drop(&mut self) {
-        match &self.target {
-            ClientRenderTarget::Queue(queue) => queue.remove_sender(),
-            #[cfg(test)]
-            ClientRenderTarget::Channel(_) => {}
-        }
+        self.queue.send_control(data)
     }
 }
 
@@ -167,16 +153,22 @@ impl ClientRenderWriter {
     fn queue(queue: Arc<ClientWriterQueue>) -> Self {
         queue.add_sender();
         Self {
-            target: ClientRenderTarget::Queue(queue),
+            queue,
+            #[cfg(test)]
+            test_render: None,
         }
     }
 
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        match &self.target {
-            ClientRenderTarget::Queue(queue) => queue.try_send_render(data),
-            #[cfg(test)]
-            ClientRenderTarget::Channel(sender) => sender.try_send(data),
+        #[cfg(test)]
+        if let Some(sender) = &self.test_render {
+            return sender.try_send(data);
         }
+        self.queue.try_send_render(data)
+    }
+
+    pub(crate) fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        self.queue.send_ordered(data)
     }
 }
 
@@ -189,6 +181,7 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
@@ -245,14 +238,43 @@ impl ClientWriterQueue {
         Ok(())
     }
 
+    fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive {
+            return Err(TrySendError::Disconnected(data));
+        }
+        if !state.ordered.is_empty() {
+            return Err(TrySendError::Full(data));
+        }
+        if let Some(older) = state.render.take() {
+            state.ordered.push_back(older);
+        }
+        state.ordered.push_back(data);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn replace_with_cleanup(&self, data: Vec<u8>) {
+        let mut state = self.lock_state();
+        state.render = None;
+        state.ordered.clear();
+        if state.writer_alive {
+            state.control.push_back(data);
+            self.ready.notify_one();
+        }
+    }
+
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
             }
-            if let Some(data) = state.render.take() {
+            if let Some(data) = state.ordered.pop_front() {
                 self.ready.notify_one();
+                return Some(ClientWriteItem::Render(data));
+            }
+            if let Some(data) = state.render.take() {
                 return Some(ClientWriteItem::Render(data));
             }
             if state.senders == 0 {
@@ -268,6 +290,8 @@ impl ClientWriterQueue {
     fn close_writer(&self) {
         let mut state = self.lock_state();
         state.writer_alive = false;
+        state.render = None;
+        state.ordered.clear();
         self.ready.notify_all();
     }
 
@@ -291,10 +315,29 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        direct_graphics: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    /// A client reported the one armed Kitty regular-file response.
+    GraphicsTransmissionResult {
+        client_id: u64,
+        transfer_id: u64,
+        image_id: u32,
+        success: bool,
+    },
+    GraphicsTransmissionStarted {
+        client_id: u64,
+        transfer_id: u64,
+        image_id: u32,
+    },
+    /// One confirmed SGR pixel report with client read-time geometry.
+    ClientInputPixels {
+        client_id: u64,
+        data: Vec<u8>,
+        geometry: crate::input::mouse::HostGeometry,
+    },
     /// A client sent structured input events.
     ClientInputEvents {
         client_id: u64,
@@ -383,24 +426,62 @@ enum InputEventLimit {
     WithinLimits,
     TooManyEvents,
     PasteTooLarge { size: usize },
+    InputPayloadTooLarge { size: usize },
 }
 
 fn input_event_limit(events: &[ClientInputEvent]) -> InputEventLimit {
-    if events.len() > MAX_INPUT_EVENT_BATCH {
-        return InputEventLimit::TooManyEvents;
-    }
-
+    let mut expanded_events = 0usize;
     let mut paste_bytes = 0usize;
+    let mut input_bytes = 0usize;
     for event in events {
-        if let ClientInputEvent::Paste { text } = event {
-            paste_bytes = paste_bytes.saturating_add(text.len());
+        expanded_events = expanded_events.saturating_add(match event {
+            ClientInputEvent::Key { repeat_count, .. } => usize::from((*repeat_count).max(1)),
+            _ => 1,
+        });
+        match event {
+            ClientInputEvent::Key {
+                repeat_count,
+                generated_text,
+                source,
+                ..
+            } => {
+                if let Some(text) = generated_text {
+                    input_bytes = input_bytes.saturating_add(
+                        text.len()
+                            .saturating_mul(usize::from((*repeat_count).max(1))),
+                    );
+                }
+                if let crate::protocol::ClientKeySource::Vt { bytes } = source {
+                    input_bytes = input_bytes.saturating_add(bytes.len());
+                }
+            }
+            ClientInputEvent::TextCommit(text) => {
+                input_bytes = input_bytes.saturating_add(text.len());
+            }
+            ClientInputEvent::Paste { text } => {
+                paste_bytes = paste_bytes.saturating_add(text.len());
+            }
+            ClientInputEvent::Mouse { .. }
+            | ClientInputEvent::FocusGained
+            | ClientInputEvent::FocusLost => {}
         }
     }
 
-    if paste_bytes > MAX_INPUT_PAYLOAD {
-        InputEventLimit::PasteTooLarge { size: paste_bytes }
-    } else {
+    if expanded_events > MAX_INPUT_EVENT_BATCH {
+        return InputEventLimit::TooManyEvents;
+    }
+
+    let payload_bytes = paste_bytes.saturating_add(input_bytes);
+    if payload_bytes <= MAX_INPUT_PAYLOAD {
         InputEventLimit::WithinLimits
+    } else if input_bytes == 0 {
+        InputEventLimit::PasteTooLarge {
+            size: payload_bytes,
+        }
+    } else {
+        InputEventLimit::InputPayloadTooLarge {
+            size: payload_bytes,
+        }
     }
 }
 
@@ -441,6 +522,10 @@ pub(crate) fn handle_client_handshake(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    if should_quit.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
@@ -477,6 +562,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        direct_graphics,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -526,6 +612,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
+                launch_mode == ClientLaunchMode::AppDirectGraphics,
             )
         }
         _ => {
@@ -540,6 +627,10 @@ pub(crate) fn handle_client_handshake(
             return Ok(());
         }
     };
+
+    if should_quit.load(Ordering::Acquire) {
+        return Ok(());
+    }
 
     // Send Welcome.
     let welcome = ServerMessage::Welcome {
@@ -570,8 +661,13 @@ pub(crate) fn handle_client_handshake(
         client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
     });
 
+    if should_quit.load(Ordering::Acquire) {
+        send_shutdown_to_unregistered_client(&writer);
+        return Ok(());
+    }
+
     // Notify the main loop about the new client.
-    let _ = server_event_tx.blocking_send(ServerEvent::ClientConnected {
+    let connected = ServerEvent::ClientConnected {
         client_id,
         cols: client_cols,
         rows: client_rows,
@@ -580,11 +676,31 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        direct_graphics,
         writer,
-    });
+    };
+    if let Err(err) = server_event_tx.blocking_send(connected) {
+        if let ServerEvent::ClientConnected { writer, .. } = err.0 {
+            send_shutdown_to_unregistered_client(&writer);
+        }
+    }
 
     // Enter read loop — read client messages and forward to main loop.
     client_read_loop(stream, client_id, server_event_tx, should_quit)
+}
+
+fn send_shutdown_to_unregistered_client(writer: &ClientWriter) {
+    let mut framed = Vec::new();
+    if protocol::write_message(
+        &mut framed,
+        &ServerMessage::ServerShutdown {
+            reason: Some("server is shutting down".to_owned()),
+        },
+    )
+    .is_ok()
+    {
+        let _ = writer.control.send(framed);
+    }
 }
 
 /// The client writer loop — prioritizes control messages over render frames.
@@ -595,19 +711,17 @@ fn client_writer_loop(
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
     while let Some(item) = writer_queue.recv() {
-        match item {
-            ClientWriteItem::Control(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
-                    break;
-                }
-            }
+        let written = match item {
+            ClientWriteItem::Control(data) => write_framed_bytes(&mut stream, &data),
             ClientWriteItem::Render(data) => {
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                if !write_framed_bytes(&mut stream, &data) {
-                    break;
-                }
+                write_framed_bytes(&mut stream, &data)
             }
+        };
+        if !written {
+            let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+            break;
         }
     }
     writer_queue.close_writer();
@@ -690,6 +804,47 @@ fn client_read_loop(
                     ServerEvent::ClientInput { client_id, data }
                 }
             }
+            ClientMessage::InputPixels {
+                data,
+                cols,
+                rows,
+                width_px,
+                height_px,
+            } => {
+                let Some(geometry) =
+                    crate::input::mouse::HostGeometry::new(cols, rows, width_px, height_px)
+                else {
+                    warn!(
+                        client_id,
+                        cols,
+                        rows,
+                        width_px,
+                        height_px,
+                        "invalid pixel mouse geometry from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                };
+                if data.len() > MAX_PIXEL_MOUSE_PAYLOAD
+                    || crate::input::mouse::parse_report(&data).is_none()
+                {
+                    warn!(
+                        client_id,
+                        size = data.len(),
+                        max = MAX_PIXEL_MOUSE_PAYLOAD,
+                        "invalid pixel mouse report from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ClientInputPixels {
+                    client_id,
+                    data,
+                    geometry,
+                }
+            }
             ClientMessage::InputEvents { events } => match input_event_limit(&events) {
                 InputEventLimit::WithinLimits => {
                     ServerEvent::ClientInputEvents { client_id, events }
@@ -717,6 +872,17 @@ fn client_read_loop(
                         max: MAX_INPUT_PAYLOAD,
                     }
                 }
+                InputEventLimit::InputPayloadTooLarge { size } => {
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized structured input payload from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
             },
             ClientMessage::ObserveTerminal { target } => {
                 ServerEvent::ClientObserveTerminal { client_id, target }
@@ -728,6 +894,24 @@ fn client_read_loop(
                     takeover,
                 }
             }
+            ClientMessage::GraphicsTransmissionResult {
+                transfer_id,
+                image_id,
+                success,
+            } => ServerEvent::GraphicsTransmissionResult {
+                client_id,
+                transfer_id,
+                image_id,
+                success,
+            },
+            ClientMessage::GraphicsTransmissionStarted {
+                transfer_id,
+                image_id,
+            } => ServerEvent::GraphicsTransmissionStarted {
+                client_id,
+                transfer_id,
+                image_id,
+            },
             ClientMessage::ClipboardImage { extension, data } => {
                 if data.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
                     warn!(
@@ -895,6 +1079,30 @@ mod tests {
         assert!(matches!(
             writer.render.try_send(second),
             Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn ordered_direct_follows_older_render_and_stays_bounded() {
+        let (writer, queue) = test_queue_writer();
+        writer.render.try_send(b"old".to_vec()).unwrap();
+        writer.render.send_ordered(b"direct".to_vec()).unwrap();
+        assert!(matches!(
+            writer.render.send_ordered(b"second".to_vec()),
+            Err(TrySendError::Full(_))
+        ));
+        writer.render.try_send(b"new".to_vec()).unwrap();
+
+        for expected in [b"old".as_slice(), b"direct", b"new"] {
+            assert_eq!(
+                queue.recv(),
+                Some(ClientWriteItem::Render(expected.to_vec()))
+            );
+        }
+        queue.close_writer();
+        assert!(matches!(
+            writer.render.send_ordered(b"closed".to_vec()),
+            Err(TrySendError::Disconnected(_))
         ));
     }
 
@@ -1154,6 +1362,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                direct_graphics,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1162,6 +1371,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
+                assert!(!direct_graphics);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1346,6 +1556,76 @@ new_tab = "ctrl+notakey"
     }
 
     #[test]
+    fn client_read_loop_disconnects_invalid_pixel_mouse_geometry() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-invalid-pixel-geometry");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::InputPixels {
+                data: b"\x1b[<35;1;1M".to_vec(),
+                cols: 0,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            },
+        )
+        .expect("write invalid pixel geometry");
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "invalid pixel geometry disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn client_read_loop_disconnects_invalid_pixel_mouse_report() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-invalid-pixel-report");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::InputPixels {
+                data: vec![b'x'; MAX_PIXEL_MOUSE_PAYLOAD + 1],
+                cols: 80,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            },
+        )
+        .expect("write invalid pixel report");
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "invalid pixel report disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
     fn client_read_loop_disconnects_marker_wrapped_invalid_utf8() {
         let (mut client_stream, server_stream, _path) =
             local_stream_pair("client-read-invalid-utf8-paste");
@@ -1388,6 +1668,10 @@ new_tab = "ctrl+notakey"
                 code: crate::protocol::ClientKeyCode::Enter,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
             },
             ClientInputEvent::FocusGained,
         ];
@@ -1547,6 +1831,43 @@ new_tab = "ctrl+notakey"
             .join()
             .expect("read thread join")
             .expect("read thread result");
+    }
+
+    #[test]
+    fn structured_input_limits_charge_grouped_repeats_and_text_payloads() {
+        let grouped = ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char('x'),
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: (MAX_INPUT_EVENT_BATCH + 1) as u16,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::Synthesized,
+        };
+        assert_eq!(
+            input_event_limit(&[grouped]),
+            InputEventLimit::TooManyEvents
+        );
+
+        let repeated_text = ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char('x'),
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: MAX_INPUT_EVENT_BATCH as u16,
+            generated_text: Some("x".repeat((MAX_INPUT_PAYLOAD / MAX_INPUT_EVENT_BATCH) + 1)),
+            source: crate::protocol::ClientKeySource::Synthesized,
+        };
+        assert!(matches!(
+            input_event_limit(&[repeated_text]),
+            InputEventLimit::InputPayloadTooLarge { size } if size > MAX_INPUT_PAYLOAD
+        ));
+
+        let text = ClientInputEvent::TextCommit("x".repeat(MAX_INPUT_PAYLOAD + 1));
+        assert_eq!(
+            input_event_limit(&[text]),
+            InputEventLimit::InputPayloadTooLarge {
+                size: MAX_INPUT_PAYLOAD + 1
+            }
+        );
     }
 
     #[test]

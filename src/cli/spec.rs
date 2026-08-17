@@ -44,18 +44,23 @@ pub(super) fn command() -> Command {
         .subcommand(session_command())
         .subcommand(integration_command())
         .subcommand(plugin_command());
-    configure_help(command, true)
+    configure_help(command, 0)
 }
 
-fn configure_help(command: Command, root: bool) -> Command {
-    let command = if root {
+fn configure_help(command: Command, depth: usize) -> Command {
+    let command = if depth == 0 {
         command
     } else {
         command.disable_help_flag(false)
     };
+    let command = if depth == 1 && command.has_subcommands() {
+        command.after_help(super::AGENT_HELP_FOOTER)
+    } else {
+        command
+    };
     command
         .disable_help_subcommand(true)
-        .mut_subcommands(|subcommand| configure_help(subcommand, false))
+        .mut_subcommands(|subcommand| configure_help(subcommand, depth + 1))
 }
 
 pub(super) fn print_requested_help(args: &[String]) -> std::io::Result<bool> {
@@ -230,8 +235,7 @@ fn worktree_command() -> Command {
             Command::new("list")
                 .about("List worktree workspaces")
                 .arg(option("workspace", "ID"))
-                .arg(path_option("cwd", "PATH"))
-                .arg(json_flag()),
+                .arg(path_option("cwd", "PATH")),
         )
         .subcommand(
             Command::new("create")
@@ -243,8 +247,7 @@ fn worktree_command() -> Command {
                 .arg(path_option("path", "PATH"))
                 .arg(option("label", "TEXT"))
                 .arg(flag("focus"))
-                .arg(flag("no-focus"))
-                .arg(json_flag()),
+                .arg(flag("no-focus")),
         )
         .subcommand(
             Command::new("open")
@@ -255,15 +258,13 @@ fn worktree_command() -> Command {
                 .arg(option("branch", "NAME"))
                 .arg(option("label", "TEXT"))
                 .arg(flag("focus"))
-                .arg(flag("no-focus"))
-                .arg(json_flag()),
+                .arg(flag("no-focus")),
         )
         .subcommand(
             Command::new("remove")
                 .about("Remove a worktree checkout")
                 .arg(option("workspace", "ID"))
-                .arg(flag("force"))
-                .arg(json_flag()),
+                .arg(flag("force")),
         )
 }
 
@@ -416,7 +417,7 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "Herdr first acknowledges the complete text+Enter PTY write. If a modal input request is already visible, it returns agent_input_pending without writing. With --wait, a settled agent's lifecycle advance or the same writer-attributed composer attempt being observed and then cleared proves delivery=submitted; a persistent attributed attempt returns agent_prompt_unsubmitted, and an otherwise unobservable disposition returns agent_prompt_stalled. Bracketed paste does not depend on rendered token text. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
+                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. Otherwise Herdr first acknowledges the complete text+Enter PTY write; if a modal input request is already visible, it returns agent_input_pending without writing. With --wait, when an accepted submission starts from another non-working state Herdr first requires an observed state change within 5000ms, otherwise it returns agent_prompt_stalled and a shorter --timeout returns timeout instead. A settled agent's lifecycle advance, or the same writer-attributed composer attempt being observed and then cleared, proves delivery=submitted; a persistent attributed attempt returns agent_prompt_unsubmitted, and an otherwise unobservable disposition returns agent_prompt_stalled. Bracketed paste does not depend on rendered token text. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission, though that active turn's completion may still match the wait. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
                 ),
         )
         .subcommand(
@@ -587,6 +588,17 @@ fn pane_command() -> Command {
                 .arg(flag("clear")),
         )
         .subcommand(
+            Command::new("input")
+                .about("Set pane input routing")
+                .arg(Arg::new("pane_id").value_name("PANE_ID"))
+                .args(current_pane_args())
+                .arg(
+                    option("right-click", "TARGET")
+                        .value_parser(["herdr", "pane"])
+                        .required(true),
+                ),
+        )
+        .subcommand(
             Command::new("split")
                 .about("Split a pane")
                 .arg(Arg::new("pane_id").value_name("PANE_ID"))
@@ -595,6 +607,7 @@ fn pane_command() -> Command {
                 .arg(option("ratio", "FLOAT"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(env_option())
+                .arg(option("right-click", "TARGET").value_parser(["herdr", "pane"]))
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
@@ -1250,6 +1263,18 @@ mod tests {
     }
 
     #[test]
+    fn worktree_json_compatibility_flag_stays_out_of_public_spec() {
+        let cmd = super::command();
+        for subcommand in ["list", "create", "open", "remove"] {
+            let worktree_command = command_path(&cmd, &["worktree", subcommand]);
+            assert!(
+                !has_option(worktree_command, "json"),
+                "herdr worktree {subcommand} should not advertise --json"
+            );
+        }
+    }
+
+    #[test]
     fn spec_includes_nested_plugin_pane_open_options() {
         let cmd = super::command();
         let open = command_path(&cmd, &["plugin", "pane", "open"]);
@@ -1342,6 +1367,23 @@ mod tests {
             path.join(" ")
         );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn agent_resources_appear_on_command_groups_but_not_leaf_commands() {
+        for group in ["agent", "pane", "workspace", "terminal"] {
+            let help = long_help(&[group]);
+            assert!(
+                help.contains(super::super::AGENT_HELP_FOOTER),
+                "herdr {group} is missing agent resources: {help}"
+            );
+        }
+
+        let leaf = long_help(&["agent", "wait"]);
+        assert!(
+            !leaf.contains(super::super::AGENT_HELP_FOOTER),
+            "leaf help should stay focused: {leaf}"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "herdr"
-version = "0.7.5"
+version = "0.8.0"
 edition = "2021"
 build = "build.rs"
 description = "terminal workspace manager for AI coding agents"
@@ -14,6 +14,7 @@ include = [
     "assets/sounds/*",
     "docs/next/api/herdr-api.schema.json",
     "skills/herdr/SKILL.md",
+    "website/install.ps1",
     "README.md",
     "LICENSE",
     "Cargo.toml",
@@ -28,6 +29,7 @@ clap_complete = "4.5"
 crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 interprocess = "2.4.2"
+jsonc-parser = { version = "0.33.1", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
 # ES256 JWT signing for APNs push auth (see src/push). Pure-Rust (RustCrypto, same family as sha2);
 # no TLS/socket stack — push delivery shells out to curl like `herdr update` does, so this adds crypto
@@ -41,7 +43,8 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+time = { version = "0.3.47", features = ["formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -52,11 +55,15 @@ schemars = { version = "1.2.1", features = ["derive"] }
 portable-pty = { path = "vendor/portable-pty" }
 
 [target.'cfg(windows)'.dependencies]
+# UTF-16 SDDL input for interprocess security descriptors.
+widestring = "1.2"
 wmi = { version = "0.18.4", default-features = false }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
