@@ -23,6 +23,7 @@ use crate::ipc::{
 };
 
 mod pane_graphics_stream;
+mod pane_input_stream;
 mod pane_output_stream;
 pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 
@@ -73,6 +74,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        pane_input_stream: true,
     })
 }
 
@@ -231,6 +233,22 @@ fn handle_connection_with_stop(
         Method::PaneStream(params) => {
             let result =
                 pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::PaneInputStream(params) => {
+            let result =
+                pane_input_stream::serve(stream, request_id.clone(), params, api_tx, running);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -515,6 +533,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneStream(_) => "pane.stream",
         Method::PaneStreamOpen(_) => "pane.stream.open",
         Method::PaneStreamClose(_) => "pane.stream.close",
+        Method::PaneInputStream(_) => "pane.input.stream",
+        Method::PaneInputStreamOpen(_) => "pane.input.stream.open",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -1205,6 +1225,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                pane_input_stream: false,
             }),
             None,
             None,

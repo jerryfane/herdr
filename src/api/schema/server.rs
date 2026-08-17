@@ -27,4 +27,9 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// The daemon serves the persistent `pane.input.stream` write channel
+    /// (issue #62). Clients feature-detect this before using it and otherwise
+    /// fall back to per-call `pane.send_text` / `pane.send_input`.
+    #[serde(default)]
+    pub pane_input_stream: bool,
 }
