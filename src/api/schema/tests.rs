@@ -830,6 +830,24 @@ fn old_pane_info_shape_defaults_and_omits_the_input_tuple() {
 }
 
 #[test]
+fn old_pane_info_shape_defaults_alternate_screen_false_and_omits_it() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1",
+        "terminal_id": "term_1",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!pane.alternate_screen);
+    let serialized = serde_json::to_value(pane).unwrap();
+    assert!(serialized.get("alternate_screen").is_none());
+}
+
+#[test]
 fn old_event_data_agent_status_shape_defaults_and_omits_the_input_tuple() {
     let event: EventData = serde_json::from_value(serde_json::json!({
         "type": "pane_agent_status_changed",
@@ -1043,6 +1061,7 @@ fn worktree_request_and_response_round_trip() {
                 turn: None,
                 turn_epoch: None,
                 scroll: None,
+                alternate_screen: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1477,6 +1496,7 @@ fn create_response_round_trips_with_root_pane() {
                 turn: None,
                 turn_epoch: None,
                 scroll: None,
+                alternate_screen: false,
                 revision: 0,
             },
         },

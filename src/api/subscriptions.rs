@@ -783,6 +783,7 @@ mod tests {
             turn: None,
             turn_epoch: None,
             scroll,
+            alternate_screen: false,
             revision: 0,
         }
     }

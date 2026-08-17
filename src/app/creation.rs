@@ -574,6 +574,12 @@ impl App {
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
+        let alternate_screen = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(|runtime| runtime.active_screen())
+            .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
+            .unwrap_or(false);
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -675,6 +681,7 @@ impl App {
             turn: terminal.is_agent_terminal().then_some(terminal.turn),
             turn_epoch: terminal.is_agent_terminal().then_some(terminal.turn_epoch),
             scroll,
+            alternate_screen,
             revision: terminal.revision,
         })
     }
