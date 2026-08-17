@@ -915,6 +915,7 @@ mod tests {
             turn: Some(0),
             turn_epoch: Some(9),
             scroll: None,
+            alternate_screen: false,
             revision: 0,
         }
     }

@@ -399,6 +399,14 @@ impl PaneTerminal {
         self.ghostty.input_state()
     }
 
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        self.ghostty.active_screen()
+    }
+
+    pub fn normalize_alternate_screen_on_exit(&self) -> bool {
+        self.ghostty.leave_alternate_screen_if_active()
+    }
+
     pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
         self.ghostty.wheel_routing()
     }
@@ -1414,6 +1422,25 @@ impl GhosttyPaneTerminal {
 
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
+        }
+    }
+
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        let Ok(core) = self.core.lock() else {
+            return None;
+        };
+        core.terminal.active_screen().ok()
+    }
+
+    pub fn leave_alternate_screen_if_active(&self) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate) {
+            core.terminal.write(b"\x1b[?1049l");
+            true
+        } else {
+            false
         }
     }
 

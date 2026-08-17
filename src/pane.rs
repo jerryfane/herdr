@@ -2767,6 +2767,14 @@ impl PaneRuntime {
         self.terminal.input_state()
     }
 
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        self.terminal.active_screen()
+    }
+
+    pub fn normalize_alternate_screen_on_exit(&self) -> bool {
+        self.terminal.normalize_alternate_screen_on_exit()
+    }
+
     pub fn cursor_state(&self, area: Rect, show_cursor: bool) -> Option<TerminalCursorState> {
         if !show_cursor {
             return None;
@@ -3579,6 +3587,31 @@ mod tests {
         );
 
         assert!(runtime.handoff_history_ansi().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_died_normalize_leaves_alternate_screen_and_recovers_history() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            40,
+            5,
+            4096,
+            b"primary-line-1\r\nprimary-line-2\r\n\x1b[?1049halt-content",
+        );
+
+        let before = runtime.input_state().unwrap();
+        assert!(before.alternate_screen);
+        assert!(runtime.handoff_history_ansi().is_none());
+
+        assert!(runtime.normalize_alternate_screen_on_exit());
+
+        let after = runtime.input_state().unwrap();
+        assert!(!after.alternate_screen);
+        let history = runtime.handoff_history_ansi().unwrap();
+        assert!(history.contains("primary-line-1"));
+
+        let primary = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary-only\r\n");
+        assert!(!primary.normalize_alternate_screen_on_exit());
     }
 
     #[cfg(unix)]

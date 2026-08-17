@@ -183,6 +183,15 @@ impl App {
                 self.close_popup_pane();
                 return;
             }
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    *pane_id,
+                ) {
+                    runtime.normalize_alternate_screen_on_exit();
+                }
+            }
             let previous_toast = self.state.toast.clone();
             if let Some(update) = self.state.publish_pane_process_exit_if_agent(*pane_id) {
                 self.sync_full_lifecycle_authority_detection_pauses();
