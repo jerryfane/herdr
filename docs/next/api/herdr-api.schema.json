@@ -11887,6 +11887,11 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "pane_input_stream": {
+              "default": false,
+              "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
+              "type": "boolean"
             }
           },
           "required": [

@@ -156,6 +156,47 @@ pub(crate) fn run_api_client_bridge(encoded_request: Option<&str>) -> io::Result
     send_and_stream(conn, &request_line, &mut stdout)
 }
 
+/// Persistent duplex variant of `run_api_client_bridge` for the
+/// `pane.input.stream` channel (issue #62): hold ONE API-socket connection open
+/// and pump stdin↔socket both ways so keystroke frames become socket writes on
+/// one long-lived channel instead of one `api-bridge` exec per keystroke.
+///
+/// Like the single-shot form it connects to the API socket DIRECTLY, without
+/// `ensure_remote_server_running()` — the JSON API is versioned by its schema,
+/// not the exact TUI protocol byte. Unlike it, teardown is keyed on stdin EOF
+/// (the client closing the channel), mirroring `run_remote_client_bridge`; the
+/// single-shot stdout-hangup watcher is deliberately NOT used, because it exists
+/// only to tear down a round-trip whose client half-closed stdin while still
+/// awaiting its reply — a duplex client never half-closes stdin until it is done.
+///
+/// The client writes the `pane.input.stream` open line then input frames and
+/// reads the open ack then frame acks; this bridge is a transport-dumb
+/// pass-through — the daemon's serve loop owns the protocol.
+pub(crate) fn run_api_client_bridge_duplex() -> io::Result<()> {
+    let socket_path = crate::api::socket_path();
+    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to connect to Herdr API socket {}: {err}",
+                socket_path.display()
+            ),
+        )
+    })?;
+
+    let mut stdout = io::stdout().lock();
+    let mut socket_to_stdout = stream.try_clone()?;
+    let mut stdin_to_socket = stream;
+
+    let _upload = thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        let _ = stdin_to_socket.shutdown(std::net::Shutdown::Write);
+    });
+
+    copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
 /// Blocks until `output_fd` reports POLLHUP/POLLERR (its read peer disappeared),
 /// then shuts down `teardown` so a reader blocked on the API socket wakes and
 /// the process exits. Separated and fd-parameterised so a test can drive it with

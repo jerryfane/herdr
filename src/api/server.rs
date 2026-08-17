@@ -23,6 +23,7 @@ use crate::ipc::{
 };
 
 mod pane_graphics_stream;
+mod pane_input_stream;
 mod pane_output_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -77,6 +78,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+        pane_input_stream: true,
     })
 }
 
@@ -222,6 +224,22 @@ fn handle_connection_with_stop(
         Method::PaneStream(params) => {
             let result =
                 pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::PaneInputStream(params) => {
+            let result =
+                pane_input_stream::serve(stream, request_id.clone(), params, api_tx, running);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -487,6 +505,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneStream(_) => "pane.stream",
         Method::PaneStreamOpen(_) => "pane.stream.open",
         Method::PaneStreamClose(_) => "pane.stream.close",
+        Method::PaneInputStream(_) => "pane.input.stream",
+        Method::PaneInputStreamOpen(_) => "pane.input.stream.open",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -1121,6 +1141,7 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                pane_input_stream: false,
             }),
             None,
             None,

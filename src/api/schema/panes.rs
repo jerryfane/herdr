@@ -301,6 +301,13 @@ pub struct PaneSendInputParams {
     pub keys: Vec<String>,
 }
 
+/// Open params for the persistent `pane.input.stream` write channel. Frames on
+/// the held-open connection are field-compatible with `PaneSendInputParams`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputStreamParams {
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReadParams {
     pub pane_id: String,

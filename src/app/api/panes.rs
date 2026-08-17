@@ -4,9 +4,9 @@ use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCurrentParams,
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneInputStreamParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
@@ -623,6 +623,25 @@ impl App {
                 }
             }
             None => crate::api::output_registry::unregister(&params.pane_id),
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Open handshake for the persistent `pane.input.stream` write channel
+    /// (issue #62). Unlike the output stream there is no ring or registry to
+    /// attach: each frame is dispatched through the normal `pane.send_input`
+    /// path, so this only validates that the pane exists and is live before the
+    /// server upgrades the connection into a held-open frame loop.
+    pub(super) fn handle_pane_input_stream_open(
+        &mut self,
+        id: String,
+        params: PaneInputStreamParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
+            return pane_not_found(id, &params.pane_id);
         }
         encode_success(id, ResponseResult::Ok {})
     }
