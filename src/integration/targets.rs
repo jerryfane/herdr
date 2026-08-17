@@ -2,9 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use super::command::{hook_command, shell_single_quote};
+use super::claude_settings::{
+    install as install_claude_settings, uninstall as uninstall_claude_settings,
+};
+use super::command::hook_command;
+#[cfg(not(windows))]
+use super::command::shell_single_quote;
 use super::config_edit::{
     build_codex_config_with_hooks, build_kimi_config_with_hooks, ensure_command_hook,
     ensure_direct_command_hook, ensure_flat_command_hook, ensure_hermes_plugin_enabled,
@@ -13,39 +18,45 @@ use super::config_edit::{
     remove_hook_commands, remove_kimi_config_block, remove_simple_command_hook,
 };
 use super::env::{
-    claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir, grok_dir, hermes_dir,
-    hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir, omp_extension_dir, opencode_dir,
-    pi_extension_dir, qodercli_dir,
+    antigravity_cli_dir, claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir,
+    grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir, omp_extension_dir,
+    opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
 };
+use super::opencode_config::{
+    add_tui_plugin, remove_tui_plugin, tui_config_path, validate_tui_plugin_config,
+};
 use super::types::{
-    ClaudeInstallPaths, ClaudeUninstallResult, CodexInstallPaths, CodexUninstallResult,
-    CopilotInstallPaths, CopilotUninstallResult, CursorInstallPaths, CursorUninstallResult,
-    DevinInstallPaths, DevinUninstallResult, DroidInstallPaths, DroidUninstallResult,
-    GrokInstallPaths, GrokUninstallResult, HermesInstallPaths, HermesUninstallResult,
-    KiloInstallPaths, KiloUninstallResult, KimiInstallPaths, KimiUninstallResult,
-    MastracodeInstallPaths, MastracodeUninstallResult, OmpInstallPaths, OmpUninstallResult,
-    OpenCodeInstallPaths, OpenCodeUninstallResult, PiUninstallResult, QodercliInstallPaths,
-    QodercliUninstallResult,
+    AntigravityCliInstallPaths, AntigravityCliUninstallResult, ClaudeInstallPaths,
+    ClaudeUninstallResult, CodexInstallPaths, CodexUninstallResult, CopilotInstallPaths,
+    CopilotUninstallResult, CursorInstallPaths, CursorUninstallResult, DevinInstallPaths,
+    DevinUninstallResult, DroidInstallPaths, DroidUninstallResult, GrokInstallPaths,
+    GrokUninstallResult, HermesInstallPaths, HermesUninstallResult, KiloInstallPaths,
+    KiloUninstallResult, KimiInstallPaths, KimiUninstallResult, MastracodeInstallPaths,
+    MastracodeUninstallResult, OmpInstallPaths, OmpUninstallResult, OpenCodeInstallPaths,
+    OpenCodeUninstallResult, PiUninstallResult, QodercliInstallPaths, QodercliUninstallResult,
+    QwenInstallPaths, QwenUninstallResult,
 };
 use super::{
-    CLAUDE_HOOK_ASSET, CLAUDE_HOOK_INSTALL_NAME, CODEX_HOOK_ASSET, CODEX_HOOK_INSTALL_NAME,
-    COPILOT_HOOK_ASSET, COPILOT_HOOK_EVENTS, COPILOT_HOOK_INSTALL_NAME,
-    COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS, CURSOR_HOOK_ASSET, CURSOR_HOOK_INSTALL_NAME,
-    DEVIN_HOOK_ASSET, DEVIN_HOOK_EVENTS, DEVIN_HOOK_INSTALL_NAME,
-    DEVIN_REMOVED_LIFECYCLE_HOOK_EVENTS, DROID_HOOK_ASSET, DROID_HOOK_EVENTS,
-    DROID_HOOK_INSTALL_NAME, DROID_REMOVED_LIFECYCLE_HOOK_EVENTS, GROK_HOOK_ASSET,
-    GROK_HOOK_CONFIG_INSTALL_NAME, GROK_HOOK_INSTALL_NAME, HERMES_PLUGIN_INIT_ASSET,
-    HERMES_PLUGIN_INIT_INSTALL_NAME, HERMES_PLUGIN_MANIFEST_ASSET,
+    ANTIGRAVITY_CLI_HOOK_ASSET, ANTIGRAVITY_CLI_HOOK_BLOCK_NAME, ANTIGRAVITY_CLI_HOOK_EVENTS,
+    ANTIGRAVITY_CLI_HOOK_INSTALL_NAME, ANTIGRAVITY_CLI_HOOK_TIMEOUT_SEC, CLAUDE_HOOK_ASSET,
+    CLAUDE_HOOK_INSTALL_NAME, CODEX_HOOK_ASSET, CODEX_HOOK_INSTALL_NAME, COPILOT_HOOK_ASSET,
+    COPILOT_HOOK_EVENTS, COPILOT_HOOK_INSTALL_NAME, COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS,
+    CURSOR_HOOK_ASSET, CURSOR_HOOK_INSTALL_NAME, DEVIN_HOOK_ASSET, DEVIN_HOOK_EVENTS,
+    DEVIN_HOOK_INSTALL_NAME, DEVIN_REMOVED_LIFECYCLE_HOOK_EVENTS, DROID_HOOK_ASSET,
+    DROID_HOOK_EVENTS, DROID_HOOK_INSTALL_NAME, DROID_REMOVED_LIFECYCLE_HOOK_EVENTS,
+    GROK_HOOK_ASSET, GROK_HOOK_CONFIG_INSTALL_NAME, GROK_HOOK_INSTALL_NAME,
+    HERMES_PLUGIN_INIT_ASSET, HERMES_PLUGIN_INIT_INSTALL_NAME, HERMES_PLUGIN_MANIFEST_ASSET,
     HERMES_PLUGIN_MANIFEST_INSTALL_NAME, KILO_PLUGIN_ASSET, KILO_PLUGIN_INSTALL_NAME,
     KIMI_HOOK_ASSET, KIMI_HOOK_INSTALL_NAME, MASTRACODE_HOOK_ASSET, MASTRACODE_HOOK_EVENTS,
     MASTRACODE_HOOK_INSTALL_NAME, MASTRACODE_HOOK_TIMEOUT_MS, MASTRACODE_REMOVED_HOOK_EVENTS,
     OMP_EXTENSION_ASSET, OMP_EXTENSION_INSTALL_NAME, OPENCODE_PLUGIN_ASSET,
-    OPENCODE_PLUGIN_INSTALL_NAME, PI_EXTENSION_ASSET, PI_EXTENSION_INSTALL_NAME,
-    QODERCLI_HOOK_ASSET, QODERCLI_HOOK_EVENTS, QODERCLI_HOOK_INSTALL_NAME,
-    QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS,
+    OPENCODE_PLUGIN_INSTALL_NAME, OPENCODE_TUI_PLUGIN_ASSET, OPENCODE_TUI_PLUGIN_INSTALL_NAME,
+    OPENCODE_TUI_PLUGIN_SPEC, PI_EXTENSION_ASSET, PI_EXTENSION_INSTALL_NAME, QODERCLI_HOOK_ASSET,
+    QODERCLI_HOOK_EVENTS, QODERCLI_HOOK_INSTALL_NAME, QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS,
+    QWEN_HOOK_ASSET, QWEN_HOOK_EVENTS, QWEN_HOOK_INSTALL_NAME,
 };
 
 fn ensure_extension_dir(dir: &Path, agent: &str) -> io::Result<()> {
@@ -122,43 +133,17 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     make_executable(&hook_path)?;
 
     let settings_path = dir.join("settings.json");
-    let mut settings = if settings_path.is_file() {
-        serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?).map_err(|err| {
-            io::Error::other(format!(
-                "failed to parse {}: {err}",
-                settings_path.display()
-            ))
-        })?
+    let existing_settings = if settings_path.is_file() {
+        fs::read_to_string(&settings_path)?
     } else {
-        json!({})
+        "{}".to_string()
     };
-
-    let hooks = ensure_hooks_object(
-        &mut settings,
-        &settings_path,
-        "claude settings",
-        "claude settings hooks",
-    )?;
-    remove_hook_commands(hooks, "PostToolUse", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PostToolUseFailure", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "SubagentStop", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PermissionRequest", &hook_path, Some("blocked"))?;
-    remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "UserPromptSubmit", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PreToolUse", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "Stop", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "SessionEnd", &hook_path, Some("release"))?;
-    remove_hook_commands(hooks, "SessionStart", &hook_path, Some("session"))?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        hook_command(&hook_path, Some("session")),
-        10,
-        Some("*"),
-    )?;
+    let updated_settings = install_claude_settings(&existing_settings, &settings_path, &hook_path)?;
     remove_legacy_bash_hook_file(&hook_path)?;
 
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    if updated_settings != existing_settings {
+        fs::write(&settings_path, updated_settings)?;
+    }
 
     Ok(ClaudeInstallPaths {
         hook_path,
@@ -472,13 +457,21 @@ pub(crate) fn install_opencode() -> io::Result<OpenCodeInstallPaths> {
         )));
     }
 
+    validate_tui_plugin_config(&dir)?;
     let plugins_dir = dir.join("plugins");
     fs::create_dir_all(&plugins_dir)?;
 
     let plugin_path = plugins_dir.join(OPENCODE_PLUGIN_INSTALL_NAME);
     fs::write(&plugin_path, OPENCODE_PLUGIN_ASSET)?;
+    let tui_plugin_path = dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME);
+    fs::write(&tui_plugin_path, OPENCODE_TUI_PLUGIN_ASSET)?;
+    let tui_config_path = add_tui_plugin(&dir, OPENCODE_TUI_PLUGIN_SPEC)?;
 
-    Ok(OpenCodeInstallPaths { plugin_path })
+    Ok(OpenCodeInstallPaths {
+        plugin_path,
+        tui_plugin_path,
+        tui_config_path,
+    })
 }
 
 pub(crate) fn install_kilo() -> io::Result<KiloInstallPaths> {
@@ -562,43 +555,12 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
     let mut updated_settings = false;
 
     if settings_path.is_file() {
-        let mut settings = serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?)
-            .map_err(|err| {
-                io::Error::other(format!(
-                    "failed to parse {}: {err}",
-                    settings_path.display()
-                ))
-            })?;
-
-        if let Some(hooks) = hooks_object_if_present(
-            &mut settings,
-            &settings_path,
-            "claude settings",
-            "claude settings hooks",
-        )? {
-            updated_settings |=
-                remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "SessionStart", &hook_path, Some("session"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "UserPromptSubmit", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PreToolUse", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PermissionRequest", &hook_path, Some("blocked"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PostToolUse", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PostToolUseFailure", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "SubagentStop", &hook_path, Some("working"))?;
-            updated_settings |= remove_hook_commands(hooks, "Stop", &hook_path, Some("idle"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "SessionEnd", &hook_path, Some("release"))?;
-        }
-
+        let existing_settings = fs::read_to_string(&settings_path)?;
+        let new_settings =
+            uninstall_claude_settings(&existing_settings, &settings_path, &hook_path)?;
+        updated_settings = new_settings != existing_settings;
         if updated_settings {
-            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+            fs::write(&settings_path, new_settings)?;
         }
     }
 
@@ -852,14 +814,38 @@ pub(crate) fn uninstall_droid() -> io::Result<DroidUninstallResult> {
 }
 
 pub(crate) fn uninstall_opencode() -> io::Result<OpenCodeUninstallResult> {
-    let plugin_path = opencode_dir()?
-        .join("plugins")
-        .join(OPENCODE_PLUGIN_INSTALL_NAME);
-    let removed_plugin = remove_file_if_exists(&plugin_path)?;
+    let dir = opencode_dir()?;
+    let tui_config_path = tui_config_path(&dir);
+    let plugin_path = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
+    let tui_plugin_path = dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME);
+    let mut errors = Vec::new();
+    let updated_tui_config =
+        remove_tui_plugin(&dir, OPENCODE_TUI_PLUGIN_SPEC).unwrap_or_else(|err| {
+            errors.push(err.to_string());
+            false
+        });
+    let removed_plugin = remove_file_if_exists(&plugin_path).unwrap_or_else(|err| {
+        errors.push(format!("failed to remove {}: {err}", plugin_path.display()));
+        false
+    });
+    let removed_tui_plugin = remove_file_if_exists(&tui_plugin_path).unwrap_or_else(|err| {
+        errors.push(format!(
+            "failed to remove {}: {err}",
+            tui_plugin_path.display()
+        ));
+        false
+    });
+    if !errors.is_empty() {
+        return Err(io::Error::other(errors.join("; ")));
+    }
 
     Ok(OpenCodeUninstallResult {
         plugin_path,
+        tui_plugin_path,
+        tui_config_path,
         removed_plugin,
+        removed_tui_plugin,
+        updated_tui_config,
     })
 }
 
@@ -961,6 +947,59 @@ pub(crate) fn install_qodercli() -> io::Result<QodercliInstallPaths> {
     })
 }
 
+pub(crate) fn install_qwen() -> io::Result<QwenInstallPaths> {
+    let dir = qwen_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "qwen code config directory not found at {}. install qwen code first",
+            dir.display()
+        )));
+    }
+
+    let hooks_dir = dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join(QWEN_HOOK_INSTALL_NAME);
+    fs::write(&hook_path, QWEN_HOOK_ASSET)?;
+    make_executable(&hook_path)?;
+
+    let settings_path = dir.join("settings.json");
+    let mut settings = if settings_path.is_file() {
+        serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?).map_err(|err| {
+            io::Error::other(format!(
+                "failed to parse {}: {err}",
+                settings_path.display()
+            ))
+        })?
+    } else {
+        json!({})
+    };
+
+    let hooks = ensure_hooks_object(
+        &mut settings,
+        &settings_path,
+        "qwen settings",
+        "qwen settings hooks",
+    )?;
+    for (event, action) in QWEN_HOOK_EVENTS {
+        remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+        ensure_command_hook(
+            hooks,
+            event,
+            hook_command(&hook_path, Some(action)),
+            10_000,
+            Some("*"),
+        )?;
+    }
+
+    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+
+    Ok(QwenInstallPaths {
+        hook_path,
+        settings_path,
+    })
+}
+
 pub(crate) fn install_cursor() -> io::Result<CursorInstallPaths> {
     let dir = cursor_dir()?;
     if !dir.is_dir() {
@@ -1001,8 +1040,7 @@ pub(crate) fn install_cursor() -> io::Result<CursorInstallPaths> {
         "cursor hooks file",
         "cursor hooks file hooks",
     )?;
-    let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
-    let session_command = format!("bash {quoted_hook_path} session");
+    let session_command = hook_command(&hook_path, Some("session"));
     remove_simple_command_hook(hooks, "beforeSubmitPrompt", &session_command)?;
     remove_simple_command_hook(hooks, "beforeShellExecution", &session_command)?;
     remove_simple_command_hook(hooks, "beforeMCPExecution", &session_command)?;
@@ -1064,6 +1102,46 @@ pub(crate) fn uninstall_qodercli() -> io::Result<QodercliUninstallResult> {
     })
 }
 
+pub(crate) fn uninstall_qwen() -> io::Result<QwenUninstallResult> {
+    let hook_path = qwen_dir()?.join("hooks").join(QWEN_HOOK_INSTALL_NAME);
+    let settings_path = qwen_dir()?.join("settings.json");
+    let mut updated_settings = false;
+
+    if settings_path.is_file() {
+        let mut settings = serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?)
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to parse {}: {err}",
+                    settings_path.display()
+                ))
+            })?;
+
+        if let Some(hooks) = hooks_object_if_present(
+            &mut settings,
+            &settings_path,
+            "qwen settings",
+            "qwen settings hooks",
+        )? {
+            for (event, action) in QWEN_HOOK_EVENTS {
+                updated_settings |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
+        }
+
+        if updated_settings {
+            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+        }
+    }
+
+    let removed_hook_file = remove_file_if_exists(&hook_path)?;
+
+    Ok(QwenUninstallResult {
+        hook_path,
+        settings_path,
+        removed_hook_file,
+        updated_settings,
+    })
+}
+
 pub(crate) fn uninstall_cursor() -> io::Result<CursorUninstallResult> {
     let cursor_home = cursor_dir()?;
     let hook_path = cursor_home.join(CURSOR_HOOK_INSTALL_NAME);
@@ -1082,8 +1160,7 @@ pub(crate) fn uninstall_cursor() -> io::Result<CursorUninstallResult> {
             "cursor hooks file",
             "cursor hooks file hooks",
         )? {
-            let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
-            let session_command = format!("bash {quoted_hook_path} session");
+            let session_command = hook_command(&hook_path, Some("session"));
             updated_hooks |= remove_simple_command_hook(hooks, "sessionStart", &session_command)?;
             updated_hooks |=
                 remove_simple_command_hook(hooks, "beforeSubmitPrompt", &session_command)?;
@@ -1108,6 +1185,26 @@ pub(crate) fn uninstall_cursor() -> io::Result<CursorUninstallResult> {
         removed_hook_file,
         updated_hooks,
     })
+}
+
+pub(crate) fn mastracode_hook_command(hook_path: &Path, action: &str) -> String {
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+
+        let path = hook_path.display().to_string().replace('\'', "''");
+        let script = format!("& '{path}' {action}");
+        let encoded_script = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(encoded_script);
+        format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+    }
+    #[cfg(not(windows))]
+    {
+        hook_command(hook_path, Some(action))
+    }
 }
 
 pub(crate) fn install_mastracode() -> io::Result<MastracodeInstallPaths> {
@@ -1135,15 +1232,16 @@ pub(crate) fn install_mastracode() -> io::Result<MastracodeInstallPaths> {
         ))
     })?;
 
-    let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
     for (event, action) in MASTRACODE_REMOVED_HOOK_EVENTS {
-        remove_flat_command_hook(hooks, event, &format!("bash {quoted_hook_path} {action}"))?;
+        remove_flat_command_hook(hooks, event, &hook_command(&hook_path, Some(action)))?;
+        remove_flat_command_hook(hooks, event, &mastracode_hook_command(&hook_path, action))?;
     }
     for (event, action) in MASTRACODE_HOOK_EVENTS {
+        remove_flat_command_hook(hooks, event, &hook_command(&hook_path, Some(action)))?;
         ensure_flat_command_hook(
             hooks,
             event,
-            format!("bash {quoted_hook_path} {action}"),
+            mastracode_hook_command(&hook_path, action),
             MASTRACODE_HOOK_TIMEOUT_MS,
         )?;
     }
@@ -1176,15 +1274,16 @@ pub(crate) fn uninstall_mastracode() -> io::Result<MastracodeUninstallResult> {
             ))
         })?;
 
-        let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
         for (event, action) in MASTRACODE_HOOK_EVENTS
             .into_iter()
             .chain(MASTRACODE_REMOVED_HOOK_EVENTS)
         {
+            updated_hooks |=
+                remove_flat_command_hook(hooks, event, &hook_command(&hook_path, Some(action)))?;
             updated_hooks |= remove_flat_command_hook(
                 hooks,
                 event,
-                &format!("bash {quoted_hook_path} {action}"),
+                &mastracode_hook_command(&hook_path, action),
             )?;
         }
 
@@ -1203,11 +1302,124 @@ pub(crate) fn uninstall_mastracode() -> io::Result<MastracodeUninstallResult> {
     })
 }
 
+pub(crate) fn install_antigravity_cli() -> io::Result<AntigravityCliInstallPaths> {
+    let dir = antigravity_cli_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "antigravity cli config directory not found at {}. install antigravity cli first",
+            dir.display()
+        )));
+    }
+
+    let hooks_dir = dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join(ANTIGRAVITY_CLI_HOOK_INSTALL_NAME);
+    fs::write(&hook_path, ANTIGRAVITY_CLI_HOOK_ASSET)?;
+    make_executable(&hook_path)?;
+
+    let hooks_path = dir.join("hooks.json");
+    let mut hooks_file = if hooks_path.is_file() {
+        serde_json::from_str::<Value>(&fs::read_to_string(&hooks_path)?).map_err(|err| {
+            io::Error::other(format!("failed to parse {}: {err}", hooks_path.display()))
+        })?
+    } else {
+        json!({})
+    };
+
+    let hooks = hooks_file.as_object_mut().ok_or_else(|| {
+        io::Error::other(format!(
+            "antigravity cli hooks file at {} must be a JSON object",
+            hooks_path.display()
+        ))
+    })?;
+
+    // The Herdr block is Herdr-owned, so rewrite it wholesale and leave every
+    // other named hook untouched.
+    hooks.insert(
+        ANTIGRAVITY_CLI_HOOK_BLOCK_NAME.to_string(),
+        antigravity_cli_hook_block(&hook_path),
+    );
+
+    fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
+
+    Ok(AntigravityCliInstallPaths {
+        hook_path,
+        hooks_path,
+    })
+}
+
+/// Builds the Herdr-owned `hooks.json` block for Antigravity CLI.
+///
+/// Every event Herdr registers takes a flat handler list; the `matcher`/`hooks`
+/// group is only valid for the tool events, which Herdr does not use.
+fn antigravity_cli_hook_block(hook_path: &Path) -> Value {
+    let mut block = Map::new();
+    for (event, action) in ANTIGRAVITY_CLI_HOOK_EVENTS {
+        let handler = json!({
+            "type": "command",
+            "command": hook_command(hook_path, Some(action)),
+            "timeout": ANTIGRAVITY_CLI_HOOK_TIMEOUT_SEC,
+        });
+        block.insert(event.to_string(), json!([handler]));
+    }
+    Value::Object(block)
+}
+
+pub(crate) fn uninstall_antigravity_cli() -> io::Result<AntigravityCliUninstallResult> {
+    let dir = antigravity_cli_dir()?;
+    let hook_path = dir.join("hooks").join(ANTIGRAVITY_CLI_HOOK_INSTALL_NAME);
+    let hooks_path = dir.join("hooks.json");
+    let mut updated_hooks = false;
+
+    if hooks_path.is_file() {
+        let mut hooks_file = serde_json::from_str::<Value>(&fs::read_to_string(&hooks_path)?)
+            .map_err(|err| {
+                io::Error::other(format!("failed to parse {}: {err}", hooks_path.display()))
+            })?;
+
+        let hooks = hooks_file.as_object_mut().ok_or_else(|| {
+            io::Error::other(format!(
+                "antigravity cli hooks file at {} must be a JSON object",
+                hooks_path.display()
+            ))
+        })?;
+
+        updated_hooks = hooks.remove(ANTIGRAVITY_CLI_HOOK_BLOCK_NAME).is_some();
+
+        if updated_hooks {
+            fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
+        }
+    }
+
+    let removed_hook_file = remove_file_if_exists(&hook_path)?;
+
+    Ok(AntigravityCliUninstallResult {
+        hook_path,
+        hooks_path,
+        removed_hook_file,
+        updated_hooks,
+    })
+}
+
 /// The complete Herdr-owned Grok hook config. Installation and status share
 /// this value so any config drift is reported as outdated.
+fn grok_hook_command(hook_path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        hook_command(hook_path, Some("session"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "sh {} session",
+            shell_single_quote(&hook_path.display().to_string())
+        )
+    }
+}
+
 pub(crate) fn grok_hook_config(hook_path: &Path) -> Value {
-    let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
-    let session_command = format!("sh {quoted_hook_path} session");
+    let session_command = grok_hook_command(hook_path);
     json!({
         "hooks": {
             "SessionStart": [

@@ -71,9 +71,10 @@ pub fn session_ref_from_report(
 
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
-        Some(source @ ("startup" | "resume" | "clear" | "compact" | "new" | "fork")) => {
-            Some(source.to_string())
-        }
+        Some(
+            source @ ("startup" | "resume" | "clear" | "compact" | "branch" | "new" | "fork"
+            | "select"),
+        ) => Some(source.to_string()),
         _ => None,
     }
 }
@@ -87,6 +88,7 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
             | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
             | ("herdr:qodercli", "qodercli")
+            | ("herdr:qwen", "qwen")
             | ("herdr:cursor", "cursor")
             | ("herdr:grok", "grok")
     )
@@ -177,13 +179,28 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
                 session_ref.value.clone(),
             ]
         }
+        ("herdr:qwen", "qwen", AgentSessionRefKind::Id) => {
+            vec!["qwen".into(), "--resume".into(), session_ref.value.clone()]
+        }
         ("herdr:kilo", "kilo", AgentSessionRefKind::Id) => {
             vec!["kilo".into(), "--session".into(), session_ref.value.clone()]
         }
         ("herdr:cursor", "cursor", AgentSessionRefKind::Id) => {
             vec![
-                "cursor-agent".into(),
+                if cfg!(windows) {
+                    "cursor-agent.cmd"
+                } else {
+                    "cursor-agent"
+                }
+                .into(),
                 "--resume".into(),
+                session_ref.value.clone(),
+            ]
+        }
+        ("herdr:antigravity_cli", "agy", AgentSessionRefKind::Id) => {
+            vec![
+                "agy".into(),
+                "--conversation".into(),
                 session_ref.value.clone(),
             ]
         }
@@ -222,8 +239,10 @@ pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
             | ("herdr:hermes", "hermes")
             | ("herdr:opencode", "opencode")
             | ("herdr:qodercli", "qodercli")
+            | ("herdr:qwen", "qwen")
             | ("herdr:kilo", "kilo")
             | ("herdr:cursor", "cursor")
+            | ("herdr:antigravity_cli", "agy")
             | ("herdr:grok", "grok")
     )
 }
@@ -389,6 +408,16 @@ mod tests {
         );
         assert_eq!(
             plan(
+                "herdr:qwen",
+                "qwen",
+                &AgentSessionRef::id("qwen-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["qwen", "--resume", "qwen-session"]
+        );
+        assert_eq!(
+            plan(
                 "herdr:kilo",
                 "kilo",
                 &AgentSessionRef::id("kilo-session").unwrap()
@@ -405,7 +434,25 @@ mod tests {
             )
             .unwrap()
             .argv,
-            vec!["cursor-agent", "--resume", "cursor-session"]
+            vec![
+                if cfg!(windows) {
+                    "cursor-agent.cmd"
+                } else {
+                    "cursor-agent"
+                },
+                "--resume",
+                "cursor-session",
+            ]
+        );
+        assert_eq!(
+            plan(
+                "herdr:antigravity_cli",
+                "agy",
+                &AgentSessionRef::id("agy-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["agy", "--conversation", "agy-session"]
         );
         assert_eq!(
             plan(
@@ -543,6 +590,17 @@ mod tests {
                 .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "qoder-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:qwen", "qwen", Some("qwen-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "qwen-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:antigravity_cli", "agy", Some("agy-id".into()), None)
+                .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "agy-id");
     }
 
     #[test]
@@ -564,12 +622,20 @@ mod tests {
             Some("compact".into())
         );
         assert_eq!(
+            normalize_session_start_source(Some("branch".into())),
+            Some("branch".into())
+        );
+        assert_eq!(
             normalize_session_start_source(Some("new".into())),
             Some("new".into())
         );
         assert_eq!(
             normalize_session_start_source(Some("fork".into())),
             Some("fork".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("select".into())),
+            Some("select".into())
         );
         assert_eq!(
             normalize_session_start_source(Some(" resume ".into())),
@@ -676,5 +742,19 @@ mod tests {
             "devin-session"
         )
         .is_some());
+        assert!(session_ref_from_snapshot(
+            "herdr:antigravity_cli",
+            "agy",
+            AgentSessionRefKind::Id,
+            "agy-session"
+        )
+        .is_some());
+        let agy_session = absolute_test_path("agy-session");
+        assert!(plan(
+            "herdr:antigravity_cli",
+            "agy",
+            &AgentSessionRef::path(&agy_session).unwrap()
+        )
+        .is_none());
     }
 }

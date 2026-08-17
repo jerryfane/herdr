@@ -64,6 +64,7 @@ impl TerminalRuntime {
         import: crate::handoff_runtime::ImportedHandoffRuntime,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
@@ -72,6 +73,7 @@ impl TerminalRuntime {
             import,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             events,
             render_notify,
             render_dirty,
@@ -79,6 +81,8 @@ impl TerminalRuntime {
         .map(Self)
     }
 
+    // Wrapper mirrors pane runtime construction arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         pane_id: PaneId,
         rows: u16,
@@ -86,6 +90,7 @@ impl TerminalRuntime {
         cwd: std::path::PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &crate::pane::PaneLaunchEnv,
         events: mpsc::Sender<AppEvent>,
@@ -99,6 +104,7 @@ impl TerminalRuntime {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             launch_env,
             events,
@@ -117,6 +123,7 @@ impl TerminalRuntime {
         cwd: std::path::PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &crate::pane::PaneLaunchEnv,
         initial_history_ansi: Option<&str>,
@@ -131,6 +138,7 @@ impl TerminalRuntime {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             launch_env,
             initial_history_ansi,
@@ -153,6 +161,7 @@ impl TerminalRuntime {
         agent_detection: crate::pane::AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
@@ -167,6 +176,7 @@ impl TerminalRuntime {
             agent_detection,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             events,
             render_notify,
             render_dirty,
@@ -186,6 +196,7 @@ impl TerminalRuntime {
         agent_detection: crate::pane::AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
@@ -200,6 +211,7 @@ impl TerminalRuntime {
             agent_detection,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             events,
             render_notify,
             render_dirty,
@@ -209,6 +221,13 @@ impl TerminalRuntime {
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
         self.0.apply_host_terminal_theme(theme);
+    }
+
+    pub fn apply_host_terminal_appearance(
+        &self,
+        appearance: Option<crate::terminal_theme::HostAppearance>,
+    ) {
+        self.0.apply_host_terminal_appearance(appearance);
     }
 
     pub fn begin_graceful_release(&self, agent: crate::detect::Agent) {
@@ -303,6 +322,11 @@ impl TerminalRuntime {
         self.0.word_motion_target(row, col, motion)
     }
 
+    /// Collects the complete terminal input-mode snapshot.
+    ///
+    /// This performs multiple terminal queries and may format keyboard state.
+    /// Keep it out of render/layout and pane-scaled loops; add a narrow accessor
+    /// when only one terminal fact is needed.
     pub fn input_state(&self) -> Option<crate::pane::InputState> {
         self.0.input_state()
     }
@@ -313,6 +337,11 @@ impl TerminalRuntime {
 
     pub fn normalize_alternate_screen_on_exit(&self) -> bool {
         self.0.normalize_alternate_screen_on_exit()
+    }
+
+    /// Reads only whether the alternate screen is active.
+    pub fn alternate_screen_active(&self) -> bool {
+        self.0.alternate_screen_active()
     }
 
     pub fn cursor_state(
@@ -357,10 +386,6 @@ impl TerminalRuntime {
 
     pub fn agent_osc_progress(&self) -> String {
         self.0.agent_osc_progress()
-    }
-
-    pub fn recent_text(&self, lines: usize) -> String {
-        self.0.recent_text(lines)
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> crate::pane::TerminalReadSnapshot {
@@ -475,34 +500,66 @@ impl TerminalRuntime {
         self.0.wheel_routing()
     }
 
+    pub(crate) fn screen_text_snapshot(
+        &self,
+    ) -> Option<(
+        crate::ghostty::ActiveScreen,
+        crate::terminal::ScreenSnapshot,
+    )> {
+        let (screen, cols, rows) = self.0.screen_text_snapshot()?;
+        Some((screen, crate::terminal::ScreenSnapshot { cols, rows }))
+    }
+
+    pub(crate) fn screen_text_snapshot_with_seq(
+        &self,
+    ) -> Option<(
+        crate::ghostty::ActiveScreen,
+        crate::terminal::ScreenSnapshot,
+        u64,
+    )> {
+        for _ in 0..3 {
+            let before = self.content_seq();
+            if !before.is_multiple_of(2) {
+                continue;
+            }
+            let (screen, snapshot) = self.screen_text_snapshot()?;
+            let after = self.content_seq();
+            if before == after {
+                return Some((screen, snapshot, after));
+            }
+        }
+        None
+    }
+
     pub fn encode_mouse_button(
         &self,
         kind: crossterm::event::MouseEventKind,
-        column: u16,
-        row: u16,
+        position: crate::input::mouse::Position,
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Vec<u8>> {
-        self.0.encode_mouse_button(kind, column, row, modifiers)
+        self.0.encode_mouse_button(kind, position, modifiers)
     }
 
-    pub fn encode_mouse_motion(
+    pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
-        column: u16,
-        row: u16,
+        position: crate::input::mouse::Position,
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Vec<u8>> {
-        self.0.encode_mouse_motion(kind, column, row, modifiers)
+        self.0.encode_mouse_motion(kind, position, modifiers)
     }
 
-    pub fn encode_mouse_wheel(
+    pub(crate) fn encode_mouse_wheel(
         &self,
         kind: crossterm::event::MouseEventKind,
-        column: u16,
-        row: u16,
+        position: crate::input::mouse::Position,
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Vec<u8>> {
-        self.0.encode_mouse_wheel(kind, column, row, modifiers)
+        self.0.encode_mouse_wheel(kind, position, modifiers)
+    }
+
+    pub(crate) fn pixel_size(&self) -> Option<(u32, u32)> {
+        self.0.pixel_size()
     }
 
     pub fn encode_alternate_scroll(
@@ -530,6 +587,10 @@ impl TerminalRuntime {
 
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
+    }
+
+    pub(crate) fn content_seq(&self) -> u64 {
+        self.0.content_seq()
     }
 }
 

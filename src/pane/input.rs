@@ -1,5 +1,5 @@
 pub(super) fn ghostty_key_event_from_terminal_key(
-    key: crate::input::TerminalKey,
+    key: &crate::input::TerminalKey,
 ) -> Option<crate::ghostty::KeyEvent> {
     let mut event = crate::ghostty::KeyEvent::new().ok()?;
     event.set_action(match key.kind {
@@ -13,7 +13,12 @@ pub(super) fn ghostty_key_event_from_terminal_key(
             crate::ghostty::ffi::GhosttyKeyAction_GHOSTTY_KEY_ACTION_REPEAT
         }
     });
-    event.set_mods(ghostty_mods_from_key_modifiers(key.modifiers));
+    let mut mods = ghostty_mods_from_key_modifiers(key.modifiers);
+    if matches!(key.code, crossterm::event::KeyCode::BackTab) {
+        // Ghostty represents backtab as Tab with Shift rather than a distinct key.
+        mods |= crate::ghostty::MOD_SHIFT;
+    }
+    event.set_mods(mods);
     event.set_key(ghostty_key_from_crossterm_key_code(
         key.code,
         key.shifted_codepoint,
@@ -32,7 +37,7 @@ pub(super) fn ghostty_key_event_from_terminal_key(
     Some(event)
 }
 
-pub(super) fn ghostty_prefers_herdr_text_encoding(key: crate::input::TerminalKey) -> bool {
+pub(super) fn ghostty_prefers_herdr_text_encoding(key: &crate::input::TerminalKey) -> bool {
     matches!(key.code, crossterm::event::KeyCode::Char(_))
 }
 
@@ -55,21 +60,41 @@ pub(super) fn ghostty_mods_from_key_modifiers(modifiers: crossterm::event::KeyMo
 
 pub(super) fn ghostty_mouse_encoder_for_terminal(
     terminal: &crate::ghostty::Terminal,
+    position: crate::input::mouse::Position,
 ) -> Option<crate::ghostty::MouseEncoder> {
     let mut encoder = crate::ghostty::MouseEncoder::new().ok()?;
     encoder.set_from_terminal(terminal);
-    if terminal
-        .mode_get(crate::ghostty::MODE_MOUSE_SGR_PIXELS)
-        .ok()?
-    {
-        // Herdr receives host mouse positions in terminal cells. Downgrade
-        // SGR-pixels to normal SGR so forwarded coordinates stay cell-local.
-        encoder.set_format(crate::ghostty::MOUSE_FORMAT_SGR);
-    }
     let cols = terminal.cols().ok()? as u32;
     let rows = terminal.rows().ok()? as u32;
-    encoder.set_size(cols, rows, 1, 1);
+    match position {
+        crate::input::mouse::Position::Cell { .. } => {
+            if terminal
+                .mode_get(crate::ghostty::MODE_MOUSE_SGR_PIXELS)
+                .ok()?
+            {
+                encoder.set_format(crate::ghostty::MOUSE_FORMAT_SGR);
+            }
+            encoder.set_size(cols, rows, 1, 1);
+        }
+        crate::input::mouse::Position::Pixels { .. } => {
+            let width_px = terminal.width_px().ok()?;
+            let height_px = terminal.height_px().ok()?;
+            if width_px == 0 || height_px == 0 || cols == 0 || rows == 0 {
+                return None;
+            }
+            encoder.set_size(width_px, height_px, width_px / cols, height_px / rows);
+        }
+    }
     Some(encoder)
+}
+
+pub(super) fn ghostty_mouse_position_for_terminal(
+    position: crate::input::mouse::Position,
+) -> Option<(f32, f32)> {
+    match position {
+        crate::input::mouse::Position::Pixels { x, y } => Some((x as f32, y as f32)),
+        crate::input::mouse::Position::Cell { column, row } => Some((column as f32, row as f32)),
+    }
 }
 
 pub(super) fn ghostty_mouse_event_from_button_kind(
@@ -168,7 +193,7 @@ pub(super) fn ghostty_mouse_event_from_wheel_kind(
     Some(event)
 }
 
-fn ghostty_key_text(key: crate::input::TerminalKey) -> Option<String> {
+fn ghostty_key_text(key: &crate::input::TerminalKey) -> Option<String> {
     match key.code {
         crossterm::event::KeyCode::Char(c) => Some(
             key.shifted_codepoint
@@ -180,7 +205,7 @@ fn ghostty_key_text(key: crate::input::TerminalKey) -> Option<String> {
     }
 }
 
-fn ghostty_unshifted_codepoint(key: crate::input::TerminalKey) -> Option<u32> {
+fn ghostty_unshifted_codepoint(key: &crate::input::TerminalKey) -> Option<u32> {
     match key.code {
         crossterm::event::KeyCode::Char(c) => Some(c as u32),
         _ => None,

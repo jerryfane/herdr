@@ -4,18 +4,20 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
 const websiteDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(websiteDir, '../..');
+const repoRoot = process.env.HERDR_DOCS_REPO_ROOT
+  ? resolve(process.env.HERDR_DOCS_REPO_ROOT)
+  : resolve(websiteDir, '../..');
 const publicDir = resolve(repoRoot, 'website/public');
 const stableDocsDir = resolve(repoRoot, 'website/src/content/docs');
-const previewDocsSourceDir = resolve(repoRoot, 'docs/next/website/src/content/docs');
 const previewDocsDir = resolve(stableDocsDir, 'preview');
 const generatedVersionsDocsDir = resolve(stableDocsDir, '_versions');
 const versionsDir = resolve(repoRoot, 'docs/versions');
 const versionsManifestPath = resolve(versionsDir, 'manifest.json');
+const previewManifestPath = resolve(repoRoot, 'website/preview.json');
 const generatedVersionsDataPath = resolve(repoRoot, 'website/src/data/docs-versions.json');
-const previewConfigReferenceSource = resolve(
+const stableConfigReferenceDestination = resolve(
   repoRoot,
-  'docs/next/website/src/data/config-reference.json',
+  'website/src/data/config-reference.json',
 );
 const previewConfigReferenceDestination = resolve(
   repoRoot,
@@ -29,7 +31,12 @@ const generatedVersionReferencesPath = resolve(
 if (process.argv[2] === '--rewrite-preview-doc-fixture') {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
-  process.stdout.write(rewritePreviewDocContent(Buffer.concat(chunks).toString('utf8')));
+  process.stdout.write(
+    rewritePreviewDocContent(Buffer.concat(chunks).toString('utf8'), '', {
+      buildId: '2026-07-29-44b3adb12552',
+      commit: '44b3adb125524ea9a55739eee3776f922f2115ad',
+    }),
+  );
 } else if (process.argv[2] === '--rewrite-version-doc-fixture') {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -37,13 +44,21 @@ if (process.argv[2] === '--rewrite-preview-doc-fixture') {
     rewriteVersionDocContent(Buffer.concat(chunks).toString('utf8'), {
       version: process.argv[3] ?? '0.7.5',
       tag: `v${process.argv[3] ?? '0.7.5'}`,
-      sourceRoot: 'docs/next/website/src/content/docs',
       relativePath: 'index.mdx',
     }),
   );
 } else {
-  await preparePublicAssets();
-  await prepareDocs();
+  const supported = new Set(['--docs-only', '--draft']);
+  const unsupported = process.argv.slice(2).filter((argument) => !supported.has(argument));
+  if (unsupported.length > 0) {
+    throw new Error('usage: node website/scripts/prepare-docs.mjs [--docs-only] [--draft]');
+  }
+  const docsOnly = process.argv.includes('--docs-only');
+  if (!docsOnly) await preparePublicAssets();
+  await prepareDocs({
+    draft: process.argv.includes('--draft'),
+    publishAgentIndexes: !docsOnly,
+  });
 }
 
 async function preparePublicAssets() {
@@ -75,22 +90,69 @@ async function preparePublicAssets() {
   }
 }
 
-async function prepareDocs() {
-  await rm(previewDocsDir, { recursive: true, force: true });
-  await rm(generatedVersionsDocsDir, { recursive: true, force: true });
+async function prepareDocs({ draft, publishAgentIndexes }) {
+  const manifest = JSON.parse(await readFile(versionsManifestPath, 'utf8'));
+  if (
+    manifest.schema_version !== 1 ||
+    typeof manifest.current !== 'string' ||
+    !['legacy', 'snapshot'].includes(manifest.stable_source ?? 'legacy')
+  ) {
+    throw new Error(`${versionsManifestPath} has an unsupported schema`);
+  }
+  const currentEntry = manifest.versions.find((entry) => entry.version === manifest.current);
+  if (!currentEntry) throw new Error(`current docs version ${manifest.current} has no snapshot`);
+
+  const previewManifest = JSON.parse(await readFile(previewManifestPath, 'utf8'));
+  if (!/^[0-9a-f]{40}$/.test(previewManifest.commit ?? '')) {
+    throw new Error(`${previewManifestPath} must contain a full preview commit SHA`);
+  }
+  const previewWebsiteRoot = resolve(repoRoot, draft ? 'docs/next/website' : 'docs/preview/website');
+  const previewDocsSourceDir = resolve(previewWebsiteRoot, 'src/content/docs');
+  const previewConfigReferenceSource = resolve(
+    previewWebsiteRoot,
+    'src/data/config-reference.json',
+  );
+
+  if ((manifest.stable_source ?? 'legacy') === 'snapshot') {
+    await rm(stableDocsDir, { recursive: true, force: true });
+    const currentSnapshotRoot = resolve(versionsDir, manifest.current, 'website');
+    await copyPreparedDocs(
+      resolve(currentSnapshotRoot, 'src/content/docs'),
+      stableDocsDir,
+      (content, relativePath) =>
+        rewriteStableDocContent(content, {
+          version: currentEntry.version,
+          tag: currentEntry.tag,
+          relativePath,
+        }),
+    );
+    const currentReference = resolve(currentSnapshotRoot, 'src/data/config-reference.json');
+    try {
+      await cp(currentReference, stableConfigReferenceDestination);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      await rm(stableConfigReferenceDestination, { force: true });
+    }
+  } else {
+    await rm(previewDocsDir, { recursive: true, force: true });
+    await rm(generatedVersionsDocsDir, { recursive: true, force: true });
+  }
 
   await copyPreparedDocs(previewDocsSourceDir, previewDocsDir, (content, relativePath) =>
-    rewritePreviewDocContent(content, relativePath),
+    rewritePreviewDocContent(content, relativePath, {
+      buildId: draft ? 'draft' : previewManifest.build_id,
+      commit: draft ? 'master' : previewManifest.commit,
+    }),
   );
   await cp(previewConfigReferenceSource, previewConfigReferenceDestination);
 
-  const manifest = JSON.parse(await readFile(versionsManifestPath, 'utf8'));
-  if (manifest.schema_version !== 1 || typeof manifest.current !== 'string') {
-    throw new Error(`${versionsManifestPath} has an unsupported schema`);
-  }
-
   const scopes = {
-    stable: await collectDocsScope(stableDocsDir, new Set(['preview', '_versions'])),
+    stable: await collectDocsScope(
+      (manifest.stable_source ?? 'legacy') === 'snapshot'
+        ? resolve(versionsDir, manifest.current, 'website/src/content/docs')
+        : stableDocsDir,
+      new Set(['preview', '_versions']),
+    ),
     preview: await collectDocsScope(previewDocsSourceDir),
   };
   const configReferences = {};
@@ -103,7 +165,6 @@ async function prepareDocs() {
       rewriteVersionDocContent(content, {
         version,
         tag: entry.tag,
-        sourceRoot: entry.source,
         relativePath,
       }),
     );
@@ -123,7 +184,14 @@ async function prepareDocs() {
 
   await writeFile(
     generatedVersionsDataPath,
-    `${JSON.stringify({ ...manifest, scopes }, null, 2)}\n`,
+    `${JSON.stringify({
+      ...manifest,
+      preview: {
+        build_id: draft ? 'draft' : previewManifest.build_id,
+        commit: draft ? 'master' : previewManifest.commit,
+      },
+      scopes,
+    }, null, 2)}\n`,
     'utf8',
   );
   await writeFile(
@@ -131,6 +199,136 @@ async function prepareDocs() {
     `${JSON.stringify(configReferences, null, 2)}\n`,
     'utf8',
   );
+
+  if (publishAgentIndexes) {
+    if (typeof currentEntry.tag !== 'string' || typeof currentEntry.source !== 'string') {
+      throw new Error(`current docs version ${manifest.current} is missing its tag or source`);
+    }
+    const stableSourceDir = resolve(versionsDir, manifest.current, 'website/src/content/docs');
+    const previewRef = draft ? 'master' : previewManifest.commit;
+    const previewBuild = draft ? 'draft' : previewManifest.build_id;
+    await Promise.all([
+      writeAgentDocsIndex({
+        output: resolve(publicDir, 'llms.txt'),
+        heading: 'Herdr stable documentation index',
+        summary: `Current stable release: ${manifest.current}.`,
+        sourceDir: stableSourceDir,
+        ref: currentEntry.tag,
+        repositoryPath: currentEntry.source,
+        extraSections: [
+          '## Optional bundles',
+          '- [Abridged documentation](https://herdr.dev/llms-small.txt)',
+          '- [Complete documentation](https://herdr.dev/llms-full.txt)',
+          '',
+          '## Other resources',
+          '- [Agent guide](https://herdr.dev/agent-guide.md): help a human understand, set up, or troubleshoot Herdr',
+          '- [Preview documentation](https://herdr.dev/llms-preview.txt): use only for the preview channel',
+        ],
+      }),
+      writeAgentDocsIndex({
+        output: resolve(publicDir, 'llms-preview.txt'),
+        heading: 'Herdr preview documentation index',
+        summary: `Active preview build: ${previewBuild} (${previewRef.slice(0, 12)}).`,
+        sourceDir: previewDocsSourceDir,
+        ref: previewRef,
+        repositoryPath: 'docs/next/website/src/content/docs',
+        extraSections: [
+          '## Other resources',
+          '- [Stable documentation](https://herdr.dev/llms.txt): use unless the human is running the preview channel',
+          '- [Agent guide](https://herdr.dev/agent-guide.md): help a human understand, set up, or troubleshoot Herdr',
+        ],
+      }),
+    ]);
+  }
+}
+
+async function writeAgentDocsIndex({
+  output,
+  heading,
+  summary,
+  sourceDir,
+  ref,
+  repositoryPath,
+  extraSections,
+}) {
+  const pages = await collectAgentDocs(sourceDir);
+  const rawRoot = `https://raw.githubusercontent.com/herdrdev/herdr/${ref}`;
+  const rawBase = `${rawRoot}/${repositoryPath}`;
+  const configDataPath = repositoryPath.replace(
+    /\/content\/docs$/,
+    '/data/config-reference.json',
+  );
+  if (configDataPath === repositoryPath) {
+    throw new Error(`cannot derive config reference path from ${repositoryPath}`);
+  }
+
+  const lines = [
+    `# ${heading}`,
+    '',
+    `> ${summary}`,
+    '',
+    'Open only the pages relevant to the current task. Links return raw MDX from the exact documented source revision. For another topic, return to this index instead of following `/docs/` links inside a page, which serve human-facing HTML.',
+    '',
+    '## Documentation',
+    '',
+    ...pages.map(
+      ({ title, description, path }) =>
+        `- [${title}](${rawBase}/${path})${description ? `: ${description}` : ''}`,
+    ),
+    '',
+    '## Generated reference data',
+    '',
+    `- [Config reference data](${rawRoot}/${configDataPath}): every canonical config.toml key, type, default, and description`,
+    '',
+    ...extraSections,
+    '',
+  ];
+  await writeFile(output, lines.join('\n'), 'utf8');
+}
+
+async function collectAgentDocs(sourceDir) {
+  const pages = [];
+
+  async function walk(directory, prefix = '') {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!prefix && entry.isDirectory() && ['ja', 'zh-cn'].includes(entry.name)) continue;
+      const path = join(directory, entry.name);
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walk(path, relativePath);
+        continue;
+      }
+      if (!entry.isFile() || !['.md', '.mdx'].includes(extname(entry.name).toLowerCase())) {
+        continue;
+      }
+      const content = await readFile(path, 'utf8');
+      const title = frontmatterValue(content, 'title');
+      if (!title) throw new Error(`${path} is missing a frontmatter title`);
+      pages.push({
+        title,
+        description: frontmatterValue(content, 'description'),
+        path: relativePath,
+      });
+    }
+  }
+
+  await walk(sourceDir);
+  pages.sort((a, b) => {
+    if (a.path === 'index.mdx' || a.path === 'index.md') return -1;
+    if (b.path === 'index.mdx' || b.path === 'index.md') return 1;
+    return a.title.localeCompare(b.title, 'en');
+  });
+  return pages;
+}
+
+function frontmatterValue(content, key) {
+  const frontmatter = content.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1];
+  const value = frontmatter?.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim();
+  if (!value) return undefined;
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.endsWith(quote)
+    ? value.slice(1, -1)
+    : value;
 }
 
 async function copyPreparedDocs(sourceDir, destinationDir, rewrite, pathPrefix = '') {
@@ -183,34 +381,54 @@ async function collectDocsScope(sourceDir, excludedDirectories = new Set()) {
   return { locales };
 }
 
-export function rewritePreviewDocContent(content, relativePath = '') {
-  const rewritten = rewriteRelativeDocPaths(
+export function rewritePreviewDocContent(
+  content,
+  relativePath = '',
+  { buildId, commit } = {
+    buildId: 'preview',
+    commit: 'master',
+  },
+) {
+  const taggedContent = rewriteRepositoryLinks(
     content.replaceAll('/docs/', '/docs/preview/'),
-    1,
+    commit,
   );
-  const withEditLink = setGeneratedEditUrl(
+  const rewritten = rewriteRelativeDocPaths(taggedContent, 1);
+  const withSourceLink = setGeneratedEditUrl(
     rewritten,
-    `https://github.com/herdrdev/herdr/edit/master/docs/next/website/src/content/docs/${relativePath}`,
+    `https://github.com/herdrdev/herdr/blob/${commit}/docs/next/website/src/content/docs/${relativePath}`,
   );
-  return insertPreviewNotice(withEditLink, relativePath);
+  return insertPreviewNotice(withSourceLink, relativePath, { buildId, commit });
 }
 
-export function rewriteVersionDocContent(content, { version, tag, sourceRoot, relativePath }) {
-  const taggedContent = content
-    .replaceAll('/docs/', `/docs/${version}/`)
+export function rewriteStableDocContent(content, { version, tag, relativePath }) {
+  const taggedContent = rewriteRepositoryLinks(content, tag);
+  return setGeneratedEditUrl(taggedContent, versionedDocSourceUrl(version, relativePath));
+}
+
+export function rewriteVersionDocContent(content, { version, tag, relativePath }) {
+  const taggedContent = rewriteRepositoryLinks(
+    content.replaceAll('/docs/', `/docs/${version}/`),
+    tag,
+  );
+  const rewritten = rewriteRelativeDocPaths(taggedContent, 2);
+  return setGeneratedEditUrl(rewritten, versionedDocSourceUrl(version, relativePath));
+}
+
+function versionedDocSourceUrl(version, relativePath) {
+  return `https://github.com/herdrdev/herdr/blob/master/docs/versions/${version}/website/src/content/docs/${relativePath}`;
+}
+
+function rewriteRepositoryLinks(content, ref) {
+  return content
     .replaceAll(
       'https://github.com/herdrdev/herdr/blob/master/',
-      `https://github.com/herdrdev/herdr/blob/${tag}/`,
+      `https://github.com/herdrdev/herdr/blob/${ref}/`,
     )
     .replaceAll(
       'https://raw.githubusercontent.com/herdrdev/herdr/master/',
-      `https://raw.githubusercontent.com/herdrdev/herdr/${tag}/`,
+      `https://raw.githubusercontent.com/herdrdev/herdr/${ref}/`,
     );
-  const rewritten = rewriteRelativeDocPaths(taggedContent, 2);
-  return setGeneratedEditUrl(
-    rewritten,
-    `https://github.com/herdrdev/herdr/blob/${tag}/${sourceRoot}/${relativePath}`,
-  );
 }
 
 function rewriteRelativeDocPaths(content, extraDepth) {
@@ -225,15 +443,16 @@ function setGeneratedEditUrl(content, editUrl) {
   return content.replace(/^---\n/, `---\neditUrl: ${editUrl}\n`);
 }
 
-function insertPreviewNotice(content, relativePath) {
+function insertPreviewNotice(content, relativePath, { buildId, commit }) {
+  const source = commit === 'master' ? '`master` draft' : `[${commit.slice(0, 12)}](https://github.com/herdrdev/herdr/commit/${commit})`;
   const notice = [
-    '> Next docs describe unreleased work from `master`. Stable docs remain at [/docs/](/docs/).',
+    `> Preview build \`${buildId}\`, published from ${source}. Stable docs remain at [/docs/](/docs/).`,
     '',
     '',
   ].join('\n');
   const indexPrefix =
     relativePath === 'index.mdx'
-      ? content.replace('title: Herdr documentation', 'title: Herdr next documentation')
+      ? content.replace('title: Herdr documentation', 'title: Herdr preview documentation')
       : content;
   const frontmatter = indexPrefix.match(/^---\n[\s\S]*?\n---\n/);
   if (!frontmatter) {

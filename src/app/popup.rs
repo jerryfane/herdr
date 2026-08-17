@@ -26,9 +26,7 @@ impl App {
             .direct_attach_resize_locks
             .remove(&popup.terminal_id);
         self.state.terminals.remove(&popup.terminal_id);
-        if let Some(runtime) = self.terminal_runtimes.remove(&popup.terminal_id) {
-            runtime.shutdown();
-        }
+        self.shutdown_terminal_runtime(popup.terminal_id);
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
         } else {
@@ -73,6 +71,7 @@ impl App {
                     crate::pane::AgentDetection::Disabled,
                     app.state.pane_scrollback_limit_bytes,
                     app.state.host_terminal_theme,
+                    app.state.host_terminal_appearance,
                     app.event_tx.clone(),
                     app.render_notify.clone(),
                     app.render_dirty.clone(),
@@ -104,6 +103,7 @@ impl App {
                     crate::pane::AgentDetection::Disabled,
                     app.state.pane_scrollback_limit_bytes,
                     app.state.host_terminal_theme,
+                    app.state.host_terminal_appearance,
                     app.event_tx.clone(),
                     app.render_notify.clone(),
                     app.render_dirty.clone(),

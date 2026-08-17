@@ -8,8 +8,8 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
-pub(crate) use server::cancel_inactive_pane_graphics_streams;
-pub use server::{start_server, start_server_with_capabilities, ServerHandle};
+pub(crate) use server::start_server_with_stop_control;
+pub use server::{start_server_with_capabilities, ServerHandle};
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;
@@ -58,11 +58,13 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneResize(_)
             | Method::PaneSetPtySize(_)
             | Method::PaneFocus(_)
+            | Method::PaneInputSet(_)
             | Method::PaneRename(_)
             | Method::PaneGraphicsSet(_)
             | Method::PaneGraphicsClear(_)
             | Method::PaneGraphicsStream(_)
             | Method::PaneGraphicsStreamSet(_)
+            | Method::PaneGraphicsStreamDirect(_)
             | Method::PaneGraphicsStreamOpen(_)
             | Method::PaneGraphicsStreamClose(_)
             | Method::PaneReportAgent(_)
@@ -85,6 +87,7 @@ pub struct ApiRequestMessage {
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
