@@ -347,6 +347,14 @@ impl TerminalRuntime {
         self.0.alternate_screen_active()
     }
 
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        self.0.active_screen()
+    }
+
+    pub fn normalize_alternate_screen_on_exit(&self) -> bool {
+        self.0.normalize_alternate_screen_on_exit()
+    }
+
     pub fn cursor_state(
         &self,
         area: Rect,

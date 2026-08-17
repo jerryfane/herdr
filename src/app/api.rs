@@ -178,6 +178,15 @@ impl App {
                 self.close_popup_pane();
                 return Vec::new();
             }
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    *pane_id,
+                ) {
+                    runtime.normalize_alternate_screen_on_exit();
+                }
+            }
             if worktree_restore_failed {
                 worktree_restore_updates
                     .extend(self.publish_worktree_runtime_agent_release(*pane_id));

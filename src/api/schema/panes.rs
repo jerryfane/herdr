@@ -633,6 +633,8 @@ pub struct PaneInfo {
     pub turn_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub alternate_screen: bool,
     pub revision: u64,
 }
 
