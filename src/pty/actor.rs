@@ -217,7 +217,7 @@ mod windows {
             let mut reader = master
                 .try_clone_reader()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
-            let mut writer = master
+            let writer = master
                 .take_writer()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             let (data_tx, data_rx) = mpsc::channel::<PtyIoDataCommand>(1024);
