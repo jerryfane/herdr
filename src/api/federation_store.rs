@@ -156,11 +156,12 @@ impl FederationStore {
     /// Every cached peer's agents, honest-reachability stamped for merge into the
     /// local `agent.list`.
     ///
-    /// - `Reachable`/`Degraded`: the agent is returned as-is with its
-    ///   `reachability` set; a `Degraded` peer keeps its last-known status.
-    /// - `Unreachable`: the visible `agent_status` is replaced with
+    /// - `Reachable`: the agent is returned as-is with its `reachability` set.
+    /// - `Degraded`/`Unreachable`: the visible `agent_status` is replaced with
     ///   [`AgentStatus::Unknown`] and the last-known status is preserved in
-    ///   `last_known_status`, so a stale `idle`/`done` is never shown as current.
+    ///   `last_known_status`, so a stale `idle`/`done` is never shown as current
+    ///   the moment a peer stops answering. `reachability` still distinguishes a
+    ///   briefly-degraded peer from a fully offline one.
     pub fn merged_agents(&self) -> Vec<AgentInfo> {
         self.peers
             .values()
@@ -179,9 +180,15 @@ impl FederationStore {
 fn stamp_agent(agent: &AgentInfo, reachability: Reachability) -> AgentInfo {
     let mut stamped = agent.clone();
     stamped.reachability = Some(reachability);
-    if reachability == Reachability::Unreachable {
-        // Never present a stale idle/done from a peer that has gone offline:
-        // surface `unknown` and keep the real last-known status separately.
+    // Only a `Reachable` peer surfaces its real live status. The moment a peer
+    // stops answering — `Degraded` (1-2 misses) OR `Unreachable` (>= 3) — its
+    // last poll's `idle`/`done` is no longer known to be current, so it must not
+    // be presented as the live `agent_status`: surface `unknown` and keep the
+    // real last-known status separately in `last_known_status`. A consumer that
+    // reads `agent_status` alone is then never misled by a stale idle/done; the
+    // `reachability` field still tells a briefly-degraded peer from a fully
+    // offline one.
+    if reachability != Reachability::Reachable {
         stamped.last_known_status = Some(agent.agent_status);
         stamped.agent_status = AgentStatus::Unknown;
     }
@@ -256,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn degraded_peer_keeps_last_known_status() {
+    fn degraded_peer_stamps_unknown_and_preserves_last_known() {
         let mut store = FederationStore::default();
         store.set_peer(
             "home",
@@ -267,9 +274,16 @@ mod tests {
             },
         );
         let merged = store.merged_agents();
-        assert_eq!(merged[0].agent_status, AgentStatus::Blocked);
+        // A Degraded peer has stopped answering (1-2 misses): it must NOT surface
+        // its last poll's status as current. It is stamped `Unknown` exactly like
+        // Unreachable, distinguished only by the `reachability` field.
+        assert_eq!(
+            merged[0].agent_status,
+            AgentStatus::Unknown,
+            "a degraded peer must not surface a stale idle/done as current"
+        );
+        assert_eq!(merged[0].last_known_status, Some(AgentStatus::Blocked));
         assert_eq!(merged[0].reachability, Some(Reachability::Degraded));
-        assert_eq!(merged[0].last_known_status, None);
     }
 
     #[test]

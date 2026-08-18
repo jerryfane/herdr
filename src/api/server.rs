@@ -56,8 +56,18 @@ const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Granularity at which the poll sleep re-checks `running`, so a shutdown is not
 /// held up for a whole poll interval.
 const FEDERATION_POLL_STEP: Duration = Duration::from_millis(100);
-/// Per-request timeout for an outbound `agent.list` poll — bounds a stuck peer.
+/// Total wall-clock bound on an outbound `agent.list` poll's response read —
+/// bounds a stuck peer. Unlike a per-read socket timeout, this caps the WHOLE
+/// read, so a peer that trickles bytes just under the socket timeout without ever
+/// sending a newline cannot keep the read (and shutdown, which joins the poll
+/// threads) running forever.
 const FEDERATION_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Byte cap on a single outbound federation poll response. Mirrors the inbound
+/// [`MAX_INITIAL_REQUEST_BYTES`] cap: an `agent.list` reply is small, so 1 MiB is
+/// generous, and a (malicious or faulty) peer returning a larger line is degraded
+/// rather than allowed to drive unbounded allocation — an OOM — on the polling
+/// home daemon.
+const FEDERATION_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Upper bound on the randomized backoff added after a failed poll.
 const FEDERATION_POLL_MAX_JITTER: Duration = Duration::from_secs(2);
 
@@ -511,7 +521,8 @@ fn run_federation_peer_poll(
     let mut tracker = ReachabilityTracker::default();
 
     while running.load(Ordering::Relaxed) {
-        let reachability = poll_once_into_cache(&client, &peer.alias, &cache, &mut tracker);
+        let reachability =
+            poll_once_into_cache(&client, &peer.alias, &cache, &mut tracker, &running);
         let interval = if reachability == Reachability::Reachable {
             FEDERATION_POLL_INTERVAL
         } else {
@@ -533,8 +544,9 @@ fn poll_once_into_cache(
     alias: &str,
     cache: &Mutex<FederationStore>,
     tracker: &mut ReachabilityTracker,
+    running: &Arc<AtomicBool>,
 ) -> Reachability {
-    match poll_peer_agent_list(client) {
+    match poll_peer_agent_list(client, running) {
         Ok(agents) => {
             let prefixed = agents
                 .into_iter()
@@ -588,14 +600,26 @@ fn read_peer_token(peer: &FederationPeer) -> Option<String> {
 /// Poll one peer's `agent.list` and return its agents. A transport error, a
 /// timeout, an error response, or an unexpected result all surface as `Err` and
 /// count as a miss.
+///
+/// The response read is BOTH byte-bounded ([`FEDERATION_MAX_RESPONSE_BYTES`]) and
+/// total-time-bounded ([`FEDERATION_POLL_REQUEST_TIMEOUT`], a wall-clock deadline)
+/// so a malicious peer cannot drive unbounded allocation or an unbounded-time
+/// read; `running` lets the read abort promptly on shutdown so [`ServerHandle`]'s
+/// drop, which joins the poll threads, does not hang.
 fn poll_peer_agent_list(
     client: &ApiClient,
+    running: &Arc<AtomicBool>,
 ) -> Result<Vec<crate::api::schema::AgentInfo>, ApiClientError> {
     let request = Request {
         id: "federation:agent.list".into(),
         method: Method::AgentList(crate::api::schema::EmptyParams {}),
     };
-    let value = client.request_value_with_timeout(&request, FEDERATION_POLL_REQUEST_TIMEOUT)?;
+    let value = client.request_value_bounded(
+        &request,
+        FEDERATION_MAX_RESPONSE_BYTES,
+        FEDERATION_POLL_REQUEST_TIMEOUT,
+        Some(running),
+    )?;
     let response = parse_response_value(value)?;
     match response.result {
         ResponseResult::AgentList { agents } => Ok(agents),
@@ -606,6 +630,14 @@ fn poll_peer_agent_list(
 /// Rewrite a remote agent's identity fields so it is unambiguous once merged into
 /// the local `agent.list`: `name` and all four id fields gain an `<alias>/`
 /// prefix, and `machine_id` records the peer alias.
+///
+/// The home OWNS the federation-derived fields and must never trust what the peer
+/// put in the [`AgentInfo`](crate::api::schema::AgentInfo) it returned: a
+/// malicious peer could set `machine_id`/`reachability`/`last_known_status` to
+/// forge a live status or a false origin. So `machine_id` is overwritten with the
+/// peer's local alias and `reachability`/`last_known_status` are cleared here. The
+/// read helper [`FederationStore::merged_agents`] is the ONLY thing that sets
+/// `reachability`/`last_known_status`, from the home's own poll-outcome tracking.
 fn prefix_remote_agent(
     alias: &str,
     mut agent: crate::api::schema::AgentInfo,
@@ -615,7 +647,11 @@ fn prefix_remote_agent(
     agent.workspace_id = format!("{alias}/{}", agent.workspace_id);
     agent.tab_id = format!("{alias}/{}", agent.tab_id);
     agent.pane_id = format!("{alias}/{}", agent.pane_id);
+    // Home-owned federation fields: normalize `machine_id` to the peer's local
+    // alias and discard any peer-supplied reachability/last-known status.
     agent.machine_id = Some(alias.to_string());
+    agent.reachability = None;
+    agent.last_known_status = None;
     agent
 }
 
@@ -3132,27 +3168,35 @@ mod federation_tests {
             addr: dead_addr,
             token: Some("t".into()),
         });
+        let running = Arc::new(AtomicBool::new(true));
         let mut tracker = ReachabilityTracker::default();
 
-        // First two misses: Degraded, last-known idle status retained.
+        // First two misses: Degraded. The last-known agents are retained in the
+        // cache, but the read helper already stamps the surfaced status `Unknown`
+        // (an honest-offline peer never shows a stale idle/done) with the real
+        // status preserved in `last_known_status`.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
             Reachability::Degraded
         );
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
             Reachability::Degraded
         );
         {
             let merged = cache.lock().expect("cache lock").merged_agents();
-            assert_eq!(merged[0].agent_status, AgentStatus::Idle);
+            assert_eq!(
+                merged[0].agent_status,
+                AgentStatus::Unknown,
+                "a degraded peer must not surface a stale idle/done"
+            );
             assert_eq!(merged[0].reachability, Some(Reachability::Degraded));
-            assert_eq!(merged[0].last_known_status, None);
+            assert_eq!(merged[0].last_known_status, Some(AgentStatus::Idle));
         }
 
-        // Third miss: Unreachable → the read helper stamps Unknown + last-known.
+        // Third miss: Unreachable → the read helper still stamps Unknown + last-known.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
             Reachability::Unreachable
         );
         let merged = cache.lock().expect("cache lock").merged_agents();
@@ -3187,5 +3231,138 @@ mod federation_tests {
             maybe_start_federation_client(peers, Arc::clone(&cache), Arc::clone(&running));
         assert!(threads.is_empty(), "no endpoint peer must spawn no thread");
         assert!(cache.lock().expect("cache lock").is_empty());
+    }
+
+    /// FIX 3: the home OWNS the federation fields. A malicious/faulty peer cannot
+    /// smuggle `machine_id`/`reachability`/`last_known_status` into the cache:
+    /// `prefix_remote_agent` normalizes `machine_id` to the peer's local alias and
+    /// CLEARS `reachability`/`last_known_status` (only the read helper sets them,
+    /// from the home's own poll tracking).
+    #[test]
+    fn prefix_remote_agent_discards_peer_supplied_federation_fields() {
+        let hostile: AgentInfo = serde_json::from_value(serde_json::json!({
+            "terminal_id": "term-remote",
+            "name": "sneaky",
+            "agent_status": "idle",
+            "workspace_id": "ws-remote",
+            "tab_id": "tab-remote",
+            "pane_id": "pane-remote",
+            "focused": false,
+            "revision": 1,
+            // Fields a peer must NOT be trusted to set:
+            "machine_id": "not-home",
+            "reachability": "reachable",
+            "last_known_status": "working",
+        }))
+        .expect("hostile agent deserializes");
+        // Sanity: the peer really did set the home-owned fields.
+        assert_eq!(hostile.machine_id.as_deref(), Some("not-home"));
+        assert_eq!(hostile.reachability, Some(Reachability::Reachable));
+        assert_eq!(hostile.last_known_status, Some(AgentStatus::Working));
+
+        let normalized = prefix_remote_agent("home", hostile);
+        assert_eq!(
+            normalized.machine_id.as_deref(),
+            Some("home"),
+            "machine_id must be overwritten with the peer's local alias"
+        );
+        assert_eq!(
+            normalized.reachability, None,
+            "a peer-supplied reachability must be discarded"
+        );
+        assert_eq!(
+            normalized.last_known_status, None,
+            "a peer-supplied last_known_status must be discarded"
+        );
+        assert_eq!(normalized.name.as_deref(), Some("home/sneaky"));
+    }
+
+    /// FIX 1 (DoS hardening): a peer that returns an over-cap response line must
+    /// not drive unbounded allocation. The poll's bounded read errors at ~the cap,
+    /// the peer is degraded (a miss) rather than caching any agents, and clearing
+    /// `running` then joins the poll thread promptly — an oversized/malicious
+    /// response can neither OOM the home nor hang shutdown.
+    #[test]
+    fn federation_client_bounds_oversized_peer_response_and_shuts_down_promptly() {
+        // A raw "peer" that accepts the poll connection, ignores the hello and the
+        // request, and floods a single line far larger than the response cap with
+        // NO newline. The bounded reader must reject it near the cap.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hostile peer");
+        let addr = listener.local_addr().expect("hostile peer addr");
+        let peer_running = Arc::new(AtomicBool::new(true));
+        let peer_flag = Arc::clone(&peer_running);
+        let peer_thread = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("hostile listener nonblocking");
+            while peer_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        // One oversized, newline-free blob. Ignore write errors:
+                        // the client closes the moment it crosses the cap.
+                        let blob = vec![b'x'; FEDERATION_MAX_RESPONSE_BYTES + 8192];
+                        let _ = sock.write_all(&blob);
+                    }
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let token_path = unique_token_file("hostile-token");
+        let peer = FederationPeer {
+            alias: "home".into(),
+            endpoint: Some(format!("tcp://{addr}")),
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+            expected_node_id: None,
+            capability: CapabilityTier::Observe,
+        };
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let client_running = Arc::new(AtomicBool::new(true));
+        let client_threads = maybe_start_federation_client(
+            vec![peer],
+            Arc::clone(&cache),
+            Arc::clone(&client_running),
+        );
+        assert_eq!(client_threads.len(), 1);
+
+        // The over-cap response is rejected, so the peer is recorded as a miss
+        // (Degraded on the first failure) rather than caching any agents.
+        let mut degraded = false;
+        for _ in 0..300 {
+            {
+                let store = cache.lock().expect("cache lock");
+                if let Some(entry) = store.peer("home") {
+                    if entry.reachability == Reachability::Degraded && entry.agents.is_empty() {
+                        degraded = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            degraded,
+            "an oversized peer response must degrade the peer, not cache agents"
+        );
+
+        // Shutdown must join the poll thread promptly (the bounded read can't hang).
+        client_running.store(false, Ordering::Relaxed);
+        let (join_tx, join_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for thread in client_threads {
+                let _ = thread.join();
+            }
+            let _ = join_tx.send(());
+        });
+        join_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("poll thread did not join promptly after shutdown");
+
+        peer_running.store(false, Ordering::Relaxed);
+        let _ = peer_thread.join();
+        let _ = std::fs::remove_file(&token_path);
     }
 }
