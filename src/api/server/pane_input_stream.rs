@@ -2,10 +2,12 @@
 //!
 //! The write-side mirror of `pane.stream` (which is the persistent read
 //! firehose). A client opens one held-open connection per attached pane and
-//! writes newline-delimited input frames; each frame is dispatched through the
-//! exact same path as a one-shot `pane.send_text`/`pane.send_input` call
-//! (`Method::PaneSendInput` → `handle_pane_send_input`), so it inherits
-//! bracketed-paste + named-key encoding and the composer/turn-abort bookkeeping.
+//! writes newline-delimited input frames. A text frame (raw terminal bytes — the
+//! client's keystroke stream) is dispatched as `pane.send_text` so control bytes
+//! reach the PTY RAW; a frame carrying named `keys` is dispatched as
+//! `pane.send_input` for its key encoding. Both inherit the composer/turn-abort
+//! bookkeeping. (Routing text through `send_input` would bracketed-paste-wrap it
+//! and break control keys under DECSET 2004 — see the dispatch in `serve_frames`.)
 //!
 //! This removes the per-keystroke remote `api-bridge` fork/exec that dominates
 //! felt typing latency on the iPad hardware-keyboard path (issue #62): keystrokes
@@ -25,8 +27,8 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, Method, PaneInputStreamParams, PaneSendInputParams, Request,
-    ResponseResult, SuccessResponse,
+    ErrorBody, ErrorResponse, Method, PaneInputStreamParams, PaneSendInputParams,
+    PaneSendTextParams, Request, ResponseResult, SuccessResponse,
 };
 use crate::api::ApiRequestSender;
 use crate::ipc::{is_connection_closed_error, LocalStream};
@@ -48,8 +50,8 @@ const INPUT_FRAME_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const INPUT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const INPUT_FALLBACK_FAST_POLLS: u8 = 32;
 
-/// One inbound input frame. Field-compatible with `PaneSendInputParams` so the
-/// per-frame dispatch reuses the existing input handler verbatim.
+/// One inbound input frame. A text-only frame dispatches as `pane.send_text`
+/// (raw bytes); a frame carrying named `keys` dispatches as `pane.send_input`.
 #[derive(serde::Deserialize)]
 struct InputFrame {
     seq: u64,
@@ -209,14 +211,29 @@ fn serve_frames(
 
         let ack = frame.ack;
         let seq = frame.seq;
+        // Raw terminal bytes (the client's keystroke stream) go through send_text
+        // so control bytes — backspace, ctrl-c, shift+tab, arrows — reach the PTY
+        // RAW. send_input would run them through encode_api_text, which
+        // bracketed-paste-wraps (\x1b[200~…\x1b[201~) whenever the pane has DECSET
+        // 2004 on (interactive shells, editors, Claude Code), turning a control
+        // byte into inert paste content instead of a key action (issue #62). Only
+        // frames that carry named `keys` need the send_input encoding path.
+        let method = if frame.keys.is_empty() {
+            Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane_id.to_string(),
+                text: frame.text,
+            })
+        } else {
+            Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.to_string(),
+                text: frame.text,
+                keys: frame.keys,
+            })
+        };
         let response = dispatch_to_app_with_timeout(
             Request {
                 id: format!("{request_id}:frame:{seq}"),
-                method: Method::PaneSendInput(PaneSendInputParams {
-                    pane_id: pane_id.to_string(),
-                    text: frame.text,
-                    keys: frame.keys,
-                }),
+                method,
             },
             api_tx,
             Some(APP_RESPONSE_TIMEOUT),
@@ -524,7 +541,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dispatches_frames_as_send_input_and_acks_only_when_requested() {
+    fn dispatches_text_as_send_text_keys_as_send_input_with_sparse_acks() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair();
 
@@ -537,16 +554,16 @@ mod tests {
 
         open_ok(&mut client, &mut api_rx, "pane_1");
 
-        // Fire-and-forget frame: dispatched as pane.send_input, no reply line.
+        // Fire-and-forget TEXT frame: dispatched as pane.send_text (RAW bytes, so
+        // control keys are NOT bracketed-paste-wrapped), no reply line.
         client.write_all(br#"{"seq":1,"text":"a"}"#).unwrap();
         client.write_all(b"\n").unwrap();
         client.flush().unwrap();
         let frame1 = api_rx.blocking_recv().unwrap();
         match &frame1.request.method {
-            Method::PaneSendInput(params) => {
+            Method::PaneSendText(params) => {
                 assert_eq!(params.pane_id, "pane_1");
                 assert_eq!(params.text, "a");
-                assert!(params.keys.is_empty());
             }
             other => panic!("unexpected frame request: {other:?}"),
         }
