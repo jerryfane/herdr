@@ -1,16 +1,20 @@
 pub mod client;
 mod event_hub;
+mod federation;
 pub(crate) mod output_registry;
 pub mod schema;
 mod server;
+mod ssh_transport;
 mod status;
 mod subscriptions;
+mod transport;
 mod wait;
 
 pub use event_hub::EventHub;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};
+pub(crate) use transport::{ApiStream, ApiStreamRead};
 
 use std::path::PathBuf;
 

@@ -879,6 +879,74 @@ impl HeadlessServer {
         }
     }
 
+    #[cfg(unix)]
+    fn restore_public_sockets_after_failed_handoff(&mut self) -> io::Result<()> {
+        let api_tx = self
+            .api_tx
+            .clone()
+            .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        // NOTE: this failed-handoff socket-restore path does not have the loaded
+        // config in scope (HeadlessServer stores only derived config fields), so
+        // it restores the API + client sockets without re-binding the federation
+        // listener. Federation defaults to off, so passing the default here is
+        // safe; a live federation listener is re-established on the next normal
+        // server start. Threading config here would need a wider refactor.
+        let api_server = api::start_server_with_stop_control(
+            api_tx,
+            self.app.event_hub.clone(),
+            self.should_quit.clone(),
+            &crate::config::FederationConfig::default(),
+        )?;
+
+        let client_path = client_socket_path();
+        prepare_socket_path(&client_path)?;
+        let listener = bind_local_listener(&client_path)?;
+        restrict_socket_permissions(&client_path)?;
+        let client_socket_identity = socket_file_identity(&client_path)?;
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+
+        self.api_server = Some(api_server);
+        self.client_listener = listener;
+        self.client_socket_path = client_path;
+        self.client_socket_identity = client_socket_identity;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn wait_then_restore_public_sockets_after_failed_handoff(&mut self) -> io::Result<()> {
+        let timeout = crate::server::handoff::COMMIT_TIMEOUT + Duration::from_secs(2);
+        wait_for_old_public_sockets_to_close(timeout)?;
+        self.restore_public_sockets_after_failed_handoff()
+    }
+
+    #[cfg(unix)]
+    fn rollback_handoff_before_commit(
+        &mut self,
+        socket_path: &Path,
+        paused_terminal_ids: &[crate::terminal::TerminalId],
+    ) {
+        for terminal_id in paused_terminal_ids {
+            if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
+                runtime.set_handoff_reader_paused(false);
+            }
+        }
+        self.handoff_in_progress = false;
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[cfg(unix)]
+    fn nudge_handoff_panes_on_first_client_attach(&mut self) {
+        if !self.pending_handoff_repaint_nudge {
+            return;
+        }
+        self.pending_handoff_repaint_nudge = false;
+        self.app
+            .terminal_runtimes
+            .nudge_child_redraw_after_handoff();
+    }
+
+    #[cfg(not(unix))]
+    fn nudge_handoff_panes_on_first_client_attach(&mut self) {}
     fn reload_server_config(&mut self, notify_success: bool) -> crate::config::ConfigReloadReport {
         let server_keybindings = self.server_keybindings.clone();
         apply_keybindings(&mut self.app, &server_keybindings);
@@ -3553,6 +3621,7 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
 // Tests
 // ---------------------------------------------------------------------------
 

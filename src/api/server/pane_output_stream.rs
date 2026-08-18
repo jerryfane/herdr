@@ -20,8 +20,8 @@ use crate::api::output_registry;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneStreamParams, Request, ResponseResult, SuccessResponse,
 };
-use crate::api::ApiRequestSender;
-use crate::ipc::{is_connection_closed_error, LocalStream};
+use crate::api::{ApiRequestSender, ApiStream};
+use crate::ipc::is_connection_closed_error;
 use crate::pane::{clamp_max_frame_bytes, OutputDrain, OutputWait};
 
 use super::{
@@ -108,7 +108,7 @@ fn encode_bytes(bytes: &[u8]) -> String {
 }
 
 pub(super) fn serve(
-    mut stream: LocalStream,
+    mut stream: ApiStream,
     request_id: String,
     params: PaneStreamParams,
     api_tx: &ApiRequestSender,
@@ -144,7 +144,7 @@ pub(super) fn serve(
 }
 
 fn serve_attached(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     request_id: &str,
     pane_id: &str,
     max_frame_bytes: usize,
@@ -290,7 +290,7 @@ fn serve_attached(
 /// Write one frame/response line, reporting `false` when the peer has closed so
 /// the caller can stop cleanly. A wedged socket write times out via the
 /// connection-wide send timeout and tears down only this connection.
-fn emit<T: serde::Serialize>(stream: &mut LocalStream, value: &T) -> std::io::Result<bool> {
+fn emit<T: serde::Serialize>(stream: &mut ApiStream, value: &T) -> std::io::Result<bool> {
     match write_json_line(stream, value) {
         Ok(()) => Ok(true),
         Err(err) if is_connection_closed_error(&err) => Ok(false),

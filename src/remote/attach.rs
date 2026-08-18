@@ -551,7 +551,7 @@ pub(super) struct PreparedRemoteHerdr {
 }
 
 #[derive(Clone)]
-pub(super) struct ManagedSshOptions {
+pub(crate) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
 }
@@ -1026,27 +1026,10 @@ impl Drop for RemoteSsh {
     }
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
-    command
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ConnectionAttempts=1")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=4");
-}
-
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
-    // Compress the first connection too: multiplexed bridges inherit the master's transport.
-    command.arg("-C");
+pub(crate) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     let Some(options) = options else {
         return;
     };
