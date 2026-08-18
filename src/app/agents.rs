@@ -399,6 +399,10 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
+            // Local agents carry no federation stamping; these serialize away.
+            machine_id: None,
+            reachability: None,
+            last_known_status: None,
         })
     }
 

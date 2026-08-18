@@ -14,12 +14,19 @@ const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
-        encode_success(
-            id,
-            ResponseResult::AgentList {
-                agents: self.collect_agent_infos(),
-            },
-        )
+        // Local agents first, then remote federation peers' agents appended with
+        // honest reachability stamping. The remote agents are injected HERE (not
+        // in `collect_agent_infos`, which `agent_name_conflicts` reuses for local
+        // conflict checks). When no peer has an endpoint the store is empty and
+        // this is a no-op, keeping the local path byte-identical to today.
+        let mut agents = self.collect_agent_infos();
+        let store = self
+            .federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        agents.extend(store.merged_agents());
+        drop(store);
+        encode_success(id, ResponseResult::AgentList { agents })
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {

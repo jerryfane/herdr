@@ -7538,8 +7538,26 @@
                 }
               ]
             },
+            "last_known_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Federation: the peer's last-known agent status, preserved when the peer is\nunreachable and `agent_status` is surfaced as `unknown`. `None` for a\nlocal agent or a reachable peer."
+            },
             "launch_pending": {
               "type": "boolean"
+            },
+            "machine_id": {
+              "description": "Federation: alias of the remote peer this agent lives on. `None` for a\nlocal agent (and serialized away).",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "name": {
               "type": [
@@ -7549,6 +7567,17 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "reachability": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/Reachability"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Federation: reachability of the remote peer as of the last poll. `None`\nfor a local agent."
             },
             "revision": {
               "format": "uint64",
@@ -10497,6 +10526,26 @@
             {
               "description": "Outer popup size as a percentage of the terminal area, for example 80%.",
               "pattern": "^(100|[1-9][0-9]?)%$",
+              "type": "string"
+            }
+          ]
+        },
+        "Reachability": {
+          "description": "Reachability of a federation peer, derived from consecutive poll outcomes.\n\nSerialized onto remote [`AgentInfo`]s so a client can tell a live peer from\none that has gone quiet. A C-like enum, so it derives `Eq` and keeps\n[`AgentInfo`]'s `Eq`.",
+          "oneOf": [
+            {
+              "const": "reachable",
+              "description": "The last poll succeeded.",
+              "type": "string"
+            },
+            {
+              "const": "degraded",
+              "description": "One or two consecutive polls have failed; last-known agents are retained.",
+              "type": "string"
+            },
+            {
+              "const": "unreachable",
+              "description": "At least [`UNREACHABLE_MISS_THRESHOLD`] consecutive polls have failed; the\npeer is treated as offline and its agents are stamped `unknown`.",
               "type": "string"
             }
           ]

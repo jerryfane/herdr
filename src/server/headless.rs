@@ -1458,14 +1458,18 @@ impl HeadlessServer {
         // NOTE: this failed-handoff socket-restore path does not have the loaded
         // config in scope (HeadlessServer stores only derived config fields), so
         // it restores the API + client sockets without re-binding the federation
-        // listener. Federation defaults to off, so passing the default here is
-        // safe; a live federation listener is re-established on the next normal
-        // server start. Threading config here would need a wider refactor.
+        // listener or outbound poll threads. Federation defaults to off, so
+        // passing the default config + a fresh empty store here is safe; a live
+        // federation listener and outbound client are re-established on the next
+        // normal server start. Threading config here would need a wider refactor.
         let api_server = api::start_server_with_stop_control(
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
             &crate::config::FederationConfig::default(),
+            Arc::new(std::sync::Mutex::new(
+                api::federation_store::FederationStore::default(),
+            )),
         )?;
 
         let client_path = client_socket_path();
@@ -5043,6 +5047,11 @@ pub fn run_server() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
+    // Shared cache written by the outbound federation poll threads and read by
+    // `agent.list`. Empty (and driving no threads) unless a peer has an endpoint.
+    let federation_store = Arc::new(std::sync::Mutex::new(
+        api::federation_store::FederationStore::default(),
+    ));
 
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
@@ -5050,6 +5059,7 @@ pub fn run_server() -> io::Result<()> {
         event_hub.clone(),
         should_quit.clone(),
         &loaded_config.config.federation,
+        federation_store.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -5076,6 +5086,7 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_federation_store(federation_store.clone());
         seed_startup_workspace_if_empty(&mut app);
 
         // The server runs headless — disable local notification side effects.
@@ -5186,6 +5197,13 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &received.manifest.snapshot,
             &mut imports,
         )?;
+        // Shared federation cache, as in the normal server start. Empty unless a
+        // peer has an endpoint; the outbound poll threads are spawned by
+        // `start_server_with_stop_control` below.
+        let federation_store = Arc::new(std::sync::Mutex::new(
+            api::federation_store::FederationStore::default(),
+        ));
+        app.set_federation_store(federation_store.clone());
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
@@ -5202,6 +5220,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             event_hub.clone(),
             should_quit.clone(),
             &loaded_config.config.federation,
+            federation_store.clone(),
         )?;
         let mut server = HeadlessServer::new(
             app,

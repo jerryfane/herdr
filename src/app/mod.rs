@@ -101,6 +101,10 @@ pub struct App {
     pub state: AppState,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
+    /// Cache of remote federation peers' agents, written by the outbound poll
+    /// threads and merged into `agent.list`. Empty (and shared with no threads)
+    /// unless a peer has an `endpoint`; see `crate::api::federation_store`.
+    pub(crate) federation: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -745,6 +749,11 @@ impl App {
             state,
             pane_graphics: pane_graphics::Runtime::default(),
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
+            // Empty by default; production startup shares the store the outbound
+            // federation client writes into via `set_federation_store`.
+            federation: Arc::new(std::sync::Mutex::new(
+                crate::api::federation_store::FederationStore::default(),
+            )),
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
@@ -804,6 +813,17 @@ impl App {
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app
+    }
+
+    /// Share the federation store the outbound client manager writes into, so
+    /// `agent.list` merges remote peers. Production startup only; the empty
+    /// default constructed in `new` is what every test and the no-federation
+    /// path keep.
+    pub fn set_federation_store(
+        &mut self,
+        store: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
+    ) {
+        self.federation = store;
     }
 
     #[cfg(unix)]
