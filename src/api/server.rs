@@ -366,6 +366,7 @@ fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<(String, Peer
                         PeerContext {
                             alias: peer.alias.clone(),
                             tier: peer.capability,
+                            expected_node_id: peer.expected_node_id.clone(),
                         },
                     ));
                 }
@@ -795,6 +796,19 @@ fn handle_federation_connection(
         write_json_line_allow_disconnect(&mut stream, &federation_unauthorized_error())?;
         return Ok(());
     };
+
+    // Optional identity pin: when this peer is configured with an
+    // `expected_node_id`, the install id presented in the hello must match it.
+    // The token stays the authenticator; this only ADDS a bind when configured
+    // (a peer with no pin is unaffected). Reuse the same opaque unauthorized line
+    // as a token failure so a mismatch never reveals which check failed, and
+    // reject here — before any request is dispatched.
+    if let Some(expected) = peer.expected_node_id.as_deref() {
+        if hello.machine_id != expected {
+            write_json_line_allow_disconnect(&mut stream, &federation_unauthorized_error())?;
+            return Ok(());
+        }
+    }
 
     // A federation-INBOUND connection must never drive the home's OWN outbound
     // peer routing. The home drives its peers; it does not RELAY an inbound peer
@@ -2758,7 +2772,24 @@ mod federation_tests {
         PeerContext {
             alias: alias.into(),
             tier,
+            expected_node_id: None,
         }
+    }
+
+    /// A peer bound to `token` at `tier` with a pinned `expected_node_id`.
+    fn one_peer_pinned(
+        token: &str,
+        tier: CapabilityTier,
+        node_id: &str,
+    ) -> Vec<(String, PeerContext)> {
+        vec![(
+            token.to_string(),
+            PeerContext {
+                alias: "peer".into(),
+                tier,
+                expected_node_id: Some(node_id.to_string()),
+            },
+        )]
     }
 
     /// One peer bound to `token` at `tier`, in the shape `spawn_federation_listener`
@@ -2805,6 +2836,20 @@ mod federation_tests {
     fn raw_hello(addr: SocketAddr, token: &str) -> TcpStream {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let hello = FederationHello::new(token).to_line().unwrap();
+        writeln!(stream, "{hello}").unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    /// Like [`raw_hello`], but stamps an explicit `machine_id` so tests can drive
+    /// the `expected_node_id` identity pin with a value they control (the real
+    /// `ApiClient` TCP path would send this process's persisted install id).
+    fn raw_hello_with_machine_id(addr: SocketAddr, token: &str, machine_id: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let hello = FederationHello::new(token)
+            .with_machine_id(machine_id.to_string())
+            .to_line()
+            .unwrap();
         writeln!(stream, "{hello}").unwrap();
         stream.flush().unwrap();
         stream
@@ -3449,6 +3494,49 @@ mod federation_tests {
             })
             .expect("ping round-trips at the negotiated version");
         assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn expected_node_id_match_proceeds() {
+        // A peer pinned to "node-A": a valid token whose hello carries the
+        // matching machine_id passes the pin and reaches the app dispatch path.
+        let mut fed = start_federation(one_peer_pinned("tok", CapabilityTier::Observe, "node-A"));
+        let mut stream = raw_hello_with_machine_id(fed.addr, "tok", "node-A");
+        send_request(&mut stream, "list", Method::AgentList(EmptyParams {}));
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentList(_)));
+    }
+
+    #[test]
+    fn expected_node_id_mismatch_is_rejected_and_never_dispatches() {
+        // A peer pinned to "node-A": the right token but a hello carrying a
+        // different machine_id is rejected with the SAME opaque unauthorized line
+        // as a bad token (the failing check is never revealed), at handshake time
+        // before any request can be read.
+        let mut fed = start_federation(one_peer_pinned("tok", CapabilityTier::Observe, "node-A"));
+        let stream = raw_hello_with_machine_id(fed.addr, "tok", "node-B");
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read rejection line");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
+        assert_eq!(value["error"]["code"], "unauthorized");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "a machine-id-mismatched connection dispatched a request"
+        );
+    }
+
+    #[test]
+    fn peer_without_expected_node_id_ignores_machine_id() {
+        // Back-compat: a peer with no pin admits any presented machine_id.
+        let mut fed = start_federation(one_peer("tok", CapabilityTier::Observe));
+        let mut stream = raw_hello_with_machine_id(fed.addr, "tok", "any-unpinned-id");
+        send_request(&mut stream, "list", Method::AgentList(EmptyParams {}));
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentList(_)));
     }
 
     #[test]
