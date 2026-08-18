@@ -242,6 +242,11 @@ fn start_server_inner(
     // A bad federation address or an address already in use must not crash the
     // daemon: `maybe_start_federation_listener` logs and returns `None`, leaving
     // the unix listener above serving on its own.
+    // NB: the federation-inbound listener is deliberately NOT given the outbound
+    // `federation_peers` registry. The home drives its OWN peers from local
+    // clients only; an inbound peer must never be able to relay through the home
+    // to its other peers (a confused-deputy trust expansion). Keeping the
+    // registry out of this chain makes that unreachable by construction.
     let federation_thread = maybe_start_federation_listener(
         federation,
         &api_tx,
@@ -249,7 +254,6 @@ fn start_server_inner(
         &capabilities,
         &running,
         &server_stop,
-        Arc::clone(&federation_peers),
     );
 
     // Outbound side: poll each configured peer that has an `endpoint`. When no
@@ -282,7 +286,6 @@ fn maybe_start_federation_listener(
     capabilities: &Option<ServerCapabilities>,
     running: &Arc<AtomicBool>,
     server_stop: &Option<Arc<AtomicBool>>,
-    federation_peers: Arc<HashMap<String, ConnectionTarget>>,
 ) -> Option<JoinHandle<()>> {
     if !federation.listen {
         return None;
@@ -325,7 +328,6 @@ fn maybe_start_federation_listener(
         capabilities.clone(),
         Arc::clone(running),
         server_stop.clone(),
-        federation_peers,
     ) {
         Ok(thread) => Some(thread),
         Err(err) => {
@@ -384,7 +386,6 @@ fn spawn_federation_listener(
     capabilities: Option<ServerCapabilities>,
     running: Arc<AtomicBool>,
     server_stop: Option<Arc<AtomicBool>>,
-    federation_peers: Arc<HashMap<String, ConnectionTarget>>,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     let peers = Arc::new(peers);
@@ -426,7 +427,6 @@ fn spawn_federation_listener(
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&running);
-                    let federation_peers = Arc::clone(&federation_peers);
                     std::thread::spawn(move || {
                         let _slot = slot;
                         if let Err(err) = handle_federation_connection(
@@ -437,7 +437,6 @@ fn spawn_federation_listener(
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
-                            &federation_peers,
                         ) {
                             warn!(err = %err, peer = %peer, "federation connection failed");
                         }
@@ -765,7 +764,6 @@ fn handle_federation_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
-    federation_peers: &HashMap<String, ConnectionTarget>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "federation connection write timeout unavailable");
@@ -791,6 +789,17 @@ fn handle_federation_connection(
         return Ok(());
     };
 
+    // A federation-INBOUND connection must never drive the home's OWN outbound
+    // peer routing. The home drives its peers; it does not RELAY an inbound peer
+    // through to its other peers. If the inbound registry were passed here, an
+    // inbound peer sending `<other-alias>/…` would be transit-proxied to that
+    // other peer using the HOME's credentials/tier — a confused deputy that
+    // expands the inbound peer's trust to peers it has no relationship with.
+    // Pass an empty registry so `maybe_route_to_peer` never matches on this
+    // path and a `<alias>/…` target falls through to a local not-found. This
+    // single choke point also keeps the pane.stream proxy inbound-safe, since it
+    // reads the same registry.
+    let no_outbound_routing: HashMap<String, ConnectionTarget> = HashMap::new();
     handle_connection_with_stop(
         stream,
         api_tx,
@@ -799,7 +808,7 @@ fn handle_federation_connection(
         capabilities,
         server_stop,
         Some(peer),
-        federation_peers,
+        &no_outbound_routing,
     )
 }
 
@@ -2548,7 +2557,6 @@ mod federation_tests {
             None,
             Arc::clone(&running),
             None,
-            Arc::new(HashMap::new()),
         )
         .expect("spawn federation listener");
         TestFederation {
@@ -2609,6 +2617,72 @@ mod federation_tests {
 
         assert_eq!(response["id"], "fed_ping");
         assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn inbound_peer_target_naming_a_peer_is_not_transit_proxied() {
+        // Confused-deputy guard. A FEDERATION-INBOUND peer must never drive the
+        // home's OWN outbound routing: the home drives its peers only from LOCAL
+        // clients, never by relaying an inbound peer through to its other peers
+        // on the home's own credentials. So an inbound Observe peer sending a
+        // target that names another peer (`remote/screen`) must fall through to
+        // LOCAL dispatch with the target UNREWRITTEN — never split, stripped, and
+        // proxied onward. (The local-client side that DOES route is covered by
+        // `proxy_returns_the_peers_read_snapshot_verbatim`.) The inbound listener
+        // is given no outbound registry at all, so this holds by construction.
+        let mut fed = start_federation(one_peer("peertok", CapabilityTier::Observe));
+
+        // App responder: proves the request reached local dispatch, and captures
+        // the target it arrived with. A transit-proxied request would never have
+        // reached the app at all.
+        let mut api_rx = std::mem::replace(&mut fed.api_rx, mpsc::unbounded_channel().1);
+        let responder = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if let Ok(msg) = api_rx.try_recv() {
+                    let target = match &msg.request.method {
+                        Method::AgentRead(params) => params.target.clone(),
+                        other => panic!("unexpected local method: {other:?}"),
+                    };
+                    let resp = error_response_json(
+                        msg.request.id.clone(),
+                        "not_found",
+                        "no such agent".into(),
+                    );
+                    let _ = msg.respond_to.send(resp);
+                    return Some(target);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        });
+
+        let mut stream = raw_hello(fed.addr, "peertok");
+        send_request(
+            &mut stream,
+            "ir1",
+            Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: "remote/screen".into(),
+                source: crate::api::schema::ReadSource::Visible,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        );
+        let response = read_json_line(&stream);
+        assert_eq!(response["id"], "ir1");
+        assert_eq!(
+            response["error"]["code"], "not_found",
+            "an inbound `<alias>/…` target must resolve locally (not-found), not be proxied"
+        );
+
+        let seen_target = responder
+            .join()
+            .expect("responder thread panicked")
+            .expect("inbound request never reached local dispatch (it was transit-proxied)");
+        assert_eq!(
+            seen_target, "remote/screen",
+            "an inbound peer's target must reach local dispatch UNREWRITTEN, never split and proxied"
+        );
     }
 
     #[test]
@@ -3266,7 +3340,6 @@ mod federation_tests {
             None,
             Arc::clone(&listener_running),
             None,
-            Arc::new(HashMap::new()),
         )
         .expect("spawn federation listener");
         let responder = std::thread::spawn(move || {
