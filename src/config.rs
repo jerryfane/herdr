@@ -21,7 +21,7 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
+        validated_sidebar_bounds, AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport,
         ConfigReloadStatus, FederationConfig, HostCursorModeConfig, NewTerminalCwdConfig,
         PushConfig, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
         TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,

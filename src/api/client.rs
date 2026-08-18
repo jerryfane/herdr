@@ -302,8 +302,13 @@ fn write_request_line(stream: &mut ApiStream, request: &Request) -> io::Result<(
     stream.flush()
 }
 
-/// Write the `federation.hello` token line. Must match the exact shape the
+/// Write the versioned `federation.hello` line. Must match the exact shape the
 /// listener expects — both sides share [`crate::api::federation::FederationHello`].
+///
+/// `FederationHello::new` stamps the current `FEDERATION_PROTOCOL_VERSION` and an
+/// empty `machine_id`: no persisted machine id exists yet (a later workstream),
+/// and `machine_id` is informational in this version — the token is the
+/// authenticator — so an empty placeholder is sent for now.
 fn write_federation_hello(stream: &mut ApiStream, token: &str) -> io::Result<()> {
     let line = crate::api::federation::FederationHello::new(token)
         .to_line()
