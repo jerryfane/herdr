@@ -826,11 +826,17 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
+    // Shared cache written by the outbound federation poll threads and read by
+    // `agent.list`. Empty (and driving no threads) unless a peer has an endpoint.
+    let federation_store = std::sync::Arc::new(std::sync::Mutex::new(
+        api::federation_store::FederationStore::default(),
+    ));
     let _api_server = match api::start_server_with_capabilities(
         api_tx,
         event_hub.clone(),
         None,
         &loaded_config.config.federation,
+        federation_store.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -907,6 +913,7 @@ fn main() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_federation_store(federation_store.clone());
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.

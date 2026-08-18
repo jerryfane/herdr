@@ -243,6 +243,19 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
+    /// Federation: alias of the remote peer this agent lives on. `None` for a
+    /// local agent (and serialized away).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Federation: reachability of the remote peer as of the last poll. `None`
+    /// for a local agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<crate::api::federation_store::Reachability>,
+    /// Federation: the peer's last-known agent status, preserved when the peer is
+    /// unreachable and `agent_status` is surfaced as `unknown`. `None` for a
+    /// local agent or a reachable peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_status: Option<AgentStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

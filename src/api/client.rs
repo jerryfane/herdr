@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -347,6 +347,86 @@ pub(crate) fn parse_response_value(
     }
 }
 
+/// Failure parsing a federation peer `endpoint` string into a [`ConnectionTarget`].
+#[derive(Debug)]
+pub enum EndpointParseError {
+    /// The scheme is neither `tcp://` nor `ssh://`.
+    UnknownScheme(String),
+    /// The authority (host, or host:port for TCP) was empty.
+    MissingHost,
+    /// A `tcp://host:port` authority did not resolve to a socket address.
+    UnresolvedTcpAddress {
+        authority: String,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for EndpointParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownScheme(endpoint) => write!(
+                f,
+                "unsupported federation endpoint scheme in {endpoint:?}; expected tcp:// or ssh://"
+            ),
+            Self::MissingHost => write!(f, "federation endpoint is missing a host"),
+            Self::UnresolvedTcpAddress { authority, source } => {
+                write!(
+                    f,
+                    "could not resolve tcp federation endpoint {authority:?}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EndpointParseError {}
+
+/// Resolve a federation peer `endpoint` string into a [`ConnectionTarget`].
+///
+/// - `tcp://host:port` resolves the authority to a [`SocketAddr`] (DNS is
+///   allowed) and yields [`ConnectionTarget::Tcp`], carrying `token` as the
+///   `federation.hello` credential.
+/// - `ssh://[user@]host` yields an [`SshTarget`] with key-based auth. `token` is
+///   ignored — SSH federation authenticates with the ssh key, not a token.
+/// - Any other scheme is rejected.
+pub fn endpoint_to_target(
+    endpoint: &str,
+    token: Option<String>,
+) -> Result<ConnectionTarget, EndpointParseError> {
+    if let Some(authority) = endpoint.strip_prefix("tcp://") {
+        if authority.is_empty() {
+            return Err(EndpointParseError::MissingHost);
+        }
+        let addr = authority
+            .to_socket_addrs()
+            .map_err(|source| EndpointParseError::UnresolvedTcpAddress {
+                authority: authority.to_string(),
+                source,
+            })?
+            .next()
+            .ok_or_else(|| EndpointParseError::UnresolvedTcpAddress {
+                authority: authority.to_string(),
+                source: io::Error::new(io::ErrorKind::NotFound, "no addresses resolved"),
+            })?;
+        Ok(ConnectionTarget::Tcp { addr, token })
+    } else if let Some(authority) = endpoint.strip_prefix("ssh://") {
+        let (user, host) = match authority.split_once('@') {
+            Some((user, host)) => (Some(user.to_string()), host),
+            None => (None, authority),
+        };
+        if host.is_empty() {
+            return Err(EndpointParseError::MissingHost);
+        }
+        Ok(ConnectionTarget::Ssh(SshTarget {
+            host: host.to_string(),
+            user,
+            credential: SshCredential::Key,
+        }))
+    } else {
+        Err(EndpointParseError::UnknownScheme(endpoint.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +458,74 @@ mod tests {
             credential: SshCredential::Key,
         }));
         assert_eq!(ssh.socket_path(), PathBuf::new());
+    }
+
+    #[test]
+    fn endpoint_tcp_resolves_to_a_tcp_target_with_token() {
+        let target = endpoint_to_target("tcp://127.0.0.1:9000", Some("s3cret".into()))
+            .expect("tcp endpoint parses");
+        match target {
+            ConnectionTarget::Tcp { addr, token } => {
+                assert_eq!(addr, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+                assert_eq!(token.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected tcp target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn endpoint_ssh_parses_user_and_host_and_ignores_token() {
+        let target = endpoint_to_target("ssh://alice@host.example", Some("ignored".into()))
+            .expect("ssh endpoint parses");
+        assert_eq!(
+            target,
+            ConnectionTarget::Ssh(SshTarget {
+                host: "host.example".into(),
+                user: Some("alice".into()),
+                credential: SshCredential::Key,
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_ssh_without_user_parses_bare_host() {
+        let target =
+            endpoint_to_target("ssh://host.example", None).expect("bare ssh endpoint parses");
+        assert_eq!(
+            target,
+            ConnectionTarget::Ssh(SshTarget {
+                host: "host.example".into(),
+                user: None,
+                credential: SshCredential::Key,
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_rejects_unknown_scheme_and_empty_host() {
+        assert!(matches!(
+            endpoint_to_target("http://host:80", None),
+            Err(EndpointParseError::UnknownScheme(_))
+        ));
+        assert!(matches!(
+            endpoint_to_target("garbage", None),
+            Err(EndpointParseError::UnknownScheme(_))
+        ));
+        assert!(matches!(
+            endpoint_to_target("ssh://", None),
+            Err(EndpointParseError::MissingHost)
+        ));
+        assert!(matches!(
+            endpoint_to_target("tcp://", None),
+            Err(EndpointParseError::MissingHost)
+        ));
+    }
+
+    #[test]
+    fn endpoint_tcp_missing_port_is_rejected() {
+        assert!(matches!(
+            endpoint_to_target("tcp://127.0.0.1", None),
+            Err(EndpointParseError::UnresolvedTcpAddress { .. })
+        ));
     }
 }
