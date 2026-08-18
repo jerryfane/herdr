@@ -24,14 +24,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::Stream as _;
-
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneInputStreamParams, PaneSendInputParams,
     PaneSendTextParams, Request, ResponseResult, SuccessResponse,
 };
-use crate::api::ApiRequestSender;
-use crate::ipc::{is_connection_closed_error, LocalStream};
+use crate::api::{ApiRequestSender, ApiStream};
+use crate::ipc::is_connection_closed_error;
 
 use super::{
     api_response_outcome, dispatch_stream_open, dispatch_to_app_with_timeout, write_json_line,
@@ -81,7 +79,7 @@ struct InputFrameError {
 }
 
 pub(super) fn serve(
-    stream: LocalStream,
+    stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     api_tx: &ApiRequestSender,
@@ -98,7 +96,7 @@ pub(super) fn serve(
 }
 
 fn serve_with_open_timeout(
-    mut stream: LocalStream,
+    mut stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     api_tx: &ApiRequestSender,
@@ -151,7 +149,7 @@ fn serve_with_open_timeout(
 }
 
 fn serve_frames(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     request_id: &str,
     pane_id: &str,
     api_tx: &ApiRequestSender,
@@ -269,7 +267,7 @@ fn stream_is_running(running: &AtomicBool, stream_active: &AtomicBool) -> bool {
 // ---------------------------------------------------------------------------
 
 fn read_line(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
     max_bytes: usize,
@@ -377,8 +375,8 @@ impl PollBackoff {
 }
 
 fn with_timed_reads<T>(
-    stream: &mut LocalStream,
-    read: impl FnOnce(&mut LocalStream, ReadWait) -> std::io::Result<Option<T>>,
+    stream: &mut ApiStream,
+    read: impl FnOnce(&mut ApiStream, ReadWait) -> std::io::Result<Option<T>>,
 ) -> std::io::Result<Option<T>> {
     match stream.set_recv_timeout(Some(CONNECTION_POLL_INTERVAL)) {
         Ok(()) => {

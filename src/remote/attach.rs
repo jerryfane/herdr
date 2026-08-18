@@ -400,7 +400,7 @@ struct PreparedRemoteHerdr {
 }
 
 #[derive(Clone)]
-struct ManagedSshOptions {
+pub(crate) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
 }
@@ -603,7 +603,10 @@ impl Drop for RemoteSsh {
     }
 }
 
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(crate) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     let Some(options) = options else {
         return;
     };

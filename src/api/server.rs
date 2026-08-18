@@ -1,25 +1,33 @@
 use std::io::{self, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::ListenerExt as _;
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(test, unix))]
 use std::fs;
 
+use crate::api::federation::{token_is_authorized, FederationHello};
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
-use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
+use crate::api::{
+    request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, ApiStream, ApiStreamRead,
+    EventHub,
+};
+use crate::config::FederationConfig;
+#[cfg(test)]
+use crate::ipc::LocalStream;
 use crate::ipc::{
-    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    bind_local_listener, is_connection_closed_error, remove_socket_file_if_owned,
+    socket_file_identity, SocketFileIdentity,
 };
 
 mod pane_graphics_stream;
@@ -34,7 +42,10 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub struct ServerHandle {
-    _thread: std::thread::JoinHandle<()>,
+    _thread: JoinHandle<()>,
+    /// Federation TCP accept thread, joined on drop. `None` when federation is
+    /// not listening.
+    federation_thread: Option<JoinHandle<()>>,
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
@@ -43,6 +54,14 @@ pub struct ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+
+        // The federation accept loop polls `running` between non-blocking
+        // accepts, so clearing it above unblocks the thread; join it to release
+        // the TCP listener before returning. (The unix accept thread is detached
+        // like before — its listener drops with the process.)
+        if let Some(thread) = self.federation_thread.take() {
+            let _ = thread.join();
+        }
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -62,16 +81,24 @@ pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
+    federation: &FederationConfig,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    start_server_inner(
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+        federation,
+    )
 }
 
 pub fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
+    federation: &FederationConfig,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, capabilities, None)
+    start_server_inner(api_tx, event_hub, capabilities, None, federation)
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -87,6 +114,7 @@ fn start_server_inner(
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
+    federation: &FederationConfig,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -98,18 +126,22 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let listener_api_tx = api_tx.clone();
+    let listener_event_hub = event_hub.clone();
+    let listener_capabilities = capabilities.clone();
+    let listener_server_stop = server_stop.clone();
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let server_stop = server_stop.clone();
+                    let api_tx = listener_api_tx.clone();
+                    let event_hub = listener_event_hub.clone();
+                    let capabilities = listener_capabilities.clone();
+                    let server_stop = listener_server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
-                            stream,
+                            ApiStream::Local(stream),
                             &api_tx,
                             &event_hub,
                             &connection_running,
@@ -129,12 +161,226 @@ fn start_server_inner(
         debug!("api server thread exiting");
     });
 
+    // A bad federation address or an address already in use must not crash the
+    // daemon: `maybe_start_federation_listener` logs and returns `None`, leaving
+    // the unix listener above serving on its own.
+    let federation_thread = maybe_start_federation_listener(
+        federation,
+        &api_tx,
+        &event_hub,
+        &capabilities,
+        &running,
+        &server_stop,
+    );
+
     Ok(ServerHandle {
         _thread: thread,
+        federation_thread,
         path,
         identity,
         running,
     })
+}
+
+/// Bind the federation TCP listener and spawn its accept thread when federation
+/// is enabled and configured. Returns `None` (federation disabled) for any
+/// non-fatal reason — disabled, no address, no usable token, or a bind failure —
+/// after logging, so the daemon keeps running on the unix socket alone.
+fn maybe_start_federation_listener(
+    federation: &FederationConfig,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    capabilities: &Option<ServerCapabilities>,
+    running: &Arc<AtomicBool>,
+    server_stop: &Option<Arc<AtomicBool>>,
+) -> Option<JoinHandle<()>> {
+    if !federation.listen {
+        return None;
+    }
+    let Some(addr) = federation.listen_addr.as_deref() else {
+        warn!("federation.listen is enabled but federation.listen_addr is unset; not binding");
+        return None;
+    };
+
+    // Safety floor: never open a federation listener without at least one token
+    // to authenticate against, or every peer would be admitted.
+    let tokens = resolve_federation_tokens(federation);
+    if tokens.is_empty() {
+        warn!(
+            addr = %addr,
+            "federation.listen is enabled but no peer token file yielded a token; \
+             refusing to bind an unauthenticated federation listener"
+        );
+        return None;
+    }
+
+    let listener = match TcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            error!(addr = %addr, err = %err, "failed to bind federation listener; serving unix socket only");
+            return None;
+        }
+    };
+    let bound = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| addr.to_string());
+    info!(addr = %bound, peer_tokens = tokens.len(), "federation listener listening");
+
+    match spawn_federation_listener(
+        listener,
+        tokens,
+        api_tx.clone(),
+        event_hub.clone(),
+        capabilities.clone(),
+        Arc::clone(running),
+        server_stop.clone(),
+    ) {
+        Ok(thread) => Some(thread),
+        Err(err) => {
+            error!(err = %err, "failed to start federation listener thread; serving unix socket only");
+            None
+        }
+    }
+}
+
+/// Read each peer's `token_file`, trimmed, into the accepted-token set. A single
+/// unreadable token file is logged and skipped rather than failing the listener.
+fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for peer in &federation.peers {
+        let Some(path) = peer.token_file.as_deref() else {
+            continue;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let token = contents.trim();
+                if token.is_empty() {
+                    warn!(path = %path, alias = %peer.alias, "federation peer token file is empty; skipping");
+                } else {
+                    tokens.push(token.to_string());
+                }
+            }
+            Err(err) => {
+                warn!(path = %path, alias = %peer.alias, err = %err, "failed to read federation peer token file; skipping");
+            }
+        }
+    }
+    tokens
+}
+
+/// Spawn the federation TCP accept loop. Each accepted connection is handed to
+/// [`handle_federation_connection`], which enforces the token gate before any
+/// request is dispatched.
+///
+/// The listener is non-blocking and the loop polls `running` between accepts, so
+/// [`ServerHandle::drop`] can stop and join it by clearing `running`.
+fn spawn_federation_listener(
+    listener: TcpListener,
+    tokens: Vec<String>,
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    capabilities: Option<ServerCapabilities>,
+    running: Arc<AtomicBool>,
+    server_stop: Option<Arc<AtomicBool>>,
+) -> std::io::Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    let tokens = Arc::new(tokens);
+
+    let thread = std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    // The accepted socket is used in blocking mode; the framed
+                    // reader toggles polling on it as needed.
+                    if let Err(err) = stream.set_nonblocking(false) {
+                        warn!(err = %err, "federation connection blocking-mode reset failed");
+                        continue;
+                    }
+                    let tokens = Arc::clone(&tokens);
+                    let api_tx = api_tx.clone();
+                    let event_hub = event_hub.clone();
+                    let capabilities = capabilities.clone();
+                    let server_stop = server_stop.clone();
+                    let connection_running = Arc::clone(&running);
+                    std::thread::spawn(move || {
+                        if let Err(err) = handle_federation_connection(
+                            ApiStream::Tcp(stream),
+                            &tokens,
+                            &api_tx,
+                            &event_hub,
+                            &connection_running,
+                            capabilities,
+                            server_stop.as_ref(),
+                        ) {
+                            warn!(err = %err, peer = %peer, "federation connection failed");
+                        }
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                }
+                Err(err) => {
+                    error!(err = %err, "federation listener accept failed");
+                    break;
+                }
+            }
+        }
+        debug!("federation listener thread exiting");
+    });
+
+    Ok(thread)
+}
+
+/// Enforce the federation token gate, then dispatch the connection normally.
+///
+/// The first line MUST be a `federation.hello` carrying a token that matches one
+/// configured peer token (constant-time compared). On mismatch/malformed/missing
+/// hello a single JSON error line is written and the connection closes with no
+/// request dispatched. On success the remaining lines flow through the same
+/// [`handle_connection_with_stop`] path as a local connection.
+fn handle_federation_connection(
+    mut stream: ApiStream,
+    tokens: &[String],
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<()> {
+    if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
+        debug!(err = %err, "federation connection write timeout unavailable");
+    }
+
+    let Some(line) = read_initial_request_line(&mut stream)? else {
+        return Ok(()); // peer closed before sending the hello
+    };
+
+    let authorized = FederationHello::token_from_line(line.trim())
+        .is_some_and(|token| token_is_authorized(&token, tokens));
+    if !authorized {
+        write_json_line_allow_disconnect(&mut stream, &federation_unauthorized_error())?;
+        return Ok(());
+    }
+
+    handle_connection_with_stop(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        server_stop,
+    )
+}
+
+fn federation_unauthorized_error() -> ErrorResponse {
+    ErrorResponse {
+        id: String::new(),
+        error: ErrorBody {
+            code: "unauthorized".into(),
+            message: "federation authentication failed".into(),
+        },
+    }
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
@@ -158,11 +404,18 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
+    handle_connection_with_stop(
+        ApiStream::Local(stream),
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        None,
+    )
 }
 
 fn handle_connection_with_stop(
-    mut stream: LocalStream,
+    mut stream: ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -344,7 +597,7 @@ fn handle_connection_with_stop(
 }
 
 fn finish_wait_response(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     response: Option<String>,
     request_id: &str,
     method: &'static str,
@@ -549,35 +802,35 @@ fn api_response_outcome(response: &str) -> &'static str {
     }
 }
 
-fn read_initial_request_line(stream: &mut LocalStream) -> std::io::Result<Option<String>> {
+fn read_initial_request_line(stream: &mut ApiStream) -> std::io::Result<Option<String>> {
     read_initial_request_line_with_timeout(stream, INITIAL_REQUEST_TIMEOUT)
 }
 
 fn read_initial_request_line_with_timeout(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     timeout: Duration,
 ) -> std::io::Result<Option<String>> {
     read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
 }
 
 fn read_initial_request_line_with_limits(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     timeout: Duration,
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
-    set_local_stream_polling(stream, true)?;
+    stream.set_polling(true)?;
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
 
     let result = loop {
-        let read = match poll_local_stream_read(stream, &mut byte) {
+        let read = match stream.poll_read(&mut byte) {
             Ok(read) => read,
             Err(err) => break Err(err),
         };
         match read {
-            LocalStreamRead::Closed => break Ok(None),
-            LocalStreamRead::Data => {
+            ApiStreamRead::Closed => break Ok(None),
+            ApiStreamRead::Data(_) => {
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)
@@ -591,7 +844,7 @@ fn read_initial_request_line_with_limits(
                     ));
                 }
             }
-            LocalStreamRead::Pending => {
+            ApiStreamRead::Pending => {
                 if Instant::now() >= deadline {
                     break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -602,7 +855,7 @@ fn read_initial_request_line_with_limits(
             }
         }
     };
-    set_local_stream_polling(stream, false)?;
+    stream.set_polling(false)?;
     result
 }
 
@@ -699,7 +952,8 @@ mod windows_tests {
 
     #[test]
     fn windows_idle_initial_request_honors_timeout() {
-        let (_client, mut server, path) = local_stream_pair("request-timeout");
+        let (_client, server, path) = local_stream_pair("request-timeout");
+        let mut server = ApiStream::Local(server);
 
         let err = read_initial_request_line_with_timeout(&mut server, Duration::from_millis(50))
             .unwrap_err();
@@ -710,9 +964,10 @@ mod windows_tests {
 
     #[test]
     fn windows_initial_request_enforces_size_limit() {
-        let (mut client, mut server, path) = local_stream_pair("request-size-limit");
+        let (mut client, server, path) = local_stream_pair("request-size-limit");
         client.write_all(b"12345").unwrap();
         client.flush().unwrap();
+        let mut server = ApiStream::Local(server);
 
         let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
             .unwrap_err();
@@ -724,9 +979,10 @@ mod windows_tests {
 
     #[test]
     fn windows_initial_request_rejects_invalid_utf8() {
-        let (mut client, mut server, path) = local_stream_pair("request-invalid-utf8");
+        let (mut client, server, path) = local_stream_pair("request-invalid-utf8");
         client.write_all(&[0xff, b'\n']).unwrap();
         client.flush().unwrap();
+        let mut server = ApiStream::Local(server);
 
         let err = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(1))
             .unwrap_err();
@@ -737,7 +993,7 @@ mod windows_tests {
 }
 
 fn stream_subscriptions(
-    mut stream: LocalStream,
+    mut stream: ApiStream,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
@@ -794,30 +1050,27 @@ fn stream_subscriptions(
     }
 }
 
-fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
+fn write_text_line(stream: &mut ApiStream, value: &str) -> std::io::Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
 }
 
-fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
+fn write_text_line_allow_disconnect(stream: &mut ApiStream, value: &str) -> std::io::Result<()> {
     match write_text_line(stream, value) {
         Err(err) if is_connection_closed_error(&err) => Ok(()),
         result => result,
     }
 }
 
-fn write_json_line<T: serde::Serialize>(
-    stream: &mut LocalStream,
-    value: &T,
-) -> std::io::Result<()> {
+fn write_json_line<T: serde::Serialize>(stream: &mut ApiStream, value: &T) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
     write_text_line(stream, &encoded)
 }
 
 fn write_json_line_allow_disconnect<T: serde::Serialize>(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     value: &T,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
@@ -826,14 +1079,14 @@ fn write_json_line_allow_disconnect<T: serde::Serialize>(
 }
 
 pub(super) fn should_stop_connection(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
 
-    local_stream_peer_closed(stream)
+    stream.peer_closed()
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -1529,5 +1782,209 @@ mod pane_graphics_request_tests {
         let encoded = r#"{"id":"duplicate","method":"ping","method":"pane.graphics.stream","params":{"pane_id":"pane_1"}}"#;
 
         assert!(serde_json::from_str::<Request>(encoded).is_err());
+    }
+}
+
+/// Federation TCP listener + token-gate tests. These run a real loopback
+/// `TcpListener` through [`spawn_federation_listener`] and drive it with the
+/// real [`ApiClient`] TCP transport (or a raw socket for the rejection paths),
+/// entirely in-process — no external machine.
+#[cfg(test)]
+mod federation_tests {
+    use super::*;
+    use crate::api::client::{ApiClient, ConnectionTarget};
+    use crate::api::schema::{
+        EventData, EventEnvelope, EventKind, EventsSubscribeParams, PingParams, Subscription,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use tokio::sync::mpsc;
+
+    /// A running federation listener bound to a loopback ephemeral port, plus the
+    /// app channel receiver so a test can assert whether any request reached the
+    /// dispatch path. Dropping it stops and joins the accept thread.
+    struct TestFederation {
+        addr: SocketAddr,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+        _api_tx: ApiRequestSender,
+        api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
+    }
+
+    impl Drop for TestFederation {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_federation(tokens: Vec<String>) -> TestFederation {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback federation listener");
+        let addr = listener.local_addr().expect("federation listener addr");
+        let (api_tx, api_rx) = mpsc::unbounded_channel();
+        let event_hub = EventHub::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let thread = spawn_federation_listener(
+            listener,
+            tokens,
+            api_tx.clone(),
+            event_hub.clone(),
+            None,
+            Arc::clone(&running),
+            None,
+        )
+        .expect("spawn federation listener");
+        TestFederation {
+            addr,
+            event_hub,
+            running,
+            thread: Some(thread),
+            _api_tx: api_tx,
+            api_rx,
+        }
+    }
+
+    fn tcp_client(addr: SocketAddr, token: Option<&str>) -> ApiClient {
+        ApiClient::for_target(ConnectionTarget::Tcp {
+            addr,
+            token: token.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn valid_token_round_trips_a_ping_over_tcp() {
+        let fed = start_federation(vec!["s3cret".into()]);
+        let client = tcp_client(fed.addr, Some("s3cret"));
+
+        let response = client
+            .request_value(&Request {
+                id: "fed_ping".into(),
+                method: Method::Ping(PingParams::default()),
+            })
+            .expect("federation ping round-trips");
+
+        assert_eq!(response["id"], "fed_ping");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn wrong_token_is_rejected_and_never_dispatches() {
+        let mut fed = start_federation(vec!["right".into()]);
+
+        // A bad hello is rejected before the connection handler ever reads a
+        // request line, so nothing can reach the app dispatch path.
+        let mut stream = TcpStream::connect(fed.addr).expect("connect");
+        let hello = FederationHello::new("wrong").to_line().unwrap();
+        writeln!(stream, "{hello}").unwrap();
+        stream.flush().unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read rejection line");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
+        assert_eq!(value["error"]["code"], "unauthorized");
+
+        // The connection is closed right after the error line (clean EOF: the
+        // whole hello was consumed, so there is no unread data to force an RST).
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).expect("read after close"),
+            0,
+            "connection was not closed after the rejection"
+        );
+
+        // No request ever reached the app dispatch path.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "a rejected connection dispatched a request"
+        );
+    }
+
+    #[test]
+    fn missing_hello_is_rejected() {
+        let fed = start_federation(vec!["right".into()]);
+
+        // A request line where the hello is expected is not a hello.
+        let mut stream = TcpStream::connect(fed.addr).expect("connect");
+        writeln!(stream, r#"{{"id":"x","method":"ping","params":{{}}}}"#).unwrap();
+        stream.flush().unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read rejection line");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
+        assert_eq!(value["error"]["code"], "unauthorized");
+
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).expect("read after close"),
+            0,
+            "connection was not closed after the missing-hello rejection"
+        );
+    }
+
+    #[test]
+    fn request_stream_yields_multiple_lines_then_terminates_on_close() {
+        let fed = start_federation(vec!["s3cret".into()]);
+        let client = tcp_client(fed.addr, Some("s3cret"));
+
+        let mut lines = client
+            .request_stream(&Request {
+                id: "fed_sub".into(),
+                method: Method::EventsSubscribe(EventsSubscribeParams {
+                    subscriptions: vec![Subscription::PaneClosed {}],
+                }),
+            })
+            .expect("open subscription stream");
+
+        // Line 1: the subscription ack.
+        let ack = lines
+            .next()
+            .expect("subscription ack line")
+            .expect("ack is io-ok");
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        // Push a matching event; line 2 is that event.
+        fed.event_hub.push(EventEnvelope {
+            event: EventKind::PaneClosed,
+            data: EventData::PaneClosed {
+                pane_id: "pane_1".into(),
+                workspace_id: "ws_1".into(),
+            },
+        });
+        let event = lines
+            .next()
+            .expect("streamed event line")
+            .expect("event is io-ok");
+        assert_eq!(event["event"], "pane_closed");
+        assert_eq!(event["data"]["pane_id"], "pane_1");
+
+        // Shutting the server down closes the connection; the stream terminates.
+        fed.running.store(false, Ordering::Relaxed);
+        assert!(
+            lines.next().is_none(),
+            "stream did not terminate when the connection closed"
+        );
+    }
+
+    #[test]
+    fn empty_token_set_never_authorizes() {
+        // A listener started with no tokens must reject even an empty-token hello
+        // (the production bind path refuses to start such a listener at all).
+        let fed = start_federation(Vec::new());
+        let mut stream = TcpStream::connect(fed.addr).expect("connect");
+        let hello = FederationHello::new("").to_line().unwrap();
+        writeln!(stream, "{hello}").unwrap();
+        stream.flush().unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read rejection line");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
+        assert_eq!(value["error"]["code"], "unauthorized");
     }
 }

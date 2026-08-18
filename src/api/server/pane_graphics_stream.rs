@@ -3,14 +3,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::Stream as _;
-
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneGraphicsSetParams, PaneGraphicsStreamParams, Request,
     ResponseResult, SuccessResponse,
 };
-use crate::api::ApiRequestSender;
-use crate::ipc::{is_connection_closed_error, LocalStream};
+use crate::api::{ApiRequestSender, ApiStream};
+use crate::ipc::is_connection_closed_error;
 
 use super::{
     api_response_outcome, dispatch_stream_frame, dispatch_stream_open,
@@ -66,7 +64,7 @@ const READ_TIMEOUTS: ReadTimeouts = ReadTimeouts {
 };
 
 pub(super) fn serve(
-    stream: LocalStream,
+    stream: ApiStream,
     request_id: String,
     params: PaneGraphicsStreamParams,
     api_tx: &ApiRequestSender,
@@ -83,7 +81,7 @@ pub(super) fn serve(
 }
 
 fn serve_with_open_timeout(
-    stream: LocalStream,
+    stream: ApiStream,
     request_id: String,
     params: PaneGraphicsStreamParams,
     api_tx: &ApiRequestSender,
@@ -102,7 +100,7 @@ fn serve_with_open_timeout(
 }
 
 fn serve_with_timeouts(
-    mut stream: LocalStream,
+    mut stream: ApiStream,
     request_id: String,
     mut params: PaneGraphicsStreamParams,
     api_tx: &ApiRequestSender,
@@ -166,7 +164,7 @@ fn serve_with_timeouts(
 }
 
 fn serve_frames(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     request_id: &str,
     owner: &str,
     pane_id: &str,
@@ -371,7 +369,7 @@ fn clear_layer(
 }
 
 fn read_line(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
     max_bytes: usize,
@@ -431,7 +429,7 @@ fn read_line(
 }
 
 fn read_exact(
-    stream: &mut LocalStream,
+    stream: &mut ApiStream,
     len: usize,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
@@ -536,8 +534,8 @@ impl PollBackoff {
 }
 
 fn with_timed_reads<T>(
-    stream: &mut LocalStream,
-    read: impl FnOnce(&mut LocalStream, ReadWait) -> std::io::Result<Option<T>>,
+    stream: &mut ApiStream,
+    read: impl FnOnce(&mut ApiStream, ReadWait) -> std::io::Result<Option<T>>,
 ) -> std::io::Result<Option<T>> {
     match stream.set_recv_timeout(Some(CONNECTION_POLL_INTERVAL)) {
         Ok(()) => {
@@ -819,6 +817,7 @@ mod tests {
     fn pane_graphics_stream_closes_claim_after_open_timeout() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair("api-pane-graphics-stream-timeout");
+        let server = ApiStream::Local(server);
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
         let server_thread = std::thread::spawn(move || {
@@ -911,7 +910,8 @@ mod tests {
 
     #[test]
     fn idle_graphics_stream_waits_for_header_without_timing_out() {
-        let (_client, mut server, _path) = local_stream_pair("graphics-idle-header");
+        let (_client, server, _path) = local_stream_pair("graphics-idle-header");
+        let mut server = ApiStream::Local(server);
         let running = Arc::new(AtomicBool::new(true));
         let active = Arc::new(AtomicBool::new(true));
         let stop = Arc::clone(&running);
@@ -956,9 +956,10 @@ mod tests {
 
     #[test]
     fn partial_graphics_header_times_out_after_first_byte() {
-        let (mut client, mut server, _path) = local_stream_pair("graphics-partial-header");
+        let (mut client, server, _path) = local_stream_pair("graphics-partial-header");
         client.write_all(b"{").unwrap();
         client.flush().unwrap();
+        let mut server = ApiStream::Local(server);
         let running = Arc::new(AtomicBool::new(true));
         let active = Arc::new(AtomicBool::new(true));
 
@@ -977,9 +978,10 @@ mod tests {
 
     #[test]
     fn trickled_graphics_body_obeys_absolute_deadline() {
-        let (mut client, mut server, _path) = local_stream_pair("graphics-trickle-body");
+        let (mut client, server, _path) = local_stream_pair("graphics-trickle-body");
         client.write_all(&[1_u8]).unwrap();
         client.flush().unwrap();
+        let mut server = ApiStream::Local(server);
         let running = Arc::new(AtomicBool::new(true));
         let active = Arc::new(AtomicBool::new(true));
         let writer_running = Arc::clone(&running);
@@ -1014,6 +1016,7 @@ mod tests {
     #[test]
     fn timed_out_header_dispatches_owner_scoped_stream_close() {
         let (mut client, server, _path) = local_stream_pair("graphics-timeout-close");
+        let server = ApiStream::Local(server);
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
@@ -1064,7 +1067,8 @@ mod tests {
 
     #[test]
     fn oversized_stream_frame_is_rejected_before_body_or_app_dispatch() {
-        let (mut client, mut server, _path) = local_stream_pair("graphics-oversized-frame");
+        let (mut client, server, _path) = local_stream_pair("graphics-oversized-frame");
+        let mut server = ApiStream::Local(server);
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);

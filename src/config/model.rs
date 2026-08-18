@@ -324,6 +324,7 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub push: PushConfig,
+    pub federation: FederationConfig,
 }
 
 #[derive(Debug)]
@@ -994,6 +995,37 @@ pub struct PushConfig {
     pub topic: Option<String>,
     /// Deliver through the APNs sandbox host instead of production. Default: false.
     pub sandbox: bool,
+}
+
+/// Peer-to-peer federation between Herdr daemons.
+///
+/// The listener, outbound transports (TCP/SSH), and peer connection handling
+/// land in later parts of the federation work; these fields are declared now so
+/// the `[federation]` config section parses and defaults cleanly.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FederationConfig {
+    /// Accept inbound federation connections. Default: false.
+    pub listen: bool,
+    /// Address the federation listener binds to when `listen` is enabled.
+    pub listen_addr: Option<String>,
+    /// Federation peers this daemon may reach out to.
+    pub peers: Vec<FederationPeer>,
+}
+
+/// A single federation peer. Connection details are consumed by later parts of
+/// the federation work (outbound transports and node-identity verification).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FederationPeer {
+    /// Local alias used to refer to this peer.
+    pub alias: String,
+    /// Endpoint to reach the peer (e.g. an `ssh://` or `tcp://` target).
+    pub endpoint: Option<String>,
+    /// Filesystem path to the shared auth token for this peer.
+    pub token_file: Option<String>,
+    /// Expected node identity presented by the peer, verified on connect.
+    pub expected_node_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
