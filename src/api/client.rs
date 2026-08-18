@@ -211,6 +211,59 @@ impl ApiClient {
         serde_json::from_str(&line).map_err(ApiClientError::Json)
     }
 
+    /// Two-phase federation proxy: connect + write the request (phase 1), then
+    /// bounded-read the single response line (phase 2), returning that line's
+    /// content VERBATIM (trimmed of surrounding whitespace) for pass-through to
+    /// the originating client.
+    ///
+    /// Unlike [`Self::request_value_bounded`], the two phases are distinguished in
+    /// the error so the caller can tell a request that never reached the peer
+    /// ([`ProxyError::Connect`] — connect or request-write failed) from one that
+    /// was delivered but whose response could not be read back
+    /// ([`ProxyError::Read`] — EOF, timeout, oversized, empty, or shutdown). That
+    /// distinction is the home's delivered-vs-unknown verdict: a `Connect` failure
+    /// is safe to report as not-delivered and may be retried; a `Read` failure
+    /// means the peer may or may not have acted, so the caller must NOT retry.
+    ///
+    /// The response read is bounded by BOTH `max_bytes` and `total_timeout` and
+    /// abortable via `running`, exactly like [`Self::request_value_bounded`], so a
+    /// malicious or faulty peer can neither OOM nor indefinitely hang the home.
+    pub fn proxy_request_bounded(
+        &self,
+        request: &Request,
+        max_bytes: usize,
+        total_timeout: Duration,
+        running: Option<&Arc<AtomicBool>>,
+    ) -> Result<String, ProxyError> {
+        let deadline = Instant::now() + total_timeout;
+        let mut stream = match &self.target {
+            ConnectionTarget::Ssh(target) => {
+                // The per-request SSH child embeds the request at spawn time, so a
+                // spawn failure is the connect/write phase.
+                let json = serde_json::to_string(request).map_err(|err| {
+                    ProxyError::Connect(io::Error::new(io::ErrorKind::InvalidInput, err))
+                })?;
+                ssh_transport::spawn_request(target, &json).map_err(ProxyError::Connect)?
+            }
+            _ => {
+                let mut stream = self.connect().map_err(ProxyError::Connect)?;
+                write_request_line(&mut stream, request).map_err(ProxyError::Connect)?;
+                stream
+            }
+        };
+
+        let line = read_bounded_response_line(&mut stream, max_bytes, deadline, running)
+            .map_err(ProxyError::Read)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Err(ProxyError::Read(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "federation peer returned an empty response",
+            )));
+        }
+        Ok(trimmed.to_string())
+    }
+
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
         let response = self.request(Request {
             id: "api-client:status".into(),
@@ -349,6 +402,34 @@ impl From<serde_json::Error> for ApiClientError {
         Self::Json(err)
     }
 }
+
+/// Which phase of a [`ApiClient::proxy_request_bounded`] federation proxy failed.
+///
+/// The distinction is the home daemon's delivered-vs-unknown verdict: a
+/// `Connect` failure happened before the request left the home, so the peer never
+/// received it (safe to report not-delivered / retry); a `Read` failure happened
+/// after the request was written, so the peer may or may not have acted on it
+/// (report delivery-unknown / never retry).
+#[derive(Debug)]
+pub enum ProxyError {
+    /// Connecting to the peer or writing the request failed — the request never
+    /// reached the peer.
+    Connect(io::Error),
+    /// The request was written but reading the response line back failed (EOF,
+    /// timeout, oversized, empty, or an in-flight shutdown).
+    Read(io::Error),
+}
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect(err) => write!(f, "{err}"),
+            Self::Read(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
 
 fn write_request_line(stream: &mut ApiStream, request: &Request) -> io::Result<()> {
     let encoded = serde_json::to_string(request)

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,10 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
-use crate::api::client::{endpoint_to_target, parse_response_value, ApiClient, ApiClientError};
+use crate::api::client::{
+    endpoint_to_target, parse_response_value, ApiClient, ApiClientError, ConnectionTarget,
+    ProxyError,
+};
 use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
     FEDERATION_PROTOCOL_VERSION,
@@ -70,6 +74,15 @@ const FEDERATION_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const FEDERATION_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Upper bound on the randomized backoff added after a failed poll.
 const FEDERATION_POLL_MAX_JITTER: Duration = Duration::from_secs(2);
+/// Total wall-clock bound on a single proxied federation request's response read.
+/// Generous enough for a waited `agent.prompt` that blocks on the peer until the
+/// remote agent reaches a status (matching the local agent-start ceiling), yet
+/// finite so a silently-stalled peer cannot leak the connection thread forever.
+/// The proxy runs on the per-connection thread — never the single-threaded app
+/// loop — so blocking here for the duration is safe; the byte cap, this deadline,
+/// and the `running` flag together keep a malicious or faulty peer from OOMing or
+/// hanging the home.
+const FEDERATION_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct ServerHandle {
     _thread: JoinHandle<()>,
@@ -177,11 +190,19 @@ fn start_server_inner(
     info!(path = %path.display(), "api server listening");
 
     let running = Arc::new(AtomicBool::new(true));
+
+    // Alias→peer registry for the outbound proxy router (W4). Built once from the
+    // configured peers that have an `endpoint`; when none do the map is empty, the
+    // router never matches, and local behavior is byte-identical. Shared (as an
+    // `Arc`) with both the local and the federation accept loops.
+    let federation_peers = Arc::new(build_peer_registry(&federation.peers));
+
     let listener_running = Arc::clone(&running);
     let listener_api_tx = api_tx.clone();
     let listener_event_hub = event_hub.clone();
     let listener_capabilities = capabilities.clone();
     let listener_server_stop = server_stop.clone();
+    let listener_federation_peers = Arc::clone(&federation_peers);
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -191,6 +212,7 @@ fn start_server_inner(
                     let capabilities = listener_capabilities.clone();
                     let server_stop = listener_server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    let federation_peers = Arc::clone(&listener_federation_peers);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
                             ApiStream::Local(stream),
@@ -202,6 +224,7 @@ fn start_server_inner(
                             // Local unix-socket connections are never federation
                             // peers, so they bypass the capability-tier gate.
                             None,
+                            &federation_peers,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -219,6 +242,11 @@ fn start_server_inner(
     // A bad federation address or an address already in use must not crash the
     // daemon: `maybe_start_federation_listener` logs and returns `None`, leaving
     // the unix listener above serving on its own.
+    // NB: the federation-inbound listener is deliberately NOT given the outbound
+    // `federation_peers` registry. The home drives its OWN peers from local
+    // clients only; an inbound peer must never be able to relay through the home
+    // to its other peers (a confused-deputy trust expansion). Keeping the
+    // registry out of this chain makes that unreachable by construction.
     let federation_thread = maybe_start_federation_listener(
         federation,
         &api_tx,
@@ -349,6 +377,7 @@ fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<(String, Peer
 ///
 /// The listener is non-blocking and the loop polls `running` between accepts, so
 /// [`ServerHandle::drop`] can stop and join it by clearing `running`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_federation_listener(
     listener: TcpListener,
     peers: Vec<(String, PeerContext)>,
@@ -597,6 +626,37 @@ fn read_peer_token(peer: &FederationPeer) -> Option<String> {
     }
 }
 
+/// Build the alias→[`ConnectionTarget`] registry the outbound proxy router (W4)
+/// uses, from every configured peer that has an `endpoint`. Reuses
+/// [`read_peer_token`] + [`endpoint_to_target`], exactly mirroring the poll
+/// client's resolution, so an alias reachable for polling is reachable for
+/// proxying. A peer with no endpoint, or whose endpoint fails to parse, is skipped
+/// (the latter logged). When no peer has a usable endpoint the map is empty — the
+/// router then never matches and local behavior is byte-identical.
+fn build_peer_registry(peers: &[FederationPeer]) -> HashMap<String, ConnectionTarget> {
+    let mut registry = HashMap::new();
+    for peer in peers {
+        let Some(endpoint) = peer.endpoint.as_deref() else {
+            continue;
+        };
+        let token = read_peer_token(peer);
+        match endpoint_to_target(endpoint, token) {
+            Ok(target) => {
+                registry.insert(peer.alias.clone(), target);
+            }
+            Err(err) => {
+                warn!(
+                    alias = %peer.alias,
+                    endpoint = %endpoint,
+                    err = %err,
+                    "invalid federation endpoint; peer not routable for proxying"
+                );
+            }
+        }
+    }
+    registry
+}
+
 /// Poll one peer's `agent.list` and return its agents. A transport error, a
 /// timeout, an error response, or an unexpected result all surface as `Err` and
 /// count as a miss.
@@ -695,6 +755,7 @@ fn failure_backoff(base: Duration) -> Duration {
 /// peer's [`PeerContext`] and the remaining lines flow through the same
 /// [`handle_connection_with_stop`] path as a local connection — but gated to the
 /// peer's capability tier.
+#[allow(clippy::too_many_arguments)]
 fn handle_federation_connection(
     mut stream: ApiStream,
     peers: &[(String, PeerContext)],
@@ -728,6 +789,17 @@ fn handle_federation_connection(
         return Ok(());
     };
 
+    // A federation-INBOUND connection must never drive the home's OWN outbound
+    // peer routing. The home drives its peers; it does not RELAY an inbound peer
+    // through to its other peers. If the inbound registry were passed here, an
+    // inbound peer sending `<other-alias>/…` would be transit-proxied to that
+    // other peer using the HOME's credentials/tier — a confused deputy that
+    // expands the inbound peer's trust to peers it has no relationship with.
+    // Pass an empty registry so `maybe_route_to_peer` never matches on this
+    // path and a `<alias>/…` target falls through to a local not-found. This
+    // single choke point also keeps the pane.stream proxy inbound-safe, since it
+    // reads the same registry.
+    let no_outbound_routing: HashMap<String, ConnectionTarget> = HashMap::new();
     handle_connection_with_stop(
         stream,
         api_tx,
@@ -736,6 +808,7 @@ fn handle_federation_connection(
         capabilities,
         server_stop,
         Some(peer),
+        &no_outbound_routing,
     )
 }
 
@@ -806,9 +879,11 @@ fn handle_connection(
         capabilities,
         None,
         None,
+        &HashMap::new(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection_with_stop(
     mut stream: ApiStream,
     api_tx: &ApiRequestSender,
@@ -817,6 +892,7 @@ fn handle_connection_with_stop(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     federation: Option<PeerContext>,
+    federation_peers: &HashMap<String, ConnectionTarget>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -831,7 +907,7 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
             write_json_line_allow_disconnect(
@@ -887,6 +963,25 @@ fn handle_connection_with_stop(
     }
 
     crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    // Federation outbound router (W4). BEFORE the local dispatch match — so it
+    // covers both the early-match methods (e.g. `agent.prompt`) and the catch-all
+    // methods uniformly — a request whose target names a configured peer
+    // (`<alias>/…`) is proxied out to that peer and the peer's REAL response is
+    // returned verbatim; the local app is never touched. With no configured peer
+    // endpoints the registry is empty, this never matches, and behavior is
+    // byte-identical to a non-federated daemon.
+    if let Some(result) = maybe_route_to_peer(
+        &mut stream,
+        &mut request,
+        federation_peers,
+        running,
+        &request_id,
+        method,
+        changes_ui,
+    ) {
+        return result;
+    }
 
     match request.method {
         Method::PaneGraphicsStream(params) => {
@@ -1054,6 +1149,139 @@ fn finish_wait_response(
         Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
     }
     result
+}
+
+/// For a method whose target can name a federated remote agent, a mutable
+/// reference to that target string; `None` for every other method. The agent
+/// methods carry it in `target`; the pane read/turns methods carry it in
+/// `pane_id` (W3 alias-prefixes every identity field, `pane_id` included). This
+/// is the exact set the outbound router may proxy — everything else falls through
+/// to local dispatch unchanged.
+fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
+    match method {
+        Method::AgentPrompt(params) => Some(&mut params.target),
+        Method::AgentSendKeys(params) => Some(&mut params.target),
+        Method::AgentGet(params) => Some(&mut params.target),
+        Method::AgentRead(params) => Some(&mut params.target),
+        Method::AgentExplain(params) => Some(&mut params.target),
+        Method::PaneRead(params) => Some(&mut params.pane_id),
+        Method::PaneTurns(params) => Some(&mut params.pane_id),
+        _ => None,
+    }
+}
+
+/// Split a target into `(alias, rest)` when it is federated: it must contain a
+/// `/` and its first segment must be a configured peer alias. Local ids/names
+/// never contain `/` and never equal a configured alias (W3), and a `w1:p1`-style
+/// local id has no `/` either — so neither routes. Returns `None` (fall through to
+/// local dispatch) for every non-federated target.
+fn federated_split<'a>(
+    target: &'a str,
+    peers: &HashMap<String, ConnectionTarget>,
+) -> Option<(&'a str, &'a str)> {
+    let (alias, rest) = target.split_once('/')?;
+    if peers.contains_key(alias) {
+        Some((alias, rest))
+    } else {
+        None
+    }
+}
+
+/// If `request` targets a configured federation peer (`<alias>/…`), proxy it to
+/// that peer and return `Some(result)` — the connection is fully handled, the
+/// peer's real response already written back. Returns `None` when the request is
+/// not federated so the caller dispatches it locally, unchanged.
+///
+/// On a match the `<alias>/` prefix is stripped from the target before the
+/// request is forwarded (the peer knows its agents by their local ids), and the
+/// request's own id is preserved so the peer echoes it and the originating client
+/// correlates the reply. Owns the completed/failed request logging for the
+/// proxied path.
+fn maybe_route_to_peer(
+    stream: &mut ApiStream,
+    request: &mut Request,
+    peers: &HashMap<String, ConnectionTarget>,
+    running: &Arc<AtomicBool>,
+    request_id: &str,
+    method: &'static str,
+    changes_ui: bool,
+) -> Option<std::io::Result<()>> {
+    // Empty registry (the default-off, no-endpoint case) → never route.
+    if peers.is_empty() {
+        return None;
+    }
+    let target = routable_target_mut(&mut request.method)?;
+    // Decide from owned copies so the mutable borrow is free for the rewrite.
+    let (alias, rest) = {
+        let (alias, rest) = federated_split(target, peers)?;
+        (alias.to_string(), rest.to_string())
+    };
+    let peer_target = peers.get(&alias)?.clone();
+    // Federated: strip the `<alias>/` prefix so the peer sees its own local id.
+    *target = rest;
+
+    let client = ApiClient::for_target(peer_target);
+    let response = proxy_federated_response(&client, request, running);
+    let result = write_text_line_allow_disconnect(stream, &response);
+    match &result {
+        Ok(()) => crate::logging::api_request_completed(
+            request_id,
+            method,
+            api_response_outcome(&response),
+            changes_ui,
+        ),
+        Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+    }
+    Some(result)
+}
+
+/// Forward `request` to the peer reached by `client` and return the response LINE
+/// to write back to the originating client.
+///
+/// Verdict truth: on success the peer's real response is passed through verbatim —
+/// the peer's `AgentPrompted { delivery }`, its `Ok {}`, or a `forbidden` it
+/// raised from its OWN capability allowlist all reach the caller unchanged; the
+/// home applies no capability logic of its own. Failure is classified by phase:
+///
+/// - a connect/write failure (the request never left the home) → `peer_unreachable`;
+/// - a response-read failure AFTER the write (EOF, timeout, oversized, empty) →
+///   `delivery_unknown`, because the peer may or may not have acted — and the home
+///   NEVER auto-retries, so a write that did land is not duplicated.
+fn proxy_federated_response(
+    client: &ApiClient,
+    request: &Request,
+    running: &Arc<AtomicBool>,
+) -> String {
+    match client.proxy_request_bounded(
+        request,
+        FEDERATION_MAX_RESPONSE_BYTES,
+        FEDERATION_PROXY_REQUEST_TIMEOUT,
+        Some(running),
+    ) {
+        Ok(line) => line,
+        Err(ProxyError::Connect(err)) => {
+            warn!(id = %request.id, err = %err, "federation proxy could not reach peer");
+            error_response_json(
+                request.id.clone(),
+                "peer_unreachable",
+                format!("could not reach federation peer: {err}"),
+            )
+        }
+        Err(ProxyError::Read(err)) => {
+            warn!(
+                id = %request.id,
+                err = %err,
+                "federation proxy: response read failed after the request was delivered"
+            );
+            error_response_json(
+                request.id.clone(),
+                "delivery_unknown",
+                format!(
+                    "request was delivered to the federation peer but its response could not be read: {err}"
+                ),
+            )
+        }
+    }
 }
 
 fn handle_request(
@@ -2200,6 +2428,7 @@ mod tests {
                 None,
                 // Local path: no federation peer, so no capability filtering.
                 None,
+                &HashMap::new(),
             );
         });
 
@@ -2271,9 +2500,9 @@ mod federation_tests {
     use super::*;
     use crate::api::client::{ApiClient, ConnectionTarget};
     use crate::api::schema::{
-        AgentInfo, AgentPromptParams, AgentRenameParams, AgentStartParams, AgentStatus,
-        EmptyParams, EventData, EventEnvelope, EventKind, EventsSubscribeParams, PaneTarget,
-        PingParams, Subscription,
+        AgentInfo, AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentStartParams,
+        AgentStatus, EmptyParams, EventData, EventEnvelope, EventKind, EventsSubscribeParams,
+        PaneTarget, PingParams, Subscription,
     };
     use crate::config::CapabilityTier;
     use std::io::{BufRead, BufReader, Write};
@@ -2388,6 +2617,72 @@ mod federation_tests {
 
         assert_eq!(response["id"], "fed_ping");
         assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn inbound_peer_target_naming_a_peer_is_not_transit_proxied() {
+        // Confused-deputy guard. A FEDERATION-INBOUND peer must never drive the
+        // home's OWN outbound routing: the home drives its peers only from LOCAL
+        // clients, never by relaying an inbound peer through to its other peers
+        // on the home's own credentials. So an inbound Observe peer sending a
+        // target that names another peer (`remote/screen`) must fall through to
+        // LOCAL dispatch with the target UNREWRITTEN — never split, stripped, and
+        // proxied onward. (The local-client side that DOES route is covered by
+        // `proxy_returns_the_peers_read_snapshot_verbatim`.) The inbound listener
+        // is given no outbound registry at all, so this holds by construction.
+        let mut fed = start_federation(one_peer("peertok", CapabilityTier::Observe));
+
+        // App responder: proves the request reached local dispatch, and captures
+        // the target it arrived with. A transit-proxied request would never have
+        // reached the app at all.
+        let mut api_rx = std::mem::replace(&mut fed.api_rx, mpsc::unbounded_channel().1);
+        let responder = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if let Ok(msg) = api_rx.try_recv() {
+                    let target = match &msg.request.method {
+                        Method::AgentRead(params) => params.target.clone(),
+                        other => panic!("unexpected local method: {other:?}"),
+                    };
+                    let resp = error_response_json(
+                        msg.request.id.clone(),
+                        "not_found",
+                        "no such agent".into(),
+                    );
+                    let _ = msg.respond_to.send(resp);
+                    return Some(target);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        });
+
+        let mut stream = raw_hello(fed.addr, "peertok");
+        send_request(
+            &mut stream,
+            "ir1",
+            Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: "remote/screen".into(),
+                source: crate::api::schema::ReadSource::Visible,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        );
+        let response = read_json_line(&stream);
+        assert_eq!(response["id"], "ir1");
+        assert_eq!(
+            response["error"]["code"], "not_found",
+            "an inbound `<alias>/…` target must resolve locally (not-found), not be proxied"
+        );
+
+        let seen_target = responder
+            .join()
+            .expect("responder thread panicked")
+            .expect("inbound request never reached local dispatch (it was transit-proxied)");
+        assert_eq!(
+            seen_target, "remote/screen",
+            "an inbound peer's target must reach local dispatch UNREWRITTEN, never split and proxied"
+        );
     }
 
     #[test]
@@ -3364,5 +3659,489 @@ mod federation_tests {
         peer_running.store(false, Ordering::Relaxed);
         let _ = peer_thread.join();
         let _ = std::fs::remove_file(&token_path);
+    }
+
+    // ---- Outbound proxy router (W4) ----
+
+    #[test]
+    fn federated_split_routes_only_configured_alias_prefixes() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "w1".to_string(),
+            ConnectionTarget::Tcp {
+                addr: "127.0.0.1:9000".parse().unwrap(),
+                token: None,
+            },
+        );
+
+        // `<alias>/x` routes; the rest keeps everything after the FIRST slash.
+        assert_eq!(
+            federated_split("w1/builder", &peers),
+            Some(("w1", "builder"))
+        );
+        assert_eq!(federated_split("w1/ws/tab", &peers), Some(("w1", "ws/tab")));
+
+        // A `/`-containing name whose first segment is NOT a configured alias.
+        assert_eq!(federated_split("other/x", &peers), None);
+        // A `w1:p1`-style local id (no slash) never routes, even though `w1` is an
+        // alias — the colon is not the federation separator.
+        assert_eq!(federated_split("w1:p1", &peers), None);
+        // A bare local name and the exact alias without a slash never route.
+        assert_eq!(federated_split("builder", &peers), None);
+        assert_eq!(federated_split("w1", &peers), None);
+
+        // With no configured peers nothing routes.
+        assert_eq!(federated_split("w1/builder", &HashMap::new()), None);
+    }
+
+    #[test]
+    fn routable_target_mut_selects_the_proxyable_target_field() {
+        // Agent methods carry the target in `target`; a rewrite is reflected.
+        let mut prompt = Method::AgentPrompt(AgentPromptParams {
+            target: "remote/a".into(),
+            text: "hi".into(),
+            wait: None,
+        });
+        assert_eq!(
+            routable_target_mut(&mut prompt).map(|t| t.as_str()),
+            Some("remote/a")
+        );
+        if let Some(target) = routable_target_mut(&mut prompt) {
+            *target = "a".into();
+        }
+        assert!(matches!(&prompt, Method::AgentPrompt(p) if p.target == "a"));
+
+        // Pane read/turns carry it in `pane_id` (W3 alias-prefixes that field too).
+        let mut turns: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.turns",
+            "params": { "pane_id": "remote/p" },
+        }))
+        .unwrap();
+        assert_eq!(
+            routable_target_mut(&mut turns).map(|t| t.as_str()),
+            Some("remote/p")
+        );
+
+        // A method with no proxyable target is never routed.
+        let mut list = Method::AgentList(EmptyParams {});
+        assert!(routable_target_mut(&mut list).is_none());
+    }
+
+    #[test]
+    fn proxy_response_classifies_transport_failures_by_phase() {
+        let running = Arc::new(AtomicBool::new(true));
+        let request = Request {
+            id: "u1".into(),
+            method: Method::Ping(PingParams::default()),
+        };
+
+        // Connect/write failure (the request never left the home) → the request
+        // was NOT delivered → `peer_unreachable`.
+        let dead_addr = {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe addr")
+            // `probe` drops here, freeing the port so connects are refused.
+        };
+        let unreachable = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: dead_addr,
+            token: Some("t".into()),
+        });
+        let line = proxy_federated_response(&unreachable, &request, &running);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["id"], "u1");
+        assert_eq!(value["error"]["code"], "peer_unreachable");
+
+        // Read failure AFTER a successful write (peer drops without answering) →
+        // the peer may or may not have acted → `delivery_unknown`.
+        let peer = start_proxy_peer(|_req, sock| {
+            // Read the request (done by the harness) then drop without a response.
+            drop(sock);
+        });
+        let dropper = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some("t".into()),
+        });
+        let line = proxy_federated_response(&dropper, &request, &running);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["id"], "u1");
+        assert_eq!(value["error"]["code"], "delivery_unknown");
+    }
+
+    /// A raw loopback "peer daemon" for the outbound-proxy tests. It accepts
+    /// connections in a loop (so a spurious home reconnect/retry would be
+    /// observed), and for each: reads and discards the `federation.hello` line,
+    /// reads one request line, records it in `seen`, then hands `(request_line,
+    /// socket)` to `serve` to produce the peer's behavior — write a response line
+    /// or drop the socket. Runs until `running` clears.
+    struct ProxyPeer {
+        addr: SocketAddr,
+        seen: Arc<Mutex<Vec<String>>>,
+        running: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for ProxyPeer {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_proxy_peer(serve: impl Fn(&str, TcpStream) + Send + 'static) -> ProxyPeer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy peer");
+        listener
+            .set_nonblocking(true)
+            .expect("proxy peer nonblocking");
+        let addr = listener.local_addr().expect("proxy peer addr");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let seen_thread = Arc::clone(&seen);
+        let running_thread = Arc::clone(&running);
+        let thread = std::thread::spawn(move || {
+            while running_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((sock, _)) => {
+                        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut reader =
+                            BufReader::new(sock.try_clone().expect("clone proxy peer sock"));
+                        let mut hello = String::new();
+                        if reader.read_line(&mut hello).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let mut request = String::new();
+                        if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        seen_thread
+                            .lock()
+                            .expect("seen lock")
+                            .push(request.trim().to_string());
+                        serve(request.trim(), sock);
+                    }
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        ProxyPeer {
+            addr,
+            seen,
+            running,
+            thread: Some(thread),
+        }
+    }
+
+    /// A home daemon connection handler running over a loopback TCP pair standing
+    /// in for a LOCAL client, with `registry` as its outbound proxy registry. The
+    /// test writes requests to `client` and reads responses; `api_rx` lets a test
+    /// prove whether a request reached the LOCAL app dispatch path.
+    struct HomeConn {
+        client: TcpStream,
+        api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
+        running: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for HomeConn {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn drive_home(registry: HashMap<String, ConnectionTarget>) -> HomeConn {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind home listener");
+        let addr = listener.local_addr().expect("home addr");
+        let client = TcpStream::connect(addr).expect("connect home");
+        let (server, _) = listener.accept().expect("accept home");
+        let (api_tx, api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let handler_running = Arc::clone(&running);
+        let registry = Arc::new(registry);
+        let thread = std::thread::spawn(move || {
+            // A local client carries `federation: None` (never capability-gated).
+            let _ = handle_connection_with_stop(
+                ApiStream::Tcp(server),
+                &api_tx,
+                &event_hub,
+                &handler_running,
+                None,
+                None,
+                None,
+                &registry,
+            );
+        });
+        HomeConn {
+            client,
+            api_rx,
+            running,
+            thread: Some(thread),
+        }
+    }
+
+    fn home_roundtrip(conn: &mut HomeConn, request: serde_json::Value) -> String {
+        let encoded = serde_json::to_string(&request).expect("encode home request");
+        writeln!(conn.client, "{encoded}").expect("write home request");
+        conn.client.flush().expect("flush home request");
+        let mut response = String::new();
+        BufReader::new(conn.client.try_clone().expect("clone home client"))
+            .read_line(&mut response)
+            .expect("read home response");
+        response.trim().to_string()
+    }
+
+    #[test]
+    fn proxy_returns_the_peers_agent_prompted_verbatim() {
+        // The peer answers agent.prompt for its LOCAL agent id (prefix stripped)
+        // with a real AgentPrompted{delivery}. The exact line it sends is captured
+        // so the home's reply can be asserted byte-for-byte identical.
+        let expected = serde_json::to_string(&SuccessResponse {
+            id: "p1".into(),
+            result: ResponseResult::AgentPrompted {
+                agent: seeded_agent(AgentStatus::Working, "builder"),
+                delivery: Some(AgentPromptDelivery::Submitted),
+            },
+        })
+        .unwrap();
+        let peer_line = expected.clone();
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            // The home stripped the `<alias>/` prefix before forwarding, and left
+            // the id untouched so the peer can echo it.
+            assert_eq!(parsed["method"], "agent.prompt");
+            assert_eq!(parsed["params"]["target"], "builder");
+            assert_eq!(parsed["id"], "p1");
+            writeln!(sock, "{peer_line}").expect("peer writes response");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "p1",
+                "method": "agent.prompt",
+                "params": { "target": "remote/builder", "text": "ship it" },
+            }),
+        );
+
+        assert_eq!(
+            response, expected,
+            "the peer's response must pass through verbatim"
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["type"], "agent_prompted");
+        assert_eq!(value["result"]["delivery"], "submitted");
+
+        // A proxied request never touches the local app, and reaches the peer once.
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "a proxied prompt reached the local app dispatch path"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn proxy_returns_the_peers_read_snapshot_verbatim() {
+        // agent.read (an Observe-tier read) to `<alias>/…` returns the peer's
+        // snapshot unchanged. The response body shape is opaque to the home — it
+        // passes the line through — so a marker field is enough to prove it.
+        let expected = serde_json::json!({
+            "id": "r1",
+            "result": { "type": "pane_read", "read": { "marker": "peer-snapshot" } },
+        })
+        .to_string();
+        let peer_line = expected.clone();
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            assert_eq!(parsed["method"], "agent.read");
+            assert_eq!(parsed["params"]["target"], "screen");
+            writeln!(sock, "{peer_line}").expect("peer writes snapshot");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "r1",
+                "method": "agent.read",
+                "params": { "target": "remote/screen", "source": "visible" },
+            }),
+        );
+
+        assert_eq!(
+            response, expected,
+            "the peer snapshot must pass through verbatim"
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["read"]["marker"], "peer-snapshot");
+        assert!(home.api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn proxy_passes_through_a_peers_forbidden_verdict() {
+        // A REAL Observe-tier federation listener stands in for the peer. agent.
+        // prompt needs Interact, so the peer's OWN capability gate returns
+        // `forbidden` before any dispatch — and the home passes it straight
+        // through, applying no capability logic of its own.
+        let mut fed = start_federation(one_peer("obs-tok", CapabilityTier::Observe));
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: fed.addr,
+                token: Some("obs-tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "f1",
+                "method": "agent.prompt",
+                "params": { "target": "remote/agent", "text": "hi" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "f1");
+        assert_eq!(value["error"]["code"], "forbidden");
+
+        // The peer's gate rejected before dispatch: nothing reached its app, and
+        // nothing reached the home's app either.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "a forbidden proxied call reached the peer's app"
+        );
+        assert!(home.api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn proxy_reports_delivery_unknown_and_never_retries_when_the_peer_drops() {
+        // The peer reads the request then drops the connection WITHOUT a response.
+        let peer = start_proxy_peer(|_request, sock| {
+            drop(sock);
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "d1",
+                "method": "agent.prompt",
+                "params": { "target": "remote/builder", "text": "hi" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "d1");
+        assert_eq!(value["error"]["code"], "delivery_unknown");
+
+        // The peer saw exactly one request: a post-write read failure is NEVER
+        // auto-retried (a write that did land must not be duplicated).
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            peer.seen.lock().expect("seen lock").len(),
+            1,
+            "the proxy retried after a post-write read failure"
+        );
+        assert!(home.api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_prompt_without_alias_prefix_is_not_routed() {
+        // A peer that fails the test if it is ever contacted.
+        let peer = start_proxy_peer(|_request, _sock| {
+            panic!("a local prompt must never reach the peer");
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        // App responder: answer the LOCAL agent.prompt, proving it hit local
+        // dispatch with an UNREWRITTEN target.
+        let mut api_rx = std::mem::replace(&mut home.api_rx, mpsc::unbounded_channel().1);
+        let responder = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if let Ok(msg) = api_rx.try_recv() {
+                    let target = match &msg.request.method {
+                        Method::AgentPrompt(params) => params.target.clone(),
+                        other => panic!("unexpected local method: {other:?}"),
+                    };
+                    assert_eq!(
+                        target, "local-builder",
+                        "a local target must not be rewritten"
+                    );
+                    let resp = serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id.clone(),
+                        result: ResponseResult::AgentPrompted {
+                            agent: seeded_agent(AgentStatus::Working, "local-builder"),
+                            delivery: Some(AgentPromptDelivery::Submitted),
+                        },
+                    })
+                    .unwrap();
+                    let _ = msg.respond_to.send(resp);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        });
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "loc1",
+                "method": "agent.prompt",
+                "params": { "target": "local-builder", "text": "hi" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "loc1");
+        assert_eq!(value["result"]["type"], "agent_prompted");
+
+        assert!(
+            responder.join().unwrap(),
+            "the local prompt never reached the app dispatch path"
+        );
+        assert!(
+            peer.seen.lock().expect("seen lock").is_empty(),
+            "a local prompt was proxied to the peer"
+        );
     }
 }
