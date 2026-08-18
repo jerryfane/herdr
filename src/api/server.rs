@@ -15,7 +15,7 @@ use std::fs;
 
 use crate::api::client::{
     endpoint_to_target, parse_response_value, ApiClient, ApiClientError, ConnectionTarget,
-    ProxyError,
+    ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
 use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
@@ -25,7 +25,8 @@ use crate::api::federation_store::{
     FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
 };
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
+    ErrorBody, ErrorResponse, Method, PaneStreamParams, Request, ResponseResult,
+    ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
@@ -83,6 +84,12 @@ const FEDERATION_POLL_MAX_JITTER: Duration = Duration::from_secs(2);
 /// and the `running` flag together keep a malicious or faulty peer from OOMing or
 /// hanging the home.
 const FEDERATION_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per-frame byte cap for a proxied federated `pane.stream`. The pane output ring
+/// frames at ~64 KiB, so the 1 MiB [`FEDERATION_MAX_RESPONSE_BYTES`] scale is
+/// generous; a peer sending a single frame larger than this degrades that stream
+/// (it is closed) rather than driving unbounded allocation — an OOM — on the home.
+/// The idle-timeout companion is [`FEDERATION_STREAM_IDLE_TIMEOUT`].
+const FEDERATION_MAX_STREAM_FRAME_BYTES: usize = FEDERATION_MAX_RESPONSE_BYTES;
 
 pub struct ServerHandle {
     _thread: JoinHandle<()>,
@@ -1000,9 +1007,33 @@ fn handle_connection_with_stop(
             }
             result
         }
-        Method::PaneStream(params) => {
-            let result =
-                pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running);
+        Method::PaneStream(mut params) => {
+            // W5: a `pane.stream` whose target is `<alias>/<remote-pane-id>` names a
+            // configured federation peer's agent, so proxy it to that peer and pipe
+            // its live-terminal frames back on THIS connection thread — never the
+            // single-threaded app loop, and never through the local OutputRing. The
+            // outbound W4 router (`maybe_route_to_peer`) skips `pane.stream` on
+            // purpose, so this is the only place a federated stream is handled. With
+            // no configured peers (or the empty registry the federation-inbound path
+            // passes) `federated_stream_target` never matches and the local
+            // `pane_output_stream::serve` runs byte-identically to today.
+            let result = if let Some((alias, rest, peer_target)) =
+                federated_stream_target(&params.pane_id, federation_peers)
+            {
+                // Strip the `<alias>/` prefix so the peer sees its own local pane id;
+                // every other client parameter is forwarded unchanged.
+                params.pane_id = rest;
+                proxy_federated_pane_stream(
+                    stream,
+                    request_id.clone(),
+                    &alias,
+                    params,
+                    peer_target,
+                    running,
+                )
+            } else {
+                pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running)
+            };
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -1281,6 +1312,199 @@ fn proxy_federated_response(
                 ),
             )
         }
+    }
+}
+
+/// Resolve a `pane.stream` target into `(alias, peer-pane-id, peer connection)`
+/// when it names a configured federation peer (`<alias>/<pane-id>`), owning the
+/// alias/pane-id so the borrow of `params.pane_id` is released before it is
+/// rewritten. Returns `None` — fall through to the LOCAL `pane_output_stream`
+/// path — for every non-federated target (no `/`, or an unknown/empty alias). The
+/// `peers.get` cannot miss after a [`federated_split`] match, so this never panics.
+fn federated_stream_target(
+    pane_id: &str,
+    peers: &HashMap<String, ConnectionTarget>,
+) -> Option<(String, String, ConnectionTarget)> {
+    let (alias, rest) = federated_split(pane_id, peers)?;
+    let target = peers.get(alias)?.clone();
+    Some((alias.to_string(), rest.to_string(), target))
+}
+
+/// Proxy a federated `pane.stream` to the owning peer and pipe its NDJSON frames
+/// back to the requesting client, on the per-connection thread.
+///
+/// `params.pane_id` is already the peer's LOCAL pane id (the `<alias>/` prefix was
+/// stripped by the caller); `alias` is re-applied only to the `stream_started`
+/// ack's `pane_id` so the client keeps seeing the federated identity. The client's
+/// request id is preserved on the forwarded request so the peer echoes it.
+///
+/// Phases: (1) connect + write — a failure here means the request never reached
+/// the peer, so a `peer_unreachable` line is returned; (2) read the first line —
+/// re-prefix and forward a `stream_started` ack, or forward a peer error
+/// (`forbidden` from its allowlist, `pane_not_found`) VERBATIM and end, the peer's
+/// allowlist staying authoritative with no home-side capability logic; (3) pipe
+/// every subsequent frame verbatim until the peer/pane ends, the client drops, or
+/// `running` clears. On EVERY exit path the peer stream is dropped, so no orphan
+/// stream is left running on the peer.
+fn proxy_federated_pane_stream(
+    mut client_stream: ApiStream,
+    request_id: String,
+    alias: &str,
+    params: PaneStreamParams,
+    peer_target: ConnectionTarget,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let client = ApiClient::for_target(peer_target);
+    let request = Request {
+        id: request_id.clone(),
+        method: Method::PaneStream(params),
+    };
+
+    // Phase 1: connect + write. A connect/write failure never reached the peer.
+    let mut peer_stream = match client.open_frame_stream(&request) {
+        Ok(peer_stream) => peer_stream,
+        Err(err) => {
+            warn!(
+                id = %request_id,
+                alias,
+                err = %err,
+                "federated pane.stream could not reach peer"
+            );
+            let response = error_response_json(
+                request_id,
+                "peer_unreachable",
+                format!("could not reach federation peer: {err}"),
+            );
+            return write_text_line_allow_disconnect(&mut client_stream, &response);
+        }
+    };
+
+    // Phase 2: the first line is the peer's `stream_started` ack or an error line.
+    let first = match peer_stream.next_frame(
+        FEDERATION_MAX_STREAM_FRAME_BYTES,
+        FEDERATION_STREAM_IDLE_TIMEOUT,
+        running,
+    ) {
+        Ok(Some(first)) => first,
+        Ok(None) => {
+            // Peer closed before answering: it may or may not have opened a stream,
+            // so this is delivery-unknown, not a clean not-found.
+            let response = error_response_json(
+                request_id,
+                "delivery_unknown",
+                "federation peer closed the pane stream before it started".into(),
+            );
+            return write_text_line_allow_disconnect(&mut client_stream, &response);
+        }
+        Err(err) => {
+            warn!(
+                id = %request_id,
+                alias,
+                err = %err,
+                "federated pane.stream: reading the peer stream_started failed"
+            );
+            let response = error_response_json(
+                request_id,
+                "delivery_unknown",
+                format!("federation peer pane stream could not be read: {err}"),
+            );
+            return write_text_line_allow_disconnect(&mut client_stream, &response);
+        }
+    };
+
+    // Re-prefix a `stream_started` ack's pane_id back to `<alias>/…`; forward a peer
+    // error verbatim. `keep_streaming` is false for anything but a real ack, so a
+    // peer error ends the proxy after this single line.
+    let (first_line, keep_streaming) = prepare_first_stream_line(&first, alias);
+    if !emit_line_to_client(&mut client_stream, &first_line)? || !keep_streaming {
+        // Client dropped, or the peer's first line was an error/terminal: done.
+        // `peer_stream` drops here, tearing the peer connection down.
+        return Ok(());
+    }
+
+    // Phase 3: pipe every subsequent frame verbatim. Read-one / write-one: a slow
+    // client blocks the write, which blocks the read, so the peer's OutputRing (and
+    // its snapshot-collapse) absorbs backpressure — the home buffers nothing.
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        match peer_stream.next_frame(
+            FEDERATION_MAX_STREAM_FRAME_BYTES,
+            FEDERATION_STREAM_IDLE_TIMEOUT,
+            running,
+        ) {
+            Ok(Some(frame)) => {
+                if !emit_line_to_client(&mut client_stream, &frame)? {
+                    break; // client dropped
+                }
+            }
+            Ok(None) => break, // peer/pane ended (sent `exited` then closed)
+            Err(err) => {
+                // Idle timeout, over-cap frame, transport error, or shutdown: close
+                // the proxied stream. Shutdown (`Interrupted`) is expected and quiet.
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    warn!(
+                        id = %request_id,
+                        alias,
+                        err = %err,
+                        "federated pane.stream read ended"
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // Every exit path reaches here: dropping the peer stream closes the peer
+    // connection so no orphan stream is left running on the peer.
+    drop(peer_stream);
+    Ok(())
+}
+
+/// Prepare the first line of a proxied `pane.stream` for the client, returning
+/// `(line, keep_streaming)`.
+///
+/// A `stream_started` success has its `pane_id` re-prefixed to `<alias>/…` (the
+/// federated identity the client expects) and is re-serialized; `keep_streaming`
+/// is true so the frame-piping loop runs. Anything else — an error line the peer
+/// raised (`forbidden`, `pane_not_found`), or an unexpected/unparseable line — is
+/// forwarded VERBATIM with `keep_streaming` false, ending the proxy after it. The
+/// home applies NO capability logic of its own; the peer's allowlist is
+/// authoritative.
+fn prepare_first_stream_line(first: &str, alias: &str) -> (String, bool) {
+    match serde_json::from_str::<SuccessResponse>(first) {
+        Ok(mut success) => {
+            if let ResponseResult::StreamStarted { pane_id, .. } = &mut success.result {
+                let reprefixed = format!("{alias}/{pane_id}");
+                *pane_id = reprefixed;
+                match serde_json::to_string(&success) {
+                    Ok(line) => (line, true),
+                    // Re-encoding a value we just decoded should not fail; if it
+                    // somehow does, forward the peer's original line unchanged.
+                    Err(_) => (first.to_string(), true),
+                }
+            } else {
+                // A non-`stream_started` success is not expected as a first line;
+                // forward it verbatim and stop.
+                (first.to_string(), false)
+            }
+        }
+        // An error line (e.g. `forbidden`, `pane_not_found`) or non-JSON: verbatim.
+        Err(_) => (first.to_string(), false),
+    }
+}
+
+/// Write one raw NDJSON line to the requesting client, returning `false` when the
+/// client has closed so the proxy loop can stop cleanly. Mirrors the `emit`
+/// pattern in [`pane_output_stream`]: a genuine (non-disconnect) write error still
+/// propagates. A wedged socket write is bounded by the connection-wide send
+/// timeout and tears down only this connection.
+fn emit_line_to_client(stream: &mut ApiStream, line: &str) -> std::io::Result<bool> {
+    match write_text_line(stream, line) {
+        Ok(()) => Ok(true),
+        Err(err) if is_connection_closed_error(&err) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -4142,6 +4366,292 @@ mod federation_tests {
         assert!(
             peer.seen.lock().expect("seen lock").is_empty(),
             "a local prompt was proxied to the peer"
+        );
+    }
+
+    // ---- W5: federated pane.stream proxy ------------------------------------
+
+    /// Send a request to the home connection and return a buffered line reader over
+    /// its client socket, for reading a MULTI-line streamed response.
+    fn home_stream_reader(conn: &mut HomeConn, request: serde_json::Value) -> BufReader<TcpStream> {
+        let encoded = serde_json::to_string(&request).expect("encode home request");
+        writeln!(conn.client, "{encoded}").expect("write home request");
+        conn.client.flush().expect("flush home request");
+        BufReader::new(conn.client.try_clone().expect("clone home client"))
+    }
+
+    /// Read one NDJSON line (trailing newline stripped), or `None` at EOF — the home
+    /// closes the client connection when the proxied stream ends.
+    fn next_stream_line(reader: &mut BufReader<TcpStream>) -> Option<String> {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => Some(line.trim_end().to_string()),
+            Err(err) => panic!("stream read error: {err}"),
+        }
+    }
+
+    #[test]
+    fn proxy_streams_the_peers_frames_reprefixing_stream_started() {
+        // The peer serves a stream for its LOCAL pane id (prefix stripped): a
+        // stream_started ack, two data frames, and an exited frame, then closes.
+        let started = serde_json::to_string(&SuccessResponse {
+            id: "s1".into(),
+            result: ResponseResult::StreamStarted {
+                pane_id: "screen".into(),
+                epoch: 7,
+                cols: 80,
+                rows: 24,
+                base_seq: 100,
+                resync: true,
+            },
+        })
+        .unwrap();
+        // Opaque-to-the-home control/data frames, asserted byte-verbatim below.
+        let data1 =
+            r#"{"stream":"pane.bytes","frame":"data","seq":100,"epoch":7,"data_b64":"aGk="}"#;
+        let data2 =
+            r#"{"stream":"pane.bytes","frame":"data","seq":102,"epoch":7,"data_b64":"Ynll"}"#;
+        let exited = r#"{"stream":"pane.bytes","frame":"exited","seq":104,"epoch":7}"#;
+
+        let started_peer = started.clone();
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            // The home stripped the `<alias>/` prefix and preserved the id.
+            assert_eq!(parsed["method"], "pane.stream");
+            assert_eq!(parsed["params"]["pane_id"], "screen");
+            assert_eq!(parsed["id"], "s1");
+            writeln!(sock, "{started_peer}").expect("peer writes stream_started");
+            writeln!(sock, "{data1}").expect("peer writes data1");
+            writeln!(sock, "{data2}").expect("peer writes data2");
+            writeln!(sock, "{exited}").expect("peer writes exited");
+            let _ = sock.flush();
+            // Return → sock drops → the stream closes.
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({
+                "id": "s1",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/screen" },
+            }),
+        );
+
+        // Line 1: stream_started, pane_id RE-PREFIXED to `<alias>/…`, id preserved,
+        // geometry carried through.
+        let l1 = next_stream_line(&mut reader).expect("stream_started line");
+        let v1: serde_json::Value = serde_json::from_str(&l1).unwrap();
+        assert_eq!(v1["id"], "s1");
+        assert_eq!(v1["result"]["type"], "stream_started");
+        assert_eq!(v1["result"]["pane_id"], "remote/screen");
+        assert_eq!(v1["result"]["epoch"], 7);
+        assert_eq!(v1["result"]["cols"], 80);
+        assert_eq!(v1["result"]["rows"], 24);
+
+        // Lines 2..4: the data/exited frames pass through BYTE-VERBATIM, in order.
+        assert_eq!(next_stream_line(&mut reader).as_deref(), Some(data1));
+        assert_eq!(next_stream_line(&mut reader).as_deref(), Some(data2));
+        assert_eq!(next_stream_line(&mut reader).as_deref(), Some(exited));
+
+        // Peer closed → the home ends the stream (client sees EOF).
+        assert!(
+            next_stream_line(&mut reader).is_none(),
+            "the stream did not end when the peer closed"
+        );
+
+        // A proxied stream never touches the local app, and reaches the peer once.
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "a proxied pane.stream reached the local app dispatch path"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn proxy_passes_through_a_denied_pane_stream_verbatim() {
+        // An observe-denied peer answers pane.stream with a `forbidden` first line;
+        // the home forwards it verbatim (its allowlist is authoritative) and ends.
+        let forbidden =
+            r#"{"id":"s2","error":{"code":"forbidden","message":"pane.stream not permitted"}}"#;
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            assert_eq!(parsed["method"], "pane.stream");
+            assert_eq!(parsed["params"]["pane_id"], "screen");
+            writeln!(sock, "{forbidden}").expect("peer writes forbidden");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({
+                "id": "s2",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/screen" },
+            }),
+        );
+
+        let l1 = next_stream_line(&mut reader).expect("forbidden line");
+        assert_eq!(l1, forbidden, "a peer error must pass through verbatim");
+        let v1: serde_json::Value = serde_json::from_str(&l1).unwrap();
+        assert_eq!(v1["error"]["code"], "forbidden");
+
+        // No stream frames follow a forbidden verdict; the stream ends.
+        assert!(
+            next_stream_line(&mut reader).is_none(),
+            "the stream did not end after the forbidden line"
+        );
+        assert!(home.api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn proxy_closes_an_over_cap_streamed_frame() {
+        // After a valid stream_started, the peer floods a single frame far larger
+        // than the per-frame cap with NO newline. The proxy must close the stream
+        // (bounded — no unbounded allocation); the giant frame is never delivered.
+        let started = serde_json::to_string(&SuccessResponse {
+            id: "s3".into(),
+            result: ResponseResult::StreamStarted {
+                pane_id: "screen".into(),
+                epoch: 1,
+                cols: 80,
+                rows: 24,
+                base_seq: 0,
+                resync: true,
+            },
+        })
+        .unwrap();
+        let started_peer = started.clone();
+        let peer = start_proxy_peer(move |_request, mut sock| {
+            writeln!(sock, "{started_peer}").expect("peer writes stream_started");
+            let _ = sock.flush();
+            // One oversized, newline-free blob. Ignore write errors: the home closes
+            // the moment the in-progress frame crosses the cap.
+            let blob = vec![b'x'; FEDERATION_MAX_STREAM_FRAME_BYTES + 8192];
+            let _ = sock.write_all(&blob);
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({
+                "id": "s3",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/screen" },
+            }),
+        );
+
+        // The stream_started ack arrives (re-prefixed) ...
+        let l1 = next_stream_line(&mut reader).expect("stream_started line");
+        let v1: serde_json::Value = serde_json::from_str(&l1).unwrap();
+        assert_eq!(v1["result"]["type"], "stream_started");
+        assert_eq!(v1["result"]["pane_id"], "remote/screen");
+
+        // ... then the over-cap frame closes the stream with nothing more delivered.
+        assert!(
+            next_stream_line(&mut reader).is_none(),
+            "the over-cap frame was forwarded instead of closing the stream"
+        );
+    }
+
+    #[test]
+    fn local_pane_stream_without_alias_prefix_is_served_locally() {
+        // A peer that fails the test if it is ever contacted.
+        let peer = start_proxy_peer(|_request, _sock| {
+            panic!("a local pane.stream must never reach the peer");
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        // App responder: proves the request reached LOCAL dispatch via
+        // `pane_output_stream::serve`, whose first act is a PaneStreamOpen carrying
+        // the UNREWRITTEN pane id. Answer the open with an error (so serve returns
+        // fast) and the follow-up close with ok, and report the pane id it saw.
+        let mut api_rx = std::mem::replace(&mut home.api_rx, mpsc::unbounded_channel().1);
+        let responder = std::thread::spawn(move || {
+            let mut seen_open: Option<String> = None;
+            for _ in 0..300 {
+                if let Ok(msg) = api_rx.try_recv() {
+                    match &msg.request.method {
+                        Method::PaneStreamOpen(params) => {
+                            seen_open = Some(params.pane_id.clone());
+                            let resp = error_response_json(
+                                msg.request.id.clone(),
+                                "pane_not_found",
+                                "no such pane".into(),
+                            );
+                            let _ = msg.respond_to.send(resp);
+                        }
+                        Method::PaneStreamClose(_) => {
+                            let resp = serde_json::to_string(&SuccessResponse {
+                                id: msg.request.id.clone(),
+                                result: ResponseResult::Ok {},
+                            })
+                            .unwrap();
+                            let _ = msg.respond_to.send(resp);
+                            return seen_open;
+                        }
+                        other => panic!("unexpected local method: {other:?}"),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            seen_open
+        });
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "loc-stream",
+                "method": "pane.stream",
+                "params": { "pane_id": "local-pane" },
+            }),
+        );
+        // serve wrote the pane_not_found error (the open failed) to the client.
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "loc-stream");
+        assert_eq!(value["error"]["code"], "pane_not_found");
+
+        let seen = responder.join().unwrap();
+        assert_eq!(
+            seen.as_deref(),
+            Some("local-pane"),
+            "the local pane.stream did not reach pane_output_stream::serve with an unrewritten id"
+        );
+        assert!(
+            peer.seen.lock().expect("seen lock").is_empty(),
+            "a local pane.stream was proxied to the peer"
         );
     }
 }

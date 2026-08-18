@@ -121,17 +121,39 @@ impl ApiClient {
     /// read replies off the stream; SSH spawns a per-request `api-bridge` child
     /// with the request embedded and reads replies off its stdout.
     pub fn request_stream(&self, request: &Request) -> io::Result<ResponseLines> {
+        Ok(ResponseLines::over(self.connect_and_write(request)?))
+    }
+
+    /// Send `request` and return a [`FederatedStream`] — a bounded, per-frame-capped
+    /// NDJSON frame reader over the underlying transport.
+    ///
+    /// This is the long-lived-stream sibling of [`Self::request_stream`]: it does
+    /// the same connect + request-write, but hands back a reader that (unlike
+    /// [`ResponseLines`], whose `read_line` is uncapped/untimed) enforces a
+    /// per-frame byte cap, a per-read idle timeout, and prompt `running`-driven
+    /// abort. The federated `pane.stream` proxy reads a peer's live terminal
+    /// firehose through this, so a malicious or faulty peer can neither OOM nor
+    /// indefinitely hang the home connection thread. It deliberately does NOT wrap
+    /// the stream in a [`BufReader`], so no bytes are hidden behind an internal
+    /// buffer between the first-line read and the frame-piping loop.
+    pub fn open_frame_stream(&self, request: &Request) -> io::Result<FederatedStream> {
+        Ok(FederatedStream::over(self.connect_and_write(request)?))
+    }
+
+    /// Shared connect-and-write for the streaming request paths: Local/TCP connect
+    /// then write the request line; SSH spawns a per-request `api-bridge` child
+    /// with the request embedded (nothing is written to its stdin).
+    fn connect_and_write(&self, request: &Request) -> io::Result<ApiStream> {
         match &self.target {
             ConnectionTarget::Ssh(target) => {
                 let json = serde_json::to_string(request)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-                let stream = ssh_transport::spawn_request(target, &json)?;
-                Ok(ResponseLines::over(stream))
+                ssh_transport::spawn_request(target, &json)
             }
             _ => {
                 let mut stream = self.connect()?;
                 write_request_line(&mut stream, request)?;
-                Ok(ResponseLines::over(stream))
+                Ok(stream)
             }
         }
     }
@@ -342,6 +364,139 @@ impl Iterator for ResponseLines {
                 Err(err) => return Some(Err(err)),
             }
         }
+    }
+}
+
+/// Default per-read idle timeout for a proxied federated `pane.stream`: if the
+/// peer produces no complete frame within this window the stream is treated as
+/// dead and closed. Deliberately GREATER than the peer's 20s `pane.stream`
+/// `PING_INTERVAL` so a healthy-but-quiet stream (heartbeat `ping` frames only)
+/// is never killed, while a hung or dead peer is detected and its connection
+/// (and the peer-side stream) torn down.
+pub const FEDERATION_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// A bounded, per-frame-capped streaming NDJSON reader over an [`ApiStream`].
+///
+/// Built by [`ApiClient::open_frame_stream`] for the federated `pane.stream`
+/// proxy. It owns the underlying transport (including any SSH child process), so
+/// dropping it tears the peer connection down — the invariant that keeps a
+/// proxied stream from leaking on the peer once the home stops reading.
+///
+/// Unlike [`ResponseLines`], every read is bounded: [`Self::next_frame`] caps a
+/// single frame at `max_frame_bytes` (rejecting an over-cap frame before it grows
+/// without limit), bounds a quiet peer with a per-read idle timeout, and aborts
+/// promptly when `running` clears. Bytes read past a frame's terminating newline
+/// are retained in a persistent buffer across calls, so a chunk that carries the
+/// tail of one frame and the head of the next never loses the second frame.
+pub struct FederatedStream {
+    stream: ApiStream,
+    /// Bytes read but not yet returned: the in-progress (unterminated) frame, plus
+    /// any bytes of the following frame that arrived in the same chunk. Retained
+    /// across [`Self::next_frame`] calls so no frame boundary is lost at a chunk
+    /// split.
+    buf: Vec<u8>,
+}
+
+impl FederatedStream {
+    fn over(stream: ApiStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Read the next newline-delimited frame, or `Ok(None)` when the peer closed
+    /// the stream (a `pane.stream` peer sends `exited` then closes) with no complete
+    /// frame left buffered.
+    ///
+    /// Bounds, each of which surfaces as an `Err` so the caller closes the proxied
+    /// stream:
+    /// - `max_frame_bytes`: a single frame that exceeds the cap (with or without a
+    ///   terminating newline) is rejected before it can drive unbounded allocation.
+    /// - `idle_timeout`: recomputed at the start of each call, so it bounds the gap
+    ///   between frames, not the whole stream — a peer that goes silent for longer
+    ///   than the window is treated as dead.
+    /// - `running`: cleared (shutdown) mid-read aborts promptly with `Interrupted`.
+    ///
+    /// The returned string is the frame's bytes WITHOUT the trailing newline, so
+    /// the caller can re-emit it verbatim with a single trailing newline.
+    pub fn next_frame(
+        &mut self,
+        max_frame_bytes: usize,
+        idle_timeout: Duration,
+        running: &Arc<AtomicBool>,
+    ) -> io::Result<Option<String>> {
+        // Fast path: a whole frame is already buffered from an earlier chunk. No
+        // read (and so no idle-timeout reset) is needed to return it.
+        if let Some(frame) = self.take_buffered_frame(max_frame_bytes)? {
+            return Ok(Some(frame));
+        }
+
+        self.stream.set_polling(true)?;
+        let deadline = Instant::now() + idle_timeout;
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            if !running.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "federated stream read interrupted by shutdown",
+                ));
+            }
+
+            match self.stream.poll_read(&mut chunk)? {
+                ApiStreamRead::Closed => {
+                    // Peer/pane ended. A trailing partial frame (no newline) is
+                    // discarded — there is no more data to complete it.
+                    return Ok(None);
+                }
+                ApiStreamRead::Data(read) => {
+                    self.buf.extend_from_slice(&chunk[..read]);
+                    if let Some(frame) = self.take_buffered_frame(max_frame_bytes)? {
+                        return Ok(Some(frame));
+                    }
+                    // No newline yet: bound the in-progress frame so a peer that
+                    // never terminates a line cannot grow the buffer without limit.
+                    if self.buf.len() > max_frame_bytes {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "federated stream frame is too large",
+                        ));
+                    }
+                }
+                ApiStreamRead::Pending => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "federated stream idle timeout: peer sent no frame",
+                        ));
+                    }
+                    std::thread::sleep(BOUNDED_READ_POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    /// If the retained buffer already holds a complete `\n`-terminated frame, split
+    /// it off — returning its bytes minus the newline and keeping the remainder for
+    /// the next call — enforcing the per-frame byte cap on the completed frame.
+    fn take_buffered_frame(&mut self, max_frame_bytes: usize) -> io::Result<Option<String>> {
+        let Some(idx) = self.buf.iter().position(|&b| b == b'\n') else {
+            return Ok(None);
+        };
+        // Cap the whole frame (newline included), matching the one-shot reader.
+        if idx + 1 > max_frame_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "federated stream frame is too large",
+            ));
+        }
+        let remainder = self.buf.split_off(idx + 1);
+        self.buf.truncate(idx); // drop the trailing newline
+        let frame_bytes = std::mem::replace(&mut self.buf, remainder);
+        String::from_utf8(frame_bytes)
+            .map(Some)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 }
 
@@ -724,6 +879,175 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the read did not abort promptly on shutdown"
+        );
+        peer.join().unwrap();
+    }
+
+    /// Two whole frames delivered in a SINGLE chunk both surface, in order: the
+    /// first `next_frame` returns frame one and RETAINS frame two's bytes, which
+    /// the second call returns from the buffer without another read. Then the peer
+    /// close surfaces as `Ok(None)`.
+    #[test]
+    fn next_frame_surfaces_two_frames_from_one_chunk() {
+        let (addr, peer) = loopback_peer(|mut sock| {
+            // Both frames in one write (one chunk over loopback), then close.
+            let _ = sock.write_all(b"{\"frame\":\"one\"}\n{\"frame\":\"two\"}\n");
+            let _ = sock.flush();
+            // Hold briefly so the reader observes the bytes before EOF, then close.
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut stream = FederatedStream::over(ApiStream::Tcp(
+            TcpStream::connect(addr).expect("connect peer"),
+        ));
+        let idle = Duration::from_secs(5);
+
+        let first = stream
+            .next_frame(64 * 1024, idle, &running)
+            .expect("first frame io-ok")
+            .expect("first frame present");
+        assert_eq!(first, "{\"frame\":\"one\"}");
+
+        let second = stream
+            .next_frame(64 * 1024, idle, &running)
+            .expect("second frame io-ok")
+            .expect("second frame present");
+        assert_eq!(second, "{\"frame\":\"two\"}");
+
+        // Peer closed after both frames → end of stream.
+        assert!(
+            stream
+                .next_frame(64 * 1024, idle, &running)
+                .expect("third read io-ok")
+                .is_none(),
+            "stream did not end when the peer closed"
+        );
+        peer.join().unwrap();
+    }
+
+    /// A single frame larger than the per-frame cap (no newline in sight) makes
+    /// `next_frame` error at ~the cap instead of buffering without limit.
+    #[test]
+    fn next_frame_rejects_an_over_cap_frame() {
+        let (addr, peer) = loopback_peer(|mut sock| {
+            let _ = sock.write_all(&vec![b'x'; 4096]); // >32-byte cap, no newline
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut stream = FederatedStream::over(ApiStream::Tcp(
+            TcpStream::connect(addr).expect("connect peer"),
+        ));
+        let err = stream
+            .next_frame(32, Duration::from_secs(5), &running)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "federated stream frame is too large");
+        peer.join().unwrap();
+    }
+
+    /// A newline-TERMINATED frame larger than the cap is rejected too — the
+    /// completed-frame cap path (`take_buffered_frame`), distinct from the
+    /// unterminated-growth path above. A peer that sends one complete but
+    /// oversized line cannot slip it through, and it never reaches the client.
+    #[test]
+    fn next_frame_rejects_an_over_cap_terminated_frame() {
+        let (addr, peer) = loopback_peer(|mut sock| {
+            // 40 bytes + '\n' in a single write: a COMPLETE line of 40 > the
+            // 32-byte cap. The newline arrives in the same chunk, so
+            // `take_buffered_frame`'s completed-frame cap fires before the
+            // unterminated-growth check is ever consulted.
+            let mut line = vec![b'x'; 40];
+            line.push(b'\n');
+            let _ = sock.write_all(&line);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut stream = FederatedStream::over(ApiStream::Tcp(
+            TcpStream::connect(addr).expect("connect peer"),
+        ));
+        let err = stream
+            .next_frame(32, Duration::from_secs(5), &running)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "federated stream frame is too large");
+        peer.join().unwrap();
+    }
+
+    /// Clearing `running` mid-read aborts `next_frame` promptly, so a proxied
+    /// stream does not hang shutdown on a silent peer.
+    #[test]
+    fn next_frame_aborts_when_running_clears() {
+        let (addr, peer) = loopback_peer(|sock| {
+            std::thread::sleep(Duration::from_millis(500)); // silent but open
+            drop(sock);
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flag.store(false, Ordering::Relaxed);
+        });
+
+        let mut stream = FederatedStream::over(ApiStream::Tcp(
+            TcpStream::connect(addr).expect("connect peer"),
+        ));
+        let started = Instant::now();
+        // Far-future idle timeout: only the cleared running flag can end this read.
+        let err = stream
+            .next_frame(64 * 1024, Duration::from_secs(30), &running)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read did not abort promptly on shutdown"
+        );
+        peer.join().unwrap();
+    }
+
+    /// The idle timeout fires only PAST the threshold: a frame that arrives inside
+    /// the window is delivered, and a peer that then goes silent past the window
+    /// times out (not before it).
+    #[test]
+    fn next_frame_idle_timeout_fires_only_past_the_threshold() {
+        let (addr, peer) = loopback_peer(|mut sock| {
+            // A frame well inside the window, then silence.
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = sock.write_all(b"{\"frame\":\"tick\"}\n");
+            let _ = sock.flush();
+            std::thread::sleep(Duration::from_millis(600)); // then go quiet
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut stream = FederatedStream::over(ApiStream::Tcp(
+            TcpStream::connect(addr).expect("connect peer"),
+        ));
+        let idle = Duration::from_millis(200);
+
+        // Frame inside the window is delivered (idle timeout does NOT fire early).
+        let frame = stream
+            .next_frame(64 * 1024, idle, &running)
+            .expect("frame io-ok")
+            .expect("frame present");
+        assert_eq!(frame, "{\"frame\":\"tick\"}");
+
+        // Peer now silent: the next read times out, and only after the threshold.
+        let started = Instant::now();
+        let err = stream.next_frame(64 * 1024, idle, &running).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() >= idle,
+            "the idle timeout fired before its threshold"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the idle timeout did not fire near its threshold"
         );
         peer.join().unwrap();
     }
