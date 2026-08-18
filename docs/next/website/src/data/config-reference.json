@@ -1190,6 +1190,24 @@
       ]
     },
     {
+      "id": "federation",
+      "title": "Federation",
+      "keys": [
+        {
+          "key": "federation.listen",
+          "type": "boolean",
+          "default": "false",
+          "description": "Accept inbound federation connections over TCP. Default off. The listener only binds when `federation.listen_addr` is set and at least one peer token file yields a token; otherwise it refuses to start rather than expose an unauthenticated port. Each accepted TCP connection is authenticated by a shared token and restricted to the granting peer's `capability` tier, and inbound connections are capped so a peer cannot exhaust threads or file descriptors. The local unix socket and the SSH control path are never filtered by this setting."
+        },
+        {
+          "key": "federation.listen_addr",
+          "type": "string",
+          "default": "unset",
+          "description": "Address the federation TCP listener binds to when `federation.listen` is enabled, for example `0.0.0.0:7020` or `127.0.0.1:7020`. Leave unset to keep the listener off."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [

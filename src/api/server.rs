@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -12,7 +12,10 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
-use crate::api::federation::{token_is_authorized, FederationHello};
+use crate::api::federation::{
+    authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
+    FEDERATION_PROTOCOL_VERSION,
+};
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
@@ -40,6 +43,10 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+/// Cap on federation TCP connections handled concurrently. A bounded federation
+/// listener cannot be driven to unbounded thread/fd growth by an authenticated
+/// (or connect-flooding) peer; connections beyond the cap are refused and closed.
+const MAX_FEDERATION_CONNECTIONS: usize = 32;
 
 pub struct ServerHandle {
     _thread: JoinHandle<()>,
@@ -147,6 +154,9 @@ fn start_server_inner(
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
+                            // Local unix-socket connections are never federation
+                            // peers, so they bypass the capability-tier gate.
+                            None,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -204,8 +214,8 @@ fn maybe_start_federation_listener(
 
     // Safety floor: never open a federation listener without at least one token
     // to authenticate against, or every peer would be admitted.
-    let tokens = resolve_federation_tokens(federation);
-    if tokens.is_empty() {
+    let peers = resolve_federation_tokens(federation);
+    if peers.is_empty() {
         warn!(
             addr = %addr,
             "federation.listen is enabled but no peer token file yielded a token; \
@@ -225,11 +235,11 @@ fn maybe_start_federation_listener(
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.to_string());
-    info!(addr = %bound, peer_tokens = tokens.len(), "federation listener listening");
+    info!(addr = %bound, peer_tokens = peers.len(), "federation listener listening");
 
     match spawn_federation_listener(
         listener,
-        tokens,
+        peers,
         api_tx.clone(),
         event_hub.clone(),
         capabilities.clone(),
@@ -244,10 +254,13 @@ fn maybe_start_federation_listener(
     }
 }
 
-/// Read each peer's `token_file`, trimmed, into the accepted-token set. A single
-/// unreadable token file is logged and skipped rather than failing the listener.
-fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<String> {
-    let mut tokens = Vec::new();
+/// Read each peer's `token_file`, trimmed, into the accepted set paired with the
+/// peer's identity and capability tier. A single unreadable/empty token file is
+/// logged and skipped rather than failing the listener; peers without a token
+/// file are skipped (they have no inbound credential). The returned tier is the
+/// authority a request authenticated by that token is bound to.
+fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<(String, PeerContext)> {
+    let mut peers = Vec::new();
     for peer in &federation.peers {
         let Some(path) = peer.token_file.as_deref() else {
             continue;
@@ -258,7 +271,13 @@ fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<String> {
                 if token.is_empty() {
                     warn!(path = %path, alias = %peer.alias, "federation peer token file is empty; skipping");
                 } else {
-                    tokens.push(token.to_string());
+                    peers.push((
+                        token.to_string(),
+                        PeerContext {
+                            alias: peer.alias.clone(),
+                            tier: peer.capability,
+                        },
+                    ));
                 }
             }
             Err(err) => {
@@ -266,7 +285,7 @@ fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<String> {
             }
         }
     }
-    tokens
+    peers
 }
 
 /// Spawn the federation TCP accept loop. Each accepted connection is handed to
@@ -277,7 +296,7 @@ fn resolve_federation_tokens(federation: &FederationConfig) -> Vec<String> {
 /// [`ServerHandle::drop`] can stop and join it by clearing `running`.
 fn spawn_federation_listener(
     listener: TcpListener,
-    tokens: Vec<String>,
+    peers: Vec<(String, PeerContext)>,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
@@ -285,28 +304,50 @@ fn spawn_federation_listener(
     server_stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
-    let tokens = Arc::new(tokens);
+    let peers = Arc::new(peers);
+    let in_flight = Arc::new(AtomicUsize::new(0));
 
     let thread = std::thread::spawn(move || {
         while running.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, peer)) => {
+                    // Refuse (and immediately close) connections beyond the cap so
+                    // a peer cannot drive unbounded thread/fd growth. The accept
+                    // loop is the only writer of `in_flight`, so this load/compare
+                    // is race-free against itself; connection threads only ever
+                    // decrement it via the RAII guard below.
+                    if in_flight.load(Ordering::Acquire) >= MAX_FEDERATION_CONNECTIONS {
+                        warn!(
+                            peer = %peer,
+                            max = MAX_FEDERATION_CONNECTIONS,
+                            "federation connection cap reached; refusing connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     // The accepted socket is used in blocking mode; the framed
                     // reader toggles polling on it as needed.
                     if let Err(err) = stream.set_nonblocking(false) {
                         warn!(err = %err, "federation connection blocking-mode reset failed");
                         continue;
                     }
-                    let tokens = Arc::clone(&tokens);
+                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    // Released when the connection thread returns, including on an
+                    // early return or panic, so a slot is never leaked.
+                    let slot = ConnectionSlot {
+                        in_flight: Arc::clone(&in_flight),
+                    };
+                    let peers = Arc::clone(&peers);
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&running);
                     std::thread::spawn(move || {
+                        let _slot = slot;
                         if let Err(err) = handle_federation_connection(
                             ApiStream::Tcp(stream),
-                            &tokens,
+                            &peers,
                             &api_tx,
                             &event_hub,
                             &connection_running,
@@ -317,13 +358,21 @@ fn spawn_federation_listener(
                         }
                     });
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(CONNECTION_POLL_INTERVAL);
-                }
-                Err(err) => {
-                    error!(err = %err, "federation listener accept failed");
-                    break;
-                }
+                Err(err) => match classify_accept_error(&err) {
+                    // No connection pending: idle back-off, no logging.
+                    AcceptBackoff::Idle => {
+                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    }
+                    // A transient accept error (EMFILE from fd exhaustion,
+                    // ECONNABORTED from a peer that vanished, ...) must not
+                    // permanently kill the listener. Log, back off one poll
+                    // interval, and keep serving; the loop still exits when
+                    // `running` is cleared. There is deliberately no fatal path.
+                    AcceptBackoff::Retry => {
+                        warn!(err = %err, "federation listener accept error; continuing");
+                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    }
+                },
             }
         }
         debug!("federation listener thread exiting");
@@ -332,16 +381,55 @@ fn spawn_federation_listener(
     Ok(thread)
 }
 
-/// Enforce the federation token gate, then dispatch the connection normally.
+/// RAII slot for the federation in-flight connection counter. Incremented before
+/// a connection thread is spawned and decremented when that thread returns, so a
+/// slot is released even on an early return or a panic.
+struct ConnectionSlot {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How the federation accept loop reacts to a `TcpListener::accept()` result that
+/// is not a fresh connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptBackoff {
+    /// No connection was pending (`WouldBlock` on the non-blocking listener).
+    Idle,
+    /// A transient accept error: back off and keep serving.
+    Retry,
+}
+
+/// Classify an accept error. `WouldBlock` is the ordinary "nothing pending"
+/// signal; every other error is treated as transient and retried. There is
+/// deliberately no fatal classification — a transient accept failure (EMFILE,
+/// ECONNABORTED, ...) must never permanently kill the federation listener.
+fn classify_accept_error(err: &io::Error) -> AcceptBackoff {
+    if err.kind() == io::ErrorKind::WouldBlock {
+        AcceptBackoff::Idle
+    } else {
+        AcceptBackoff::Retry
+    }
+}
+
+/// Enforce the federation handshake, then dispatch the connection normally.
 ///
-/// The first line MUST be a `federation.hello` carrying a token that matches one
-/// configured peer token (constant-time compared). On mismatch/malformed/missing
-/// hello a single JSON error line is written and the connection closes with no
-/// request dispatched. On success the remaining lines flow through the same
-/// [`handle_connection_with_stop`] path as a local connection.
+/// The first line MUST be a `federation.hello` whose `proto_version` this daemon
+/// speaks and whose token matches one configured peer (constant-time compared).
+/// A malformed/missing hello or an unknown token is rejected as `unauthorized`;
+/// a version the daemon does not speak is rejected as `federation_protocol_mismatch`.
+/// Either way a single JSON error line is written and the connection closes with
+/// no request dispatched. On success the connection is bound to the matched
+/// peer's [`PeerContext`] and the remaining lines flow through the same
+/// [`handle_connection_with_stop`] path as a local connection — but gated to the
+/// peer's capability tier.
 fn handle_federation_connection(
     mut stream: ApiStream,
-    tokens: &[String],
+    peers: &[(String, PeerContext)],
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -356,12 +444,21 @@ fn handle_federation_connection(
         return Ok(()); // peer closed before sending the hello
     };
 
-    let authorized = FederationHello::token_from_line(line.trim())
-        .is_some_and(|token| token_is_authorized(&token, tokens));
-    if !authorized {
+    let Some(hello) = FederationHello::from_line(line.trim()) else {
+        // Missing or malformed hello: never reveals whether a token would match.
         write_json_line_allow_disconnect(&mut stream, &federation_unauthorized_error())?;
         return Ok(());
+    };
+
+    if hello.proto_version != FEDERATION_PROTOCOL_VERSION {
+        write_json_line_allow_disconnect(&mut stream, &federation_protocol_mismatch_error())?;
+        return Ok(());
     }
+
+    let Some(peer) = authorized_peer(&hello.token, peers) else {
+        write_json_line_allow_disconnect(&mut stream, &federation_unauthorized_error())?;
+        return Ok(());
+    };
 
     handle_connection_with_stop(
         stream,
@@ -370,6 +467,7 @@ fn handle_federation_connection(
         running,
         capabilities,
         server_stop,
+        Some(peer),
     )
 }
 
@@ -379,6 +477,34 @@ fn federation_unauthorized_error() -> ErrorResponse {
         error: ErrorBody {
             code: "unauthorized".into(),
             message: "federation authentication failed".into(),
+        },
+    }
+}
+
+/// Rejection line for a hello whose handshake version this daemon does not speak.
+fn federation_protocol_mismatch_error() -> ErrorResponse {
+    ErrorResponse {
+        id: String::new(),
+        error: ErrorBody {
+            code: "federation_protocol_mismatch".into(),
+            message: format!(
+                "unsupported federation protocol version; this daemon speaks version {FEDERATION_PROTOCOL_VERSION}"
+            ),
+        },
+    }
+}
+
+/// Rejection line for a federated request the peer's capability tier does not
+/// permit (an out-of-tier or entirely denied method). Reuses the
+/// [`federation_unauthorized_error`] error shape, but carries the request id so
+/// the client can correlate it, and a `forbidden` code to distinguish an
+/// authenticated-but-insufficient peer from a failed authentication.
+fn federation_forbidden_error(id: String, method: &str) -> ErrorResponse {
+    ErrorResponse {
+        id,
+        error: ErrorBody {
+            code: "forbidden".into(),
+            message: format!("federation peer is not permitted to call '{method}'"),
         },
     }
 }
@@ -411,6 +537,7 @@ fn handle_connection(
         running,
         capabilities,
         None,
+        None,
     )
 }
 
@@ -421,6 +548,7 @@ fn handle_connection_with_stop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    federation: Option<PeerContext>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -455,6 +583,41 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+
+    // Federation capability gate. Local (unix-socket) connections carry `None`
+    // here and are never filtered; only a connection bound to a federation
+    // `PeerContext` is checked. A method that is denied to federation entirely,
+    // or that requires a higher tier than this peer holds, is refused before any
+    // dispatch or stream is set up.
+    if let Some(peer) = &federation {
+        let permitted = matches!(
+            federation_access(method),
+            FederationAccess::AllowedAt(required) if required <= peer.tier
+        );
+        if !permitted {
+            warn!(
+                method,
+                alias = %peer.alias,
+                "federation request denied by capability tier"
+            );
+            crate::logging::api_request_started(&request_id, method, changes_ui);
+            let response = federation_forbidden_error(request_id.clone(), method);
+            let result = write_json_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "forbidden",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            return result;
+        }
+    }
+
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -1747,6 +1910,52 @@ mod tests {
         assert!(result.is_ok());
         server_thread.join().unwrap();
     }
+
+    #[test]
+    fn local_connection_bypasses_federation_capability_gate() {
+        use std::io::Write as _;
+
+        // A local (unix-socket) connection carries `federation: None`, so even a
+        // method federation denies outright (here `pane.close`) must dispatch
+        // unfiltered. This is the regression guard that the Part-1 gate never
+        // touches the local control path.
+        let (mut client, server, path) = local_stream_pair("local-no-fed-filter");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let handle = std::thread::spawn(move || {
+            let _ = handle_connection_with_stop(
+                ApiStream::Local(server),
+                &api_tx,
+                &EventHub::default(),
+                &running,
+                None,
+                None,
+                // Local path: no federation peer, so no capability filtering.
+                None,
+            );
+        });
+
+        let request = serde_json::to_string(&Request {
+            id: "local_close".into(),
+            method: Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: "pane_1".into(),
+            }),
+        })
+        .unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        // The normally-denied method reached the app dispatch path unfiltered.
+        let message = api_rx.blocking_recv().expect("request dispatched to app");
+        assert!(matches!(message.request.method, Method::PaneClose(_)));
+
+        // Dropping the message disconnects the response channel so the connection
+        // thread unwinds instead of blocking on a reply that never comes.
+        drop(message);
+        let _ = handle.join();
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -1794,8 +2003,10 @@ mod federation_tests {
     use super::*;
     use crate::api::client::{ApiClient, ConnectionTarget};
     use crate::api::schema::{
-        EventData, EventEnvelope, EventKind, EventsSubscribeParams, PingParams, Subscription,
+        AgentPromptParams, AgentRenameParams, AgentStartParams, EmptyParams, EventData,
+        EventEnvelope, EventKind, EventsSubscribeParams, PaneTarget, PingParams, Subscription,
     };
+    use crate::config::CapabilityTier;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpStream};
     use tokio::sync::mpsc;
@@ -1821,7 +2032,20 @@ mod federation_tests {
         }
     }
 
-    fn start_federation(tokens: Vec<String>) -> TestFederation {
+    fn peer_ctx(alias: &str, tier: CapabilityTier) -> PeerContext {
+        PeerContext {
+            alias: alias.into(),
+            tier,
+        }
+    }
+
+    /// One peer bound to `token` at `tier`, in the shape `spawn_federation_listener`
+    /// expects.
+    fn one_peer(token: &str, tier: CapabilityTier) -> Vec<(String, PeerContext)> {
+        vec![(token.to_string(), peer_ctx("peer", tier))]
+    }
+
+    fn start_federation(peers: Vec<(String, PeerContext)>) -> TestFederation {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback federation listener");
         let addr = listener.local_addr().expect("federation listener addr");
         let (api_tx, api_rx) = mpsc::unbounded_channel();
@@ -1829,7 +2053,7 @@ mod federation_tests {
         let running = Arc::new(AtomicBool::new(true));
         let thread = spawn_federation_listener(
             listener,
-            tokens,
+            peers,
             api_tx.clone(),
             event_hub.clone(),
             None,
@@ -1854,9 +2078,36 @@ mod federation_tests {
         })
     }
 
+    /// Open a raw federation connection and send `token`'s hello, returning the
+    /// still-open stream so the caller can drive requests on it directly.
+    fn raw_hello(addr: SocketAddr, token: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let hello = FederationHello::new(token).to_line().unwrap();
+        writeln!(stream, "{hello}").unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    fn send_request(stream: &mut TcpStream, id: &str, method: Method) {
+        let encoded = serde_json::to_string(&Request {
+            id: id.into(),
+            method,
+        })
+        .unwrap();
+        writeln!(stream, "{encoded}").unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn read_json_line(stream: &TcpStream) -> serde_json::Value {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read response line");
+        serde_json::from_str(&line).expect("response is json")
+    }
+
     #[test]
     fn valid_token_round_trips_a_ping_over_tcp() {
-        let fed = start_federation(vec!["s3cret".into()]);
+        let fed = start_federation(one_peer("s3cret", CapabilityTier::Observe));
         let client = tcp_client(fed.addr, Some("s3cret"));
 
         let response = client
@@ -1872,7 +2123,7 @@ mod federation_tests {
 
     #[test]
     fn wrong_token_is_rejected_and_never_dispatches() {
-        let mut fed = start_federation(vec!["right".into()]);
+        let mut fed = start_federation(one_peer("right", CapabilityTier::Observe));
 
         // A bad hello is rejected before the connection handler ever reads a
         // request line, so nothing can reach the app dispatch path.
@@ -1906,7 +2157,7 @@ mod federation_tests {
 
     #[test]
     fn missing_hello_is_rejected() {
-        let fed = start_federation(vec!["right".into()]);
+        let fed = start_federation(one_peer("right", CapabilityTier::Observe));
 
         // A request line where the hello is expected is not a hello.
         let mut stream = TcpStream::connect(fed.addr).expect("connect");
@@ -1929,7 +2180,7 @@ mod federation_tests {
 
     #[test]
     fn request_stream_yields_multiple_lines_then_terminates_on_close() {
-        let fed = start_federation(vec!["s3cret".into()]);
+        let fed = start_federation(one_peer("s3cret", CapabilityTier::Observe));
         let client = tcp_client(fed.addr, Some("s3cret"));
 
         let mut lines = client
@@ -1986,5 +2237,392 @@ mod federation_tests {
         reader.read_line(&mut line).expect("read rejection line");
         let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
         assert_eq!(value["error"]["code"], "unauthorized");
+    }
+
+    /// Poll the app channel briefly for a dispatched request, panicking if none
+    /// arrives. Used to prove that a permitted federated method reached the
+    /// dispatch path (as opposed to being gate-filtered).
+    fn recv_dispatched(
+        api_rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>,
+    ) -> ApiRequestMessage {
+        for _ in 0..200 {
+            if let Ok(message) = api_rx.try_recv() {
+                return message;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no request reached the app dispatch path within the timeout");
+    }
+
+    #[test]
+    fn every_wire_method_resolves_to_a_deliberate_access() {
+        use CapabilityTier::{Admin, Interact, Observe};
+        use FederationAccess::{AllowedAt, Denied};
+
+        // The complete, deliberate classification of every wire-reachable API
+        // method. Default-deny means a method added to `Method` without a decision
+        // here still resolves to `Denied` (safe), but this table is the audit of
+        // exactly what federation exposes and must be updated whenever a method's
+        // federation exposure changes.
+        let expected: &[(&str, FederationAccess)] = &[
+            ("ping", AllowedAt(Observe)),
+            ("server.stop", Denied),
+            ("server.live_handoff", Denied),
+            ("server.reload_config", Denied),
+            ("server.agent_manifests", Denied),
+            ("server.reload_agent_manifests", Denied),
+            ("notification.show", Denied),
+            ("notifications.register_device", Denied),
+            ("notifications.register_activity", Denied),
+            ("notifications.unregister_activity", Denied),
+            ("gram.send", Denied),
+            ("gram.post", Denied),
+            ("gram.list", Denied),
+            ("gram.grab", Denied),
+            ("gram.mark_read", Denied),
+            ("gram.delete", Denied),
+            ("gram.upload_chunk", Denied),
+            ("gram.get_file", Denied),
+            ("client.window_title.set", Denied),
+            ("client.window_title.clear", Denied),
+            ("session.snapshot", AllowedAt(Observe)),
+            ("workspace.create", Denied),
+            ("workspace.list", AllowedAt(Observe)),
+            ("workspace.get", AllowedAt(Observe)),
+            ("workspace.focus", Denied),
+            ("workspace.rename", Denied),
+            ("workspace.move", Denied),
+            ("workspace.move_block", Denied),
+            ("workspace.report_metadata", Denied),
+            ("workspace.close", Denied),
+            ("worktree.list", AllowedAt(Observe)),
+            ("worktree.create", Denied),
+            ("worktree.open", Denied),
+            ("worktree.remove", Denied),
+            ("tab.create", Denied),
+            ("tab.list", AllowedAt(Observe)),
+            ("tab.get", AllowedAt(Observe)),
+            ("tab.focus", Denied),
+            ("tab.rename", Denied),
+            ("tab.move", Denied),
+            ("tab.close", Denied),
+            ("agent.list", AllowedAt(Observe)),
+            ("agent.get", AllowedAt(Observe)),
+            ("agent.read", AllowedAt(Observe)),
+            ("agent.explain", AllowedAt(Observe)),
+            ("agent.send_keys", AllowedAt(Interact)),
+            ("agent.rename", AllowedAt(Admin)),
+            ("agent.view.set", AllowedAt(Admin)),
+            ("agent.view.clear", AllowedAt(Admin)),
+            ("agent.focus", AllowedAt(Admin)),
+            ("agent.start", Denied),
+            ("agent.prompt", AllowedAt(Interact)),
+            ("agent.wait", AllowedAt(Observe)),
+            ("pane.split", Denied),
+            ("pane.swap", Denied),
+            ("pane.move", Denied),
+            ("pane.zoom", Denied),
+            ("pane.layout", Denied),
+            ("pane.process_info", AllowedAt(Observe)),
+            ("layout.export", AllowedAt(Observe)),
+            ("layout.apply", Denied),
+            ("layout.set_split_ratio", Denied),
+            ("pane.neighbor", AllowedAt(Observe)),
+            ("pane.edges", AllowedAt(Observe)),
+            ("pane.focus_direction", Denied),
+            ("pane.resize", Denied),
+            ("pane.set_pty_size", Denied),
+            ("pane.list", AllowedAt(Observe)),
+            ("pane.current", AllowedAt(Observe)),
+            ("pane.get", AllowedAt(Observe)),
+            ("pane.turns", AllowedAt(Observe)),
+            ("pane.focus", Denied),
+            ("pane.input.set", AllowedAt(Admin)),
+            ("pane.rename", AllowedAt(Admin)),
+            ("pane.send_text", AllowedAt(Interact)),
+            ("pane.send_keys", AllowedAt(Interact)),
+            ("pane.send_input", AllowedAt(Admin)),
+            ("pane.read", AllowedAt(Observe)),
+            ("pane.graphics.set", Denied),
+            ("pane.graphics.clear", Denied),
+            ("pane.graphics.info", AllowedAt(Observe)),
+            ("pane.graphics.stream", Denied),
+            ("pane.stream", AllowedAt(Observe)),
+            ("pane.input.stream", Denied),
+            ("pane.report_agent", Denied),
+            ("pane.report_agent_session", Denied),
+            ("pane.report_metadata", Denied),
+            ("pane.clear_agent_authority", Denied),
+            ("pane.release_agent", Denied),
+            ("pane.close", Denied),
+            ("popup.close", Denied),
+            ("events.subscribe", AllowedAt(Observe)),
+            ("events.wait", AllowedAt(Observe)),
+            ("pane.wait_for_output", AllowedAt(Observe)),
+            ("integration.install", Denied),
+            ("integration.uninstall", Denied),
+            ("plugin.link", Denied),
+            ("plugin.list", Denied),
+            ("plugin.unlink", Denied),
+            ("plugin.enable", Denied),
+            ("plugin.disable", Denied),
+            ("plugin.action.list", Denied),
+            ("plugin.action.invoke", Denied),
+            ("plugin.log.list", Denied),
+            ("plugin.pane.open", Denied),
+            ("plugin.pane.focus", Denied),
+            ("plugin.pane.close", Denied),
+        ];
+
+        for (name, access) in expected {
+            assert_eq!(
+                federation_access(name),
+                *access,
+                "method {name} is mis-classified for federation"
+            );
+        }
+        // Tripwire: this table must enumerate every wire method, so its size is
+        // pinned. Adding a `Method` variant should come with a decision here.
+        assert_eq!(
+            expected.len(),
+            107,
+            "wire-method classification table drifted"
+        );
+    }
+
+    #[test]
+    fn observe_peer_allows_reads_and_denies_writes() {
+        let mut fed = start_federation(one_peer("obs", CapabilityTier::Observe));
+
+        // agent.list (observe) reaches the app dispatch path.
+        let mut reader = raw_hello(fed.addr, "obs");
+        send_request(&mut reader, "list", Method::AgentList(EmptyParams {}));
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentList(_)));
+        drop(message);
+        drop(reader);
+
+        // agent.prompt (interact) is above an observe peer's tier: forbidden.
+        let mut prompt = raw_hello(fed.addr, "obs");
+        send_request(
+            &mut prompt,
+            "prompt",
+            Method::AgentPrompt(AgentPromptParams {
+                target: "a".into(),
+                text: "hi".into(),
+                wait: None,
+            }),
+        );
+        let resp = read_json_line(&prompt);
+        assert_eq!(resp["error"]["code"], "forbidden");
+        assert_eq!(resp["id"], "prompt");
+
+        // Methods federation denies outright are forbidden at any tier.
+        for (id, method) in [
+            (
+                "start",
+                Method::AgentStart(AgentStartParams {
+                    name: "n".into(),
+                    kind: "k".into(),
+                    pane_id: "p".into(),
+                    args: vec![],
+                    timeout_ms: None,
+                }),
+            ),
+            ("stop", Method::ServerStop(EmptyParams {})),
+            (
+                "close",
+                Method::PaneClose(PaneTarget {
+                    pane_id: "p".into(),
+                }),
+            ),
+        ] {
+            let mut stream = raw_hello(fed.addr, "obs");
+            send_request(&mut stream, id, method);
+            assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
+        }
+
+        // None of the forbidden calls reached the app dispatch path.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "a forbidden federated call reached the dispatch path"
+        );
+    }
+
+    #[test]
+    fn interact_peer_allows_prompt_and_denies_admin() {
+        let mut fed = start_federation(one_peer("act", CapabilityTier::Interact));
+
+        // agent.prompt (interact) is dispatched for an interact peer.
+        let mut stream = raw_hello(fed.addr, "act");
+        send_request(
+            &mut stream,
+            "prompt",
+            Method::AgentPrompt(AgentPromptParams {
+                target: "a".into(),
+                text: "hi".into(),
+                wait: None,
+            }),
+        );
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentPrompt(_)));
+        drop(message);
+
+        // agent.rename (admin) is above its tier: forbidden.
+        let mut stream = raw_hello(fed.addr, "act");
+        send_request(
+            &mut stream,
+            "rename",
+            Method::AgentRename(AgentRenameParams {
+                target: "a".into(),
+                name: Some("n".into()),
+            }),
+        );
+        assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
+    }
+
+    #[test]
+    fn admin_peer_allows_admin_methods() {
+        let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
+
+        let mut stream = raw_hello(fed.addr, "adm");
+        send_request(
+            &mut stream,
+            "rename",
+            Method::AgentRename(AgentRenameParams {
+                target: "a".into(),
+                name: Some("n".into()),
+            }),
+        );
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentRename(_)));
+        drop(message);
+    }
+
+    #[test]
+    fn two_peers_are_each_bound_to_their_own_tier() {
+        let mut fed = start_federation(vec![
+            (
+                "obs-tok".into(),
+                peer_ctx("observer", CapabilityTier::Observe),
+            ),
+            (
+                "adm-tok".into(),
+                peer_ctx("administrator", CapabilityTier::Admin),
+            ),
+        ]);
+
+        // The observe peer's token cannot rename.
+        let mut stream = raw_hello(fed.addr, "obs-tok");
+        send_request(
+            &mut stream,
+            "r1",
+            Method::AgentRename(AgentRenameParams {
+                target: "a".into(),
+                name: Some("n".into()),
+            }),
+        );
+        assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
+
+        // The admin peer's token, over the same listener, can.
+        let mut stream = raw_hello(fed.addr, "adm-tok");
+        send_request(
+            &mut stream,
+            "r2",
+            Method::AgentRename(AgentRenameParams {
+                target: "a".into(),
+                name: Some("n".into()),
+            }),
+        );
+        let message = recv_dispatched(&mut fed.api_rx);
+        assert!(matches!(message.request.method, Method::AgentRename(_)));
+        drop(message);
+    }
+
+    #[test]
+    fn proto_version_mismatch_is_rejected_and_a_match_proceeds() {
+        let fed = start_federation(one_peer("tok", CapabilityTier::Observe));
+
+        // A hello the daemon does not speak is rejected with a distinct code and
+        // never dispatches.
+        let mut stream = TcpStream::connect(fed.addr).expect("connect");
+        let mut hello = FederationHello::new("tok");
+        hello.proto_version = FEDERATION_PROTOCOL_VERSION + 1;
+        writeln!(stream, "{}", hello.to_line().unwrap()).unwrap();
+        stream.flush().unwrap();
+        let resp = read_json_line(&stream);
+        assert_eq!(resp["error"]["code"], "federation_protocol_mismatch");
+
+        // The matching version with a valid token proceeds to a pong.
+        let client = tcp_client(fed.addr, Some("tok"));
+        let response = client
+            .request_value(&Request {
+                id: "v_ok".into(),
+                method: Method::Ping(PingParams::default()),
+            })
+            .expect("ping round-trips at the negotiated version");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn connection_cap_refuses_beyond_max_and_releases_on_close() {
+        use std::io::Read as _;
+
+        let fed = start_federation(one_peer("tok", CapabilityTier::Observe));
+
+        // Fill every slot. A slot is reserved as soon as the accept loop spawns
+        // the handler, so these connections occupy the cap while their handlers
+        // wait (indefinitely, within the handshake timeout) for a hello.
+        let mut held: Vec<TcpStream> = Vec::new();
+        for _ in 0..MAX_FEDERATION_CONNECTIONS {
+            held.push(TcpStream::connect(fed.addr).expect("connect"));
+        }
+        // Let the accept loop take and count all of them.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // The next connection is over the cap: the listener accepts then closes it
+        // without writing a byte, so the client reads a clean EOF.
+        let mut over = TcpStream::connect(fed.addr).expect("connect");
+        over.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(over.read(&mut buf), Ok(0)),
+            "a connection over the cap was not refused and closed"
+        );
+
+        // Closing one in-flight connection frees a slot; a fresh connection then
+        // completes a full authenticated ping.
+        held.pop();
+        std::thread::sleep(Duration::from_millis(500));
+        let client = tcp_client(fed.addr, Some("tok"));
+        let response = client
+            .request_value(&Request {
+                id: "after_release".into(),
+                method: Method::Ping(PingParams::default()),
+            })
+            .expect("a slot freed up after a connection closed");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn accept_loop_treats_transient_errors_as_retryable() {
+        // The federation listener must never die on a transient accept error;
+        // only `WouldBlock` is the idle signal, everything else is retried.
+        assert_eq!(
+            classify_accept_error(&io::Error::from(io::ErrorKind::WouldBlock)),
+            AcceptBackoff::Idle
+        );
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from(kind)),
+                AcceptBackoff::Retry,
+                "{kind:?} should be retried, not fatal"
+            );
+        }
     }
 }

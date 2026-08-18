@@ -119,6 +119,46 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+## Federation
+
+Federation lets one Herdr daemon reach another daemon's runtime. It is off by default. The inbound TCP listener only binds when you both enable it and give it at least one peer token to authenticate against; otherwise it refuses to start rather than expose an unauthenticated port.
+
+```toml
+[federation]
+listen = true
+listen_addr = "127.0.0.1:7020"
+
+[[federation.peers]]
+alias = "laptop"
+token_file = "/etc/herdr/peers/laptop.token"
+capability = "observe"
+
+[[federation.peers]]
+alias = "ops"
+token_file = "/etc/herdr/peers/ops.token"
+capability = "interact"
+```
+
+Each `[[federation.peers]]` table declares one peer:
+
+- `alias` — a local name for the peer, used in logs and diagnostics.
+- `token_file` — path to the shared secret. Its trimmed contents are the token this peer presents; the file's bytes are never logged. A peer with no readable, non-empty token file is skipped.
+- `endpoint` — where to reach the peer for outbound connections (consumed by later federation work).
+- `expected_node_id` — the node identity to verify on connect (consumed by later federation work).
+- `capability` — the tier this peer's token grants over inbound TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`.
+
+Capability tiers are ordered, each including the one below it:
+
+- `observe` — read-only: list, read, and inspect panes, agents, events, and layout.
+- `interact` — everything in `observe`, plus driving agents and panes (`agent.prompt`, `agent.send_keys`, `pane.send_text`, `pane.send_keys`).
+- `admin` — everything in `interact`, plus focus, rename, and input/authority mutations (`agent.focus`, `agent.rename`, `pane.rename`, `pane.input.set`, `pane.send_input`, `agent.view.set`, `agent.view.clear`).
+
+Federation exposes only a deliberate, read-and-drive subset of the API. Anything not in a tier — server lifecycle, plugin, integration, gram, notification, window-title, agent/pane/workspace/tab/worktree/layout mutation, and graphics — is denied to every federated peer regardless of tier. Inbound connections are also capped so a peer cannot exhaust the daemon's threads or file descriptors.
+
+:::caution[Security]
+A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path (`herdr --remote` / `herdr api-bridge`), which runs against the local unix socket and therefore grants full, unfiltered control-plane access — federation capability tiers do not apply to it. The local unix socket itself is never token-checked or tier-filtered.
+:::
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

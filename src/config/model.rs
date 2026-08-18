@@ -997,6 +997,26 @@ pub struct PushConfig {
     pub sandbox: bool,
 }
 
+/// Capability tier granted to a federation peer's shared token.
+///
+/// The tiers are ordered so a higher tier includes every capability of the
+/// lower ones: `Admin` ⊇ `Interact` ⊇ `Observe`. A method exposed to federation
+/// at some tier is reachable by any peer at that tier or above; everything not
+/// explicitly exposed stays denied to every tier (default-deny). Only inbound
+/// TCP federation connections are filtered by tier — the local unix socket and
+/// the SSH control path are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityTier {
+    /// Read-only: list/read/inspect panes, agents, events, layout. Default.
+    #[default]
+    Observe,
+    /// Observe plus driving agents and panes (prompts, keystrokes, text).
+    Interact,
+    /// Interact plus focus, rename, and input/authority mutations.
+    Admin,
+}
+
 /// Peer-to-peer federation between Herdr daemons.
 ///
 /// The listener, outbound transports (TCP/SSH), and peer connection handling
@@ -1026,6 +1046,9 @@ pub struct FederationPeer {
     pub token_file: Option<String>,
     /// Expected node identity presented by the peer, verified on connect.
     pub expected_node_id: Option<String>,
+    /// Capability tier this peer's token grants over inbound TCP federation.
+    /// Default: `observe` (read-only).
+    pub capability: CapabilityTier,
 }
 
 #[derive(Debug, Default, Deserialize)]
