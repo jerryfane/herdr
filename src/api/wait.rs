@@ -1032,6 +1032,9 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
             revision: 1,
+            machine_id: None,
+            reachability: None,
+            last_known_status: None,
         }
     }
 

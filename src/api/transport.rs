@@ -55,6 +55,42 @@ impl SshPipe {
             child,
         }
     }
+
+    /// Toggle non-blocking mode on the child's stdout pipe (the reply read half),
+    /// so a [`poll_read`](ApiStream::poll_read) can return `Pending` instead of
+    /// blocking. The federation bounded-response reader relies on this to enforce
+    /// its wall-clock deadline even when a peer stalls without sending a newline.
+    fn set_stdout_nonblocking(&mut self, enabled: bool) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let fd = self.stdout.as_raw_fd();
+            // SAFETY: `fd` is the live, owned read end of the child's stdout pipe
+            // for the lifetime of `self`; F_GETFL/F_SETFL only read and replace
+            // its status flags and do not transfer ownership of the descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let updated = if enabled {
+                flags | libc::O_NONBLOCK
+            } else {
+                flags & !libc::O_NONBLOCK
+            };
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            // SSH federation is not a first-class non-Unix path. The byte cap and
+            // the trickle deadline still bound the read; a full stall is bounded
+            // by ssh's own ConnectTimeout/ServerAlive settings.
+            let _ = enabled;
+            Ok(())
+        }
+    }
 }
 
 /// One API connection, over any supported transport.
@@ -142,8 +178,9 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => set_local_stream_polling(stream, enabled),
             ApiStream::Tcp(stream) => stream.set_nonblocking(enabled),
-            // SSH pipe polling lands with the SSH client in a later part.
-            ApiStream::Ssh(_) => Ok(()),
+            // Non-blocking the child stdout pipe so the federation bounded reader's
+            // poll loop can enforce its deadline instead of blocking on a stall.
+            ApiStream::Ssh(pipe) => pipe.set_stdout_nonblocking(enabled),
         }
     }
 

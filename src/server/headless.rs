@@ -888,14 +888,18 @@ impl HeadlessServer {
         // NOTE: this failed-handoff socket-restore path does not have the loaded
         // config in scope (HeadlessServer stores only derived config fields), so
         // it restores the API + client sockets without re-binding the federation
-        // listener. Federation defaults to off, so passing the default here is
-        // safe; a live federation listener is re-established on the next normal
-        // server start. Threading config here would need a wider refactor.
+        // listener or outbound poll threads. Federation defaults to off, so
+        // passing the default config + a fresh empty store here is safe; a live
+        // federation listener and outbound client are re-established on the next
+        // normal server start. Threading config here would need a wider refactor.
         let api_server = api::start_server_with_stop_control(
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
             &crate::config::FederationConfig::default(),
+            Arc::new(std::sync::Mutex::new(
+                api::federation_store::FederationStore::default(),
+            )),
         )?;
 
         let client_path = client_socket_path();
@@ -3621,6 +3625,7 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
 
 // Tests
 // ---------------------------------------------------------------------------
