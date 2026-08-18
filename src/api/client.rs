@@ -1,29 +1,70 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use interprocess::local_socket::traits::Stream as _;
 use serde::de::DeserializeOwned;
 
 use crate::api::schema::{
     ErrorResponse, Method, PingParams, Request, ResponseResult, SuccessResponse,
 };
-use crate::ipc::LocalStream;
+use crate::api::ssh_transport;
+use crate::api::ApiStream;
+
+/// Credential used for an outbound SSH federation connection.
+///
+/// v1 supports key-based auth only. [`SshCredential::Password`] is reserved for
+/// a future version and is NOT implemented — constructing an SSH transport with
+/// it is rejected.
+// Constructed by the federation tests and the SSH transport now; CLI wiring that
+// builds these from `[federation]` peer config lands in a later part.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshCredential {
+    Key,
+    Password(String),
+}
+
+/// An outbound SSH federation target reached via `herdr api-bridge`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub user: Option<String>,
+    pub credential: SshCredential,
+}
 
 /// API connection target resolved by clients at the process edge.
+///
+/// The `Tcp`/`Ssh` federation variants are constructed by tests and the SSH
+/// transport now; the CLI surface that builds them from `[federation]` peer
+/// config lands in a later part, so they read as unconstructed in a non-test
+/// build until then.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionTarget {
     LocalSession(Option<String>),
     SocketPath(PathBuf),
+    /// A federation TCP peer. `token`, when set, is sent as the
+    /// `federation.hello` line right after connecting, before any request.
+    Tcp {
+        addr: SocketAddr,
+        token: Option<String>,
+    },
+    /// A federation peer reached over key-based SSH (`herdr api-bridge`).
+    Ssh(SshTarget),
 }
 
 impl ConnectionTarget {
+    /// Local socket path for the socket-backed targets. Only meaningful for
+    /// `LocalSession`/`SocketPath`; TCP and SSH targets have no socket path and
+    /// return an empty path (they never reach the local-connect path).
     fn socket_path(&self) -> PathBuf {
         match self {
             Self::LocalSession(None) => crate::api::socket_path(),
             Self::LocalSession(Some(name)) => crate::session::api_socket_path_for(Some(name)),
             Self::SocketPath(path) => path.clone(),
+            Self::Tcp { .. } | Self::Ssh(_) => PathBuf::new(),
         }
     }
 }
@@ -53,11 +94,38 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
+        // request_value is "the first line of request_stream": one request in,
+        // the first NDJSON reply out.
+        let mut lines = self.request_stream(request)?;
+        match lines.next() {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(err)) => Err(ApiClientError::Io(err)),
+            None => Err(ApiClientError::EmptyResponse),
+        }
+    }
 
-        let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+    /// Send `request` and yield every NDJSON reply line until the peer closes
+    /// the connection. A round-trip request yields exactly one line; a streaming
+    /// request (`events.subscribe`, `pane.stream`, …) yields many and terminates
+    /// when the stream closes.
+    ///
+    /// Works over every transport: Local/TCP connect then write the request and
+    /// read replies off the stream; SSH spawns a per-request `api-bridge` child
+    /// with the request embedded and reads replies off its stdout.
+    pub fn request_stream(&self, request: &Request) -> io::Result<ResponseLines> {
+        match &self.target {
+            ConnectionTarget::Ssh(target) => {
+                let json = serde_json::to_string(request)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                let stream = ssh_transport::spawn_request(target, &json)?;
+                Ok(ResponseLines::over(stream))
+            }
+            _ => {
+                let mut stream = self.connect()?;
+                write_request_line(&mut stream, request)?;
+                Ok(ResponseLines::over(stream))
+            }
+        }
     }
 
     pub fn request_value_with_timeout(
@@ -65,10 +133,23 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if let ConnectionTarget::Ssh(target) = &self.target {
+            // The per-request SSH child has no socket-level timeout knob; the
+            // ssh client's own ConnectTimeout/ServerAlive settings govern.
+            let json = serde_json::to_string(request)?;
+            let stream = ssh_transport::spawn_request(target, &json)?;
+            let mut lines = ResponseLines::over(stream);
+            return match lines.next() {
+                Some(Ok(value)) => Ok(value),
+                Some(Err(err)) => Err(ApiClientError::Io(err)),
+                None => Err(ApiClientError::EmptyResponse),
+            };
+        }
+
         let mut stream = self.connect()?;
-        set_timeout_best_effort(&stream, TimeoutKind::Send, timeout)?;
-        set_timeout_best_effort(&stream, TimeoutKind::Recv, timeout)?;
-        write_request(&mut stream, request)?;
+        set_timeout_best_effort(&mut stream, TimeoutKind::Send, timeout)?;
+        set_timeout_best_effort(&mut stream, TimeoutKind::Recv, timeout)?;
+        write_request_line(&mut stream, request)?;
 
         let mut reader = BufReader::new(stream);
         read_json_line(&mut reader)
@@ -93,8 +174,65 @@ impl ApiClient {
         }
     }
 
-    fn connect(&self) -> io::Result<LocalStream> {
-        crate::ipc::connect_local_stream(&self.socket_path())
+    /// Connect for the socket-backed and TCP transports (never SSH, which is
+    /// per-request). For TCP with a token, the `federation.hello` line is written
+    /// before this returns, so the caller may write the request immediately.
+    fn connect(&self) -> io::Result<ApiStream> {
+        match &self.target {
+            ConnectionTarget::LocalSession(_) | ConnectionTarget::SocketPath(_) => Ok(
+                ApiStream::Local(crate::ipc::connect_local_stream(&self.socket_path())?),
+            ),
+            ConnectionTarget::Tcp { addr, token } => {
+                let mut stream = ApiStream::Tcp(TcpStream::connect(addr)?);
+                if let Some(token) = token {
+                    write_federation_hello(&mut stream, token)?;
+                }
+                Ok(stream)
+            }
+            ConnectionTarget::Ssh(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ssh federation targets connect per-request; use request_value or request_stream",
+            )),
+        }
+    }
+}
+
+/// Iterator over the NDJSON reply lines of a request. Owns the underlying
+/// transport (including any SSH child process), so dropping it tears the
+/// connection down.
+pub struct ResponseLines {
+    reader: BufReader<ApiStream>,
+}
+
+impl ResponseLines {
+    fn over(stream: ApiStream) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+        }
+    }
+}
+
+impl Iterator for ResponseLines {
+    type Item = io::Result<serde_json::Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return None,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    return Some(
+                        serde_json::from_str(trimmed)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
+                    );
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
     }
 }
 
@@ -104,7 +242,7 @@ enum TimeoutKind {
 }
 
 fn set_timeout_best_effort(
-    stream: &LocalStream,
+    stream: &mut ApiStream,
     kind: TimeoutKind,
     timeout: Duration,
 ) -> io::Result<()> {
@@ -114,7 +252,8 @@ fn set_timeout_best_effort(
     };
     match result {
         Ok(()) => Ok(()),
-        #[cfg(windows)]
+        // Named-pipe / some transports report timeouts as unsupported; the
+        // request still proceeds without an enforced deadline.
         Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
         Err(err) => Err(err),
     }
@@ -155,16 +294,30 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-fn write_request(stream: &mut LocalStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+fn write_request_line(stream: &mut ApiStream, request: &Request) -> io::Result<()> {
+    let encoded = serde_json::to_string(request)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    stream.write_all(encoded.as_bytes())?;
     stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+    stream.flush()
 }
 
-fn read_json_line<T: DeserializeOwned>(
-    reader: &mut BufReader<LocalStream>,
-) -> Result<T, ApiClientError> {
+/// Write the `federation.hello` token line. Must match the exact shape the
+/// listener expects — both sides share [`crate::api::federation::FederationHello`].
+fn write_federation_hello(stream: &mut ApiStream, token: &str) -> io::Result<()> {
+    let line = crate::api::federation::FederationHello::new(token)
+        .to_line()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+fn read_json_line<T, R>(reader: &mut R) -> Result<T, ApiClientError>
+where
+    T: DeserializeOwned,
+    R: BufRead,
+{
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
     if read == 0 || line.trim().is_empty() {
@@ -204,5 +357,21 @@ mod tests {
         let path = PathBuf::from("/tmp/herdr-test.sock");
         let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
         assert_eq!(client.socket_path(), path);
+    }
+
+    #[test]
+    fn tcp_and_ssh_targets_have_no_socket_path() {
+        let tcp = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: "127.0.0.1:9000".parse().unwrap(),
+            token: Some("t".into()),
+        });
+        assert_eq!(tcp.socket_path(), PathBuf::new());
+
+        let ssh = ApiClient::for_target(ConnectionTarget::Ssh(SshTarget {
+            host: "example".into(),
+            user: None,
+            credential: SshCredential::Key,
+        }));
+        assert_eq!(ssh.socket_path(), PathBuf::new());
     }
 }

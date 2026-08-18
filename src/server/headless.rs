@@ -1455,10 +1455,17 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        // NOTE: this failed-handoff socket-restore path does not have the loaded
+        // config in scope (HeadlessServer stores only derived config fields), so
+        // it restores the API + client sockets without re-binding the federation
+        // listener. Federation defaults to off, so passing the default here is
+        // safe; a live federation listener is re-established on the next normal
+        // server start. Threading config here would need a wider refactor.
         let api_server = api::start_server_with_stop_control(
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            &crate::config::FederationConfig::default(),
         )?;
 
         let client_path = client_socket_path();
@@ -5042,6 +5049,7 @@ pub fn run_server() -> io::Result<()> {
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
+        &loaded_config.config.federation,
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -5193,6 +5201,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            &loaded_config.config.federation,
         )?;
         let mut server = HeadlessServer::new(
             app,
