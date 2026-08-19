@@ -1216,10 +1216,13 @@ fn finish_wait_response(
 
 /// For a method whose target can name a federated remote agent, a mutable
 /// reference to that target string; `None` for every other method. The agent
-/// methods carry it in `target`; the pane read/turns methods carry it in
-/// `pane_id` (W3 alias-prefixes every identity field, `pane_id` included). This
-/// is the exact set the outbound router may proxy — everything else falls through
-/// to local dispatch unchanged.
+/// methods carry it in `target`; the pane read/turns and pane send-text/send-input
+/// methods carry it in `pane_id` (W3 alias-prefixes every identity field, `pane_id`
+/// included). This is the exact set the outbound router may proxy — everything else
+/// falls through to local dispatch unchanged. `pane.send_text`/`pane.send_input`
+/// are the write path the app uses for a federated pane's keystrokes (control keys
+/// like S-Tab, `^C`, and Ctrl-chords); both are already `AllowedAt` on the inbound
+/// (peer) side, so routing them completes the send symmetry with `agent.send_keys`.
 fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
     match method {
         Method::AgentPrompt(params) => Some(&mut params.target),
@@ -1229,6 +1232,8 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::AgentExplain(params) => Some(&mut params.target),
         Method::PaneRead(params) => Some(&mut params.pane_id),
         Method::PaneTurns(params) => Some(&mut params.pane_id),
+        Method::PaneSendText(params) => Some(&mut params.pane_id),
+        Method::PaneSendInput(params) => Some(&mut params.pane_id),
         _ => None,
     }
 }
@@ -4399,6 +4404,27 @@ mod federation_tests {
         .unwrap();
         assert_eq!(
             routable_target_mut(&mut turns).map(|t| t.as_str()),
+            Some("remote/p")
+        );
+
+        // Pane send-text/send-input carry it in `pane_id` too — the write path the
+        // app uses for a federated pane's keystrokes (S-Tab / ^C / Ctrl-chords).
+        let mut send_text: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.send_text",
+            "params": { "pane_id": "remote/p", "text": "\u{1b}[Z" },
+        }))
+        .unwrap();
+        assert_eq!(
+            routable_target_mut(&mut send_text).map(|t| t.as_str()),
+            Some("remote/p")
+        );
+        let mut send_input: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.send_input",
+            "params": { "pane_id": "remote/p", "keys": ["c-c"] },
+        }))
+        .unwrap();
+        assert_eq!(
+            routable_target_mut(&mut send_input).map(|t| t.as_str()),
             Some("remote/p")
         );
 
