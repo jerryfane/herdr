@@ -22,6 +22,7 @@
 
 use std::io::{self, Write as _};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 
@@ -58,6 +59,31 @@ pub(crate) fn federation_bridge_command(remote_herdr: &str, arg: Option<&str>) -
     command
 }
 
+/// Managed ssh options for federation, built once and reused for every request.
+///
+/// Federation talks to many peers over one ssh config with per-peer ControlMaster
+/// multiplexing, so a single warm master per peer is reused across requests
+/// instead of paying a fresh SSH handshake each time, plus a ConnectTimeout so a
+/// dead or sleeping peer fails fast. Built lazily on first use; if the config dir
+/// cannot be created the error is logged once and `None` is cached so federation
+/// still works WITHOUT multiplexing rather than breaking.
+fn federation_ssh_options() -> Option<&'static crate::remote::ManagedSshOptions> {
+    static OPTIONS: OnceLock<Option<crate::remote::ManagedSshOptions>> = OnceLock::new();
+    OPTIONS
+        .get_or_init(|| match crate::remote::build_federation_ssh_options() {
+            Ok(options) => Some(options),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not build federation ssh multiplexing config; \
+                     falling back to plain per-request ssh"
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
 /// The SSH destination (`user@host` or bare `host`) for a target.
 fn destination(target: &SshTarget) -> String {
     match &target.user {
@@ -91,10 +117,11 @@ pub(crate) fn spawn_request(target: &SshTarget, request_json: &str) -> io::Resul
     };
 
     let mut command = Command::new("ssh");
-    // No managed-ssh options for federation yet; reuse the same application point
-    // as the interactive bridge so control-master/config support is a one-liner
-    // when federation grows it.
-    crate::remote::apply_managed_ssh_options(&mut command, None);
+    // Reuse warm per-peer ControlMaster connections via the managed federation ssh
+    // config (built once), and fail fast on a cold or dead peer via its
+    // ConnectTimeout. Falls back to plain per-request ssh if the config could not
+    // be built.
+    crate::remote::apply_managed_ssh_options(&mut command, federation_ssh_options());
     command
         .arg("-T")
         .arg(destination(target))
@@ -169,6 +196,42 @@ mod tests {
             .decode(arg)
             .unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), request);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn federation_ssh_command_uses_control_master_multiplexing() {
+        let options = federation_ssh_options().expect("federation ssh options built");
+        let mut command = Command::new("ssh");
+        crate::remote::apply_managed_ssh_options(&mut command, Some(options));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        // `-F <config>` selects the managed federation config.
+        let f_idx = args.iter().position(|arg| arg == "-F").expect("-F present");
+        // `-S <…/cm-%C>` is the per-peer control socket (ssh expands %C).
+        let s_idx = args.iter().position(|arg| arg == "-S").expect("-S present");
+        assert!(
+            args[s_idx + 1].ends_with("cm-%C"),
+            "control socket must be per-connection: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "ControlMaster=auto"),
+            "must enable ControlMaster=auto: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "ControlPersist=yes"),
+            "must enable ControlPersist=yes: {args:?}"
+        );
+
+        // The cached options intentionally leave the private config dir in place
+        // for the process lifetime; the test owns cleanup of what it created.
+        let config = std::path::PathBuf::from(&args[f_idx + 1]);
+        if let Some(dir) = config.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
