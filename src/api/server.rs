@@ -21,6 +21,7 @@ use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
     FEDERATION_PROTOCOL_VERSION,
 };
+use crate::api::federation_manager::FederationPeerManager;
 use crate::api::federation_store::{
     FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
 };
@@ -96,10 +97,12 @@ pub struct ServerHandle {
     /// Federation TCP accept thread, joined on drop. `None` when federation is
     /// not listening.
     federation_thread: Option<JoinHandle<()>>,
-    /// Outbound federation poll threads, one per peer that has an `endpoint`,
-    /// joined on drop. Empty when no peer has an endpoint (the byte-identical
-    /// no-federation path).
-    federation_client_threads: Vec<JoinHandle<()>>,
+    /// Manager for the outbound federation peer set — one poll thread per peer
+    /// with an `endpoint`, plus the outbound proxy registry. Shared with the
+    /// `App` so `reload-config` can add/remove/change peers live. Drives zero
+    /// threads and an empty registry when no peer has an endpoint (the
+    /// byte-identical no-federation path). Joined on drop via `join_all`.
+    federation_manager: Arc<FederationPeerManager>,
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
@@ -119,10 +122,9 @@ impl Drop for ServerHandle {
 
         // Outbound poll threads observe the cleared `running` between their short
         // sleep increments; a mid-flight poll is bounded by the request timeout,
-        // so joining them here returns promptly.
-        for thread in self.federation_client_threads.drain(..) {
-            let _ = thread.join();
-        }
+        // so joining them here returns promptly. `join_all` also drains any
+        // threads still being retired by a concurrent reconcile.
+        self.federation_manager.join_all();
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -135,6 +137,13 @@ impl Drop for ServerHandle {
 impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, &self.identity)
+    }
+
+    /// The shared outbound federation peer manager. Handed to the `App` so its
+    /// `reload-config` handler can reconcile the peer set live against the same
+    /// manager this server boot-spawned and reads on the hot proxy path.
+    pub fn federation_manager(&self) -> Arc<FederationPeerManager> {
+        Arc::clone(&self.federation_manager)
     }
 }
 
@@ -198,18 +207,22 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
 
-    // Alias→peer registry for the outbound proxy router (W4). Built once from the
-    // configured peers that have an `endpoint`; when none do the map is empty, the
-    // router never matches, and local behavior is byte-identical. Shared (as an
-    // `Arc`) with both the local and the federation accept loops.
-    let federation_peers = Arc::new(build_peer_registry(&federation.peers));
+    // Outbound federation peer manager: owns the per-peer poll threads and the
+    // alias→target proxy registry (W4). Boot-spawns the configured peer set from
+    // empty; when no peer has an `endpoint` this spawns zero threads and leaves
+    // an empty registry, so the router never matches and local behavior is
+    // byte-identical. Shared (as an `Arc`) with the `App` so `reload-config` can
+    // add/remove/change peers live.
+    let federation_manager =
+        FederationPeerManager::new(Arc::clone(&federation_store), Arc::clone(&running));
+    federation_manager.reconcile(&federation.peers);
 
     let listener_running = Arc::clone(&running);
     let listener_api_tx = api_tx.clone();
     let listener_event_hub = event_hub.clone();
     let listener_capabilities = capabilities.clone();
     let listener_server_stop = server_stop.clone();
-    let listener_federation_peers = Arc::clone(&federation_peers);
+    let listener_federation_manager = Arc::clone(&federation_manager);
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -219,8 +232,12 @@ fn start_server_inner(
                     let capabilities = listener_capabilities.clone();
                     let server_stop = listener_server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    let federation_peers = Arc::clone(&listener_federation_peers);
+                    let federation_manager = Arc::clone(&listener_federation_manager);
                     std::thread::spawn(move || {
+                        // Snapshot the outbound proxy registry per connection so a
+                        // concurrent reconcile (add/remove/change peer) is picked
+                        // up without restarting the accept loop.
+                        let federation_peers = federation_manager.registry_snapshot();
                         if let Err(err) = handle_connection_with_stop(
                             ApiStream::Local(stream),
                             &api_tx,
@@ -263,19 +280,15 @@ fn start_server_inner(
         &server_stop,
     );
 
-    // Outbound side: poll each configured peer that has an `endpoint`. When no
-    // peer has one this spawns zero threads and leaves the store empty, so the
-    // local `agent.list` path is unchanged.
-    let federation_client_threads = maybe_start_federation_client(
-        federation.peers.clone(),
-        Arc::clone(&federation_store),
-        Arc::clone(&running),
-    );
+    // Outbound side is owned by `federation_manager`, boot-spawned above via
+    // `reconcile(&federation.peers)` from an empty set. When no peer has an
+    // `endpoint` this drove zero threads and an empty registry, so the local
+    // `agent.list` path is unchanged.
 
     Ok(ServerHandle {
         _thread: thread,
         federation_thread,
-        federation_client_threads,
+        federation_manager,
         path,
         identity,
         running,
@@ -508,40 +521,19 @@ fn classify_accept_error(err: &io::Error) -> AcceptBackoff {
     }
 }
 
-/// Spawn one outbound poll thread per configured peer that has an `endpoint`.
+/// Poll one peer forever, updating `cache` after each attempt. Resolves the
+/// endpoint and token once up front; a bad endpoint logs and exits the thread
+/// rather than spinning.
 ///
-/// Each thread polls its peer's `agent.list` on [`FEDERATION_POLL_INTERVAL`],
-/// alias-prefixes the returned agents, and writes them into `cache` with a
-/// reachability derived from consecutive successes/failures. Peers without an
-/// endpoint are skipped — when NO peer has one this returns an empty `Vec` and
-/// spawns zero threads, so a daemon configured only for inbound federation (or
-/// no federation at all) behaves exactly as before, with an empty cache.
-fn maybe_start_federation_client(
-    peers: Vec<FederationPeer>,
-    cache: Arc<Mutex<FederationStore>>,
-    running: Arc<AtomicBool>,
-) -> Vec<JoinHandle<()>> {
-    let mut threads = Vec::new();
-    for peer in peers {
-        if peer.endpoint.is_none() {
-            continue;
-        }
-        let cache = Arc::clone(&cache);
-        let running = Arc::clone(&running);
-        threads.push(std::thread::spawn(move || {
-            run_federation_peer_poll(peer, cache, running);
-        }));
-    }
-    threads
-}
-
-/// Poll one peer forever (until `running` clears), updating `cache` after each
-/// attempt. Resolves the endpoint and token once up front; a bad endpoint logs
-/// and exits the thread rather than spinning.
-fn run_federation_peer_poll(
+/// The thread runs until EITHER the global `running` flag clears (daemon
+/// shutdown) OR this peer's own `peer_stop` flag is set (the manager retiring
+/// this peer on a `reload-config` reconcile). `peer_stop` is per-peer so one
+/// removed peer can be stopped without disturbing the others.
+pub(crate) fn run_federation_peer_poll(
     peer: FederationPeer,
     cache: Arc<Mutex<FederationStore>>,
     running: Arc<AtomicBool>,
+    peer_stop: Arc<AtomicBool>,
 ) {
     let Some(endpoint) = peer.endpoint.as_deref() else {
         return; // guarded by the caller; keeps the thread body self-contained
@@ -557,15 +549,21 @@ fn run_federation_peer_poll(
     let client = ApiClient::for_target(target);
     let mut tracker = ReachabilityTracker::default();
 
-    while running.load(Ordering::Relaxed) {
-        let reachability =
-            poll_once_into_cache(&client, &peer.alias, &cache, &mut tracker, &running);
+    while running.load(Ordering::Relaxed) && !peer_stop.load(Ordering::Relaxed) {
+        let reachability = poll_once_into_cache(
+            &client,
+            &peer.alias,
+            &cache,
+            &mut tracker,
+            &running,
+            &peer_stop,
+        );
         let interval = if reachability == Reachability::Reachable {
             FEDERATION_POLL_INTERVAL
         } else {
             failure_backoff(FEDERATION_POLL_INTERVAL)
         };
-        sleep_interruptible(&running, interval);
+        sleep_interruptible(&running, &peer_stop, interval);
     }
     debug!(alias = %peer.alias, "federation peer poll thread exiting");
 }
@@ -582,6 +580,7 @@ fn poll_once_into_cache(
     cache: &Mutex<FederationStore>,
     tracker: &mut ReachabilityTracker,
     running: &Arc<AtomicBool>,
+    peer_stop: &Arc<AtomicBool>,
 ) -> Reachability {
     match poll_peer_agent_list(client, running) {
         Ok(agents) => {
@@ -593,6 +592,17 @@ fn poll_once_into_cache(
             let mut store = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Race guard for a changed peer: the manager sets this peer's
+            // `peer_stop` AND evicts the alias while holding this same store
+            // Mutex, so checking `peer_stop` here — WHILE HOLDING the lock, just
+            // before the write — serializes a retiring thread against the
+            // reconcile. If stop is set, skip the write so a stale entry can
+            // never reappear after the alias was evicted (or be overwritten by
+            // the newly spawned thread for the same alias). The store Mutex is
+            // the happens-before edge between the two, so `Relaxed` is correct.
+            if peer_stop.load(Ordering::Relaxed) {
+                return reachability;
+            }
             store.set_peer(
                 alias.to_string(),
                 PeerCacheEntry::reachable(prefixed, Instant::now()),
@@ -605,6 +615,12 @@ fn poll_once_into_cache(
             let mut store = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Same under-lock stop guard as the success arm: never degrade an
+            // alias the reconcile has already evicted (the Mutex is the
+            // happens-before edge, so `Relaxed` is correct).
+            if peer_stop.load(Ordering::Relaxed) {
+                return reachability;
+            }
             store.degrade_peer(alias, reachability);
             reachability
         }
@@ -641,7 +657,7 @@ fn read_peer_token(peer: &FederationPeer) -> Option<String> {
 /// proxying. A peer with no endpoint, or whose endpoint fails to parse, is skipped
 /// (the latter logged). When no peer has a usable endpoint the map is empty — the
 /// router then never matches and local behavior is byte-identical.
-fn build_peer_registry(peers: &[FederationPeer]) -> HashMap<String, ConnectionTarget> {
+pub(crate) fn build_peer_registry(peers: &[FederationPeer]) -> HashMap<String, ConnectionTarget> {
     let mut registry = HashMap::new();
     for peer in peers {
         let Some(endpoint) = peer.endpoint.as_deref() else {
@@ -723,12 +739,14 @@ fn prefix_remote_agent(
     agent
 }
 
-/// Sleep up to `total`, waking every [`FEDERATION_POLL_STEP`] to re-check
-/// `running`, so a shutdown is not delayed by the poll interval.
-fn sleep_interruptible(running: &Arc<AtomicBool>, total: Duration) {
+/// Sleep up to `total`, waking every [`FEDERATION_POLL_STEP`] to re-check the
+/// stop flags, so neither a shutdown nor a `reload-config` peer retirement is
+/// delayed by the poll interval. Returns early the moment EITHER `running`
+/// clears (daemon shutdown) OR `peer_stop` is set (this peer removed/changed).
+fn sleep_interruptible(running: &Arc<AtomicBool>, peer_stop: &Arc<AtomicBool>, total: Duration) {
     let mut elapsed = Duration::ZERO;
     while elapsed < total {
-        if !running.load(Ordering::Relaxed) {
+        if !running.load(Ordering::Relaxed) || peer_stop.load(Ordering::Relaxed) {
             return;
         }
         let step = FEDERATION_POLL_STEP.min(total - elapsed);
@@ -3666,97 +3684,153 @@ mod federation_tests {
         path
     }
 
-    /// The poll thread against a live seeded listener caches the peer's agent
-    /// alias-prefixed and `Reachable`, rewriting all five identity fields plus
-    /// `machine_id`.
-    #[test]
-    fn federation_client_caches_alias_prefixed_reachable_agents() {
-        let token = "poll-secret";
+    /// Shared token every seeded loopback peer gates on. The per-peer token
+    /// FILES are distinct paths (from `unique_token_file`) but hold this same
+    /// value, so a peer can authenticate to any of them.
+    const SEEDED_PEER_TOKEN: &str = "poll-secret";
 
-        // Listener that gates on `token`, plus an app responder that answers
-        // `agent.list` with one seeded working agent.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback federation listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let event_hub = EventHub::default();
-        let listener_running = Arc::new(AtomicBool::new(true));
-        let listener_thread = spawn_federation_listener(
-            listener,
-            one_peer(token, CapabilityTier::Observe),
-            api_tx,
-            event_hub,
-            None,
-            Arc::clone(&listener_running),
-            None,
-        )
-        .expect("spawn federation listener");
-        let responder = std::thread::spawn(move || {
-            while let Some(msg) = api_rx.blocking_recv() {
-                let response = match msg.request.method {
-                    Method::AgentList(_) => serde_json::to_string(&SuccessResponse {
-                        id: msg.request.id,
-                        result: ResponseResult::AgentList {
-                            agents: vec![seeded_agent(AgentStatus::Working, "builder")],
-                        },
-                    })
-                    .expect("encode agent.list response"),
-                    _ => error_response_json(
-                        msg.request.id,
-                        "unexpected_dispatch",
-                        "only agent.list is expected in this test".into(),
-                    ),
-                };
-                let _ = msg.respond_to.send(response);
+    /// A live loopback federation peer that answers `agent.list` with one seeded
+    /// working agent named `agent_name`. Used by the manager reconcile tests.
+    struct SeededPeer {
+        addr: std::net::SocketAddr,
+        token_path: PathBuf,
+        running: Arc<AtomicBool>,
+        listener: JoinHandle<()>,
+        responder: JoinHandle<()>,
+    }
+
+    impl SeededPeer {
+        /// Bind a loopback listener + responder returning one `agent_name` agent.
+        fn spawn(agent_name: &'static str) -> Self {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind loopback federation listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let event_hub = EventHub::default();
+            let running = Arc::new(AtomicBool::new(true));
+            let listener_thread = spawn_federation_listener(
+                listener,
+                one_peer(SEEDED_PEER_TOKEN, CapabilityTier::Observe),
+                api_tx,
+                event_hub,
+                None,
+                Arc::clone(&running),
+                None,
+            )
+            .expect("spawn federation listener");
+            let responder = std::thread::spawn(move || {
+                while let Some(msg) = api_rx.blocking_recv() {
+                    let response = match msg.request.method {
+                        Method::AgentList(_) => serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::AgentList {
+                                agents: vec![seeded_agent(AgentStatus::Working, agent_name)],
+                            },
+                        })
+                        .expect("encode agent.list response"),
+                        _ => error_response_json(
+                            msg.request.id,
+                            "unexpected_dispatch",
+                            "only agent.list is expected in this test".into(),
+                        ),
+                    };
+                    let _ = msg.respond_to.send(response);
+                }
+            });
+            let token_path = unique_token_file(SEEDED_PEER_TOKEN);
+            Self {
+                addr,
+                token_path,
+                running,
+                listener: listener_thread,
+                responder,
             }
-        });
+        }
 
-        // Point one outbound poll thread at the listener over loopback TCP.
-        let token_path = unique_token_file(token);
-        let peer = FederationPeer {
-            alias: "home".into(),
+        /// Stop the listener + responder and remove the token file. Call AFTER the
+        /// manager's poll threads are joined so any in-flight poll completes.
+        fn shutdown(self) {
+            self.running.store(false, Ordering::Relaxed);
+            let _ = self.listener.join();
+            let _ = self.responder.join();
+            let _ = std::fs::remove_file(&self.token_path);
+        }
+    }
+
+    /// Build an outbound `FederationPeer` targeting `addr` over loopback TCP.
+    fn reachable_peer_on(
+        addr: std::net::SocketAddr,
+        alias: &str,
+        token_path: &Path,
+    ) -> FederationPeer {
+        FederationPeer {
+            alias: alias.into(),
             endpoint: Some(format!("tcp://{addr}")),
             token_file: Some(token_path.to_string_lossy().into_owned()),
             expected_node_id: None,
             capability: CapabilityTier::Observe,
-        };
-        let cache = Arc::new(Mutex::new(FederationStore::default()));
-        let client_running = Arc::new(AtomicBool::new(true));
-        let client_threads = maybe_start_federation_client(
-            vec![peer],
-            Arc::clone(&cache),
-            Arc::clone(&client_running),
-        );
-        assert_eq!(
-            client_threads.len(),
-            1,
-            "one endpoint peer → one poll thread"
-        );
+        }
+    }
 
-        // The first poll fires immediately, so the cache populates fast.
-        let mut cached = false;
+    /// Poll the store until `alias` is cached `Reachable` with its first agent
+    /// named `expected_name`, or a bounded ~3s wait elapses. Returns whether it
+    /// converged.
+    fn wait_for_cached(
+        cache: &Arc<Mutex<FederationStore>>,
+        alias: &str,
+        expected_name: &str,
+    ) -> bool {
         for _ in 0..300 {
             {
                 let store = cache.lock().expect("cache lock");
-                if let Some(entry) = store.peer("home") {
-                    if entry.reachability == Reachability::Reachable && !entry.agents.is_empty() {
-                        let agent = &entry.agents[0];
-                        assert_eq!(agent.name.as_deref(), Some("home/builder"));
-                        assert_eq!(agent.terminal_id, "home/term-remote");
-                        assert_eq!(agent.workspace_id, "home/ws-remote");
-                        assert_eq!(agent.tab_id, "home/tab-remote");
-                        assert_eq!(agent.pane_id, "home/pane-remote");
-                        assert_eq!(agent.machine_id.as_deref(), Some("home"));
-                        cached = true;
-                        break;
+                if let Some(entry) = store.peer(alias) {
+                    if entry.reachability == Reachability::Reachable
+                        && entry.agents.first().and_then(|a| a.name.as_deref())
+                            == Some(expected_name)
+                    {
+                        return true;
                     }
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        false
+    }
+
+    /// The manager, reconciled with one endpoint peer, spawns a poll thread that
+    /// caches the peer's agent alias-prefixed and `Reachable`, rewriting all five
+    /// identity fields plus `machine_id`, and registers a proxy route for it.
+    #[test]
+    fn federation_client_caches_alias_prefixed_reachable_agents() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        manager.reconcile(&[reachable_peer_on(
+            peer_srv.addr,
+            "home",
+            &peer_srv.token_path,
+        )]);
+        assert_eq!(
+            manager.live_aliases(),
+            vec!["home".to_string()],
+            "one endpoint peer → one poll thread"
+        );
+
+        // The first poll fires immediately, so the cache populates fast.
         assert!(
-            cached,
+            wait_for_cached(&cache, "home", "home/builder"),
             "poll thread did not cache the reachable prefixed agent"
         );
+        {
+            let store = cache.lock().expect("cache lock");
+            let agent = &store.peer("home").expect("home cached").agents[0];
+            assert_eq!(agent.terminal_id, "home/term-remote");
+            assert_eq!(agent.workspace_id, "home/ws-remote");
+            assert_eq!(agent.tab_id, "home/tab-remote");
+            assert_eq!(agent.pane_id, "home/pane-remote");
+            assert_eq!(agent.machine_id.as_deref(), Some("home"));
+        }
 
         // The read/merge helper stamps a reachable peer as-is with the status.
         let merged = cache.lock().expect("cache lock").merged_agents();
@@ -3765,17 +3839,13 @@ mod federation_tests {
         assert_eq!(merged[0].reachability, Some(Reachability::Reachable));
         assert_eq!(merged[0].last_known_status, None);
 
-        // Teardown: stop the client (in-flight poll completes against the still-up
-        // listener), then the listener, which drops the last app sender and ends
-        // the responder.
-        client_running.store(false, Ordering::Relaxed);
-        for thread in client_threads {
-            let _ = thread.join();
-        }
-        listener_running.store(false, Ordering::Relaxed);
-        let _ = listener_thread.join();
-        let _ = responder.join();
-        let _ = std::fs::remove_file(&token_path);
+        // The outbound proxy registry has a route for the peer.
+        assert!(manager.registry_snapshot().contains_key("home"));
+
+        // Teardown: join the poll thread (its in-flight poll completes against the
+        // still-up listener), then stop the listener + responder.
+        manager.join_all();
+        peer_srv.shutdown();
     }
 
     /// The poll→cache path degrades a peer that stops answering: two misses keep
@@ -3812,6 +3882,9 @@ mod federation_tests {
             token: Some("t".into()),
         });
         let running = Arc::new(AtomicBool::new(true));
+        // A live (unset) per-peer stop flag: the under-lock guard must NOT skip
+        // these writes.
+        let peer_stop = Arc::new(AtomicBool::new(false));
         let mut tracker = ReachabilityTracker::default();
 
         // First two misses: Degraded. The last-known agents are retained in the
@@ -3819,11 +3892,11 @@ mod federation_tests {
         // (an honest-offline peer never shows a stale idle/done) with the real
         // status preserved in `last_known_status`.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
             Reachability::Degraded
         );
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
             Reachability::Degraded
         );
         {
@@ -3839,7 +3912,7 @@ mod federation_tests {
 
         // Third miss: Unreachable → the read helper still stamps Unknown + last-known.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running),
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
             Reachability::Unreachable
         );
         let merged = cache.lock().expect("cache lock").merged_agents();
@@ -3857,23 +3930,289 @@ mod federation_tests {
         assert_eq!(tracker.record_success(), Reachability::Reachable);
     }
 
-    /// With no peer configured with an endpoint, the manager spawns zero threads
-    /// and leaves the cache empty — the byte-identical no-federation path.
+    /// A peer with no `endpoint` is inbound-only: reconcile spawns no thread, adds
+    /// no proxy route, and writes nothing to the store — the byte-identical
+    /// no-outbound-federation path.
     #[test]
-    fn federation_client_without_endpoints_spawns_no_threads() {
+    fn reconcile_ignores_inbound_only_peer() {
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let peers = vec![FederationPeer {
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        manager.reconcile(&[FederationPeer {
             alias: "listen-only".into(),
             endpoint: None,
             token_file: None,
             expected_node_id: None,
             capability: CapabilityTier::Observe,
-        }];
-        let threads =
-            maybe_start_federation_client(peers, Arc::clone(&cache), Arc::clone(&running));
-        assert!(threads.is_empty(), "no endpoint peer must spawn no thread");
+        }]);
+        assert!(
+            manager.live_aliases().is_empty(),
+            "an endpoint-less peer must spawn no thread"
+        );
+        assert!(
+            manager.registry_snapshot().is_empty(),
+            "an endpoint-less peer must not be routable for proxying"
+        );
         assert!(cache.lock().expect("cache lock").is_empty());
+        manager.join_all();
+    }
+
+    /// `reconcile(&[])` from empty is byte-identical to no federation: zero
+    /// threads, an empty registry, an empty store, and no merged agents. And a
+    /// full teardown (peers → none) leaves the same clean state.
+    #[test]
+    fn reconcile_empty_is_byte_identical() {
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        // From empty.
+        manager.reconcile(&[]);
+        assert!(manager.live_aliases().is_empty());
+        assert!(manager.registry_snapshot().is_empty());
+        assert!(cache.lock().expect("cache lock").is_empty());
+        assert!(cache.lock().expect("cache lock").merged_agents().is_empty());
+
+        // Full teardown: bring a peer up, then reconcile back to empty.
+        let peer_srv = SeededPeer::spawn("builder");
+        manager.reconcile(&[reachable_peer_on(
+            peer_srv.addr,
+            "home",
+            &peer_srv.token_path,
+        )]);
+        assert!(wait_for_cached(&cache, "home", "home/builder"));
+        manager.reconcile(&[]);
+        assert!(
+            manager.live_aliases().is_empty(),
+            "teardown stops all threads"
+        );
+        assert!(
+            manager.registry_snapshot().is_empty(),
+            "teardown empties registry"
+        );
+        assert!(
+            cache.lock().expect("cache lock").is_empty(),
+            "teardown evicts every peer from the store"
+        );
+        assert!(cache.lock().expect("cache lock").merged_agents().is_empty());
+
+        manager.join_all();
+        peer_srv.shutdown();
+    }
+
+    /// Adding a second peer on a later reconcile spawns its thread and caches its
+    /// agents without disturbing the first peer.
+    #[test]
+    fn reconcile_adds_second_peer_both_cached() {
+        let peer_a = SeededPeer::spawn("a-agent");
+        let peer_b = SeededPeer::spawn("b-agent");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        // First reconcile: only A.
+        manager.reconcile(&[reachable_peer_on(peer_a.addr, "A", &peer_a.token_path)]);
+        assert!(wait_for_cached(&cache, "A", "A/a-agent"));
+        assert_eq!(manager.live_aliases(), vec!["A".to_string()]);
+
+        // Second reconcile: A (unchanged) and B (added).
+        manager.reconcile(&[
+            reachable_peer_on(peer_a.addr, "A", &peer_a.token_path),
+            reachable_peer_on(peer_b.addr, "B", &peer_b.token_path),
+        ]);
+        assert!(wait_for_cached(&cache, "B", "B/b-agent"));
+        assert_eq!(
+            manager.live_aliases(),
+            vec!["A".to_string(), "B".to_string()]
+        );
+        {
+            // A stayed cached across the add.
+            let store = cache.lock().expect("cache lock");
+            assert_eq!(
+                store.peer("A").expect("A still cached").agents[0]
+                    .name
+                    .as_deref(),
+                Some("A/a-agent")
+            );
+        }
+        let registry = manager.registry_snapshot();
+        assert!(registry.contains_key("A") && registry.contains_key("B"));
+
+        manager.join_all();
+        peer_a.shutdown();
+        peer_b.shutdown();
+    }
+
+    /// Removing a peer on reconcile evicts it from the registry and the store
+    /// immediately, stops its thread (which reaches `is_finished()` within a
+    /// bounded wait, without block-joining on the test's critical path), and
+    /// leaves the other peer cached.
+    #[test]
+    fn reconcile_removes_peer_stops_thread_and_evicts_store() {
+        let peer_a = SeededPeer::spawn("a-agent");
+        let peer_b = SeededPeer::spawn("b-agent");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        manager.reconcile(&[
+            reachable_peer_on(peer_a.addr, "A", &peer_a.token_path),
+            reachable_peer_on(peer_b.addr, "B", &peer_b.token_path),
+        ]);
+        assert!(wait_for_cached(&cache, "A", "A/a-agent"));
+        assert!(wait_for_cached(&cache, "B", "B/b-agent"));
+
+        // Reconcile to just B: A is removed.
+        manager.reconcile(&[reachable_peer_on(peer_b.addr, "B", &peer_b.token_path)]);
+
+        // A is evicted synchronously from the store and the registry; B remains.
+        assert!(
+            cache.lock().expect("cache lock").peer("A").is_none(),
+            "removed peer A must be evicted from the store immediately"
+        );
+        assert!(cache.lock().expect("cache lock").peer("B").is_some());
+        let registry = manager.registry_snapshot();
+        assert!(
+            !registry.contains_key("A"),
+            "A must leave the proxy registry"
+        );
+        assert!(registry.contains_key("B"));
+        assert_eq!(manager.live_aliases(), vec!["B".to_string()]);
+
+        // A's retired thread reaches `is_finished()` within a bounded wait; the
+        // reaper joins it only once finished, never blocking this path.
+        let mut reaped = false;
+        for _ in 0..300 {
+            if manager.reap_and_count_pending() == 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reaped,
+            "removed peer A's poll thread did not finish within the bounded wait"
+        );
+
+        manager.join_all();
+        peer_a.shutdown();
+        peer_b.shutdown();
+    }
+
+    /// Re-pointing an alias at a new endpoint retires the old thread and spawns a
+    /// new one: the cache converges to the NEW addr's agent and never flaps back
+    /// to a stale entry from the retiring old thread (exercises the
+    /// under-store-lock stop guard), and the registry points at the new addr.
+    #[test]
+    fn reconcile_changed_endpoint_respawns() {
+        let peer_old = SeededPeer::spawn("old-agent");
+        let peer_new = SeededPeer::spawn("new-agent");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        // Alias A points at the OLD addr.
+        manager.reconcile(&[reachable_peer_on(peer_old.addr, "A", &peer_old.token_path)]);
+        assert!(wait_for_cached(&cache, "A", "A/old-agent"));
+
+        // Re-point alias A at the NEW addr: endpoint changed → respawn.
+        manager.reconcile(&[reachable_peer_on(peer_new.addr, "A", &peer_new.token_path)]);
+        assert_eq!(manager.live_aliases(), vec!["A".to_string()]);
+
+        // The registry now routes A at the new addr.
+        match manager.registry_snapshot().get("A") {
+            Some(ConnectionTarget::Tcp { addr, .. }) => assert_eq!(*addr, peer_new.addr),
+            other => panic!("expected A to route to the new tcp addr, got {other:?}"),
+        }
+
+        // The cache converges to the NEW addr's agent.
+        assert!(
+            wait_for_cached(&cache, "A", "A/new-agent"),
+            "cache did not converge to the re-pointed endpoint's agent"
+        );
+
+        // And it STAYS the new agent — the retiring old thread's under-lock stop
+        // guard means it can never overwrite the evicted+respawned alias with a
+        // stale "A/old-agent" entry.
+        for _ in 0..20 {
+            {
+                let store = cache.lock().expect("cache lock");
+                let entry = store.peer("A").expect("A cached");
+                assert_eq!(
+                    entry.agents[0].name.as_deref(),
+                    Some("A/new-agent"),
+                    "a retiring thread must never write a stale entry after eviction"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        manager.join_all();
+        peer_old.shutdown();
+        peer_new.shutdown();
+    }
+
+    /// The under-store-lock stop guard skips the DEGRADE (miss) write once the
+    /// peer's stop flag is set: the miss is still counted, but no cache entry is
+    /// created for the evicted alias.
+    #[test]
+    fn poll_once_skips_degrade_write_when_peer_stop_set() {
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let dead_addr = {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe addr")
+        };
+        let client = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: dead_addr,
+            token: Some("t".into()),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        // The peer is already retiring: the guard must skip the write.
+        let peer_stop = Arc::new(AtomicBool::new(true));
+        let mut tracker = ReachabilityTracker::default();
+
+        let reachability =
+            poll_once_into_cache(&client, "gone", &cache, &mut tracker, &running, &peer_stop);
+        assert_eq!(
+            reachability,
+            Reachability::Degraded,
+            "the miss is still counted even though the write is skipped"
+        );
+        assert!(
+            cache.lock().expect("cache lock").peer("gone").is_none(),
+            "a stopped peer's degrade write must be skipped, leaving no entry"
+        );
+        assert!(cache.lock().expect("cache lock").is_empty());
+    }
+
+    /// The under-store-lock stop guard also skips the SUCCESS (set) write once the
+    /// peer's stop flag is set: the poll succeeds, but nothing is cached for the
+    /// evicted alias.
+    #[test]
+    fn poll_once_skips_set_write_when_peer_stop_set() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let client = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: peer_srv.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let peer_stop = Arc::new(AtomicBool::new(true));
+        let mut tracker = ReachabilityTracker::default();
+
+        let reachability =
+            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop);
+        assert_eq!(
+            reachability,
+            Reachability::Reachable,
+            "the poll itself still succeeds"
+        );
+        assert!(
+            cache.lock().expect("cache lock").peer("home").is_none(),
+            "a stopped peer's successful write must be skipped, leaving no entry"
+        );
+
+        peer_srv.shutdown();
     }
 
     /// FIX 3: the home OWNS the federation fields. A malicious/faulty peer cannot
@@ -3955,21 +4294,12 @@ mod federation_tests {
         });
 
         let token_path = unique_token_file("hostile-token");
-        let peer = FederationPeer {
-            alias: "home".into(),
-            endpoint: Some(format!("tcp://{addr}")),
-            token_file: Some(token_path.to_string_lossy().into_owned()),
-            expected_node_id: None,
-            capability: CapabilityTier::Observe,
-        };
+        let peer = reachable_peer_on(addr, "home", &token_path);
         let cache = Arc::new(Mutex::new(FederationStore::default()));
-        let client_running = Arc::new(AtomicBool::new(true));
-        let client_threads = maybe_start_federation_client(
-            vec![peer],
-            Arc::clone(&cache),
-            Arc::clone(&client_running),
-        );
-        assert_eq!(client_threads.len(), 1);
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        manager.reconcile(&[peer]);
+        assert_eq!(manager.live_aliases(), vec!["home".to_string()]);
 
         // The over-cap response is rejected, so the peer is recorded as a miss
         // (Degraded on the first failure) rather than caching any agents.
@@ -3991,13 +4321,15 @@ mod federation_tests {
             "an oversized peer response must degrade the peer, not cache agents"
         );
 
-        // Shutdown must join the poll thread promptly (the bounded read can't hang).
-        client_running.store(false, Ordering::Relaxed);
+        // Shutdown must join the poll thread promptly (the bounded read can't
+        // hang). Mirror `ServerHandle::drop`: clear `running` — which aborts any
+        // in-flight bounded read — then `join_all`.
         let (join_tx, join_rx) = std::sync::mpsc::channel();
+        let manager_for_join = Arc::clone(&manager);
+        let running_for_join = Arc::clone(&running);
         std::thread::spawn(move || {
-            for thread in client_threads {
-                let _ = thread.join();
-            }
+            running_for_join.store(false, Ordering::Relaxed);
+            manager_for_join.join_all();
             let _ = join_tx.send(());
         });
         join_rx

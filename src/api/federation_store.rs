@@ -144,6 +144,14 @@ impl FederationStore {
         }
     }
 
+    /// Evict a peer's cache entry so its agents stop being merged into
+    /// `agent.list` immediately on removal/change. Called by the federation peer
+    /// manager's `reconcile` when a peer is dropped or re-pointed, so a removed
+    /// peer's last-known agents never linger past the reload.
+    pub fn remove_peer(&mut self, alias: &str) {
+        self.peers.remove(alias);
+    }
+
     /// Whether any peer is cached. Empty means federation contributed nothing.
     /// Exercised by the no-federation regression tests; the merge path does not
     /// need it (extending by an empty set is a no-op), so it reads as unused in a
@@ -335,5 +343,34 @@ mod tests {
             .expect("ghost recorded")
             .agents
             .is_empty());
+    }
+
+    #[test]
+    fn remove_peer_evicts_entry_and_clears_merge() {
+        let mut store = FederationStore::default();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![agent(AgentStatus::Working, "home/builder")],
+                Instant::now(),
+            ),
+        );
+        assert!(store.peer("home").is_some());
+        assert_eq!(store.merged_agents().len(), 1);
+
+        store.remove_peer("home");
+        assert!(
+            store.peer("home").is_none(),
+            "removed peer must leave no cache entry"
+        );
+        assert!(
+            store.merged_agents().is_empty(),
+            "a removed peer contributes no merged agents"
+        );
+        assert!(store.is_empty());
+
+        // Removing an absent alias is a no-op, not a panic.
+        store.remove_peer("home");
+        assert!(store.is_empty());
     }
 }

@@ -846,6 +846,9 @@ fn main() -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
+    // The outbound federation peer manager the API server boot-spawned; shared
+    // with the App so `reload-config` reconciles the peer set live.
+    let fed_mgr = _api_server.federation_manager();
 
     let modify_other_keys_mode = crate::input::host_modify_other_keys_mode();
 
@@ -914,6 +917,7 @@ fn main() -> io::Result<()> {
             event_hub,
         );
         app.set_federation_store(federation_store.clone());
+        app.set_federation_manager(fed_mgr);
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.
