@@ -115,6 +115,11 @@ pub(super) fn serve(
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
+    // Capture the viewer id from the OPEN params before they are moved into the
+    // open request, so the synthesized close can drop exactly this viewer's width
+    // lease (#137). The close params are built fresh below and would otherwise
+    // carry no viewer id.
+    let viewer_id = params.viewer_id.clone();
     let max_frame_bytes = clamp_max_frame_bytes(params.max_frame_bytes);
 
     // Validate + attach + publish the ring on the app loop.
@@ -139,7 +144,7 @@ pub(super) fn serve(
     } else {
         write_text_line_allow_disconnect(&mut stream, &open_response)
     };
-    dispatch_close(&pane_id, api_tx);
+    dispatch_close(&pane_id, viewer_id, api_tx);
     result
 }
 
@@ -306,7 +311,7 @@ fn swallow_disconnect(err: std::io::Error) -> std::io::Result<()> {
     }
 }
 
-fn dispatch_close(pane_id: &str, api_tx: &ApiRequestSender) {
+fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestSender) {
     let _response = dispatch_to_app_with_timeout(
         Request {
             id: format!("pane.stream.close:{pane_id}"),
@@ -317,6 +322,8 @@ fn dispatch_close(pane_id: &str, api_tx: &ApiRequestSender) {
                 epoch: None,
                 max_frame_bytes: None,
                 scrollback_lines: None,
+                // Threaded from the open so the close drops this viewer's lease.
+                viewer_id,
             }),
         },
         api_tx,

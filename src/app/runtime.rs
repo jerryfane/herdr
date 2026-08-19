@@ -40,6 +40,7 @@ impl App {
         }
     }
 
+
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
@@ -71,6 +72,243 @@ impl App {
         self.sync_agent_metadata_deadline();
     }
 
+    /// Width-lease TTL sweep + debounced-shrink application (#137). Mirrors
+    /// [`App::expire_due_metadata`]: invoked from the same tick sites with an
+    /// injected `now`, never on the per-render path. Evicts expired leases and,
+    /// for terminals whose effective width changed (a lease expired, or a
+    /// scheduled shrink came due), reconciles the PTY winsize. Returns true when
+    /// a resize was applied or a lease was evicted (both warrant a render — an
+    /// evicted last lease lets the TUI reclaim the layout width via the gate).
+    pub(crate) fn expire_pty_leases_and_apply_shrinks(&mut self, now: Instant) -> bool {
+        if self.state.pty_width_leases.is_empty() && self.state.pty_pending_shrinks.is_empty() {
+            return false;
+        }
+
+        // 1. Evict expired leases, collecting terminals whose lease set changed.
+        let mut dirty: std::collections::HashSet<crate::terminal::TerminalId> =
+            std::collections::HashSet::new();
+        let mut evicted_any = false;
+        self.state.pty_width_leases.retain(|terminal_id, viewers| {
+            let before = viewers.len();
+            viewers.retain(|_, lease| lease.expires_at > now);
+            if viewers.len() != before {
+                evicted_any = true;
+                dirty.insert(terminal_id.clone());
+            }
+            !viewers.is_empty()
+        });
+
+        // 2. Terminals whose scheduled shrink's debounce has elapsed also need a
+        //    reconcile to apply it.
+        for (terminal_id, pending) in &self.state.pty_pending_shrinks {
+            if now >= pending.deadline {
+                dirty.insert(terminal_id.clone());
+            }
+        }
+
+        // 3. Reconcile each dirty terminal via its current pane location.
+        let mut applied = false;
+        if !dirty.is_empty() {
+            for (ws_idx, pane_id, terminal_id) in self.state.pane_locations_for_terminals(&dirty) {
+                // The sweep only ever applies debounced shrinks (or grows that
+                // race in), never an immediate shrink.
+                applied |= self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, false);
+            }
+        }
+
+        // 4. Drop pending shrinks for terminals that no longer have any lease
+        //    (all leases expired, or the pane vanished) — nothing to shrink to.
+        if !self.state.pty_pending_shrinks.is_empty() {
+            let leased: std::collections::HashSet<crate::terminal::TerminalId> =
+                self.state.pty_width_leases.keys().cloned().collect();
+            self.state
+                .pty_pending_shrinks
+                .retain(|terminal_id, _| leased.contains(terminal_id));
+        }
+
+        applied || evicted_any
+    }
+
+    /// Reconcile a terminal's real PTY winsize toward the width arbiter's
+    /// effective size (#137). Grows (or an unchanged size) always apply
+    /// immediately. Shrinks apply immediately when `immediate` is set — used for
+    /// an explicit synchronous `pane.set_pty_size` call (a set, or a release with
+    /// other viewers still attached), which the caller expects to take effect at
+    /// once — and are otherwise deferred behind a per-terminal debounce deadline
+    /// that the sweep applies once stable. The debounced path is the one that
+    /// matters for the fix: when a viewer's lease is dropped by the tick (its
+    /// `pane.stream` closing or its TTL expiring) the pane must not thrash the
+    /// PTY with an immediate SIGWINCH down to the next-widest. `now` is injected
+    /// so the debounce is deterministic in tests. Returns true only when a resize
+    /// actually changed the winsize.
+    pub(crate) fn reconcile_pty_lease_size(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        terminal_id: &crate::terminal::TerminalId,
+        now: Instant,
+        immediate: bool,
+    ) -> bool {
+        let effective = self.state.effective_pty_size(terminal_id);
+
+        // Read the current winsize under a scoped immutable borrow so the lease /
+        // pending-shrink maps can be mutated afterwards without a borrow conflict.
+        let Some((cur_rows, cur_cols)) = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(|runtime| runtime.current_size())
+        else {
+            // Pane/runtime is gone: nothing to resize. Drop any stale pending
+            // shrink so it cannot leak.
+            self.state.pty_pending_shrinks.remove(terminal_id);
+            return false;
+        };
+
+        let Some((rows, cols, cell_width_px, cell_height_px)) = effective else {
+            // No live lease: do NOT force a size — the TUI reclaims the winsize
+            // via the render gate. Clear any pending shrink.
+            self.state.pty_pending_shrinks.remove(terminal_id);
+            return false;
+        };
+
+        // Grow (or unchanged in both dimensions), or an explicit synchronous
+        // shrink, applies immediately.
+        if immediate || (rows >= cur_rows && cols >= cur_cols) {
+            self.state.pty_pending_shrinks.remove(terminal_id);
+            self.resize_pane_runtime(ws_idx, pane_id, rows, cols, cell_width_px, cell_height_px);
+            return (rows, cols) != (cur_rows, cur_cols);
+        }
+
+        // Debounced shrink (a wider viewer left): honour (or arm) the debounce.
+        let target = (rows, cols, cell_width_px, cell_height_px);
+        match self.state.pty_pending_shrinks.get(terminal_id).copied() {
+            Some(pending) if pending.target == target && now >= pending.deadline => {
+                self.state.pty_pending_shrinks.remove(terminal_id);
+                self.resize_pane_runtime(
+                    ws_idx,
+                    pane_id,
+                    rows,
+                    cols,
+                    cell_width_px,
+                    cell_height_px,
+                );
+                true
+            }
+            // Still waiting out the debounce for the same target: keep the
+            // existing deadline (do not restart the clock).
+            Some(pending) if pending.target == target => false,
+            // No pending shrink, or the target changed (a wider viewer left and
+            // the next-widest is different): (re)arm the debounce.
+            _ => {
+                self.state.pty_pending_shrinks.insert(
+                    terminal_id.clone(),
+                    crate::app::state::PtyPendingShrink {
+                        target,
+                        deadline: now + crate::app::state::PTY_SHRINK_DEBOUNCE,
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    /// Drive a pane's PTY winsize through the same runtime call the TUI uses.
+    /// `PaneRuntime::resize` clamps to its minimums (rows >= 2, cols >= 4) and
+    /// early-returns when unchanged, so no-op resizes dedup.
+    fn resize_pane_runtime(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) {
+        if let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        {
+            runtime.resize(rows, cols, cell_width_px, cell_height_px);
+        }
+    }
+
+    pub(crate) fn tick_selection_autoscroll(&mut self, now: Instant) {
+        let Some(autoscroll) = self.state.selection_autoscroll.clone() else {
+            // Self-heal: state cleared but deadline leaked
+            self.selection_autoscroll_deadline = None;
+            return;
+        };
+
+        // Selection must still be in progress for autoscroll to continue
+        let Some(pane_id) = self.state.selection.as_ref().map(|s| s.pane_id) else {
+            self.stop_selection_autoscroll();
+            return;
+        };
+        if !self
+            .state
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.is_dragging())
+        {
+            self.stop_selection_autoscroll();
+            return;
+        }
+
+        // Rect-change detection: if inner_rect changed since drag, stop
+        let current_rect = self
+            .state
+            .pane_info_by_id(pane_id)
+            .map(|info| info.inner_rect);
+        if current_rect != Some(autoscroll.inner_rect) {
+            self.stop_selection_autoscroll();
+            return;
+        }
+
+        // Scrollback boundary detection via ScrollMetrics — fail-closed if unavailable
+        let Some(metrics) = self
+            .state
+            .pane_scroll_metrics(&self.terminal_runtimes, pane_id)
+        else {
+            self.stop_selection_autoscroll();
+            return;
+        };
+        match autoscroll.direction {
+            crate::app::state::SelectionAutoscrollDirection::Up => {
+                let at_top = metrics.offset_from_bottom >= metrics.max_offset_from_bottom;
+                if at_top {
+                    self.stop_selection_autoscroll();
+                    return;
+                }
+                self.state
+                    .scroll_pane_up(&self.terminal_runtimes, pane_id, 1);
+            }
+            crate::app::state::SelectionAutoscrollDirection::Down => {
+                let at_bottom = metrics.offset_from_bottom == 0;
+                if at_bottom {
+                    self.stop_selection_autoscroll();
+                    return;
+                }
+                self.state
+                    .scroll_pane_down(&self.terminal_runtimes, pane_id, 1);
+            }
+        }
+
+        // Extend selection cursor to last known mouse position
+        self.state.update_selection_cursor(
+            &self.terminal_runtimes,
+            pane_id,
+            autoscroll.last_mouse_screen_col,
+            autoscroll.last_mouse_screen_row,
+        );
+
+        // Reschedule
+        self.selection_autoscroll_deadline = Some(now + SELECTION_AUTOSCROLL_INTERVAL);
+    }
+
+    pub(crate) fn stop_selection_autoscroll(&mut self) {
+        self.state.stop_selection_autoscroll_state();
+        self.selection_autoscroll_deadline = None;
+    }
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
             Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,
