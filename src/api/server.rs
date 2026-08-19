@@ -3514,9 +3514,22 @@ mod federation_tests {
         // as a bad token (the failing check is never revealed), at handshake time
         // before any request can be read.
         let mut fed = start_federation(one_peer_pinned("tok", CapabilityTier::Observe, "node-A"));
-        let stream = raw_hello_with_machine_id(fed.addr, "tok", "node-B");
+        let mut stream = raw_hello_with_machine_id(fed.addr, "tok", "node-B");
 
-        let mut reader = BufReader::new(stream);
+        // Put a real request on the wire behind the rejected hello: "never
+        // dispatches" is only a meaningful check if there was a request TO
+        // dispatch — the handler must tear the connection down at the failed pin
+        // before ever reading this line. Best-effort write: the handler may close
+        // first, which is itself proof of rejection.
+        let request = serde_json::to_string(&Request {
+            id: "list".into(),
+            method: Method::AgentList(EmptyParams {}),
+        })
+        .unwrap();
+        let _ = writeln!(stream, "{request}");
+        let _ = stream.flush();
+
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let mut line = String::new();
         reader.read_line(&mut line).expect("read rejection line");
         let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
@@ -3525,7 +3538,7 @@ mod federation_tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             fed.api_rx.try_recv().is_err(),
-            "a machine-id-mismatched connection dispatched a request"
+            "a machine-id-mismatched connection dispatched a request sent after the hello"
         );
     }
 
