@@ -105,6 +105,13 @@ pub struct App {
     /// threads and merged into `agent.list`. Empty (and shared with no threads)
     /// unless a peer has an `endpoint`; see `crate::api::federation_store`.
     pub(crate) federation: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
+    /// The outbound federation peer manager, shared with the API server. `Some`
+    /// only on a real daemon start (see `set_federation_manager`); the
+    /// `reload-config` handler then reconciles the peer set live against it.
+    /// `None` in tests and the no-federation path, where the reconcile is a
+    /// no-op.
+    pub(crate) federation_manager:
+        Option<Arc<crate::api::federation_manager::FederationPeerManager>>,
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -754,6 +761,9 @@ impl App {
             federation: Arc::new(std::sync::Mutex::new(
                 crate::api::federation_store::FederationStore::default(),
             )),
+            // Shared in on production startup via `set_federation_manager`; the
+            // no-federation path and every test keep this `None`.
+            federation_manager: None,
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
@@ -824,6 +834,17 @@ impl App {
         store: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
     ) {
         self.federation = store;
+    }
+
+    /// Share the outbound federation peer manager the API server owns, so
+    /// `reload-config` can add/remove/change peers live. Production startup only;
+    /// the `None` default kept in `new` makes the reconcile a no-op everywhere
+    /// else (tests, no-federation path).
+    pub fn set_federation_manager(
+        &mut self,
+        manager: Arc<crate::api::federation_manager::FederationPeerManager>,
+    ) {
+        self.federation_manager = Some(manager);
     }
 
     #[cfg(unix)]
@@ -1623,6 +1644,16 @@ impl App {
         if !invalid_section("theme") {
             self.state.theme_runtime = theme_runtime_config(config, !invalid_section("ui"));
             self.refresh_effective_app_theme();
+        }
+
+        // Reconcile the OUTBOUND federation peer set against the freshly parsed
+        // config: add a poller + proxy route for a new peer, stop + evict a
+        // removed one, respawn a changed one — with no daemon restart. `None`
+        // (tests, no-federation path) makes this a no-op; `reconcile` with an
+        // empty peer list is a clean full teardown. The inbound listener is bound
+        // at boot and is intentionally NOT touched here.
+        if let Some(manager) = &self.federation_manager {
+            manager.reconcile(&config.federation.peers);
         }
 
         let status = if diagnostics.is_empty() {

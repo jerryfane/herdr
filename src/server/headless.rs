@@ -5069,6 +5069,9 @@ pub fn run_server() -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
+    // The outbound federation peer manager the API server boot-spawned; shared
+    // with the App so `reload-config` reconciles the peer set live.
+    let fed_mgr = _api_server.federation_manager();
 
     let no_session = false; // Server always does session persistence.
 
@@ -5087,6 +5090,7 @@ pub fn run_server() -> io::Result<()> {
             event_hub,
         );
         app.set_federation_store(federation_store.clone());
+        app.set_federation_manager(fed_mgr);
         seed_startup_workspace_if_empty(&mut app);
 
         // The server runs headless — disable local notification side effects.
@@ -5222,6 +5226,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &loaded_config.config.federation,
             federation_store.clone(),
         )?;
+        // Share the outbound federation peer manager with the App so a
+        // `reload-config` on the handoff-imported server reconciles peers live,
+        // as in the normal server start.
+        app.set_federation_manager(api_server.federation_manager());
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
