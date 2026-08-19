@@ -597,12 +597,13 @@ fn write_request_line(stream: &mut ApiStream, request: &Request) -> io::Result<(
 /// Write the versioned `federation.hello` line. Must match the exact shape the
 /// listener expects — both sides share [`crate::api::federation::FederationHello`].
 ///
-/// `FederationHello::new` stamps the current `FEDERATION_PROTOCOL_VERSION` and an
-/// empty `machine_id`: no persisted machine id exists yet (a later workstream),
-/// and `machine_id` is informational in this version — the token is the
-/// authenticator — so an empty placeholder is sent for now.
+/// `FederationHello::new` stamps the current `FEDERATION_PROTOCOL_VERSION`; this
+/// then stamps the persisted per-install machine id
+/// ([`crate::persist::machine::get_or_create`]) so a receiving peer that pins an
+/// `expected_node_id` can verify it. The token remains the authenticator.
 fn write_federation_hello(stream: &mut ApiStream, token: &str) -> io::Result<()> {
     let line = crate::api::federation::FederationHello::new(token)
+        .with_machine_id(crate::persist::machine::get_or_create())
         .to_line()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     stream.write_all(line.as_bytes())?;

@@ -107,6 +107,18 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Persisted terminal identity, so the terminal keeps the same
+    /// [`crate::terminal::TerminalId`] across a daemon restart instead of being
+    /// re-minted. Additive + optional: an old snapshot without it restores to a
+    /// freshly allocated id (previous behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Occupant generation at capture time — bumped each time a different agent
+    /// seizes the terminal — rehydrated on restore so the global identity
+    /// `machine_id / terminal_id / occupant_generation` survives a restart.
+    /// Additive: an old snapshot defaults it to 0.
+    #[serde(default)]
+    pub occupant_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +380,10 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                terminal_id: terminal.map(|terminal| terminal.id.to_string()),
+                occupant_generation: terminal
+                    .map(|terminal| terminal.occupant_generation)
+                    .unwrap_or(0),
             },
         );
     }
@@ -648,6 +664,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
             },
         );
         panes.insert(
@@ -659,6 +677,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
             },
         );
 
@@ -1100,6 +1120,66 @@ mod tests {
     }
 
     #[test]
+    fn capture_persists_terminal_id_and_occupant_generation() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .occupant_generation = 5;
+
+        let snapshot = capture_from_state(&state);
+        let pane = &snapshot.workspaces[0].tabs[0].panes[&root.raw()];
+        assert_eq!(
+            pane.terminal_id.as_deref(),
+            Some(terminal_id.to_string().as_str()),
+            "captured pane must carry the terminal's persisted id"
+        );
+        assert_eq!(
+            pane.occupant_generation, 5,
+            "captured pane must carry the terminal's occupant generation"
+        );
+    }
+
+    #[test]
+    fn capture_defaults_occupant_generation_and_terminal_id_are_additive() {
+        // A snapshot written before W6 has neither field; both decode to their
+        // additive defaults (terminal_id: None, occupant_generation: 0) without
+        // failing the load, and re-serializing omits the absent optional.
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [{
+                "id": "wtest",
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": { "Pane": 0 },
+                    "panes": { "0": { "cwd": "/tmp" } },
+                    "zoomed": false,
+                    "focused": 0,
+                    "root_pane": 0
+                }],
+                "active_tab": 0
+            }],
+            "active": 0,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+        let pane = &restored.workspaces[0].tabs[0].panes[&0];
+        assert_eq!(pane.terminal_id, None);
+        assert_eq!(pane.occupant_generation, 0);
+
+        let encoded = serde_json::to_string(&restored).unwrap();
+        assert!(!encoded.contains("terminal_id"));
+    }
+
+    #[test]
     fn capture_contract_tracks_hook_authority_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("pi-session.jsonl");
@@ -1207,6 +1287,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
             },
         );
         panes.insert(
@@ -1220,6 +1302,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
             },
         );
 

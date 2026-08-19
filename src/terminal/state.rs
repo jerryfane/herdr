@@ -269,6 +269,14 @@ pub struct TerminalState {
     pub last_agent_state_change_seq: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
+    /// Monotonic count of how many times a DIFFERENT agent has seized this
+    /// terminal (a foreground hook-authority takeover). Unlike `turn_epoch`,
+    /// which is deliberately reset per boot, this is persisted and rehydrated on
+    /// restore, so `machine_id / terminal_id / occupant_generation` forms a
+    /// stable global identity that survives a daemon restart. Bumped only at the
+    /// genuine-takeover site in `set_hook_authority_at`, never on an ordinary
+    /// same-occupant hook update.
+    pub occupant_generation: u64,
     turn_records: VecDeque<TurnRecord>,
     turn_abort_pending_at: Option<Instant>,
     pub revision: u64,
@@ -313,6 +321,7 @@ impl TerminalState {
             last_agent_state_change_seq: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
+            occupant_generation: 0,
             turn_records: VecDeque::with_capacity(TURN_RECORD_LIMIT),
             turn_abort_pending_at: None,
             revision: 0,
@@ -559,6 +568,14 @@ impl TerminalState {
 
     pub fn with_respawn_shell_on_exit(mut self) -> Self {
         self.respawn_shell_on_exit = true;
+        self
+    }
+
+    /// Rehydrate the persisted occupant generation on restore, so the terminal's
+    /// global identity survives a daemon restart. Additive — old snapshots supply
+    /// 0, the same as a freshly created terminal.
+    pub fn with_occupant_generation(mut self, occupant_generation: u64) -> Self {
+        self.occupant_generation = occupant_generation;
         self
     }
 
@@ -1026,6 +1043,11 @@ impl TerminalState {
         let previous_session = self.current_session_identity_for_persistence();
         self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
+            // A genuinely different occupant is seizing the terminal (owner
+            // conflict + confirmed takeover). Bump the occupant generation here
+            // and ONLY here — an ordinary same-owner hook update never reaches
+            // this branch, so it does not advance the generation.
+            self.occupant_generation = self.occupant_generation.wrapping_add(1);
             self.suppress_current_full_lifecycle_hook_authority(
                 FullLifecycleHookSuppressionReason::HookClear,
             );
@@ -5808,6 +5830,85 @@ mod tests {
 
         assert!(terminal.agent_name.is_none());
         assert_eq!(terminal.effective_known_agent(), Some(Agent::Grok));
+    }
+
+    #[test]
+    fn occupant_generation_starts_at_zero() {
+        assert_eq!(test_terminal().occupant_generation, 0);
+    }
+
+    #[test]
+    fn occupant_generation_bumps_on_a_different_agent_takeover() {
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.occupant_generation, 0, "starts at 0");
+
+        // Occupant A: a persisted codex session establishes the current owner.
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+        });
+        // Detection now matches the INCOMING agent B (claude), so a foreground
+        // takeover by claude is confirmed.
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        terminal
+            .set_hook_authority_at(
+                "herdr:claude".into(),
+                "claude".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(21),
+                Instant::now(),
+            )
+            .expect("foreground claude should take over the terminal");
+
+        assert_eq!(
+            terminal.effective_known_agent(),
+            Some(Agent::Claude),
+            "the terminal should now be owned by claude"
+        );
+        assert_eq!(
+            terminal.occupant_generation, 1,
+            "a genuine different-occupant takeover bumps the occupant generation"
+        );
+    }
+
+    #[test]
+    fn occupant_generation_unchanged_on_same_occupant_hook_update() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_hook_authority_at(
+                "custom:agent".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                None,
+                Some(20),
+                Instant::now(),
+            )
+            .expect("initial hook should be accepted");
+        assert_eq!(terminal.occupant_generation, 0);
+
+        // A later update from the SAME occupant is an ordinary hook update, not a
+        // takeover: it must not advance the occupant generation.
+        terminal
+            .set_hook_authority_at(
+                "custom:agent".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                None,
+                Some(21),
+                Instant::now(),
+            )
+            .expect("same-owner update should be accepted");
+        assert_eq!(
+            terminal.occupant_generation, 0,
+            "an ordinary same-occupant hook update must not bump the generation"
+        );
     }
 
     #[test]
