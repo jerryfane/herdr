@@ -618,7 +618,8 @@ fn pane_set_pty_size_round_trips_over_socket() {
         .unwrap()
         .to_string();
 
-    // lock=true drives the real winsize and reports the applied size.
+    // lock=true takes a width lease and drives the real winsize; an explicit set
+    // applies immediately and reports the applied size.
     let locked = send_request(
         &socket_path,
         &format!(
@@ -632,7 +633,9 @@ fn pane_set_pty_size_round_trips_over_socket() {
     assert_eq!(locked["result"]["rows"], 40);
     assert_eq!(locked["result"]["locked"], true);
 
-    // Zero dimensions clamp to the runtime minimums (rows >= 2, cols >= 4).
+    // An explicit lock=true set applies its shrink immediately too (no debounce
+    // for an explicit call); zero dimensions clamp to the runtime minimums
+    // (rows >= 2, cols >= 4).
     let clamped = send_request(
         &socket_path,
         &format!(
@@ -644,7 +647,10 @@ fn pane_set_pty_size_round_trips_over_socket() {
     assert_eq!(clamped["result"]["rows"], 2);
     assert_eq!(clamped["result"]["locked"], true);
 
-    // lock=false releases geometry ownership back to the TUI.
+    // lock=false drops this caller's width lease. With no lease left, the release
+    // applies the caller's requested size once as the parting handoff and reports
+    // it; no lock persists, so the TUI reclaims the layout width via the render
+    // gate on the next frame.
     let released = send_request(
         &socket_path,
         &format!(

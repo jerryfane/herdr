@@ -544,7 +544,8 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
-            api_pty_size_locks: std::collections::HashSet::new(),
+            pty_width_leases: std::collections::HashMap::new(),
+            pty_pending_shrinks: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
@@ -993,6 +994,9 @@ impl App {
                 needs_render = true;
             }
             if self.expire_due_metadata(Instant::now()) {
+                needs_render = true;
+            }
+            if self.expire_pty_leases_and_apply_shrinks(Instant::now()) {
                 needs_render = true;
             }
             if self.drain_api_requests() {

@@ -250,6 +250,18 @@ pub struct PaneSetPtySizeParams {
     /// reclaims the size on its next render.
     #[serde(default)]
     pub lock: bool,
+    /// Stable identity of the viewer taking this width lease. Send the SAME
+    /// `viewer_id` on the viewer's `pane.stream` so the lease is dropped when
+    /// that stream closes. Absent for legacy callers, whose lease then relies on
+    /// the TTL backstop and explicit release only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_id: Option<String>,
+    /// Optional width-lease TTL in milliseconds (1 .. 86_400_000). Backstop that
+    /// drops the lease if the viewer disconnects ungracefully; defaults to a
+    /// generous server value when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 86_400_000))]
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
@@ -431,6 +443,12 @@ pub struct PaneStreamParams {
     /// Number of scrollback lines to window into the reset seed (reserved).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback_lines: Option<usize>,
+    /// Stable identity of this viewer, echoed on its `pane.set_pty_size` so the
+    /// viewer's width lease is dropped when this stream closes. The server
+    /// carries it through to the close so the correct lease is released. Absent
+    /// for legacy clients (their leases rely on the TTL backstop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

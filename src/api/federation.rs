@@ -167,10 +167,11 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         }
         // Admin: focus, rename, and input/authority mutations.
         "agent.focus" | "agent.rename" | "pane.send_input" | "pane.input.set" | "pane.rename"
-        | "agent.view.set" | "agent.view.clear" => AllowedAt(Admin),
+        | "pane.set_pty_size" | "agent.view.set" | "agent.view.clear" => AllowedAt(Admin),
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
         // notification(s).*, client.window_title.*, agent.start, pane.close,
-        // popup.close, every workspace/worktree/tab/layout/pane mutation, the
+        // popup.close, every workspace/worktree/tab/layout/pane mutation except
+        // the Admin `pane.set_pty_size` width-lease call above, the
         // pane.report_*/authority calls, and pane.graphics.set/clear/stream) is
         // denied to federation regardless of tier.
         _ => FederationAccess::Denied,
