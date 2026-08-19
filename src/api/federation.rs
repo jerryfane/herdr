@@ -40,9 +40,11 @@ pub(crate) const FEDERATION_PROTOCOL_VERSION: u32 = 1;
 pub(crate) struct FederationHello {
     #[serde(rename = "type")]
     pub kind: String,
-    /// Informational identifier for the connecting daemon. No persisted machine
-    /// id exists yet (a later workstream), so the client sends `""` for now; the
-    /// token, not this field, is the authenticator.
+    /// Install-stable identifier for the connecting daemon, persisted across
+    /// restarts by [`crate::persist::machine`]. The token, not this field, is the
+    /// authenticator; but when the receiving peer pins an `expected_node_id`, this
+    /// value must match it or the connection is rejected. Empty when the client
+    /// has no persisted id available.
     pub machine_id: String,
     /// Handshake envelope version the client speaks. See
     /// [`FEDERATION_PROTOCOL_VERSION`].
@@ -67,12 +69,20 @@ impl FederationHello {
     pub(crate) fn new(token: impl Into<String>) -> Self {
         Self {
             kind: FEDERATION_HELLO_TYPE.to_string(),
-            // No persisted machine id exists yet; it is informational in this
-            // version, so the client sends an empty placeholder.
+            // Empty by default; the outbound client stamps the persisted install
+            // id via `with_machine_id` right before it writes the line.
             machine_id: String::new(),
             proto_version: FEDERATION_PROTOCOL_VERSION,
             token: token.into(),
         }
+    }
+
+    /// Stamp the persisted per-install machine id onto the hello. Called by the
+    /// outbound client so `FederationHello::new` stays independent of the persist
+    /// layer.
+    pub(crate) fn with_machine_id(mut self, machine_id: String) -> Self {
+        self.machine_id = machine_id;
+        self
     }
 
     /// Serialize to the single-line wire form (no trailing newline).
@@ -92,11 +102,15 @@ impl FederationHello {
 }
 
 /// The peer a federation connection is bound to after a successful hello: the
-/// configured alias plus the capability tier the matching token grants.
+/// configured alias, the capability tier the matching token grants, and an
+/// optional pinned node identity. When `expected_node_id` is `Some`, the hello's
+/// `machine_id` must equal it or the connection is rejected after the token
+/// check; when `None`, no identity pin is applied (back-compat).
 #[derive(Debug, Clone)]
 pub(crate) struct PeerContext {
     pub alias: String,
     pub tier: CapabilityTier,
+    pub expected_node_id: Option<String>,
 }
 
 /// Capability required to invoke an API method over a federation connection, or
@@ -209,6 +223,7 @@ mod tests {
                     PeerContext {
                         alias: format!("alias-{token}"),
                         tier: *tier,
+                        expected_node_id: None,
                     },
                 )
             })
@@ -226,6 +241,15 @@ mod tests {
         assert_eq!(parsed.token, "s3cret");
         assert_eq!(parsed.machine_id, "");
         assert_eq!(parsed.proto_version, FEDERATION_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn with_machine_id_populates_and_round_trips() {
+        let hello = FederationHello::new("tok").with_machine_id("machine_abc123".into());
+        let line = hello.to_line().unwrap();
+        let parsed = FederationHello::from_line(&line).expect("parses back");
+        assert_eq!(parsed.machine_id, "machine_abc123");
+        assert_eq!(parsed.token, "tok");
     }
 
     #[test]

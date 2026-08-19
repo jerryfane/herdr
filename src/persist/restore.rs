@@ -542,9 +542,15 @@ fn restore_tab(
             startup.restore_plan.clone()
         };
         if let Some(plan) = pending_native_agent_restore {
-            let terminal_id = TerminalId::alloc();
+            // Reuse the persisted terminal identity so it survives the restart;
+            // fall back to a fresh id only for pre-W6 snapshots that lack one.
+            let terminal_id = saved_pane
+                .and_then(|p| p.terminal_id.clone())
+                .map(TerminalId::from_persisted)
+                .unwrap_or_else(TerminalId::alloc);
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                .with_pending_agent_resume_plan(plan);
+                .with_pending_agent_resume_plan(plan)
+                .with_occupant_generation(saved_pane.map(|p| p.occupant_generation).unwrap_or(0));
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -635,8 +641,16 @@ fn restore_tab(
 
         match runtime_result {
             Ok(runtime) => {
-                let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                // Reuse the persisted terminal identity so it survives the
+                // restart; fall back to a fresh id only for pre-W6 snapshots.
+                let terminal_id = saved_pane
+                    .and_then(|p| p.terminal_id.clone())
+                    .map(TerminalId::from_persisted)
+                    .unwrap_or_else(TerminalId::alloc);
+                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_occupant_generation(
+                        saved_pane.map(|p| p.occupant_generation).unwrap_or(0),
+                    );
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -973,6 +987,8 @@ mod tests {
                                 value: "turn-epoch-session".into(),
                             }),
                             launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
                         },
                     )]),
                     zoomed: false,
@@ -1313,6 +1329,8 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
                         },
                     )]),
                     zoomed: false,
@@ -1363,6 +1381,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_reuses_persisted_terminal_id_and_occupant_generation() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            terminal_id: Some("term_persisted_boot1".into()),
+                            occupant_generation: 7,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert_eq!(
+            terminal.id.to_string(),
+            "term_persisted_boot1",
+            "the persisted terminal id must be reused verbatim across restart"
+        );
+        assert_eq!(
+            terminal.occupant_generation, 7,
+            "occupant_generation must survive capture -> restore"
+        );
+        assert!(
+            terminals.contains_key(&crate::terminal::TerminalId::from_persisted(
+                "term_persisted_boot1".into()
+            )),
+            "the terminal must be keyed by its persisted id"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1394,6 +1491,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                terminal_id: None,
+                                occupant_generation: 0,
                             },
                         ),
                         (
@@ -1405,6 +1504,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                terminal_id: None,
+                                occupant_generation: 0,
                             },
                         ),
                     ]),
@@ -1458,6 +1559,8 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    terminal_id: None,
+                    occupant_generation: 0,
                 },
             )
         };
@@ -1473,6 +1576,8 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            terminal_id: None,
+            occupant_generation: 0,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1624,6 +1729,8 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
                         },
                     )]),
                     zoomed: false,
@@ -1785,6 +1892,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
             },
         );
         let history = SessionHistorySnapshot {
