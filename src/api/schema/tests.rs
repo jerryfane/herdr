@@ -496,6 +496,8 @@ fn pane_set_pty_size_request_and_response_round_trip() {
             cell_width_px: Some(8),
             cell_height_px: Some(16),
             lock: true,
+            viewer_id: Some("viewer-a".into()),
+            ttl_ms: Some(60_000),
         }),
     };
     let json = serde_json::to_value(&request).unwrap();
@@ -503,10 +505,12 @@ fn pane_set_pty_size_request_and_response_round_trip() {
     assert_eq!(json["params"]["cols"], 100);
     assert_eq!(json["params"]["rows"], 40);
     assert_eq!(json["params"]["lock"], true);
+    assert_eq!(json["params"]["viewer_id"], "viewer-a");
+    assert_eq!(json["params"]["ttl_ms"], 60_000);
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
 
-    // cell_*_px and lock are optional/defaulted on the wire.
+    // cell_*_px, lock, viewer_id, and ttl_ms are optional/defaulted on the wire.
     let minimal: Request = serde_json::from_str(
         r#"{"id":"req_2","method":"pane.set_pty_size","params":{"cols":80,"rows":24}}"#,
     )
@@ -518,6 +522,8 @@ fn pane_set_pty_size_request_and_response_round_trip() {
     assert_eq!(params.cell_width_px, None);
     assert_eq!(params.cell_height_px, None);
     assert!(!params.lock);
+    assert_eq!(params.viewer_id, None);
+    assert_eq!(params.ttl_ms, None);
 
     let response = SuccessResponse {
         id: "req_set_pty_size".into(),
@@ -545,12 +551,14 @@ fn pane_stream_request_round_trips_and_defaults() {
             epoch: Some(7),
             max_frame_bytes: Some(65_536),
             scrollback_lines: Some(200),
+            viewer_id: Some("viewer-1".into()),
         }),
     };
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "pane.stream");
     assert_eq!(json["params"]["pane_id"], "w1:p1");
     assert_eq!(json["params"]["max_frame_bytes"], 65_536);
+    assert_eq!(json["params"]["viewer_id"], "viewer-1");
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
 
@@ -567,6 +575,7 @@ fn pane_stream_request_round_trips_and_defaults() {
     assert_eq!(params.resume_from, None);
     assert_eq!(params.epoch, None);
     assert_eq!(params.max_frame_bytes, None);
+    assert_eq!(params.viewer_id, None);
 }
 
 #[test]

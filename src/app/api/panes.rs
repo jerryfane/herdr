@@ -526,44 +526,97 @@ impl App {
             return pane_not_found(id, &pane_public_id);
         };
 
-        // Drive the real PTY winsize through the same runtime call the TUI uses,
-        // BEFORE touching any ownership lock. If the pane resolves but has no
-        // runtime the request fails, and it must leave the lock set untouched
-        // (otherwise `lock=true` would strand a stale lock and `lock=false` would
-        // release an existing lock despite the request failing).
-        // `PaneRuntime::resize` clamps to its minimum (rows >= 2, cols >= 4) and
-        // early-returns when unchanged; read the size back to report the applied
-        // (clamped) dimensions. The scope drops the immutable `self.state` borrow
-        // taken by `runtime_for_pane_in_workspace` before the lock is mutated.
-        let (applied_rows, applied_cols) = {
-            let Some(runtime) =
-                self.state
-                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
-            else {
-                return pane_not_found(id, &pane_public_id);
-            };
-            runtime.resize(
-                params.rows,
-                params.cols,
-                params.cell_width_px.unwrap_or(0),
-                params.cell_height_px.unwrap_or(0),
-            );
-            runtime.current_size()
-        };
-
-        // Take or release geometry ownership only after the resize succeeds. While
-        // a terminal is in this set the desktop TUI stops re-asserting
-        // layout-driven winsize for it (`ui::panes` gates its resize on the
-        // geometry not being externally owned), so a remote client can own the pane
-        // size. This set is API-owned and kept separate from
-        // `direct_attach_resize_locks` so a direct attach client
-        // connecting/disconnecting cannot clear an API lock and vice versa.
-        // Releasing lets the TUI reclaim the size on its next render.
-        if params.lock {
-            self.state.api_pty_size_locks.insert(terminal_id.clone());
-        } else {
-            self.state.api_pty_size_locks.remove(&terminal_id);
+        // Validate the pane has a live runtime BEFORE touching any lease, so a
+        // failed request leaves the lease map untouched (otherwise `lock=true`
+        // would strand a lease and `lock=false` would drop an existing lease
+        // despite the request failing).
+        if self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .is_none()
+        {
+            return pane_not_found(id, &pane_public_id);
         }
+
+        // Upsert/remove this viewer's width lease, then let the arbiter drive the
+        // effective winsize (widest active viewer wins). A narrow request from
+        // one viewer no longer shrinks a pane a wider viewer holds; grows apply
+        // immediately, shrinks are debounced (see `reconcile_pty_lease_size`).
+        // The lease set is API-owned and kept separate from
+        // `direct_attach_resize_locks` so a direct attach client
+        // connecting/disconnecting cannot clear an API lease and vice versa.
+        let now = std::time::Instant::now();
+        let viewer = crate::app::state::AppState::lease_viewer_key(params.viewer_id.as_deref());
+        if params.lock {
+            let ttl = params
+                .ttl_ms
+                .map(|ms| {
+                    std::time::Duration::from_millis(ms.clamp(
+                        crate::app::state::PTY_LEASE_TTL_MIN_MS,
+                        crate::app::state::PTY_LEASE_TTL_MAX_MS,
+                    ))
+                })
+                .unwrap_or(crate::app::state::DEFAULT_PTY_LEASE_TTL);
+            let expires_at = now.checked_add(ttl).unwrap_or(now);
+            self.state.upsert_pty_width_lease(
+                &terminal_id,
+                viewer,
+                crate::app::state::WidthLease {
+                    cols: params.cols,
+                    rows: params.rows,
+                    cell_width_px: params.cell_width_px.unwrap_or(0),
+                    cell_height_px: params.cell_height_px.unwrap_or(0),
+                    expires_at,
+                },
+            );
+            // An explicit `lock:true` set applies the arbiter's effective size
+            // immediately (grow OR shrink) — a single/widest viewer resizing
+            // itself expects the synchronous response to report the size it asked
+            // for. The debounce is reserved for lease drops on the tick.
+            self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, true);
+        } else {
+            // Release only this viewer's lease.
+            self.state.remove_pty_width_lease(&terminal_id, &viewer);
+            if self
+                .state
+                .pty_width_leases
+                .get(&terminal_id)
+                .is_some_and(|viewers| !viewers.is_empty())
+            {
+                // Other viewers remain: apply the widest remaining immediately. A
+                // narrow viewer releasing must NOT shrink a pane a wider viewer
+                // still holds (the arbiter keeps the widest).
+                self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, true);
+            } else {
+                // No lease remains: apply the caller's requested size once as the
+                // parting handoff and report it. No lock persists, so the TUI
+                // reclaims the layout width via the render gate on the next frame
+                // (this is not an orphan pin). Clear any pending shrink first.
+                self.state.pty_pending_shrinks.remove(&terminal_id);
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    runtime.resize(
+                        params.rows,
+                        params.cols,
+                        params.cell_width_px.unwrap_or(0),
+                        params.cell_height_px.unwrap_or(0),
+                    );
+                }
+            }
+        }
+
+        // Report the winsize actually in effect — a superseded caller (a wider
+        // lease exists) sees the real current size, not its own request. The
+        // runtime was validated above, so the fallback (clamped request) is only
+        // a defensive default.
+        let (applied_rows, applied_cols) = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(|runtime| runtime.current_size())
+            .unwrap_or((params.rows.max(2), params.cols.max(4)));
 
         encode_success(
             id,
@@ -600,11 +653,20 @@ impl App {
         };
         let ring = runtime.attach_output_stream(crate::pane::OUTPUT_RING_CAPACITY_BYTES);
         crate::api::output_registry::register(&params.pane_id, &ring);
+        // No width-lease state is created at open: a lease is only minted by
+        // `pane.set_pty_size`. The viewer's identity (`params.viewer_id`) is
+        // carried through to the matching close (see the stream server), which is
+        // where the lease liveness tie is honoured by dropping that viewer's lease
+        // (#137).
         encode_success(id, ResponseResult::Ok {})
     }
 
     /// Internal close for `pane.stream`: detaches one viewer and, once the last
     /// leaves, unpublishes the ring (which also stops the read hot-path tap).
+    /// When the close carries a `viewer_id` (threaded from the open, #137) it also
+    /// drops that viewer's width lease — the PRIMARY liveness signal — and re-runs
+    /// the arbiter so the pane shrinks (debounced) to the next-widest viewer, or
+    /// the TUI reclaims the layout width once the last lease is gone.
     pub(super) fn handle_pane_stream_close(
         &mut self,
         id: String,
@@ -620,6 +682,21 @@ impl App {
                 // already gone (the pane was closed out from under the stream).
                 if remaining.is_none_or(|count| count == 0) {
                     crate::api::output_registry::unregister(&params.pane_id);
+                }
+                if let Some(viewer_id) = params.viewer_id.as_deref() {
+                    if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+                        if self.state.remove_pty_width_lease(&terminal_id, viewer_id) {
+                            // A viewer leaving is a lease DROP: the shrink to the
+                            // next-widest viewer is debounced, not immediate.
+                            self.reconcile_pty_lease_size(
+                                ws_idx,
+                                pane_id,
+                                &terminal_id,
+                                std::time::Instant::now(),
+                                false,
+                            );
+                        }
+                    }
                 }
             }
             None => crate::api::output_registry::unregister(&params.pane_id),
@@ -2364,57 +2441,156 @@ mod tests {
         assert!(pane.last_completed_turn.is_none());
     }
 
+    fn set_pty_params(
+        public_pane_id: &str,
+        cols: u16,
+        rows: u16,
+        lock: bool,
+        viewer_id: Option<&str>,
+    ) -> PaneSetPtySizeParams {
+        PaneSetPtySizeParams {
+            pane_id: Some(public_pane_id.to_string()),
+            cols,
+            rows,
+            cell_width_px: None,
+            cell_height_px: None,
+            lock,
+            viewer_id: viewer_id.map(str::to_string),
+            ttl_ms: None,
+        }
+    }
+
+    fn stream_params(public_pane_id: &str, viewer_id: Option<&str>) -> PaneStreamParams {
+        PaneStreamParams {
+            pane_id: public_pane_id.to_string(),
+            include_history: true,
+            resume_from: None,
+            epoch: None,
+            max_frame_bytes: None,
+            scrollback_lines: None,
+            viewer_id: viewer_id.map(str::to_string),
+        }
+    }
+
+    fn pty_size(app: &App, pane_id: PaneId) -> (u16, u16) {
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime present")
+            .current_size()
+    }
+
+    #[test]
+    fn effective_pty_size_picks_max_cols_wholesale() {
+        let mut state = crate::app::state::AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+
+        // No leases → None.
+        assert_eq!(state.effective_pty_size(&terminal_id), None);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "narrow".into(),
+            crate::app::state::WidthLease {
+                cols: 80,
+                rows: 50,
+                cell_width_px: 7,
+                cell_height_px: 15,
+                expires_at: far,
+            },
+        );
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "wide".into(),
+            crate::app::state::WidthLease {
+                cols: 200,
+                rows: 30,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                expires_at: far,
+            },
+        );
+
+        // The widest lease wins WHOLESALE: its own rows (30) and cell metrics
+        // (9x18), never a mix with the narrow lease's taller rows (50).
+        assert_eq!(
+            state.effective_pty_size(&terminal_id),
+            Some((30, 200, 9, 18))
+        );
+    }
+
+    #[test]
+    fn pty_width_lease_state_invariants_hold() {
+        // Empty state: no leases or pending shrinks — invariants pass.
+        crate::app::state::AppState::test_new().assert_invariants_for_test();
+
+        // A consistent non-empty state carrying a lease on a real terminal upholds
+        // the lease/pending-shrink invariants.
+        let mut state = crate::app::state::AppState::test_with_adversarial_identity_state();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "viewer".into(),
+            crate::app::state::WidthLease {
+                cols: 120,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn pty_geometry_externally_owned_reflects_leases_and_direct_attach() {
+        let mut state = crate::app::state::AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
+
+        // Direct-attach ownership alone.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // A width lease alone.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "viewer".into(),
+            crate::app::state::WidthLease {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Both sources at once.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Clearing both drops ownership; the two sources are independent.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        assert!(state.remove_pty_width_lease(&terminal_id, "viewer"));
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
+        state.assert_invariants_for_test();
+    }
+
     #[tokio::test]
-    async fn api_pane_set_pty_size_locks_clamps_and_releases() {
+    async fn pty_size_lease_widest_viewer_wins_no_narrow_shrink() {
         let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
 
-        // lock=true drives the real winsize and takes geometry ownership.
+        // Viewer A takes a WIDE lease on an 80x24 runtime — a grow, applied now.
         let response = app.handle_pane_set_pty_size(
-            "lock".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 100,
-                rows: 40,
-                cell_width_px: Some(8),
-                cell_height_px: Some(16),
-                lock: true,
-            },
-        );
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PanePtySize {
-            pane_id: reported_pane_id,
-            cols,
-            rows,
-            locked,
-        } = success.result
-        else {
-            panic!("expected pane pty size response");
-        };
-        assert_eq!(reported_pane_id, public_pane_id);
-        assert_eq!((cols, rows), (100, 40));
-        assert!(locked);
-        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
-        assert_eq!(
-            app.state
-                .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
-                .unwrap()
-                .current_size(),
-            (40, 100)
-        );
-
-        // Zero dimensions clamp to the runtime minimums (rows >= 2, cols >= 4).
-        let response = app.handle_pane_set_pty_size(
-            "clamp".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 0,
-                rows: 0,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: true,
-            },
+            "a".into(),
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         let ResponseResult::PanePtySize {
@@ -2423,33 +2599,241 @@ mod tests {
         else {
             panic!("expected pane pty size response");
         };
-        assert_eq!((cols, rows), (4, 2));
+        assert_eq!((cols, rows), (100, 40));
         assert!(locked);
+        assert_eq!(pty_size(&app, pane_id), (40, 100));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
 
-        // lock=false reclaims geometry ownership for the TUI.
+        // Viewer B sets a NARROWER size while A holds wider: the arbiter keeps A's
+        // width, so the pane does NOT shrink and B sees the real (wide) winsize.
         let response = app.handle_pane_set_pty_size(
-            "release".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 120,
-                rows: 50,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: false,
-            },
+            "b".into(),
+            set_pty_params(&public_pane_id, 60, 30, true, Some("B")),
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PanePtySize { locked, .. } = success.result else {
+        let ResponseResult::PanePtySize { cols, rows, .. } = success.result else {
             panic!("expected pane pty size response");
         };
-        assert!(!locked);
-        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
+        assert_eq!((cols, rows), (100, 40));
+        assert_eq!(pty_size(&app, pane_id), (40, 100));
+        // Both viewers hold a lease.
+        assert_eq!(
+            app.state
+                .pty_width_leases
+                .get(&terminal_id)
+                .map(|m| m.len()),
+            Some(2)
+        );
     }
 
     #[tokio::test]
-    async fn api_pane_set_pty_size_missing_runtime_lock_true_leaves_locks_unchanged() {
-        // A pane with terminal metadata but no runtime must fail without minting
-        // a stale lock.
+    async fn pty_size_lease_explicit_set_applies_grow_and_shrink_immediately() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        // An explicit grow applies immediately.
+        app.handle_pane_set_pty_size(
+            "grow".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The same (widest) viewer narrowing ITSELF via an explicit lock=true set
+        // is a deliberate synchronous resize and applies immediately too — a
+        // single viewer behaves as it does today. (The debounce is only for a
+        // wider viewer LEAVING; see `pty_size_lease_widest_drop_...`.)
+        let response = app.handle_pane_set_pty_size(
+            "shrink".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("A")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize { cols, rows, .. } = success.result else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows), (90, 30));
+        assert_eq!(pty_size(&app, pane_id), (30, 90));
+        // No pending shrink was armed — it applied straight away.
+        assert!(app.state.pty_pending_shrinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_widest_stream_close_shrinks_to_next_after_debounce() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        app.handle_pane_set_pty_size(
+            "b".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("B")),
+        );
+        // Wide A wins.
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // A's `pane.stream` closes (a lease DROP by the tick, not an explicit
+        // call): effective drops to B's width, but the shrink is DEBOUNCED to
+        // avoid thrashing the PTY down when a wider viewer disconnects.
+        app.handle_pane_stream_close("close-a".into(), stream_params(&public_pane_id, Some("A")));
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // A sweep BEFORE the debounce deadline does not apply the shrink yet.
+        app.expire_pty_leases_and_apply_shrinks(std::time::Instant::now());
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // After the debounce the pane shrinks to the next-widest viewer (B).
+        app.expire_pty_leases_and_apply_shrinks(
+            std::time::Instant::now()
+                + crate::app::state::PTY_SHRINK_DEBOUNCE
+                + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(pty_size(&app, pane_id), (30, 90));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_explicit_release_is_immediate_and_honours_remaining() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        app.handle_pane_set_pty_size(
+            "b".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("B")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The NARROW viewer B releases explicitly: A still holds wider, so the
+        // arbiter keeps A's width — B's release must not shrink the pane.
+        app.handle_pane_set_pty_size(
+            "b-release".into(),
+            set_pty_params(&public_pane_id, 90, 30, false, Some("B")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The WIDE viewer A releases explicitly while a narrower B is gone: no
+        // lease remains, so the release applies its own requested size once as
+        // the parting handoff and relinquishes ownership immediately (no
+        // debounce, no persisted lock).
+        let response = app.handle_pane_set_pty_size(
+            "a-release".into(),
+            set_pty_params(&public_pane_id, 70, 20, false, Some("A")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize {
+            cols, rows, locked, ..
+        } = success.result
+        else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows, locked), (70, 20, false));
+        assert_eq!(pty_size(&app, pane_id), (20, 70));
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_last_release_reverts_to_layout_ownership() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, Some("A")),
+        );
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // Releasing the only lease relinquishes ownership — no lease remains, so
+        // the arbiter returns None and the TUI reclaims the winsize via the gate.
+        app.handle_pane_set_pty_size(
+            "a-release".into(),
+            set_pty_params(&public_pane_id, 120, 45, false, Some("A")),
+        );
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_dropped_when_viewer_stream_closes() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, Some("A")),
+        );
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // A close carrying NO viewer_id (a legacy/synthesized close) must NOT drop
+        // the lease.
+        app.handle_pane_stream_close("close-none".into(), stream_params(&public_pane_id, None));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // The viewer's own stream closing (its viewer_id) drops the lease — the
+        // PRIMARY liveness signal — and, with no lease left, ownership reverts.
+        app.handle_pane_stream_close("close-a".into(), stream_params(&public_pane_id, Some("A")));
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_ttl_expiry_evicts_dead_viewer_on_tick() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // A short-TTL lease with no stream to tie liveness to (backstop only).
+        let mut params = set_pty_params(&public_pane_id, 120, 45, true, Some("A"));
+        params.ttl_ms = Some(1);
+        app.handle_pane_set_pty_size("a".into(), params);
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // The sweep with a `now` past the TTL evicts the dead viewer's lease.
+        let changed = app.expire_pty_leases_and_apply_shrinks(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        assert!(changed);
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_no_viewer_id_still_pins_for_legacy_clients() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // A legacy caller with no viewer_id still pins (via the sentinel key).
+        app.handle_pane_set_pty_size(
+            "legacy".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, None),
+        );
+        assert_eq!(pty_size(&app, pane_id), (45, 120));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(
+            app.state.effective_pty_size(&terminal_id),
+            Some((45, 120, 0, 0))
+        );
+
+        // Explicit release (still no viewer_id) drops the sentinel lease.
+        app.handle_pane_set_pty_size(
+            "legacy-release".into(),
+            set_pty_params(&public_pane_id, 120, 45, false, None),
+        );
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_missing_runtime_lock_true_leaves_leases_untouched() {
+        // A pane with terminal metadata but no runtime must fail without minting a
+        // lease.
         let (mut app, public_pane_id) = app_with_test_workspace();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
@@ -2460,29 +2844,32 @@ mod tests {
 
         let response = app.handle_pane_set_pty_size(
             "lock-no-runtime".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 100,
-                rows: 40,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: true,
-            },
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
         );
-
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "pane_not_found");
-        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
-        assert!(app.state.api_pty_size_locks.is_empty());
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert!(app.state.pty_width_leases.is_empty());
     }
 
     #[tokio::test]
-    async fn api_pane_set_pty_size_missing_runtime_lock_false_leaves_locks_unchanged() {
-        // A failing lock=false request must not release an existing lock.
+    async fn pty_size_lease_missing_runtime_lock_false_leaves_leases_untouched() {
+        // A failing lock=false request must not drop an existing lease.
         let (mut app, public_pane_id) = app_with_test_workspace();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
-        app.state.api_pty_size_locks.insert(terminal_id.clone());
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        app.state.upsert_pty_width_lease(
+            &terminal_id,
+            crate::app::state::DEFAULT_LEASE_VIEWER.into(),
+            crate::app::state::WidthLease {
+                cols: 100,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
         assert!(app
             .state
             .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
@@ -2490,110 +2877,48 @@ mod tests {
 
         let response = app.handle_pane_set_pty_size(
             "release-no-runtime".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 120,
-                rows: 50,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: false,
-            },
+            set_pty_params(&public_pane_id, 120, 50, false, None),
         );
-
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "pane_not_found");
-        // The pre-existing lock survives because the request failed.
-        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
+        // The pre-existing lease survives because the request failed.
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
     }
 
     #[tokio::test]
-    async fn api_pty_size_lock_survives_direct_attach_client_churn() {
+    async fn pty_size_lease_and_direct_attach_are_independent() {
         let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
 
-        // API takes geometry ownership in its own set.
-        let response = app.handle_pane_set_pty_size(
-            "api-lock".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 100,
-                rows: 40,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: true,
-            },
+        // API takes a width lease.
+        app.handle_pane_set_pty_size(
+            "api".into(),
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
         );
-        let _success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
-        assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
         assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+        assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
 
-        // A direct-attach client connects then disconnects: the headless
-        // `remove_client` path clears the terminal from `direct_attach_resize_locks`.
-        // The API lock lives in a separate set and must survive.
+        // A direct-attach client connects then disconnects: its separate set is
+        // toggled, but the API lease is untouched and survives the churn.
         app.state
             .direct_attach_resize_locks
             .insert(terminal_id.clone());
         app.state.direct_attach_resize_locks.remove(&terminal_id);
-        assert!(app.state.api_pty_size_locks.contains(&terminal_id));
         assert!(app.state.pty_geometry_externally_owned(&terminal_id));
-    }
 
-    #[tokio::test]
-    async fn api_pty_size_release_does_not_touch_direct_attach_lock() {
-        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
-        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
-
-        // An active direct-attach client owns the size.
+        // With a direct-attach client owning the size, releasing the API lease
+        // clears only the lease; the direct-attach lock keeps ownership.
         app.state
             .direct_attach_resize_locks
             .insert(terminal_id.clone());
-
-        let response = app.handle_pane_set_pty_size(
+        app.handle_pane_set_pty_size(
             "api-release".into(),
-            PaneSetPtySizeParams {
-                pane_id: Some(public_pane_id.clone()),
-                cols: 120,
-                rows: 50,
-                cell_width_px: None,
-                cell_height_px: None,
-                lock: false,
-            },
+            set_pty_params(&public_pane_id, 100, 40, false, Some("A")),
         );
-        let _success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        // Only the API set is cleared; the direct-attach lock is untouched, so
-        // geometry remains externally owned.
-        assert!(!app.state.api_pty_size_locks.contains(&terminal_id));
+        assert!(!app.state.pty_width_leases.contains_key(&terminal_id));
         assert!(app.state.direct_attach_resize_locks.contains(&terminal_id));
         assert!(app.state.pty_geometry_externally_owned(&terminal_id));
-    }
-
-    #[test]
-    fn pty_geometry_externally_owned_is_true_if_either_set_contains_id() {
-        let mut state = crate::app::state::AppState::test_new();
-        let terminal_id = crate::terminal::TerminalId::alloc();
-
-        assert!(!state.pty_geometry_externally_owned(&terminal_id));
-
-        // Direct-attach ownership alone.
-        state.direct_attach_resize_locks.insert(terminal_id.clone());
-        assert!(state.pty_geometry_externally_owned(&terminal_id));
-
-        // API ownership alone.
-        state.direct_attach_resize_locks.remove(&terminal_id);
-        state.api_pty_size_locks.insert(terminal_id.clone());
-        assert!(state.pty_geometry_externally_owned(&terminal_id));
-
-        // Both sources at once.
-        state.direct_attach_resize_locks.insert(terminal_id.clone());
-        assert!(state.pty_geometry_externally_owned(&terminal_id));
-
-        // Neither: the two sets are independent and clearing both drops ownership.
-        state.direct_attach_resize_locks.remove(&terminal_id);
-        state.api_pty_size_locks.remove(&terminal_id);
-        assert!(!state.pty_geometry_externally_owned(&terminal_id));
     }
 
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {

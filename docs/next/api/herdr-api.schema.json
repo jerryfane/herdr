@@ -3681,6 +3681,23 @@
               "maximum": 65535,
               "minimum": 0,
               "type": "integer"
+            },
+            "ttl_ms": {
+              "description": "Optional width-lease TTL in milliseconds (1 .. 86_400_000). Backstop that\ndrops the lease if the viewer disconnects ungracefully; defaults to a\ngenerous server value when omitted.",
+              "format": "uint64",
+              "maximum": 86400000,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "viewer_id": {
+              "description": "Stable identity of the viewer taking this width lease. Send the SAME\n`viewer_id` on the viewer's `pane.stream` so the lease is dropped when\nthat stream closes. Absent for legacy callers, whose lease then relies on\nthe TTL backstop and explicit release only.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

@@ -599,6 +599,11 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
+            if self.app.expire_pty_leases_and_apply_shrinks(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.pty_lease_sweep");
+            }
 
             // 3. Drain API requests.
             if self.pane_graphics_runtime_active() {
@@ -3653,7 +3658,8 @@ impl HeadlessServer {
             }
         };
 
-        let metadata_expired = self.app.expire_due_metadata(Instant::now());
+        let metadata_expired = self.app.expire_due_metadata(Instant::now())
+            | self.app.expire_pty_leases_and_apply_shrinks(Instant::now());
         let stream_open = match &msg.request.method {
             api::schema::Method::PaneGraphicsStreamOpen(params) => Some(params.clone()),
             _ => None,

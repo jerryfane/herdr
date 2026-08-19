@@ -1234,6 +1234,11 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::PaneTurns(params) => Some(&mut params.pane_id),
         Method::PaneSendText(params) => Some(&mut params.pane_id),
         Method::PaneSendInput(params) => Some(&mut params.pane_id),
+        // `pane.set_pty_size` carries the target in `pane_id` too (an
+        // `Option<String>`); a `None`/current-pane resize stays local, while a
+        // federated `<alias>/pane` routes to the owning peer, where the width
+        // arbiter runs (#137).
+        Method::PaneSetPtySize(params) => params.pane_id.as_mut(),
         _ => None,
     }
 }
@@ -3187,7 +3192,7 @@ mod federation_tests {
             ("pane.edges", AllowedAt(Observe)),
             ("pane.focus_direction", Denied),
             ("pane.resize", Denied),
-            ("pane.set_pty_size", Denied),
+            ("pane.set_pty_size", AllowedAt(Admin)),
             ("pane.list", AllowedAt(Observe)),
             ("pane.current", AllowedAt(Observe)),
             ("pane.get", AllowedAt(Observe)),
@@ -4427,6 +4432,27 @@ mod federation_tests {
             routable_target_mut(&mut send_input).map(|t| t.as_str()),
             Some("remote/p")
         );
+
+        // pane.set_pty_size carries the target in `pane_id` too, so a federated
+        // width-lease request routes to the owning peer (#137).
+        let mut set_pty_size: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.set_pty_size",
+            "params": { "pane_id": "remote/p", "cols": 100, "rows": 40, "lock": true },
+        }))
+        .unwrap();
+        assert_eq!(
+            routable_target_mut(&mut set_pty_size).map(|t| t.as_str()),
+            Some("remote/p")
+        );
+
+        // A current-pane (no `pane_id`) set_pty_size has no proxyable target and
+        // stays local.
+        let mut local_set_pty_size: Method = serde_json::from_value(serde_json::json!({
+            "method": "pane.set_pty_size",
+            "params": { "cols": 100, "rows": 40, "lock": true },
+        }))
+        .unwrap();
+        assert!(routable_target_mut(&mut local_set_pty_size).is_none());
 
         // A method with no proxyable target is never routed.
         let mut list = Method::AgentList(EmptyParams {});

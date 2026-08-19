@@ -1371,16 +1371,80 @@ pub enum TabBarStatusSegment {
     Text(Option<String>),
 }
 
+/// Identity for a single width-lease holder (a remote viewer such as the mobile
+/// app). Threaded from the viewer's `pane.stream` open through to its close so
+/// the right lease drops when that viewer disconnects. Legacy callers that send
+/// no viewer id share the [`DEFAULT_LEASE_VIEWER`] sentinel key.
+pub type ViewerId = String;
+
+/// One viewer's requested PTY geometry for a pane, kept alive while the viewer is
+/// attached. [`AppState::effective_pty_size`] arbitrates the widest active lease
+/// and applies its FULL geometry. A lease is dropped by explicit release
+/// (`pane.set_pty_size` with `lock:false`), by its viewer's `pane.stream`
+/// closing, or by the TTL backstop swept on the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidthLease {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+    /// Absolute expiry deadline, compared against an injected `now` on the sweep
+    /// tick — the same `Instant`-based mechanism agent-metadata deadlines use
+    /// (`reported_at + ttl`), so lease expiry is deterministic in tests.
+    pub expires_at: std::time::Instant,
+}
+
+/// A per-terminal shrink waiting out the debounce window before it is applied, so
+/// a wider viewer leaving does not immediately thrash the PTY with a SIGWINCH.
+/// Recorded when the arbiter's effective size drops below the current winsize and
+/// applied by the lease sweep once `now >= deadline` and the target still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyPendingShrink {
+    /// `(rows, cols, cell_width_px, cell_height_px)` the PTY should shrink to.
+    pub target: (u16, u16, u32, u32),
+    pub deadline: std::time::Instant,
+}
+
+/// Sentinel viewer key for `pane.set_pty_size` callers that send no `viewer_id`
+/// (legacy clients). Such a lease has no `pane.stream` to tie liveness to, so it
+/// relies purely on the TTL backstop and explicit release.
+pub(crate) const DEFAULT_LEASE_VIEWER: &str = "__herdr_default_viewer__";
+
+/// Generous default width-lease TTL used when a caller sends no `ttl_ms`. The
+/// `pane.stream` close is the primary liveness signal; this is only the backstop
+/// for an ungraceful disconnect.
+pub(crate) const DEFAULT_PTY_LEASE_TTL: std::time::Duration =
+    std::time::Duration::from_millis(300_000);
+
+/// Bounds for a caller-supplied `ttl_ms`, mirroring the metadata TTL bounds
+/// (1ms .. 24h). Out-of-range values are clamped into this window.
+pub(crate) const PTY_LEASE_TTL_MIN_MS: u64 = 1;
+pub(crate) const PTY_LEASE_TTL_MAX_MS: u64 = 86_400_000;
+
+/// Debounce window a shrink must remain stable for before it is applied, to avoid
+/// SIGWINCH thrash as viewers come and go. Grows always apply immediately.
+pub(crate) const PTY_SHRINK_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub struct AppState {
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
-    /// Terminal ids whose size is currently owned by an API `pane.set_pty_size`
-    /// caller. Tracked separately from `direct_attach_resize_locks` so the two
-    /// ownership sources cannot clear each other's locks (a direct attach client
-    /// connecting/disconnecting must not drop an API lock, and vice versa).
-    pub api_pty_size_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Per-viewer width leases owned by API `pane.set_pty_size` callers, keyed by
+    /// terminal then by [`ViewerId`]. The effective winsize is the widest active
+    /// lease's full geometry (see [`AppState::effective_pty_size`]); a lease dies
+    /// when its viewer's `pane.stream` closes (primary) or its TTL elapses
+    /// (backstop). Tracked separately from `direct_attach_resize_locks` so the
+    /// two ownership sources cannot clear each other (a direct attach client
+    /// connecting/disconnecting must not drop an API lease, and vice versa).
+    pub pty_width_leases: std::collections::HashMap<
+        crate::terminal::TerminalId,
+        std::collections::HashMap<ViewerId, WidthLease>,
+    >,
+    /// Per-terminal shrink awaiting its debounce deadline. At most one entry per
+    /// terminal; swept alongside lease TTL expiry off the render path.
+    pub pty_pending_shrinks:
+        std::collections::HashMap<crate::terminal::TerminalId, PtyPendingShrink>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
@@ -1656,11 +1720,111 @@ impl AppState {
     }
 
     /// Whether the pty geometry for a terminal is owned by an external client
-    /// (a direct attach client or an API `pane.set_pty_size` caller), meaning the
-    /// desktop TUI must not re-assert its layout-driven winsize for that pane.
+    /// (a direct attach client or an API `pane.set_pty_size` viewer lease),
+    /// meaning the desktop TUI must not re-assert its layout-driven winsize for
+    /// that pane.
+    ///
+    /// Called per-render × per-pane (a multiplicative path), so this MUST stay
+    /// O(1): the lease half is a single map lookup plus a non-empty check. It
+    /// does NOT filter expired leases — the tick sweep evicts those, so between
+    /// ticks the map holds only live leases and a just-expired lease lingering a
+    /// single tick is harmless.
     pub fn pty_geometry_externally_owned(&self, terminal_id: &crate::terminal::TerminalId) -> bool {
         self.direct_attach_resize_locks.contains(terminal_id)
-            || self.api_pty_size_locks.contains(terminal_id)
+            || self
+                .pty_width_leases
+                .get(terminal_id)
+                .is_some_and(|viewers| !viewers.is_empty())
+    }
+
+    /// Resolve a caller's optional `viewer_id` to a lease map key, substituting
+    /// the legacy sentinel when absent so no-`viewer_id` callers still pin.
+    pub(crate) fn lease_viewer_key(viewer_id: Option<&str>) -> ViewerId {
+        viewer_id.unwrap_or(DEFAULT_LEASE_VIEWER).to_string()
+    }
+
+    /// Insert or replace one viewer's width lease for a terminal.
+    pub(crate) fn upsert_pty_width_lease(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        viewer: ViewerId,
+        lease: WidthLease,
+    ) {
+        self.pty_width_leases
+            .entry(terminal_id.clone())
+            .or_default()
+            .insert(viewer, lease);
+    }
+
+    /// Remove one viewer's lease for a terminal, pruning the terminal's now-empty
+    /// map so [`AppState::pty_geometry_externally_owned`] stays a cheap presence
+    /// check. Returns true when a lease was actually removed.
+    pub(crate) fn remove_pty_width_lease(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        viewer: &str,
+    ) -> bool {
+        let Some(viewers) = self.pty_width_leases.get_mut(terminal_id) else {
+            return false;
+        };
+        let removed = viewers.remove(viewer).is_some();
+        if viewers.is_empty() {
+            self.pty_width_leases.remove(terminal_id);
+        }
+        removed
+    }
+
+    /// The width arbiter: among a terminal's non-expired leases, return the
+    /// widest (max cols) lease's FULL geometry WHOLESALE as
+    /// `(rows, cols, cell_width_px, cell_height_px)` — never a mixed synthesis.
+    /// Ties break deterministically on max cols, then max rows, then the max cell
+    /// metrics. Returns `None` when the terminal has no live lease.
+    ///
+    /// O(leases-on-this-terminal) and only called off the render path (the set
+    /// handler, `pane.stream` close, and the sweep tick), never per-render.
+    pub fn effective_pty_size(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<(u16, u16, u32, u32)> {
+        let now = std::time::Instant::now();
+        self.pty_width_leases
+            .get(terminal_id)?
+            .values()
+            .filter(|lease| lease.expires_at > now)
+            .map(|lease| {
+                (
+                    lease.cols,
+                    lease.rows,
+                    lease.cell_width_px,
+                    lease.cell_height_px,
+                )
+            })
+            .max()
+            .map(|(cols, rows, cell_width_px, cell_height_px)| {
+                (rows, cols, cell_width_px, cell_height_px)
+            })
+    }
+
+    /// Locate the `(workspace, pane)` currently hosting each of the given
+    /// terminals. The lease sweep uses this to find the runtime for a terminal
+    /// that needs a resize (leases are keyed by terminal, runtimes by pane).
+    pub(crate) fn pane_locations_for_terminals(
+        &self,
+        terminals: &std::collections::HashSet<crate::terminal::TerminalId>,
+    ) -> Vec<(usize, PaneId, crate::terminal::TerminalId)> {
+        let mut out = Vec::new();
+        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    if let Some(pane) = ws.pane_state(pane_id) {
+                        if terminals.contains(&pane.attached_terminal_id) {
+                            out.push((ws_idx, pane_id, pane.attached_terminal_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
@@ -1764,7 +1928,8 @@ impl AppState {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
-            api_pty_size_locks: std::collections::HashSet::new(),
+            pty_width_leases: std::collections::HashMap::new(),
+            pty_pending_shrinks: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
@@ -2043,6 +2208,14 @@ impl AppState {
                 self.host_mouse_pixels.is_none(),
                 "empty app state must not keep host mouse pixel provenance"
             );
+            assert!(
+                self.pty_width_leases.is_empty(),
+                "empty app state must not keep pty width leases"
+            );
+            assert!(
+                self.pty_pending_shrinks.is_empty(),
+                "empty app state must not keep pending pty shrinks"
+            );
             return;
         }
 
@@ -2159,6 +2332,20 @@ impl AppState {
                 &notification.workspace_id,
                 notification.pane_id,
                 "pending agent notification",
+            );
+        }
+        for (terminal_id, viewers) in &self.pty_width_leases {
+            assert!(
+                !viewers.is_empty(),
+                "terminal {terminal_id} keeps an empty width-lease map instead of being pruned"
+            );
+        }
+        for terminal_id in self.pty_pending_shrinks.keys() {
+            assert!(
+                self.pty_width_leases
+                    .get(terminal_id)
+                    .is_some_and(|viewers| !viewers.is_empty()),
+                "terminal {terminal_id} has a pending pty shrink but no live width lease"
             );
         }
         if let Some(popup) = &self.popup_pane {
