@@ -1044,7 +1044,15 @@ pub struct FederationPeer {
     pub endpoint: Option<String>,
     /// Filesystem path to the shared auth token for this peer.
     pub token_file: Option<String>,
-    /// Expected node identity presented by the peer, verified on connect.
+    /// Expected per-install node identity the peer must present in its handshake
+    /// (its persisted `machine_id`), verified on connect: a mismatch is rejected
+    /// with the same opaque error as a bad token. Optional — omit to authenticate
+    /// by the shared token alone.
+    ///
+    /// Operator note: only pin this against a peer running a build that sends a
+    /// machine_id (herdr with cross-restart identity, or newer). An older peer
+    /// presents an empty id, and a home that pins it will — correctly — reject the
+    /// connection, so roll the pin out only after the peer is upgraded.
     pub expected_node_id: Option<String>,
     /// Capability tier this peer's token grants over inbound TCP federation.
     /// Default: `observe` (read-only).

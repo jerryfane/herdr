@@ -3514,18 +3514,54 @@ mod federation_tests {
         // as a bad token (the failing check is never revealed), at handshake time
         // before any request can be read.
         let mut fed = start_federation(one_peer_pinned("tok", CapabilityTier::Observe, "node-A"));
-        let stream = raw_hello_with_machine_id(fed.addr, "tok", "node-B");
 
-        let mut reader = BufReader::new(stream);
+        // Write the hello AND a real request in a SINGLE flush, before the handler
+        // reads. This makes "never dispatches" a meaningful check: if the pin
+        // failed to reject, the handler would go on to read this request and
+        // dispatch it. Doing both in one write (rather than a second write after
+        // the hello) is deliberate — a second write racing the handler's
+        // rejection-close RSTs on macOS.
+        let hello = FederationHello::new("tok")
+            .with_machine_id("node-B".to_string())
+            .to_line()
+            .unwrap();
+        let request = serde_json::to_string(&Request {
+            id: "list".into(),
+            method: Method::AgentList(EmptyParams {}),
+        })
+        .unwrap();
+        let mut stream = TcpStream::connect(fed.addr).expect("connect");
+        write!(stream, "{hello}\n{request}\n").expect("write hello+request");
+        stream.flush().expect("flush hello+request");
+        // Bound the read: a correctly-rejecting handler closes fast, but a broken
+        // pin that DISPATCHED the request would then block awaiting a response and
+        // never write — the timeout makes the test fall through to the no-dispatch
+        // assertion (which catches that regression) instead of hanging.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+
+        // The rejection SHOULD be the opaque unauthorized line. Read it
+        // best-effort: the handler rejects at the pin without reading the request,
+        // so it closes with that request still unread — which on macOS/BSD RSTs the
+        // connection and can discard the line (and a broken pin instead times out
+        // above). Either way the load-bearing assertion below is that nothing was
+        // dispatched.
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let mut line = String::new();
-        reader.read_line(&mut line).expect("read rejection line");
-        let value: serde_json::Value = serde_json::from_str(&line).expect("rejection is json");
-        assert_eq!(value["error"]["code"], "unauthorized");
+        if reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                assert_eq!(
+                    value["error"]["code"], "unauthorized",
+                    "the rejection line, when delivered, must be the opaque unauthorized error"
+                );
+            }
+        }
 
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             fed.api_rx.try_recv().is_err(),
-            "a machine-id-mismatched connection dispatched a request"
+            "a machine-id-mismatched connection dispatched a request sent behind the hello"
         );
     }
 
