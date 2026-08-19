@@ -38,6 +38,146 @@ const WINDOWS_REMOTE_PATH_MARKER: &str = "herdr-remote-path:1:";
 const WINDOWS_REMOTE_INSTALL_DIR_MARKER: &str = "herdr-remote-install-dir:1:";
 const WINDOWS_REMOTE_INSTALL_RESULT_MARKER: &str = "herdr-remote-install-result:1:";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+/// Federation control-socket path template. ssh expands `%C` to a hash of the
+/// connection parameters (host/port/user), so one persistent master exists per
+/// peer while every peer shares a single config file. We store the literal
+/// template; ssh performs the expansion.
+const FEDERATION_CONTROL_SOCKET_TEMPLATE: &str = "cm-%C";
+/// Widest hex digest ssh might substitute for `%C` (SHA-256 => 64 chars). Used
+/// only to reserve Unix-socket path budget when picking the private config dir,
+/// so the *expanded* socket path still fits even under a long `$TMPDIR` (e.g.
+/// macOS `/var/folders`).
+const FEDERATION_CONTROL_SOCKET_HASH_MAX: usize = 64;
+/// ConnectTimeout (seconds) applied to the federation ssh config so a cold or
+/// sleeping peer fails fast on the handshake instead of blocking a request.
+const FEDERATION_CONNECT_TIMEOUT_SECS: u32 = 10;
+pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+
+pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteKeybindings {
+    Local,
+    Server,
+}
+
+impl RemoteKeybindings {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "server" => Ok(Self::Server),
+            _ => Err("--remote-keybindings must be 'local' or 'server'".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Server => "server",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteLaunch {
+    pub(crate) target: String,
+    pub(crate) keybindings: RemoteKeybindings,
+    pub(crate) live_handoff: bool,
+}
+
+pub(crate) fn extract_remote_args(
+    args: &[String],
+) -> Result<(Vec<String>, Option<RemoteLaunch>), String> {
+    let mut cleaned = Vec::with_capacity(args.len());
+    if let Some(program) = args.first() {
+        cleaned.push(program.clone());
+    }
+
+    let mut remote_target = None;
+    let mut keybindings = RemoteKeybindings::Local;
+    let mut keybindings_seen = false;
+    let mut live_handoff = false;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            cleaned.extend_from_slice(&args[index..]);
+            break;
+        }
+        if arg == "--handoff" {
+            live_handoff = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--remote" {
+            if remote_target.is_some() {
+                return Err("--remote can only be specified once".to_string());
+            }
+            let Some(value) = args.get(index + 1) else {
+                return Err("missing value for --remote".to_string());
+            };
+            remote_target = Some(validate_remote_target(value)?.to_owned());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--remote=") {
+            if remote_target.is_some() {
+                return Err("--remote can only be specified once".to_string());
+            }
+            remote_target = Some(validate_remote_target(value)?.to_owned());
+            index += 1;
+            continue;
+        }
+        if arg == "--remote-keybindings" {
+            if keybindings_seen {
+                return Err("--remote-keybindings can only be specified once".to_string());
+            }
+            let Some(value) = args.get(index + 1) else {
+                return Err("missing value for --remote-keybindings".to_string());
+            };
+            keybindings = RemoteKeybindings::parse(value)?;
+            keybindings_seen = true;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--remote-keybindings=") {
+            if keybindings_seen {
+                return Err("--remote-keybindings can only be specified once".to_string());
+            }
+            keybindings = RemoteKeybindings::parse(value)?;
+            keybindings_seen = true;
+            index += 1;
+            continue;
+        }
+
+        cleaned.push(arg.clone());
+        index += 1;
+    }
+
+    let remote = remote_target.map(|target| RemoteLaunch {
+        target,
+        keybindings,
+        live_handoff,
+    });
+    if remote.is_none() && keybindings_seen {
+        return Err("--remote-keybindings requires --remote".to_string());
+    }
+    if remote.is_none() && live_handoff {
+        cleaned.push("--handoff".to_string());
+    }
+
+    Ok((cleaned, remote))
+}
+
+fn validate_remote_target(target: &str) -> Result<&str, String> {
+    if target.is_empty() {
+        return Err("missing value for --remote".to_string());
+    }
+    if target.starts_with('-') {
+        return Err("--remote target must not start with '-'".to_string());
+    }
+    Ok(target)
+}
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
@@ -554,6 +694,38 @@ pub(super) struct PreparedRemoteHerdr {
 pub(crate) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
+}
+
+/// Which control-socket scheme a managed ssh config uses.
+#[derive(Clone, Copy)]
+enum ControlSocket {
+    /// Interactive bridge: one fixed socket for the single target.
+    Fixed,
+    /// Federation: one socket per peer, keyed by ssh's `%C` connection hash, so
+    /// many peers reuse warm masters through a single shared config.
+    PerConnection,
+}
+
+impl ControlSocket {
+    /// Literal filename stored in the config's control path (ssh expands tokens).
+    fn socket_name(self) -> &'static str {
+        match self {
+            ControlSocket::Fixed => SSH_CONTROL_SOCKET_NAME,
+            ControlSocket::PerConnection => FEDERATION_CONTROL_SOCKET_TEMPLATE,
+        }
+    }
+
+    /// Name whose LENGTH reserves socket-path budget when creating the private
+    /// config dir. For a per-connection socket ssh expands `%C` at runtime, so
+    /// reserve a worst-case-width placeholder rather than the short literal.
+    fn reservation_name(self) -> String {
+        match self {
+            ControlSocket::Fixed => SSH_CONTROL_SOCKET_NAME.to_string(),
+            ControlSocket::PerConnection => {
+                format!("cm-{}", "0".repeat(FEDERATION_CONTROL_SOCKET_HASH_MAX))
+            }
+        }
+    }
 }
 
 struct ManagedSshConfig {
@@ -2705,14 +2877,21 @@ fn ssh_user_config_include(path: Option<&Path>) -> Option<String> {
 }
 
 /// Builds a temporary ssh config that includes the user's settings first, so
-/// OpenSSH's first-value-wins behavior preserves explicit user keepalives.
-fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
+/// OpenSSH's first-value-wins behavior preserves explicit user keepalives, and
+/// returns the bare options with NO cleanup guard. The caller owns the config
+/// dir's lifetime: [`write_managed_ssh_config`] wraps the result in a
+/// [`ManagedSshConfig`] so Drop removes it, while federation caches the options
+/// for the whole process and leaves the dir in place.
+fn build_managed_ssh_options(
+    control_socket: ControlSocket,
+    connect_timeout: Option<u32>,
+) -> io::Result<ManagedSshOptions> {
     let paths = crate::platform::remote_ssh_config_paths();
-    let dir = crate::platform::create_remote_ssh_config_dir(SSH_CONTROL_SOCKET_NAME)?;
+    let dir = crate::platform::create_remote_ssh_config_dir(&control_socket.reservation_name())?;
     let path = dir.join("config");
     let control_path = paths
         .multiplexing
-        .then(|| dir.join(SSH_CONTROL_SOCKET_NAME));
+        .then(|| dir.join(control_socket.socket_name()));
 
     let mut contents = String::new();
     if let Some(include) = ssh_user_config_include(paths.user_config.as_deref()) {
@@ -2727,6 +2906,9 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     contents.push_str("Host *\n");
     contents.push_str("  ServerAliveInterval 15\n");
     contents.push_str("  ServerAliveCountMax 4\n");
+    if let Some(seconds) = connect_timeout {
+        contents.push_str(&format!("  ConnectTimeout {seconds}\n"));
+    }
 
     let write_result = (|| {
         let mut file = crate::platform::create_remote_ssh_config_file(&path)?;
@@ -2736,11 +2918,9 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
         let _ = fs::remove_dir_all(&dir);
         return Err(err);
     }
-    Ok(ManagedSshConfig {
-        options: ManagedSshOptions {
-            config_path: path,
-            control_path,
-        },
+    Ok(ManagedSshOptions {
+        config_path: path,
+        control_path,
     })
 }
 
@@ -2748,6 +2928,46 @@ struct BridgeUploadStop {
     stopped: AtomicBool,
     wake: crate::platform::RemoteBridgeWake,
 }
+
+/// Interactive bridge ssh config: one fixed control socket for the single target
+/// and no connect timeout, wrapped so Drop cleans up the private dir when the
+/// session ends.
+fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
+    Ok(ManagedSshConfig {
+        options: build_managed_ssh_options(ControlSocket::Fixed, None)?,
+    })
+}
+
+/// Federation ssh config: one persistent control master per peer (keyed by ssh's
+/// `%C` connection hash) shared across all peers, plus a ConnectTimeout so a cold
+/// or sleeping peer fails fast. Returns bare options with NO cleanup guard —
+/// federation caches these for the whole process, so the config dir must outlive
+/// every request. On Windows (no multiplexing) this yields `-F <config>` only.
+pub(crate) fn build_federation_ssh_options() -> io::Result<ManagedSshOptions> {
+    build_managed_ssh_options(
+        ControlSocket::PerConnection,
+        Some(FEDERATION_CONNECT_TIMEOUT_SECS),
+    )
+}
+
+#[cfg(unix)]
+fn bridge_connection(
+    stream: crate::ipc::LocalStream,
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    ssh_options: Option<&ManagedSshOptions>,
+    _bridge_stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    let mut command = Command::new("ssh");
+    apply_managed_ssh_options(&mut command, ssh_options);
+    command
+        .arg("-T")
+        .arg(target)
+        .arg(remote_bridge_command(remote_herdr, session_name))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
 
 impl BridgeUploadStop {
     fn new() -> io::Result<Self> {
@@ -3572,6 +3792,61 @@ mod tests {
         );
 
         drop(managed_config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn federation_managed_ssh_config_uses_per_connection_socket_and_connect_timeout() {
+        let options = build_federation_ssh_options().expect("build federation ssh options");
+        let control_path = options
+            .control_path
+            .clone()
+            .expect("Unix federation config has a per-connection control path");
+        // Per-connection socket: one master per peer via ssh's %C connection hash,
+        // stored as the literal template (ssh expands it, not us).
+        assert!(
+            control_path.ends_with("cm-%C"),
+            "federation control path must be the per-connection template: {control_path:?}"
+        );
+        // The reserved dir keeps the *expanded* socket path within the Unix limit.
+        assert!(
+            fits_unix_socket_path(&control_path),
+            "federation control socket path template must fit portable Unix socket limits"
+        );
+
+        let contents =
+            std::fs::read_to_string(&options.config_path).expect("read federation config");
+        assert!(
+            contents.contains("ConnectTimeout 10"),
+            "federation config should fail fast on a cold peer: {contents}"
+        );
+        assert!(
+            contents.contains("ServerAliveInterval 15"),
+            "federation config should keep the shared keepalive: {contents}"
+        );
+
+        // Federation returns bare options with no cleanup guard, so the test owns
+        // removing the private dir it created.
+        if let Some(dir) = options.config_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn federation_managed_ssh_config_has_no_control_socket_on_windows() {
+        let options = build_federation_ssh_options().expect("build federation ssh options");
+        // ControlMaster is unix-only; federation mirrors the interactive Windows
+        // gating and multiplexes nothing there.
+        assert!(options.control_path.is_none());
+        let contents =
+            std::fs::read_to_string(&options.config_path).expect("read federation config");
+        assert!(contents.contains("ConnectTimeout 10"), "{contents}");
+        assert!(contents.contains("ServerAliveInterval 15"), "{contents}");
+
+        if let Some(dir) = options.config_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
