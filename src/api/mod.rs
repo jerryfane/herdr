@@ -1,6 +1,7 @@
 pub mod client;
 mod event_hub;
 mod federation;
+pub mod federation_manager;
 pub mod federation_store;
 pub(crate) mod output_registry;
 pub mod schema;
