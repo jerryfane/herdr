@@ -38,9 +38,26 @@ pub(crate) struct SshPipe {
     // stdin in that form; the bridge tears down on stdout hangup).
     stdin: std::process::ChildStdin,
     stdout: std::process::ChildStdout,
-    // Owned so the child is not reaped while the stream is still in use.
-    #[allow(dead_code)] // Held for its Drop, not read.
+    // Owned so the child is force-killed and reaped when the stream drops (see the
+    // `Drop` impl); also keeps it from being reaped while the stream is in use.
     child: std::process::Child,
+}
+
+impl Drop for SshPipe {
+    /// Force-kill and reap the SSH child on drop.
+    ///
+    /// `std::process::Child` has NO killing Drop of its own — dropping it only
+    /// closes the handle. For a TCP peer, dropping the socket is a definitive
+    /// teardown; the SSH bridge instead relies on stdin/stdout pipe closure to
+    /// make the child exit, which a hung or wedged `herdr api-bridge` (or a stuck
+    /// `ssh`) could ignore and orphan. So kill the local child explicitly — which
+    /// also drops the SSH connection and so tears the remote bridge down — and
+    /// `wait` to reap the zombie. Both are best-effort: `kill` on an
+    /// already-exited child is a benign error, and `wait` then returns its status.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl SshPipe {
