@@ -226,7 +226,10 @@ fn parse_codex_usage(body: &serde_json::Value) -> Option<(AccountUsage, bool)> {
     let mut windows = Vec::new();
     if is_object(primary) {
         windows.push(UsageWindow {
-            label: "5h".to_string(),
+            // Codex windows are NOT fixed 5h/weekly slots — a pro plan's primary
+            // window is the 7-day one. Derive the label from the window duration
+            // (`limit_window_seconds`) rather than its position.
+            label: codex_window_label(primary, "5h"),
             used_percent: primary_used,
             resets_at: window_resets_at(primary, &["reset_at", "resets_at"]),
             status: Some(window_status(primary_used, limit_reached)),
@@ -234,7 +237,7 @@ fn parse_codex_usage(body: &serde_json::Value) -> Option<(AccountUsage, bool)> {
     }
     if is_object(secondary) {
         windows.push(UsageWindow {
-            label: "weekly".to_string(),
+            label: codex_window_label(secondary, "weekly"),
             used_percent: secondary_used,
             resets_at: window_resets_at(secondary, &["reset_at", "resets_at"]),
             status: Some(window_status(secondary_used, false)),
@@ -343,6 +346,31 @@ fn is_object(value: Option<&serde_json::Value>) -> bool {
 fn window_used_percent(window: Option<&serde_json::Value>, key: &str) -> Option<f32> {
     let used = window?.get(key)?.as_f64()?;
     Some(used.clamp(0.0, 100.0) as f32)
+}
+
+/// Label for a live Codex window from its `limit_window_seconds` duration,
+/// falling back to `fallback` when the duration is absent.
+fn codex_window_label(window: Option<&serde_json::Value>, fallback: &str) -> String {
+    window
+        .and_then(|w| w.get("limit_window_seconds"))
+        .and_then(serde_json::Value::as_u64)
+        .map(window_label_from_seconds)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Human label for a rate-limit window from its duration in seconds:
+/// 18000→"5h", 604800→"weekly", else whole days ("Nd"), whole hours ("Nh"),
+/// or minutes ("Nm"). Shared by the live and local Codex readers so both derive
+/// the label from the real window length instead of its position.
+pub(crate) fn window_label_from_seconds(seconds: u64) -> String {
+    match seconds {
+        18000 => "5h".to_string(),
+        604800 => "weekly".to_string(),
+        s if s >= 86400 && s % 86400 == 0 => format!("{}d", s / 86400),
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// The first present reset marker among `keys`, rendered as a string (epoch
@@ -665,5 +693,35 @@ mod tests {
     fn ttl_is_per_kind() {
         assert_eq!(usage_ttl("codex"), USAGE_CODEX_TTL);
         assert_eq!(usage_ttl("claude"), USAGE_CLAUDE_TTL);
+    }
+
+    #[test]
+    fn window_label_derives_from_duration() {
+        assert_eq!(window_label_from_seconds(18000), "5h");
+        assert_eq!(window_label_from_seconds(604800), "weekly");
+        assert_eq!(window_label_from_seconds(3600), "1h");
+        assert_eq!(window_label_from_seconds(86400), "1d");
+        assert_eq!(window_label_from_seconds(259200), "3d");
+        assert_eq!(window_label_from_seconds(1800), "30m");
+    }
+
+    #[test]
+    fn codex_weekly_only_labels_the_window_weekly() {
+        // A pro plan: the primary window is the 7-day one (604800s), no secondary.
+        // The label must derive from the duration, not the position (was "5h").
+        let body = serde_json::json!({
+            "plan_type": "pro",
+            "email": "user@example.com",
+            "rate_limit": {
+                "limit_reached": false,
+                "primary_window": {"used_percent": 63.0, "limit_window_seconds": 604800, "reset_at": 1_789_827_841i64},
+                "secondary_window": serde_json::Value::Null
+            }
+        });
+        let (usage, active) = parse_codex_usage(&body).expect("fixture should parse");
+        assert!(active);
+        assert_eq!(usage.windows.len(), 1, "only the weekly window is present");
+        assert_eq!(usage.windows[0].label, "weekly");
+        assert_eq!(usage.windows[0].used_percent, Some(63.0));
     }
 }
