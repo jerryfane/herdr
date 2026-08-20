@@ -145,6 +145,9 @@ pub struct App {
     pub(crate) update_version_check_enabled: bool,
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
+    /// Configured credential/config-home accounts, refreshed on config reload.
+    /// Holds only directory paths and labels — never a credential value.
+    pub(crate) loaded_accounts: Vec<crate::config::AccountConfig>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
@@ -620,6 +623,7 @@ impl App {
             update_version_check_enabled: config.update.version_check,
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
+            loaded_accounts: config.accounts.clone(),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
@@ -839,6 +843,10 @@ impl App {
         let mut diagnostics = load_diagnostics.to_vec();
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
+
+        if !invalid_section("accounts") {
+            self.loaded_accounts = config.accounts.clone();
+        }
 
         if !invalid_section("keys") {
             match config.live_keybinds_with_diagnostics() {
@@ -3091,6 +3099,7 @@ mod tests {
                 pane_id,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
+                account: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3133,6 +3142,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
+                account: None,
             }),
         };
         let response = app.handle_api_request(request());

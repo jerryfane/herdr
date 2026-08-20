@@ -22,9 +22,9 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport,
-        ConfigReloadStatus, FederationConfig, FederationPeer, HostCursorModeConfig,
-        NewTerminalCwdConfig, PaneBordersConfig, PushConfig, ShellModeConfig,
+        validated_sidebar_bounds, AccountConfig, AgentPanelSortConfig, CapabilityTier, Config,
+        ConfigReloadReport, ConfigReloadStatus, FederationConfig, FederationPeer,
+        HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig, PushConfig, ShellModeConfig,
         SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,

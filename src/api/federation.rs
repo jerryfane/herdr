@@ -137,6 +137,7 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         // Observe: read-only inspection of panes, agents, events, and layout.
         "ping"
         | "agent.list"
+        | "accounts.list"
         | "agent.get"
         | "agent.read"
         | "agent.explain"

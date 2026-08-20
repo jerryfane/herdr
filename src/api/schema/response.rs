@@ -110,6 +110,9 @@ pub enum ResponseResult {
     AgentList {
         agents: Vec<AgentInfo>,
     },
+    AccountsList {
+        accounts: Vec<super::accounts::AccountInfo>,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
