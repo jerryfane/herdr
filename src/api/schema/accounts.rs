@@ -14,6 +14,11 @@ pub struct AccountInfo {
     /// data proves exhaustion (Codex over quota / rate-limit-reached); `true`
     /// otherwise, including when exhaustion cannot be detected locally.
     pub active: bool,
+    /// The account's login email, when derivable from its config-home (Claude's
+    /// `.claude.json`, Codex's `auth.json` id-token). Identity only — never a
+    /// token or secret. None for kinds/accounts with no local email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AccountUsage>,
 }

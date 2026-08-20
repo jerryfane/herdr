@@ -7538,6 +7538,13 @@
               "description": "Whether the account is usable right now. `false` only when local usage\ndata proves exhaustion (Codex over quota / rate-limit-reached); `true`\notherwise, including when exhaustion cannot be detected locally.",
               "type": "boolean"
             },
+            "email": {
+              "description": "The account's login email, when derivable from its config-home (Claude's\n`.claude.json`, Codex's `auth.json` id-token). Identity only — never a\ntoken or secret. None for kinds/accounts with no local email.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
