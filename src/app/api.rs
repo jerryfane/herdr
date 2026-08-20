@@ -236,13 +236,26 @@ impl App {
                 self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
                 self.emit_live_activity_updates();
             }
-            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
-                && self.respawn_shell_for_launch_pane(*pane_id)
-            {
-                self.overlay_panes.remove(pane_id);
-                self.render_dirty.request_generic();
-                self.render_notify.notify_one();
-                return Vec::new();
+            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell {
+                // A per-agent `agent.restart` arms a pending resume plan before
+                // killing the process; the single PaneDied it triggers relaunches
+                // the agent with `--resume` here (one respawn, no double-spawn,
+                // pane + identity preserved). If the resume cannot start (rare:
+                // env/PTY failure), fall back to a bare shell so the pane ALWAYS
+                // SURVIVES for manual recovery — a restart must never destroy the
+                // pane. Otherwise respawn a bare shell as before.
+                let relaunched = if self.pane_has_pending_agent_resume(*pane_id) {
+                    self.resume_pending_agent_for_pane(*pane_id)
+                        || self.respawn_shell_for_launch_pane(*pane_id)
+                } else {
+                    self.respawn_shell_for_launch_pane(*pane_id)
+                };
+                if relaunched {
+                    self.overlay_panes.remove(pane_id);
+                    self.render_dirty.request_generic();
+                    self.render_notify.notify_one();
+                    return Vec::new();
+                }
             }
         }
 
@@ -621,6 +634,36 @@ impl App {
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
         self.schedule_session_save();
         true
+    }
+
+    /// True when the pane's terminal holds a pending agent-resume plan — set by
+    /// an `agent.restart` just before it killed the process, so the imminent
+    /// `PaneDied` relaunches with `--resume` instead of a bare shell.
+    fn pane_has_pending_agent_resume(&self, pane_id: crate::layout::PaneId) -> bool {
+        self.find_pane(pane_id)
+            .map(|(_, pane)| pane.attached_terminal_id.clone())
+            .and_then(|terminal_id| self.state.terminals.get(&terminal_id))
+            .is_some_and(|terminal| terminal.pending_agent_resume_plan.is_some())
+    }
+
+    /// Relaunch the pane's agent from its pending resume plan: the deferred
+    /// launcher spawns a fresh shell in the same pane, types the harness's
+    /// `--resume` command, and clears the plan. Returns true if a relaunch was
+    /// started. The old runtime was already removed by `agent.restart`'s
+    /// `shutdown_terminal_runtime`, so the launcher (which requires no live
+    /// runtime) proceeds.
+    fn resume_pending_agent_for_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        let Some((_, pane)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        let terminal_id = pane.attached_terminal_id.clone();
+        let (rows, cols) = self.state.estimate_pane_size();
+        // A restart is an explicit user action, so proceed even when the host
+        // terminal theme has not been reported yet (`allow_empty_theme = true`) —
+        // never strand a deliberate restart waiting for a theme that a headless
+        // daemon may never receive. Residual failures degrade to a bare shell
+        // (see the caller), so the pane still survives.
+        self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true)
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
@@ -1285,6 +1328,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentRestart(target) => return self.handle_agent_restart(request.id, target),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
@@ -2858,6 +2902,54 @@ mod tests {
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
         assert!(terminal.agent_name.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_restart_pane_survives_pane_died_with_empty_theme() {
+        // Regression (failure atomicity): an `agent.restart` arms a resume plan
+        // and kills the process. When the PaneDied fires with an EMPTY host
+        // terminal theme (a headless daemon that never received an OSC 10/11
+        // answer — the reachable strand JARVIS found), the resume must still
+        // relaunch (allow_empty_theme) and, failing that, degrade to a bare
+        // shell. Either way the PANE MUST SURVIVE — a restart never destroys it.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("restart");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        // Host theme is unset by default — the exact strand condition.
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.respawn_shell_on_exit = true;
+        terminal.set_agent_name("claude".into());
+        // Arm the restart's resume plan directly (as handle_agent_restart does).
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "sess-x".into()],
+            dedupe_key: "claude:sess-x".into(),
+        });
+
+        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+
+        assert!(
+            app.find_pane(pane_id).is_some(),
+            "an agent.restart must keep the pane alive after PaneDied, even with an empty theme"
+        );
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
