@@ -1246,6 +1246,9 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::AgentGet(params) => Some(&mut params.target),
         Method::AgentRead(params) => Some(&mut params.target),
         Method::AgentExplain(params) => Some(&mut params.target),
+        // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
+        // agent can be restarted from home; the resume runs where the process is.
+        Method::AgentRestart(params) => Some(&mut params.target),
         Method::PaneRead(params) => Some(&mut params.pane_id),
         Method::PaneTurns(params) => Some(&mut params.pane_id),
         Method::PaneSendText(params) => Some(&mut params.pane_id),
@@ -1675,6 +1678,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
+        Method::AgentRestart(_) => "agent.restart",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
         Method::PaneMove(_) => "pane.move",
@@ -3358,6 +3362,7 @@ mod federation_tests {
             ("agent.view.clear", AllowedAt(Admin)),
             ("agent.focus", AllowedAt(Admin)),
             ("agent.start", Denied),
+            ("agent.restart", AllowedAt(Admin)),
             ("agent.prompt", AllowedAt(Interact)),
             ("agent.wait", AllowedAt(Observe)),
             ("pane.split", Denied),

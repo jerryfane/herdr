@@ -166,8 +166,10 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
             AllowedAt(Interact)
         }
         // Admin: focus, rename, and input/authority mutations.
-        "agent.focus" | "agent.rename" | "pane.send_input" | "pane.input.set" | "pane.rename"
-        | "pane.set_pty_size" | "agent.view.set" | "agent.view.clear" => AllowedAt(Admin),
+        "agent.focus" | "agent.rename" | "agent.restart" | "pane.send_input" | "pane.input.set"
+        | "pane.rename" | "pane.set_pty_size" | "agent.view.set" | "agent.view.clear" => {
+            AllowedAt(Admin)
+        }
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
         // notification(s).*, client.window_title.*, agent.start, pane.close,
         // popup.close, every workspace/worktree/tab/layout/pane mutation except
