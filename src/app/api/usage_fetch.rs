@@ -278,8 +278,10 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
     }
 
     // Minimal messages request; its `anthropic-ratelimit-unified-*` RESPONSE
-    // headers carry the live usage. The body is form-safe (fixed literal), and
-    // the token rides in the `-K` config, never argv (see curl_request_headers).
+    // headers carry the live usage. The JSON body has double-quotes, so it is
+    // passed via `--data @<file>` (NOT a `data = "..."` config line — curl's
+    // config parser would truncate at the first inner quote). The token still
+    // rides only in the `-K` config header, never argv (see curl_request_headers).
     let request_body = format!(
         "{{\"model\":\"{CLAUDE_PROBE_MODEL}\",\"max_tokens\":1,\
          \"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
@@ -289,9 +291,9 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
         "header = \"anthropic-version: 2023-06-01\"".to_string(),
         "header = \"anthropic-beta: oauth-2025-04-20\"".to_string(),
         "header = \"content-type: application/json\"".to_string(),
-        format!("data = \"{request_body}\""),
     ];
-    let (code, headers) = curl_request_headers(CLAUDE_MESSAGES_URL, &config_lines)?;
+    let (code, headers) =
+        curl_request_headers(CLAUDE_MESSAGES_URL, &config_lines, Some(&request_body))?;
     // A 429 (or any non-2xx) means back off and fall back to the local read.
     if !is_success(code) {
         return None;
@@ -513,6 +515,7 @@ fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde
 fn curl_request_headers(
     url: &str,
     config_lines: &[String],
+    body: Option<&str>,
 ) -> Option<(u16, std::collections::HashMap<String, String>)> {
     let config = ScopedPath(unique_temp_path("cfg"));
     {
@@ -530,12 +533,29 @@ fn curl_request_headers(
         }
     }
 
+    // POST body (if any) goes in its OWN 0600 temp file referenced as `--data
+    // @<file>`, NOT a `data = "..."` config line — curl's `-K` parser truncates a
+    // double-quoted value at the first inner quote, which silently ships a broken
+    // body. The file holds only the request JSON (no token) and is RAII-cleaned.
+    let body_file = ScopedPath(unique_temp_path("body"));
+    if let Some(body) = body {
+        let write = (|| -> std::io::Result<()> {
+            let mut file = create_private_file(&body_file.0)?;
+            file.write_all(body.as_bytes())
+        })();
+        if write.is_err() {
+            tracing::warn!("usage fetch: failed to write request body file");
+            return None;
+        }
+    }
+
     let header_dump = ScopedPath(unique_temp_path("hdr"));
     if let Err(err) = create_private_file(&header_dump.0) {
         tracing::warn!(error = %err, "usage fetch: failed to create header file");
         return None;
     }
-    let output = crate::noninteractive_process::curl_command()
+    let mut command = crate::noninteractive_process::curl_command();
+    command
         .arg("-sS")
         .arg("-K")
         .arg(&config.0)
@@ -548,10 +568,14 @@ fn curl_request_headers(
         .arg("-o")
         .arg("/dev/null")
         .arg("-w")
-        .arg("%{http_code}")
-        .arg(url)
-        .output()
-        .ok()?;
+        .arg("%{http_code}");
+    if body.is_some() {
+        // `@<path>` reads the raw bytes from the file — no shell/config quoting.
+        command
+            .arg("--data")
+            .arg(format!("@{}", body_file.0.display()));
+    }
+    let output = command.arg(url).output().ok()?;
 
     let code: u16 = String::from_utf8_lossy(&output.stdout)
         .trim()
