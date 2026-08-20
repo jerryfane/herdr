@@ -30,7 +30,14 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Codex CLI OAuth client id (mirrors `codex-usage-api`'s reference flow).
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// Claude live usage comes from the `anthropic-ratelimit-unified-*` RESPONSE
+/// HEADERS on a normal messages call — NOT the `/api/oauth/usage` endpoint, which
+/// rate-limits usage checks so aggressively it 429s. A minimal `max_tokens:1`
+/// probe returns those headers (verified live), matching how omp warms usage.
+const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+/// A cheap model for the header-warming probe (only its response headers are
+/// used; the ~1-token reply is discarded).
+const CLAUDE_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 const USAGE_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
@@ -270,17 +277,28 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
         return None;
     }
 
+    // Minimal messages request; its `anthropic-ratelimit-unified-*` RESPONSE
+    // headers carry the live usage. The JSON body has double-quotes, so it is
+    // passed via `--data @<file>` (NOT a `data = "..."` config line — curl's
+    // config parser would truncate at the first inner quote). The token still
+    // rides only in the `-K` config header, never argv (see curl_request_headers).
+    let request_body = format!(
+        "{{\"model\":\"{CLAUDE_PROBE_MODEL}\",\"max_tokens\":1,\
+         \"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+    );
     let config_lines = [
         format!("header = \"Authorization: Bearer {access_token}\""),
+        "header = \"anthropic-version: 2023-06-01\"".to_string(),
         "header = \"anthropic-beta: oauth-2025-04-20\"".to_string(),
-        "header = \"Accept: application/json\"".to_string(),
+        "header = \"content-type: application/json\"".to_string(),
     ];
-    let (code, body) = curl_request(CLAUDE_USAGE_URL, &config_lines)?;
+    let (code, headers) =
+        curl_request_headers(CLAUDE_MESSAGES_URL, &config_lines, Some(&request_body))?;
     // A 429 (or any non-2xx) means back off and fall back to the local read.
     if !is_success(code) {
         return None;
     }
-    let (mut usage, active) = parse_claude_usage(&body?)?;
+    let (mut usage, active) = parse_claude_usage_headers(&headers)?;
     // The usage endpoint omits plan/tier; enrich from the same on-disk
     // credentials so a live result never regresses the locally-shown plan.
     // Only the two label strings are read — never the token.
@@ -295,46 +313,62 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
     Some((usage, active))
 }
 
-/// Parse a Claude `/api/oauth/usage` body into `(usage, active)`. Pure. Maps the
-/// `five_hour` bucket to a "5h" window and `seven_day` to a "weekly" window,
-/// each `utilization` -> used_percent. `None` for a body with neither bucket
-/// (an error / 429 / garbage body).
-fn parse_claude_usage(body: &serde_json::Value) -> Option<(AccountUsage, bool)> {
-    let five_hour = body.get("five_hour");
-    let seven_day = body.get("seven_day");
-    let five_used = window_used_percent(five_hour, "utilization");
-    let seven_used = window_used_percent(seven_day, "utilization");
+/// Parse Claude live usage from the `anthropic-ratelimit-unified-*` RESPONSE
+/// headers of a `/v1/messages` call (keys lowercased). Pure. `5h`/`7d`
+/// `utilization` (0..1 → 0..100%) map to "5h"/"weekly" windows with epoch-second
+/// resets; a window is exhausted when its `-status` is not "allowed" or it reads
+/// ≥100%. `None` when neither window header is present.
+fn parse_claude_usage_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<(AccountUsage, bool)> {
+    fn parse_window(
+        headers: &std::collections::HashMap<String, String>,
+        key: &str,
+        label: &str,
+    ) -> Option<(UsageWindow, bool)> {
+        let util = headers.get(&format!("anthropic-ratelimit-unified-{key}-utilization"))?;
+        let used_percent = (util.parse::<f64>().ok()?.clamp(0.0, 1.0) * 100.0) as f32;
+        let reached = headers
+            .get(&format!("anthropic-ratelimit-unified-{key}-status"))
+            .is_some_and(|status| status != "allowed");
+        let exhausted = reached || used_percent >= 100.0;
+        let window = UsageWindow {
+            label: label.to_string(),
+            used_percent: Some(used_percent),
+            resets_at: headers
+                .get(&format!("anthropic-ratelimit-unified-{key}-reset"))
+                .cloned(),
+            status: Some(if exhausted { "exhausted" } else { "ok" }.to_string()),
+        };
+        Some((window, exhausted))
+    }
 
     let mut windows = Vec::new();
-    if is_object(five_hour) {
-        windows.push(UsageWindow {
-            label: "5h".to_string(),
-            used_percent: five_used,
-            resets_at: window_resets_at(five_hour, &["resets_at"]),
-            status: Some(window_status(five_used, false)),
-        });
-    }
-    if is_object(seven_day) {
-        windows.push(UsageWindow {
-            label: "weekly".to_string(),
-            used_percent: seven_used,
-            resets_at: window_resets_at(seven_day, &["resets_at"]),
-            status: Some(window_status(seven_used, false)),
-        });
+    let mut any_exhausted = false;
+    for (key, label) in [("5h", "5h"), ("7d", "weekly")] {
+        if let Some((window, exhausted)) = parse_window(headers, key, label) {
+            any_exhausted |= exhausted;
+            windows.push(window);
+        }
     }
     if windows.is_empty() {
         return None;
     }
+    // The overall unified status also gates activeness, when present.
+    if headers
+        .get("anthropic-ratelimit-unified-status")
+        .is_some_and(|status| status != "allowed")
+    {
+        any_exhausted = true;
+    }
 
-    let exhausted =
-        five_used.is_some_and(|used| used >= 100.0) || seven_used.is_some_and(|used| used >= 100.0);
     let mut usage = AccountUsage {
         windows,
         source: Some("live".to_string()),
         ..Default::default()
     };
     usage.backfill_flat_fields();
-    Some((usage, !exhausted))
+    Some((usage, !any_exhausted))
 }
 
 // --- shared parse helpers -----------------------------------------------------
@@ -473,6 +507,94 @@ fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde
     Some((code, parsed))
 }
 
+/// Like `curl_request` but returns the RESPONSE HEADERS (lowercased keys) rather
+/// than the body — for header-warming usage (Claude reads its live limits off
+/// `anthropic-ratelimit-unified-*` response headers). The body is discarded
+/// (`-o /dev/null`); headers are dumped to a 0600 temp file via `-D`. Same
+/// token-in-`-K`-config, `ScopedPath`-cleanup security model as `curl_request`.
+fn curl_request_headers(
+    url: &str,
+    config_lines: &[String],
+    body: Option<&str>,
+) -> Option<(u16, std::collections::HashMap<String, String>)> {
+    let config = ScopedPath(unique_temp_path("cfg"));
+    {
+        let mut file = match create_private_file(&config.0) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(error = %err, "usage fetch: failed to create curl config");
+                return None;
+            }
+        };
+        for line in config_lines {
+            if writeln!(file, "{line}").is_err() {
+                return None;
+            }
+        }
+    }
+
+    // POST body (if any) goes in its OWN 0600 temp file referenced as `--data
+    // @<file>`, NOT a `data = "..."` config line — curl's `-K` parser truncates a
+    // double-quoted value at the first inner quote, which silently ships a broken
+    // body. The file holds only the request JSON (no token) and is RAII-cleaned.
+    let body_file = ScopedPath(unique_temp_path("body"));
+    if let Some(body) = body {
+        let write = (|| -> std::io::Result<()> {
+            let mut file = create_private_file(&body_file.0)?;
+            file.write_all(body.as_bytes())
+        })();
+        if write.is_err() {
+            tracing::warn!("usage fetch: failed to write request body file");
+            return None;
+        }
+    }
+
+    let header_dump = ScopedPath(unique_temp_path("hdr"));
+    if let Err(err) = create_private_file(&header_dump.0) {
+        tracing::warn!(error = %err, "usage fetch: failed to create header file");
+        return None;
+    }
+    let mut command = crate::noninteractive_process::curl_command();
+    command
+        .arg("-sS")
+        .arg("-K")
+        .arg(&config.0)
+        .arg("-A")
+        .arg(USAGE_USER_AGENT)
+        .arg("--max-time")
+        .arg(CURL_MAX_TIME_SECS.to_string())
+        .arg("-D")
+        .arg(&header_dump.0)
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("-w")
+        .arg("%{http_code}");
+    if body.is_some() {
+        // `@<path>` reads the raw bytes from the file — no shell/config quoting.
+        command
+            .arg("--data")
+            .arg(format!("@{}", body_file.0.display()));
+    }
+    let output = command.arg(url).output().ok()?;
+
+    let code: u16 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    if code == 0 {
+        return None;
+    }
+    let dump = std::fs::read_to_string(&header_dump.0).ok()?;
+    let mut headers = std::collections::HashMap::new();
+    for line in dump.lines() {
+        // Skip the "HTTP/2 200" status line (no colon); keep "name: value".
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    Some((code, headers))
+}
+
 /// Reject any secret value that would break — or inject into — a curl config
 /// line. OAuth access tokens are JWT/base64url and never contain these, so a
 /// value that does is treated as malformed and the fetch is abandoned.
@@ -596,48 +718,58 @@ mod tests {
         assert!(parse_codex_usage(&body).is_none());
     }
 
-    #[test]
-    fn claude_usage_fixture_parses_windows_and_active() {
-        let body = serde_json::json!({
-            "five_hour": {"utilization": 31.0, "resets_at": "2026-08-20T16:49:59Z"},
-            "seven_day": {"utilization": 61.0, "resets_at": "2026-08-22T23:59:59Z"},
-            "limits": []
-        });
+    fn claude_headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
 
-        let (usage, active) = parse_claude_usage(&body).expect("fixture should parse");
+    #[test]
+    fn claude_usage_headers_parse_windows_and_active() {
+        // utilization is a 0..1 fraction on the header (0.25 -> 25%).
+        let headers = claude_headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+            ("anthropic-ratelimit-unified-5h-reset", "1787280600"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+            ("anthropic-ratelimit-unified-7d-reset", "1787443200"),
+        ]);
+        let (usage, active) = parse_claude_usage_headers(&headers).expect("fixture should parse");
         assert!(active);
         assert_eq!(usage.source.as_deref(), Some("live"));
         assert_eq!(usage.windows.len(), 2);
         assert_eq!(usage.windows[0].label, "5h");
-        assert_eq!(usage.windows[0].used_percent, Some(31.0));
-        assert_eq!(
-            usage.windows[0].resets_at.as_deref(),
-            Some("2026-08-20T16:49:59Z")
-        );
+        assert_eq!(usage.windows[0].used_percent, Some(25.0));
+        assert_eq!(usage.windows[0].resets_at.as_deref(), Some("1787280600"));
         assert_eq!(usage.windows[1].label, "weekly");
-        assert_eq!(usage.windows[1].used_percent, Some(61.0));
-        assert_eq!(usage.primary_used_percent, Some(31.0));
-        assert_eq!(usage.secondary_used_percent, Some(61.0));
+        assert_eq!(usage.windows[1].used_percent, Some(50.0));
+        // Flat back-compat fields mirror the first two windows.
+        assert_eq!(usage.primary_used_percent, Some(25.0));
+        assert_eq!(usage.secondary_used_percent, Some(50.0));
+        assert_eq!(usage.resets_at.as_deref(), Some("1787280600"));
     }
 
     #[test]
-    fn claude_usage_over_quota_is_inactive() {
-        let body = serde_json::json!({
-            "five_hour": {"utilization": 100.0, "resets_at": "2026-08-20T16:49:59Z"},
-            "seven_day": {"utilization": 50.0}
-        });
-
-        let (_usage, active) = parse_claude_usage(&body).expect("fixture should parse");
-        assert!(!active, "a window at 100% is inactive");
+    fn claude_usage_headers_rejected_status_is_inactive() {
+        let headers = claude_headers(&[
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
+        ]);
+        let (_usage, active) = parse_claude_usage_headers(&headers).expect("fixture should parse");
+        assert!(!active, "a rejected / 100% window is inactive");
     }
 
     #[test]
-    fn claude_usage_rate_limit_error_body_is_none() {
-        let body = serde_json::json!({
-            "type": "error",
-            "error": {"type": "rate_limit_error", "message": "too many requests"}
-        });
-        assert!(parse_claude_usage(&body).is_none());
+    fn claude_usage_headers_absent_windows_is_none() {
+        // A non-200 / unexpected response carries no unified window headers.
+        let headers = claude_headers(&[
+            ("content-type", "application/json"),
+            ("x-request-id", "abc"),
+        ]);
+        assert!(parse_claude_usage_headers(&headers).is_none());
     }
 
     #[test]
