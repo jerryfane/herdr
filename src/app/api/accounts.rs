@@ -222,36 +222,59 @@ fn read_tail(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
 
 /// Recursively enumerate `*.jsonl` files under `dir` with their mtimes, bounded
 /// to `limit` entries so a huge session tree cannot stall the call.
+///
+/// Codex nests session logs as `sessions/YYYY/MM/DD/…`, whose directory names
+/// sort chronologically, so subdirectories are visited in DESCENDING name order
+/// and the `limit` bound therefore keeps the NEWEST-dated logs — the ones that
+/// carry the current rate-limit snapshot — instead of an arbitrary traversal
+/// slice. (A default home can hold tens of thousands of logs, far above the
+/// bound; a traversal-order cut would routinely miss the recent ones.) Callers
+/// still sort the result by mtime before scanning.
 fn collect_jsonl_files(dir: &Path, limit: usize) -> Vec<(PathBuf, std::time::SystemTime)> {
     let mut found = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
+    collect_jsonl_files_into(dir, limit, &mut found);
+    found
+}
+
+fn collect_jsonl_files_into(
+    dir: &Path,
+    limit: usize,
+    found: &mut Vec<(PathBuf, std::time::SystemTime)>,
+) {
+    if found.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            subdirs.push(path);
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            if found.len() >= limit {
+                return;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push((path, mtime));
+        }
+    }
+    // Newest-named subdirectory first (dates sort chronologically), so the
+    // `limit` bound retains recent logs rather than an arbitrary slice.
+    subdirs.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for sub in subdirs {
         if found.len() >= limit {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if found.len() >= limit {
-                break;
-            }
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                let mtime = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                found.push((path, mtime));
-            }
-        }
+        collect_jsonl_files_into(&sub, limit, found);
     }
-    found
 }
 
 /// Extract only Claude's plan/tier from `<config_dir>/.credentials.json`.
@@ -427,6 +450,36 @@ mod tests {
         assert!(!active, "exhausted snapshot is inactive");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_jsonl_files_keeps_newest_date_dir_within_limit() {
+        // Codex nests sessions as YYYY/MM/DD. With a bound smaller than the
+        // total file count, the collector must retain the NEWEST-dated logs
+        // (which carry the current rate-limit snapshot), not an arbitrary
+        // traversal slice — a real default home holds far more logs than the
+        // bound, so a traversal-order cut would routinely drop the recent ones.
+        let root = std::env::temp_dir().join(format!("herdr-codex-recency-{}", std::process::id()));
+        for day in ["01", "10", "20"] {
+            let d = root.join("2026").join("08").join(day);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("rollout.jsonl"), b"{}\n").unwrap();
+        }
+        // Bound to a single file: it must be the newest day's (20), regardless
+        // of the filesystem's directory-read order.
+        let files = collect_jsonl_files(&root, 1);
+        assert_eq!(files.len(), 1);
+        let newest = root
+            .join("2026")
+            .join("08")
+            .join("20")
+            .join("rollout.jsonl");
+        assert_eq!(
+            files[0].0, newest,
+            "expected the newest day's log within the bound"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
