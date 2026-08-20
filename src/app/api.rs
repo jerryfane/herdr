@@ -13,6 +13,7 @@ pub(crate) mod plugins;
 mod responses;
 mod session;
 mod tabs;
+pub(crate) mod usage_fetch;
 mod workspaces;
 mod worktrees;
 
@@ -71,6 +72,12 @@ impl App {
                 segment_index,
                 result,
             } => self.handle_tab_bar_command_finished(generation, segment_index, result),
+            AppEvent::UsageRefreshed { account_id, usage } => {
+                self.handle_usage_refreshed(account_id, usage);
+                // Live usage is surfaced only through the `accounts.list` API,
+                // never the TUI, so it never dirties a render.
+                false
+            }
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
                 false
@@ -105,6 +112,27 @@ impl App {
             self.render_notify.notify_one();
         }
         changed
+    }
+
+    /// Apply a finished background live-usage fetch: clear the in-flight marker
+    /// (so a later `accounts.list` can retry) and, on success, cache the result.
+    /// A `None` result (failure/timeout) leaves any existing cache untouched.
+    fn handle_usage_refreshed(
+        &mut self,
+        account_id: String,
+        usage: Option<(crate::api::schema::AccountUsage, bool)>,
+    ) {
+        self.usage_refresh_inflight.remove(&account_id);
+        if let Some((usage, active)) = usage {
+            self.usage_cache.insert(
+                account_id,
+                usage_fetch::CachedUsage {
+                    fetched_at: Instant::now(),
+                    usage,
+                    active,
+                },
+            );
+        }
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
@@ -165,6 +193,11 @@ impl App {
         } = ev
         {
             let _ = self.handle_tab_bar_command_finished(generation, segment_index, result);
+            return Vec::new();
+        }
+
+        if let AppEvent::UsageRefreshed { account_id, usage } = ev {
+            self.handle_usage_refreshed(account_id, usage);
             return Vec::new();
         }
 

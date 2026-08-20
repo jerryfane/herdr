@@ -133,6 +133,13 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Per-account live-usage cache, written by background fetch threads via
+    /// `AppEvent::UsageRefreshed` and read (with a per-kind TTL) by the sync
+    /// `accounts.list` handler. Holds only usage NUMBERS — never a credential.
+    pub(crate) usage_cache: HashMap<String, api::usage_fetch::CachedUsage>,
+    /// Account ids with a live-usage fetch currently in flight, so the sync
+    /// handler kicks at most one background fetch per account at a time.
+    pub(crate) usage_refresh_inflight: HashSet<String>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -779,6 +786,8 @@ impl App {
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            usage_cache: HashMap::new(),
+            usage_refresh_inflight: HashSet::new(),
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
