@@ -7567,7 +7567,7 @@
           "type": "object"
         },
         "AccountUsage": {
-          "description": "Best-effort, locally-derived usage for an account. Every field is optional so\nthe call degrades honestly when a harness exposes nothing (Kimi), only a plan\n(Claude), or a full snapshot (Codex). Percentages only — no token is read.",
+          "description": "Best-effort usage for an account. Every field is optional so the call\ndegrades honestly when a harness exposes nothing (Kimi), only a plan\n(Claude), or a full snapshot (Codex). Percentages only — no token is read.\n\n`windows` is the current shape (any number of rate-limit buckets). The flat\n`primary_used_percent`/`secondary_used_percent`/`resets_at` mirror the first\ntwo windows and are kept ONLY for back-compat with app versions shipped\nbefore `windows` existed — populate them from `windows` when building this.",
           "properties": {
             "plan": {
               "description": "Plan/subscription name, when known.",
@@ -7577,7 +7577,7 @@
               ]
             },
             "primary_used_percent": {
-              "description": "Primary (e.g. 5h) window used-percent, when known.",
+              "description": "Back-compat: primary (e.g. 5h) window used-percent (= `windows[0]`).",
               "format": "float",
               "type": [
                 "number",
@@ -7585,17 +7585,24 @@
               ]
             },
             "resets_at": {
-              "description": "When the primary window resets, as reported by the harness (opaque\nstring; may be an epoch or timestamp).",
+              "description": "Back-compat: when the primary window resets (= `windows[0].resets_at`).",
               "type": [
                 "string",
                 "null"
               ]
             },
             "secondary_used_percent": {
-              "description": "Secondary (e.g. weekly) window used-percent, when known.",
+              "description": "Back-compat: secondary (e.g. weekly) window used-percent (= `windows[1]`).",
               "format": "float",
               "type": [
                 "number",
+                "null"
+              ]
+            },
+            "source": {
+              "description": "Where the numbers came from: \"live\" (fetched from the provider) or\n\"local\" (read from on-disk session logs / credentials). None when absent.",
+              "type": [
+                "string",
                 "null"
               ]
             },
@@ -7605,6 +7612,13 @@
                 "string",
                 "null"
               ]
+            },
+            "windows": {
+              "description": "Per-window usage buckets (5h / weekly / …). The forward-looking shape.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/UsageWindow"
+              },
+              "type": "array"
             }
           },
           "type": "object"
@@ -12248,6 +12262,41 @@
               "type": "string"
             }
           ]
+        },
+        "UsageWindow": {
+          "description": "One rate-limit window for an account (e.g. a 5-hour or weekly bucket).",
+          "properties": {
+            "label": {
+              "description": "Short window label, e.g. \"5h\", \"weekly\", \"7d\".",
+              "type": "string"
+            },
+            "resets_at": {
+              "description": "When this window resets (opaque string; may be an epoch or timestamp).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "description": "Window status, e.g. \"ok\" or \"exhausted\", when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "used_percent": {
+              "description": "Percent of this window consumed (0..100), when known.",
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
         },
         "WorkspaceInfo": {
           "properties": {

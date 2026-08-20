@@ -163,6 +163,13 @@ pub enum AppEvent {
         segment_index: usize,
         result: Result<Option<String>, String>,
     },
+    /// A background live account-usage fetch finished. `usage` is `None` on any
+    /// failure/timeout: the handler then leaves the cache untouched and clears
+    /// the in-flight marker so a later `accounts.list` can retry.
+    UsageRefreshed {
+        account_id: String,
+        usage: Option<(crate::api::schema::AccountUsage, bool)>,
+    },
     /// A plugin action or event command finished.
     PluginCommandFinished {
         log_id: String,
