@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
-    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
+    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentRestartParams,
+    AgentSendKeysParams, AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -73,8 +73,12 @@ impl App {
     /// resume-aware respawn path turns into a single `--resume` relaunch — no
     /// double-spawn, pane + agent identity preserved. Errors when the agent has
     /// no resumable session (not a herdr-launched agent, or none reported).
-    pub(super) fn handle_agent_restart(&mut self, id: String, target: AgentTarget) -> String {
-        let resolved = match self.resolve_agent_target(&target.target) {
+    pub(super) fn handle_agent_restart(
+        &mut self,
+        id: String,
+        params: AgentRestartParams,
+    ) -> String {
+        let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
@@ -85,7 +89,7 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
             .cloned()
         else {
-            return agent_not_found(id, &target.target);
+            return agent_not_found(id, &params.target);
         };
 
         let Some((source, agent, session_ref)) = self
@@ -108,8 +112,25 @@ impl App {
             );
         };
 
+        // Resolve which account to resume under: an explicit `account` param is a
+        // swap; absent, default to the account this agent already runs under so a
+        // plain restart stays on the same subscription.
+        let remembered_account = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.agent_account.clone());
+        let selected_account = params.account.clone().or(remembered_account);
+        let account_env = match selected_account.as_deref() {
+            Some(account_id) => match self.resolve_account_launch_env(account_id, &agent) {
+                Ok(env) => Some((account_id.to_string(), env)),
+                Err(err) => return encode_error_body(id, err.into_error_body()),
+            },
+            None => None,
+        };
+
         // Snapshot the agent info to return before the process is killed.
-        let agent_info = match self.agent_info_for_target(&target.target) {
+        let agent_info = match self.agent_info_for_target(&params.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
@@ -117,9 +138,19 @@ impl App {
         // Arm the resume plan and guarantee the imminent PaneDied respawns the
         // pane (rather than closing it), then kill the process. The single
         // PaneDied drives one resume relaunch via the resume-aware respawn path.
+        // The account env (if any) rides on `pending_launch_env`, read at that
+        // relaunch's fresh-shell spawn; `agent_account` remembers the choice so a
+        // later plain restart keeps it.
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = Some(plan);
             terminal.respawn_shell_on_exit = true;
+            match account_env {
+                Some((account_id, env)) => {
+                    terminal.pending_launch_env = env;
+                    terminal.agent_account = Some(account_id);
+                }
+                None => terminal.pending_launch_env.clear(),
+            }
         }
         self.shutdown_terminal_runtime(terminal_id);
 
@@ -1296,8 +1327,9 @@ mod tests {
 
         let response = app.handle_agent_restart(
             "req".into(),
-            AgentTarget {
+            AgentRestartParams {
                 target: "reviewer".into(),
+                account: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1343,8 +1375,9 @@ mod tests {
 
         let response = app.handle_agent_restart(
             "req".into(),
-            AgentTarget {
+            AgentRestartParams {
                 target: "omp-seat".into(),
+                account: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1380,8 +1413,9 @@ mod tests {
 
         let response = app.handle_agent_restart(
             "req".into(),
-            AgentTarget {
+            AgentRestartParams {
                 target: "noresume".into(),
+                account: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1389,5 +1423,98 @@ mod tests {
         assert!(app.state.terminals[&terminal_id]
             .pending_agent_resume_plan
             .is_none());
+    }
+
+    fn arm_codex_agent(app: &mut App, name: &str) -> crate::terminal::TerminalId {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("codex-sess").unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        terminal_id
+    }
+
+    #[tokio::test]
+    async fn agent_restart_with_account_threads_env_and_remembers_swap() {
+        let mut app = app_with_agent();
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        }];
+        let terminal_id = arm_codex_agent(&mut app, "codexseat");
+
+        // Explicit swap: the account env lands on pending_launch_env — exactly the
+        // pairs the resume relaunch injects at its fresh-shell spawn.
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentRestartParams {
+                target: "codexseat".into(),
+                account: Some("work".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        {
+            let terminal = app.state.terminals.get(&terminal_id).unwrap();
+            assert_eq!(
+                terminal.pending_launch_env,
+                vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())]
+            );
+            assert_eq!(terminal.agent_account.as_deref(), Some("work"));
+        }
+
+        // Simulate the relaunch consuming the armed env, then a plain restart
+        // (no account param) must resume under the remembered account.
+        arm_codex_agent(&mut app, "codexseat");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_launch_env
+            .clear();
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentRestartParams {
+                target: "codexseat".into(),
+                account: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.pending_launch_env,
+            vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+            "a plain restart keeps the remembered account"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_restart_unknown_account_errors() {
+        let mut app = app_with_agent();
+        arm_codex_agent(&mut app, "codexseat");
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentRestartParams {
+                target: "codexseat".into(),
+                account: Some("missing".into()),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "unknown_account");
     }
 }

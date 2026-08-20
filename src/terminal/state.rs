@@ -285,6 +285,17 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// Extra `(env_var, value)` pairs to inject into the next deferred
+    /// shell spawn for this terminal (the account config-home env selected by an
+    /// `agent.restart`). Consumed and cleared at the resume/respawn spawn site so
+    /// a relaunch runs under the chosen account. Holds only a config-dir path,
+    /// never a credential value.
+    pub pending_launch_env: Vec<(String, String)>,
+    /// The credential/config-home account id this terminal's agent runs under, if
+    /// any. Remembered across an in-place restart so a plain `agent.restart`
+    /// keeps the same account; an explicit swap overrides it. Independent of the
+    /// session-ref churn from hook reports.
+    pub agent_account: Option<String>,
 }
 
 impl TerminalState {
@@ -330,6 +341,8 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
+            pending_launch_env: Vec::new(),
+            agent_account: None,
         }
     }
 

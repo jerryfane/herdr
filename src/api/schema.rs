@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod accounts;
 pub mod agents;
 pub mod common;
 pub mod events;
@@ -14,6 +15,7 @@ pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
 
+pub use accounts::*;
 pub use agents::*;
 pub use common::*;
 pub use events::*;
@@ -152,7 +154,9 @@ pub enum Method {
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "agent.restart")]
-    AgentRestart(AgentTarget),
+    AgentRestart(AgentRestartParams),
+    #[serde(rename = "accounts.list")]
+    AccountsList(EmptyParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]

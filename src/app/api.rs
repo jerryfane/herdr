@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+pub(crate) mod accounts;
 mod agent_view;
 mod agents;
 mod env;
@@ -593,12 +594,16 @@ impl App {
         };
 
         let cwd = terminal.cwd.clone();
+        // Reuse any account config-home env armed for this pane so a bare-shell
+        // fallback keeps the same account. Empty for an ordinary launch-pane
+        // respawn, so that path stays byte-identical.
+        let extra_env = terminal.pending_launch_env.clone();
         let (rows, cols) = self
             .terminal_runtimes
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
             .unwrap_or_else(|| self.state.estimate_pane_size());
-        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
+        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, extra_env) else {
             return false;
         };
         let runtime = match crate::terminal::TerminalRuntime::spawn(
@@ -630,6 +635,7 @@ impl App {
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.clear_agent_runtime_identity_after_respawn();
+            terminal.pending_launch_env.clear();
         }
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
         self.schedule_session_save();
@@ -1328,7 +1334,8 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
-            Method::AgentRestart(target) => return self.handle_agent_restart(request.id, target),
+            Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
+            Method::AccountsList(_) => return self.handle_accounts_list(request.id),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(

@@ -226,9 +226,17 @@ impl App {
             );
             return false;
         };
+        // Carry the account config-home env armed by `agent.restart` (empty for a
+        // plain restore) so the relaunched shell resumes under the chosen account.
+        let extra_env = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.pending_launch_env.clone())
+            .unwrap_or_default();
         let Some(launch_env) = self
             .find_pane(pane_id)
-            .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, Vec::new()))
+            .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, extra_env))
         else {
             return false;
         };
@@ -280,6 +288,7 @@ impl App {
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
+            terminal.pending_launch_env.clear();
             terminal.respawn_shell_on_exit = false;
         }
         true

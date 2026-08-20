@@ -192,8 +192,25 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-        argv.extend(params.args);
+        // Resolve an optional credential/config-home account for this agent. The
+        // pane's shell already exists, so the account env is prepended to the
+        // typed command as an `env VAR=value ...` prefix (the value is a config
+        // dir PATH, never a credential). No account keeps the argv byte-identical.
+        let account_env = match params.account.as_deref() {
+            Some(account_id) => {
+                let env = self
+                    .resolve_account_launch_env(account_id, crate::detect::agent_label(kind))
+                    .map_err(AgentStartError::from_account_resolve)?;
+                Some((account_id.to_string(), env))
+            }
+            None => None,
+        };
+
+        let argv = agent_launch_argv(
+            account_env.as_ref().map(|(_, env)| env.as_slice()),
+            crate::detect::interactive_agent_executable(kind),
+            params.args,
+        );
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
@@ -213,6 +230,9 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        if let Some((account_id, _)) = &account_env {
+            terminal.agent_account = Some(account_id.clone());
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
@@ -262,6 +282,22 @@ impl App {
             AgentStartError::InputFailed(message) => crate::api::schema::ErrorBody {
                 code: "agent_start_input_failed".into(),
                 message,
+            },
+            AgentStartError::UnknownAccount(account) => crate::api::schema::ErrorBody {
+                code: "unknown_account".into(),
+                message: format!(
+                    "no configured account with id {account} for this agent kind"
+                ),
+            },
+            AgentStartError::AccountKindMismatch {
+                account,
+                account_kind,
+                agent_kind,
+            } => crate::api::schema::ErrorBody {
+                code: "account_kind_mismatch".into(),
+                message: format!(
+                    "account {account} is for kind {account_kind}, not {agent_kind}"
+                ),
             },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 code: "agent_name_taken".into(),
@@ -428,6 +464,27 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
     crate::platform::available_pane_shell(runtime.child_pid()?)
 }
 
+/// Build the argv typed into an `agent.start` pane's existing shell. When an
+/// account is selected, its config-home env is applied via an `env VAR=value …`
+/// prefix that exec-replaces itself with the agent, so detection still sees the
+/// harness process. Without an account the argv is `[executable, ..args]`.
+fn agent_launch_argv(
+    account_env: Option<&[(String, String)]>,
+    executable: &str,
+    args: Vec<String>,
+) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(env) = account_env {
+        argv.push("env".to_string());
+        for (key, value) in env {
+            argv.push(format!("{key}={value}"));
+        }
+    }
+    argv.push(executable.to_string());
+    argv.extend(args);
+    argv
+}
+
 pub(super) fn runtime_hosts_agent(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
@@ -542,6 +599,31 @@ pub(super) enum AgentStartError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+    UnknownAccount(String),
+    AccountKindMismatch {
+        account: String,
+        account_kind: String,
+        agent_kind: String,
+    },
+}
+
+impl AgentStartError {
+    fn from_account_resolve(err: crate::app::api::accounts::AccountResolveError) -> Self {
+        match err {
+            crate::app::api::accounts::AccountResolveError::Unknown(account) => {
+                AgentStartError::UnknownAccount(account)
+            }
+            crate::app::api::accounts::AccountResolveError::KindMismatch {
+                account,
+                account_kind,
+                agent_kind,
+            } => AgentStartError::AccountKindMismatch {
+                account,
+                account_kind,
+                agent_kind,
+            },
+        }
+    }
 }
 
 pub(super) enum AgentRenameError {
@@ -624,7 +706,29 @@ mod tests {
             Some(&job(4242, 4242, "claude"))
         ));
     }
-    use super::valid_agent_name;
+    use super::{agent_launch_argv, valid_agent_name};
+
+    #[test]
+    fn agent_launch_argv_prefixes_account_env() {
+        let env = [("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())];
+        assert_eq!(
+            agent_launch_argv(Some(&env), "codex", vec!["--yolo".to_string()]),
+            vec![
+                "env".to_string(),
+                "CODEX_HOME=/home/x/.codex-work".to_string(),
+                "codex".to_string(),
+                "--yolo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_launch_argv_without_account_is_byte_identical() {
+        assert_eq!(
+            agent_launch_argv(None, "claude", vec!["--resume".to_string()]),
+            vec!["claude".to_string(), "--resume".to_string()]
+        );
+    }
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
