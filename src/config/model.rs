@@ -325,6 +325,51 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub push: PushConfig,
     pub federation: FederationConfig,
+    pub accounts: Vec<AccountConfig>,
+}
+
+/// A per-harness credential/config-home account.
+///
+/// An account points a coding-agent harness at an alternate config-home
+/// directory (Claude Code `CLAUDE_CONFIG_DIR`, Codex `CODEX_HOME`, Kimi
+/// `KIMI_CODE_HOME`), so a single herdr install can run several subscriptions of
+/// the same harness side by side and swap between them per agent. Only the
+/// directory PATH is recorded here — never a token or credential value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct AccountConfig {
+    /// Stable identifier used to select this account on `agent.start` /
+    /// `agent.restart` and to key it in `accounts.list`.
+    pub id: String,
+    /// Harness this account belongs to: `claude`, `codex`, or `kimi`.
+    pub kind: String,
+    /// Human-facing label shown in listings.
+    pub label: String,
+    /// Filesystem path to the harness config-home directory for this account.
+    pub config_dir: String,
+}
+
+/// The config-home environment variable a harness reads to locate its
+/// config/credentials directory, or `None` for a kind that has no such lever.
+pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude" => Some("CLAUDE_CONFIG_DIR"),
+        "codex" => Some("CODEX_HOME"),
+        "kimi" => Some("KIMI_CODE_HOME"),
+        _ => None,
+    }
+}
+
+impl AccountConfig {
+    /// The single `(env_var, config_dir)` pair that points this account's harness
+    /// at its config-home directory. `None` when the kind has no config-home
+    /// lever (an unknown/misconfigured kind).
+    pub fn launch_env(&self) -> Option<Vec<(String, String)>> {
+        Some(vec![(
+            env_var_for_kind(&self.kind)?.to_string(),
+            self.config_dir.clone(),
+        )])
+    }
 }
 
 #[derive(Debug)]
@@ -1317,6 +1362,72 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_var_for_kind_maps_supported_harnesses() {
+        assert_eq!(env_var_for_kind("claude"), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(env_var_for_kind("codex"), Some("CODEX_HOME"));
+        assert_eq!(env_var_for_kind("kimi"), Some("KIMI_CODE_HOME"));
+        assert_eq!(env_var_for_kind("gemini"), None);
+        assert_eq!(env_var_for_kind(""), None);
+    }
+
+    #[test]
+    fn account_launch_env_builds_config_home_pair() {
+        let account = AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        };
+        assert_eq!(
+            account.launch_env(),
+            Some(vec![(
+                "CODEX_HOME".to_string(),
+                "/home/x/.codex-work".to_string()
+            )])
+        );
+
+        let unknown = AccountConfig {
+            kind: "gemini".into(),
+            ..account
+        };
+        assert_eq!(unknown.launch_env(), None);
+    }
+
+    #[test]
+    fn accounts_registry_round_trips_from_toml() {
+        let toml = r#"
+[[accounts]]
+id = "work"
+kind = "codex"
+label = "Work"
+config_dir = "/home/x/.codex-work"
+
+[[accounts]]
+id = "personal"
+kind = "claude"
+label = "Personal"
+config_dir = "/home/x/.claude-personal"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.accounts.len(), 2);
+        assert_eq!(config.accounts[0].id, "work");
+        assert_eq!(config.accounts[0].kind, "codex");
+        assert_eq!(config.accounts[0].config_dir, "/home/x/.codex-work");
+        assert_eq!(config.accounts[1].id, "personal");
+        assert_eq!(config.accounts[1].kind, "claude");
+        assert_eq!(
+            config.accounts[1].launch_env(),
+            Some(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/x/.claude-personal".to_string()
+            )])
+        );
+
+        // Absent section defaults to an empty registry.
+        assert!(Config::default().accounts.is_empty());
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

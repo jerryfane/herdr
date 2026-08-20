@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, Method,
-    PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -275,7 +275,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [--account ID] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -285,6 +285,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut account = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
@@ -313,6 +314,14 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Ok(timeout_ms) => Some(timeout_ms),
                     Err(exit_code) => return Ok(exit_code),
                 };
+                index += 2;
+            }
+            "--account" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --account");
+                    return Ok(2);
+                };
+                account = Some(value.clone());
                 index += 2;
             }
             other => {
@@ -364,6 +373,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                account: account.clone(),
             }),
         })?;
         if response.get("error").is_none() {
@@ -471,19 +481,34 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_restart(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent restart <target> [--account <id>]";
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent restart <target>");
+        eprintln!("{USAGE}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: herdr agent restart <target>");
-        return Ok(2);
+    let mut account = None;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--account" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                account = Some(value.clone());
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        }
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:restart".into(),
-        method: Method::AgentRestart(AgentTarget {
+        method: Method::AgentRestart(AgentRestartParams {
             target: target.clone(),
+            account,
         }),
     })?)
 }

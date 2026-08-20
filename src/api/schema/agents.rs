@@ -172,6 +172,21 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Optional credential/config-home account id (from the `[[accounts]]` config
+    /// registry) to launch this agent under. Points the harness at that account's
+    /// config-home directory. Must match the agent's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentRestartParams {
+    pub target: String,
+    /// Optional credential/config-home account id to resume under. Absent keeps
+    /// the agent's remembered account (a plain restart); present swaps to the
+    /// named account for this and subsequent restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

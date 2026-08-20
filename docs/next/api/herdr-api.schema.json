@@ -1636,6 +1636,24 @@
           ],
           "type": "object"
         },
+        "AgentRestartParams": {
+          "properties": {
+            "account": {
+              "description": "Optional credential/config-home account id to resume under. Absent keeps\nthe agent's remembered account (a plain restart); present swaps to the\nnamed account for this and subsequent restarts.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentSendKeysParams": {
           "properties": {
             "keys": {
@@ -1656,6 +1674,13 @@
         },
         "AgentStartParams": {
           "properties": {
+            "account": {
+              "description": "Optional credential/config-home account id (from the `[[accounts]]` config\nregistry) to launch this agent under. Points the harness at that account's\nconfig-home directory. Must match the agent's kind.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "args": {
               "items": {
                 "type": "string"
@@ -5967,7 +5992,23 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/AgentTarget"
+              "$ref": "#/schemas/request/$defs/AgentRestartParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "accounts.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
             }
           },
           "required": [
@@ -7490,6 +7531,84 @@
     },
     "success_response": {
       "$defs": {
+        "AccountInfo": {
+          "description": "A configured credential/config-home account, as returned by `accounts.list`.\n\nReports only non-secret metadata: the account id, harness kind, label, and\nbest-effort usage NUMBERS. It never carries a token, key, or any credential\nvalue.",
+          "properties": {
+            "active": {
+              "description": "Whether the account is usable right now. `false` only when local usage\ndata proves exhaustion (Codex over quota / rate-limit-reached); `true`\notherwise, including when exhaustion cannot be detected locally.",
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AccountUsage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "label",
+            "active"
+          ],
+          "type": "object"
+        },
+        "AccountUsage": {
+          "description": "Best-effort, locally-derived usage for an account. Every field is optional so\nthe call degrades honestly when a harness exposes nothing (Kimi), only a plan\n(Claude), or a full snapshot (Codex). Percentages only — no token is read.",
+          "properties": {
+            "plan": {
+              "description": "Plan/subscription name, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "primary_used_percent": {
+              "description": "Primary (e.g. 5h) window used-percent, when known.",
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "resets_at": {
+              "description": "When the primary window resets, as reported by the harness (opaque\nstring; may be an epoch or timestamp).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "secondary_used_percent": {
+              "description": "Secondary (e.g. weekly) window used-percent, when known.",
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "tier": {
+              "description": "Rate-limit tier string, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -10952,6 +11071,25 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "accounts": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AccountInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "accounts_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "accounts"
               ],
               "type": "object"
             },
