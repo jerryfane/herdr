@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::api::schema::{AccountInfo, AccountUsage, ResponseResult};
+use crate::api::schema::{AccountInfo, AccountUsage, ResponseResult, UsageWindow};
 use crate::app::App;
 use crate::config::AccountConfig;
 
@@ -31,11 +31,13 @@ impl App {
     /// account with best-effort, locally-derived usage. Read-only; returns only
     /// paths, labels, and usage NUMBERS — never a credential value.
     pub(super) fn handle_accounts_list(&mut self, id: String) -> String {
-        let accounts = self
-            .loaded_accounts
+        // Clone the config (small: ids/labels/paths only) so the loop can take
+        // `&mut self` to read the cache and kick background fetches.
+        let loaded_accounts = self.loaded_accounts.clone();
+        let accounts = loaded_accounts
             .iter()
             .map(|account| {
-                let (usage, active) = account_usage(account);
+                let (usage, active) = self.account_usage_cached(account);
                 AccountInfo {
                     id: account.id.clone(),
                     kind: account.kind.clone(),
@@ -46,6 +48,35 @@ impl App {
             })
             .collect();
         encode_success(id, ResponseResult::AccountsList { accounts })
+    }
+
+    /// The usage to report for one account, without ever blocking the app loop.
+    ///
+    /// For a kind with a live provider (Codex/Claude): serve a fresh (< per-kind
+    /// TTL) live-cache entry when present; otherwise kick at most one background
+    /// live fetch and, for THIS response, fall back to the local read. Kimi and
+    /// unknown kinds skip the fetch entirely and use the local read.
+    fn account_usage_cached(&mut self, account: &AccountConfig) -> (Option<AccountUsage>, bool) {
+        if super::usage_fetch::kind_supports_live_usage(&account.kind) {
+            if let Some(cached) = self.usage_cache.get(&account.id) {
+                if cached.fetched_at.elapsed() < super::usage_fetch::usage_ttl(&account.kind) {
+                    return (Some(cached.usage.clone()), cached.active);
+                }
+            }
+            // Missing or stale: kick a background refresh if one isn't already
+            // running for this account. `insert` returns false when present.
+            if self.usage_refresh_inflight.insert(account.id.clone()) {
+                spawn_usage_fetch(
+                    self.event_tx.clone(),
+                    account.id.clone(),
+                    account.kind.clone(),
+                    account.config_dir.clone(),
+                );
+            }
+        }
+        // This response falls back to the honest local read while any live fetch
+        // is in flight.
+        account_usage(account)
     }
 
     /// Resolve an account id (matching the agent's kind) to the single
@@ -93,6 +124,25 @@ impl AccountResolveError {
             },
         }
     }
+}
+
+/// Spawn a background live-usage fetch on its own OS thread and deliver the
+/// result as `AppEvent::UsageRefreshed`. An OS thread (not `tokio::spawn`) is
+/// used because `fetch_live_usage` blocks on a `curl` subprocess, which must not
+/// run on a tokio worker — mirroring the repo's other blocking-curl paths
+/// (`git_refresh`, `push`). The app loop is never blocked: it only clones the
+/// ids and returns.
+fn spawn_usage_fetch(
+    event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    account_id: String,
+    kind: String,
+    config_dir: String,
+) {
+    std::thread::spawn(move || {
+        let usage = super::usage_fetch::fetch_live_usage(&kind, &config_dir);
+        let _ =
+            event_tx.blocking_send(crate::events::AppEvent::UsageRefreshed { account_id, usage });
+    });
 }
 
 /// Best-effort `(usage, active)` for an account. Never fails the caller: an
@@ -153,14 +203,45 @@ fn read_codex_usage(config_dir: &str) -> (Option<AccountUsage>, bool) {
         || primary_used.is_some_and(|used| used >= 100.0)
         || secondary_used.is_some_and(|used| used >= 100.0);
 
-    let usage = AccountUsage {
-        primary_used_percent: primary_used,
-        secondary_used_percent: secondary_used,
-        resets_at,
+    let mut windows = Vec::new();
+    if primary.is_some() {
+        windows.push(UsageWindow {
+            label: "5h".to_string(),
+            used_percent: primary_used,
+            resets_at,
+            status: Some(window_status(primary_used, rate_limit_reached)),
+        });
+    }
+    if secondary.is_some() {
+        let secondary_resets = secondary
+            .and_then(|bucket| bucket.get("resets_at"))
+            .and_then(json_scalar_to_string);
+        windows.push(UsageWindow {
+            label: "weekly".to_string(),
+            used_percent: secondary_used,
+            resets_at: secondary_resets,
+            status: Some(window_status(secondary_used, false)),
+        });
+    }
+
+    let mut usage = AccountUsage {
+        windows,
+        source: Some("local".to_string()),
         plan,
-        tier: None,
+        ..Default::default()
     };
+    usage.backfill_flat_fields();
     (Some(usage), !exhausted)
+}
+
+/// "exhausted" when a bucket is at/over 100% or a rate-limit-reached marker is
+/// set for it, else "ok".
+fn window_status(used_percent: Option<f32>, rate_limit_reached: bool) -> String {
+    if rate_limit_reached || used_percent.is_some_and(|used| used >= 100.0) {
+        "exhausted".to_string()
+    } else {
+        "ok".to_string()
+    }
 }
 
 fn bucket_used_percent(bucket: Option<&serde_json::Value>) -> Option<f32> {
@@ -294,6 +375,7 @@ fn read_claude_plan_tier(config_dir: &str) -> Option<AccountUsage> {
     Some(AccountUsage {
         plan,
         tier,
+        source: Some("local".to_string()),
         ..Default::default()
     })
 }
@@ -393,6 +475,143 @@ mod tests {
         assert!(accounts[0].get("usage").is_none());
         assert_eq!(accounts[1]["id"], "kimi-main");
         assert_eq!(accounts[1]["active"], true);
+        // Kimi has no live provider, so it is never scheduled for a fetch.
+        assert!(!app.usage_refresh_inflight.contains("kimi-main"));
+    }
+
+    #[test]
+    fn accounts_list_serves_a_fresh_live_cache_entry() {
+        let mut app = test_app_with_accounts(vec![account(
+            "work",
+            "codex",
+            "/tmp/does-not-exist-codex-live",
+        )]);
+        let mut usage = AccountUsage {
+            windows: vec![UsageWindow {
+                label: "5h".to_string(),
+                used_percent: Some(37.0),
+                resets_at: Some("1789827841".to_string()),
+                status: Some("ok".to_string()),
+            }],
+            source: Some("live".to_string()),
+            plan: Some("pro".to_string()),
+            ..Default::default()
+        };
+        usage.backfill_flat_fields();
+        app.usage_cache.insert(
+            "work".to_string(),
+            crate::app::api::usage_fetch::CachedUsage {
+                fetched_at: std::time::Instant::now(),
+                usage,
+                active: true,
+            },
+        );
+
+        let response = app.handle_accounts_list("req".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let account = &value["result"]["accounts"][0];
+        assert_eq!(account["usage"]["source"], "live");
+        assert_eq!(account["usage"]["primary_used_percent"], 37.0);
+        assert_eq!(account["usage"]["plan"], "pro");
+        // A fresh cache hit is served WITHOUT scheduling another fetch.
+        assert!(!app.usage_refresh_inflight.contains("work"));
+    }
+
+    #[test]
+    fn accounts_list_kicks_one_background_fetch_on_cache_miss() {
+        // A missing config dir keeps the spawned fetch offline: it reads a
+        // nonexistent auth.json and returns before any network call.
+        let mut app = test_app_with_accounts(vec![account(
+            "work",
+            "codex",
+            "/tmp/does-not-exist-codex-miss",
+        )]);
+        // Cold cache: the handler schedules exactly one fetch and, for this
+        // response, falls back to the (empty) local read.
+        let response = app.handle_accounts_list("req".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(value["result"]["accounts"][0].get("usage").is_none());
+        assert!(app.usage_refresh_inflight.contains("work"));
+
+        // A second call while still in flight does NOT schedule a duplicate.
+        let _ = app.handle_accounts_list("req2".into());
+        assert_eq!(app.usage_refresh_inflight.len(), 1);
+    }
+
+    #[test]
+    fn stale_live_cache_entry_falls_back_and_reschedules() {
+        let mut app = test_app_with_accounts(vec![account(
+            "work",
+            "codex",
+            "/tmp/does-not-exist-codex-stale",
+        )]);
+        let usage = AccountUsage {
+            windows: vec![UsageWindow {
+                label: "5h".to_string(),
+                used_percent: Some(50.0),
+                resets_at: None,
+                status: Some("ok".to_string()),
+            }],
+            source: Some("live".to_string()),
+            ..Default::default()
+        };
+        // Fetched well beyond the codex TTL (60s).
+        app.usage_cache.insert(
+            "work".to_string(),
+            crate::app::api::usage_fetch::CachedUsage {
+                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(600),
+                usage,
+                active: true,
+            },
+        );
+
+        let response = app.handle_accounts_list("req".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Stale entry is NOT served; this response uses the local read (none
+        // here) and a refresh is scheduled.
+        assert!(value["result"]["accounts"][0].get("usage").is_none());
+        assert!(app.usage_refresh_inflight.contains("work"));
+    }
+
+    #[test]
+    fn usage_refreshed_event_populates_and_clears_inflight() {
+        let mut app = test_app_with_accounts(vec![account("work", "codex", "/tmp/x")]);
+        app.usage_refresh_inflight.insert("work".to_string());
+        let mut usage = AccountUsage {
+            windows: vec![UsageWindow {
+                label: "5h".to_string(),
+                used_percent: Some(12.0),
+                resets_at: None,
+                status: Some("ok".to_string()),
+            }],
+            source: Some("live".to_string()),
+            ..Default::default()
+        };
+        usage.backfill_flat_fields();
+
+        app.handle_internal_event(crate::events::AppEvent::UsageRefreshed {
+            account_id: "work".to_string(),
+            usage: Some((usage, false)),
+        });
+
+        assert!(!app.usage_refresh_inflight.contains("work"));
+        let cached = app.usage_cache.get("work").expect("cache populated");
+        assert!(!cached.active);
+        assert_eq!(cached.usage.primary_used_percent, Some(12.0));
+    }
+
+    #[test]
+    fn usage_refreshed_failure_clears_inflight_without_caching() {
+        let mut app = test_app_with_accounts(vec![account("work", "codex", "/tmp/x")]);
+        app.usage_refresh_inflight.insert("work".to_string());
+
+        app.handle_internal_event(crate::events::AppEvent::UsageRefreshed {
+            account_id: "work".to_string(),
+            usage: None,
+        });
+
+        assert!(!app.usage_refresh_inflight.contains("work"));
+        assert!(!app.usage_cache.contains_key("work"));
     }
 
     #[test]
