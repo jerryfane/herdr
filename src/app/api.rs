@@ -236,13 +236,23 @@ impl App {
                 self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
                 self.emit_live_activity_updates();
             }
-            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
-                && self.respawn_shell_for_launch_pane(*pane_id)
-            {
-                self.overlay_panes.remove(pane_id);
-                self.render_dirty.request_generic();
-                self.render_notify.notify_one();
-                return Vec::new();
+            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell {
+                // A per-agent `agent.restart` arms a pending resume plan before
+                // killing the process; the single PaneDied it triggers relaunches
+                // the agent with `--resume` here (one respawn, no double-spawn,
+                // pane + identity preserved). Otherwise respawn a bare shell as
+                // before.
+                let relaunched = if self.pane_has_pending_agent_resume(*pane_id) {
+                    self.resume_pending_agent_for_pane(*pane_id)
+                } else {
+                    self.respawn_shell_for_launch_pane(*pane_id)
+                };
+                if relaunched {
+                    self.overlay_panes.remove(pane_id);
+                    self.render_dirty.request_generic();
+                    self.render_notify.notify_one();
+                    return Vec::new();
+                }
             }
         }
 
@@ -621,6 +631,31 @@ impl App {
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
         self.schedule_session_save();
         true
+    }
+
+    /// True when the pane's terminal holds a pending agent-resume plan — set by
+    /// an `agent.restart` just before it killed the process, so the imminent
+    /// `PaneDied` relaunches with `--resume` instead of a bare shell.
+    fn pane_has_pending_agent_resume(&self, pane_id: crate::layout::PaneId) -> bool {
+        self.find_pane(pane_id)
+            .map(|(_, pane)| pane.attached_terminal_id.clone())
+            .and_then(|terminal_id| self.state.terminals.get(&terminal_id))
+            .is_some_and(|terminal| terminal.pending_agent_resume_plan.is_some())
+    }
+
+    /// Relaunch the pane's agent from its pending resume plan: the deferred
+    /// launcher spawns a fresh shell in the same pane, types the harness's
+    /// `--resume` command, and clears the plan. Returns true if a relaunch was
+    /// started. The old runtime was already removed by `agent.restart`'s
+    /// `shutdown_terminal_runtime`, so the launcher (which requires no live
+    /// runtime) proceeds.
+    fn resume_pending_agent_for_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        let Some((_, pane)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        let terminal_id = pane.attached_terminal_id.clone();
+        let (rows, cols) = self.state.estimate_pane_size();
+        self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, false)
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
@@ -1285,6 +1320,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentRestart(target) => return self.handle_agent_restart(request.id, target),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(

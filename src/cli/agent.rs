@@ -26,6 +26,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "restart" => agent_restart(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -464,6 +465,24 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:focus".into(),
         method: Method::AgentFocus(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
+fn agent_restart(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("usage: herdr agent restart <target>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: herdr agent restart <target>");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:restart".into(),
+        method: Method::AgentRestart(AgentTarget {
             target: target.clone(),
         }),
     })?)
@@ -919,6 +938,7 @@ fn print_agent_help() {
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
+    eprintln!("  herdr agent restart <target>");
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"

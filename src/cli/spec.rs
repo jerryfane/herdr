@@ -434,6 +434,11 @@ fn agent_command() -> Command {
                 ),
         )
         .subcommand(id_command("focus", "target", "Focus an agent"))
+        .subcommand(id_command(
+            "restart",
+            "target",
+            "Restart an agent (close its session, reopen with --resume)",
+        ))
         .subcommand(
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")

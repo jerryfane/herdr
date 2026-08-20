@@ -66,6 +66,90 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    /// Restart an agent in place: kill its harness process and reopen the same
+    /// session with `--resume`, keeping the pane. The resume plan is built from
+    /// the LIVE session identity already resident on the terminal (no
+    /// session.json read). The kill fires exactly one `PaneDied`, which the
+    /// resume-aware respawn path turns into a single `--resume` relaunch — no
+    /// double-spawn, pane + agent identity preserved. Errors when the agent has
+    /// no resumable session (not a herdr-launched agent, or none reported).
+    pub(super) fn handle_agent_restart(&mut self, id: String, target: AgentTarget) -> String {
+        let resolved = match self.resolve_agent_target(&target.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return agent_not_found(id, &target.target);
+        };
+
+        let Some((source, agent, session_ref)) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(Self::terminal_resume_source)
+        else {
+            return encode_error(
+                id,
+                "no_resumable_session",
+                "agent has no resumable session — not a herdr-launched agent, or no session was reported",
+            );
+        };
+        let Some(plan) = crate::agent_resume::plan(&source, &agent, &session_ref) else {
+            return encode_error(
+                id,
+                "no_resumable_session",
+                "agent has no resumable session for its harness",
+            );
+        };
+
+        // Snapshot the agent info to return before the process is killed.
+        let agent_info = match self.agent_info_for_target(&target.target) {
+            Ok(agent) => agent,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+
+        // Arm the resume plan and guarantee the imminent PaneDied respawns the
+        // pane (rather than closing it), then kill the process. The single
+        // PaneDied drives one resume relaunch via the resume-aware respawn path.
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.pending_agent_resume_plan = Some(plan);
+            terminal.respawn_shell_on_exit = true;
+        }
+        self.shutdown_terminal_runtime(terminal_id);
+
+        encode_success(id, ResponseResult::AgentInfo { agent: agent_info })
+    }
+
+    /// The `(source, agent, session_ref)` needed to resume a terminal's agent,
+    /// from the live hook authority, else the persisted session. `None` when the
+    /// agent never reported a resumable session (or isn't herdr-launched).
+    fn terminal_resume_source(
+        terminal: &crate::terminal::TerminalState,
+    ) -> Option<(String, String, crate::agent_resume::AgentSessionRef)> {
+        if let Some(authority) = terminal.hook_authority.as_ref() {
+            if let Some(session_ref) = authority.session_ref.as_ref() {
+                return Some((
+                    authority.source.clone(),
+                    authority.agent_label.clone(),
+                    session_ref.clone(),
+                ));
+            }
+        }
+        terminal.persisted_agent_session.as_ref().map(|session| {
+            (
+                session.source.clone(),
+                session.agent.clone(),
+                session.session_ref.clone(),
+            )
+        })
+    }
+
     pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
         if params.text.is_empty() {
             return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
@@ -1188,5 +1272,122 @@ mod tests {
                 Some("shell-pane")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_restart_arms_resume_plan_from_live_session() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-123").unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentTarget {
+                target: "reviewer".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let plan = terminal
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("restart arms a resume plan");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "sess-123".to_string()
+            ]
+        );
+        // The imminent PaneDied must respawn the pane (with resume), not close it.
+        assert!(terminal.respawn_shell_on_exit);
+    }
+
+    #[tokio::test]
+    async fn agent_restart_omp_uses_path_resume() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("omp-seat".into());
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/omp/sess.jsonl")
+                    .unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentTarget {
+                target: "omp-seat".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        let plan = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("restart arms a resume plan");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "omp".to_string(),
+                "--resume=/tmp/omp/sess.jsonl".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_restart_errors_without_resumable_session() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("noresume".into());
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            // No hook-authority session ref and no persisted session → not resumable.
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentTarget {
+                target: "noresume".into(),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "no_resumable_session");
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
     }
 }
