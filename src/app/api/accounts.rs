@@ -43,6 +43,7 @@ impl App {
                     kind: account.kind.clone(),
                     label: account.label.clone(),
                     active,
+                    email: account_email(account),
                     usage,
                 }
             })
@@ -206,7 +207,10 @@ fn read_codex_usage(config_dir: &str) -> (Option<AccountUsage>, bool) {
     let mut windows = Vec::new();
     if primary.is_some() {
         windows.push(UsageWindow {
-            label: "5h".to_string(),
+            // Codex windows are not fixed 5h/weekly slots — derive the label from
+            // the bucket's `window_minutes` rather than its position (a pro plan's
+            // primary bucket is the 7-day one).
+            label: codex_local_window_label(primary, "5h"),
             used_percent: primary_used,
             resets_at,
             status: Some(window_status(primary_used, rate_limit_reached)),
@@ -217,7 +221,7 @@ fn read_codex_usage(config_dir: &str) -> (Option<AccountUsage>, bool) {
             .and_then(|bucket| bucket.get("resets_at"))
             .and_then(json_scalar_to_string);
         windows.push(UsageWindow {
-            label: "weekly".to_string(),
+            label: codex_local_window_label(secondary, "weekly"),
             used_percent: secondary_used,
             resets_at: secondary_resets,
             status: Some(window_status(secondary_used, false)),
@@ -247,6 +251,17 @@ fn window_status(used_percent: Option<f32>, rate_limit_reached: bool) -> String 
 fn bucket_used_percent(bucket: Option<&serde_json::Value>) -> Option<f32> {
     let value = bucket?.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
     Some(value as f32)
+}
+
+/// Label for a local Codex session-log bucket from its `window_minutes`,
+/// falling back to `fallback` when absent. Shares the duration→label mapping
+/// with the live reader so both derive the label from the window length.
+fn codex_local_window_label(bucket: Option<&serde_json::Value>, fallback: &str) -> String {
+    bucket
+        .and_then(|b| b.get("window_minutes"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|minutes| super::usage_fetch::window_label_from_seconds(minutes.saturating_mul(60)))
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
@@ -395,6 +410,59 @@ fn find_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Best-effort login email for an account, from its config-home. Identity only —
+/// never reads or returns a token. None for kinds/accounts with no local email.
+fn account_email(account: &AccountConfig) -> Option<String> {
+    match account.kind.as_str() {
+        "claude" => read_claude_email(&account.config_dir),
+        "codex" => read_codex_email(&account.config_dir),
+        _ => None,
+    }
+}
+
+/// Claude email: `<config_dir>/.claude.json` -> `oauthAccount.emailAddress`
+/// (a scoped lookup — `.claude.json` is large, so avoid a tree-wide search).
+fn read_claude_email(config_dir: &str) -> Option<String> {
+    let path = Path::new(config_dir).join(".claude.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    value
+        .get("oauthAccount")
+        .and_then(|oauth| oauth.get("emailAddress"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Codex email: the `email` claim inside `<config_dir>/auth.json` ->
+/// `tokens.id_token` (a JWT). Only the non-secret email claim is read; the token
+/// itself is never returned or logged.
+fn read_codex_email(config_dir: &str) -> Option<String> {
+    let path = Path::new(config_dir).join("auth.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let id_token = value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("id_token"))
+        .and_then(serde_json::Value::as_str)?;
+    decode_jwt_email(id_token)
+}
+
+/// Read ONLY the `email` claim from a JWT's payload (the middle segment),
+/// without verifying the signature. Pad-tolerant base64url decode. Never
+/// surfaces any other claim or the token itself.
+fn decode_jwt_email(jwt: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -740,5 +808,75 @@ mod tests {
     #[test]
     fn claude_plan_tier_missing_file_degrades_to_none() {
         assert!(read_claude_plan_tier("/tmp/herdr-nonexistent-claude-home-xyz").is_none());
+    }
+
+    #[test]
+    fn codex_local_window_label_derives_from_minutes() {
+        let weekly = serde_json::json!({"window_minutes": 10080});
+        let five_h = serde_json::json!({"window_minutes": 300});
+        assert_eq!(codex_local_window_label(Some(&weekly), "x"), "weekly");
+        assert_eq!(codex_local_window_label(Some(&five_h), "x"), "5h");
+        // Missing duration → fallback.
+        assert_eq!(
+            codex_local_window_label(Some(&serde_json::json!({})), "fb"),
+            "fb"
+        );
+    }
+
+    #[test]
+    fn claude_email_reads_only_oauth_email_address() {
+        let dir = std::env::temp_dir().join(format!("herdr-claude-email-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {"emailAddress": "user@example.com", "accountUuid": "abc"},
+                "someToken": "SECRET-should-not-be-read"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_claude_email(&dir.display().to_string()).as_deref(),
+            Some("user@example.com")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_email_reads_only_the_email_claim_from_the_id_token() {
+        use base64::Engine;
+        // A JWT whose payload carries an email claim (+ an unrelated secret claim).
+        let payload =
+            serde_json::json!({"email": "codex@example.com", "sub": "user-1", "secret": "nope"});
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let jwt = format!("aGVhZGVy.{encoded}.c2ln");
+        let dir = std::env::temp_dir().join(format!("herdr-codex-email-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            serde_json::json!({"tokens": {"id_token": jwt, "access_token": "SECRET"}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_email(&dir.display().to_string()).as_deref(),
+            Some("codex@example.com")
+        );
+        assert_eq!(decode_jwt_email("not.a.jwt-with-bad-b64!!"), None);
+        assert_eq!(decode_jwt_email("only-one-segment"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_email_none_for_kimi_and_unknown() {
+        let mk = |kind: &str| crate::config::AccountConfig {
+            id: "x".into(),
+            kind: kind.into(),
+            label: "x".into(),
+            config_dir: "/tmp/herdr-nonexistent-email-home".into(),
+        };
+        assert!(account_email(&mk("kimi")).is_none());
+        assert!(account_email(&mk("codex")).is_none()); // missing dir → None
     }
 }
