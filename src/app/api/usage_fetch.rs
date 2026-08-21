@@ -316,8 +316,11 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
 /// Parse Claude live usage from the `anthropic-ratelimit-unified-*` RESPONSE
 /// headers of a `/v1/messages` call (keys lowercased). Pure. `5h`/`7d`
 /// `utilization` (0..1 → 0..100%) map to "5h"/"weekly" windows with epoch-second
-/// resets; a window is exhausted when its `-status` is not "allowed" or it reads
-/// ≥100%. `None` when neither window header is present.
+/// resets; a window is exhausted when its `-status` is a NON-allowed status (e.g.
+/// "rejected") or it reads ≥100%. Anthropic sends "allowed_warning" once a window
+/// crosses its soft threshold (~0.75) — that is still ALLOWED, not exhausted, so
+/// only a status that does not start with "allowed" counts as blocked. `None`
+/// when neither window header is present.
 fn parse_claude_usage_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> Option<(AccountUsage, bool)> {
@@ -328,9 +331,11 @@ fn parse_claude_usage_headers(
     ) -> Option<(UsageWindow, bool)> {
         let util = headers.get(&format!("anthropic-ratelimit-unified-{key}-utilization"))?;
         let used_percent = (util.parse::<f64>().ok()?.clamp(0.0, 1.0) * 100.0) as f32;
+        // "allowed" and "allowed_warning" are both still serving; only a status
+        // that is NOT an allowed-* variant (e.g. "rejected") means blocked.
         let reached = headers
             .get(&format!("anthropic-ratelimit-unified-{key}-status"))
-            .is_some_and(|status| status != "allowed");
+            .is_some_and(|status| !status.starts_with("allowed"));
         let exhausted = reached || used_percent >= 100.0;
         let window = UsageWindow {
             label: label.to_string(),
@@ -354,10 +359,11 @@ fn parse_claude_usage_headers(
     if windows.is_empty() {
         return None;
     }
-    // The overall unified status also gates activeness, when present.
+    // The overall unified status also gates activeness, when present. Same rule:
+    // "allowed"/"allowed_warning" are serving; only a non-allowed status blocks.
     if headers
         .get("anthropic-ratelimit-unified-status")
-        .is_some_and(|status| status != "allowed")
+        .is_some_and(|status| !status.starts_with("allowed"))
     {
         any_exhausted = true;
     }
@@ -760,6 +766,32 @@ mod tests {
         ]);
         let (_usage, active) = parse_claude_usage_headers(&headers).expect("fixture should parse");
         assert!(!active, "a rejected / 100% window is inactive");
+    }
+
+    #[test]
+    fn claude_usage_headers_allowed_warning_is_active_not_exhausted() {
+        // Anthropic sends "allowed_warning" once a window passes its soft threshold
+        // (~0.75). That is STILL serving — it must not be shown as exhausted.
+        let headers = claude_headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.1"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.78"),
+        ]);
+        let (usage, active) = parse_claude_usage_headers(&headers).expect("fixture should parse");
+        assert!(active, "an allowed_warning account is still active");
+        let weekly = usage
+            .windows
+            .iter()
+            .find(|w| w.label == "weekly")
+            .expect("weekly window present");
+        assert_eq!(weekly.used_percent, Some(78.0));
+        assert_eq!(
+            weekly.status.as_deref(),
+            Some("ok"),
+            "78% with allowed_warning is not exhausted"
+        );
     }
 
     #[test]
