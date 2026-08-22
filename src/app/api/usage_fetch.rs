@@ -38,6 +38,11 @@ const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 /// A cheap model for the header-warming probe (only its response headers are
 /// used; the ~1-token reply is discarded).
 const CLAUDE_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
+/// Anthropic OAuth token endpoint + the Claude Code OAuth client id, used to
+/// refresh an expired `accessToken` from the `refreshToken` (both live in the
+/// account's `.credentials.json`). Matches the flow the Claude CLI / omp use.
+const CLAUDE_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const USAGE_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
@@ -126,7 +131,7 @@ fn codex_usage_request(
         format!("header = \"chatgpt-account-id: {account_id}\""),
         "header = \"Accept: application/json\"".to_string(),
     ];
-    curl_request(CODEX_USAGE_URL, &config_lines)
+    curl_request(CODEX_USAGE_URL, &config_lines, None)
 }
 
 /// Exchange a refresh token for a fresh access token (mirrors the
@@ -142,7 +147,7 @@ fn codex_refresh_token(refresh_token: &str) -> Option<serde_json::Value> {
         "header = \"Content-Type: application/x-www-form-urlencoded\"".to_string(),
         format!("data = \"{body}\""),
     ];
-    let (code, response) = curl_request(CODEX_TOKEN_URL, &config_lines)?;
+    let (code, response) = curl_request(CODEX_TOKEN_URL, &config_lines, None)?;
     if !is_success(code) {
         return None;
     }
@@ -272,32 +277,35 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
     let creds: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&creds_path).ok()?).ok()?;
     let oauth = creds.get("claudeAiOauth")?;
-    let access_token = oauth.get("accessToken").and_then(|v| v.as_str())?;
-    if !config_safe(access_token) {
-        return None;
-    }
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(|v| v.as_str())?
+        .to_string();
 
-    // Minimal messages request; its `anthropic-ratelimit-unified-*` RESPONSE
-    // headers carry the live usage. The JSON body has double-quotes, so it is
-    // passed via `--data @<file>` (NOT a `data = "..."` config line — curl's
-    // config parser would truncate at the first inner quote). The token still
-    // rides only in the `-K` config header, never argv (see curl_request_headers).
-    let request_body = format!(
-        "{{\"model\":\"{CLAUDE_PROBE_MODEL}\",\"max_tokens\":1,\
-         \"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
-    );
-    let config_lines = [
-        format!("header = \"Authorization: Bearer {access_token}\""),
-        "header = \"anthropic-version: 2023-06-01\"".to_string(),
-        "header = \"anthropic-beta: oauth-2025-04-20\"".to_string(),
-        "header = \"content-type: application/json\"".to_string(),
-    ];
-    let (code, headers) =
-        curl_request_headers(CLAUDE_MESSAGES_URL, &config_lines, Some(&request_body))?;
-    // A 429 (or any non-2xx) means back off and fall back to the local read.
-    if !is_success(code) {
+    // Probe with the on-disk token. On an expired/invalid token (401/403) refresh
+    // ONCE from the refresh token, persist, and retry — so usage self-heals instead
+    // of blanking whenever the CLI/harness lets the on-disk token go stale. Any
+    // other non-2xx (e.g. a 429) just backs off to the local read.
+    let (code, headers) = claude_probe(&access_token)?;
+    let headers = if is_success(code) {
+        headers
+    } else if matches!(code, 401 | 403) {
+        let refresh_token = oauth.get("refreshToken").and_then(|v| v.as_str())?;
+        let refreshed = claude_refresh_token(refresh_token)?;
+        let new_access = refreshed
+            .get("access_token")
+            .and_then(|v| v.as_str())?
+            .to_string();
+        persist_claude_tokens(&creds_path, &creds, &refreshed);
+        let (code, headers) = claude_probe(&new_access)?;
+        if !is_success(code) {
+            return None;
+        }
+        headers
+    } else {
         return None;
-    }
+    };
+
     let (mut usage, active) = parse_claude_usage_headers(&headers)?;
     // The usage endpoint omits plan/tier; enrich from the same on-disk
     // credentials so a live result never regresses the locally-shown plan.
@@ -311,6 +319,135 @@ fn fetch_claude_live(config_dir: &str) -> Option<(AccountUsage, bool)> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
     Some((usage, active))
+}
+
+/// The header-warming probe: a minimal `max_tokens:1` messages call whose
+/// `anthropic-ratelimit-unified-*` RESPONSE headers carry the live usage. The
+/// JSON body has double-quotes, so it rides `--data @<file>` (NOT a `data = "..."`
+/// config line, which curl truncates at the first inner quote). The token stays
+/// in the `-K` config header, never argv.
+fn claude_probe(access_token: &str) -> Option<(u16, std::collections::HashMap<String, String>)> {
+    if !config_safe(access_token) {
+        return None;
+    }
+    let request_body = format!(
+        "{{\"model\":\"{CLAUDE_PROBE_MODEL}\",\"max_tokens\":1,\
+         \"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+    );
+    let config_lines = [
+        format!("header = \"Authorization: Bearer {access_token}\""),
+        "header = \"anthropic-version: 2023-06-01\"".to_string(),
+        "header = \"anthropic-beta: oauth-2025-04-20\"".to_string(),
+        "header = \"content-type: application/json\"".to_string(),
+    ];
+    curl_request_headers(CLAUDE_MESSAGES_URL, &config_lines, Some(&request_body))
+}
+
+/// Exchange a Claude `refreshToken` for a fresh access token. Anthropic's
+/// `/v1/oauth/token` takes a JSON body (unlike Codex's form POST), so the body —
+/// which carries the refresh token — is serde-built (proper escaping, no
+/// injection) and passed via `--data @<0600 file>` inside `curl_request`, never
+/// argv or a log line.
+fn claude_refresh_token(refresh_token: &str) -> Option<serde_json::Value> {
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        "refresh_token": refresh_token,
+    })
+    .to_string();
+    let config_lines = [
+        "header = \"content-type: application/json\"".to_string(),
+        "header = \"anthropic-beta: oauth-2025-04-20\"".to_string(),
+        "header = \"user-agent: anthropic-sdk-typescript/0.94.0 userOAuthProvider\"".to_string(),
+    ];
+    let (code, response) = curl_request(CLAUDE_TOKEN_URL, &config_lines, Some(&body))?;
+    if !is_success(code) {
+        return None;
+    }
+    let response = response?;
+    response
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .is_some()
+        .then_some(response)
+}
+
+/// Persist a Claude token refresh back to THIS account's own `.credentials.json`
+/// and nowhere else (security invariant). Best-effort — a write failure only logs
+/// and never fails the usage fetch. Rewrites only `accessToken` / `refreshToken` /
+/// `expiresAt` (computed from `expires_in`), leaving every other field intact, via
+/// a private temp file renamed atomically into place. Mirrors `persist_codex_tokens`.
+fn persist_claude_tokens(
+    creds_path: &Path,
+    original: &serde_json::Value,
+    refreshed: &serde_json::Value,
+) {
+    let mut updated = original.clone();
+    let Some(oauth) = updated
+        .get_mut("claudeAiOauth")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(v) = refreshed.get("access_token").and_then(|v| v.as_str()) {
+        oauth.insert(
+            "accessToken".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
+        changed = true;
+    }
+    if let Some(v) = refreshed.get("refresh_token").and_then(|v| v.as_str()) {
+        oauth.insert(
+            "refreshToken".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
+        changed = true;
+    }
+    if let (Some(secs), Some(now_ms)) = (
+        refreshed.get("expires_in").and_then(|v| v.as_u64()),
+        now_epoch_ms(),
+    ) {
+        oauth.insert(
+            "expiresAt".to_string(),
+            serde_json::Value::from(now_ms + secs * 1000),
+        );
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    let Ok(serialized) = serde_json::to_string_pretty(&updated) else {
+        return;
+    };
+    let Some(dir) = creds_path.parent() else {
+        return;
+    };
+    let tmp = ScopedPath(dir.join(format!(
+        ".credentials.json.herdr-usage-{}.tmp",
+        unique_suffix()
+    )));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = create_private_file(&tmp.0)?;
+        file.write_all(serialized.as_bytes())?;
+        file.sync_all()
+    })();
+    if write_result.is_err() {
+        tracing::warn!("usage fetch: failed to write refreshed claude tokens");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp.0, creds_path) {
+        tracing::warn!(error = %err, "usage fetch: failed to replace claude .credentials.json");
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the `expiresAt` the Claude
+/// credentials store (which is epoch-ms, unlike Codex's `expires_in` seconds).
+fn now_epoch_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
 }
 
 /// Parse Claude live usage from the `anthropic-ratelimit-unified-*` RESPONSE
@@ -458,7 +595,11 @@ impl Drop for ScopedPath {
 /// POST data) are written to a mode-0600 `-K` config file — never argv. Returns
 /// the HTTP status and the parsed JSON body (parsed only when the body is valid
 /// JSON). `None` only when curl could not run or produced no status code.
-fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde_json::Value>)> {
+fn curl_request(
+    url: &str,
+    config_lines: &[String],
+    request_body: Option<&str>,
+) -> Option<(u16, Option<serde_json::Value>)> {
     let config = ScopedPath(unique_temp_path("cfg"));
     {
         // Written and closed (flushed) before curl reads the file below.
@@ -476,6 +617,22 @@ fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde
         }
     }
 
+    // A POST body (if any) goes in its OWN 0600 temp file referenced as `--data
+    // @<file>`, NOT a `data = "..."` config line — curl's `-K` parser truncates a
+    // double-quoted value at the first inner quote, so a JSON body (e.g. an OAuth
+    // refresh) would ship broken. RAII-cleaned; carries only the request body.
+    let req_body = ScopedPath(unique_temp_path("req"));
+    if let Some(body) = request_body {
+        let write = (|| -> std::io::Result<()> {
+            let mut file = create_private_file(&req_body.0)?;
+            file.write_all(body.as_bytes())
+        })();
+        if write.is_err() {
+            tracing::warn!("usage fetch: failed to write request body file");
+            return None;
+        }
+    }
+
     let body = ScopedPath(unique_temp_path("body"));
     // Pre-create the response file 0600 so a body carrying account PII (the
     // Codex usage response includes an email + user id) is never briefly
@@ -484,7 +641,8 @@ fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde
         tracing::warn!(error = %err, "usage fetch: failed to create response file");
         return None;
     }
-    let output = crate::noninteractive_process::curl_command()
+    let mut command = crate::noninteractive_process::curl_command();
+    command
         .arg("-sS")
         .arg("-K")
         .arg(&config.0)
@@ -495,10 +653,13 @@ fn curl_request(url: &str, config_lines: &[String]) -> Option<(u16, Option<serde
         .arg("-o")
         .arg(&body.0)
         .arg("-w")
-        .arg("%{http_code}")
-        .arg(url)
-        .output()
-        .ok()?;
+        .arg("%{http_code}");
+    if request_body.is_some() {
+        command
+            .arg("--data")
+            .arg(format!("@{}", req_body.0.display()));
+    }
+    let output = command.arg(url).output().ok()?;
 
     let code: u16 = String::from_utf8_lossy(&output.stdout)
         .trim()
@@ -887,5 +1048,62 @@ mod tests {
         assert_eq!(usage.windows.len(), 1, "only the weekly window is present");
         assert_eq!(usage.windows[0].label, "weekly");
         assert_eq!(usage.windows[0].used_percent, Some(63.0));
+    }
+
+    #[test]
+    fn claude_persist_rewrites_only_token_fields_and_preserves_the_rest() {
+        let dir = std::env::temp_dir().join(format!("herdr-persist-test-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let creds_path = dir.join(".credentials.json");
+        let original = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "OLD_ACCESS",
+                "refreshToken": "OLD_REFRESH",
+                "expiresAt": 1_000_000i64,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_20x"
+            },
+            "otherTopLevel": "keep-me"
+        });
+        std::fs::write(&creds_path, serde_json::to_string(&original).unwrap()).expect("seed");
+
+        // A refresh that rotates the token and returns a 1h expiry.
+        let refreshed = serde_json::json!({
+            "access_token": "NEW_ACCESS",
+            "refresh_token": "NEW_REFRESH",
+            "expires_in": 3600u64
+        });
+        persist_claude_tokens(&creds_path, &original, &refreshed);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        let oauth = &written["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "NEW_ACCESS");
+        assert_eq!(oauth["refreshToken"], "NEW_REFRESH");
+        // expiresAt rewritten to a future epoch-ms (now + ~1h), well past the old value.
+        let exp = oauth["expiresAt"].as_u64().expect("expiresAt is a number");
+        assert!(
+            exp > now_epoch_ms().unwrap(),
+            "expiresAt must be in the future"
+        );
+        // Untouched fields survive verbatim.
+        assert_eq!(oauth["scopes"], serde_json::json!(["user:inference"]));
+        assert_eq!(oauth["subscriptionType"], "max");
+        assert_eq!(oauth["rateLimitTier"], "default_claude_max_20x");
+        assert_eq!(written["otherTopLevel"], "keep-me");
+
+        // A refresh WITHOUT a rotated refresh_token keeps the existing one.
+        let no_rotate = serde_json::json!({ "access_token": "NEWER", "expires_in": 3600u64 });
+        persist_claude_tokens(&creds_path, &written, &no_rotate);
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        assert_eq!(after["claudeAiOauth"]["accessToken"], "NEWER");
+        assert_eq!(
+            after["claudeAiOauth"]["refreshToken"], "NEW_REFRESH",
+            "an absent refresh_token must not wipe the stored one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
