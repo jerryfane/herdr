@@ -4494,8 +4494,23 @@ mod federation_tests {
         // Read failure AFTER a successful write (peer drops without answering) →
         // the peer may or may not have acted → `delivery_unknown`.
         let peer = start_proxy_peer(|_req, sock| {
-            // Read the request (done by the harness) then drop without a response.
-            drop(sock);
+            // A READ-phase failure (peer read the request, then never answered), made deterministic
+            // across platforms — macOS included (refs #103). Half-close ONLY the response direction
+            // so the home reads a clean EOF, and keep draining the request side so the peer never
+            // RSTs the home's already-delivered write. A full `drop(sock)` here is a platform-timing
+            // gamble: on macOS the close can RST an in-flight / lazily-flushed home write, which the
+            // home then misclassifies as a write-phase `peer_unreachable` instead of the intended
+            // read-phase `delivery_unknown`. Keeping the read side open (until the home closes or the
+            // harness 2s read-timeout fires) guarantees the write lands and only the response EOFs.
+            use std::io::Read as _;
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            let mut drain = [0u8; 256];
+            loop {
+                match (&sock).read(&mut drain) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
         });
         let dropper = ApiClient::for_target(ConnectionTarget::Tcp {
             addr: peer.addr,
@@ -4543,6 +4558,14 @@ mod federation_tests {
             while running_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((sock, _)) => {
+                        // The listener is non-blocking (for the accept loop). On macOS/BSD an
+                        // ACCEPTED socket INHERITS the listener's non-blocking flag (Linux does
+                        // not), which makes the blocking `read_line`s below return WouldBlock →
+                        // the peer never reads the request, and the home then sees the connection
+                        // break as a write-phase failure (peer_unreachable) instead of the intended
+                        // read-phase delivery_unknown. Force the per-connection socket blocking so
+                        // the peer behaves identically on every platform. refs #103
+                        let _ = sock.set_nonblocking(false);
                         let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
                         let mut reader =
                             BufReader::new(sock.try_clone().expect("clone proxy peer sock"));
@@ -5006,6 +5029,18 @@ mod federation_tests {
             assert_eq!(parsed["params"]["pane_id"], "screen");
             writeln!(sock, "{forbidden}").expect("peer writes forbidden");
             let _ = sock.flush();
+            // Keep the connection open until the home has consumed the response and closes, so the
+            // peer's close never RSTs the home BEFORE it reads the buffered `forbidden` line. A bare
+            // drop here races the home's read on macOS — the RST arrives first and the home reports
+            // a broken-pipe `peer_unreachable` instead of forwarding the verdict. refs #103
+            use std::io::Read as _;
+            let mut drain = [0u8; 256];
+            loop {
+                match (&sock).read(&mut drain) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
         });
         let registry = HashMap::from([(
             "remote".to_string(),
