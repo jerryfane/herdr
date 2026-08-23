@@ -561,7 +561,12 @@ fn restore_tab(
                 (Some(agent_name), Some(agent)) => {
                     terminal.restore_managed_agent(agent_name, agent)
                 }
-                (Some(_), None) => {}
+                // A name set via `agent rename` has no managed_agent; restore it too so it
+                // survives a restart (the snapshot already carries it). `set_persisted_agent_session`
+                // ran above, so the name anchors to the resumed session and `reconcile_agent_name_owner`
+                // keeps it when the agent re-attaches, rather than being dropped. See issue: agent
+                // names wiped on restart.
+                (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                 (None, _) => {}
             }
             if let Some(agent) = initial_restore_agent {
@@ -667,8 +672,10 @@ fn restore_tab(
                         terminal.restore_managed_agent(agent_name, agent)
                     }
                     (Some(_), Some(_)) => {}
-                    (Some(agent_name), None) if was_imported => terminal.set_agent_name(agent_name),
-                    (Some(_), None) => {}
+                    // A name set via `agent rename` (no managed_agent) is restored whether or
+                    // not the pane was imported, so it survives a restart instead of coming
+                    // back nameless. The snapshot already carries it.
+                    (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                     (None, _) => {}
                 }
                 if let Some(agent) = initial_restore_agent {
@@ -1034,6 +1041,39 @@ mod tests {
             crate::terminal::state::turn_epoch_reset_path_for_test(restored_epoch),
             crate::terminal::TurnCounterResetPath::SessionRestore
         );
+    }
+
+    /// The NATIVE-RESUME path (a `systemctl restart` relaunch with `--resume`) must retain an
+    /// unmanaged (renamed) agent name — not only the cold-restore path. Guards restore.rs:569:
+    /// mutating it back to `(Some(_), None) => {}` makes THIS test go red (the inert half of a
+    /// two-site fix the cold-restore test alone could not catch).
+    #[test]
+    fn native_resume_retains_unmanaged_agent_name() {
+        let mut snapshot = snapshot_with_deferred_native_agent();
+        // A pane renamed via `agent rename` (unmanaged) that also has a resumable session, so
+        // resume_agents_on_restore = true routes it through the native-resume branch.
+        if let Some(pane) = snapshot.workspaces[0].tabs[0].panes.get_mut(&0) {
+            pane.agent_name = Some("planner".into());
+        }
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        // Deferred native resume launches no runtime yet; the terminal exists with the name.
+        assert!(runtimes.is_empty());
+        let terminal = terminals.values().next().expect("one restored terminal");
+        assert_eq!(terminal.agent_name.as_deref(), Some("planner"));
+        assert_eq!(terminal.managed_agent_kind(), None);
     }
 
     #[test]
@@ -1547,7 +1587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
+    async fn cold_restore_with_gapped_public_tab_numbers_retains_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
         let pane_snap = |id: &str| {
             (
@@ -1653,12 +1693,20 @@ mod tests {
         assert_eq!(workspace.tabs[3].number, 5);
         let agent_pane = workspace.tabs[3].root_pane;
         let terminal_id = &workspace.tabs[3].panes[&agent_pane].attached_terminal_id;
-        assert!(terminals[terminal_id].agent_name.is_none());
+        // An unmanaged (renamed) agent name now SURVIVES restore instead of being dropped,
+        // so a restart no longer returns the pane nameless. managed_agent stays None — the
+        // name is restored without fabricating a managed agent.
+        assert_eq!(
+            terminals[terminal_id].agent_name.as_deref(),
+            Some("planner")
+        );
         assert_eq!(terminals[terminal_id].managed_agent_kind(), None);
+        // With its name restored, the pane now surfaces as an agent in pane_details —
+        // where, nameless, it was previously absent.
         assert!(workspace
             .pane_details(&terminals)
             .into_iter()
-            .all(|detail| detail.pane_id != agent_pane));
+            .any(|detail| detail.pane_id == agent_pane));
     }
 
     #[test]
