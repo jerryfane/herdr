@@ -13,6 +13,7 @@ pub mod machine;
 pub mod plugin_registry;
 mod restore;
 mod snapshot;
+pub mod staged_build;
 
 pub use self::io::{clear, clear_history, load, load_history, save};
 pub use self::restore::restore;

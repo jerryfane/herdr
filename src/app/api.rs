@@ -1243,6 +1243,26 @@ impl App {
                     },
                 }
             }
+            Method::ServerStagedUpdate(_) => {
+                // Report the running version/protocol plus the staged (built, not-yet-running)
+                // build, if the fleet build step recorded one. A staged build with a different
+                // version/sha means an update is ready to activate (server.apply_staged_update).
+                let staged = crate::persist::staged_build::load().map(|staged| {
+                    crate::api::schema::StagedBuildInfo {
+                        version: staged.version,
+                        sha: staged.sha,
+                        built_at: staged.built_at,
+                    }
+                });
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::StagedUpdate {
+                        running_version: crate::build_info::version(),
+                        running_protocol: crate::protocol::PROTOCOL_VERSION,
+                        staged,
+                    },
+                }
+            }
             Method::ServerAgentManifests(_) => {
                 self.state.refresh_agent_manifest_summaries();
                 let update_status = crate::detect::manifest_update::load_status();
@@ -2152,6 +2172,69 @@ mod tests {
             },
         );
         app
+    }
+
+    #[test]
+    fn server_staged_update_reports_running_version_and_staged_without_leaking_path() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-staged-api-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let request = || crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::ServerStagedUpdate(
+                crate::api::schema::EmptyParams {},
+            ),
+        };
+
+        // No manifest staged → `staged` is null; the running version is reported.
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(
+            v["result"]["running_version"].as_str().unwrap(),
+            crate::build_info::version()
+        );
+        assert!(v["result"]["staged"].is_null());
+
+        // Stage a manifest → it is reported, but the on-disk PATH is NOT exposed on the wire.
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+        std::fs::write(
+            crate::config::config_dir().join("staged-build.json"),
+            r#"{"version":"9.9.9","sha":"deadbee","built_at":"2026-08-23T15:00:00Z","path":"/root/.local/bin/herdr.staged"}"#,
+        )
+        .unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(v2["result"]["staged"]["version"], "9.9.9");
+        assert_eq!(v2["result"]["staged"]["sha"], "deadbee");
+        assert_eq!(v2["result"]["staged"]["built_at"], "2026-08-23T15:00:00Z");
+        assert!(
+            v2["result"]["staged"]["path"].is_null(),
+            "the staged binary path must not be exposed on the wire"
+        );
+
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
