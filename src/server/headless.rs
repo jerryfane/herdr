@@ -871,6 +871,272 @@ impl HeadlessServer {
         self.app.set_host_terminal_theme(host_terminal_theme);
     }
 
+    #[cfg(unix)]
+    fn perform_live_handoff(
+        &mut self,
+        params: crate::api::schema::ServerLiveHandoffParams,
+    ) -> io::Result<()> {
+        info!("starting live handoff");
+        let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
+        let socket_path = crate::server::handoff::handoff_socket_path();
+        let token = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let listener = match crate::server::handoff::bind_listener(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                self.handoff_in_progress = false;
+                return Err(err);
+            }
+        };
+
+        let mut pane_by_terminal = HashMap::new();
+        for ws in &self.app.state.workspaces {
+            for tab in &ws.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    pane_by_terminal.insert(pane.attached_terminal_id.clone(), pane_id.raw());
+                }
+            }
+        }
+        if pane_by_terminal.len() > crate::server::handoff::MAX_FDS_PER_HANDOFF {
+            let _ = std::fs::remove_file(&socket_path);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "live handoff supports at most {} panes in one update; close panes or restart herdr normally",
+                    crate::server::handoff::MAX_FDS_PER_HANDOFF
+                ),
+            ));
+        }
+
+        self.handoff_in_progress = true;
+        self.disconnect_all_clients_for_handoff();
+        let _ = reject_pending_client_connections(&self.client_listener);
+
+        let mut paused_terminal_ids = Vec::new();
+        for terminal_id in pane_by_terminal.keys() {
+            if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
+                if let Err(err) = runtime.pause_handoff_reader(Duration::from_secs(2)) {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(err);
+                }
+                paused_terminal_ids.push(terminal_id.clone());
+            }
+        }
+
+        let snapshot = crate::persist::capture(
+            &self.app.state.workspaces,
+            &self.app.state.terminals,
+            &self.app.terminal_runtimes,
+            self.app.state.active,
+            self.app.state.selected,
+            self.app.state.sidebar_width,
+            self.app.state.sidebar_section_split,
+            self.app.state.collapsed_space_keys.clone(),
+        );
+
+        let mut handoff_entries = Vec::new();
+        for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
+            let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
+                continue;
+            };
+            let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
+            let has_agent_session = self
+                .app
+                .state
+                .terminals
+                .get(terminal_id)
+                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            if !has_agent_session {
+                handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
+            }
+            handoff_entries.push((terminal_id.clone(), handoff_runtime));
+        }
+
+        let panes = handoff_entries
+            .iter()
+            .map(|(_, runtime)| runtime.clone())
+            .collect();
+        let manifest = crate::server::handoff::manifest_for(
+            snapshot,
+            panes,
+            params.expected_protocol,
+            params.expected_version,
+            self.api_window_title.clone(),
+        );
+        let mut import_child = match crate::server::handoff::spawn_handoff_import(
+            import_exe.as_deref(),
+            &socket_path,
+            &token,
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(err);
+            }
+        };
+        let child_pid = import_child.id();
+        info!(pid = child_pid, socket = %socket_path.display(), "spawned handoff import server");
+
+        let mut fds = Vec::new();
+        let duplicate_result = (|| {
+            for (terminal_id, _) in &handoff_entries {
+                let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
+                    continue;
+                };
+                fds.push(runtime.duplicate_handoff_fd()?);
+            }
+            Ok::<(), io::Error>(())
+        })();
+        if let Err(err) = duplicate_result {
+            for fd in fds {
+                let _ = unsafe { libc::close(fd) };
+            }
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(err);
+        }
+
+        let mut stream = match crate::server::handoff::accept_and_validate_on(
+            listener,
+            &socket_path,
+            &token,
+            &manifest,
+        ) {
+            Ok(stream) => stream,
+            Err(err) => {
+                for fd in fds {
+                    let _ = unsafe { libc::close(fd) };
+                }
+                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(err);
+            }
+        };
+
+        let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        for fd in fds {
+            let _ = unsafe { libc::close(fd) };
+        }
+        if let Err(err) = send_result {
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(err);
+        }
+
+        if let Some(api_server) = &self.api_server {
+            let _ = api_server.remove_socket_file_if_owned();
+        } else {
+            let _ = std::fs::remove_file(crate::api::socket_path());
+        }
+        let _ = remove_socket_file_if_owned(&self.client_socket_path, &self.client_socket_identity);
+        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                Ok(()) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                }
+                Err(restore_err) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(io::Error::other(format!(
+                        "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
+                    )));
+                }
+            }
+            return Err(io::Error::other(format!(
+                "handoff replacement server did not become ready: {err}"
+            )));
+        }
+        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                Ok(()) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                }
+                Err(restore_err) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(io::Error::other(format!(
+                        "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
+                    )));
+                }
+            }
+            return Err(err);
+        }
+
+        for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
+            if !pane_by_terminal.contains_key(&terminal_id) {
+                continue;
+            }
+            debug!(terminal = %terminal_id, "preserving pane runtime for handoff");
+            runtime.preserve_for_handoff();
+        }
+        crate::server::handoff::wait_owned_ack(&mut stream);
+
+        Ok(())
+    }
+
+    fn finish_live_handoff_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.app.state.should_quit = true;
+        self.app.no_session = true;
+        info!("live handoff completed; old server exiting");
+    }
+
+    /// Activate the staged build (`server.apply_staged_update`): re-exec into it via `live_handoff`,
+    /// keeping pane processes — and so agent names/sessions — alive.
+    ///
+    /// VALIDATE BEFORE SWAP: the handoff spawns the replacement directly from the STAGED path and
+    /// validates it reports the staged version BEFORE committing, while the on-disk LIVE path is
+    /// left untouched. So a failed handoff needs no rollback — the running (good) binary is still
+    /// in place — and there is no crash window in which an un-validated binary sits at the live
+    /// path. Only AFTER the handoff commits do we swap the on-disk live path to the new build, so a
+    /// future systemd restart runs it too. (Spawning from the staged path also avoids the trap
+    /// where swapping first unlinks the running binary's inode and `current_exe()` then resolves to
+    /// a deleted path — the replacement spawn would fail ENOENT and nothing would ever activate.)
+    fn apply_staged_update(&mut self) -> io::Result<crate::persist::staged_build::ApplyOutcome> {
+        use crate::persist::staged_build::{self, ApplyOutcome};
+
+        let staged = staged_build::load()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
+        let staged_path = std::path::PathBuf::from(&staged.path);
+        staged_build::verify_staged_binary(&staged_path)?;
+        // Capture the live path BEFORE the handoff so this can only fail PRE-commit (current_exe()
+        // does not change across the handoff); every step after the handoff commits is then
+        // uniformly non-fatal, avoiding a post-commit error that would skip the old server's
+        // shutdown while the new server already owns the panes/sockets.
+        let live = std::env::current_exe()?;
+
+        // Validate-before-swap: run the handoff FIRST (spawns + validates the replacement from the
+        // staged binary and commits), with the live path untouched, so a failed handoff leaves the
+        // live binary byte-unchanged. The live path is swapped only AFTER commit (best-effort).
+        let outcome = staged_build::apply_with_handoff(&staged_path, &live, || {
+            self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(staged_path.to_string_lossy().into_owned()),
+                expected_protocol: None,
+                expected_version: Some(staged.version.clone()),
+            })
+        })?;
+
+        // Stop advertising the update only once it is fully activated on disk; on a partial apply
+        // (disk swap failed) the manifest is left so the owner can retry the swap.
+        if outcome == ApplyOutcome::Activated {
+            staged_build::clear();
+        }
+        Ok(outcome)
+    }
+
+    #[cfg(not(unix))]
+    fn perform_live_handoff(
+        &mut self,
+        _params: crate::api::schema::ServerLiveHandoffParams,
+    ) -> io::Result<()> {
+        Err(io::Error::other("live handoff is only supported on Unix"))
+    }
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
         let visible = if uses_local_keybindings {
             &self.server_config_diagnostic_without_keybindings
@@ -3103,6 +3369,53 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
             if handoff_succeeded {
+                wait_for_live_handoff_response_write(msg.response_write_complete);
+                self.finish_live_handoff_shutdown();
+            }
+            return true;
+        }
+
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            use crate::persist::staged_build::ApplyOutcome;
+            let apply_result = self.apply_staged_update();
+            // An Err is PRE-commit (the handoff never committed; the live binary is untouched) — do
+            // NOT shut the old server down, it must keep serving. Any Ok means the handoff committed
+            // and the replacement owns the panes, so the old server hands off regardless of whether
+            // the on-disk swap fully succeeded.
+            let committed = apply_result.is_ok();
+            let response = match apply_result {
+                Ok(ApplyOutcome::Activated) => serde_json::to_string(&api::schema::SuccessResponse {
+                    id: msg.request.id,
+                    result: api::schema::ResponseResult::Ok {},
+                }),
+                // Partial: the new build is LIVE, but the on-disk live path was not updated. Surface
+                // it distinctly (not a clean Ok) so the running-new/disk-old divergence is visible;
+                // the old server still hands off (the update is live) and it was error!-logged.
+                Ok(ApplyOutcome::ActivatedDiskUpdateFailed) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "apply_staged_update_disk_stale".into(),
+                            message: "update applied and running, but the on-disk binary path was \
+                                      not updated; a future restart may run the previous build until \
+                                      re-applied"
+                                .into(),
+                        },
+                    })
+                }
+                Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
+                    id: msg.request.id,
+                    error: api::schema::ErrorBody {
+                        code: "apply_staged_update_failed".into(),
+                        message: err.to_string(),
+                    },
+                }),
+            }
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
+            // Any committed apply (clean or disk-stale) exported the panes to the replacement; shut
+            // the old server down exactly as the plain live-handoff path does.
+            if committed {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
                 self.finish_live_handoff_shutdown();
             }
