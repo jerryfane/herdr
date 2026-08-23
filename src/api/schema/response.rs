@@ -315,7 +315,24 @@ pub enum ResponseResult {
         size: u64,
         data_base64: String,
     },
+    /// `server.staged_update` — the running daemon version/protocol, plus the staged (built
+    /// but not-yet-running) build if one is available. `staged` present with a different
+    /// `version`/`sha` than the running daemon means an update is ready to apply.
+    StagedUpdate {
+        running_version: String,
+        running_protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<StagedBuildInfo>,
+    },
     Ok {},
+}
+
+/// A staged (built, not-yet-running) daemon build, as returned to a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StagedBuildInfo {
+    pub version: String,
+    pub sha: String,
+    pub built_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

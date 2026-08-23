@@ -5204,6 +5204,22 @@
         {
           "properties": {
             "method": {
+              "const": "server.staged_update",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.agent_manifests",
               "type": "string"
             },
@@ -12122,6 +12138,39 @@
               "type": "object"
             },
             {
+              "description": "`server.staged_update` — the running daemon version/protocol, plus the staged (built\nbut not-yet-running) build if one is available. `staged` present with a different\n`version`/`sha` than the running daemon means an update is ready to apply.",
+              "properties": {
+                "running_protocol": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "running_version": {
+                  "type": "string"
+                },
+                "staged": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/StagedBuildInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "staged_update",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "running_version",
+                "running_protocol"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -12231,6 +12280,26 @@
             "down"
           ],
           "type": "string"
+        },
+        "StagedBuildInfo": {
+          "description": "A staged (built, not-yet-running) daemon build, as returned to a client.",
+          "properties": {
+            "built_at": {
+              "type": "string"
+            },
+            "sha": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "sha",
+            "built_at"
+          ],
+          "type": "object"
         },
         "TabInfo": {
           "properties": {
