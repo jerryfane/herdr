@@ -244,7 +244,7 @@ fn guess_mime(name: &str) -> String {
 }
 
 fn gram_list(args: &[String]) -> std::io::Result<i32> {
-    let (only_queue, unread_only, owner) = match parse_list_args(args) {
+    let parsed = match parse_list_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -256,17 +256,45 @@ fn gram_list(args: &[String]) -> std::io::Result<i32> {
     // `--unread`, which is an owner-only view) omit it so the server returns the
     // owner view — otherwise the owner view would be unreachable from any pane,
     // since HERDR_PANE_ID is set on every managed pane.
-    let owner_view = owner || unread_only;
+    let owner_view = parsed.owner || parsed.unread_only;
     let caller_pane_id = if owner_view { None } else { env_pane_id() };
 
-    super::print_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:gram:list".into(),
         method: Method::GramList(GramListParams {
             caller_pane_id,
-            only_queue,
-            unread_only,
+            only_queue: parsed.only_queue,
+            unread_only: parsed.unread_only,
         }),
-    })?)
+    })?;
+    // Redact credential-looking bodies before printing so a routine `gram list`
+    // can't spill a secret into the reader's transcript. Display-only: stored
+    // messages are untouched and `--reveal` prints the raw value. (issue #95)
+    if !parsed.reveal {
+        redact_gram_response(&mut response);
+    }
+    super::print_response(&response)
+}
+
+/// Redact credential-looking spans in every gram body of a `gram list` response,
+/// in place, for DISPLAY only. Walks `result.messages[].text`; leaves ids, files,
+/// and all other fields untouched.
+fn redact_gram_response(response: &mut serde_json::Value) {
+    let Some(messages) = response
+        .get_mut("result")
+        .and_then(|r| r.get_mut("messages"))
+        .and_then(|m| m.as_array_mut())
+    else {
+        return;
+    };
+    for message in messages {
+        if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
+            let redacted = redact_credentials(text);
+            if redacted != text {
+                message["text"] = serde_json::Value::String(redacted);
+            }
+        }
+    }
 }
 
 fn gram_grab(args: &[String]) -> std::io::Result<i32> {
@@ -426,22 +454,135 @@ fn parse_post_args(args: &[String]) -> Result<(String, Option<String>), String> 
 /// `--queue` (shared unclaimed work) and `--unread` (owner's unread inbox) are
 /// mutually exclusive. `--owner` reads as the owner (omits the caller pane);
 /// `--unread` implies it.
-fn parse_list_args(args: &[String]) -> Result<(bool, bool, bool), String> {
-    let mut only_queue = false;
-    let mut unread_only = false;
-    let mut owner = false;
+/// Credential-looking token prefixes redacted from gram bodies on the CLI read
+/// path (issue #95). `sk-` covers OpenAI / OpenRouter (`sk-or-`) / Anthropic
+/// (`sk-ant-`) / project keys. PEM private-key blocks are handled separately.
+const CREDENTIAL_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "glpat-",
+    "AKIA",
+    "xoxb-",
+    "xoxp-",
+    "AIza",
+];
+
+/// A contiguous `[A-Za-z0-9_-]` run counts as a credential when it starts with a
+/// known prefix AND is long enough to be a real key (short words like a bare
+/// "sk-" in prose never trip it). 20 is the AWS access-key-id length (the shortest
+/// of the set).
+fn is_credential_token(token: &str) -> bool {
+    token.len() >= 20
+        && CREDENTIAL_PREFIXES
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+}
+
+/// Redact credential-looking spans from `text` for DISPLAY. Never mutates stored
+/// messages. Each detected secret becomes `[redacted credential, N chars]` (or
+/// `[redacted private key, N chars]` for a PEM block), N being the redacted
+/// length. Pure — unit-tested over the prefix set.
+fn redact_credentials(text: &str) -> String {
+    let collapsed = redact_pem_blocks(text);
+    let mut out = String::with_capacity(collapsed.len());
+    let mut token = String::new();
+    for ch in collapsed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            token.push(ch);
+        } else {
+            push_token(&token, &mut out);
+            token.clear();
+            out.push(ch);
+        }
+    }
+    push_token(&token, &mut out);
+    out
+}
+
+fn push_token(token: &str, out: &mut String) {
+    if is_credential_token(token) {
+        out.push_str(&format!(
+            "[redacted credential, {} chars]",
+            token.chars().count()
+        ));
+    } else {
+        out.push_str(token);
+    }
+}
+
+/// Collapse each `-----BEGIN … PRIVATE KEY-----` … `-----END … -----` block into a
+/// single marker (its multi-line base64 body would otherwise slip past the
+/// token scanner). If a BEGIN has no well-formed END, redact to end-of-text
+/// (over-redacting a key is the safe failure).
+fn redact_pem_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..begin]);
+        let block = &rest[begin..];
+        let block_end = block.find("-----END ").and_then(|end| {
+            block[end + "-----END ".len()..]
+                .find("-----")
+                .map(|c| end + "-----END ".len() + c + "-----".len())
+        });
+        match block_end {
+            Some(stop) if block[..stop].contains("PRIVATE KEY") => {
+                out.push_str(&format!(
+                    "[redacted private key, {} chars]",
+                    block[..stop].chars().count()
+                ));
+                rest = &block[stop..];
+            }
+            _ => {
+                // A BEGIN with no proper END (or not a private key). If it names a
+                // PRIVATE KEY, redact the remainder to be safe; else pass it through.
+                if block.contains("PRIVATE KEY") {
+                    out.push_str(&format!(
+                        "[redacted private key, {} chars]",
+                        block.chars().count()
+                    ));
+                    rest = "";
+                } else {
+                    out.push_str("-----BEGIN ");
+                    rest = &block["-----BEGIN ".len()..];
+                }
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
+    let mut parsed = ListArgs::default();
     for arg in args {
         match arg.as_str() {
-            "--queue" => only_queue = true,
-            "--unread" => unread_only = true,
-            "--owner" => owner = true,
+            "--queue" => parsed.only_queue = true,
+            "--unread" => parsed.unread_only = true,
+            "--owner" => parsed.owner = true,
+            // Print credential-looking bodies in the clear. Default is to redact them
+            // (see `redact_credentials`) so a routine `gram list` can't drop a secret
+            // into the reader's transcript.
+            "--reveal" | "--show-secrets" => parsed.reveal = true,
             other => return Err(format!("unknown option: {other}")),
         }
     }
-    if only_queue && unread_only {
+    if parsed.only_queue && parsed.unread_only {
         return Err("--queue and --unread cannot be combined".into());
     }
-    Ok((only_queue, unread_only, owner))
+    Ok(parsed)
+}
+
+#[derive(Default)]
+struct ListArgs {
+    only_queue: bool,
+    unread_only: bool,
+    owner: bool,
+    reveal: bool,
 }
 
 /// `grab <id> [--as LABEL]` -> (id, grabbed_by).
@@ -515,7 +656,7 @@ fn print_gram_help() {
     eprintln!(
         "  herdr gram send <text> [--from LABEL] [--file PATH]   message the owner (push-notified)"
     );
-    eprintln!("  herdr gram list [--queue] [--unread] [--owner]   list messages (--owner: read as the owner)");
+    eprintln!("  herdr gram list [--queue] [--unread] [--owner] [--reveal]   list messages (--owner: read as the owner)");
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram get-file <id> -o PATH         download a message's attached file");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
@@ -527,6 +668,11 @@ fn print_gram_help() {
     eprintln!("--from/--as override the attribution label (default: your agent name).");
     eprintln!("delete removes only a message you sent, grabbed, or that is addressed to you;");
     eprintln!("--owner deletes any message (owner authority).");
+    eprintln!();
+    eprintln!("list REDACTS credential-looking bodies (api keys, tokens, private keys) so a");
+    eprintln!("routine `gram list` can't spill a secret into your transcript; pass --reveal to");
+    eprintln!("print raw values. Threads are PER-AGENT: `list` only ever shows YOUR own thread,");
+    eprintln!("so it cannot audit another agent's grams.");
 }
 
 #[cfg(test)]
@@ -602,19 +748,14 @@ mod tests {
 
     #[test]
     fn list_flags_are_exclusive() {
-        assert_eq!(
-            parse_list_args(&args(&["--queue"])).unwrap(),
-            (true, false, false)
-        );
-        assert_eq!(
-            parse_list_args(&args(&["--unread"])).unwrap(),
-            (false, true, false)
-        );
-        assert_eq!(
-            parse_list_args(&args(&["--owner"])).unwrap(),
-            (false, false, true)
-        );
-        assert_eq!(parse_list_args(&args(&[])).unwrap(), (false, false, false));
+        let q = parse_list_args(&args(&["--queue"])).unwrap();
+        assert!(q.only_queue && !q.unread_only && !q.owner);
+        let u = parse_list_args(&args(&["--unread"])).unwrap();
+        assert!(!u.only_queue && u.unread_only && !u.owner);
+        let o = parse_list_args(&args(&["--owner"])).unwrap();
+        assert!(!o.only_queue && !o.unread_only && o.owner);
+        let none = parse_list_args(&args(&[])).unwrap();
+        assert!(!none.only_queue && !none.unread_only && !none.owner && !none.reveal);
         assert!(parse_list_args(&args(&["--queue", "--unread"])).is_err());
         assert!(parse_list_args(&args(&["--nope"])).is_err());
     }
@@ -651,5 +792,93 @@ mod tests {
         );
         assert!(parse_single_id(&args(&[]), "mark-read").is_err());
         assert!(parse_single_id(&args(&["--x"]), "mark-read").is_err());
+    }
+
+    // --- credential redaction (issue #95) ---
+    // Secret-shaped strings are BUILT at runtime from a prefix + synthetic filler,
+    // never written as literals, so no real-looking token sits in the source (which
+    // would trip secret-scanning push protection) yet the redactor still sees the
+    // prefix + length it keys on.
+
+    /// A synthetic, non-secret 40-char suffix. High-charset but obviously fake.
+    fn filler() -> String {
+        "0a1b2c3d4e".repeat(4)
+    }
+
+    fn is_redacted(secret: &str) -> bool {
+        let out = redact_credentials(&format!("here is the key {secret} use it"));
+        !out.contains(secret) && out.contains("[redacted")
+    }
+
+    #[test]
+    fn redacts_every_credential_prefix() {
+        for prefix in CREDENTIAL_PREFIXES {
+            let secret = format!("{prefix}{}", filler());
+            assert!(is_redacted(&secret), "not redacted: prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn keeps_prose_and_short_lookalikes() {
+        // A bare prefix in prose is below the length gate and must survive.
+        let body = "the ssh-agent sk- and a short gho_x are fine; deploy ok";
+        assert_eq!(
+            redact_credentials(body),
+            body,
+            "ordinary prose must survive"
+        );
+    }
+
+    #[test]
+    fn redacts_only_the_token_inside_prose() {
+        let secret = format!("ghp_{}", filler());
+        let out = redact_credentials(&format!("here: {secret}, thanks"));
+        let marker = format!("[redacted credential, {} chars]", secret.chars().count());
+        assert_eq!(out, format!("here: {marker}, thanks"), "{out}");
+    }
+
+    #[test]
+    fn redacts_a_pem_private_key_block() {
+        // Build the markers at runtime so no contiguous key header sits in source.
+        let begin = format!("-----BEGIN OPENSSH {} KEY-----", "PRIVATE");
+        let end = format!("-----END OPENSSH {} KEY-----", "PRIVATE");
+        let body = format!("key below:\n{begin}\nAAAABG5vbmU=\nZm9vYmFy\n{end}\ndone");
+        let out = redact_credentials(&body);
+        assert!(!out.contains(&begin), "pem body leaked: {out}");
+        assert!(out.contains("[redacted private key,"));
+        assert!(out.starts_with("key below:\n") && out.ends_with("\ndone"));
+    }
+
+    #[test]
+    fn reveal_flag_disables_redaction_intent() {
+        assert!(parse_list_args(&args(&["--reveal"])).unwrap().reveal);
+        assert!(parse_list_args(&args(&["--show-secrets"])).unwrap().reveal);
+        assert!(!parse_list_args(&args(&[])).unwrap().reveal);
+    }
+
+    #[test]
+    fn redact_gram_response_only_rewrites_text() {
+        let secret = format!("ghp_{}", filler());
+        let mut response = serde_json::json!({
+            "result": { "messages": [
+                { "id": "gram-1", "text": format!("my key is {secret}"), "read_by_owner": false },
+                { "id": "gram-2", "text": "nothing secret here" }
+            ], "type": "gram_list" }
+        });
+        redact_gram_response(&mut response);
+        let msgs = response["result"]["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["id"], "gram-1", "ids untouched");
+        assert_eq!(msgs[0]["read_by_owner"], false, "other fields untouched");
+        assert!(
+            msgs[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[redacted credential,"),
+            "the secret body must be redacted"
+        );
+        assert_eq!(
+            msgs[1]["text"], "nothing secret here",
+            "clean body unchanged"
+        );
     }
 }
