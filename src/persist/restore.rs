@@ -1043,6 +1043,39 @@ mod tests {
         );
     }
 
+    /// The NATIVE-RESUME path (a `systemctl restart` relaunch with `--resume`) must retain an
+    /// unmanaged (renamed) agent name — not only the cold-restore path. Guards restore.rs:569:
+    /// mutating it back to `(Some(_), None) => {}` makes THIS test go red (the inert half of a
+    /// two-site fix the cold-restore test alone could not catch).
+    #[test]
+    fn native_resume_retains_unmanaged_agent_name() {
+        let mut snapshot = snapshot_with_deferred_native_agent();
+        // A pane renamed via `agent rename` (unmanaged) that also has a resumable session, so
+        // resume_agents_on_restore = true routes it through the native-resume branch.
+        if let Some(pane) = snapshot.workspaces[0].tabs[0].panes.get_mut(&0) {
+            pane.agent_name = Some("planner".into());
+        }
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        // Deferred native resume launches no runtime yet; the terminal exists with the name.
+        assert!(runtimes.is_empty());
+        let terminal = terminals.values().next().expect("one restored terminal");
+        assert_eq!(terminal.agent_name.as_deref(), Some("planner"));
+        assert_eq!(terminal.managed_agent_kind(), None);
+    }
+
     #[test]
     #[cfg(unix)]
     fn restore_handoff_changes_turn_epoch_via_handoff_path() {
