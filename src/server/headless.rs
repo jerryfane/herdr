@@ -1433,6 +1433,48 @@ impl HeadlessServer {
         info!("live handoff completed; old server exiting");
     }
 
+    /// Activate the staged build (`server.apply_staged_update`): swap the daemon binary over the
+    /// live path and re-exec into it via `live_handoff`, keeping pane processes — and so agent
+    /// names/sessions — alive. The handoff validates the replacement reports the staged version;
+    /// on ANY failure the old binary is restored and the old server keeps running the old build.
+    fn apply_staged_update(&mut self) -> io::Result<()> {
+        let staged = crate::persist::staged_build::load()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
+        let staged_path = std::path::PathBuf::from(&staged.path);
+        crate::persist::staged_build::verify_staged_binary(&staged_path)?;
+
+        let live = std::env::current_exe()?;
+        // Swap the on-disk binary (backed up), then hand off into it. import_exe = None means the
+        // replacement is spawned from current_exe (the live path we just overwrote = the new build).
+        let backup = crate::persist::staged_build::install_staged_binary(&staged_path, &live)?;
+
+        match self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+            import_exe: None,
+            expected_protocol: None,
+            expected_version: Some(staged.version.clone()),
+        }) {
+            Ok(()) => {
+                // The staged build is now the running one; stop advertising it as available.
+                crate::persist::staged_build::clear();
+                Ok(())
+            }
+            Err(err) => {
+                // perform_live_handoff rolled the handoff back (the OLD server keeps running the
+                // OLD build); restore the on-disk live binary to match, so a later crash / systemd
+                // restart does not silently adopt the un-activated staged binary.
+                if let Err(restore_err) =
+                    crate::persist::staged_build::restore_backup(&backup, &live)
+                {
+                    tracing::warn!(
+                        %restore_err,
+                        "apply_staged_update: failed to restore the pre-apply binary after a failed handoff"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
     #[cfg(not(unix))]
     fn perform_live_handoff(
         &mut self,
@@ -3685,6 +3727,33 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
             if handoff_succeeded {
+                wait_for_live_handoff_response_write(msg.response_write_complete);
+                self.finish_live_handoff_shutdown();
+            }
+            return true;
+        }
+
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            let apply_result = self.apply_staged_update();
+            let apply_succeeded = apply_result.is_ok();
+            let response = match apply_result {
+                Ok(()) => serde_json::to_string(&api::schema::SuccessResponse {
+                    id: msg.request.id,
+                    result: api::schema::ResponseResult::Ok {},
+                }),
+                Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
+                    id: msg.request.id,
+                    error: api::schema::ErrorBody {
+                        code: "apply_staged_update_failed".into(),
+                        message: err.to_string(),
+                    },
+                }),
+            }
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
+            // On success the handoff already exported the panes to the replacement; shut the old
+            // server down exactly as the plain live-handoff path does.
+            if apply_succeeded {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
                 self.finish_live_handoff_shutdown();
             }
