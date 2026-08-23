@@ -99,14 +99,16 @@ fn set_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Install the staged binary over the `live` path, first backing up the current live binary so a
-/// failed apply can restore it. Returns the backup path. Uses copy-to-temp + rename-over-live: you
-/// cannot overwrite a RUNNING executable in place (ETXTBSY), but you can rename another file over
-/// its path. Assumes `staged` was already verified with [`verify_staged_binary`].
-pub fn install_staged_binary(staged: &Path, live: &Path) -> io::Result<PathBuf> {
-    let backup = sibling(live, ".bak-preapply");
-    std::fs::copy(live, &backup)?;
-
+/// Swap the staged binary onto the `live` path: copy to a temp beside it, mark it executable, then
+/// rename over `live` (atomic, and ETXTBSY-safe — you cannot overwrite a RUNNING executable in
+/// place, but you can rename another file over its path).
+///
+/// Called ONLY AFTER a successful `live_handoff`, so it needs no backup: the new build is already
+/// running (the handoff spawned it from the staged path and validated its version before commit),
+/// and this only updates the on-disk live path so a future restart runs the new build too. The
+/// old binary is being intentionally replaced. Assumes `staged` was verified with
+/// [`verify_staged_binary`].
+pub fn activate_on_disk(staged: &Path, live: &Path) -> io::Result<()> {
     let tmp = sibling(live, ".apply-tmp");
     if let Err(err) = std::fs::copy(staged, &tmp).and_then(|_| set_executable(&tmp)) {
         let _ = std::fs::remove_file(&tmp);
@@ -116,18 +118,7 @@ pub fn install_staged_binary(staged: &Path, live: &Path) -> io::Result<PathBuf> 
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
-    Ok(backup)
-}
-
-/// Restore a backup produced by [`install_staged_binary`] back over `live` (rollback after a
-/// failed handoff), so the on-disk binary matches the still-running old server.
-pub fn restore_backup(backup: &Path, live: &Path) -> io::Result<()> {
-    let tmp = sibling(live, ".restore-tmp");
-    if let Err(err) = std::fs::copy(backup, &tmp).and_then(|_| set_executable(&tmp)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    std::fs::rename(&tmp, live)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -181,32 +172,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn install_swaps_the_binary_and_backs_up_the_old_one() {
-        let dir = temp_dir("install");
+    fn activate_swaps_the_live_binary_to_the_staged_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("activate");
         let live = dir.join("herdr");
         let staged = dir.join("herdr.staged");
         write_exec(&live, b"OLD-BINARY");
         write_exec(&staged, b"NEW-BINARY");
 
-        let backup = install_staged_binary(&staged, &live).unwrap();
+        activate_on_disk(&staged, &live).unwrap();
         assert_eq!(
             std::fs::read(&live).unwrap(),
             b"NEW-BINARY",
             "live is now the staged binary"
         );
-        assert_eq!(
-            std::fs::read(&backup).unwrap(),
-            b"OLD-BINARY",
-            "backup holds the old binary"
+        assert!(
+            std::fs::metadata(&live).unwrap().permissions().mode() & 0o111 != 0,
+            "the swapped-in binary keeps its executable bit"
         );
-
-        // Rollback restores the old bytes over live.
-        restore_backup(&backup, &live).unwrap();
-        assert_eq!(
-            std::fs::read(&live).unwrap(),
-            b"OLD-BINARY",
-            "restore rolls live back"
-        );
+        // No stray backup/temp files linger next to the live path.
+        assert!(!sibling(&live, ".apply-tmp").exists());
+        assert!(!sibling(&live, ".bak-preapply").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -239,6 +225,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_removes_the_manifest_and_is_a_noop_when_absent() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let home = temp_dir("clear");
+        std::env::set_var("XDG_CONFIG_HOME", &home);
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+
+        std::fs::write(
+            manifest_path(),
+            br#"{"version":"1","sha":"a","built_at":"t","path":"/x"}"#,
+        )
+        .unwrap();
+        assert!(load().is_some(), "manifest present before clear");
+        clear();
+        assert!(load().is_none(), "clear() removes the manifest");
+        clear(); // absent now — must not panic/error
+
+        match prev {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -1433,46 +1433,45 @@ impl HeadlessServer {
         info!("live handoff completed; old server exiting");
     }
 
-    /// Activate the staged build (`server.apply_staged_update`): swap the daemon binary over the
-    /// live path and re-exec into it via `live_handoff`, keeping pane processes — and so agent
-    /// names/sessions — alive. The handoff validates the replacement reports the staged version;
-    /// on ANY failure the old binary is restored and the old server keeps running the old build.
+    /// Activate the staged build (`server.apply_staged_update`): re-exec into it via `live_handoff`,
+    /// keeping pane processes — and so agent names/sessions — alive.
+    ///
+    /// VALIDATE BEFORE SWAP: the handoff spawns the replacement directly from the STAGED path and
+    /// validates it reports the staged version BEFORE committing, while the on-disk LIVE path is
+    /// left untouched. So a failed handoff needs no rollback — the running (good) binary is still
+    /// in place — and there is no crash window in which an un-validated binary sits at the live
+    /// path. Only AFTER the handoff commits do we swap the on-disk live path to the new build, so a
+    /// future systemd restart runs it too. (Spawning from the staged path also avoids the trap
+    /// where swapping first unlinks the running binary's inode and `current_exe()` then resolves to
+    /// a deleted path — the replacement spawn would fail ENOENT and nothing would ever activate.)
     fn apply_staged_update(&mut self) -> io::Result<()> {
         let staged = crate::persist::staged_build::load()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
         let staged_path = std::path::PathBuf::from(&staged.path);
         crate::persist::staged_build::verify_staged_binary(&staged_path)?;
 
-        let live = std::env::current_exe()?;
-        // Swap the on-disk binary (backed up), then hand off into it. import_exe = None means the
-        // replacement is spawned from current_exe (the live path we just overwrote = the new build).
-        let backup = crate::persist::staged_build::install_staged_binary(&staged_path, &live)?;
-
-        match self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
-            import_exe: None,
+        // Hand off into the STAGED binary; the live path is untouched, so a failed handoff simply
+        // propagates with nothing to undo.
+        self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+            import_exe: Some(staged_path.to_string_lossy().into_owned()),
             expected_protocol: None,
             expected_version: Some(staged.version.clone()),
-        }) {
-            Ok(()) => {
-                // The staged build is now the running one; stop advertising it as available.
-                crate::persist::staged_build::clear();
-                Ok(())
-            }
-            Err(err) => {
-                // perform_live_handoff rolled the handoff back (the OLD server keeps running the
-                // OLD build); restore the on-disk live binary to match, so a later crash / systemd
-                // restart does not silently adopt the un-activated staged binary.
-                if let Err(restore_err) =
-                    crate::persist::staged_build::restore_backup(&backup, &live)
-                {
-                    tracing::warn!(
-                        %restore_err,
-                        "apply_staged_update: failed to restore the pre-apply binary after a failed handoff"
-                    );
-                }
-                Err(err)
-            }
+        })?;
+
+        // Committed: the new build is now the running server. Update the on-disk live path so a
+        // future restart runs it too, then stop advertising the update. Best-effort — the new build
+        // is already live regardless, so a swap failure is loud-logged but NOT fatal (a stale live
+        // path only bites a future hard restart, and the manifest is left so it can be retried).
+        let live = std::env::current_exe()?;
+        match crate::persist::staged_build::activate_on_disk(&staged_path, &live) {
+            Ok(()) => crate::persist::staged_build::clear(),
+            Err(err) => tracing::error!(
+                %err,
+                "apply_staged_update: handed off to the new build, but updating the on-disk live \
+                 binary path failed; a future restart may run the previous build until re-applied"
+            ),
         }
+        Ok(())
     }
 
     #[cfg(not(unix))]
