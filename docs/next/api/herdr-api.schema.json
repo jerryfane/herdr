@@ -5220,6 +5220,22 @@
         {
           "properties": {
             "method": {
+              "const": "server.apply_staged_update",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.agent_manifests",
               "type": "string"
             },

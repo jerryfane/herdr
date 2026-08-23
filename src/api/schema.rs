@@ -57,6 +57,8 @@ pub enum Method {
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.staged_update")]
     ServerStagedUpdate(EmptyParams),
+    #[serde(rename = "server.apply_staged_update")]
+    ServerApplyStagedUpdate(EmptyParams),
     #[serde(rename = "server.agent_manifests")]
     ServerAgentManifests(EmptyParams),
     #[serde(rename = "server.reload_agent_manifests")]

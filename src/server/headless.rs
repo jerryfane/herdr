@@ -1433,6 +1433,49 @@ impl HeadlessServer {
         info!("live handoff completed; old server exiting");
     }
 
+    /// Activate the staged build (`server.apply_staged_update`): re-exec into it via `live_handoff`,
+    /// keeping pane processes — and so agent names/sessions — alive.
+    ///
+    /// VALIDATE BEFORE SWAP: the handoff spawns the replacement directly from the STAGED path and
+    /// validates it reports the staged version BEFORE committing, while the on-disk LIVE path is
+    /// left untouched. So a failed handoff needs no rollback — the running (good) binary is still
+    /// in place — and there is no crash window in which an un-validated binary sits at the live
+    /// path. Only AFTER the handoff commits do we swap the on-disk live path to the new build, so a
+    /// future systemd restart runs it too. (Spawning from the staged path also avoids the trap
+    /// where swapping first unlinks the running binary's inode and `current_exe()` then resolves to
+    /// a deleted path — the replacement spawn would fail ENOENT and nothing would ever activate.)
+    fn apply_staged_update(&mut self) -> io::Result<crate::persist::staged_build::ApplyOutcome> {
+        use crate::persist::staged_build::{self, ApplyOutcome};
+
+        let staged = staged_build::load()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
+        let staged_path = std::path::PathBuf::from(&staged.path);
+        staged_build::verify_staged_binary(&staged_path)?;
+        // Capture the live path BEFORE the handoff so this can only fail PRE-commit (current_exe()
+        // does not change across the handoff); every step after the handoff commits is then
+        // uniformly non-fatal, avoiding a post-commit error that would skip the old server's
+        // shutdown while the new server already owns the panes/sockets.
+        let live = std::env::current_exe()?;
+
+        // Validate-before-swap: run the handoff FIRST (spawns + validates the replacement from the
+        // staged binary and commits), with the live path untouched, so a failed handoff leaves the
+        // live binary byte-unchanged. The live path is swapped only AFTER commit (best-effort).
+        let outcome = staged_build::apply_with_handoff(&staged_path, &live, || {
+            self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(staged_path.to_string_lossy().into_owned()),
+                expected_protocol: None,
+                expected_version: Some(staged.version.clone()),
+            })
+        })?;
+
+        // Stop advertising the update only once it is fully activated on disk; on a partial apply
+        // (disk swap failed) the manifest is left so the owner can retry the swap.
+        if outcome == ApplyOutcome::Activated {
+            staged_build::clear();
+        }
+        Ok(outcome)
+    }
+
     #[cfg(not(unix))]
     fn perform_live_handoff(
         &mut self,
@@ -3685,6 +3728,53 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
             if handoff_succeeded {
+                wait_for_live_handoff_response_write(msg.response_write_complete);
+                self.finish_live_handoff_shutdown();
+            }
+            return true;
+        }
+
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            use crate::persist::staged_build::ApplyOutcome;
+            let apply_result = self.apply_staged_update();
+            // An Err is PRE-commit (the handoff never committed; the live binary is untouched) — do
+            // NOT shut the old server down, it must keep serving. Any Ok means the handoff committed
+            // and the replacement owns the panes, so the old server hands off regardless of whether
+            // the on-disk swap fully succeeded.
+            let committed = apply_result.is_ok();
+            let response = match apply_result {
+                Ok(ApplyOutcome::Activated) => serde_json::to_string(&api::schema::SuccessResponse {
+                    id: msg.request.id,
+                    result: api::schema::ResponseResult::Ok {},
+                }),
+                // Partial: the new build is LIVE, but the on-disk live path was not updated. Surface
+                // it distinctly (not a clean Ok) so the running-new/disk-old divergence is visible;
+                // the old server still hands off (the update is live) and it was error!-logged.
+                Ok(ApplyOutcome::ActivatedDiskUpdateFailed) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "apply_staged_update_disk_stale".into(),
+                            message: "update applied and running, but the on-disk binary path was \
+                                      not updated; a future restart may run the previous build until \
+                                      re-applied"
+                                .into(),
+                        },
+                    })
+                }
+                Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
+                    id: msg.request.id,
+                    error: api::schema::ErrorBody {
+                        code: "apply_staged_update_failed".into(),
+                        message: err.to_string(),
+                    },
+                }),
+            }
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
+            // Any committed apply (clean or disk-stale) exported the panes to the replacement; shut
+            // the old server down exactly as the plain live-handoff path does.
+            if committed {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
                 self.finish_live_handoff_shutdown();
             }

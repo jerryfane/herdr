@@ -1233,6 +1233,18 @@ impl App {
                 };
                 return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             }
+            Method::ServerApplyStagedUpdate(_) => {
+                let response = ErrorResponse {
+                    id: request.id,
+                    error: ErrorBody {
+                        code: "unsupported_in_app_mode".into(),
+                        message:
+                            "applying a staged update is only supported by the headless server"
+                                .into(),
+                    },
+                };
+                return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            }
             Method::ServerReloadConfig(_) => {
                 let report = self.reload_config();
                 SuccessResponse {
