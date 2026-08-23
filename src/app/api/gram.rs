@@ -86,6 +86,7 @@ impl App {
 
         let from = self.resolve_sender(params.from.as_deref(), params.caller_pane_id.as_deref());
         let message_id = new_id();
+        let store_id = crate::persist::machine::get_or_create();
         let file = match attach_file(&id, &message_id, params.file) {
             Ok(file) => file,
             Err(err) => return err,
@@ -101,6 +102,7 @@ impl App {
             created_unix_ms: super::unix_millis_now(),
             read_by_owner: false,
             file,
+            origin_id: store_id.clone(),
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -110,6 +112,7 @@ impl App {
                     id,
                     ResponseResult::GramSent {
                         message: gram_item_to_info(item),
+                        store_id,
                     },
                 )
             }
@@ -155,6 +158,7 @@ impl App {
         }
 
         let message_id = new_id();
+        let store_id = crate::persist::machine::get_or_create();
         let file = match attach_file(&id, &message_id, params.file) {
             Ok(file) => file,
             Err(err) => return err,
@@ -171,6 +175,7 @@ impl App {
             // The owner's own message is not an unread inbox item for the owner.
             read_by_owner: true,
             file,
+            origin_id: store_id.clone(),
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -178,6 +183,7 @@ impl App {
                 id,
                 ResponseResult::GramSent {
                     message: gram_item_to_info(item),
+                    store_id,
                 },
             ),
             Err(err) => {
@@ -224,7 +230,13 @@ impl App {
         // Store order is oldest-first; clients want newest-first.
         let messages: Vec<GramMessageInfo> =
             filtered.into_iter().rev().map(gram_item_to_info).collect();
-        encode_success(id, ResponseResult::GramList { messages })
+        encode_success(
+            id,
+            ResponseResult::GramList {
+                messages,
+                store_id: crate::persist::machine::get_or_create(),
+            },
+        )
     }
 
     pub(super) fn handle_gram_grab(&mut self, id: String, params: GramGrabParams) -> String {
@@ -659,6 +671,7 @@ fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
             mime: file.mime,
             sha256: file.sha256,
         }),
+        origin_id: item.origin_id,
     }
 }
 
@@ -769,6 +782,7 @@ mod tests {
             created_unix_ms: 1,
             read_by_owner: true,
             file: None,
+            origin_id: "machine_test".to_string(),
         }
     }
 
@@ -970,5 +984,101 @@ mod tests {
         assert!(validate_mime("id", "image/png").is_none());
         assert!(validate_mime("id", &"x".repeat(MAX_MIME_BYTES)).is_none());
         assert!(validate_mime("id", &"x".repeat(MAX_MIME_BYTES + 1)).is_some());
+    }
+
+    #[test]
+    fn gram_item_to_info_carries_origin_id_to_the_wire() {
+        let mut item = owner_shared("m1");
+        item.origin_id = "machine_abc123".to_string();
+        assert_eq!(gram_item_to_info(item).origin_id, "machine_abc123");
+    }
+
+    #[test]
+    fn wire_message_without_origin_id_decodes_to_empty() {
+        // A message serialized by an older daemon has no origin_id; it must still
+        // decode (empty), so the app keeps rendering old grams. See issue #98.
+        let legacy = serde_json::json!({
+            "id": "gram-1-2-3",
+            "direction": "agent_to_owner",
+            "from": "alpha",
+            "text": "hi",
+            "created_unix_ms": 1u64,
+        });
+        let info: GramMessageInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(info.origin_id, "");
+    }
+
+    #[test]
+    fn gram_send_stamps_and_returns_the_stable_store_origin_id() {
+        // Redirect config-home to a throwaway dir so the send writes to a temp
+        // store (never the real ~/.config/herdr/gram.json) and machine::get_or_create
+        // mints a temp id. nextest runs each test in its own process, so the
+        // machine-id OnceLock and this env var stay isolated to this test.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-gram-origin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            false,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let send = |app: &mut App, req: &str| -> serde_json::Value {
+            let raw = app.handle_gram_send(
+                req.to_string(),
+                GramSendParams {
+                    text: "ping".to_string(),
+                    caller_pane_id: None,
+                    from: Some("tester".to_string()),
+                    file: None,
+                },
+            );
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        let first = send(&mut app, "req-1");
+        let store_id = first["result"]["store_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let origin_id = first["result"]["message"]["origin_id"]
+            .as_str()
+            .unwrap_or("");
+        // The mint site actually stamped the stable install id (not an empty string
+        // or the volatile pid), and it is echoed on the send response envelope.
+        assert!(store_id.starts_with("machine_"), "store_id: {store_id:?}");
+        assert_eq!(
+            origin_id, store_id,
+            "message.origin_id must equal the store it landed in"
+        );
+
+        // A second send carries the SAME origin_id — the stability the pid lacked
+        // (a restart would have changed the pid segment; the store id does not).
+        let second = send(&mut app, "req-2");
+        assert_eq!(
+            second["result"]["message"]["origin_id"]
+                .as_str()
+                .unwrap_or(""),
+            store_id
+        );
+
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
