@@ -561,7 +561,12 @@ fn restore_tab(
                 (Some(agent_name), Some(agent)) => {
                     terminal.restore_managed_agent(agent_name, agent)
                 }
-                (Some(_), None) => {}
+                // A name set via `agent rename` has no managed_agent; restore it too so it
+                // survives a restart (the snapshot already carries it). `set_persisted_agent_session`
+                // ran above, so the name anchors to the resumed session and `reconcile_agent_name_owner`
+                // keeps it when the agent re-attaches, rather than being dropped. See issue: agent
+                // names wiped on restart.
+                (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                 (None, _) => {}
             }
             if let Some(agent) = initial_restore_agent {
@@ -667,8 +672,10 @@ fn restore_tab(
                         terminal.restore_managed_agent(agent_name, agent)
                     }
                     (Some(_), Some(_)) => {}
-                    (Some(agent_name), None) if was_imported => terminal.set_agent_name(agent_name),
-                    (Some(_), None) => {}
+                    // A name set via `agent rename` (no managed_agent) is restored whether or
+                    // not the pane was imported, so it survives a restart instead of coming
+                    // back nameless. The snapshot already carries it.
+                    (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                     (None, _) => {}
                 }
                 if let Some(agent) = initial_restore_agent {
@@ -1547,7 +1554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
+    async fn cold_restore_with_gapped_public_tab_numbers_retains_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
         let pane_snap = |id: &str| {
             (
@@ -1653,12 +1660,20 @@ mod tests {
         assert_eq!(workspace.tabs[3].number, 5);
         let agent_pane = workspace.tabs[3].root_pane;
         let terminal_id = &workspace.tabs[3].panes[&agent_pane].attached_terminal_id;
-        assert!(terminals[terminal_id].agent_name.is_none());
+        // An unmanaged (renamed) agent name now SURVIVES restore instead of being dropped,
+        // so a restart no longer returns the pane nameless. managed_agent stays None — the
+        // name is restored without fabricating a managed agent.
+        assert_eq!(
+            terminals[terminal_id].agent_name.as_deref(),
+            Some("planner")
+        );
         assert_eq!(terminals[terminal_id].managed_agent_kind(), None);
+        // With its name restored, the pane now surfaces as an agent in pane_details —
+        // where, nameless, it was previously absent.
         assert!(workspace
             .pane_details(&terminals)
             .into_iter()
-            .all(|detail| detail.pane_id != agent_pane));
+            .any(|detail| detail.pane_id == agent_pane));
     }
 
     #[test]
