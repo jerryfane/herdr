@@ -474,7 +474,10 @@ fn agent_launch_argv(
     args: Vec<String>,
 ) -> Vec<String> {
     let mut argv = Vec::new();
-    if let Some(env) = account_env {
+    // An empty account env (a primary account on the harness default config-home,
+    // issue #94) carries no overrides, so it must launch byte-identically to no
+    // account — no `env` prefix.
+    if let Some(env) = account_env.filter(|env| !env.is_empty()) {
         argv.push("env".to_string());
         for (key, value) in env {
             argv.push(format!("{key}={value}"));
@@ -727,6 +730,18 @@ mod tests {
         assert_eq!(
             agent_launch_argv(None, "claude", vec!["--resume".to_string()]),
             vec!["claude".to_string(), "--resume".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_launch_argv_empty_account_env_is_byte_identical() {
+        // A primary account on the harness default config-home resolves to an
+        // empty env (issue #94); it must launch with no `env` prefix, exactly
+        // like no account at all.
+        let empty: [(String, String); 0] = [];
+        assert_eq!(
+            agent_launch_argv(Some(&empty), "claude", vec!["--resume".to_string()]),
+            agent_launch_argv(None, "claude", vec!["--resume".to_string()])
         );
     }
 

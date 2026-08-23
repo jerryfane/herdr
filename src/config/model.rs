@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::BTreeSet,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -360,15 +364,53 @@ pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// The default config-home directory a harness uses with no override
+/// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.kimi-code`). `None` when `HOME` is
+/// unset or the kind has no config-home lever.
+pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
+    let sub = match kind {
+        "claude" => ".claude",
+        "codex" => ".codex",
+        "kimi" => ".kimi-code",
+        _ => return None,
+    };
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(sub))
+}
+
+/// Whether `config_dir` points at the harness's DEFAULT config-home for `kind`.
+///
+/// A "primary" account registered at this directory must inject NO env override:
+/// some harnesses (Claude Code) keep their main config file as a SIBLING of this
+/// directory (`~/.claude.json`), so forcing `CLAUDE_CONFIG_DIR=~/.claude` on a
+/// default install strands that config and boots a blank one. Compares
+/// canonicalized paths when both resolve (so a symlinked `HOME` still matches),
+/// else falls back to a component-wise path comparison. See issue #94.
+pub fn is_default_config_dir(kind: &str, config_dir: &str) -> bool {
+    let Some(default) = default_config_dir(kind) else {
+        return false;
+    };
+    let candidate = Path::new(config_dir);
+    match (candidate.canonicalize(), default.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => candidate == default.as_path(),
+    }
+}
+
 impl AccountConfig {
-    /// The single `(env_var, config_dir)` pair that points this account's harness
-    /// at its config-home directory. `None` when the kind has no config-home
-    /// lever (an unknown/misconfigured kind).
+    /// The launch env that points this account's harness at its config-home.
+    /// `None` when the kind has no config-home lever (an unknown/misconfigured
+    /// kind). A primary account whose `config_dir` is the harness DEFAULT
+    /// config-home resolves to an EMPTY env: it stays selectable/rememberable
+    /// while launching exactly as a default install, because injecting the
+    /// override would strand a harness whose config file is a sibling of the dir
+    /// rather than inside it (issue #94).
     pub fn launch_env(&self) -> Option<Vec<(String, String)>> {
-        Some(vec![(
-            env_var_for_kind(&self.kind)?.to_string(),
-            self.config_dir.clone(),
-        )])
+        let env_var = env_var_for_kind(&self.kind)?;
+        if is_default_config_dir(&self.kind, &self.config_dir) {
+            return Some(Vec::new());
+        }
+        Some(vec![(env_var.to_string(), self.config_dir.clone())])
     }
 }
 
@@ -1393,6 +1435,73 @@ mod tests {
             ..account
         };
         assert_eq!(unknown.launch_env(), None);
+    }
+
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn default_config_dir_is_home_relative_per_kind() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(
+            default_config_dir("claude"),
+            Some(PathBuf::from("/home/tester/.claude"))
+        );
+        assert_eq!(
+            default_config_dir("codex"),
+            Some(PathBuf::from("/home/tester/.codex"))
+        );
+        assert_eq!(
+            default_config_dir("kimi"),
+            Some(PathBuf::from("/home/tester/.kimi-code"))
+        );
+        assert_eq!(default_config_dir("gemini"), None);
+        restore_home(prev);
+    }
+
+    #[test]
+    fn primary_default_dir_account_injects_no_env_but_secondary_does() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/tester");
+
+        // Primary account at the DEFAULT config-home -> empty env, so it launches
+        // byte-identically to a default install (issue #94) while staying
+        // selectable.
+        let primary = AccountConfig {
+            id: "claude-main".into(),
+            kind: "claude".into(),
+            label: "main".into(),
+            config_dir: "/home/tester/.claude".into(),
+        };
+        assert_eq!(primary.launch_env(), Some(Vec::new()));
+        assert!(is_default_config_dir("claude", "/home/tester/.claude"));
+        // Trailing slash still resolves as the default (component-wise compare).
+        assert!(is_default_config_dir("claude", "/home/tester/.claude/"));
+        // Kind matters: $HOME/.claude is not codex's default home.
+        assert!(!is_default_config_dir("codex", "/home/tester/.claude"));
+
+        // A distinct secondary dir still injects the override.
+        let secondary = AccountConfig {
+            config_dir: "/home/tester/.claude-2".into(),
+            ..primary.clone()
+        };
+        assert_eq!(
+            secondary.launch_env(),
+            Some(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/tester/.claude-2".to_string()
+            )])
+        );
+        assert!(!is_default_config_dir("claude", "/home/tester/.claude-2"));
+
+        restore_home(prev);
     }
 
     #[test]
