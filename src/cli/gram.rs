@@ -67,7 +67,7 @@ fn gram_send(args: &[String]) -> std::io::Result<i32> {
         None => None,
     };
 
-    super::print_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:gram:send".into(),
         method: Method::GramSend(GramSendParams {
             text,
@@ -75,7 +75,11 @@ fn gram_send(args: &[String]) -> std::io::Result<i32> {
             from,
             file,
         }),
-    })?)
+    })?;
+    // Redact the echoed body too, for symmetry with grab/list (the sender already
+    // has the text; the confirmation echo doesn't need to reprint a secret).
+    redact_message_info(&mut response);
+    super::print_response(&response)
 }
 
 fn gram_post(args: &[String]) -> std::io::Result<i32> {
@@ -288,11 +292,31 @@ fn redact_gram_response(response: &mut serde_json::Value) {
         return;
     };
     for message in messages {
-        if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
-            let redacted = redact_credentials(text);
-            if redacted != text {
-                message["text"] = serde_json::Value::String(redacted);
-            }
+        redact_message_text(message);
+    }
+}
+
+/// Redact the single echoed message body in a `result.message` response — the
+/// shape `gram grab` and `gram send` return. WITHOUT this, `grab`ing a queued
+/// credential (the normal claim-work flow) prints it verbatim, bypassing the
+/// `list` redaction. grab/send have no `--reveal`: an agent that truly needs the
+/// raw value uses `gram list --reveal`.
+fn redact_message_info(response: &mut serde_json::Value) {
+    if let Some(message) = response
+        .get_mut("result")
+        .and_then(|r| r.get_mut("message"))
+    {
+        redact_message_text(message);
+    }
+}
+
+/// Redact the credential-looking span in one message object's `text` field, in
+/// place. Leaves every other field untouched.
+fn redact_message_text(message: &mut serde_json::Value) {
+    if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
+        let redacted = redact_credentials(text);
+        if redacted != text {
+            message["text"] = serde_json::Value::String(redacted);
         }
     }
 }
@@ -306,14 +330,18 @@ fn gram_grab(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    super::print_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:gram:grab".into(),
         method: Method::GramGrab(GramGrabParams {
             id,
             caller_pane_id: env_pane_id(),
             grabbed_by,
         }),
-    })?)
+    })?;
+    // Redact the echoed body: `grab` claims a queued item, whose text may hold a
+    // credential — printing it raw here bypasses the `list` redaction (issue #95).
+    redact_message_info(&mut response);
+    super::print_response(&response)
 }
 
 fn gram_mark_read(args: &[String]) -> std::io::Result<i32> {
@@ -879,6 +907,30 @@ mod tests {
         assert_eq!(
             msgs[1]["text"], "nothing secret here",
             "clean body unchanged"
+        );
+    }
+
+    #[test]
+    fn redact_message_info_redacts_the_grab_send_echo() {
+        // grab/send return a single `result.message`, not `messages[]`. This is the
+        // claim-work leak (an agent grabs a queued credential) the list fix missed.
+        let secret = format!("ghp_{}", filler());
+        let mut response = serde_json::json!({
+            "result": {
+                "message": { "id": "gram-9", "text": format!("claimed: {secret}"), "grabbed_by": "herdr-app" },
+                "type": "gram_grabbed"
+            }
+        });
+        redact_message_info(&mut response);
+        let msg = &response["result"]["message"];
+        assert_eq!(msg["id"], "gram-9", "ids untouched");
+        assert_eq!(msg["grabbed_by"], "herdr-app", "other fields untouched");
+        assert!(
+            msg["text"]
+                .as_str()
+                .unwrap()
+                .contains("[redacted credential,"),
+            "the grabbed/sent body must be redacted"
         );
     }
 }
