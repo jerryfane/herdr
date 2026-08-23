@@ -178,4 +178,9 @@ pub struct GramMessageInfo {
     /// `gram.get_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<GramFileInfo>,
+    /// Install-stable identity of the daemon/store that wrote this message (see
+    /// [`crate::persist::gram::GramItem::origin_id`]). Stable across daemon
+    /// restarts; empty for messages written by an older build.
+    #[serde(default)]
+    pub origin_id: String,
 }

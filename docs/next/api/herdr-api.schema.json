@@ -8946,6 +8946,11 @@
             "id": {
               "type": "string"
             },
+            "origin_id": {
+              "default": "",
+              "description": "Install-stable identity of the daemon/store that wrote this message (see\n[`crate::persist::gram::GramItem::origin_id`]). Stable across daemon\nrestarts; empty for messages written by an older build.",
+              "type": "string"
+            },
             "read_by_owner": {
               "default": false,
               "type": "boolean"
@@ -12030,6 +12035,10 @@
                 "message": {
                   "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
                 },
+                "store_id": {
+                  "description": "Install-stable identity of the store this send landed in (the responding\ndaemon's `machine` id). Lets a sender see WHICH store its gram was\nwritten to, so a send that lands where the owner never reads becomes\nvisible instead of silent. See issue #98.",
+                  "type": "string"
+                },
                 "type": {
                   "const": "gram_sent",
                   "type": "string"
@@ -12037,7 +12046,8 @@
               },
               "required": [
                 "type",
-                "message"
+                "message",
+                "store_id"
               ],
               "type": "object"
             },
@@ -12049,6 +12059,10 @@
                   },
                   "type": "array"
                 },
+                "store_id": {
+                  "description": "Install-stable identity of the store these messages were read from (the\nresponding daemon's `machine` id). Present even when `messages` is empty,\nso a reader can tell which store it is looking at when it appears empty.",
+                  "type": "string"
+                },
                 "type": {
                   "const": "gram_list",
                   "type": "string"
@@ -12056,7 +12070,8 @@
               },
               "required": [
                 "type",
-                "messages"
+                "messages",
+                "store_id"
               ],
               "type": "object"
             },

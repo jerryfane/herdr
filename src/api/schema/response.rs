@@ -293,9 +293,18 @@ pub enum ResponseResult {
     },
     GramSent {
         message: GramMessageInfo,
+        /// Install-stable identity of the store this send landed in (the responding
+        /// daemon's `machine` id). Lets a sender see WHICH store its gram was
+        /// written to, so a send that lands where the owner never reads becomes
+        /// visible instead of silent. See issue #98.
+        store_id: String,
     },
     GramList {
         messages: Vec<GramMessageInfo>,
+        /// Install-stable identity of the store these messages were read from (the
+        /// responding daemon's `machine` id). Present even when `messages` is empty,
+        /// so a reader can tell which store it is looking at when it appears empty.
+        store_id: String,
     },
     GramGrabbed {
         message: GramMessageInfo,

@@ -122,6 +122,15 @@ pub struct GramItem {
     /// keyed by this message's id; this is only the metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<GramFile>,
+    /// Install-stable identity of the daemon/store this message was written to
+    /// (`crate::persist::machine::get_or_create`). Unlike the pid embedded in `id`,
+    /// it survives daemon restarts, so every message in one store shares it and a
+    /// different box's store carries a different one — which is what lets a sender
+    /// and a reader tell when they are on different stores instead of a send
+    /// silently landing where the reader never looks. Empty on records written by an
+    /// older build. See issue #98.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_id: String,
 }
 
 impl GramItem {
@@ -320,6 +329,31 @@ fn load_from_path_strict(path: &Path) -> std::io::Result<Vec<GramItem>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn origin_id_defaults_empty_for_legacy_records_and_skips_when_empty() {
+        // A record written by an older daemon has no origin_id; strict load must
+        // still decode it (empty), never fail. See issue #98.
+        let legacy = r#"[{"id":"gram-1-2-3","direction":"agent_to_owner","from":"alpha","text":"hi","created_unix_ms":1}]"#;
+        let items: Vec<GramItem> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].origin_id, "");
+
+        // An empty origin_id is skip-serialized, so re-saving a legacy record does
+        // not add a noisy empty field.
+        let json = serde_json::to_string(&items[0]).unwrap();
+        assert!(
+            !json.contains("origin_id"),
+            "unexpected origin_id in {json}"
+        );
+
+        // A populated origin_id round-trips.
+        let mut stamped = items[0].clone();
+        stamped.origin_id = "machine_deadbeef".to_string();
+        let round: GramItem =
+            serde_json::from_str(&serde_json::to_string(&stamped).unwrap()).unwrap();
+        assert_eq!(round.origin_id, "machine_deadbeef");
+    }
+
     fn item(id: &str, created: u64) -> GramItem {
         GramItem {
             id: id.to_string(),
@@ -332,6 +366,7 @@ mod tests {
             created_unix_ms: created,
             read_by_owner: false,
             file: None,
+            origin_id: String::new(),
         }
     }
 
