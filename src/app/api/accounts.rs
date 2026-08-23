@@ -425,14 +425,31 @@ fn account_email(account: &AccountConfig) -> Option<String> {
 /// Claude email: `<config_dir>/.claude.json` -> `oauthAccount.emailAddress`
 /// (a scoped lookup — `.claude.json` is large, so avoid a tree-wide search).
 fn read_claude_email(config_dir: &str) -> Option<String> {
-    let path = Path::new(config_dir).join(".claude.json");
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-    value
+    read_claude_config_json(config_dir)?
         .get("oauthAccount")
         .and_then(|oauth| oauth.get("emailAddress"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// Load Claude's `.claude.json`. Normally `<config_dir>/.claude.json`, but a
+/// DEFAULT install keeps that file as a SIBLING of `~/.claude`
+/// (i.e. `~/.claude.json`), not inside it. So when `config_dir` is the default
+/// config-home and has no inner `.claude.json`, fall back to `$HOME/.claude.json`
+/// — otherwise the primary account's email always reads as null. See issue #94.
+fn read_claude_config_json(config_dir: &str) -> Option<serde_json::Value> {
+    let inner = Path::new(config_dir).join(".claude.json");
+    let raw = match std::fs::read_to_string(&inner) {
+        Ok(text) => text,
+        Err(_) if crate::config::is_default_config_dir("claude", config_dir) => {
+            let fallback = crate::config::default_config_dir("claude")?
+                .parent()?
+                .join(".claude.json");
+            std::fs::read_to_string(fallback).ok()?
+        }
+        Err(_) => return None,
+    };
+    serde_json::from_str(&raw).ok()
 }
 
 /// Codex email: the `email` claim inside `<config_dir>/auth.json` ->
@@ -841,6 +858,41 @@ mod tests {
             Some("user@example.com")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_email_falls_back_to_sibling_for_the_default_home() {
+        // Default install layout: config-home ~/.claude has NO inner .claude.json;
+        // the real config file is the sibling ~/.claude.json. The primary account's
+        // email must resolve from that sibling (issue #94), not read as null.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        let home = std::env::temp_dir().join(format!("herdr-claude-home-{}", std::process::id()));
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {"emailAddress": "primary@example.com"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        // config_dir == $HOME/.claude, inner .claude.json absent -> sibling used.
+        assert_eq!(
+            read_claude_email(&claude_dir.display().to_string()).as_deref(),
+            Some("primary@example.com")
+        );
+        // A non-default dir with no .claude.json still yields None (no sibling scan).
+        assert!(read_claude_email(&home.join(".claude-other").display().to_string()).is_none());
+
+        match prev {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
