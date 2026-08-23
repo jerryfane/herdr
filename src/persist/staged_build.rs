@@ -121,6 +121,44 @@ pub fn activate_on_disk(staged: &Path, live: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The outcome of a staged apply once the handoff has committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The new build is running AND the on-disk live path was updated to it.
+    Activated,
+    /// The new build is running (the handoff committed), but updating the on-disk live path
+    /// FAILED — so a future hard restart would run the PREVIOUS build until re-applied. A distinct
+    /// signal so this running-new/disk-old divergence is never a silent success.
+    ActivatedDiskUpdateFailed,
+}
+
+/// Orchestrate a staged apply, VALIDATE-BEFORE-SWAP. Runs `handoff` FIRST — it spawns + validates
+/// the replacement from the staged binary and commits it — while the on-disk `live` path is left
+/// UNTOUCHED, so a failed handoff propagates with the live binary BYTE-UNCHANGED (nothing to roll
+/// back). Only AFTER a committed handoff is the live path swapped to the new build, and that swap
+/// is best-effort (the new build is already running): a swap failure returns
+/// [`ApplyOutcome::ActivatedDiskUpdateFailed`] rather than a bare success.
+///
+/// `handoff` is injected so this ordering invariant — the whole point of the apply path — is
+/// unit-testable without a real process re-exec.
+pub fn apply_with_handoff<F>(staged: &Path, live: &Path, handoff: F) -> io::Result<ApplyOutcome>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    handoff()?; // pre-commit: on failure the live path was never touched
+    match activate_on_disk(staged, live) {
+        Ok(()) => Ok(ApplyOutcome::Activated),
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "apply_staged_update: handed off to the new build, but updating the on-disk live \
+                 binary path failed; a future restart may run the previous build until re-applied"
+            );
+            Ok(ApplyOutcome::ActivatedDiskUpdateFailed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +231,41 @@ mod tests {
         // No stray backup/temp files linger next to the live path.
         assert!(!sibling(&live, ".apply-tmp").exists());
         assert!(!sibling(&live, ".bak-preapply").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_with_handoff_swaps_only_after_a_committed_handoff() {
+        let dir = temp_dir("apply-order");
+        let live = dir.join("herdr");
+        let staged = dir.join("herdr.staged");
+        write_exec(&live, b"OLD-BINARY");
+        write_exec(&staged, b"NEW-BINARY");
+
+        // Validate-before-swap invariant: a FAILED handoff must leave the live path BYTE-UNCHANGED
+        // (nothing is swapped pre-commit). Mutation guard: reorder the swap before the handoff and
+        // this assertion goes RED — the exact HIGH/MEDIUM regression class.
+        let result = apply_with_handoff(&staged, &live, || Err(io::Error::other("handoff failed")));
+        assert!(result.is_err(), "a failed handoff propagates");
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"OLD-BINARY",
+            "a failed handoff must leave the live binary byte-unchanged"
+        );
+
+        // A committed handoff swaps the live path AFTER commit.
+        let outcome = apply_with_handoff(&staged, &live, || Ok(())).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Activated);
+        assert_eq!(std::fs::read(&live).unwrap(), b"NEW-BINARY");
+
+        // Committed handoff but the on-disk swap FAILS (live path is a directory) → a DISTINCT
+        // partial outcome, never a silent clean success.
+        let live_dir = dir.join("live-as-dir");
+        std::fs::create_dir(&live_dir).unwrap();
+        let partial = apply_with_handoff(&staged, &live_dir, || Ok(())).unwrap();
+        assert_eq!(partial, ApplyOutcome::ActivatedDiskUpdateFailed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
