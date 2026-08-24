@@ -138,6 +138,7 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         "ping"
         | "agent.list"
         | "accounts.list"
+        | "agent.kinds"
         | "agent.get"
         | "agent.read"
         | "agent.explain"
