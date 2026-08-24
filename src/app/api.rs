@@ -1271,6 +1271,7 @@ impl App {
                     result: ResponseResult::StagedUpdate {
                         running_version: crate::build_info::version(),
                         running_protocol: crate::protocol::PROTOCOL_VERSION,
+                        running_sha: crate::build_info::commit().map(str::to_string),
                         staged,
                     },
                 }
@@ -2223,6 +2224,11 @@ mod tests {
             v["result"]["running_version"].as_str().unwrap(),
             crate::build_info::version()
         );
+        // running_sha mirrors the binary's own commit: present in a git build, absent otherwise.
+        match crate::build_info::commit() {
+            Some(sha) => assert_eq!(v["result"]["running_sha"].as_str().unwrap(), sha),
+            None => assert!(v["result"]["running_sha"].is_null()),
+        }
         assert!(v["result"]["staged"].is_null());
 
         // Stage a manifest → it is reported, but the on-disk PATH is NOT exposed on the wire.
