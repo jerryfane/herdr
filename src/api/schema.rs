@@ -5,6 +5,7 @@ pub mod agents;
 pub mod commands;
 pub mod common;
 pub mod events;
+pub mod fs;
 pub mod gram;
 pub mod integrations;
 pub mod panes;
@@ -21,6 +22,7 @@ pub use agents::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
+pub use fs::*;
 pub use gram::*;
 pub use integrations::*;
 pub use panes::*;
@@ -171,6 +173,10 @@ pub enum Method {
     AgentRestart(AgentRestartParams),
     #[serde(rename = "accounts.list")]
     AccountsList(EmptyParams),
+    #[serde(rename = "agent.kinds")]
+    AgentKinds(EmptyParams),
+    #[serde(rename = "fs.list_dir")]
+    FsListDir(FsListDirParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
