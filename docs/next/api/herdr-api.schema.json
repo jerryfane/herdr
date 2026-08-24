@@ -12154,12 +12154,18 @@
               "type": "object"
             },
             {
-              "description": "`server.staged_update` — the running daemon version/protocol, plus the staged (built\nbut not-yet-running) build if one is available. `staged` present with a different\n`version`/`sha` than the running daemon means an update is ready to apply.",
+              "description": "`server.staged_update` — the running daemon version/protocol/commit, plus the staged (built\nbut not-yet-running) build if one is available. `staged` present with a `sha` different from\n`running_sha` means an update is ready to apply. `running_sha` is the running binary's short\ngit commit, absent on a build with no git context.",
               "properties": {
                 "running_protocol": {
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"
+                },
+                "running_sha": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "running_version": {
                   "type": "string"

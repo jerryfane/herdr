@@ -315,12 +315,15 @@ pub enum ResponseResult {
         size: u64,
         data_base64: String,
     },
-    /// `server.staged_update` — the running daemon version/protocol, plus the staged (built
-    /// but not-yet-running) build if one is available. `staged` present with a different
-    /// `version`/`sha` than the running daemon means an update is ready to apply.
+    /// `server.staged_update` — the running daemon version/protocol/commit, plus the staged (built
+    /// but not-yet-running) build if one is available. `staged` present with a `sha` different from
+    /// `running_sha` means an update is ready to apply. `running_sha` is the running binary's short
+    /// git commit, absent on a build with no git context.
     StagedUpdate {
         running_version: String,
         running_protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_sha: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         staged: Option<StagedBuildInfo>,
     },

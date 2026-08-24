@@ -737,7 +737,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("herdr {}", crate::build_info::version());
+        println!("herdr {}", crate::build_info::version_display());
         return Ok(());
     }
 
