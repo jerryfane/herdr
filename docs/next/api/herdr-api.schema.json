@@ -2441,6 +2441,18 @@
           ],
           "type": "object"
         },
+        "FsListDirParams": {
+          "description": "Parameters for `fs.list_dir` — list a single directory's entries, for an app\nfolder picker. `path` is absolute; a leading `~` is expanded and `None`\ndefaults to `$HOME`. Read-only; never writes or traverses recursively.",
+          "properties": {
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "GramDeleteParams": {
           "description": "`gram.delete` — remove a message from the store for good.\n\nDeletion is deliberately destructive: the record (and any attached file bytes)\nare gone, which is what makes gram safe for a short-lived secret like a\ntemporary API key — send it, use it, delete it. Authority follows the caller:\nthe owner's app sends no `caller_pane_id` and may delete any message; an agent\nsupplies its `caller_pane_id` and may delete only a message it is involved in\n(one it sent, one addressed to it, or one it grabbed), else the call is\nrejected. A `caller_pane_id` that names no live pane is an error, not a\nfall-through to owner authority.",
           "properties": {
@@ -6052,6 +6064,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.kinds",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "fs.list_dir",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/FsListDirParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.split",
               "type": "string"
             },
@@ -7871,6 +7915,22 @@
           ],
           "type": "object"
         },
+        "AgentKindInfo": {
+          "description": "One known agent kind and whether its interactive harness binary is installed\non the daemon's `$PATH`, as returned by `agent.kinds`.",
+          "properties": {
+            "installed": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "installed"
+          ],
+          "type": "object"
+        },
         "AgentManifestInfo": {
           "properties": {
             "active_version": {
@@ -8121,6 +8181,22 @@
             "failed"
           ],
           "type": "string"
+        },
+        "DirEntryInfo": {
+          "description": "One entry in a directory listing returned by `fs.list_dir`. `name` is the\nentry's file name only (not a full path); `is_dir` is resolved through\nsymlinks, so a symlink to a directory reports `true`.",
+          "properties": {
+            "is_dir": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "is_dir"
+          ],
+          "type": "object"
         },
         "EventData": {
           "oneOf": [
@@ -11148,6 +11224,48 @@
               "required": [
                 "type",
                 "accounts"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kinds": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentKindInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_kinds",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "kinds"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "entries": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/DirEntryInfo"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "dir_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path",
+                "entries"
               ],
               "type": "object"
             },

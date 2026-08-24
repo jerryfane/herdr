@@ -113,6 +113,13 @@ pub enum ResponseResult {
     AccountsList {
         accounts: Vec<super::accounts::AccountInfo>,
     },
+    AgentKinds {
+        kinds: Vec<AgentKindInfo>,
+    },
+    DirList {
+        path: String,
+        entries: Vec<DirEntryInfo>,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +343,23 @@ pub struct StagedBuildInfo {
     pub version: String,
     pub sha: String,
     pub built_at: String,
+}
+
+/// One known agent kind and whether its interactive harness binary is installed
+/// on the daemon's `$PATH`, as returned by `agent.kinds`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentKindInfo {
+    pub kind: String,
+    pub installed: bool,
+}
+
+/// One entry in a directory listing returned by `fs.list_dir`. `name` is the
+/// entry's file name only (not a full path); `is_dir` is resolved through
+/// symlinks, so a symlink to a directory reports `true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

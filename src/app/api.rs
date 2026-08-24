@@ -1402,6 +1402,8 @@ impl App {
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AccountsList(_) => return self.handle_accounts_list(request.id),
+            Method::AgentKinds(_) => return self.handle_agent_kinds(request.id),
+            Method::FsListDir(params) => return self.handle_fs_list_dir(request.id, params),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
@@ -1573,6 +1575,76 @@ impl App {
         };
 
         serde_json::to_string(&response).unwrap()
+    }
+
+    /// `agent.kinds` — every known agent kind and whether its interactive
+    /// harness binary is installed on the daemon's `$PATH`. Read-only; used by a
+    /// client to offer only the harnesses that can actually launch.
+    fn handle_agent_kinds(&self, id: String) -> String {
+        use crate::api::schema::{AgentKindInfo, ResponseResult};
+
+        let kinds = crate::detect::Agent::ALL
+            .iter()
+            .map(|&agent| AgentKindInfo {
+                kind: crate::detect::agent_label(agent).to_string(),
+                installed: executable_on_path(crate::detect::interactive_agent_executable(agent)),
+            })
+            .collect();
+        responses::encode_success(id, ResponseResult::AgentKinds { kinds })
+    }
+
+    /// `fs.list_dir` — list a single directory's entries for an app folder
+    /// picker. Read-only and non-recursive. `path` defaults to `$HOME` (or `/`
+    /// when unset) and expands a leading `~`. A path that does not exist or is
+    /// not a directory is a `not_a_directory` error.
+    fn handle_fs_list_dir(
+        &self,
+        id: String,
+        params: crate::api::schema::FsListDirParams,
+    ) -> String {
+        use crate::api::schema::{DirEntryInfo, ResponseResult};
+
+        let resolved = resolve_list_dir_path(params.path.as_deref());
+
+        let read_dir = match std::fs::read_dir(&resolved) {
+            Ok(read_dir) => read_dir,
+            Err(_) => {
+                return responses::encode_error(
+                    id,
+                    "not_a_directory",
+                    format!("{} is not a directory", resolved.display()),
+                );
+            }
+        };
+
+        let mut entries: Vec<DirEntryInfo> = Vec::new();
+        for entry in read_dir.flatten() {
+            // Skip an entry whose metadata can't be read (e.g. a broken symlink)
+            // rather than failing the whole listing. `metadata` follows symlinks,
+            // so a symlink to a directory reports `is_dir = true`.
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            entries.push(DirEntryInfo {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                is_dir: metadata.is_dir(),
+            });
+        }
+
+        // Directories first, then case-insensitive by name.
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+
+        // Report the resolved absolute path, canonicalized best-effort.
+        let path = std::fs::canonicalize(&resolved)
+            .unwrap_or(resolved)
+            .to_string_lossy()
+            .into_owned();
+
+        responses::encode_success(id, ResponseResult::DirList { path, entries })
     }
 
     fn handle_notification_show(
@@ -1797,6 +1869,59 @@ fn is_valid_apns_activity_token(token: &str) -> bool {
 static LAST_LIVE_ACTIVITY_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Hash of the last content-state dispatched, so an unchanged aggregate is not re-sent.
 static LAST_LIVE_ACTIVITY_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve an `fs.list_dir` request path to an absolute filesystem path. `None`
+/// defaults to `$HOME` (or `/` when unset). A leading `~` (`~` alone or `~/…`)
+/// expands against `$HOME`; any other value is used verbatim. Handled locally so
+/// this stays independent of `worktree`'s `pub(crate)` tilde helper.
+fn resolve_list_dir_path(path: Option<&str>) -> std::path::PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    };
+    match path {
+        None | Some("~") => home(),
+        Some(raw) => match raw.strip_prefix("~/") {
+            Some(rest) => home().join(rest),
+            None => std::path::PathBuf::from(raw),
+        },
+    }
+}
+
+/// Whether `exe` names an executable file in any `$PATH` directory. Unix-focused:
+/// on unix it requires an executable bit; on other targets it only checks that a
+/// file by that name exists. Compile-safe on every target.
+fn executable_on_path(exe: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if is_executable_file(&dir.join(exe)) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        // `metadata` follows symlinks, so a symlinked binary resolves to its
+        // target. Require a regular file with at least one executable bit set.
+        Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
+}
 
 /// Aggregate a session's agents into the Live Activity content-state the widget renders.
 /// Keys MUST match the app's `AgentActivityAttributes.State` (camelCase). The status +
@@ -2253,6 +2378,153 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn fs_test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    #[test]
+    fn fs_list_dir_lists_a_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-fs-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("beta")).unwrap();
+        std::fs::create_dir_all(dir.join("Alpha")).unwrap();
+        std::fs::write(dir.join("zeta.txt"), b"x").unwrap();
+
+        let mut app = fs_test_app();
+        let request = crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::FsListDir(crate::api::schema::FsListDirParams {
+                path: Some(dir.display().to_string()),
+            }),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        let entries = value["result"]["entries"].as_array().unwrap();
+
+        // Directories first (case-insensitive: Alpha before beta), then the file.
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "beta", "zeta.txt"]);
+        assert_eq!(entries[0]["is_dir"], true);
+        assert_eq!(entries[1]["is_dir"], true);
+        assert_eq!(entries[2]["is_dir"], false);
+        // The reported path resolves back to the directory we listed.
+        assert_eq!(
+            std::fs::canonicalize(value["result"]["path"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&dir).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_list_dir_errors_on_a_non_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "herdr-fs-notdir-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&file, b"not a dir").unwrap();
+
+        let mut app = fs_test_app();
+        let request = crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::FsListDir(crate::api::schema::FsListDirParams {
+                path: Some(file.display().to_string()),
+            }),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(value["error"]["code"], "not_a_directory");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn agent_kinds_lists_all_known_kinds_with_installed_flags() {
+        let mut app = fs_test_app();
+        let request = crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentKinds(crate::api::schema::EmptyParams {}),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        let kinds = value["result"]["kinds"].as_array().unwrap();
+
+        // One entry per known agent kind, each with a non-empty label and a bool
+        // `installed` flag.
+        assert_eq!(kinds.len(), crate::detect::Agent::ALL.len());
+        assert_eq!(kinds.len(), 22);
+        for entry in kinds {
+            assert!(!entry["kind"].as_str().unwrap().is_empty());
+            assert!(entry["installed"].is_boolean());
+        }
+        // A representative known label is present.
+        assert!(kinds
+            .iter()
+            .any(|entry| entry["kind"].as_str() == Some("claude")));
+    }
+
+    #[test]
+    fn resolve_list_dir_path_defaults_and_expands_tilde() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/tester");
+
+        // None -> $HOME.
+        assert_eq!(
+            resolve_list_dir_path(None),
+            std::path::PathBuf::from("/home/tester")
+        );
+        // Bare "~" -> $HOME.
+        assert_eq!(
+            resolve_list_dir_path(Some("~")),
+            std::path::PathBuf::from("/home/tester")
+        );
+        // "~/sub" -> $HOME/sub.
+        assert_eq!(
+            resolve_list_dir_path(Some("~/projects/x")),
+            std::path::PathBuf::from("/home/tester/projects/x")
+        );
+        // An absolute path passes through verbatim.
+        assert_eq!(
+            resolve_list_dir_path(Some("/etc")),
+            std::path::PathBuf::from("/etc")
+        );
+
+        match prev {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_on_path_finds_present_and_rejects_missing() {
+        // `sh` is guaranteed present and executable on any unix PATH.
+        assert!(executable_on_path("sh"));
+        // A name that cannot exist on PATH is not found.
+        assert!(!executable_on_path("herdr-nonexistent-xyz"));
     }
 
     #[tokio::test]
