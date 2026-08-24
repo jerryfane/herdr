@@ -73,6 +73,11 @@ build:
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1
 
+# ~3-5 minute CPU comparison; downloads stable unless HERDR_PERF_BASELINE_BIN is set
+bench-release-smoke:
+    cargo build --release --locked
+    scripts/release_perf_smoke.sh "${CARGO_TARGET_DIR:-target}/release/herdr"
+
 # Build the website and documentation
 website-build:
     cd website && bun install --frozen-lockfile && bun run build
@@ -130,10 +135,11 @@ release-docs-check:
     just website-build
     cd website && bun run build:draft
 
-# Validate release docs and review full-render scaling before release preparation
+# Validate release docs, render scaling, and end-to-end CPU before release preparation
 pre-release-check:
     just release-docs-check
     just bench-render-scale
+    just bench-release-smoke
     @echo "release review required: investigate material render-scaling regressions before publishing."
     @echo "release review required: update skills/herdr/SKILL.md for this stable release so it matches the current CLI, IDs, agent lifecycle semantics, and safety guidance."
     @echo "release policy: do not update skills/herdr/SKILL.md between stable releases; preview builds keep the latest stable skill."

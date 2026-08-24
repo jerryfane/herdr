@@ -68,10 +68,12 @@ async function preparePublicAssets() {
   for (const file of [
     'install.sh',
     'install.ps1',
+    'install.cmd',
     'agent-guide.md',
     'latest.json',
     'preview.json',
     'robots.txt',
+    'favicon.ico',
     '_headers',
     '_redirects',
   ]) {
@@ -261,24 +263,30 @@ async function writeAgentDocsIndex({
   if (configDataPath === repositoryPath) {
     throw new Error(`cannot derive config reference path from ${repositoryPath}`);
   }
+  const configDataUrl = `${rawRoot}/${configDataPath}`;
 
   const lines = [
     `# ${heading}`,
     '',
     `> ${summary}`,
     '',
-    'Open only the pages relevant to the current task. Links return raw MDX from the exact documented source revision. For another topic, return to this index instead of following `/docs/` links inside a page, which serve human-facing HTML.',
+    'Open only the pages relevant to the current task. Links return raw source files from the exact documented revision. For another topic, return to this index instead of following `/docs/` links inside a page, which serve human-facing HTML.',
     '',
     '## Documentation',
     '',
-    ...pages.map(
-      ({ title, description, path }) =>
-        `- [${title}](${rawBase}/${path})${description ? `: ${description}` : ''}`,
-    ),
+    ...pages.map(({ title, description, path }) => {
+      const url = /^config-reference\.mdx?$/.test(path) ? configDataUrl : `${rawBase}/${path}`;
+      return `- [${title}](${url})${description ? `: ${description}` : ''}`;
+    }),
     '',
-    '## Generated reference data',
+    '## Using the config reference',
     '',
-    `- [Config reference data](${rawRoot}/${configDataPath}): every canonical config.toml key, type, default, and description`,
+    'The Config reference link above is a large structured JSON file. When command tools are available, fetch and filter it by exact key instead of loading the whole file:',
+    '',
+    '```sh',
+    `curl -fsSL '${configDataUrl}' | jq --arg key 'ui.sidebar_width' \\`,
+    "  '.sections[].keys[] | select(.key == $key)'",
+    '```',
     '',
     ...extraSections,
     '',

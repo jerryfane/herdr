@@ -1,5 +1,24 @@
 use std::path::{Path, PathBuf};
 
+fn set_sigpipe_disposition(handler: libc::sighandler_t) {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        // Rust starts with SIGPIPE ignored. If this best-effort transition
+        // fails, stdout retains the existing Rust behavior.
+        libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+    }
+}
+
+pub(crate) fn begin_cli_output() {
+    set_sigpipe_disposition(libc::SIG_DFL);
+}
+
+pub(crate) fn end_cli_output() {
+    set_sigpipe_disposition(libc::SIG_IGN);
+}
+
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
     super::RemoteSshConfigPaths {
         user_config: std::env::var_os("HOME")
@@ -209,9 +228,27 @@ fn datetime_from_tm(value: &libc::tm) -> Option<time::PrimitiveDateTime> {
     Some(time::PrimitiveDateTime::new(date, time))
 }
 
+pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: &std::path::Path) {
+    if !env.iter().any(|(key, _)| key == "PWD") {
+        env.push(("PWD".to_string(), cwd.display().to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {
+        let cwd = Path::new("/plugin-cwd");
+        let mut derived = vec![("OTHER".to_string(), "value".to_string())];
+        set_default_plugin_pane_pwd(&mut derived, cwd);
+        assert!(derived.contains(&("PWD".to_string(), "/plugin-cwd".to_string())));
+
+        let mut explicit = vec![("PWD".to_string(), "/caller-pwd".to_string())];
+        set_default_plugin_pane_pwd(&mut explicit, cwd);
+        assert_eq!(explicit, [("PWD".to_string(), "/caller-pwd".to_string())]);
+    }
 
     #[test]
     fn remote_ssh_config_dir_rejects_overlong_control_socket_name() {

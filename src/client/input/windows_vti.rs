@@ -587,15 +587,25 @@ impl WindowsInputMapper {
                         code,
                         modifiers,
                         kind,
+                        generated_text,
                         ..
-                    } => crate::protocol::ClientInputEvent::Key {
-                        code,
-                        modifiers,
-                        kind,
-                        repeat_count: key.repeat_count.max(1),
-                        generated_text: None,
-                        source: crate::protocol::ClientKeySource::WindowsConsole { record: key },
-                    },
+                    } => {
+                        // Windows Unicode is the authoritative host-layout result. Plain and
+                        // AltGr characters already encode from `code`; Shift must remain on the
+                        // physical event, so carry its produced text separately.
+                        let shifted_text = key.key_down
+                            && modifiers == crossterm::event::KeyModifiers::SHIFT.bits();
+                        crate::protocol::ClientInputEvent::Key {
+                            code,
+                            modifiers,
+                            kind,
+                            repeat_count: key.repeat_count.max(1),
+                            generated_text: if shifted_text { generated_text } else { None },
+                            source: crate::protocol::ClientKeySource::WindowsConsole {
+                                record: key,
+                            },
+                        }
+                    }
                     event => event,
                 })
                 .into_iter()
@@ -683,7 +693,9 @@ impl WindowsInputMapper {
             if key.unicode == 0 {
                 self.pending_high_surrogate = None;
             }
-            if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !(0x30..=0x39).contains(&key.virtual_key_code)
+            {
                 if let Some(code) = windows_unicode_control_to_key_code(key.unicode) {
                     self.pending_high_surrogate = None;
                     return Some(crate::protocol::ClientInputEvent::Key {
@@ -1426,12 +1438,13 @@ mod tests {
     }
 
     #[test]
-    fn vti_real_non_letter_control_records_are_preserved() {
+    fn vti_control_records_keep_physical_digit_identity() {
         let cases = [
             (0x20, 0x00, ' '),
+            (0x31, 0x00, '1'),
             (0xdc, 0x1c, '\\'),
             (0xdd, 0x1d, ']'),
-            (0x36, 0x1e, '^'),
+            (0x36, 0x1e, '6'),
             (0xbd, 0x1f, '-'),
         ];
 
@@ -2021,6 +2034,181 @@ mod tests {
                     (Release, 1, false, 1)
                 ],
                 "repeat_count={repeat_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn vti_win32_input_mode_non_us_shifted_text_preserves_generated_text() {
+        let pressed = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x37,
+            virtual_scan_code: 0x08,
+            unicode: b'/'.into(),
+            control_key_state: 0x0010,
+        };
+        let released = WindowsKeyRecord {
+            key_down: false,
+            ..pressed
+        };
+        let mut records = win32_input_mode_encoded_record(pressed);
+        records.extend(win32_input_mode_encoded_record(released));
+
+        let events = translate_with_provenance(records);
+        assert_eq!(
+            events,
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('/'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("/".into()),
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record: pressed },
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('/'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record: released },
+                },
+            ]
+        );
+
+        let crate::raw_input::RawInputEvent::Key(key) = events[0].to_raw_input_event() else {
+            panic!("expected translated key");
+        };
+        assert_eq!(
+            crate::input::encode_terminal_key(key.clone(), crate::input::KeyboardProtocol::Legacy),
+            b"/"
+        );
+        assert_eq!(
+            crate::input::encode_terminal_key(
+                key.clone(),
+                crate::input::KeyboardProtocol::Kitty { flags: 7 },
+            ),
+            b"/"
+        );
+        assert_eq!(
+            crate::input::encode_terminal_key(
+                key,
+                crate::input::KeyboardProtocol::Kitty { flags: 15 },
+            ),
+            b"\x1b[47;2:1u"
+        );
+    }
+
+    #[test]
+    fn vti_native_layout_text_and_command_modifiers_encode_by_role() {
+        let cases = [
+            (
+                "plain unicode",
+                0x4c,
+                0x26,
+                'λ' as u16,
+                0,
+                0,
+                None,
+                "λ".as_bytes(),
+            ),
+            (
+                "shifted latin",
+                0x41,
+                0x1e,
+                'A' as u16,
+                0x0010,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("A"),
+                b"A".as_slice(),
+            ),
+            (
+                "shifted non-ascii",
+                0x4c,
+                0x26,
+                'Λ' as u16,
+                0x0010,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("Λ"),
+                "Λ".as_bytes(),
+            ),
+            (
+                "altgr",
+                0x45,
+                0x12,
+                '€' as u16,
+                0x0009,
+                0,
+                None,
+                "€".as_bytes(),
+            ),
+            (
+                "shift altgr",
+                0x37,
+                0x08,
+                '{' as u16,
+                0x0019,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("{"),
+                b"{".as_slice(),
+            ),
+            (
+                "left alt command",
+                0x41,
+                0x1e,
+                'a' as u16,
+                0x0002,
+                crossterm::event::KeyModifiers::ALT.bits(),
+                None,
+                b"\x1ba".as_slice(),
+            ),
+            (
+                "control command",
+                0x41,
+                0x1e,
+                0x01,
+                0x0008,
+                crossterm::event::KeyModifiers::CONTROL.bits(),
+                None,
+                b"\x01".as_slice(),
+            ),
+        ];
+
+        for (
+            name,
+            virtual_key_code,
+            virtual_scan_code,
+            unicode,
+            state,
+            modifiers,
+            text,
+            expected,
+        ) in cases
+        {
+            let events =
+                translate_with_provenance(win32_input_mode_encoded_record(WindowsKeyRecord {
+                    key_down: true,
+                    repeat_count: 1,
+                    virtual_key_code,
+                    virtual_scan_code,
+                    unicode,
+                    control_key_state: state,
+                }));
+            let [event] = events.as_slice() else {
+                panic!("{name}: expected one translated event, got {events:?}");
+            };
+            let crate::raw_input::RawInputEvent::Key(key) = event.to_raw_input_event() else {
+                panic!("{name}: expected translated key");
+            };
+
+            assert_eq!(key.modifiers.bits(), modifiers, "{name}: modifiers");
+            assert_eq!(key.generated_text.as_deref(), text, "{name}: text");
+            assert_eq!(
+                crate::input::encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy),
+                expected,
+                "{name}: encoding"
             );
         }
     }

@@ -831,8 +831,14 @@ pub(super) fn wait_for_event(
         Ok(subscription) => subscription,
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
     };
-    let mut active = match ActiveSubscription::new(subscription, &request_id, 0, api_tx, event_hub)
-    {
+    let mut active = match ActiveSubscription::new(
+        subscription,
+        &request_id,
+        0,
+        api_tx,
+        event_hub,
+        event_hub.current_sequence(),
+    ) {
         Ok(active) => active,
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
     };

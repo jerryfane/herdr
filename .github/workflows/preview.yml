@@ -344,12 +344,58 @@ jobs:
           pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
           PY
 
-      - name: Create preview prerelease
+      - name: Check for an immutable preview from an earlier run
+        id: existing-preview
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: ${{ needs.preflight.outputs.tag }}
+          PREVIEW_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if ! release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${PREVIEW_TAG}" 2>/dev/null)"; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(jq -r '.immutable // false' <<<"$release")" != "true" ]; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(jq -r '.draft' <<<"$release")" != "false" ] || [ "$(jq -r '.prerelease' <<<"$release")" != "true" ]; then
+            echo "error: $PREVIEW_TAG exists as an immutable release with the wrong release type" >&2
+            exit 1
+          fi
+          tag_commit="$(git ls-remote origin "refs/tags/${PREVIEW_TAG}" | awk 'NR == 1 {print $1}')"
+          if [ "$tag_commit" != "$PREVIEW_COMMIT" ]; then
+            echo "error: immutable release $PREVIEW_TAG points at $tag_commit, expected $PREVIEW_COMMIT" >&2
+            exit 1
+          fi
+          expected_assets="$(jq -S '{
+            "herdr-linux-x86_64": .["linux-x86_64"],
+            "herdr-linux-aarch64": .["linux-aarch64"],
+            "herdr-macos-x86_64": .["macos-x86_64"],
+            "herdr-macos-aarch64": .["macos-aarch64"],
+            "herdr-windows-x86_64.zip": .["windows-x86_64"]
+          }' preview-sha256.json)"
+          actual_assets="$(jq -S '[
+            .assets[] | select(.digest | type == "string") |
+            {key: .name, value: (.digest | sub("^sha256:"; ""))}
+          ] | from_entries' <<<"$release")"
+          if [ "$actual_assets" != "$expected_assets" ]; then
+            echo "error: immutable release $PREVIEW_TAG does not match the artifacts from this run" >&2
+            exit 1
+          fi
+          echo "already_published=true" >> "$GITHUB_OUTPUT"
+          echo "$PREVIEW_TAG is already published with the expected assets; continuing the interrupted run."
+
+      - name: Create preview draft
+        if: steps.existing-preview.outputs.already_published != 'true'
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: Preview build ${{ needs.preflight.outputs.build_id }}
           body_path: PREVIEW_NOTES.md
+          draft: true
           prerelease: true
           make_latest: false
           overwrite_files: true
@@ -360,6 +406,14 @@ jobs:
             artifacts/herdr-macos-x86_64/herdr-macos-x86_64
             artifacts/herdr-macos-aarch64/herdr-macos-aarch64
             artifacts/herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
+
+      - name: Publish preview prerelease
+        if: steps.existing-preview.outputs.already_published != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: ${{ needs.preflight.outputs.tag }}
+        run: gh release edit "$PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
 
       - name: Update preview documentation and manifest
         run: |

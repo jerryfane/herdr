@@ -83,6 +83,15 @@ fn spawn_client_process(
     runtime_dir: &PathBuf,
     api_socket_path: &PathBuf,
 ) -> SpawnedHerdr {
+    spawn_client_process_with_args(config_home, runtime_dir, api_socket_path, &["client"])
+}
+
+fn spawn_client_process_with_args(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket_path: &PathBuf,
+    args: &[&str],
+) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -94,7 +103,7 @@ fn spawn_client_process(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
-    cmd.arg("client");
+    cmd.args(args);
     cmd.env("HERDR_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -380,6 +389,123 @@ fn client_connects_and_receives_frame() {
         .expect("should receive a frame from server");
 
     cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn direct_attach_initial_mouse_capture_follows_config() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let config_path = config_home.join(app_dir_name()).join("config.toml");
+
+    let spawned_server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n[ui]\nmouse_capture = false\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "create-workspace-for-direct-attach",
+            "method": "workspace.create",
+            "params": {"cwd": base},
+        })
+        .to_string(),
+    );
+    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+        .as_str()
+        .expect("created terminal id")
+        .to_string();
+
+    let mut attach = spawn_client_process_with_args(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["terminal", "attach", &terminal_id],
+    );
+    let output = spawn_pty_drain(
+        attach
+            ._master
+            .as_ref()
+            .expect("direct attach master")
+            .try_clone_reader()
+            .expect("clone direct attach PTY reader"),
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            read_output(&output).contains("\x1b[?7l")
+        }),
+        "direct attach terminal setup should complete; output: {:?}",
+        read_output(&output)
+    );
+    assert!(
+        !read_output(&output).contains("\x1b[?1000h"),
+        "mouse capture disabled must not enable host mouse reporting; output: {:?}",
+        read_output(&output)
+    );
+    assert!(
+        read_output(&output).contains("\x1b[?2004h"),
+        "direct attach must enable host bracketed paste; output: {:?}",
+        read_output(&output)
+    );
+
+    let restore_watermark = output_len(&output);
+    attach
+        ._master
+        .as_ref()
+        .expect("direct attach master")
+        .take_writer()
+        .expect("direct attach PTY writer")
+        .write_all(b"\x02q")
+        .expect("detach direct attach client");
+    let restore_output = drain_until_client_exits(&mut attach, &output, restore_watermark);
+    assert!(
+        restore_output.contains("\x1b[?2004l"),
+        "direct attach must disable host bracketed paste on restore; output: {restore_output:?}"
+    );
+    drop(attach);
+
+    fs::write(
+        &config_path,
+        "onboarding = false\n[ui]\nmouse_capture = true\n",
+    )
+    .unwrap();
+    let attach = spawn_client_process_with_args(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["terminal", "attach", &terminal_id],
+    );
+    let output = spawn_pty_drain(
+        attach
+            ._master
+            .as_ref()
+            .expect("direct attach master")
+            .try_clone_reader()
+            .expect("clone direct attach PTY reader"),
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            read_output(&output).contains("\x1b[?7l")
+        }),
+        "direct attach terminal setup should complete; output: {:?}",
+        read_output(&output)
+    );
+    assert!(
+        read_output(&output).contains("\x1b[?1000h"),
+        "mouse capture enabled must retain host mouse reporting; output: {:?}",
+        read_output(&output)
+    );
+
+    drop(spawned_server);
+    cleanup_spawned_herdr(attach, base);
 }
 
 #[test]

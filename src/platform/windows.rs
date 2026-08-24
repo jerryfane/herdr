@@ -15,6 +15,12 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn set_default_plugin_pane_pwd(
+    _env: &mut Vec<(String, String)>,
+    _cwd: &std::path::Path,
+) {
+}
+
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
@@ -1889,7 +1895,7 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);
     let result = unsafe {
@@ -1903,7 +1909,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
         )
     };
     if result as isize > 32 {
-        Ok(())
+        Ok(None)
     } else {
         Err(std::io::Error::other(format!(
             "failed to open URL with ShellExecuteW: code {}",

@@ -45,6 +45,8 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+#[cfg(any(unix, test))]
+pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalComposerFrame, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
@@ -52,7 +54,7 @@ pub(crate) use self::terminal::{
 };
 pub use self::{
     state::PaneState,
-    terminal::{InputState, ScrollMetrics, TerminalCursorState},
+    terminal::{ScrollMetrics, TerminalCursorState},
 };
 
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
@@ -81,6 +83,7 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // when the remote side lacks matching terminfo entries.
     cmd.env("TERM", PANE_TERM);
     cmd.env("COLORTERM", PANE_COLORTERM);
+    cmd.env_remove("WT_SESSION");
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1636,8 +1639,8 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
 /// wraps whatever `prompt` function the user's profile left behind so each
 /// prompt render appends the cwd as OSC 9;9 — the sequence Windows Terminal
 /// and ConEmu standardized for shell integration. PowerShell never updates
-/// its Win32 process cwd on `Set-Location`, so prompt-time reporting is the
-/// only reliable cwd source on Windows.
+/// its Win32 process cwd on `Set-Location`, so the prompt hook updates it when
+/// possible before reporting the cwd.
 ///
 /// The snippet must not contain double quotes: powershell.exe parses its
 /// command line with its own rules that disagree with the ArgvQuote escaping
@@ -1649,7 +1652,7 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
 /// The original prompt must be invoked before any other statement in the
 /// wrapper: anything that runs first resets `$?`, so a status-aware user
 /// prompt would show success after a failed command (verified on 5.1).
-pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
+pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $loc.ProviderPath } catch {}; $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
 
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
@@ -1833,11 +1836,7 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn handoff_history_ansi(&self) -> Option<String> {
-        if self
-            .terminal
-            .input_state()
-            .is_some_and(|input_state| input_state.alternate_screen)
-        {
+        if self.terminal.alternate_screen_active() {
             return None;
         }
         self.snapshot_history().map(|history| {
@@ -2915,6 +2914,7 @@ impl PaneRuntime {
         self.terminal.word_motion_target(row, col, motion)
     }
 
+    #[cfg(any(unix, test))]
     pub fn input_state(&self) -> Option<InputState> {
         #[cfg(test)]
         AGGREGATE_INPUT_STATE_READS.set(AGGREGATE_INPUT_STATE_READS.get() + 1);
@@ -2927,6 +2927,30 @@ impl PaneRuntime {
 
     pub fn normalize_alternate_screen_on_exit(&self) -> bool {
         self.terminal.normalize_alternate_screen_on_exit()
+    }
+
+    pub fn keyboard_report_all_requested(&self) -> bool {
+        self.terminal.keyboard_report_all_requested()
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.terminal.bracketed_paste_enabled()
+    }
+
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.terminal.focus_reporting_enabled()
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.terminal.mouse_reporting_enabled()
+    }
+
+    pub fn sgr_pixel_mouse_enabled(&self) -> bool {
+        self.terminal.sgr_pixel_mouse_enabled()
+    }
+
+    pub fn plain_page_keys_use_host_scrollback(&self) -> Option<bool> {
+        self.terminal.plain_page_keys_use_host_scrollback()
     }
 
     pub fn alternate_screen_active(&self) -> bool {
@@ -3093,10 +3117,7 @@ impl PaneRuntime {
     }
 
     fn paste_payload(&self, text: String) -> Bytes {
-        let bracketed = self
-            .input_state()
-            .map(|state| state.bracketed_paste)
-            .unwrap_or(false);
+        let bracketed = self.bracketed_paste_enabled();
         let payload = if bracketed {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
@@ -3106,11 +3127,7 @@ impl PaneRuntime {
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
-        if !self
-            .input_state()
-            .map(|state| state.focus_reporting)
-            .unwrap_or(false)
-        {
+        if !self.focus_reporting_enabled() {
             return false;
         }
 
@@ -3143,7 +3160,7 @@ impl PaneRuntime {
         position: crate::input::mouse::Position,
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Vec<u8>> {
-        if !self.input_state()?.mouse_protocol_mode.reporting_enabled() {
+        if !self.mouse_reporting_enabled() {
             return None;
         }
         self.terminal.encode_mouse_button(kind, position, modifiers)
@@ -3181,7 +3198,6 @@ impl PaneRuntime {
         &self,
         kind: crossterm::event::MouseEventKind,
     ) -> Option<Vec<u8>> {
-        self.input_state()?;
         if self.wheel_routing()? != WheelRouting::AlternateScroll {
             return None;
         }
@@ -3347,6 +3363,16 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    #[test]
+    fn pane_terminal_identity_removes_outer_windows_terminal_session() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("WT_SESSION", "outer-session");
+
+        apply_pane_terminal_env(&mut cmd);
+
+        assert!(cmd.get_env("WT_SESSION").is_none());
     }
 
     #[tokio::test]
@@ -3613,7 +3639,11 @@ mod tests {
         }
 
         let script = WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND;
-        assert!(script.contains("]9;9;"), "missing OSC 9;9 emit: {script}");
+        let cwd_sync = script
+            .find("[Environment]::CurrentDirectory = $loc.ProviderPath")
+            .expect("wrapper must synchronize the Win32 process cwd");
+        let osc_report = script.find("]9;9;").expect("wrapper must emit OSC 9;9");
+        assert!(cwd_sync < osc_report, "cwd sync must precede OSC report");
         assert!(
             script.contains("$global:__HerdrOriginalPrompt = $function:prompt"),
             "must wrap the profile-defined prompt: {script}"

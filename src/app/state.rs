@@ -645,6 +645,68 @@ impl Palette {
         }
         self
     }
+
+    pub fn with_mode_overrides(mut self, custom: &crate::config::ModeThemeColors) -> Self {
+        use crate::config::parse_color;
+        if let Some(c) = &custom.accent {
+            self.accent = parse_color(c);
+        }
+        if let Some(c) = &custom.panel_bg {
+            self.panel_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.sidebar_bg {
+            self.sidebar_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.active_row_bg {
+            self.active_row_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.selection_bg {
+            self.selection_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.surface0 {
+            self.surface0 = parse_color(c);
+        }
+        if let Some(c) = &custom.surface1 {
+            self.surface1 = parse_color(c);
+        }
+        if let Some(c) = &custom.surface_dim {
+            self.surface_dim = parse_color(c);
+        }
+        if let Some(c) = &custom.overlay0 {
+            self.overlay0 = parse_color(c);
+        }
+        if let Some(c) = &custom.overlay1 {
+            self.overlay1 = parse_color(c);
+        }
+        if let Some(c) = &custom.text {
+            self.text = parse_color(c);
+        }
+        if let Some(c) = &custom.subtext0 {
+            self.subtext0 = parse_color(c);
+        }
+        if let Some(c) = &custom.mauve {
+            self.mauve = parse_color(c);
+        }
+        if let Some(c) = &custom.green {
+            self.green = parse_color(c);
+        }
+        if let Some(c) = &custom.yellow {
+            self.yellow = parse_color(c);
+        }
+        if let Some(c) = &custom.red {
+            self.red = parse_color(c);
+        }
+        if let Some(c) = &custom.blue {
+            self.blue = parse_color(c);
+        }
+        if let Some(c) = &custom.teal {
+            self.teal = parse_color(c);
+        }
+        if let Some(c) = &custom.peach {
+            self.peach = parse_color(c);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1686,6 +1748,26 @@ impl AppState {
         section == SettingsSection::Integrations && self.integration_updates_available()
     }
 
+    pub(crate) fn app_surface_pane_ids(&self) -> std::collections::HashSet<PaneId> {
+        let mut pane_ids = std::collections::HashSet::new();
+        if let Some(popup) = &self.popup_pane {
+            pane_ids.insert(popup.pane_id);
+        }
+        let Some(tab) = self
+            .active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::active_tab)
+        else {
+            return pane_ids;
+        };
+        if tab.zoomed {
+            pane_ids.insert(tab.layout.focused());
+        } else {
+            pane_ids.extend(tab.panes.keys().copied());
+        }
+        pane_ids
+    }
+
     pub(crate) fn focused_pane_requests_mouse_capture_from(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
@@ -1694,8 +1776,7 @@ impl AppState {
             && self
                 .active
                 .and_then(|idx| self.focused_runtime_in_workspace(terminal_runtimes, idx))
-                .and_then(crate::terminal::TerminalRuntime::input_state)
-                .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
+                .is_some_and(crate::terminal::TerminalRuntime::mouse_reporting_enabled)
     }
 
     pub(crate) fn should_capture_host_mouse_from(

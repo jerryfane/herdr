@@ -80,27 +80,14 @@ impl App {
             return;
         }
 
-        if let Some(action) =
-            non_indexed_action_for_key(&self.state, &raw_key, BindingDispatch::Prefix)
-        {
-            self.execute_prefix_key_action(action);
-            return;
+        match prefix_binding_for_key(&self.state, &raw_key) {
+            Some(PrefixBindingMatch::Action(action)) => self.execute_prefix_key_action(action),
+            Some(PrefixBindingMatch::Command(binding)) => {
+                self.cancel_copy_mode_if_active();
+                self.launch_custom_command(binding, ActionContext::Prefix);
+            }
+            None => leave_command_mode(&mut self.state),
         }
-
-        if let Some(binding) = command_for_key(&self.state, &raw_key, BindingDispatch::Prefix) {
-            self.cancel_copy_mode_if_active();
-            self.launch_custom_command(binding, ActionContext::Prefix);
-            return;
-        }
-
-        if let Some(action) =
-            indexed_navigation_action(&self.state, &raw_key, BindingDispatch::Prefix)
-        {
-            self.execute_prefix_key_action(action);
-            return;
-        }
-
-        leave_command_mode(&mut self.state);
     }
 
     fn execute_prefix_key_action(&mut self, action: NavigateAction) {
@@ -964,7 +951,7 @@ impl App {
             command.current_dir(cwd);
         }
         let child = command.spawn()?;
-        self.detached_custom_command_children.push(child);
+        self.detached_process_children.push(child);
         Ok(())
     }
 
@@ -1210,6 +1197,43 @@ impl App {
 pub(crate) enum BindingDispatch {
     Direct,
     Prefix,
+}
+
+enum PrefixBindingMatch {
+    Action(NavigateAction),
+    Command(crate::config::CustomCommandKeybind),
+}
+
+fn prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
+    exact_prefix_binding_for_key(state, key).or_else(|| {
+        generated_character_key(key)
+            .as_ref()
+            .and_then(|generated_key| exact_prefix_binding_for_key(state, generated_key))
+    })
+}
+
+fn exact_prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
+    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
+        .map(PrefixBindingMatch::Action)
+        .or_else(|| {
+            command_for_key(state, key, BindingDispatch::Prefix).map(PrefixBindingMatch::Command)
+        })
+        .or_else(|| {
+            indexed_navigation_action(state, key, BindingDispatch::Prefix)
+                .map(PrefixBindingMatch::Action)
+        })
+}
+
+fn generated_character_key(key: &TerminalKey) -> Option<TerminalKey> {
+    let mut characters = key.generated_text.as_deref()?.chars();
+    let character = characters.next()?;
+    if character.is_control() || characters.next().is_some() {
+        return None;
+    }
+    Some(TerminalKey::new(
+        KeyCode::Char(character),
+        crossterm::event::KeyModifiers::empty(),
+    ))
 }
 
 pub(crate) fn command_for_key(
@@ -2042,9 +2066,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode};
     use ratatui::layout::Direction;
 
-    #[cfg(unix)]
-    use super::super::wait_for_file;
     use super::super::{state_with_workspaces, unique_temp_path};
+    #[cfg(unix)]
+    use super::super::{wait_for_detached_process_reap, wait_for_file};
     use super::*;
     use crate::{
         app::App,
@@ -2844,6 +2868,62 @@ resize_pane_left = "prefix+shift+left"
     }
 
     #[test]
+    fn generated_character_prefix_binding_falls_back_after_exact_chord() {
+        let generated_key = crate::input::parse_terminal_key_sequence("\x1b[119;3;124u").unwrap();
+        assert_eq!(generated_key.code, KeyCode::Char('w'));
+        assert_eq!(generated_key.modifiers, KeyModifiers::ALT);
+        assert_eq!(generated_key.generated_text.as_deref(), Some("|"));
+
+        let generated_only: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+"#,
+        )
+        .unwrap();
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds = generated_only.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Action(NavigateAction::SplitVertical))
+        ));
+        let multi_character_key =
+            crate::input::parse_terminal_key_sequence("\x1b[119;3;124:120u").unwrap();
+        assert!(prefix_binding_for_key(&state, &multi_character_key).is_none());
+
+        let exact_and_generated: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+split_horizontal = "prefix+alt+w"
+"#,
+        )
+        .unwrap();
+        state.keybinds = exact_and_generated.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Action(NavigateAction::SplitHorizontal))
+        ));
+
+        let exact_command: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+
+[[keys.command]]
+key = "prefix+alt+w"
+command = "echo exact"
+"#,
+        )
+        .unwrap();
+        state.keybinds = exact_command.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Command(binding)) if binding.command == "echo exact"
+        ));
+    }
+
+    #[test]
     fn shifted_backslash_layout_prefers_horizontal_split_binding() {
         let config: Config = toml::from_str(
             r#"
@@ -3570,16 +3650,10 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(app.state.mode, Mode::Terminal);
 
         std::fs::write(&release_path, b"release").expect("release command");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while crate::platform::process_exists(pid) && tokio::time::Instant::now() < deadline {
-            app.reap_finished_custom_commands();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        app.reap_finished_custom_commands();
-        let reaped_by_runtime = !crate::platform::process_exists(pid);
+        let reaped_by_runtime = wait_for_detached_process_reap(&mut app, pid).await;
         if !reaped_by_runtime {
             if let Some(child) = app
-                .detached_custom_command_children
+                .detached_process_children
                 .iter_mut()
                 .find(|child| child.id() == pid)
             {

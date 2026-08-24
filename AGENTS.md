@@ -58,7 +58,10 @@ Inside pane-scaled render and layout loops:
 
 Prefer deterministic operation or architecture tests to wall-clock CI limits.
 Performance benchmarks are supporting evidence, not substitutes for behavioral
-coverage.
+coverage. Before a stable release, `just bench-release-smoke` must compare the
+candidate with the current stable binary under hidden and visible output. When
+the result moves materially or when validating performance work, repeat it with
+`HERDR_PERF_SAMPLE_SECONDS=60` and investigate the affected scenario.
 
 ### Runtime/client boundary guardrail
 
@@ -256,12 +259,17 @@ just release 0.x.y
 
 Before stable release, run `/pre-release-audit`, finalize `docs/next`, and run `just pre-release-check` to validate the staged docs, website build, and render scaling. `just release` prepares the changelog and release commit, tags it, and pushes the tag. GitHub Actions builds binaries, creates the GitHub release, closes released issues, snapshots and promotes the tagged docs, and updates `website/latest.json`.
 
-The release workflows must publish these four assets:
+Before the first stable Windows release, publish and verify a preview containing stable-channel support. Existing Windows preview users need that preview before `herdr channel set stable` can migrate them.
+
+The release workflows must publish these five assets:
 
 - `herdr-linux-x86_64`
 - `herdr-linux-aarch64`
 - `herdr-macos-x86_64`
 - `herdr-macos-aarch64`
+- `herdr-windows-x86_64.zip`
+
+The Windows archive must contain `herdr.exe` and its app-local ConPTY runtime. Do not publish a bare executable as the stable Windows asset.
 
 `nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
 
