@@ -162,7 +162,7 @@ pub struct App {
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
-    pub(crate) detached_custom_command_children: Vec<std::process::Child>,
+    pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
     tab_bar_commands: Vec<tab_bar_status::TabBarCommandRuntime>,
@@ -170,7 +170,10 @@ pub struct App {
     /// Parsed `ui.window_title` plus the hostname resolved when it was applied.
     window_title_template: Option<(crate::config::WindowTitleTemplate, String)>,
     pub(crate) persist_pane_history: bool,
+    /// Last render-loop attempt, including a throttled hidden-only PTY skip.
     pub(crate) last_render_at: Option<Instant>,
+    /// Last attempt that could update a connected presentation surface.
+    pub(crate) last_presentation_at: Option<Instant>,
     pub(crate) input_leases: input::InputLeaseTable,
     pub render_notify: Arc<Notify>,
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
@@ -355,6 +358,7 @@ fn resolve_palette_for_theme_name(
     name: &str,
     fallback_name: &str,
     runtime: &state::ThemeRuntimeConfig,
+    mode_custom: Option<&crate::config::ModeThemeColors>,
 ) -> state::Palette {
     let mut palette = state::Palette::from_name(name).unwrap_or_else(|| {
         tracing::warn!(
@@ -371,6 +375,9 @@ fn resolve_palette_for_theme_name(
     if let Some(accent) = &runtime.legacy_accent {
         palette.accent = crate::config::parse_color(accent);
     }
+    if let Some(custom) = mode_custom {
+        palette = palette.with_mode_overrides(custom);
+    }
 
     palette
 }
@@ -379,18 +386,30 @@ fn resolve_effective_theme(
     runtime: &state::ThemeRuntimeConfig,
     appearance: Option<crate::terminal_theme::HostAppearance>,
 ) -> (state::Palette, String) {
-    let (name, fallback) = if runtime.auto_switch {
+    let (name, fallback, mode_custom) = if runtime.auto_switch {
         match appearance.unwrap_or(crate::terminal_theme::HostAppearance::Dark) {
-            crate::terminal_theme::HostAppearance::Dark => (&runtime.dark_name, "catppuccin"),
-            crate::terminal_theme::HostAppearance::Light => {
-                (&runtime.light_name, "catppuccin-latte")
-            }
+            crate::terminal_theme::HostAppearance::Dark => (
+                &runtime.dark_name,
+                "catppuccin",
+                runtime
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.dark.as_ref()),
+            ),
+            crate::terminal_theme::HostAppearance::Light => (
+                &runtime.light_name,
+                "catppuccin-latte",
+                runtime
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.light.as_ref()),
+            ),
         }
     } else {
-        (&runtime.manual_name, "catppuccin")
+        (&runtime.manual_name, "catppuccin", None)
     };
     (
-        resolve_palette_for_theme_name(name, fallback, runtime),
+        resolve_palette_for_theme_name(name, fallback, runtime, mode_custom),
         name.clone(),
     )
 }
@@ -808,7 +827,7 @@ impl App {
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
-            detached_custom_command_children: Vec::new(),
+            detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
             tab_bar_commands: Vec::new(),
@@ -818,6 +837,7 @@ impl App {
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
+            last_presentation_at: None,
             input_leases: input::InputLeaseTable::default(),
             api_rx,
             event_hub,
@@ -997,7 +1017,7 @@ impl App {
         let mut host_keyboard_report_all_active = false;
 
         while !self.state.should_quit {
-            self.reap_finished_custom_commands();
+            self.reap_finished_detached_processes();
             if self.render_dirty.is_pending() {
                 needs_render = true;
             }
@@ -1121,6 +1141,8 @@ impl App {
             }
 
             let now = Instant::now();
+            self.render_dirty
+                .set_immediate_pty_sources(self.state.app_surface_pane_ids());
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
             self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
 
@@ -1193,7 +1215,7 @@ impl App {
                     self.render_dirty.request_generic();
                     self.render_notify.notify_one();
                 }
-                self.last_render_at = Some(now);
+                self.record_render_attempt(now, true);
                 needs_render = false;
                 continue;
             }
@@ -2889,6 +2911,17 @@ mod tests {
     fn theme_auto_switch_is_opt_in_and_preserves_manual_default() {
         let mut config = Config::default();
         config.theme.name = Some("tokyo-night".to_string());
+        config.theme.custom = Some(crate::config::CustomThemeColors {
+            light: Some(crate::config::ModeThemeColors {
+                accent: Some("#010203".to_string()),
+                ..Default::default()
+            }),
+            dark: Some(crate::config::ModeThemeColors {
+                accent: Some("#040506".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -2934,6 +2967,55 @@ mod tests {
             app.state.palette.accent,
             ratatui::style::Color::Rgb(1, 2, 3)
         );
+    }
+
+    #[test]
+    fn theme_auto_switch_layers_active_mode_overrides_last() {
+        let mut config = Config::default();
+        config.theme.name = Some("gruvbox".to_string());
+        config.theme.auto_switch = true;
+        config.theme.custom = Some(crate::config::CustomThemeColors {
+            accent: Some("#010203".to_string()),
+            text: Some("#040506".to_string()),
+            light: Some(crate::config::ModeThemeColors {
+                accent: Some("#070809".to_string()),
+                ..Default::default()
+            }),
+            dark: Some(crate::config::ModeThemeColors {
+                text: Some("#0a0b0c".to_string()),
+                sidebar_bg: Some("#0d0e0f".to_string()),
+                active_row_bg: Some("#101112".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(
+            app.state.palette.accent,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(
+            app.state.palette.text,
+            ratatui::style::Color::Rgb(10, 11, 12)
+        );
+        assert_eq!(
+            app.state.palette.sidebar_bg,
+            ratatui::style::Color::Rgb(13, 14, 15)
+        );
+        assert_eq!(
+            app.state.palette.active_row_bg,
+            ratatui::style::Color::Rgb(16, 17, 18)
+        );
+
+        app.set_host_terminal_appearance(crate::terminal_theme::HostAppearance::Light, true);
+
+        assert_eq!(
+            app.state.palette.accent,
+            ratatui::style::Color::Rgb(7, 8, 9)
+        );
+        assert_eq!(app.state.palette.text, ratatui::style::Color::Rgb(4, 5, 6));
     }
 
     #[test]
@@ -5619,6 +5701,29 @@ last_pane = "prefix+tab"
             rx.recv().await.unwrap(),
             bytes::Bytes::from_static("你".as_bytes())
         );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kitty_associated_ime_text_bypasses_report_all_key_encoding() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[32;;20320:22909u".to_vec());
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static("你好".as_bytes())
+        );
+        assert!(rx.try_recv().is_err());
         assert!(app.input_leases.is_empty());
     }
 

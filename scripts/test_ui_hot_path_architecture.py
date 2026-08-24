@@ -11,16 +11,21 @@ HOT_PATH_SOURCES = (
     *sorted((PROJECT_ROOT / "src" / "ui").rglob("*.rs")),
     PROJECT_ROOT / "src" / "server" / "render_stream.rs",
 )
+APP_SERVER_SOURCES = (
+    *sorted((PROJECT_ROOT / "src" / "app").rglob("*.rs")),
+    *sorted((PROJECT_ROOT / "src" / "server").rglob("*.rs")),
+)
 TEST_MODULE = re.compile(r"(?m)^#\[cfg\(test\)\]\s*\nmod\s+\w+\s*\{")
+INPUT_STATE_CALL = re.compile(r"(?:\.|::)input_state\b")
+KEYBOARD_STATE_ANSI_CALL = re.compile(
+    r"(?:\.|::)(?:keyboard_state_ansi|kitty_keyboard_state_ansi)\b"
+)
+AGGREGATE_STATE_CALLS = (
+    (INPUT_STATE_CALL, "aggregate terminal input state; add a narrow accessor"),
+    (KEYBOARD_STATE_ANSI_CALL, "formatted keyboard state"),
+)
 FORBIDDEN_CALLS = (
-    (
-        re.compile(r"(?:\.|::)input_state\b"),
-        "aggregate terminal input state; add a narrow accessor",
-    ),
-    (
-        re.compile(r"(?:\.|::)(?:keyboard_state_ansi|kitty_keyboard_state_ansi)\b"),
-        "formatted keyboard state",
-    ),
+    *AGGREGATE_STATE_CALLS,
     (
         re.compile(r"(?:\.|::)screen_text_snapshot\b"),
         "formatted terminal screen snapshot",
@@ -130,23 +135,37 @@ def production_code(source: str) -> str:
     return code
 
 
+def find_violations(paths, rules) -> list[str]:
+    violations: list[str] = []
+    for path in paths:
+        code = production_code(path.read_text(encoding="utf-8"))
+        for pattern, description in rules:
+            for match in pattern.finditer(code):
+                line = code.count("\n", 0, match.start()) + 1
+                relative_path = path.relative_to(PROJECT_ROOT)
+                violations.append(f"{relative_path}:{line}: {description}")
+    return violations
+
+
 class UiHotPathArchitectureTests(unittest.TestCase):
     def test_render_hot_paths_avoid_known_expensive_runtime_queries(self) -> None:
-        violations: list[str] = []
-
-        for path in HOT_PATH_SOURCES:
-            source = path.read_text(encoding="utf-8")
-            code = production_code(source)
-            for pattern, description in FORBIDDEN_CALLS:
-                for match in pattern.finditer(code):
-                    line = code.count("\n", 0, match.start()) + 1
-                    relative_path = path.relative_to(PROJECT_ROOT)
-                    violations.append(f"{relative_path}:{line}: {description}")
+        violations = find_violations(HOT_PATH_SOURCES, FORBIDDEN_CALLS)
 
         self.assertEqual(
             violations,
             [],
             "Render/layout code must not perform pane-scaled expensive reads:\n"
+            + "\n".join(violations),
+        )
+
+    def test_app_and_server_avoid_aggregate_terminal_state(self) -> None:
+        self.assertTrue(APP_SERVER_SOURCES, "No app/server Rust sources were discovered")
+        violations = find_violations(APP_SERVER_SOURCES, AGGREGATE_STATE_CALLS)
+
+        self.assertEqual(
+            violations,
+            [],
+            "App/server code must use narrow terminal-state accessors:\n"
             + "\n".join(violations),
         )
 
@@ -174,6 +193,16 @@ mod tests {
 fn render() { TerminalRuntime::input_state; }
 '''
         self.assertRegex(production_code(source), FORBIDDEN_CALLS[0][0])
+
+    def test_scanner_catches_each_aggregate_state_call(self) -> None:
+        cases = (
+            ("fn render() { runtime.input_state(); }", INPUT_STATE_CALL),
+            ("fn render() { runtime.keyboard_state_ansi(); }", KEYBOARD_STATE_ANSI_CALL),
+            ("fn render() { runtime.kitty_keyboard_state_ansi(); }", KEYBOARD_STATE_ANSI_CALL),
+        )
+        for source, pattern in cases:
+            with self.subTest(source=source):
+                self.assertRegex(production_code(source), pattern)
 
     def test_scanner_catches_imported_process_query(self) -> None:
         source = "fn render() { foreground_job(pid); }"

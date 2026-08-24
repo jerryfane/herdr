@@ -8,6 +8,20 @@ use crate::api::schema::{
     ReadSource, Request, SplitDirection,
 };
 
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::platform::begin_cli_output();
+        std::print!($($arg)*);
+    }};
+}
+
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        crate::platform::begin_cli_output();
+        std::println!($($arg)*);
+    }};
+}
+
 mod agent;
 mod api;
 mod completion;
@@ -196,6 +210,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         ChannelSetInstallAction::RunSelfUpdate => {}
     }
 
+    crate::platform::end_cli_output();
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
         eprintln!("Run `herdr update` to retry.");
@@ -218,12 +233,6 @@ fn channel_set_rejection(
     channel: &str,
     install_rejection: Option<&'static str>,
 ) -> Option<&'static str> {
-    if cfg!(windows) && channel == "stable" {
-        return Some(
-            "stable channel is not available on Windows yet; Windows builds are preview-only",
-        );
-    }
-
     if channel == "preview" {
         return install_rejection;
     }
@@ -1054,36 +1063,16 @@ mod tests {
     }
 
     #[test]
-    fn channel_set_rejects_package_managed_preview_before_config_write() {
+    fn channel_set_only_applies_package_rejection_to_preview() {
         assert_eq!(
             super::channel_set_rejection("preview", Some("no preview")),
             Some("no preview")
         );
         assert_eq!(
             super::channel_set_rejection("stable", Some("no preview")),
-            if cfg!(windows) {
-                Some(
-                    "stable channel is not available on Windows yet; Windows builds are preview-only",
-                )
-            } else {
-                None
-            }
+            None
         );
         assert_eq!(super::channel_set_rejection("preview", None), None);
-    }
-
-    #[test]
-    fn channel_set_rejects_stable_only_on_windows() {
-        assert_eq!(
-            super::channel_set_rejection("stable", None),
-            if cfg!(windows) {
-                Some(
-                    "stable channel is not available on Windows yet; Windows builds are preview-only",
-                )
-            } else {
-                None
-            }
-        );
     }
 
     #[test]

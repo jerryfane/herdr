@@ -38,12 +38,13 @@ impl App {
                 .state
                 .selection
                 .as_ref()
-                .is_some_and(crate::selection::Selection::is_finalized)
+                .is_some_and(crate::selection::Selection::is_visible)
         {
             return false;
         }
 
         self.state.copy_selection(&self.terminal_runtimes);
+        self.selection_autoscroll_deadline = None;
         if !self.dispatch_pending_clipboard_write() {
             return false;
         }
@@ -216,6 +217,83 @@ mod tests {
 
         assert_eq!(clipboard_write_content(&mut app), b"alpha");
         assert!(app.state.selection.is_none());
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_shortcut_before_delayed_mouse_up_copies_in_progress_selection() {
+        let (mut app, info, mut input_rx) = app_with_screen_bytes_and_input(b"alpha beta");
+        app.state.copy_on_select = false;
+        let source_id = 41;
+        let row = info.inner_rect.y;
+        let start_col = info.inner_rect.x;
+        let end_col = info.inner_rect.x + 4;
+        app.route_client_events_from(
+            source_id,
+            vec![
+                crate::raw_input::RawInputEvent::Mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    start_col,
+                    row,
+                )),
+                crate::raw_input::RawInputEvent::Mouse(mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    end_col,
+                    row,
+                )),
+            ],
+            false,
+        );
+        assert_visible_selection(&app);
+        assert!(app
+            .state
+            .selection
+            .as_ref()
+            .is_some_and(crate::selection::Selection::is_in_progress));
+        assert!(app.state.selection_autoscroll.is_some());
+        assert!(app.selection_autoscroll_deadline.is_some());
+
+        let cmd_c = TerminalKey::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        app.route_client_events_from(
+            source_id,
+            vec![crate::raw_input::RawInputEvent::Key(cmd_c.clone())],
+            false,
+        );
+
+        assert_eq!(clipboard_write_content(&mut app), b"alpha");
+        assert!(app.event_rx.try_recv().is_err());
+        assert!(app.state.selection.is_none());
+        assert!(app.state.selection_autoscroll.is_none());
+        assert!(app.selection_autoscroll_deadline.is_none());
+        assert!(app.selection_highlight_clear_deadline.is_none());
+        assert_eq!(app.input_leases.len(), 1);
+        assert!(input_rx.try_recv().is_err());
+
+        app.route_client_events_from(
+            source_id,
+            vec![crate::raw_input::RawInputEvent::Key(
+                cmd_c.with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+        assert!(app.input_leases.is_empty());
+
+        app.route_client_events_from(
+            source_id,
+            vec![crate::raw_input::RawInputEvent::Mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                end_col,
+                row,
+            ))],
+            false,
+        );
+
+        assert!(app.state.selection.is_none());
+        assert!(app.state.selection_autoscroll.is_none());
+        assert!(app.selection_autoscroll_deadline.is_none());
+        assert!(app.selection_highlight_clear_deadline.is_none());
+        assert!(app.input_leases.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
         assert!(input_rx.try_recv().is_err());
     }
 

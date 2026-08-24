@@ -1701,6 +1701,12 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let ack = reader.read_json_line(Duration::from_secs(2));
     assert_eq!(ack["id"], "sub_life_b");
     assert_eq!(ack["result"]["type"], "subscription_started");
+    assert!(
+        reader
+            .try_read_json_line(Duration::from_millis(250))
+            .is_none(),
+        "new subscription must not replay the root pane creation"
+    );
 
     let split = send_request(
         &socket_path,

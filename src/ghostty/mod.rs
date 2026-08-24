@@ -1034,6 +1034,10 @@ impl Terminal {
         self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING)
     }
 
+    pub fn modify_other_keys_enabled(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MODIFY_OTHER_KEYS)
+    }
+
     pub fn active_screen(&self) -> Result<ActiveScreen, Error> {
         let mut out = ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY;
         unsafe {
@@ -3633,6 +3637,17 @@ mod tests {
         mouse_event.set_position(0.0, 0.0);
         let encoded_mouse = mouse_encoder.encode(&mouse_event).unwrap();
         assert_eq!(encoded_mouse, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn modify_other_keys_query_tracks_mode_two() {
+        let mut terminal = Terminal::new(80, 24, 0).unwrap();
+
+        assert!(!terminal.modify_other_keys_enabled().unwrap());
+        terminal.write(b"\x1b[>4;2m");
+        assert!(terminal.modify_other_keys_enabled().unwrap());
+        terminal.write(b"\x1b[>4;0m");
+        assert!(!terminal.modify_other_keys_enabled().unwrap());
     }
 
     #[test]

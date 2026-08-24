@@ -51,7 +51,11 @@ impl Default for UpdateConfig {
 }
 
 fn default_update_channel() -> UpdateChannelConfig {
-    if cfg!(windows) {
+    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+}
+
+fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
+    if is_windows && is_preview {
         UpdateChannelConfig::Preview
     } else {
         UpdateChannelConfig::Stable
@@ -1588,19 +1592,32 @@ sandbox = true
 
     #[cfg(windows)]
     #[test]
-    fn windows_update_config_defaults_to_preview() {
+    fn update_channel_default_follows_windows_build_identity() {
+        assert_eq!(
+            default_update_channel_for_build(true, true),
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(
+            default_update_channel_for_build(true, false),
+            UpdateChannelConfig::Stable
+        );
+        assert_eq!(
+            default_update_channel_for_build(false, true),
+            UpdateChannelConfig::Stable
+        );
+    }
+
+    #[test]
+    fn missing_update_channel_uses_build_default() {
         let empty: Config = toml::from_str("").unwrap();
         let without_update_channel: Config =
             toml::from_str("[update]\nversion_check = false").unwrap();
 
-        assert_eq!(
-            Config::default().update.channel,
-            UpdateChannelConfig::Preview
-        );
-        assert_eq!(empty.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(Config::default().update.channel, default_update_channel());
+        assert_eq!(empty.update.channel, default_update_channel());
         assert_eq!(
             without_update_channel.update.channel,
-            UpdateChannelConfig::Preview
+            default_update_channel()
         );
     }
 

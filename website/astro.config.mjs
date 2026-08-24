@@ -71,7 +71,7 @@ export default defineConfig({
     starlight({
       title: 'herdr',
       description: 'Terminal-native agent runtime and multiplexer.',
-      favicon: '/assets/favicon.png?v=14',
+      favicon: '/favicon.ico',
       defaultLocale: 'root',
       locales: {
         root: { label: 'English', lang: 'en' },
@@ -110,6 +110,12 @@ export default defineConfig({
       ],
       customCss: ['./src/styles/starlight.css'],
       head: [
+        {
+          // Google's favicon crawler rejects icons smaller than 48px
+          tag: 'link',
+          attrs: { rel: 'icon', type: 'image/png', sizes: '192x192', href: '/assets/favicon.png' },
+        },
+        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/assets/logo.png' } },
         // the brand display face; Starlight owns its own <head>, so the
         // marketing pages' font link doesn't reach docs
         { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
@@ -225,7 +231,7 @@ export default defineConfig({
             { label: 'Socket API', translations: { ja: 'ソケット API', 'zh-CN': 'Socket API' }, slug: 'docs/socket-api' },
             { label: 'Integrations', translations: { ja: 'インテグレーション', 'zh-CN': '集成' }, slug: 'docs/integrations' },
             { label: 'Agent skill file', translations: { ja: 'エージェントスキルファイル', 'zh-CN': '智能体技能文件' }, slug: 'docs/agent-skill' },
-            { label: 'Windows beta', translations: { ja: 'Windows ベータ', 'zh-CN': 'Windows 测试版' }, slug: 'docs/windows-beta' },
+            { label: 'Windows support', translations: { ja: 'Windows サポート', 'zh-CN': 'Windows 支持' }, slug: 'docs/windows-beta' },
           ],
         },
         {

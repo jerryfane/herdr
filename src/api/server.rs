@@ -1934,21 +1934,28 @@ fn stream_subscriptions(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    let event_start_sequence = event_hub.current_sequence();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
-        let active =
-            match ActiveSubscription::new(subscription, &request_id, index, api_tx, event_hub) {
-                Ok(active) => active,
-                Err(response) => {
-                    if let Err(err) = write_json_line(&mut stream, &response) {
-                        if is_connection_closed_error(&err) {
-                            return Ok(());
-                        }
-                        return Err(err);
+        let active = match ActiveSubscription::new(
+            subscription,
+            &request_id,
+            index,
+            api_tx,
+            event_hub,
+            event_start_sequence,
+        ) {
+            Ok(active) => active,
+            Err(response) => {
+                if let Err(err) = write_json_line(&mut stream, &response) {
+                    if is_connection_closed_error(&err) {
+                        return Ok(());
                     }
-                    return Ok(());
+                    return Err(err);
                 }
-            };
+                return Ok(());
+            }
+        };
         subscriptions.push(active);
     }
 

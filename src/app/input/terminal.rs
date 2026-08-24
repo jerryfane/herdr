@@ -174,8 +174,8 @@ impl App {
         if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
             && key_event.modifiers.is_empty()
         {
-            if let Some(input_state) = rt.input_state() {
-                if input_state.plain_page_keys_use_host_scrollback() {
+            if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
+                if host_scroll {
                     if key_event.kind == crossterm::event::KeyEventKind::Release {
                         return None;
                     }
@@ -333,14 +333,7 @@ impl App {
             None
         };
 
-        runtime.is_some_and(|runtime| {
-            let protocol = runtime.keyboard_protocol();
-            protocol.reports_all_keys()
-                || (protocol.reports_event_types()
-                    && runtime
-                        .input_state()
-                        .is_some_and(|state| state.modify_other_keys))
-        })
+        runtime.is_some_and(crate::terminal::TerminalRuntime::keyboard_report_all_requested)
     }
 
     fn terminal_input_runtime(
@@ -480,6 +473,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
+    #[cfg(target_os = "linux")]
+    use super::super::wait_for_detached_process_reap;
     use super::super::{app_for_mouse_test, mouse, numbered_lines_bytes};
     #[cfg(unix)]
     use super::super::{unique_temp_path, wait_for_file};
@@ -952,6 +947,65 @@ mod tests {
 
         assert!(app.event_rx.try_recv().is_err());
         assert!(app.selection_highlight_clear_deadline.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ctrl_click_url_reaps_failed_opener() {
+        let opener_dir = unique_temp_path("url-opener");
+        let record_path = opener_dir.join("record");
+        let opener_path = opener_dir.join("xdg-open");
+        std::fs::create_dir_all(&opener_dir).expect("fake opener directory");
+        std::fs::write(
+            &opener_path,
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$$\" \"$1\" > \"$2\"\nexit 3\n",
+        )
+        .expect("fake opener script");
+
+        let url = "https://example.com/akbash-2903";
+        let line = format!("see {url}");
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        let col = info.inner_rect.x + line.find("example").expect("url host") as u16;
+        let handled = app.handle_modified_url_click_with(
+            41,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ),
+            |clicked_url| {
+                std::process::Command::new("/bin/sh")
+                    .arg(&opener_path)
+                    .arg(clicked_url)
+                    .arg(&record_path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map(Some)
+            },
+        );
+        assert!(handled);
+
+        let record = wait_for_file(&record_path);
+        let mut lines = record.lines();
+        let pid = lines
+            .next()
+            .expect("opener pid")
+            .parse::<u32>()
+            .expect("numeric opener pid");
+        assert_eq!(lines.next(), Some(url));
+
+        let reaped = wait_for_detached_process_reap(&mut app, pid).await;
+        if !reaped {
+            unsafe {
+                libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&opener_dir);
+        assert!(reaped, "failed URL opener child {pid} was not reaped");
     }
 
     #[cfg(unix)]

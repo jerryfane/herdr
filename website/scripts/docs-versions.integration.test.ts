@@ -155,7 +155,9 @@ describe('documentation release publishing', () => {
     delete archivedManifest.versions[0].commit;
     await write(root, 'docs/versions/manifest.json', `${JSON.stringify(archivedManifest)}\n`);
     expect(() => runScript(root, ['check'])).toThrow();
-  });
+    // This test runs a dozen git and node subprocesses; slow CI builders can
+    // exceed the 5s default timeout.
+  }, 30_000);
 });
 
 async function write(root: string, path: string, content: string) {
