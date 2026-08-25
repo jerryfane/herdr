@@ -1,4 +1,6 @@
 use base64::Engine as _;
+use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::api::schema::{
     GramDeleteParams, GramFileUpload, GramGetFileParams, GramGrabParams, GramListParams,
@@ -198,7 +200,7 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
     // secret sent as a file would otherwise be written to disk and into this
     // agent's transcript verbatim. `--reveal` overrides for a deliberate download.
     // refs #109
-    if !reveal && attachment_is_credential_shaped(name, &bytes) {
+    if should_refuse_download(name, &bytes, reveal) {
         eprintln!(
             "refused: \"{name}\" ({} bytes) looks like it contains a credential. \
              Saving it would write the secret to disk and into this transcript. \
@@ -475,7 +477,8 @@ fn parse_get_file_args(args: &[String]) -> Result<(String, String, bool), String
                 index += 2;
             }
             // Download a credential-shaped attachment anyway (default refuses it).
-            "--reveal" => {
+            // `--show-secrets` accepted for symmetry with `gram list`.
+            "--reveal" | "--show-secrets" => {
                 reveal = true;
                 index += 1;
             }
@@ -574,12 +577,48 @@ fn filename_suggests_credential(name: &str) -> bool {
         || EXT_HINTS.iter().any(|ext| lower.ends_with(ext))
 }
 
+/// A JSON Web Token: a base64url header that begins `eyJ` (the encoding of `{"`),
+/// then a payload, then a signature (which may be empty for `alg=none`). Session
+/// tokens of this shape carry no known key prefix, so #96's prefix scanner misses
+/// them. refs #109
+static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*")
+        .expect("static JWT regex is valid")
+});
+
+/// Session-cookie / cookie-jar / JWT content shapes that carry NO recognizable
+/// key prefix, so #96's token/PEM detector misses them. This is the mis-named
+/// session-file leak class (#109): a real session blob (Apple/fastlane cookie
+/// jar, a raw `Set-Cookie` dump, a JWT) sent under an innocuous name. refs #109
+fn content_has_session_or_token(text: &str) -> bool {
+    if JWT_RE.is_match(text) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "set-cookie:",
+        "netscape http cookie file",
+        "!ruby/object:http::cookie", // fastlane spaceship cookie jar (YAML)
+        "myacinfo",                  // Apple ID web session cookie
+        "x-apple-id-session-id",
+        "x-apple-web-session-token",
+        "dqsid", // Apple developer portal session
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Whether decoded text carries a credential, combining #96's body detector
+/// (token prefixes + PEM blocks) with the session/cookie/JWT content shapes
+/// above. refs #109
+fn content_has_credential_shape(text: &str) -> bool {
+    redact_credentials(text) != text || content_has_session_or_token(text)
+}
+
 /// Whether a downloaded attachment looks like it carries a credential — by
-/// filename shape, or by the SAME content detector `gram list` runs on message
-/// bodies (#96), applied to a bounded, text-decoded prefix of the bytes.
-/// Credentials are short and appear early, so a 256 KiB prefix is enough; binary
-/// files (images, archives, video) decode to noise the token/PEM scanner won't
-/// match, so they don't false-positive. refs #109
+/// filename shape, or by the content detector applied to a bounded, text-decoded
+/// prefix of the bytes. Credentials are short and appear early, so a 256 KiB
+/// prefix is enough; binary files (images, archives, video) decode to noise the
+/// scanner won't match, so they don't false-positive. refs #109
 fn attachment_is_credential_shaped(name: &str, bytes: &[u8]) -> bool {
     if filename_suggests_credential(name) {
         return true;
@@ -587,7 +626,16 @@ fn attachment_is_credential_shaped(name: &str, bytes: &[u8]) -> bool {
     const SNIFF_LIMIT: usize = 256 * 1024;
     let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
     let text = String::from_utf8_lossy(head);
-    redact_credentials(&text) != text
+    content_has_credential_shape(&text)
+}
+
+/// Pure decision for `gram get-file`: refuse to write this attachment? Kept
+/// separate from the imperative download (fetch/write/exit) so the make-or-break
+/// composition — credential detection AND `!reveal`, not inverted — is unit-tested
+/// directly, without a live socket. A regression that drops the guard or inverts
+/// `reveal` turns a test red. refs #109
+fn should_refuse_download(name: &str, bytes: &[u8], reveal: bool) -> bool {
+    !reveal && attachment_is_credential_shaped(name, bytes)
 }
 
 /// Redact credential-looking spans from `text` for DISPLAY. Never mutates stored
@@ -1000,6 +1048,49 @@ mod tests {
             "photo.png",
             &[0u8, 159, 200, 1, 255, 42, 7]
         ));
+    }
+
+    #[test]
+    fn attachment_flagged_by_jwt_content_under_benign_name() {
+        // A JWT with no known key prefix, under an innocuous name and extension —
+        // caught by content shape, not the filename heuristic.
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlF";
+        assert!(attachment_is_credential_shaped("blob.dat", jwt.as_bytes()));
+        assert!(!filename_suggests_credential("blob.dat"));
+    }
+
+    #[test]
+    fn attachment_flagged_by_session_cookie_under_benign_name() {
+        // The #109 motivating case: a fastlane/Apple session blob sent under a
+        // name that trips no filename hint.
+        let jar = "--- !ruby/object:HTTP::Cookie\nname: myacinfo\nvalue: DAWTKNV2opaque\n";
+        assert!(attachment_is_credential_shaped("apple.txt", jar.as_bytes()));
+        assert!(attachment_is_credential_shaped(
+            "session.yml",
+            b"Set-Cookie: dqsid=abcdef0123456789; Path=/; Secure"
+        ));
+        assert!(!filename_suggests_credential("apple.txt"));
+        assert!(!filename_suggests_credential("session.yml"));
+    }
+
+    #[test]
+    fn should_refuse_download_composes_detection_and_reveal() {
+        let secret = format!("ghp_{}", filler());
+        let cred = format!("token={secret}").into_bytes();
+        // Credential + no reveal -> refuse.
+        assert!(should_refuse_download("notes.txt", &cred, false));
+        // --reveal overrides -> must NOT refuse (guards an inverted `!reveal`).
+        assert!(!should_refuse_download("notes.txt", &cred, true));
+        // Benign + no reveal -> allow.
+        assert!(!should_refuse_download(
+            "report.txt",
+            b"ordinary prose, nothing secret",
+            false
+        ));
+        // A mis-named session file (benign name, JWT content) is still refused.
+        let jwt = b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJlX2hlcmU";
+        assert!(should_refuse_download("blob.dat", jwt, false));
     }
 
     #[test]
