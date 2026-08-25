@@ -1,4 +1,6 @@
 use base64::Engine as _;
+use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::api::schema::{
     GramDeleteParams, GramFileUpload, GramGetFileParams, GramGrabParams, GramListParams,
@@ -154,7 +156,7 @@ fn upload_file(path: &str) -> std::io::Result<Result<GramFileUpload, serde_json:
 }
 
 fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
-    let (id, out) = match parse_get_file_args(args) {
+    let (id, out, reveal) = match parse_get_file_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -188,14 +190,30 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
                 "server returned invalid base64",
             )
         })?;
-    // Write owner-only (0600): a downloaded file may be a secret (a temporary API
-    // key), and the default umask would otherwise leave it world-readable.
-    write_private(&out, &bytes)?;
 
     let name = response
         .pointer("/result/name")
         .and_then(|value| value.as_str())
         .unwrap_or("file");
+    // Refuse a credential-shaped attachment by default. #96 redacts credential
+    // BODIES on the read path, but a file attachment has no body to scan, so a
+    // secret sent as a file would otherwise be written to disk and into this
+    // agent's transcript verbatim. `--reveal` overrides for a deliberate download.
+    // refs #109
+    if should_refuse_download(name, &bytes, reveal) {
+        eprintln!(
+            "refused: \"{name}\" ({} bytes) looks like it contains a credential. \
+             Saving it would write the secret to disk and into this transcript. \
+             Re-run with --reveal to download it anyway.",
+            bytes.len()
+        );
+        return Ok(3);
+    }
+
+    // Write owner-only (0600): a downloaded file may be a secret (a temporary API
+    // key), and the default umask would otherwise leave it world-readable.
+    write_private(&out, &bytes)?;
+
     eprintln!("saved {name} ({} bytes) to {out}", bytes.len());
     Ok(0)
 }
@@ -293,6 +311,29 @@ fn redact_gram_response(response: &mut serde_json::Value) {
     };
     for message in messages {
         redact_message_text(message);
+        flag_message_file(message);
+    }
+}
+
+/// Mark a message's file attachment as credential-suspected — an additive
+/// `file.credential_suspected = true` JSON field — so a routine `gram list` warns
+/// before anyone downloads it. The bytes aren't fetched at list time, so this is a
+/// filename heuristic only; the content scan + refusal happens on `gram get-file`.
+/// refs #109
+fn flag_message_file(message: &mut serde_json::Value) {
+    let suspected = message
+        .get("file")
+        .and_then(|file| file.get("name"))
+        .and_then(|name| name.as_str())
+        .map(filename_suggests_credential)
+        .unwrap_or(false);
+    if suspected {
+        if let Some(file) = message
+            .get_mut("file")
+            .and_then(|file| file.as_object_mut())
+        {
+            file.insert("credential_suspected".into(), serde_json::Value::Bool(true));
+        }
     }
 }
 
@@ -421,9 +462,10 @@ fn parse_send_args(args: &[String]) -> Result<(String, Option<String>, Option<St
 }
 
 /// `get-file <id> -o PATH` (or `--out PATH`) -> (id, path).
-fn parse_get_file_args(args: &[String]) -> Result<(String, String), String> {
+fn parse_get_file_args(args: &[String]) -> Result<(String, String, bool), String> {
     let mut id: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut reveal = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -433,6 +475,12 @@ fn parse_get_file_args(args: &[String]) -> Result<(String, String), String> {
                 };
                 out = Some(value.clone());
                 index += 2;
+            }
+            // Download a credential-shaped attachment anyway (default refuses it).
+            // `--show-secrets` accepted for symmetry with `gram list`.
+            "--reveal" | "--show-secrets" => {
+                reveal = true;
+                index += 1;
             }
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => {
@@ -444,9 +492,9 @@ fn parse_get_file_args(args: &[String]) -> Result<(String, String), String> {
             }
         }
     }
-    let id = id.ok_or("usage: herdr gram get-file <id> -o PATH")?;
-    let out = out.ok_or("usage: herdr gram get-file <id> -o PATH")?;
-    Ok((id, out))
+    let id = id.ok_or("usage: herdr gram get-file <id> -o PATH [--reveal]")?;
+    let out = out.ok_or("usage: herdr gram get-file <id> -o PATH [--reveal]")?;
+    Ok((id, out, reveal))
 }
 
 /// `post <text> [--to AGENT]` -> (text, to). `--to` addresses one agent; omit it
@@ -508,6 +556,86 @@ fn is_credential_token(token: &str) -> bool {
         && CREDENTIAL_PREFIXES
             .iter()
             .any(|prefix| token.starts_with(prefix))
+}
+
+/// Filenames that strongly imply a credential file regardless of content — a
+/// session/cookie file or a private-key/keystore extension. Complements the
+/// content scan so a credential attachment is caught even when its bytes carry no
+/// recognizable token prefix (e.g. a session cookie). refs #109
+fn filename_suggests_credential(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const NAME_HINTS: &[&str] = &[
+        "cookie",
+        "credential",
+        "secret",
+        "id_rsa",
+        "id_ed25519",
+        "fastlane_session",
+    ];
+    const EXT_HINTS: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".p8", ".jks", ".keystore"];
+    NAME_HINTS.iter().any(|hint| lower.contains(hint))
+        || EXT_HINTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// A JSON Web Token: a base64url header that begins `eyJ` (the encoding of `{"`),
+/// then a payload, then a signature (which may be empty for `alg=none`). Session
+/// tokens of this shape carry no known key prefix, so #96's prefix scanner misses
+/// them. refs #109
+static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*")
+        .expect("static JWT regex is valid")
+});
+
+/// Session-cookie / cookie-jar / JWT content shapes that carry NO recognizable
+/// key prefix, so #96's token/PEM detector misses them. This is the mis-named
+/// session-file leak class (#109): a real session blob (Apple/fastlane cookie
+/// jar, a raw `Set-Cookie` dump, a JWT) sent under an innocuous name. refs #109
+fn content_has_session_or_token(text: &str) -> bool {
+    if JWT_RE.is_match(text) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "set-cookie:",
+        "netscape http cookie file",
+        "!ruby/object:http::cookie", // fastlane spaceship cookie jar (YAML)
+        "myacinfo",                  // Apple ID web session cookie
+        "x-apple-id-session-id",
+        "x-apple-web-session-token",
+        "dqsid", // Apple developer portal session
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Whether decoded text carries a credential, combining #96's body detector
+/// (token prefixes + PEM blocks) with the session/cookie/JWT content shapes
+/// above. refs #109
+fn content_has_credential_shape(text: &str) -> bool {
+    redact_credentials(text) != text || content_has_session_or_token(text)
+}
+
+/// Whether a downloaded attachment looks like it carries a credential — by
+/// filename shape, or by the content detector applied to a bounded, text-decoded
+/// prefix of the bytes. Credentials are short and appear early, so a 256 KiB
+/// prefix is enough; binary files (images, archives, video) decode to noise the
+/// scanner won't match, so they don't false-positive. refs #109
+fn attachment_is_credential_shaped(name: &str, bytes: &[u8]) -> bool {
+    if filename_suggests_credential(name) {
+        return true;
+    }
+    const SNIFF_LIMIT: usize = 256 * 1024;
+    let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
+    let text = String::from_utf8_lossy(head);
+    content_has_credential_shape(&text)
+}
+
+/// Pure decision for `gram get-file`: refuse to write this attachment? Kept
+/// separate from the imperative download (fetch/write/exit) so the make-or-break
+/// composition — credential detection AND `!reveal`, not inverted — is unit-tested
+/// directly, without a live socket. A regression that drops the guard or inverts
+/// `reveal` turns a test red. refs #109
+fn should_refuse_download(name: &str, bytes: &[u8], reveal: bool) -> bool {
+    !reveal && attachment_is_credential_shaped(name, bytes)
 }
 
 /// Redact credential-looking spans from `text` for DISPLAY. Never mutates stored
@@ -750,11 +878,11 @@ mod tests {
     fn get_file_parses_id_and_out() {
         assert_eq!(
             parse_get_file_args(&args(&["gram-1", "-o", "/tmp/x"])).unwrap(),
-            ("gram-1".to_string(), "/tmp/x".to_string())
+            ("gram-1".to_string(), "/tmp/x".to_string(), false)
         );
         assert_eq!(
             parse_get_file_args(&args(&["gram-1", "--out", "/tmp/x"])).unwrap(),
-            ("gram-1".to_string(), "/tmp/x".to_string())
+            ("gram-1".to_string(), "/tmp/x".to_string(), false)
         );
         // Both id and an output path are required.
         assert!(parse_get_file_args(&args(&["gram-1"])).is_err());
@@ -875,6 +1003,119 @@ mod tests {
         assert!(!out.contains(&begin), "pem body leaked: {out}");
         assert!(out.contains("[redacted private key,"));
         assert!(out.starts_with("key below:\n") && out.ends_with("\ndone"));
+    }
+
+    // --- credential-shaped file attachments (issue #109) ---
+
+    #[test]
+    fn attachment_flagged_by_credential_content() {
+        let secret = format!("ghp_{}", filler());
+        let bytes = format!("export TOKEN={secret}\n").into_bytes();
+        assert!(attachment_is_credential_shaped("notes.txt", &bytes));
+    }
+
+    #[test]
+    fn attachment_pem_content_flagged() {
+        let begin = format!("-----BEGIN OPENSSH {} KEY-----", "PRIVATE");
+        let end = format!("-----END OPENSSH {} KEY-----", "PRIVATE");
+        let bytes = format!("{begin}\nAAAABG5vbmU=\n{end}\n").into_bytes();
+        assert!(attachment_is_credential_shaped("attachment.txt", &bytes));
+    }
+
+    #[test]
+    fn attachment_flagged_by_filename_without_token() {
+        // No recognizable token in the bytes, but the name marks it a credential —
+        // the session-cookie / key-file case #96's content scan can miss.
+        assert!(attachment_is_credential_shaped(
+            "apple-session.cookie",
+            b"opaque-blob"
+        ));
+        assert!(attachment_is_credential_shaped("id_rsa", b"opaque-blob"));
+        assert!(attachment_is_credential_shaped(
+            "server.pem",
+            b"opaque-blob"
+        ));
+        assert!(filename_suggests_credential("Deploy.p8"));
+    }
+
+    #[test]
+    fn benign_attachment_not_flagged() {
+        assert!(!attachment_is_credential_shaped(
+            "report.txt",
+            b"just some ordinary prose here, nothing secret"
+        ));
+        assert!(!attachment_is_credential_shaped(
+            "photo.png",
+            &[0u8, 159, 200, 1, 255, 42, 7]
+        ));
+    }
+
+    #[test]
+    fn attachment_flagged_by_jwt_content_under_benign_name() {
+        // A JWT with no known key prefix, under an innocuous name and extension —
+        // caught by content shape, not the filename heuristic.
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlF";
+        assert!(attachment_is_credential_shaped("blob.dat", jwt.as_bytes()));
+        assert!(!filename_suggests_credential("blob.dat"));
+    }
+
+    #[test]
+    fn attachment_flagged_by_session_cookie_under_benign_name() {
+        // The #109 motivating case: a fastlane/Apple session blob sent under a
+        // name that trips no filename hint.
+        let jar = "--- !ruby/object:HTTP::Cookie\nname: myacinfo\nvalue: DAWTKNV2opaque\n";
+        assert!(attachment_is_credential_shaped("apple.txt", jar.as_bytes()));
+        assert!(attachment_is_credential_shaped(
+            "session.yml",
+            b"Set-Cookie: dqsid=abcdef0123456789; Path=/; Secure"
+        ));
+        assert!(!filename_suggests_credential("apple.txt"));
+        assert!(!filename_suggests_credential("session.yml"));
+    }
+
+    #[test]
+    fn should_refuse_download_composes_detection_and_reveal() {
+        let secret = format!("ghp_{}", filler());
+        let cred = format!("token={secret}").into_bytes();
+        // Credential + no reveal -> refuse.
+        assert!(should_refuse_download("notes.txt", &cred, false));
+        // --reveal overrides -> must NOT refuse (guards an inverted `!reveal`).
+        assert!(!should_refuse_download("notes.txt", &cred, true));
+        // Benign + no reveal -> allow.
+        assert!(!should_refuse_download(
+            "report.txt",
+            b"ordinary prose, nothing secret",
+            false
+        ));
+        // A mis-named session file (benign name, JWT content) is still refused.
+        let jwt = b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJlX2hlcmU";
+        assert!(should_refuse_download("blob.dat", jwt, false));
+    }
+
+    #[test]
+    fn get_file_parses_reveal_flag() {
+        let (_, _, reveal) =
+            parse_get_file_args(&args(&["gram-1", "-o", "/tmp/x", "--reveal"])).unwrap();
+        assert!(reveal);
+        let (_, _, reveal) = parse_get_file_args(&args(&["gram-1", "-o", "/tmp/x"])).unwrap();
+        assert!(!reveal);
+    }
+
+    #[test]
+    fn list_flags_credential_shaped_file_by_name() {
+        let mut suspect =
+            serde_json::json!({ "id": "g", "file": { "name": "apple.cookie", "size": 10 } });
+        flag_message_file(&mut suspect);
+        assert_eq!(
+            suspect["file"]["credential_suspected"],
+            serde_json::json!(true)
+        );
+
+        let mut benign =
+            serde_json::json!({ "id": "g", "file": { "name": "photo.png", "size": 10 } });
+        flag_message_file(&mut benign);
+        assert!(benign["file"].get("credential_suspected").is_none());
     }
 
     #[test]
