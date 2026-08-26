@@ -98,7 +98,10 @@ fn print_table(rows: &[AccountRow]) {
         println!("no accounts configured (see [[accounts]] in config.toml)");
         return;
     }
-    println!("{:<22} {:<8} {:<22} {}", "id", "kind", "config_dir", "launch env");
+    println!(
+        "{:<22} {:<8} {:<22} {}",
+        "id", "kind", "config_dir", "launch env"
+    );
     for row in rows {
         let env = match &row.launch_env {
             None => "(no env lever for this kind)".to_string(),
@@ -156,7 +159,11 @@ mod tests {
 
     #[test]
     fn non_default_config_home_account_injects_its_env() {
-        let row = AccountRow::from(&account("codex-work", "codex", "/opt/gitmoot-runtime/codex-work"));
+        let row = AccountRow::from(&account(
+            "codex-work",
+            "codex",
+            "/opt/gitmoot-runtime/codex-work",
+        ));
         assert_eq!(
             row.launch_env,
             Some(BTreeMap::from([(
