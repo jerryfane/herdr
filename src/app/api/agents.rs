@@ -155,7 +155,7 @@ impl App {
             .terminals
             .get(&terminal_id)
             .and_then(|terminal| terminal.agent_account.clone());
-        let selected_account = params.account.clone().or(remembered_account);
+        let selected_account = params.account.clone().or(remembered_account.clone());
         let account_env = match selected_account.as_deref() {
             Some(account_id) => match self.resolve_account_launch_env(account_id, &agent) {
                 Ok(env) => Some((account_id.to_string(), env)),
@@ -163,6 +163,29 @@ impl App {
             },
             None => None,
         };
+
+        // SWAP SAFETY: when this restart moves the agent to a DIFFERENT account, its session transcript
+        // only exists under the CURRENT account's config-home. Copy it into the target's first, or the
+        // `--resume` under the new account can't find it and the seat breaks into a dead state (this
+        // silently killed a coordinator). On any failure FAIL-LOUD: return an error and leave the agent
+        // exactly as it is — never arm the resume / kill the runtime into a broken swap.
+        if params.account.is_some() {
+            if let Err(reason) = migrate_session_for_account_swap(
+                &self.loaded_accounts,
+                &agent,
+                &session_ref,
+                remembered_account.as_deref(),
+                selected_account.as_deref(),
+            ) {
+                return encode_error(
+                    id,
+                    "session_migrate_failed",
+                    format!(
+                        "couldn't move this agent's session to the new account: {reason}; the agent was left on its current account"
+                    ),
+                );
+            }
+        }
 
         // Snapshot the agent info to return before the process is killed.
         let agent_info = match self.agent_info_for_target(&params.target) {
@@ -547,6 +570,109 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
+/// Resolve the on-disk config-home for an account id (or the harness default when `None`).
+fn resolve_config_home(
+    accounts: &[crate::config::AccountConfig],
+    account_id: Option<&str>,
+    kind: &str,
+) -> Option<std::path::PathBuf> {
+    match account_id {
+        Some(id) => accounts
+            .iter()
+            .find(|account| account.id == id)
+            .map(|account| std::path::PathBuf::from(&account.config_dir)),
+        None => crate::config::default_config_dir(kind),
+    }
+}
+
+/// Find `<config_home>/projects/<slug>/<id>.jsonl`, returning `(file, slug)`. Globs by session id so it
+/// does not depend on reproducing claude's exact cwd→slug rule.
+fn find_claude_session_file(
+    config_home: &std::path::Path,
+    id: &str,
+) -> Option<(std::path::PathBuf, String)> {
+    let projects = config_home.join("projects");
+    let file_name = format!("{id}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let candidate = entry.path().join(&file_name);
+            if candidate.is_file() {
+                return Some((candidate, entry.file_name().to_string_lossy().into_owned()));
+            }
+        }
+    }
+    None
+}
+
+fn session_backup_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "bak".to_string())
+}
+
+/// Copy an agent's session transcript from its current account's config-home into the target's, so a
+/// `--resume` under the target account can find it. `Ok(())` on success or when no copy is needed (same
+/// config-home, or a Path-kind ref that is not config-home-relative). `Err(reason)` means FAIL-LOUD: the
+/// caller must NOT tear the agent down — leave it on its current account.
+fn migrate_session_for_account_swap(
+    accounts: &[crate::config::AccountConfig],
+    kind: &str,
+    session_ref: &crate::agent_resume::AgentSessionRef,
+    current_account: Option<&str>,
+    target_account: Option<&str>,
+) -> Result<(), String> {
+    // Path-kind sessions (pi/omp) are absolute files, not config-home-relative — an account swap does not
+    // relocate them; nothing to copy.
+    if session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path {
+        return Ok(());
+    }
+    // Id-kind: only claude's on-disk session layout is known. Leave other harnesses (codex/kimi/…) on
+    // the pre-existing swap behaviour rather than block a swap that may already work for them — adding
+    // their per-harness locators here is a follow-up (H3).
+    if kind != "claude" {
+        return Ok(());
+    }
+    let current = resolve_config_home(accounts, current_account, kind)
+        .ok_or_else(|| "couldn't resolve the current account's config-home".to_string())?;
+    let target = resolve_config_home(accounts, target_account, kind)
+        .ok_or_else(|| "couldn't resolve the target account's config-home".to_string())?;
+    if current == target {
+        return Ok(());
+    }
+
+    let id = session_ref.value.as_str();
+    let (source, slug) = find_claude_session_file(&current, id)
+        .ok_or_else(|| format!("couldn't find session {id} under the current account"))?;
+    let target_dir = target.join("projects").join(&slug);
+    let target_file = target_dir.join(format!("{id}.jsonl"));
+
+    // Stale-copy guard: the target may already hold an OLD copy from a prior stint. The current account's
+    // file is authoritative (the agent is live on one account at a time → superset), so overwrite — but
+    // refuse if the source is SMALLER (suspicious), and always back up the target's copy first.
+    if target_file.exists() {
+        let src_len = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
+        let dst_len = std::fs::metadata(&target_file)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if src_len < dst_len {
+            return Err(format!(
+                "the target account already holds a LARGER copy of this session ({dst_len} > {src_len} bytes); refusing to overwrite — resolve manually"
+            ));
+        }
+        let backup = target_dir.join(format!("{id}.jsonl.bak-{}", session_backup_suffix()));
+        std::fs::rename(&target_file, &backup)
+            .map_err(|err| format!("couldn't back up the target's existing session copy: {err}"))?;
+    }
+
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("couldn't create the target project dir: {err}"))?;
+    std::fs::copy(&source, &target_file)
+        .map_err(|err| format!("couldn't copy the session file: {err}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +683,184 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    fn swap_temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-swap-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn swap_account(id: &str, config_dir: &std::path::Path) -> crate::config::AccountConfig {
+        crate::config::AccountConfig {
+            id: id.to_string(),
+            kind: "claude".to_string(),
+            label: id.to_string(),
+            config_dir: config_dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn id_session(value: &str) -> crate::agent_resume::AgentSessionRef {
+        crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: value.to_string(),
+        }
+    }
+
+    fn write_session(config_home: &std::path::Path, slug: &str, id: &str, body: &str) {
+        let dir = config_home.join("projects").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+    }
+
+    #[test]
+    fn account_swap_copies_session_into_target_config_home() {
+        let root = swap_temp_root("copy");
+        let (a, b) = (root.join("a"), root.join("b"));
+        let id = "5cf9801c-abc";
+        write_session(&a, "-root-gitmoot", id, "line1\nline2\n");
+        let accounts = vec![swap_account("A", &a), swap_account("B", &b)];
+
+        migrate_session_for_account_swap(
+            &accounts,
+            "claude",
+            &id_session(id),
+            Some("A"),
+            Some("B"),
+        )
+        .expect("migration should succeed");
+
+        let dst = b
+            .join("projects")
+            .join("-root-gitmoot")
+            .join(format!("{id}.jsonl"));
+        assert!(
+            dst.is_file(),
+            "session should be copied to the target config-home"
+        );
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "line1\nline2\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn account_swap_fails_loud_when_session_missing() {
+        let root = swap_temp_root("missing");
+        let accounts = vec![
+            swap_account("A", &root.join("a")),
+            swap_account("B", &root.join("b")),
+        ];
+        let err = migrate_session_for_account_swap(
+            &accounts,
+            "claude",
+            &id_session("nope-id"),
+            Some("A"),
+            Some("B"),
+        )
+        .unwrap_err();
+        assert!(err.contains("couldn't find session"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn account_swap_noop_for_path_kind_and_same_home() {
+        let root = swap_temp_root("noop");
+        let accounts = vec![
+            swap_account("A", &root.join("a")),
+            swap_account("B", &root.join("b")),
+        ];
+        let path_ref = crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: "/some/abs/session.jsonl".to_string(),
+        };
+        migrate_session_for_account_swap(&accounts, "claude", &path_ref, Some("A"), Some("B"))
+            .unwrap();
+        migrate_session_for_account_swap(
+            &accounts,
+            "claude",
+            &id_session("x"),
+            Some("A"),
+            Some("A"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn account_swap_noop_for_unsupported_kind() {
+        // codex/kimi keep their pre-existing swap behaviour (no migration) until their locators land.
+        let accounts: Vec<crate::config::AccountConfig> = vec![];
+        migrate_session_for_account_swap(
+            &accounts,
+            "codex",
+            &id_session("x"),
+            Some("A"),
+            Some("B"),
+        )
+        .expect("non-claude kinds are a no-op, not an error");
+    }
+
+    #[test]
+    fn account_swap_backs_up_stale_target_then_overwrites() {
+        let root = swap_temp_root("stale-ok");
+        let (a, b) = (root.join("a"), root.join("b"));
+        let id = "sess-stale";
+        write_session(&a, "-root-gitmoot", id, "NEW longer content\n");
+        write_session(&b, "-root-gitmoot", id, "old\n");
+        let accounts = vec![swap_account("A", &a), swap_account("B", &b)];
+
+        migrate_session_for_account_swap(
+            &accounts,
+            "claude",
+            &id_session(id),
+            Some("A"),
+            Some("B"),
+        )
+        .unwrap();
+        let dir = b.join("projects").join("-root-gitmoot");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap(),
+            "NEW longer content\n"
+        );
+        let baks = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".jsonl.bak-"))
+            .count();
+        assert_eq!(baks, 1, "the stale target copy should be backed up");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn account_swap_refuses_when_source_smaller_than_target() {
+        let root = swap_temp_root("stale-refuse");
+        let (a, b) = (root.join("a"), root.join("b"));
+        let id = "sess-x";
+        write_session(&a, "-root-gitmoot", id, "sm\n");
+        write_session(
+            &b,
+            "-root-gitmoot",
+            id,
+            "much larger existing target content\n",
+        );
+        let accounts = vec![swap_account("A", &a), swap_account("B", &b)];
+        let err = migrate_session_for_account_swap(
+            &accounts,
+            "claude",
+            &id_session(id),
+            Some("A"),
+            Some("B"),
+        )
+        .unwrap_err();
+        assert!(err.contains("LARGER copy"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     fn app_with_agent() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
