@@ -1772,6 +1772,10 @@
         "AgentUnarchiveParams": {
           "description": "`agent.unarchive` — resume a previously archived agent (issue #173). The\nstored session ref is resumed into a fresh pane, preserving the agent's\nterminal identity.",
           "properties": {
+            "fresh": {
+              "description": "Start a clean agent for the preserved terminal identity instead of\nresuming the archived session. The operator escape hatch when the\nsession is gone or unwanted.",
+              "type": "boolean"
+            },
             "target": {
               "description": "The archived agent's name or terminal id.",
               "type": "string"

@@ -261,9 +261,15 @@ impl App {
     /// pane, preserving the agent's terminal identity. Mirrors the restore path —
     /// a new terminal carries the resume plan and no runtime; the pending-resume
     /// loop spawns the shell and relaunches with the agent's resume command.
+    ///
+    /// When `fresh` is set, the resume plan is skipped entirely: the preserved
+    /// terminal identity comes back hosting a clean agent of the archived
+    /// `kind` in the archived `cwd`. This is the operator's escape hatch when
+    /// the stored session is gone or unwanted.
     pub(super) fn unarchive_agent_target(
         &mut self,
         target: &str,
+        fresh: bool,
     ) -> Result<crate::api::schema::AgentInfo, AgentUnarchiveError> {
         let Some(index) = self
             .state
@@ -274,35 +280,65 @@ impl App {
             return Err(AgentUnarchiveError::NotFound);
         };
 
-        // Build the resume plan before removing the record, so a plan failure
-        // leaves the archive intact.
-        let record = &self.state.archived_agents[index];
-        let Some(persisted) = crate::agent_resume::session_ref_from_snapshot(
-            &record.agent_session.source,
-            &record.agent_session.agent,
-            record.agent_session.kind,
-            &record.agent_session.value,
-        ) else {
-            return Err(AgentUnarchiveError::NoResumablePlan);
-        };
-        let Some(plan) = crate::agent_resume::plan(
-            &record.agent_session.source,
-            &record.agent_session.agent,
-            &persisted.session_ref,
-        ) else {
-            return Err(AgentUnarchiveError::NoResumablePlan);
+        // Build the resume plan before removing the record, so a plan failure —
+        // or a lost session file — leaves the archive intact. `--fresh` skips
+        // this entirely and starts a clean agent instead.
+        let resume = if fresh {
+            None
+        } else {
+            let record = &self.state.archived_agents[index];
+            let Some(persisted) = crate::agent_resume::session_ref_from_snapshot(
+                &record.agent_session.source,
+                &record.agent_session.agent,
+                record.agent_session.kind,
+                &record.agent_session.value,
+            ) else {
+                return Err(AgentUnarchiveError::NoResumablePlan);
+            };
+            let Some(plan) = crate::agent_resume::plan(
+                &record.agent_session.source,
+                &record.agent_session.agent,
+                &persisted.session_ref,
+            ) else {
+                return Err(AgentUnarchiveError::NoResumablePlan);
+            };
+
+            // Fail-loud existence probe for PATH-kind session refs only (pi/omp):
+            // if the archived session file is gone, resuming it would silently
+            // start a brand-new session, so refuse and point the operator at
+            // `--fresh`. Runs after the plan is built and before the record is
+            // removed, so a miss leaves the archive intact — mirroring the
+            // plan-failure contract above.
+            //
+            // ID-kind refs (claude/codex/kimi and the other id-kind harnesses)
+            // are not probed here — resume is attempted exactly as before.
+            // H3: add a per-harness id->session-path locator (claude
+            // ~/.claude/projects/<slug>/<id>.jsonl, codex/kimi dirs) so id-kind
+            // harnesses also get this fail-loud probe.
+            if persisted.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path
+                && !std::path::Path::new(&persisted.session_ref.value).exists()
+            {
+                return Err(AgentUnarchiveError::SessionLost);
+            }
+
+            Some((persisted, plan))
         };
 
         let record = self.state.archived_agents.remove(index);
         let terminal_id = crate::terminal::TerminalId::from_persisted(record.terminal_id.clone());
         let pane_id = crate::layout::PaneId::alloc();
-        let initial_agent = crate::detect::parse_agent_label(&plan.agent);
+        let initial_agent = crate::detect::parse_agent_label(match resume.as_ref() {
+            Some((_, plan)) => plan.agent.as_str(),
+            None => record.kind.as_str(),
+        });
 
         let mut terminal =
             crate::terminal::TerminalState::new(terminal_id.clone(), record.cwd.clone())
-                .with_pending_agent_resume_plan(plan)
                 .with_occupant_generation(record.occupant_generation);
-        terminal.set_persisted_agent_session(persisted);
+        if let Some((persisted, plan)) = resume {
+            terminal = terminal.with_pending_agent_resume_plan(plan);
+            terminal.set_persisted_agent_session(persisted);
+        }
         match (
             record.name.clone(),
             crate::detect::parse_agent_label(&record.kind),
@@ -383,6 +419,11 @@ impl App {
             AgentUnarchiveError::NoResumablePlan => crate::api::schema::ErrorBody {
                 code: "no_resumable_session".into(),
                 message: "archived agent has no resumable session for its harness".into(),
+            },
+            AgentUnarchiveError::SessionLost => crate::api::schema::ErrorBody {
+                code: "session_lost".into(),
+                message: "archived session file no longer exists; retry with --fresh to start a clean agent"
+                    .into(),
             },
         }
     }
@@ -899,6 +940,7 @@ pub(super) enum AgentArchiveError {
 pub(super) enum AgentUnarchiveError {
     NotFound,
     NoResumablePlan,
+    SessionLost,
 }
 
 /// True when an archived record is addressed by `target` — its agent name or its
