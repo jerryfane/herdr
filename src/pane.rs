@@ -136,6 +136,15 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env_remove("CODEX_THREAD_ID");
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
+        // When this launch applies a config-home override, clear conflicting auth
+        // tokens so the selected account's own credentials are authoritative — a
+        // global CLAUDE_CODE_OAUTH_TOKEN otherwise overrides CLAUDE_CONFIG_DIR
+        // (gitmoot workflow-note row 86147).
+        if let Some(kind) = crate::config::kind_for_config_env_var(key) {
+            for var in crate::config::auth_env_vars_to_clear(kind) {
+                cmd.env_remove(var);
+            }
+        }
     }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);

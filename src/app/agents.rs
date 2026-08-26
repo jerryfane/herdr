@@ -769,6 +769,18 @@ fn agent_launch_argv(
     // account — no `env` prefix.
     if let Some(env) = account_env.filter(|env| !env.is_empty()) {
         argv.push("env".to_string());
+        // Clear conflicting auth tokens FIRST so the config-home override is the
+        // authoritative account selector. A machine-global CLAUDE_CODE_OAUTH_TOKEN
+        // otherwise wins over CLAUDE_CONFIG_DIR and the swap silently keeps the old
+        // authenticated account (gitmoot workflow-note row 86147).
+        for (key, _) in env {
+            if let Some(kind) = crate::config::kind_for_config_env_var(key) {
+                for var in crate::config::auth_env_vars_to_clear(kind) {
+                    argv.push("-u".to_string());
+                    argv.push((*var).to_string());
+                }
+            }
+        }
         for (key, value) in env {
             argv.push(format!("{key}={value}"));
         }
@@ -1084,6 +1096,41 @@ mod tests {
                 "--yolo".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn agent_launch_argv_clears_claude_oauth_token_before_config_dir() {
+        // A claude account override must clear the machine-global CLAUDE_CODE_OAUTH_TOKEN
+        // (via `env -u`) so the config-home selects the account, not the inherited token
+        // (workflow-note row 86147). The `-u` must precede the KEY=VALUE assignment.
+        let env = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/root/.claude-2".to_string(),
+        )];
+        assert_eq!(
+            agent_launch_argv(
+                Some(&env),
+                "claude",
+                vec!["--resume".to_string(), "abc".to_string()]
+            ),
+            vec![
+                "env".to_string(),
+                "-u".to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "CLAUDE_CONFIG_DIR=/root/.claude-2".to_string(),
+                "claude".to_string(),
+                "--resume".to_string(),
+                "abc".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_launch_argv_does_not_clear_tokens_for_codex() {
+        // codex has no token lever today, so its override must not gain a `-u` flag.
+        let env = [("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())];
+        let argv = agent_launch_argv(Some(&env), "codex", vec![]);
+        assert!(!argv.iter().any(|a| a == "-u"), "unexpected -u in {argv:?}");
     }
 
     #[test]
