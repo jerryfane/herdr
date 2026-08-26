@@ -392,6 +392,8 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        // Archived agents own no pane, so they bypass workspace restore.
+        let mut restored_archived_agents: Vec<crate::persist::ArchivedAgentSnapshot> = Vec::new();
         let snapshot = policy.restore_session.then(crate::persist::load).flatten();
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             policy.restore_session && snapshot.is_none(),
@@ -417,6 +419,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            restored_archived_agents = snap.archived_agents.clone();
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (Vec::new(), None, 0)
@@ -550,6 +553,7 @@ impl App {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            archived_agents: restored_archived_agents,
         };
 
         state.terminals = restored_terminals;
@@ -721,6 +725,7 @@ impl App {
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
+        app.state.archived_agents = snapshot.archived_agents.clone();
         app.terminal_runtimes = runtimes.into();
         app.state.active = snapshot
             .active

@@ -21,8 +21,7 @@ use crate::api::schema::{AgentInfo, AgentStatus};
 /// Reachability of a federation peer, derived from consecutive poll outcomes.
 ///
 /// Serialized onto remote [`AgentInfo`]s so a client can tell a live peer from
-/// one that has gone quiet. A C-like enum, so it derives `Eq` and keeps
-/// [`AgentInfo`]'s `Eq`.
+/// one that has gone quiet. A C-like enum, so it derives `Eq`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Reachability {

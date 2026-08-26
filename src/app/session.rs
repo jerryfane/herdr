@@ -38,7 +38,9 @@ impl App {
     }
 
     fn capture_session_save_job(&self) -> SessionSaveJob {
-        if self.state.workspaces.is_empty() {
+        // Archived agents are paneless, so a session with only archived agents
+        // still has state worth persisting — clearing would lose them.
+        if self.state.workspaces.is_empty() && self.state.archived_agents.is_empty() {
             SessionSaveJob::Clear
         } else {
             let snapshot = crate::persist::capture(
@@ -47,6 +49,7 @@ impl App {
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
+                &self.state.archived_agents,
             );
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
