@@ -164,6 +164,34 @@ impl App {
             None => None,
         };
 
+        // FAIL CLOSED on a logged-out target: when this restart swaps to a DIFFERENT account, verify that
+        // account actually holds credentials BEFORE we tear down the running process. A logged-out profile
+        // (its `.credentials.json` deleted, e.g. by a `/logout`) would otherwise strand the seat at a login
+        // screen once we kill it (gitmoot workflow-note row 86147). Only claude has this credential layout
+        // today; other kinds skip the check. Checked here rather than by spawning `claude auth status` so the
+        // request handler never blocks on a subprocess.
+        if params.account.is_some() {
+            if let Some(account_id) = selected_account.as_deref() {
+                if let Some(account) = self
+                    .loaded_accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                {
+                    if account.kind == "claude"
+                        && !claude_account_has_credentials(&account.config_dir)
+                    {
+                        return encode_error(
+                            id,
+                            "account_not_authenticated",
+                            format!(
+                                "target account {account_id} is logged out (no credentials found); the agent was left on its current account"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         // SWAP SAFETY: when this restart moves the agent to a DIFFERENT account, its session transcript
         // only exists under the CURRENT account's config-home. Copy it into the target's first, or the
         // `--resume` under the new account can't find it and the seat breaks into a dead state (this
@@ -570,6 +598,18 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
+/// Whether a claude account's config-home currently holds usable credentials. A logged-out profile
+/// (e.g. after a `/logout`, which deletes `.credentials.json`) has no credential file; swapping a seat
+/// onto it would strand it at a login screen, so restart fails closed on this (workflow-note row 86147).
+/// A present file is treated as authenticated here — a deeper `claude auth status` probe (to also catch
+/// present-but-expired credentials) is left as a follow-up so the request handler stays subprocess-free.
+fn claude_account_has_credentials(config_dir: &str) -> bool {
+    let creds = std::path::Path::new(config_dir).join(".credentials.json");
+    std::fs::metadata(&creds)
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
+}
+
 /// Resolve the on-disk config-home for an account id (or the harness default when `None`).
 fn resolve_config_home(
     accounts: &[crate::config::AccountConfig],
@@ -718,6 +758,21 @@ mod tests {
         let dir = config_home.join("projects").join(slug);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+    }
+
+    #[test]
+    fn claude_account_has_credentials_tracks_the_creds_file() {
+        let home = swap_temp_root("creds");
+        let creds = home.join(".credentials.json");
+        // Missing → logged out.
+        assert!(!claude_account_has_credentials(&home.to_string_lossy()));
+        // Empty file → still treated as logged out.
+        std::fs::write(&creds, "").unwrap();
+        assert!(!claude_account_has_credentials(&home.to_string_lossy()));
+        // Non-empty creds → authenticated.
+        std::fs::write(&creds, "{\"token\":\"x\"}").unwrap();
+        assert!(claude_account_has_credentials(&home.to_string_lossy()));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

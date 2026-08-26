@@ -368,6 +368,33 @@ pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// The auth-credential environment variables that applying a config-home
+/// override for `kind` must CLEAR so the selected account's own credentials are
+/// authoritative. A machine-global `CLAUDE_CODE_OAUTH_TOKEN` otherwise overrides
+/// every per-account credential regardless of `CLAUDE_CONFIG_DIR`, so an account
+/// swap that only sets the config dir keeps authenticating as the token's
+/// account and hits its quota (gitmoot workflow-note row 86147, 2026-08-26).
+/// Empty for kinds with no such token lever today (codex/kimi/unknown).
+pub fn auth_env_vars_to_clear(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "claude" => &["CLAUDE_CODE_OAUTH_TOKEN"],
+        _ => &[],
+    }
+}
+
+/// The harness kind whose config-home lever is `var` (the reverse of
+/// [`env_var_for_kind`]), or `None` when `var` is not a config-home override.
+/// Lets a launch surface that only sees the resolved env vars decide which auth
+/// tokens to clear alongside the config-dir it is applying.
+pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
+    match var {
+        "CLAUDE_CONFIG_DIR" => Some("claude"),
+        "CODEX_HOME" => Some("codex"),
+        "KIMI_CODE_HOME" => Some("kimi"),
+        _ => None,
+    }
+}
+
 /// The default config-home directory a harness uses with no override
 /// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.kimi-code`). `None` when `HOME` is
 /// unset or the kind has no config-home lever.
@@ -1416,6 +1443,28 @@ mod tests {
         assert_eq!(env_var_for_kind("kimi"), Some("KIMI_CODE_HOME"));
         assert_eq!(env_var_for_kind("gemini"), None);
         assert_eq!(env_var_for_kind(""), None);
+    }
+
+    #[test]
+    fn auth_env_vars_to_clear_covers_claude_token_only() {
+        assert_eq!(
+            auth_env_vars_to_clear("claude"),
+            &["CLAUDE_CODE_OAUTH_TOKEN"]
+        );
+        assert_eq!(auth_env_vars_to_clear("codex"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear("kimi"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear("gemini"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear(""), &[] as &[&str]);
+    }
+
+    #[test]
+    fn kind_for_config_env_var_is_the_reverse_of_env_var_for_kind() {
+        for kind in ["claude", "codex", "kimi"] {
+            let var = env_var_for_kind(kind).expect("supported kind has a config var");
+            assert_eq!(kind_for_config_env_var(var), Some(kind));
+        }
+        assert_eq!(kind_for_config_env_var("PATH"), None);
+        assert_eq!(kind_for_config_env_var(""), None);
     }
 
     #[test]

@@ -1,0 +1,20 @@
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json
+cargo:rerun-if-changed=vendor/libghostty-vt/build.zig
+cargo:rerun-if-changed=vendor/libghostty-vt/build.zig.zon
+cargo:rerun-if-changed=vendor/libghostty-vt/include
+cargo:rerun-if-changed=vendor/libghostty-vt/pkg
+cargo:rerun-if-changed=vendor/libghostty-vt/src
+cargo:rerun-if-changed=vendor/libghostty-vt/VERSION
+cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE
+cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SIMD
+cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ZIG_SYSTEM_DIR
+cargo:rerun-if-env-changed=HERDR_BUILD_CHANNEL
+cargo:rerun-if-env-changed=HERDR_BUILD_ID
+cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT
+cargo:rerun-if-env-changed=ZIG
+cargo:rustc-env=HERDR_BUILD_COMMIT=2aa50b3a
+cargo:rerun-if-changed=.git/HEAD
+cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work.
+cargo:rustc-link-search=native=/root/repos/herdr-staging/vendor/libghostty-vt/zig-out/lib
+cargo:rustc-link-lib=static=ghostty-vt
