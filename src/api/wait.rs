@@ -992,6 +992,8 @@ mod tests {
             machine_id: None,
             reachability: None,
             last_known_status: None,
+            archived: None,
+            parked_work: Vec::new(),
         }
     }
 

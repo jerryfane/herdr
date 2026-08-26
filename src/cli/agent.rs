@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
-    EmptyParams, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentArchiveParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
+    AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
+    AgentUnarchiveParams, AgentWaitParams, EmptyParams, Method, PaneProcessInfoParams, PaneTarget,
+    ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -22,6 +23,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
+        "archive" => agent_archive(&args[1..]),
+        "unarchive" => agent_unarchive(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
@@ -798,6 +801,98 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_archive(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let mut reason = None;
+    let mut by = None;
+    let mut parked_work = Vec::new();
+    let mut force = false;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--reason" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                reason = Some(value.clone());
+            }
+            "--by" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                by = Some(value.clone());
+            }
+            "--parked-work" => {
+                let Some(path) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                let content = std::fs::read_to_string(path)?;
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(serde_json::Value::Array(items)) => parked_work = items,
+                    Ok(_) => {
+                        eprintln!("--parked-work file must contain a JSON array");
+                        return Ok(2);
+                    }
+                    Err(err) => {
+                        eprintln!("--parked-work file is not valid JSON: {err}");
+                        return Ok(2);
+                    }
+                }
+            }
+            "--force" => force = true,
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:archive".into(),
+        method: Method::AgentArchive(AgentArchiveParams {
+            target: target.clone(),
+            reason,
+            by,
+            parked_work,
+            force,
+        }),
+    })?)
+}
+
+fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent unarchive <target> [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    for arg in &args[1..] {
+        match arg.as_str() {
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:unarchive".into(),
+        method: Method::AgentUnarchive(AgentUnarchiveParams {
+            target: target.clone(),
+        }),
+    })?)
+}
+
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
@@ -957,6 +1052,8 @@ fn print_agent_help() {
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
+    eprintln!("  herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]");
+    eprintln!("  herdr agent unarchive <target> [--json]");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");

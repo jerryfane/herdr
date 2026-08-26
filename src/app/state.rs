@@ -1694,6 +1694,12 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// Agents taken out of active rotation (issue #173). Paneless: each record
+    /// freezes an archived agent's resume identity so it can be resumed later
+    /// (unarchive) without recreating the session. Not derived from any live
+    /// pane — the one genuinely new persisted store — so it is captured and
+    /// rehydrated separately from the workspace/terminal tree.
+    pub archived_agents: Vec<crate::persist::ArchivedAgentSnapshot>,
 }
 
 impl AppState {
@@ -2181,6 +2187,7 @@ impl AppState {
             host_mouse_pixels: None,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            archived_agents: Vec::new(),
         }
     }
 

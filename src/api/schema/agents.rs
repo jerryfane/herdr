@@ -46,6 +46,37 @@ pub struct AgentRenameParams {
     pub name: Option<String>,
 }
 
+/// `agent.archive` — take an agent out of active rotation (issue #173). The pane
+/// is released but the session ref is preserved, so `agent.unarchive` can resume
+/// (not recreate) it later. Rejected when the agent is mid-turn unless `force`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentArchiveParams {
+    pub target: String,
+    /// Optional free-text note recorded on the archived record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Who requested the archive; recorded verbatim. Defaults server-side to
+    /// `"api"` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// Opaque open-work list, stored and returned verbatim (gitmoot supplies and
+    /// renders it; herdr does not interpret it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_work: Vec<serde_json::Value>,
+    /// Archive even when the agent is currently working / mid-turn.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub force: bool,
+}
+
+/// `agent.unarchive` — resume a previously archived agent (issue #173). The
+/// stored session ref is resumed into a fresh pane, preserving the agent's
+/// terminal identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentUnarchiveParams {
+    /// The archived agent's name or terminal id.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentViewSetParams {
     pub source: String,
@@ -204,7 +235,10 @@ pub enum AgentPromptDelivery {
     Submitted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+// `parked_work` holds arbitrary JSON (`serde_json::Value`), which is `PartialEq`
+// but not `Eq`, so `AgentInfo` can no longer derive `Eq`. Nothing keys a
+// map/set on it, so only the derive is dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +305,27 @@ pub struct AgentInfo {
     /// local agent or a reachable peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_known_status: Option<AgentStatus>,
+    /// Present only for archived agents (issue #173). Its presence is the
+    /// load-bearing signal that this agent is archived; absent means active, so
+    /// older clients that ignore the field see a normal (active) agent list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<AgentArchivedInfo>,
+    /// Opaque open-work list carried on an archived agent, returned verbatim.
+    /// Absent (empty) for active agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_work: Vec<serde_json::Value>,
+}
+
+/// The `archived { at, by, reason }` provenance surfaced on an archived
+/// [`AgentInfo`] in `agent.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentArchivedInfo {
+    /// RFC3339 timestamp of when the agent was archived.
+    pub at: String,
+    /// Who archived it.
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

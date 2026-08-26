@@ -9,7 +9,11 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+///
+/// Bumped 3 → 4 for the additive `archived_agents` collection. The new field is
+/// `#[serde(default)]`, so a v3 `session.json` still deserializes into a v4
+/// `SessionSnapshot` with an empty `archived_agents`.
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -26,6 +30,12 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Agents taken out of active rotation (issue #173, "archive"). Paneless:
+    /// each record freezes the resume identity of an agent whose pane was
+    /// released, so it can be resumed later without recreating the session.
+    /// Additive — a v3 snapshot lacking this field restores to an empty list.
+    #[serde(default)]
+    pub archived_agents: Vec<ArchivedAgentSnapshot>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,6 +139,50 @@ pub struct PaneAgentSessionSnapshot {
     pub value: String,
 }
 
+/// A single archived agent (issue #173). Frozen at archive time: the resume
+/// identity (`agent_session`), the stable `terminal_id` and `occupant_generation`
+/// so an unarchive keeps the same global identity, the launch `cwd`, and the
+/// opaque `parked_work` that gitmoot supplies and renders (herdr stores it
+/// verbatim). This is both the durable serialized form and the runtime
+/// `AppState.archived_agents` element — the two would be byte-identical given
+/// `agent_session` already reuses the serializable [`PaneAgentSessionSnapshot`],
+/// so they are one type rather than a lock-step-divergent pair.
+///
+/// `PartialEq` (not `Eq`) because `parked_work` holds arbitrary JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivedAgentSnapshot {
+    /// The agent's display name (`agent rename`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The agent kind label (e.g. `claude`, `codex`), for display and resume.
+    pub kind: String,
+    /// The stable terminal identity, preserved across the archive so an
+    /// unarchive resumes into the same `machine_id / terminal_id` slot.
+    pub terminal_id: String,
+    /// The resumable session identity, frozen from the live terminal.
+    pub agent_session: PaneAgentSessionSnapshot,
+    pub cwd: PathBuf,
+    /// Occupant generation at archive time, rehydrated on unarchive.
+    #[serde(default)]
+    pub occupant_generation: u64,
+    /// Who archived it and when, plus an optional reason.
+    pub archived: ArchivedAgentMeta,
+    /// Opaque open-work list, stored and returned verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_work: Vec<serde_json::Value>,
+}
+
+/// The `archived { at, by, reason }` provenance block on an [`ArchivedAgentSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedAgentMeta {
+    /// RFC3339 timestamp of when the agent was archived.
+    pub at: String,
+    /// Who requested the archive (caller-supplied identity).
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PaneHistorySnapshot {
     pub ansi: String,
@@ -196,6 +250,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    archived_agents: Vec<ArchivedAgentSnapshot>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -211,6 +267,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        archived_agents: raw.archived_agents,
     })
 }
 
@@ -273,6 +330,7 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    archived_agents: &[ArchivedAgentSnapshot],
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -285,6 +343,7 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        archived_agents: archived_agents.to_vec(),
     }
 }
 
@@ -557,6 +616,7 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            &state.archived_agents,
         )
     }
 
@@ -621,6 +681,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -628,6 +689,66 @@ mod tests {
         assert_eq!(restored.active, None);
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    #[test]
+    fn v3_snapshot_without_archived_agents_still_parses() {
+        // A pre-#173 (v3) session.json has no `archived_agents` key. Serde default
+        // must fill it with an empty list so an old session still loads.
+        let v3 = serde_json::json!({
+            "version": 3,
+            "workspaces": [],
+            "active": null,
+            "selected": 0,
+            "sidebar_width": 26,
+            "sidebar_section_split": 0.5,
+            "collapsed_space_keys": [],
+        })
+        .to_string();
+        let restored = parse_snapshot(&v3).expect("v3 snapshot parses");
+        assert_eq!(restored.version, 3);
+        assert!(restored.archived_agents.is_empty());
+    }
+
+    #[test]
+    fn archived_agents_round_trip_through_the_snapshot() {
+        let snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: vec![],
+            active: None,
+            selected: 0,
+            sidebar_width: Some(26),
+            sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: vec![ArchivedAgentSnapshot {
+                name: Some("reviewer".into()),
+                kind: "claude".into(),
+                terminal_id: "term-1".into(),
+                agent_session: PaneAgentSessionSnapshot {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    kind: crate::agent_resume::AgentSessionRefKind::Id,
+                    value: "sess-123".into(),
+                },
+                cwd: PathBuf::from("/work"),
+                occupant_generation: 7,
+                archived: ArchivedAgentMeta {
+                    at: "2026-08-26T00:00:00Z".into(),
+                    by: "tester".into(),
+                    reason: Some("parked".into()),
+                },
+                parked_work: vec![serde_json::json!({"pr": 42})],
+            }],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert_eq!(restored.archived_agents.len(), 1);
+        let record = &restored.archived_agents[0];
+        assert_eq!(record.terminal_id, "term-1");
+        assert_eq!(record.occupant_generation, 7);
+        assert_eq!(record.agent_session.value, "sess-123");
+        assert_eq!(record.archived.by, "tester");
+        assert_eq!(record.parked_work, vec![serde_json::json!({"pr": 42})]);
     }
 
     #[test]
@@ -712,6 +833,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -1338,6 +1460,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

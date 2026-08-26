@@ -1544,6 +1544,41 @@
     },
     "request": {
       "$defs": {
+        "AgentArchiveParams": {
+          "description": "`agent.archive` — take an agent out of active rotation (issue #173). The pane\nis released but the session ref is preserved, so `agent.unarchive` can resume\n(not recreate) it later. Rejected when the agent is mid-turn unless `force`.",
+          "properties": {
+            "by": {
+              "description": "Who requested the archive; recorded verbatim. Defaults server-side to\n`\"api\"` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "force": {
+              "description": "Archive even when the agent is currently working / mid-turn.",
+              "type": "boolean"
+            },
+            "parked_work": {
+              "description": "Opaque open-work list, stored and returned verbatim (gitmoot supplies and\nrenders it; herdr does not interpret it).",
+              "items": true,
+              "type": "array"
+            },
+            "reason": {
+              "description": "Optional free-text note recorded on the archived record.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1726,6 +1761,19 @@
         "AgentTarget": {
           "properties": {
             "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentUnarchiveParams": {
+          "description": "`agent.unarchive` — resume a previously archived agent (issue #173). The\nstored session ref is resumed into a fresh pane, preserving the agent's\nterminal identity.",
+          "properties": {
+            "target": {
+              "description": "The archived agent's name or terminal id.",
               "type": "string"
             }
           },
@@ -5936,6 +5984,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.archive",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentArchiveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.unarchive",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentUnarchiveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.view.set",
               "type": "string"
             },
@@ -7706,6 +7786,30 @@
           },
           "type": "object"
         },
+        "AgentArchivedInfo": {
+          "description": "The `archived { at, by, reason }` provenance surfaced on an archived\n[`AgentInfo`] in `agent.list`.",
+          "properties": {
+            "at": {
+              "description": "RFC3339 timestamp of when the agent was archived.",
+              "type": "string"
+            },
+            "by": {
+              "description": "Who archived it.",
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "at",
+            "by"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -7726,6 +7830,17 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "archived": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentArchivedInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only for archived agents (issue #173). Its presence is the\nload-bearing signal that this agent is archived; absent means active, so\nolder clients that ignore the field see a normal (active) agent list."
             },
             "composer": {
               "$ref": "#/schemas/success_response/$defs/ComposerInfo",
@@ -7816,6 +7931,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "parked_work": {
+              "description": "Opaque open-work list carried on an archived agent, returned verbatim.\nAbsent (empty) for active agents.",
+              "items": true,
+              "type": "array"
             },
             "reachability": {
               "anyOf": [
@@ -10817,7 +10937,7 @@
           ]
         },
         "Reachability": {
-          "description": "Reachability of a federation peer, derived from consecutive poll outcomes.\n\nSerialized onto remote [`AgentInfo`]s so a client can tell a live peer from\none that has gone quiet. A C-like enum, so it derives `Eq` and keeps\n[`AgentInfo`]'s `Eq`.",
+          "description": "Reachability of a federation peer, derived from consecutive poll outcomes.\n\nSerialized onto remote [`AgentInfo`]s so a client can tell a live peer from\none that has gone quiet. A C-like enum, so it derives `Eq`.",
           "oneOf": [
             {
               "const": "reachable",

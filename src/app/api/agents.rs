@@ -3,8 +3,9 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentRestartParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
+    AgentArchiveParams, AgentPromptDelivery, AgentPromptParams, AgentRenameParams,
+    AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentUnarchiveParams,
+    PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -55,6 +56,40 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentInfo { agent })
+    }
+
+    /// `agent.archive` — take an agent out of active rotation, preserving its
+    /// session (issue #173).
+    pub(super) fn handle_agent_archive(
+        &mut self,
+        id: String,
+        params: AgentArchiveParams,
+    ) -> String {
+        let by = params.by.unwrap_or_else(|| "api".to_string());
+        let at = now_rfc3339();
+        match self.archive_agent_target(
+            &params.target,
+            params.reason,
+            by,
+            params.parked_work,
+            params.force,
+            at,
+        ) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+            Err(err) => encode_error_body(id, self.agent_archive_error_body(err)),
+        }
+    }
+
+    /// `agent.unarchive` — resume a previously archived agent (issue #173).
+    pub(super) fn handle_agent_unarchive(
+        &mut self,
+        id: String,
+        params: AgentUnarchiveParams,
+    ) -> String {
+        match self.unarchive_agent_target(&params.target) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+            Err(err) => encode_error_body(id, self.agent_unarchive_error_body(err)),
+        }
     }
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
@@ -160,7 +195,7 @@ impl App {
     /// The `(source, agent, session_ref)` needed to resume a terminal's agent,
     /// from the live hook authority, else the persisted session. `None` when the
     /// agent never reported a resumable session (or isn't herdr-launched).
-    fn terminal_resume_source(
+    pub(in crate::app) fn terminal_resume_source(
         terminal: &crate::terminal::TerminalState,
     ) -> Option<(String, String, crate::agent_resume::AgentSessionRef)> {
         if let Some(authority) = terminal.hook_authority.as_ref() {
@@ -500,6 +535,16 @@ fn agent_not_found(id: String, target: &str) -> String {
         "agent_not_found",
         format!("agent target {target} not found"),
     )
+}
+
+/// Current wall-clock time as an RFC3339 string, for stamping an archive's `at`.
+/// Uses the same `now`-source family the rest of the daemon uses (system clock);
+/// formatting an always-valid `now_utc()` cannot fail in practice, so an empty
+/// string on the impossible error path is a safe, non-panicking fallback.
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1516,5 +1561,263 @@ mod tests {
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "unknown_account");
+    }
+
+    /// Arm a live, resumable Claude agent named `name` on the root pane and return
+    /// its terminal id.
+    fn arm_resumable_claude(app: &mut App, name: &str, state: AgentState) -> String {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(Some(Agent::Claude), state);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-123").unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        terminal_id.to_string()
+    }
+
+    #[tokio::test]
+    async fn agent_archive_moves_agent_into_store_and_persists() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+
+        let response = app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: Some("parked".into()),
+                by: Some("tester".into()),
+                parked_work: vec![serde_json::json!({"pr": 42})],
+                force: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info");
+        };
+        assert!(
+            agent.archived.is_some(),
+            "response marks the agent archived"
+        );
+        assert_eq!(agent.parked_work, vec![serde_json::json!({"pr": 42})]);
+
+        assert_eq!(app.state.archived_agents.len(), 1);
+        let record = &app.state.archived_agents[0];
+        assert_eq!(record.name.as_deref(), Some("reviewer"));
+        assert_eq!(record.kind, "claude");
+        assert_eq!(record.terminal_id, terminal_id);
+        assert_eq!(record.agent_session.source, "herdr:claude");
+        assert_eq!(record.agent_session.value, "sess-123");
+        assert_eq!(record.archived.by, "tester");
+        assert_eq!(record.archived.reason.as_deref(), Some("parked"));
+        assert!(!record.archived.at.is_empty());
+        assert_eq!(record.parked_work, vec![serde_json::json!({"pr": 42})]);
+        // The pane's terminal is released (this was the workspace's only pane).
+        assert!(!app
+            .state
+            .terminals
+            .contains_key(&crate::terminal::TerminalId::from_persisted(
+                terminal_id.clone()
+            )));
+        assert!(app.state.session_dirty);
+    }
+
+    #[tokio::test]
+    async fn agent_archive_rejects_working_agent_without_force() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Working);
+
+        let response = app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: None,
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_working");
+        assert!(app.state.archived_agents.is_empty());
+
+        // With force it archives anyway.
+        let forced = app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: None,
+                parked_work: Vec::new(),
+                force: true,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&forced).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert_eq!(app.state.archived_agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_archive_is_idempotent() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let params = || AgentArchiveParams {
+            target: "reviewer".into(),
+            reason: None,
+            by: Some("tester".into()),
+            parked_work: Vec::new(),
+            force: false,
+        };
+        let first = app.handle_agent_archive("req".into(), params());
+        assert!(serde_json::from_str::<SuccessResponse>(&first).is_ok());
+        // A second archive of the same (now archived) name is a no-op ok.
+        let second = app.handle_agent_archive("req".into(), params());
+        let success: SuccessResponse = serde_json::from_str(&second).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert_eq!(app.state.archived_agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_unarchive_arms_resume_plan_and_removes_record() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        assert_eq!(app.state.archived_agents.len(), 1);
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.state.archived_agents.is_empty());
+
+        // Round-trip preserves the terminal identity, and the resumed terminal
+        // carries a pending resume plan for the pending-resume loop to spawn.
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+        let terminal = app
+            .state
+            .terminals
+            .get(&tid)
+            .expect("unarchive resumes into the same terminal id");
+        let plan = terminal
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("unarchive arms a resume plan");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "sess-123".to_string()
+            ]
+        );
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        // The resumed agent lives on a real pane again.
+        assert!(app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.attached_terminal_id == tid));
+    }
+
+    #[test]
+    fn agent_unarchive_missing_record_errors() {
+        let mut app = app_with_agent();
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "ghost".into(),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "archived_agent_not_found");
+    }
+
+    #[test]
+    fn collect_agent_infos_emits_archived_and_marks_active() {
+        let mut app = app_with_agent();
+        // One live agent on the pane.
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("live-one".into());
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        // One archived agent in the store.
+        app.state
+            .archived_agents
+            .push(crate::persist::ArchivedAgentSnapshot {
+                name: Some("archived-one".into()),
+                kind: "codex".into(),
+                terminal_id: "term-archived".into(),
+                agent_session: crate::persist::PaneAgentSessionSnapshot {
+                    source: "herdr:codex".into(),
+                    agent: "codex".into(),
+                    kind: crate::agent_resume::AgentSessionRefKind::Id,
+                    value: "sess-arch".into(),
+                },
+                cwd: std::path::PathBuf::from("/tmp/arch"),
+                occupant_generation: 3,
+                archived: crate::persist::ArchivedAgentMeta {
+                    at: "2026-08-26T00:00:00Z".into(),
+                    by: "tester".into(),
+                    reason: None,
+                },
+                parked_work: vec![serde_json::json!({"task": "x"})],
+            });
+
+        let agents = app.collect_agent_infos();
+        let live = agents
+            .iter()
+            .find(|a| a.name.as_deref() == Some("live-one"))
+            .expect("live agent present");
+        assert!(
+            live.archived.is_none(),
+            "active agents omit the archived block"
+        );
+        assert!(live.parked_work.is_empty());
+
+        let archived = agents
+            .iter()
+            .find(|a| a.name.as_deref() == Some("archived-one"))
+            .expect("archived agent present");
+        let block = archived.archived.as_ref().expect("archived block present");
+        assert_eq!(block.by, "tester");
+        assert_eq!(archived.terminal_id, "term-archived");
+        assert_eq!(archived.parked_work, vec![serde_json::json!({"task": "x"})]);
+        // Paneless: no live pane ids.
+        assert!(archived.pane_id.is_empty());
     }
 }
