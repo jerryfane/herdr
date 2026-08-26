@@ -21,6 +21,10 @@ fn valid_agent_name(name: &str) -> bool {
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        // Live agents derived from panes, then the paneless archived store. The
+        // archived entries bypass the `is_agent_terminal` pane gate (they have no
+        // pane) and carry the `archived` block that marks them; older clients that
+        // ignore the field see them as ordinary idle agents.
         self.state
             .workspaces
             .iter()
@@ -33,6 +37,7 @@ impl App {
                         .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
                 })
             })
+            .chain(self.state.archived_agents.iter().map(archived_agent_info))
             .collect()
     }
 
@@ -140,6 +145,246 @@ impl App {
                     target: target.to_string(),
                 })
             })
+    }
+
+    /// Archive an agent (issue #173): release its pane but preserve the session
+    /// so it can be resumed later. Record-then-release — the resume identity is
+    /// captured into `AppState.archived_agents` FIRST, then the process is
+    /// released and the now-empty pane removed. Idempotent: archiving an
+    /// already-archived name/terminal id is a no-op that returns the record.
+    pub(super) fn archive_agent_target(
+        &mut self,
+        target: &str,
+        reason: Option<String>,
+        by: String,
+        parked_work: Vec<serde_json::Value>,
+        force: bool,
+        at: String,
+    ) -> Result<crate::api::schema::AgentInfo, AgentArchiveError> {
+        // Idempotent no-op if already archived.
+        if let Some(existing) = self
+            .state
+            .archived_agents
+            .iter()
+            .find(|record| archived_matches_target(record, target))
+        {
+            return Ok(archived_agent_info(existing));
+        }
+
+        let resolved = self
+            .resolve_agent_target(target)
+            .map_err(AgentArchiveError::Target)?;
+
+        let info = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .ok_or(AgentArchiveError::NotAgent)?;
+        if !force && matches!(info.agent_status, crate::api::schema::AgentStatus::Working) {
+            return Err(AgentArchiveError::Working);
+        }
+
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return Err(AgentArchiveError::NotAgent);
+        };
+
+        // Capture the resume identity BEFORE anything is released, so dropping the
+        // TerminalState below loses nothing.
+        let terminal = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .ok_or(AgentArchiveError::NotAgent)?;
+        let Some((source, agent, session_ref)) = Self::terminal_resume_source(terminal) else {
+            return Err(AgentArchiveError::NoResumableSession);
+        };
+        let name = terminal.agent_name.clone();
+        let cwd = terminal.cwd.clone();
+        let occupant_generation = terminal.occupant_generation;
+        let kind = terminal
+            .managed_agent_kind()
+            .map(|agent| crate::detect::agent_label(agent).to_string())
+            .unwrap_or_else(|| agent.clone());
+
+        self.state
+            .archived_agents
+            .push(crate::persist::ArchivedAgentSnapshot {
+                name,
+                kind,
+                terminal_id: terminal_id.to_string(),
+                agent_session: crate::persist::PaneAgentSessionSnapshot {
+                    source,
+                    agent,
+                    kind: session_ref.kind,
+                    value: session_ref.value,
+                },
+                cwd,
+                occupant_generation,
+                archived: crate::persist::ArchivedAgentMeta { at, by, reason },
+                parked_work,
+            });
+
+        // Release the pane's process, then remove the now-empty pane. The session
+        // was captured above, so this is a safe, non-`release_agent_with_mutation`
+        // teardown.
+        self.shutdown_terminal_runtime(terminal_id.clone());
+        let should_close_workspace = self
+            .state
+            .workspaces
+            .get_mut(resolved.ws_idx)
+            .is_some_and(|workspace| workspace.close_pane(resolved.pane_id));
+        self.state.remove_plugin_pane_records([resolved.pane_id]);
+        if should_close_workspace {
+            self.state.selected = resolved.ws_idx;
+            self.state.close_selected_workspace();
+        } else {
+            self.state.remove_unattached_terminal_ids([terminal_id]);
+        }
+        self.shutdown_detached_terminal_runtimes();
+
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+
+        let record = self
+            .state
+            .archived_agents
+            .last()
+            .ok_or(AgentArchiveError::NotAgent)?;
+        Ok(archived_agent_info(record))
+    }
+
+    /// Unarchive an agent (issue #173): resume the stored session into a fresh
+    /// pane, preserving the agent's terminal identity. Mirrors the restore path —
+    /// a new terminal carries the resume plan and no runtime; the pending-resume
+    /// loop spawns the shell and relaunches with the agent's resume command.
+    pub(super) fn unarchive_agent_target(
+        &mut self,
+        target: &str,
+    ) -> Result<crate::api::schema::AgentInfo, AgentUnarchiveError> {
+        let Some(index) = self
+            .state
+            .archived_agents
+            .iter()
+            .position(|record| archived_matches_target(record, target))
+        else {
+            return Err(AgentUnarchiveError::NotFound);
+        };
+
+        // Build the resume plan before removing the record, so a plan failure
+        // leaves the archive intact.
+        let record = &self.state.archived_agents[index];
+        let Some(persisted) = crate::agent_resume::session_ref_from_snapshot(
+            &record.agent_session.source,
+            &record.agent_session.agent,
+            record.agent_session.kind,
+            &record.agent_session.value,
+        ) else {
+            return Err(AgentUnarchiveError::NoResumablePlan);
+        };
+        let Some(plan) = crate::agent_resume::plan(
+            &record.agent_session.source,
+            &record.agent_session.agent,
+            &persisted.session_ref,
+        ) else {
+            return Err(AgentUnarchiveError::NoResumablePlan);
+        };
+
+        let record = self.state.archived_agents.remove(index);
+        let terminal_id = crate::terminal::TerminalId::from_persisted(record.terminal_id.clone());
+        let pane_id = crate::layout::PaneId::alloc();
+        let initial_agent = crate::detect::parse_agent_label(&plan.agent);
+
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), record.cwd.clone())
+                .with_pending_agent_resume_plan(plan)
+                .with_occupant_generation(record.occupant_generation);
+        terminal.set_persisted_agent_session(persisted);
+        match (
+            record.name.clone(),
+            crate::detect::parse_agent_label(&record.kind),
+        ) {
+            (Some(name), Some(agent_kind)) => terminal.restore_managed_agent(name, agent_kind),
+            (Some(name), None) => terminal.set_agent_name(name),
+            (None, _) => {}
+        }
+        if let Some(agent) = initial_agent {
+            let _ = terminal.set_detected_state_with_screen_signals_at(
+                Some(agent),
+                crate::detect::AgentState::Idle,
+                false,
+                false,
+                false,
+                false,
+                Instant::now(),
+            );
+        }
+        self.state.terminals.insert(terminal_id.clone(), terminal);
+
+        let moved = crate::workspace::MovedPane {
+            pane_id,
+            pane_state: crate::pane::PaneState::new(terminal_id),
+        };
+        let workspace = crate::workspace::Workspace::from_existing_pane(
+            record.name.clone(),
+            None,
+            record.cwd.clone(),
+            moved,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        );
+        self.state.workspaces.push(workspace);
+        let ws_idx = self.state.workspaces.len() - 1;
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        self.state.switch_workspace(ws_idx);
+        self.state.mode = crate::app::Mode::Terminal;
+        self.emit_workspace_open_events(ws_idx);
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+
+        self.agent_info(ws_idx, pane_id)
+            .ok_or(AgentUnarchiveError::NoResumablePlan)
+    }
+
+    pub(super) fn agent_archive_error_body(
+        &self,
+        err: AgentArchiveError,
+    ) -> crate::api::schema::ErrorBody {
+        match err {
+            AgentArchiveError::Target(err) => self.agent_target_error_body(err),
+            AgentArchiveError::NotAgent => crate::api::schema::ErrorBody {
+                code: "agent_not_found".into(),
+                message: "agent target does not currently host an agent".into(),
+            },
+            AgentArchiveError::Working => crate::api::schema::ErrorBody {
+                code: "agent_working".into(),
+                message: "agent is working / mid-turn; retry with force to archive anyway".into(),
+            },
+            AgentArchiveError::NoResumableSession => crate::api::schema::ErrorBody {
+                code: "no_resumable_session".into(),
+                message: "agent has no resumable session to preserve — not a herdr-launched agent, or none reported".into(),
+            },
+        }
+    }
+
+    pub(super) fn agent_unarchive_error_body(
+        &self,
+        err: AgentUnarchiveError,
+    ) -> crate::api::schema::ErrorBody {
+        match err {
+            AgentUnarchiveError::NotFound => crate::api::schema::ErrorBody {
+                code: "archived_agent_not_found".into(),
+                message: "no archived agent matches that name or terminal id".into(),
+            },
+            AgentUnarchiveError::NoResumablePlan => crate::api::schema::ErrorBody {
+                code: "no_resumable_session".into(),
+                message: "archived agent has no resumable session for its harness".into(),
+            },
+        }
     }
 
     pub(super) fn start_agent(
@@ -439,6 +684,10 @@ impl App {
             machine_id: None,
             reachability: None,
             last_known_status: None,
+            // A live pane is never archived; the archived list is emitted
+            // separately in `collect_agent_infos`.
+            archived: None,
+            parked_work: Vec::new(),
         })
     }
 
@@ -638,6 +887,76 @@ pub(super) enum AgentRenameError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+pub(super) enum AgentArchiveError {
+    Target(TerminalTargetError),
+    NotAgent,
+    Working,
+    NoResumableSession,
+}
+
+pub(super) enum AgentUnarchiveError {
+    NotFound,
+    NoResumablePlan,
+}
+
+/// True when an archived record is addressed by `target` — its agent name or its
+/// stored terminal id.
+fn archived_matches_target(record: &crate::persist::ArchivedAgentSnapshot, target: &str) -> bool {
+    record.name.as_deref() == Some(target) || record.terminal_id == target
+}
+
+/// Render an archived record as an [`AgentInfo`] for `agent.list`/archive
+/// responses. It has no live pane, so the pane/workspace/tab ids are empty and
+/// the status is idle; the `archived` block is the load-bearing signal.
+fn archived_agent_info(
+    record: &crate::persist::ArchivedAgentSnapshot,
+) -> crate::api::schema::AgentInfo {
+    crate::api::schema::AgentInfo {
+        terminal_id: record.terminal_id.clone(),
+        name: record.name.clone(),
+        agent: Some(record.kind.clone()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        display_agent: Some(record.kind.clone()),
+        agent_status: crate::api::schema::AgentStatus::Idle,
+        input_pending: false,
+        input_prompt_kind: None,
+        composer: Default::default(),
+        screen_detection_skipped: false,
+        state_labels: Default::default(),
+        tokens: Default::default(),
+        agent_session: Some(crate::api::schema::AgentSessionInfo {
+            source: record.agent_session.source.clone(),
+            agent: record.agent_session.agent.clone(),
+            kind: record.agent_session.kind,
+            value: record.agent_session.value.clone(),
+        }),
+        last_completed_turn: None,
+        turn: None,
+        turn_epoch: None,
+        workspace_id: String::new(),
+        tab_id: String::new(),
+        pane_id: String::new(),
+        focused: false,
+        launch_pending: false,
+        interactive_ready: false,
+        state_change_seq: 0,
+        cwd: Some(record.cwd.display().to_string()),
+        foreground_cwd: None,
+        revision: 0,
+        machine_id: None,
+        reachability: None,
+        last_known_status: None,
+        archived: Some(crate::api::schema::AgentArchivedInfo {
+            at: record.archived.at.clone(),
+            by: record.archived.by.clone(),
+            reason: record.archived.reason.clone(),
+        }),
+        parked_work: record.parked_work.clone(),
+    }
 }
 
 #[cfg(test)]
