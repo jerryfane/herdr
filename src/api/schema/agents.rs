@@ -75,6 +75,11 @@ pub struct AgentArchiveParams {
 pub struct AgentUnarchiveParams {
     /// The archived agent's name or terminal id.
     pub target: String,
+    /// Start a clean agent for the preserved terminal identity instead of
+    /// resuming the archived session. The operator escape hatch when the
+    /// session is gone or unwanted.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub fresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

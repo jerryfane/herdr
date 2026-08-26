@@ -86,7 +86,7 @@ impl App {
         id: String,
         params: AgentUnarchiveParams,
     ) -> String {
-        match self.unarchive_agent_target(&params.target) {
+        match self.unarchive_agent_target(&params.target, params.fresh) {
             Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
             Err(err) => encode_error_body(id, self.agent_unarchive_error_body(err)),
         }
@@ -1706,6 +1706,7 @@ mod tests {
             "req".into(),
             AgentUnarchiveParams {
                 target: "reviewer".into(),
+                fresh: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1750,10 +1751,197 @@ mod tests {
             "req".into(),
             AgentUnarchiveParams {
                 target: "ghost".into(),
+                fresh: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "archived_agent_not_found");
+    }
+
+    /// Push an archived record directly into the store, bypassing the archive
+    /// flow, so a test can pin the exact session ref kind/value under test.
+    fn push_archived(
+        app: &mut App,
+        name: &str,
+        kind: &str,
+        source: &str,
+        agent: &str,
+        ref_kind: crate::agent_resume::AgentSessionRefKind,
+        value: &str,
+        cwd: &str,
+    ) {
+        app.state
+            .archived_agents
+            .push(crate::persist::ArchivedAgentSnapshot {
+                name: Some(name.into()),
+                kind: kind.into(),
+                terminal_id: format!("term-{name}"),
+                agent_session: crate::persist::PaneAgentSessionSnapshot {
+                    source: source.into(),
+                    agent: agent.into(),
+                    kind: ref_kind,
+                    value: value.into(),
+                },
+                cwd: std::path::PathBuf::from(cwd),
+                occupant_generation: 2,
+                archived: crate::persist::ArchivedAgentMeta {
+                    at: "2026-08-26T00:00:00Z".into(),
+                    by: "tester".into(),
+                    reason: None,
+                },
+                parked_work: Vec::new(),
+            });
+    }
+
+    #[tokio::test]
+    async fn agent_unarchive_fresh_starts_clean_and_removes_record() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        let cwd = app.state.archived_agents[0].cwd.clone();
+        assert_eq!(app.state.archived_agents.len(), 1);
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: true,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.state.archived_agents.is_empty());
+
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+        let terminal = app
+            .state
+            .terminals
+            .get(&tid)
+            .expect("fresh unarchive resumes into the same terminal id");
+        // No resume plan is armed — the agent starts clean.
+        assert!(
+            terminal.pending_agent_resume_plan.is_none(),
+            "fresh unarchive must not attach a pending resume plan"
+        );
+        // Identity and launch cwd are still preserved.
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.cwd, cwd);
+        assert!(app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.attached_terminal_id == tid));
+    }
+
+    #[tokio::test]
+    async fn agent_unarchive_path_kind_missing_session_errors_then_fresh_succeeds() {
+        let mut app = app_with_agent();
+        let missing = "/nonexistent/herdr-h2-test/omp-session.json";
+        assert!(
+            !std::path::Path::new(missing).exists(),
+            "test fixture path must not exist"
+        );
+        push_archived(
+            &mut app,
+            "omp-one",
+            "omp",
+            "herdr:omp",
+            "omp",
+            crate::agent_resume::AgentSessionRefKind::Path,
+            missing,
+            "/tmp/omp",
+        );
+
+        // Without --fresh the lost session file is fatal, and the record stays
+        // archived so the operator can retry.
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "omp-one".into(),
+                fresh: false,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "session_lost");
+        assert_eq!(app.state.archived_agents.len(), 1, "archive left intact");
+
+        // With --fresh the probe is skipped and the agent starts clean.
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "omp-one".into(),
+                fresh: true,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.state.archived_agents.is_empty());
+        let tid = crate::terminal::TerminalId::from_persisted("term-omp-one".to_string());
+        let terminal = app
+            .state
+            .terminals
+            .get(&tid)
+            .expect("fresh unarchive brings the terminal back");
+        assert!(terminal.pending_agent_resume_plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_unarchive_id_kind_ignores_existence_probe_and_arms_plan() {
+        // Regression guard: the existence probe is PATH-kind only. An ID-kind
+        // ref whose value happens to look like a missing path must still resume.
+        let mut app = app_with_agent();
+        let path_shaped_id = "/nonexistent/herdr-h2-test/looks-like-a-path";
+        assert!(!std::path::Path::new(path_shaped_id).exists());
+        push_archived(
+            &mut app,
+            "claude-one",
+            "claude",
+            "herdr:claude",
+            "claude",
+            crate::agent_resume::AgentSessionRefKind::Id,
+            path_shaped_id,
+            "/tmp/claude",
+        );
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "claude-one".into(),
+                fresh: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.state.archived_agents.is_empty());
+
+        let tid = crate::terminal::TerminalId::from_persisted("term-claude-one".to_string());
+        let plan = app
+            .state
+            .terminals
+            .get(&tid)
+            .expect("id-kind unarchive resumes into the same terminal id")
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("id-kind unarchive still arms a resume plan");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                path_shaped_id.to_string(),
+            ]
+        );
     }
 
     #[test]

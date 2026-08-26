@@ -435,10 +435,26 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+/// Validate `agent list` flags. `--json` is accepted as a no-op — bare
+/// `agent list` already emits JSON via `print_response`, so the flag only makes
+/// the documented contract copy-safe. Any other argument is rejected. Returns
+/// the exit code to surface on rejection.
+fn parse_agent_list_args(args: &[String]) -> Result<(), i32> {
+    for arg in args {
+        match arg.as_str() {
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Err(2);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: herdr agent list");
-        return Ok(2);
+    if let Err(code) = parse_agent_list_args(args) {
+        return Ok(code);
     }
 
     super::print_response(&super::send_request(&Request {
@@ -869,13 +885,16 @@ fn agent_archive(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr agent unarchive <target> [--json]";
+    const USAGE: &str = "usage: herdr agent unarchive <target> [--fresh] [--json]";
     let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
         eprintln!("{USAGE}");
         return Ok(2);
     };
+    let mut fresh = false;
     for arg in &args[1..] {
         match arg.as_str() {
+            // Start a clean agent instead of resuming the archived session.
+            "--fresh" => fresh = true,
             // Output is already JSON via print_response; accepted for symmetry.
             "--json" => {}
             other => {
@@ -889,6 +908,7 @@ fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:unarchive".into(),
         method: Method::AgentUnarchive(AgentUnarchiveParams {
             target: target.clone(),
+            fresh,
         }),
     })?)
 }
@@ -1053,7 +1073,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]");
-    eprintln!("  herdr agent unarchive <target> [--json]");
+    eprintln!("  herdr agent unarchive <target> [--fresh] [--json]");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
@@ -1074,4 +1094,26 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_list_accepts_json_flag_as_no_op() {
+        // Bare `agent list` already emits JSON; `--json` is copy-safe and does
+        // not trip the reject path.
+        assert_eq!(parse_agent_list_args(&[]), Ok(()));
+        assert_eq!(parse_agent_list_args(&["--json".to_string()]), Ok(()));
+    }
+
+    #[test]
+    fn agent_list_rejects_unknown_option() {
+        assert_eq!(parse_agent_list_args(&["--bogus".to_string()]), Err(2));
+        assert_eq!(
+            parse_agent_list_args(&["--json".to_string(), "--bogus".to_string()]),
+            Err(2)
+        );
+    }
 }
