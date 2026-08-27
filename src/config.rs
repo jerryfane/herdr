@@ -11,9 +11,9 @@ mod window_title;
 
 pub use self::{
     io::{
-        config_diagnostic_summary, config_dir, config_path, load_live_config,
-        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
-        upsert_section_value,
+        append_accounts_block, config_diagnostic_summary, config_dir, config_path,
+        load_live_config, remove_keybinding_config_sections, remove_section_key, state_dir,
+        upsert_section_bool, upsert_section_value,
     },
     keybinds::{
         format_key_combo, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
@@ -21,10 +21,10 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        auth_env_vars_to_clear, default_config_dir, is_default_config_dir, kind_for_config_env_var,
-        validated_sidebar_bounds, AccountConfig, AgentPanelSortConfig, CapabilityTier, Config,
-        ConfigReloadReport, ConfigReloadStatus, FederationConfig, FederationPeer,
-        HostCursorModeConfig, NewTerminalCwdConfig, PushConfig, ShellModeConfig,
+        auth_env_vars_to_clear, default_config_dir, env_var_for_kind, is_default_config_dir,
+        kind_for_config_env_var, validated_sidebar_bounds, AccountConfig, AgentPanelSortConfig,
+        CapabilityTier, Config, ConfigReloadReport, ConfigReloadStatus, FederationConfig,
+        FederationPeer, HostCursorModeConfig, NewTerminalCwdConfig, PushConfig, ShellModeConfig,
         SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,

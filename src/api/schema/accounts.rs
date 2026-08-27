@@ -27,6 +27,22 @@ pub struct AccountInfo {
     pub usage: Option<AccountUsage>,
 }
 
+/// `accounts.create` — register a NEW credential account (in-app add-account). Creates
+/// the config-home directory and appends an `[[accounts]]` entry to config.toml, then
+/// reloads so it shows up in `accounts.list`. The client then drives login into it. It
+/// stores only non-secret metadata; no credential is written here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AccountsCreateParams {
+    /// Harness kind: claude/codex/kimi.
+    pub kind: String,
+    /// Human label shown in the list.
+    pub label: String,
+    /// Config-home directory to use. Absent → the server derives a fresh default for the
+    /// kind (e.g. `~/.claude-<n>`) that does not collide with an existing account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+}
+
 /// One rate-limit window for an account (e.g. a 5-hour or weekly bucket).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct UsageWindow {

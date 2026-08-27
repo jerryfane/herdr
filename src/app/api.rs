@@ -1406,6 +1406,9 @@ impl App {
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AccountsList(_) => return self.handle_accounts_list(request.id),
+            Method::AccountsCreate(params) => {
+                return self.handle_accounts_create(request.id, params)
+            }
             Method::AgentKinds(_) => return self.handle_agent_kinds(request.id),
             Method::FsListDir(params) => return self.handle_fs_list_dir(request.id, params),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
