@@ -26,6 +26,62 @@ pub(crate) enum AccountResolveError {
     },
 }
 
+/// Pick a config-home for a new account of `kind`: the harness default (`~/.claude`),
+/// else `~/.claude-2`, `-3`, … — the first that is neither already registered nor
+/// present on disk (so a new account never clobbers an existing config-home). `None`
+/// when the kind has no default config-home lever.
+fn derive_fresh_config_dir(accounts: &[AccountConfig], kind: &str) -> Option<String> {
+    let base = crate::config::default_config_dir(kind)?
+        .to_string_lossy()
+        .into_owned();
+    for n in 1..1000u32 {
+        let candidate = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let taken = accounts
+            .iter()
+            .any(|account| account.config_dir == candidate)
+            || Path::new(&candidate).exists();
+        if !taken {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// A fresh, unique account id: a lowercase slug of the label (fallback: the kind),
+/// suffixed `-2`, `-3`, … if that base is already an account id.
+fn fresh_account_id(accounts: &[AccountConfig], kind: &str, label: &str) -> String {
+    let slug: String = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    let base = if slug.is_empty() {
+        kind.to_string()
+    } else {
+        slug
+    };
+    if !accounts.iter().any(|account| account.id == base) {
+        return base;
+    }
+    for n in 2..1000u32 {
+        let candidate = format!("{base}-{n}");
+        if !accounts.iter().any(|account| account.id == candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", accounts.len() + 1)
+}
+
 impl App {
     /// The complete, deliberate `accounts.list` response: every configured
     /// account with best-effort, locally-derived usage. Read-only; returns only
@@ -50,6 +106,90 @@ impl App {
             })
             .collect();
         encode_success(id, ResponseResult::AccountsList { accounts })
+    }
+
+    /// `accounts.create`: register a NEW account. Validates the kind, derives a fresh
+    /// unique id + config-home (or takes the caller's), creates the directory, appends
+    /// an `[[accounts]]` block to config.toml (append-only), reloads, and returns the
+    /// refreshed `accounts.list`. Writes only non-secret metadata — the client drives
+    /// login into the new config-home separately.
+    pub(super) fn handle_accounts_create(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AccountsCreateParams,
+    ) -> String {
+        let kind = params.kind.trim().to_string();
+        let label = params.label.trim().to_string();
+        if crate::config::env_var_for_kind(&kind).is_none() {
+            return super::responses::encode_error(
+                id,
+                "invalid_kind",
+                format!("unknown account kind '{kind}' (expected claude, codex, or kimi)"),
+            );
+        }
+        if label.is_empty() {
+            return super::responses::encode_error(
+                id,
+                "invalid_label",
+                "label must not be empty".to_string(),
+            );
+        }
+        let config_dir = match params
+            .config_dir
+            .map(|dir| dir.trim().to_string())
+            .filter(|dir| !dir.is_empty())
+        {
+            Some(dir) => dir,
+            None => match derive_fresh_config_dir(&self.loaded_accounts, &kind) {
+                Some(dir) => dir,
+                None => {
+                    return super::responses::encode_error(
+                        id,
+                        "no_default_config_dir",
+                        format!("couldn't derive a config-home for '{kind}'; pass config_dir"),
+                    )
+                }
+            },
+        };
+        if self
+            .loaded_accounts
+            .iter()
+            .any(|account| account.config_dir == config_dir)
+        {
+            return super::responses::encode_error(
+                id,
+                "config_dir_in_use",
+                format!("an account already uses {config_dir}"),
+            );
+        }
+        let account_id = fresh_account_id(&self.loaded_accounts, &kind, &label);
+        if let Err(err) = std::fs::create_dir_all(&config_dir) {
+            return super::responses::encode_error(
+                id,
+                "config_dir_create_failed",
+                format!("couldn't create {config_dir}: {err}"),
+            );
+        }
+        let (write_id, write_kind, write_label, write_dir) = (account_id, kind, label, config_dir);
+        let wrote = self.update_config_file("new account", move |content| {
+            crate::config::append_accounts_block(
+                content,
+                &write_id,
+                &write_kind,
+                &write_label,
+                &write_dir,
+            )
+        });
+        if !wrote {
+            return super::responses::encode_error(
+                id,
+                "config_write_failed",
+                "couldn't write the new account to config.toml".to_string(),
+            );
+        }
+        self.apply_config_from_disk(false);
+        // Return the refreshed list so the client picks up the new account.
+        self.handle_accounts_list(id)
     }
 
     /// The usage to report for one account, without ever blocking the app loop.
@@ -486,6 +626,30 @@ fn decode_jwt_email(jwt: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acct(id: &str, kind: &str, config_dir: &str) -> AccountConfig {
+        AccountConfig {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            label: id.to_string(),
+            config_dir: config_dir.to_string(),
+        }
+    }
+
+    #[test]
+    fn fresh_account_id_slugs_the_label_and_dedupes() {
+        let existing = vec![acct("claude", "claude", "/root/.claude")];
+        assert_eq!(fresh_account_id(&existing, "claude", "My Work!"), "my-work");
+        // Base already an id → suffix.
+        assert_eq!(fresh_account_id(&existing, "claude", "claude"), "claude-2");
+        // Empty/symbol-only label → fall back to the kind.
+        assert_eq!(fresh_account_id(&existing, "codex", "  ---  "), "codex");
+    }
+
+    #[test]
+    fn derive_fresh_config_dir_is_none_for_a_kind_without_a_default() {
+        assert_eq!(derive_fresh_config_dir(&[], "gemini"), None);
+    }
 
     fn test_app_with_accounts(accounts: Vec<AccountConfig>) -> App {
         let config = crate::config::Config {

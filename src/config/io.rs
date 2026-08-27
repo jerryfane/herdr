@@ -595,6 +595,37 @@ pub(crate) fn upsert_top_level_bool(content: &str, key: &str, value: bool) -> St
     }
 }
 
+/// Append a new `[[accounts]]` array-of-tables entry to a config.toml body. APPEND-ONLY
+/// — everything above is preserved byte-for-byte (comments included); only a well-formed
+/// block is added at the end, separated by a blank line. String values are TOML-escaped.
+/// Used by `accounts.create`.
+pub fn append_accounts_block(
+    content: &str,
+    id: &str,
+    kind: &str,
+    label: &str,
+    config_dir: &str,
+) -> String {
+    let mut out = content.to_string();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str("[[accounts]]\n");
+    out.push_str(&format!("id = {}\n", toml_basic_string(id)));
+    out.push_str(&format!("kind = {}\n", toml_basic_string(kind)));
+    out.push_str(&format!("label = {}\n", toml_basic_string(label)));
+    out.push_str(&format!("config_dir = {}\n", toml_basic_string(config_dir)));
+    out
+}
+
+/// Quote a value as a TOML basic string, escaping backslashes and double-quotes.
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Write a key = value pair in a TOML section (creates section if missing).
 pub fn upsert_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
     upsert_section_raw(content, section, key, value)
@@ -751,6 +782,43 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_accounts_block_is_append_only_escapes_and_reparses() {
+        let base = "[server]\nheadless_cols = 120\n";
+        let out =
+            append_accounts_block(base, "claude-2", "claude", "My \"Max\"", "/root/.claude-2");
+        assert!(out.starts_with(base), "existing content preserved verbatim");
+        assert!(out.contains("[[accounts]]\n"));
+        assert!(out.contains("id = \"claude-2\"\n"));
+        assert!(out.contains("kind = \"claude\"\n"));
+        assert!(out.contains("config_dir = \"/root/.claude-2\"\n"));
+        assert!(
+            out.contains("label = \"My \\\"Max\\\"\"\n"),
+            "quotes escaped: {out}"
+        );
+        // The result must still be valid TOML with the new account in the array.
+        let parsed: toml::Value = toml::from_str(&out).expect("valid TOML");
+        let accounts = parsed
+            .get("accounts")
+            .and_then(|value| value.as_array())
+            .expect("accounts array");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].get("id").and_then(|value| value.as_str()),
+            Some("claude-2")
+        );
+    }
+
+    #[test]
+    fn append_accounts_block_onto_empty_config() {
+        let out = append_accounts_block("", "a", "claude", "A", "/root/.a");
+        assert!(
+            out.starts_with("[[accounts]]\n"),
+            "no leading blank line on empty input: {out:?}"
+        );
+        assert!(toml::from_str::<toml::Value>(&out).is_ok());
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

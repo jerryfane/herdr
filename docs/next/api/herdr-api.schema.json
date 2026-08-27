@@ -1544,6 +1544,31 @@
     },
     "request": {
       "$defs": {
+        "AccountsCreateParams": {
+          "description": "`accounts.create` — register a NEW credential account (in-app add-account). Creates\nthe config-home directory and appends an `[[accounts]]` entry to config.toml, then\nreloads so it shows up in `accounts.list`. The client then drives login into it. It\nstores only non-secret metadata; no credential is written here.",
+          "properties": {
+            "config_dir": {
+              "description": "Config-home directory to use. Absent → the server derives a fresh default for the\nkind (e.g. `~/.claude-<n>`) that does not collide with an existing account.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Harness kind: claude/codex/kimi.",
+              "type": "string"
+            },
+            "label": {
+              "description": "Human label shown in the list.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "label"
+          ],
+          "type": "object"
+        },
         "AgentArchiveParams": {
           "description": "`agent.archive` — take an agent out of active rotation (issue #173). The pane\nis released but the session ref is preserved, so `agent.unarchive` can resume\n(not recreate) it later. Rejected when the agent is mid-turn unless `force`.",
           "properties": {
@@ -6137,6 +6162,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "accounts.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AccountsCreateParams"
             }
           },
           "required": [
