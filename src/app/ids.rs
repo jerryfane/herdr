@@ -41,7 +41,7 @@ impl App {
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
-        extra_env: Vec<(String, String)>,
+        account_env: crate::config::AccountLaunchEnv,
     ) -> Option<crate::pane::PaneLaunchEnv> {
         let workspace_id = self.public_workspace_id(ws_idx);
         let ws = self.state.workspaces.get(ws_idx)?;
@@ -49,7 +49,7 @@ impl App {
         let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
         let pane_id = self.public_pane_id(ws_idx, pane_id)?;
         Some(
-            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_identity(
+            crate::pane::PaneLaunchEnv::from_account(account_env).with_identity(
                 workspace_id,
                 tab_id,
                 pane_id,

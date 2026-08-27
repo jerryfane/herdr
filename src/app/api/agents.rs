@@ -235,7 +235,10 @@ impl App {
             terminal.respawn_shell_on_exit = true;
             match account_env {
                 Some((account_id, env)) => {
-                    terminal.pending_launch_env = env;
+                    // Store the override vars only. The clear-list is re-derived at resume:
+                    // for a secondary account from the config-home key, and for a primary
+                    // account (empty vars) from `agent_account` via the registry.
+                    terminal.pending_launch_env = env.vars;
                     terminal.agent_account = Some(account_id);
                 }
                 None => terminal.pending_launch_env.clear(),
@@ -2198,6 +2201,88 @@ mod tests {
             vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
             "a plain restart keeps the remembered account"
         );
+    }
+
+    /// THE POINT OF THE WHOLE DIAGNOSTIC: an agent says which account it is on.
+    ///
+    /// During the incident nothing did. The API answered `ok`, the pane count was right,
+    /// and the only evidence that 11 agents had come back on the WRONG account lived in
+    /// each child's `/proc/<pid>/environ`. This is that fact, reported by the daemon.
+    #[tokio::test]
+    async fn an_agent_reports_the_account_it_runs_under() {
+        let mut app = app_with_agent();
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        }];
+        let terminal_id = arm_codex_agent(&mut app, "codexseat");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("work".to_string());
+
+        let info = app
+            .agent_info_for_target("codexseat")
+            .expect("agent info for a live agent");
+        assert_eq!(info.account.as_deref(), Some("work"));
+        assert_eq!(
+            info.account_config_dir.as_deref(),
+            Some("/home/x/.codex-work"),
+            "the config-home is the fact that decides which transcript is written"
+        );
+        assert!(!info.account_unresolved);
+    }
+
+    /// A recorded account that is GONE is an error state a person must see, not an agent
+    /// that quietly looks idle. This pane will refuse to resume rather than come back on
+    /// the default account, and the reason has to reach the surface.
+    #[tokio::test]
+    async fn an_account_that_no_longer_resolves_is_reported_as_an_error_state() {
+        let mut app = app_with_agent();
+        // Registry deliberately does NOT contain "retired".
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        }];
+        let terminal_id = arm_codex_agent(&mut app, "codexseat");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("retired".to_string());
+
+        let info = app
+            .agent_info_for_target("codexseat")
+            .expect("agent info for a live agent");
+        assert_eq!(info.account.as_deref(), Some("retired"));
+        assert!(
+            info.account_unresolved,
+            "an unresolvable account must be surfaced; it is why the agent will not resume"
+        );
+        assert!(
+            info.account_config_dir.is_none(),
+            "there is no config-home to report for an account that is not registered"
+        );
+    }
+
+    /// The NEGATIVE half: a pane with no account invents nothing. Without this, the two
+    /// tests above would pass just as well against a builder that hard-coded a value.
+    #[tokio::test]
+    async fn an_agent_without_an_account_reports_none_and_no_error() {
+        let mut app = app_with_agent();
+        arm_codex_agent(&mut app, "codexseat");
+
+        let info = app
+            .agent_info_for_target("codexseat")
+            .expect("agent info for a live agent");
+        assert_eq!(info.account, None);
+        assert_eq!(info.account_config_dir, None);
+        assert!(!info.account_unresolved);
     }
 
     #[tokio::test]

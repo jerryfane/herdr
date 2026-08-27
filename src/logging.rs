@@ -355,6 +355,37 @@ pub(crate) fn session_restored(workspaces: usize, outcome: &'static str) {
     );
 }
 
+/// Report, per pane, which account a resumed agent actually launched under.
+///
+/// Exists because the routing failure that cost this fleet ~2 hours of apparent history
+/// was completely silent: the API answered `ok`, the pane count was right, and the only
+/// evidence of the wrong account was in each child process's `/proc/<pid>/environ`. Proving
+/// a restore was correct meant reading that by hand, which nobody will do routinely.
+///
+/// Records the account ID and the config-home PATH only — never a credential value.
+/// `config_dir` is `None` for an account that deliberately applies no override (a primary
+/// account on the harness default config-home, issue #94), which is not the same as no
+/// account: `account` carries that distinction.
+pub(crate) fn agent_account_routing(
+    pane: u32,
+    terminal: &str,
+    account: Option<&str>,
+    config_dir: Option<&str>,
+    cleared_conflicting_auth: bool,
+) {
+    tracing::info!(
+        event = "agent.account_routing",
+        subsystem = "agents",
+        outcome = "resumed",
+        pane,
+        terminal,
+        account = account.unwrap_or("<none>"),
+        config_dir = config_dir.unwrap_or("<harness-default>"),
+        cleared_conflicting_auth,
+        "resumed agent account routing"
+    );
+}
+
 pub(crate) fn update_check_started() {
     tracing::info!(
         event = "update.check.start",

@@ -82,7 +82,7 @@ impl From<&AccountConfig> for AccountRow {
     fn from(account: &AccountConfig) -> Self {
         let launch_env = account
             .launch_env()
-            .map(|pairs| pairs.into_iter().collect::<BTreeMap<String, String>>());
+            .map(|env| env.vars.into_iter().collect::<BTreeMap<String, String>>());
         Self {
             id: account.id.clone(),
             kind: account.kind.clone(),

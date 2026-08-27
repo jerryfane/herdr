@@ -301,6 +301,18 @@ pub struct TerminalState {
     /// keeps the same account; an explicit swap overrides it. Independent of the
     /// session-ref churn from hook reports.
     pub agent_account: Option<String>,
+    /// Set when a resume was REFUSED because `agent_account` no longer resolves to a
+    /// registered account. Holds the unresolved account id.
+    ///
+    /// Two jobs. It stops the refusal retrying every tick — the resume plan is kept (so
+    /// re-registering the account can still bring the agent back) but the pane is skipped
+    /// as a resume candidate, instead of re-refusing and re-logging forever. And it is the
+    /// fact the API surfaces, so a seat that did not come back says WHY rather than
+    /// looking like an ordinary idle shell.
+    ///
+    /// Not persisted: re-derived on the next restore attempt, and cleared when the
+    /// accounts registry reloads so a re-added account is picked straight up.
+    pub account_resume_blocked: Option<String>,
 }
 
 impl TerminalState {
@@ -348,6 +360,7 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             pending_launch_env: Vec::new(),
+            account_resume_blocked: None,
             agent_account: None,
         }
     }

@@ -630,13 +630,15 @@ impl App {
         // Reuse any account config-home env armed for this pane so a bare-shell
         // fallback keeps the same account. Empty for an ordinary launch-pane
         // respawn, so that path stays byte-identical.
-        let extra_env = terminal.pending_launch_env.clone();
+        let account_env = crate::config::AccountLaunchEnv::from_resolved_vars(
+            terminal.pending_launch_env.clone(),
+        );
         let (rows, cols) = self
             .terminal_runtimes
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
             .unwrap_or_else(|| self.state.estimate_pane_size());
-        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, extra_env) else {
+        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, account_env) else {
             return false;
         };
         let runtime = match crate::terminal::TerminalRuntime::spawn(
