@@ -236,24 +236,45 @@ impl App {
     /// unknown kinds skip the fetch entirely and use the local read.
     fn account_usage_cached(&mut self, account: &AccountConfig) -> (Option<AccountUsage>, bool) {
         if super::usage_fetch::kind_supports_live_usage(&account.kind) {
-            if let Some(cached) = self.usage_cache.get(&account.id) {
-                if cached.fetched_at.elapsed() < super::usage_fetch::usage_ttl(&account.kind) {
-                    return (Some(cached.usage.clone()), cached.active);
+            // Copy out what this response needs so the immutable cache borrow ends before
+            // the in-flight set below is touched mutably.
+            let cached = self
+                .usage_cache
+                .get(&account.id)
+                .map(|cached| (cached.fetched_at, cached.usage.clone(), cached.active));
+            let fresh = cached.as_ref().is_some_and(|(fetched_at, _, _)| {
+                fetched_at.elapsed() < super::usage_fetch::usage_ttl(&account.kind)
+            });
+            if !fresh {
+                // Missing or stale: kick a background refresh if one isn't already
+                // running for this account. `insert` returns false when present.
+                if self.usage_refresh_inflight.insert(account.id.clone()) {
+                    spawn_usage_fetch(
+                        self.event_tx.clone(),
+                        account.id.clone(),
+                        account.kind.clone(),
+                        account.config_dir.clone(),
+                    );
                 }
             }
-            // Missing or stale: kick a background refresh if one isn't already
-            // running for this account. `insert` returns false when present.
-            if self.usage_refresh_inflight.insert(account.id.clone()) {
-                spawn_usage_fetch(
-                    self.event_tx.clone(),
-                    account.id.clone(),
-                    account.kind.clone(),
-                    account.config_dir.clone(),
-                );
+            // SERVE A STALE READING RATHER THAN A BLANK ONE.
+            //
+            // A merely-stale cache used to be discarded here, dropping the response to the
+            // local read below — which for claude reports NO usage windows at all, because
+            // claude has no local usage source the way codex does. The visible effect was
+            // a meter that emptied itself the moment the TTL lapsed and stayed empty for
+            // as long as live fetches kept failing, which reads as "my usage disappeared"
+            // rather than "this number is a few minutes old".
+            //
+            // A slightly old number is strictly better than no number, and the refresh
+            // kicked above replaces it as soon as it lands. Only a genuinely empty cache
+            // falls through to the local read.
+            if let Some((_, usage, active)) = cached {
+                return (Some(usage), active);
             }
         }
-        // This response falls back to the honest local read while any live fetch
-        // is in flight.
+        // No cached reading at all: the honest local read (a real snapshot for codex,
+        // metadata-only for claude).
         account_usage(account)
     }
 
@@ -824,8 +845,16 @@ mod tests {
         assert_eq!(app.usage_refresh_inflight.len(), 1);
     }
 
+    /// A STALE reading is still served, and a refresh is scheduled behind it.
+    ///
+    /// This test previously asserted the opposite — that a stale entry is discarded and the
+    /// response drops to the local read. That WAS the behaviour, and it is what made the
+    /// owner's usage "disappear": claude has no local usage source (codex does), so
+    /// discarding a stale entry emptied the meter the instant the TTL lapsed, and it stayed
+    /// empty for as long as live fetches kept failing. A few-minutes-old number is strictly
+    /// better than no number.
     #[test]
-    fn stale_live_cache_entry_falls_back_and_reschedules() {
+    fn stale_live_cache_entry_is_still_served_while_it_refreshes() {
         let mut app = test_app_with_accounts(vec![account(
             "work",
             "codex",
@@ -853,10 +882,63 @@ mod tests {
 
         let response = app.handle_accounts_list("req".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        // Stale entry is NOT served; this response uses the local read (none
-        // here) and a refresh is scheduled.
-        assert!(value["result"]["accounts"][0].get("usage").is_none());
+        // The stale numbers are still there ...
+        let usage = &value["result"]["accounts"][0]["usage"];
+        assert_eq!(usage["windows"][0]["label"], "5h");
+        assert_eq!(usage["windows"][0]["used_percent"], 50.0);
+        // ... and a refresh is scheduled to replace them.
         assert!(app.usage_refresh_inflight.contains("work"));
+    }
+
+    /// The claude shape specifically: no local usage source, so discarding a stale cache
+    /// leaves NOTHING. This is the exact case the owner hit — a meter that emptied itself —
+    /// and it is why serving stale matters more for claude than for codex.
+    #[test]
+    fn a_stale_claude_reading_does_not_blank_the_meter() {
+        let mut app = test_app_with_accounts(vec![account(
+            "primary",
+            "claude",
+            "/tmp/does-not-exist-claude-stale",
+        )]);
+        let mut usage = AccountUsage {
+            windows: vec![
+                UsageWindow {
+                    label: "5h".to_string(),
+                    used_percent: Some(32.0),
+                    resets_at: None,
+                    status: Some("ok".to_string()),
+                },
+                UsageWindow {
+                    label: "weekly".to_string(),
+                    used_percent: Some(24.0),
+                    resets_at: None,
+                    status: Some("ok".to_string()),
+                },
+            ],
+            source: Some("live".to_string()),
+            ..Default::default()
+        };
+        usage.backfill_flat_fields();
+        // Well beyond the claude TTL (300s).
+        app.usage_cache.insert(
+            "primary".to_string(),
+            crate::app::api::usage_fetch::CachedUsage {
+                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(3_600),
+                usage,
+                active: true,
+            },
+        );
+
+        let response = app.handle_accounts_list("req".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let usage = &value["result"]["accounts"][0]["usage"];
+        assert_eq!(
+            usage["windows"].as_array().map(Vec::len),
+            Some(2),
+            "a stale claude reading must not collapse to an empty meter"
+        );
+        assert_eq!(usage["windows"][0]["used_percent"], 32.0);
+        assert!(app.usage_refresh_inflight.contains("primary"));
     }
 
     #[test]
