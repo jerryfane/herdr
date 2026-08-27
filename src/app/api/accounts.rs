@@ -192,6 +192,42 @@ impl App {
         self.handle_accounts_list(id)
     }
 
+    /// `accounts.remove`: unregister an account by id — remove its `[[accounts]]` block
+    /// from config.toml and reload. Does NOT delete the config-home directory or any
+    /// credentials (the entry can be re-added later). Returns the refreshed
+    /// `accounts.list`; errors if the id is not a known account.
+    pub(super) fn handle_accounts_remove(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AccountsRemoveParams,
+    ) -> String {
+        let target = params.id.trim().to_string();
+        if !self
+            .loaded_accounts
+            .iter()
+            .any(|account| account.id == target)
+        {
+            return super::responses::encode_error(
+                id,
+                "unknown_account",
+                format!("no account with id '{target}'"),
+            );
+        }
+        let removed_id = target;
+        let wrote = self.update_config_file("remove account", move |content| {
+            crate::config::remove_accounts_block(content, &removed_id)
+        });
+        if !wrote {
+            return super::responses::encode_error(
+                id,
+                "config_write_failed",
+                "couldn't update config.toml".to_string(),
+            );
+        }
+        self.apply_config_from_disk(false);
+        self.handle_accounts_list(id)
+    }
+
     /// The usage to report for one account, without ever blocking the app loop.
     ///
     /// For a kind with a live provider (Codex/Claude): serve a fresh (< per-kind

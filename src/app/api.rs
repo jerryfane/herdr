@@ -1409,6 +1409,9 @@ impl App {
             Method::AccountsCreate(params) => {
                 return self.handle_accounts_create(request.id, params)
             }
+            Method::AccountsRemove(params) => {
+                return self.handle_accounts_remove(request.id, params)
+            }
             Method::AgentKinds(_) => return self.handle_agent_kinds(request.id),
             Method::FsListDir(params) => return self.handle_fs_list_dir(request.id, params),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
