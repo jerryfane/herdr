@@ -362,7 +362,7 @@ impl App {
 
         let moved = crate::workspace::MovedPane {
             pane_id,
-            pane_state: crate::pane::PaneState::new(terminal_id),
+            pane_state: crate::pane::PaneState::new(terminal_id.clone()),
         };
         let workspace = crate::workspace::Workspace::from_existing_pane(
             record.name.clone(),
@@ -379,11 +379,94 @@ impl App {
         self.state.switch_workspace(ws_idx);
         self.state.mode = crate::app::Mode::Terminal;
         self.emit_workspace_open_events(ws_idx);
+
+        // SPAWN THE RUNTIME NOW — an unarchived pane must never be advertised without
+        // one.
+        //
+        // Everything above rebuilds pure state: a terminal, a pane, a workspace, an
+        // armed resume plan. None of that is a live PTY, and the deferred launcher that
+        // would have spawned one only collects candidates when `view.terminal_area` is
+        // non-zero (`start_pending_agent_resumes`) — geometry a HEADLESS daemon never
+        // has. So on a server with no rendering client the PTY was never spawned, while
+        // `agent.list` and `pane.list` (which read state and treat the runtime as
+        // optional) happily advertised the pane. Every path that needs a real terminal
+        // — `pane.read`, `pane.stream`, `agent.read`, `pane.set_pty_size` — then
+        // answered `pane_not_found` for a pane the same daemon had just listed, and a
+        // client that opened it retried forever.
+        //
+        // Spawn eagerly on the same headless-safe terms `agent.restart` already uses:
+        // `estimate_pane_size` (falls back to a headless size) and
+        // `allow_empty_theme = true`, because an unarchive is an explicit operator
+        // action that must not wait on a host theme a headless daemon may never report.
+        let (rows, cols) = self.state.estimate_pane_size();
+        if !self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true) {
+            // No plan to resume (`fresh`), or the resume launcher declined. The pane
+            // still has to be usable, so give it a plain shell in the archived cwd
+            // rather than leave the dead pane this whole block exists to prevent.
+            self.spawn_plain_runtime_for_unarchived_pane(ws_idx, pane_id, &terminal_id, rows, cols);
+        }
+
         self.state.mark_session_dirty();
         self.schedule_session_save();
 
         self.agent_info(ws_idx, pane_id)
             .ok_or(AgentUnarchiveError::NoResumablePlan)
+    }
+
+    /// Last-resort shell for a pane that unarchived without a resume plan, so the pane
+    /// is openable instead of dead.
+    ///
+    /// Deliberately NOT `respawn_shell_for_launch_pane`: that path calls
+    /// `clear_agent_runtime_identity_after_respawn`, which is right when a launch
+    /// command exited and wrong here — preserving the archived agent's identity is the
+    /// entire point of an unarchive. Returns whether a runtime was installed; a failure
+    /// is logged rather than propagated, because the archive record is already gone and
+    /// surfacing the agent without a shell still beats losing it.
+    fn spawn_plain_runtime_for_unarchived_pane(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        terminal_id: &crate::terminal::TerminalId,
+        rows: u16,
+        cols: u16,
+    ) -> bool {
+        if self.terminal_runtimes.get(terminal_id).is_some() {
+            return true;
+        }
+        let cwd = match self.state.terminals.get(terminal_id) {
+            Some(terminal) => terminal.cwd.clone(),
+            None => return false,
+        };
+        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
+            return false;
+        };
+        let runtime = match crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            &launch_env,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    err = %err,
+                    "unarchive could not spawn a shell for the restored pane"
+                );
+                return false;
+            }
+        };
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        true
     }
 
     pub(super) fn agent_archive_error_body(
