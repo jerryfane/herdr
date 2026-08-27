@@ -14,6 +14,26 @@ struct PendingAgentResumeCandidate {
     cols: u16,
 }
 
+/// What environment a resumed agent should launch with — or that it must NOT launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeLaunchEnv {
+    /// Launch with these extra vars. Empty means the harness default, which is correct for
+    /// a pane that never selected an account.
+    Ready(Vec<(String, String)>),
+    /// The pane RECORDED an account that no longer resolves — removed from the registry,
+    /// renamed, or its config-home gone.
+    ///
+    /// This must not fall back to the default. Falling back is precisely the incident: a
+    /// seat switched to a secondary account came back on the primary and appended to the
+    /// PRIMARY transcript, and the owner experienced that as one to two hours of history
+    /// disappearing while the records sat intact in the other account's file.
+    ///
+    /// Between "never leave a pane unlaunchable" and "never write to the wrong transcript",
+    /// the second wins: an unlaunched agent is visible and recoverable, whereas a divergent
+    /// transcript branch is silent, is discovered late, and costs a manual reconstruction.
+    Unresolvable { account_id: String },
+}
+
 impl App {
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
@@ -202,6 +222,50 @@ impl App {
         changed
     }
 
+    /// The child environment a resumed agent must launch with: the env armed by
+    /// `agent.restart`, or — when nothing is armed — one REBUILT from the account registry
+    /// for the account this terminal belongs to.
+    ///
+    /// The rebuild is the part that matters. "Nothing armed" is the normal state after any
+    /// restart, crash or staged update, and it used to mean the agent resumed under the
+    /// harness DEFAULT. A seat switched to a secondary account then silently began
+    /// appending to the PRIMARY transcript — which reads as hours of work vanishing, while
+    /// the records sit intact in the other account's file.
+    ///
+    /// Only the account ID is persisted, so the config-home is resolved here against the
+    /// live registry: a rotated config-home follows the registry, and no credential material
+    /// is ever written to a snapshot. An id that no longer resolves yields an empty env,
+    /// i.e. the pre-existing default behaviour rather than a failure.
+    ///
+    /// The returned env carries the config-home var, and `apply_pane_launch_env` clears the
+    /// conflicting global auth token whenever it sees one — so routing cannot be overridden
+    /// by a machine-global `CLAUDE_CODE_OAUTH_TOKEN`.
+    pub(crate) fn resume_launch_env(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        agent_kind: &str,
+    ) -> ResumeLaunchEnv {
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return ResumeLaunchEnv::Ready(Vec::new());
+        };
+        if !terminal.pending_launch_env.is_empty() {
+            return ResumeLaunchEnv::Ready(terminal.pending_launch_env.clone());
+        }
+        let Some(account_id) = terminal.agent_account.as_deref() else {
+            // No account was ever selected for this pane: the harness default is correct,
+            // and this is the pre-existing behaviour, unchanged.
+            return ResumeLaunchEnv::Ready(Vec::new());
+        };
+        match self.resolve_account_launch_env(account_id, agent_kind) {
+            Ok(env) => ResumeLaunchEnv::Ready(env),
+            // A pane that RECORDED an account and cannot resolve it must not come back on
+            // the default one. See `ResumeLaunchEnv::Unresolvable`.
+            Err(_) => ResumeLaunchEnv::Unresolvable {
+                account_id: account_id.to_string(),
+            },
+        }
+    }
+
     fn start_pending_agent_resume(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -226,14 +290,37 @@ impl App {
             );
             return false;
         };
-        // Carry the account config-home env armed by `agent.restart` (empty for a
-        // plain restore) so the relaunched shell resumes under the chosen account.
-        let extra_env = self
-            .state
-            .terminals
-            .get(&terminal_id)
-            .map(|terminal| terminal.pending_launch_env.clone())
-            .unwrap_or_default();
+        // Carry the account config-home env armed by `agent.restart`, and REBUILD it from
+        // the account registry when it is absent.
+        //
+        // "Empty for a plain restore" used to be the whole story, and it is exactly how a
+        // fleet loses its account routing: a restart, crash or staged update rebuilds panes
+        // from the snapshot with no armed env, every agent resumes under the harness
+        // default, and a seat that had been switched to a secondary account silently starts
+        // appending to the PRIMARY transcript. That reads as hours of work vanishing when
+        // the records are intact in the other account's file.
+        //
+        // The snapshot persists the account ID only, so the env is resolved HERE, from the
+        // live registry — a rotated config-home follows the registry, and no credential
+        // material is ever written to disk by us.
+        //
+        // AND IF THE RECORDED ACCOUNT NO LONGER RESOLVES, THE AGENT DOES NOT COME BACK AT
+        // ALL. Resuming it on the default account is what wrote hours of work into the
+        // wrong transcript; refusing leaves a shell the operator can see and fix.
+        let extra_env = match self.resume_launch_env(&terminal_id, &plan.agent) {
+            ResumeLaunchEnv::Ready(env) => env,
+            ResumeLaunchEnv::Unresolvable { account_id } => {
+                tracing::error!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    account = %account_id,
+                    session = %plan.argv.last().map(String::as_str).unwrap_or(""),
+                    "refusing to resume: this pane's account no longer resolves, and resuming \
+                     it on the default account would append to the wrong transcript"
+                );
+                return false;
+            }
+        };
         let Some(launch_env) = self
             .find_pane(pane_id)
             .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, extra_env))
@@ -361,7 +448,11 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // NOT `#[cfg(unix)]`: the PTY-spawning tests below are unix-only, but constructing an
+    // `App` is portable (see `app_with_agent` in api/agents.rs, which is ungated). The
+    // account-routing tests need this on every platform — the routing logic they cover is
+    // not unix-specific, and gating them would drop Windows coverage of the exact bug that
+    // sent a fleet's work to the wrong account.
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -385,6 +476,109 @@ mod tests {
             "-c".into(),
             "printf '%s' 'restored agent: shell quoted | marker'; sleep 5".into(),
         ]
+    }
+
+    /// A resumed agent must launch under ITS OWN account, rebuilt from the registry.
+    ///
+    /// The armed env is only present right after `agent.restart`. Every other path —
+    /// ordinary restore, crash recovery, staged update, pane respawn — has nothing armed,
+    /// and that used to mean the agent resumed under the harness DEFAULT. A seat switched
+    /// to a secondary account then silently appended to the PRIMARY transcript, which is
+    /// what made hours of work look lost while the records sat intact elsewhere.
+    #[test]
+    fn a_resumed_agent_launches_under_its_own_account() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent")];
+        app.state.ensure_test_terminals();
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "claudecrazy".into(),
+            kind: "claude".into(),
+            label: "ClaudeCrazy".into(),
+            config_dir: "/root/.claude-9".into(),
+        }];
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+
+        // Nothing armed and no account: the pre-existing default, unchanged.
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            ResumeLaunchEnv::Ready(Vec::new())
+        );
+
+        // Nothing armed, but the pane belongs to an account — rebuild from the registry.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("claudecrazy".to_string());
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            ResumeLaunchEnv::Ready(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/root/.claude-9".to_string()
+            )]),
+            "a resumed agent must be pointed at its own config-home, not the default"
+        );
+
+        // An armed env still wins — `agent.restart` is choosing deliberately.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .pending_launch_env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/armed".to_string())];
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            ResumeLaunchEnv::Ready(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/armed".to_string()
+            )])
+        );
+    }
+
+    /// THE DIVERGENT-BRANCH GUARD — the test that judges the SYMPTOM, not the mechanism.
+    ///
+    /// A pane that recorded an account which no longer resolves must NOT come back on the
+    /// default account. That fallback is exactly the incident: eleven seats switched to a
+    /// secondary account were restored onto the primary and began appending to the PRIMARY
+    /// transcript, and the owner experienced it as one to two hours of history vanishing
+    /// while the records sat intact in the other account's file.
+    ///
+    /// Note what this deliberately does NOT assert: not pane count, not that a session id
+    /// survived, not that a process exists. All three of those PASSED during the incident.
+    #[test]
+    fn a_recorded_account_that_cannot_resolve_refuses_rather_than_re_homing() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("deleted-account".to_string());
+
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            ResumeLaunchEnv::Unresolvable {
+                account_id: "deleted-account".to_string()
+            },
+            "a recorded-but-unresolvable account must REFUSE, not silently resume on the \
+             default account and write to the wrong transcript"
+        );
+        // And specifically: it must not produce a usable env. An empty env is the default
+        // account, which is the failure being prevented.
+        assert!(
+            !matches!(
+                app.resume_launch_env(&terminal_id, "claude"),
+                ResumeLaunchEnv::Ready(_)
+            ),
+            "refusal must not degrade into Ready(empty) — that IS the default account"
+        );
     }
 
     #[cfg(unix)]
