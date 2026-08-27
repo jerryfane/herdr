@@ -419,10 +419,7 @@ impl App {
         // PUT IT BACK WHERE IT CAME FROM. Three tiers, most specific first, mirroring
         // `recover_failed_pane_move` — an archive can outlive its tab or its whole
         // workspace, so each tier must degrade rather than fail.
-        let ws_idx = match self.restore_archived_pane(&record, moved) {
-            Ok(ws_idx) => ws_idx,
-            Err(err) => return Err(err),
-        };
+        let ws_idx = self.restore_archived_pane(&record, moved)?;
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
         self.state.mode = crate::app::Mode::Terminal;
 
