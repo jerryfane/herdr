@@ -177,16 +177,19 @@ impl App {
                     .iter()
                     .find(|account| account.id == account_id)
                 {
-                    if account.kind == "claude"
-                        && !claude_account_has_credentials(&account.config_dir)
-                    {
-                        return encode_error(
-                            id,
-                            "account_not_authenticated",
-                            format!(
-                                "target account {account_id} is logged out (no credentials found); the agent was left on its current account"
-                            ),
-                        );
+                    if account.kind == "claude" {
+                        // The cwd the replacement will resume in — trust is per directory,
+                        // so it can only be judged against this.
+                        let cwd = self
+                            .state
+                            .terminals
+                            .get(&terminal_id)
+                            .map(|terminal| terminal.cwd.to_string_lossy().into_owned());
+                        if let Some(blocker) =
+                            claude_account_launch_blocker(&account.config_dir, cwd.as_deref())
+                        {
+                            return encode_error(id, blocker.code(), blocker.message(account_id));
+                        }
                     }
                 }
             }
@@ -610,6 +613,97 @@ fn claude_account_has_credentials(config_dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Why a target account cannot host a resumed agent yet. Each variant names the stage that
+/// failed, so a caller can say what to fix instead of reporting a bare failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ClaudeLaunchBlocker {
+    /// No credentials in the target config-home.
+    LoggedOut,
+    /// Credentials are present but the profile has never completed first-run setup, so
+    /// `claude` opens its theme/onboarding picker instead of resuming.
+    OnboardingIncomplete,
+    /// The profile has not accepted the trust prompt for this working directory, so
+    /// `claude` opens the trust dialog instead of resuming.
+    DirectoryNotTrusted { cwd: String },
+}
+
+impl ClaudeLaunchBlocker {
+    pub(super) fn code(&self) -> &'static str {
+        match self {
+            Self::LoggedOut => "account_not_authenticated",
+            Self::OnboardingIncomplete => "account_onboarding_incomplete",
+            Self::DirectoryNotTrusted { .. } => "account_directory_not_trusted",
+        }
+    }
+
+    pub(super) fn message(&self, account_id: &str) -> String {
+        match self {
+            Self::LoggedOut => format!(
+                "target account {account_id} is logged out (no credentials found); the agent was left on its current account"
+            ),
+            Self::OnboardingIncomplete => format!(
+                "target account {account_id} has credentials but has not completed first-run setup, so it would open the theme/onboarding picker instead of resuming; the agent was left on its current account"
+            ),
+            Self::DirectoryNotTrusted { cwd } => format!(
+                "target account {account_id} has not trusted {cwd}, so it would open the trust prompt instead of resuming; the agent was left on its current account"
+            ),
+        }
+    }
+}
+
+/// Whether a claude account is READY TO HOST a resumed agent in `cwd`, or the first reason
+/// it is not.
+///
+/// Credentials alone were the old gate, and they are not sufficient: the Aug 27 bulk-switch
+/// incident moved eleven panes onto an account whose credentials were valid the whole time.
+/// The profile had never completed first-run setup and trusted none of the working
+/// directories, so every replacement `claude` opened its theme picker or trust prompt
+/// instead of resuming — eleven live agents destroyed to reach a modal that looks, to the
+/// daemon, like an idle agent.
+///
+/// These are cheap file reads on purpose. The request handler must not block on a
+/// subprocess, so this cannot be `claude auth status`; it catches the states that strand a
+/// seat, not expired credentials (see the note on `claude_account_has_credentials`).
+pub(super) fn claude_account_launch_blocker(
+    config_dir: &str,
+    cwd: Option<&str>,
+) -> Option<ClaudeLaunchBlocker> {
+    if !claude_account_has_credentials(config_dir) {
+        return Some(ClaudeLaunchBlocker::LoggedOut);
+    }
+    let config = std::fs::read_to_string(std::path::Path::new(config_dir).join(".claude.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    // No parsable config at all is the un-onboarded case: a fresh config-home has no
+    // `.claude.json` until the harness writes one on first run.
+    let Some(config) = config else {
+        return Some(ClaudeLaunchBlocker::OnboardingIncomplete);
+    };
+    if config
+        .get("hasCompletedOnboarding")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Some(ClaudeLaunchBlocker::OnboardingIncomplete);
+    }
+    // Trust is per working directory, so it can only be judged against the cwd the agent
+    // will actually resume in. With no cwd to check, do not invent a failure.
+    if let Some(cwd) = cwd {
+        let trusted = config
+            .get("projects")
+            .and_then(|projects| projects.get(cwd))
+            .and_then(|project| project.get("hasTrustDialogAccepted"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !trusted {
+            return Some(ClaudeLaunchBlocker::DirectoryNotTrusted {
+                cwd: cwd.to_string(),
+            });
+        }
+    }
+    None
+}
+
 /// Resolve the on-disk config-home for an account id (or the harness default when `None`).
 fn resolve_config_home(
     accounts: &[crate::config::AccountConfig],
@@ -772,6 +866,206 @@ mod tests {
         // Non-empty creds → authenticated.
         std::fs::write(&creds, "{\"token\":\"x\"}").unwrap();
         assert!(claude_account_has_credentials(&home.to_string_lossy()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The readiness gate, stage by stage.
+    ///
+    /// Credentials alone were the old gate and they are NOT sufficient: in the Aug 27
+    /// incident eleven live agents were killed to move onto an account whose credentials
+    /// were valid the entire time. The profile had never completed first-run setup and
+    /// trusted nothing, so each replacement opened a theme picker or trust prompt instead
+    /// of resuming.
+    #[test]
+    fn launch_blocker_names_each_stage_that_would_strand_a_seat() {
+        let home = swap_temp_root("readiness");
+        let dir = home.to_string_lossy().to_string();
+        let cwd = "/work/repo";
+
+        // No credentials at all.
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::LoggedOut)
+        );
+
+        // Credentials, but no profile yet — the incident's shape.
+        std::fs::write(home.join(".credentials.json"), "{\"token\":\"x\"}").unwrap();
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::OnboardingIncomplete)
+        );
+
+        // A profile that exists but has NOT completed onboarding is still blocked —
+        // presence of the file is not readiness.
+        std::fs::write(home.join(".claude.json"), "{\"projects\":{}}").unwrap();
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::OnboardingIncomplete)
+        );
+
+        // Onboarded, but this directory is untrusted.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{}}",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::DirectoryNotTrusted {
+                cwd: cwd.to_string()
+            })
+        );
+
+        // Trusted for a DIFFERENT directory is not trust for this one.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{\"/other\":{\"hasTrustDialogAccepted\":true}}}",
+        )
+        .unwrap();
+        assert!(matches!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::DirectoryNotTrusted { .. })
+        ));
+
+        // Fully ready.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{\"/work/repo\":{\"hasTrustDialogAccepted\":true}}}",
+        )
+        .unwrap();
+        assert_eq!(claude_account_launch_blocker(&dir, Some(cwd)), None);
+
+        // With no cwd to judge, trust is not invented as a failure.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{}}",
+        )
+        .unwrap();
+        assert_eq!(claude_account_launch_blocker(&dir, None), None);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A READY claude target must still swap successfully.
+    ///
+    /// The gate this file adds only runs for `kind == "claude"`, and the pre-existing
+    /// success test uses codex — so it sails straight past and proves nothing about claude.
+    /// Without this test, a gate that rejected EVERY claude target would look completely
+    /// healthy: all the refusal tests would pass and switching would simply never work
+    /// again. Guarding only the failure direction is how you fix one bug by shipping a
+    /// worse one.
+    #[tokio::test]
+    async fn restart_onto_a_ready_claude_account_still_swaps() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+        // Trust is judged against the cwd the replacement resumes in, so seed the target
+        // profile with exactly this agent's cwd.
+        let cwd = app
+            .state
+            .terminals
+            .get(&tid)
+            .expect("agent terminal")
+            .cwd
+            .to_string_lossy()
+            .into_owned();
+
+        // The agent currently lives on a SOURCE account holding its transcript — a swap
+        // copies the session across, so without this the run fails at migration and never
+        // exercises the swap it is meant to prove.
+        let source = swap_temp_root("restart-ready-src");
+        write_session(&source, "-work", "sess-123", "line1\nline2\n");
+        app.loaded_accounts.push(swap_account("source", &source));
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .expect("agent terminal")
+            .agent_account = Some("source".to_string());
+
+        let home = swap_temp_root("restart-ready");
+        std::fs::write(home.join(".credentials.json"), "{\"token\":\"x\"}").unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "projects": { cwd.clone(): { "hasTrustDialogAccepted": true } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        app.loaded_accounts.push(swap_account("target", &home));
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            crate::api::schema::AgentRestartParams {
+                target: "reviewer".into(),
+                account: Some("target".into()),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("a ready claude target must swap, got: {response}"));
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+
+        // The swap actually armed: resume plan set, account remembered, env pointed at the
+        // target config-home.
+        let terminal = app.state.terminals.get(&tid).expect("terminal survives");
+        assert!(
+            terminal.pending_agent_resume_plan.is_some(),
+            "a permitted swap must arm the resume"
+        );
+        assert_eq!(terminal.agent_account.as_deref(), Some("target"));
+        assert_eq!(
+            terminal.pending_launch_env,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                home.to_string_lossy().into_owned()
+            )]
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&source).ok();
+    }
+
+    /// THE ASSERTION THE INCIDENT LACKED: on a failed preflight the OLD SEAT KEEPS RUNNING.    /// THE ASSERTION THE INCIDENT LACKED: on a failed preflight the OLD SEAT KEEPS RUNNING.
+    ///
+    /// The restart path kills the current runtime before anything proves the replacement
+    /// can resume, so a preflight that passes wrongly costs a live agent. Asserting only
+    /// the error code would not catch a version that returns the error *after* tearing the
+    /// seat down — which is exactly the failure mode being fixed.
+    #[tokio::test]
+    async fn restart_refuses_an_unready_account_and_leaves_the_agent_running() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+
+        // A target with VALID credentials but no completed onboarding — credentials alone
+        // used to be enough to proceed.
+        let home = swap_temp_root("restart-unready");
+        std::fs::write(home.join(".credentials.json"), "{\"token\":\"x\"}").unwrap();
+        app.loaded_accounts.push(swap_account("target", &home));
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            crate::api::schema::AgentRestartParams {
+                target: "reviewer".into(),
+                account: Some("target".into()),
+            },
+        );
+
+        let err: crate::api::schema::ErrorResponse = serde_json::from_str(&response)
+            .expect("an unready target must be refused, not attempted");
+        assert_eq!(err.error.code, "account_onboarding_incomplete");
+
+        // The seat is untouched: no resume plan armed, and the terminal still present.
+        let terminal = app.state.terminals.get(&tid).expect("agent still exists");
+        assert!(
+            terminal.pending_agent_resume_plan.is_none(),
+            "a refused restart must not arm a resume — that is the destructive half"
+        );
+        assert!(
+            !terminal.respawn_shell_on_exit,
+            "a refused restart must not mark the pane for respawn"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
