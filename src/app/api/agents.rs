@@ -2193,6 +2193,261 @@ mod tests {
         );
     }
 
+    /// AN UNARCHIVED AGENT MUST COME BACK WHERE IT LEFT, WITH ITS LABEL.
+    ///
+    /// This is the assertion whose absence let the defect ship. The sibling round-trip
+    /// test accepts a pane in ANY workspace, so restoring into a brand-new one passed it
+    /// while, in production, every restored agent silently lost the pane LABEL that
+    /// fleet tooling binds a role to — healthy-looking and unaddressable.
+    /// `arm_resumable_claude` for a workspace other than the first.
+    ///
+    /// The duplicate-session tests need a SECOND agent holding the same session, and it
+    /// has to exist BEFORE the archive: archiving the last agent in a workspace closes
+    /// that workspace, so a stand-in armed afterwards has nowhere to live.
+    fn arm_resumable_claude_in(app: &mut App, ws_idx: usize, name: &str) -> String {
+        let pane_id = app.state.workspaces[ws_idx].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-123").unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        terminal_id.to_string()
+    }
+
+    #[tokio::test]
+    async fn agent_unarchive_restores_the_original_workspace_tab_and_label() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        // A SECOND pane in the same tab, so the origin workspace SURVIVES the archive.
+        // Without it, archiving the last agent closes the workspace and the origin is
+        // gone — the test would then silently exercise the new-workspace fallback and
+        // could not tell a real restore from it.
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let filler = crate::workspace::MovedPane {
+            pane_id: crate::layout::PaneId::alloc(),
+            pane_state: crate::pane::PaneState::new(crate::terminal::TerminalId::alloc()),
+        };
+        app.state.workspaces[0]
+            .insert_moved_pane_into_tab(
+                0,
+                root,
+                filler,
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                false,
+            )
+            .unwrap_or_else(|_| panic!("second pane must insert, or the origin dies on archive"));
+        // Give the pane a label, the thing that has to survive the round trip.
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+        app.state
+            .terminals
+            .get_mut(&tid)
+            .expect("terminal")
+            .set_manual_label("reviewer".into());
+        let origin_ws = app.public_workspace_id(0);
+        let origin_tab = app.public_tab_id(0, 0).expect("tab id");
+
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        // The origin really was captured — otherwise the restore below could only be
+        // passing by luck of there being one workspace.
+        let record = app.state.archived_agents.first().expect("archived");
+        assert_eq!(
+            record.origin_workspace_id.as_deref(),
+            Some(origin_ws.as_str())
+        );
+        assert_eq!(record.origin_tab_id.as_deref(), Some(origin_tab.as_str()));
+        assert_eq!(record.pane_label.as_deref(), Some("reviewer"));
+
+        app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+
+        // Back in the SAME workspace AND the same tab — asserted by ID, not by count.
+        // A count cannot discriminate here: the fallback also yields one workspace, so
+        // an id-blind assertion would pass on the very behaviour this test exists to
+        // reject.
+        let (restored_ws, restored_tab) = app
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(tab_idx, tab)| {
+                        tab.panes
+                            .values()
+                            .any(|pane| pane.attached_terminal_id == tid)
+                            .then_some((ws_idx, tab_idx))
+                    })
+            })
+            .expect("the restored pane must exist somewhere");
+        assert_eq!(
+            app.public_workspace_id(restored_ws),
+            origin_ws,
+            "unarchive stranded the agent in a different workspace instead of its own"
+        );
+        assert_eq!(
+            app.public_tab_id(restored_ws, restored_tab),
+            Some(origin_tab),
+            "unarchive restored into the right workspace but the wrong tab"
+        );
+        // And the label is back, which is the whole point.
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&tid)
+                .and_then(|terminal| terminal.manual_label.clone())
+                .as_deref(),
+            Some("reviewer"),
+            "the restored pane lost its label, so a role bound to it cannot resolve"
+        );
+    }
+
+    /// An archive can outlive its workspace. When the origin is gone the restore must
+    /// still succeed in a new workspace — the old behaviour, kept as the last tier.
+    #[tokio::test]
+    async fn agent_unarchive_falls_back_to_a_new_workspace_when_the_origin_is_gone() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        // Destroy the origin between archive and unarchive.
+        app.state.workspaces.clear();
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+        let success: SuccessResponse =
+            serde_json::from_str(&response).expect("a lost origin must still restore, not error");
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert_eq!(
+            app.state.workspaces.len(),
+            1,
+            "restored into a fresh workspace"
+        );
+        assert!(app.state.archived_agents.is_empty());
+    }
+
+    /// TWO PROCESSES MUST NEVER SHARE ONE SESSION.
+    ///
+    /// Reproduces the shape seen in production: an agent is archived, a replacement is
+    /// started on the SAME session as a workaround, and then the original is unarchived.
+    /// Without the guard that yields two harness processes appending to one transcript,
+    /// and org actions that cannot be attributed to either.
+    #[tokio::test]
+    async fn agent_unarchive_refuses_a_session_a_live_agent_already_holds() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        // The stand-in holding the same session must exist BEFORE the archive —
+        // archiving the last agent in a workspace closes that workspace.
+        app.state.workspaces.push(Workspace::test_new("standin"));
+        app.state.ensure_test_terminals();
+        arm_resumable_claude_in(&mut app, 1, "reviewer-2");
+
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        assert_eq!(app.state.archived_agents.len(), 1);
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+        let err: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&response).expect("a duplicate resume must be refused");
+        assert_eq!(err.error.code, "session_in_use");
+        // Refusal must be recoverable: the record survives so it can be unarchived once
+        // the other agent is retired.
+        assert_eq!(
+            app.state.archived_agents.len(),
+            1,
+            "a refused unarchive must leave the archive intact"
+        );
+    }
+
+    /// The guard must not fire for `--fresh`, which resumes nothing and therefore cannot
+    /// duplicate anything. A guard that blocked the escape hatch would be worse than no
+    /// guard, because it would strand the operator with no way forward.
+    #[tokio::test]
+    async fn agent_unarchive_fresh_is_not_blocked_by_a_live_session_holder() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.state.workspaces.push(Workspace::test_new("standin"));
+        app.state.ensure_test_terminals();
+        arm_resumable_claude_in(&mut app, 1, "reviewer-2");
+
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: true,
+            },
+        );
+        let success: SuccessResponse =
+            serde_json::from_str(&response).expect("--fresh must remain available");
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.state.archived_agents.is_empty());
+    }
+
     #[test]
     fn agent_unarchive_missing_record_errors() {
         let mut app = app_with_agent();
@@ -2239,6 +2494,11 @@ mod tests {
                     reason: None,
                 },
                 parked_work: Vec::new(),
+                // Origin deliberately absent: these fixtures model a record written
+                // BEFORE the origin was captured, which is the tier-3 fallback path.
+                origin_workspace_id: None,
+                origin_tab_id: None,
+                pane_label: None,
             });
     }
 
@@ -2433,6 +2693,9 @@ mod tests {
                     reason: None,
                 },
                 parked_work: vec![serde_json::json!({"task": "x"})],
+                origin_workspace_id: None,
+                origin_tab_id: None,
+                pane_label: None,
             });
 
         let agents = app.collect_agent_infos();
