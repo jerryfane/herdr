@@ -3364,6 +3364,90 @@ impl PaneRuntime {
 mod tests {
     use super::*;
 
+    /// THE INCIDENT'S ACCEPTANCE CRITERION, AT THE LAST LINK IN THE CHAIN.
+    ///
+    /// A staged update killed 30 panes; on restore all 11 Claude agents relaunched under
+    /// the DEFAULT profile instead of the selected secondary account, and began appending
+    /// to the PRIMARY transcript. The user experienced that as ONE TO TWO HOURS OF AGENT
+    /// HISTORY DISAPPEARING — the bytes were intact in the other account's file the whole
+    /// time.
+    ///
+    /// Which transcript a resumed agent writes to is decided by exactly two things in the
+    /// child environment: the config-home it is pointed at, and whether a machine-global
+    /// auth token is present to override that. Everything upstream — persisting the
+    /// account id, rebuilding the launch env — is only worth anything if it survives to
+    /// HERE.
+    ///
+    /// I claimed in a commit message that the token clearing "comes for free" from this
+    /// function and did not check it. Asserting it is the difference between a mechanism
+    /// that looks right and one that is known to work. The checks that falsely passed
+    /// during the incident — pane counts, restored session ids, a process existing — are
+    /// deliberately not what this test looks at.
+    #[test]
+    fn a_selected_account_reaches_the_child_and_defeats_a_global_token() {
+        let mut cmd = CommandBuilder::new("shell");
+        // The hazard: a machine-global token that overrides CLAUDE_CONFIG_DIR and silently
+        // re-homes the agent onto whichever account minted it.
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "global-token-for-primary");
+
+        let launch_env = PaneLaunchEnv {
+            extra: vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/root/.claude-9".to_string(),
+            )],
+            ..PaneLaunchEnv::default()
+        };
+        apply_pane_launch_env(&mut cmd, &launch_env);
+
+        // The selected account reaches the child ...
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/root/.claude-9"),
+            "the resumed agent must be pointed at the SELECTED account's config-home"
+        );
+        // ... and nothing is left that can override it. This is the assertion whose
+        // absence let the routing claim go unverified.
+        assert!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN").is_none(),
+            "a global OAuth token outranks CLAUDE_CONFIG_DIR; leaving it set sends the \
+             agent's writes to the WRONG account's transcript, which is what the user \
+             experiences as lost history"
+        );
+    }
+
+    /// The negative half: with NO account selected, this function CHANGES NOTHING about
+    /// account routing. A launch that never chose an account must behave exactly as before,
+    /// or the guard above would quietly break every default-account pane.
+    ///
+    /// Asserted as "unchanged from an explicit baseline", NOT as "absent". The first version
+    /// asserted `CLAUDE_CONFIG_DIR` was absent — which depends on the ambient environment of
+    /// whatever machine runs it. It passed in isolation and failed in the full run on this
+    /// box, because this seat itself runs under a secondary account and `CommandBuilder`
+    /// inherits the process environment. A test whose result depends on where it runs is not
+    /// evidence.
+    #[test]
+    fn no_selected_account_does_not_change_account_routing() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("CLAUDE_CONFIG_DIR", "/ambient-home");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "ambient-token");
+
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/ambient-home"),
+            "an empty launch env must not redirect a pane's config-home"
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("ambient-token"),
+            "the token is cleared only when an account override is actually applied"
+        );
+    }
+
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
         let mut cmd = CommandBuilder::new("shell");
