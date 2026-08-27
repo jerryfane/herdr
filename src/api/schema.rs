@@ -179,6 +179,8 @@ pub enum Method {
     AccountsList(EmptyParams),
     #[serde(rename = "accounts.create")]
     AccountsCreate(AccountsCreateParams),
+    #[serde(rename = "accounts.remove")]
+    AccountsRemove(AccountsRemoveParams),
     #[serde(rename = "agent.kinds")]
     AgentKinds(EmptyParams),
     #[serde(rename = "fs.list_dir")]
