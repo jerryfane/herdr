@@ -278,14 +278,15 @@ impl App {
         account_usage(account)
     }
 
-    /// Resolve an account id (matching the agent's kind) to the single
-    /// `(env_var, config_dir)` launch env that points the harness at that
-    /// account's config-home directory.
+    /// Resolve an account id (matching the agent's kind) to the launch env that
+    /// points the harness at that account's config-home AND clears credentials
+    /// that would outrank it. Note the override set can be empty while the
+    /// clear-list is not — see [`crate::config::AccountLaunchEnv`].
     pub(crate) fn resolve_account_launch_env(
         &self,
         account_id: &str,
         agent_kind: &str,
-    ) -> Result<Vec<(String, String)>, AccountResolveError> {
+    ) -> Result<crate::config::AccountLaunchEnv, AccountResolveError> {
         let Some(account) = self
             .loaded_accounts
             .iter()
@@ -735,15 +736,21 @@ mod tests {
 
         assert_eq!(
             app.resolve_account_launch_env("work", "codex").unwrap(),
-            vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())]
+            crate::config::AccountLaunchEnv {
+                vars: vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+                clear_vars: Vec::new(),
+            }
         );
         assert_eq!(
             app.resolve_account_launch_env("personal", "claude")
                 .unwrap(),
-            vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                "/home/x/.claude-personal".to_string()
-            )]
+            crate::config::AccountLaunchEnv {
+                vars: vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/x/.claude-personal".to_string()
+                )],
+                clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            }
         );
     }
 

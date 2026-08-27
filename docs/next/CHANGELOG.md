@@ -18,6 +18,9 @@
 - On Linux and macOS, terminal observers that stop accepting output are disconnected after 30 seconds without write progress. Their pane and other clients keep running; an interrupted stream may end without a final close record. (#3612)
 - Windows terminal cleanup now explicitly resets mouse-reporting modes. The remaining standalone Git Bash detach report in #3748 is still under investigation; do not treat this release as a confirmed fix for that report. (#4055, thanks @JJLiebig)
 
+### Changed
+- Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.
+
 ### Fixed
 - Remote typing, switching, and popup interaction no longer resend the entire pane screen for small changes. Busy SSH sessions use less bandwidth, and idle attached clients avoid unnecessary redraw work. (#3769, #3745, #3822)
 - A stalled SSH machine no longer traps the client away from Local. Clicking a local workspace or agent cancels the unfinished remote switch, and a recovered remote workspace refreshes without an away-and-back selection. Stale screens from before a reconnect are not reused. (#3903, #3842)
