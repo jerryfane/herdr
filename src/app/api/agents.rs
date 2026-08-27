@@ -2046,7 +2046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_unarchive_arms_resume_plan_and_removes_record() {
+    async fn agent_unarchive_resumes_the_session_and_removes_record() {
         let mut app = app_with_agent();
         let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
         app.handle_agent_archive(
@@ -2072,26 +2072,33 @@ mod tests {
         assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
         assert!(app.state.archived_agents.is_empty());
 
-        // Round-trip preserves the terminal identity, and the resumed terminal
-        // carries a pending resume plan for the pending-resume loop to spawn.
+        // Round-trip preserves the terminal identity and resumes the archived session.
+        //
+        // The plan is CONSUMED, not left pending: unarchive now spawns the runtime
+        // itself instead of arming a plan for a render loop that a headless daemon never
+        // runs. A still-pending plan here would mean a second resume fires later.
         let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
         let terminal = app
             .state
             .terminals
             .get(&tid)
             .expect("unarchive resumes into the same terminal id");
-        let plan = terminal
-            .pending_agent_resume_plan
-            .as_ref()
-            .expect("unarchive arms a resume plan");
-        assert_eq!(
-            plan.argv,
-            vec![
-                "claude".to_string(),
-                "--resume".to_string(),
-                "sess-123".to_string()
-            ]
+        assert!(
+            terminal.pending_agent_resume_plan.is_none(),
+            "the resume plan must be consumed by the spawn, or it resumes twice"
         );
+        // The session that was resumed is the archived one — asserted through the
+        // durable field the spawn does not clear, since the plan itself is gone.
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("sess-123")
+        );
+        // The argv that session produces (`claude --resume <id>`) is asserted where it is
+        // built, in `agent_resume`'s own plan tests. Re-deriving it here would only test
+        // this test's copy of the call, not the one unarchive made.
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         // The resumed agent lives on a real pane again.
         assert!(app
@@ -2101,6 +2108,89 @@ mod tests {
             .flat_map(|ws| ws.tabs.iter())
             .flat_map(|tab| tab.panes.values())
             .any(|pane| pane.attached_terminal_id == tid));
+    }
+
+    /// An unarchived pane must come back with a LIVE RUNTIME, not just live state.
+    ///
+    /// This is the assertion whose absence let the bug ship. The sibling test above
+    /// checks the terminal, the plan, the name and that some pane references the
+    /// terminal id — all of which were TRUE while the pane was unusable, because the
+    /// PTY spawn was deferred to a render loop gated on view geometry a headless daemon
+    /// never has. `agent.list` and `pane.list` read state and treat the runtime as
+    /// optional, so they advertised the pane; `pane.read`, `pane.stream` and
+    /// `agent.read` all require the runtime and answered `pane_not_found` for it.
+    ///
+    /// Asserting through the registry rather than a state field is the point: it is the
+    /// thing every runtime-requiring API path actually consults.
+    #[tokio::test]
+    async fn agent_unarchive_leaves_the_pane_with_a_live_runtime() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id.clone());
+        // Archiving really did release the runtime — otherwise a leftover one would let
+        // this test pass without unarchive spawning anything.
+        assert!(
+            app.terminal_runtimes.get(&tid).is_none(),
+            "archive must release the pane's runtime, or this test proves nothing"
+        );
+
+        app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+
+        assert!(
+            app.terminal_runtimes.get(&tid).is_some(),
+            "unarchive advertised a pane with no runtime: every read/stream call on it \
+             answers pane_not_found and a client retries forever"
+        );
+    }
+
+    /// The `--fresh` escape hatch arms no resume plan, so the resume launcher declines —
+    /// and the pane must still get a shell. A pane you cannot open is not an escape
+    /// hatch. Kept separate because `fresh` takes the other branch entirely, and a test
+    /// of the default path cannot reach it.
+    #[tokio::test]
+    async fn agent_unarchive_fresh_also_leaves_the_pane_with_a_live_runtime() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+
+        app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: true,
+            },
+        );
+
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id);
+        assert!(
+            app.terminal_runtimes.get(&tid).is_some(),
+            "a fresh unarchive left the pane with no runtime, so it cannot be opened"
+        );
     }
 
     #[test]
@@ -2256,7 +2346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_unarchive_id_kind_ignores_existence_probe_and_arms_plan() {
+    async fn agent_unarchive_id_kind_ignores_existence_probe_and_resumes() {
         // Regression guard: the existence probe is PATH-kind only. An ID-kind
         // ref whose value happens to look like a missing path must still resume.
         let mut app = app_with_agent();
@@ -2285,21 +2375,21 @@ mod tests {
         assert!(app.state.archived_agents.is_empty());
 
         let tid = crate::terminal::TerminalId::from_persisted("term-claude-one".to_string());
-        let plan = app
+        let terminal = app
             .state
             .terminals
             .get(&tid)
-            .expect("id-kind unarchive resumes into the same terminal id")
-            .pending_agent_resume_plan
-            .as_ref()
-            .expect("id-kind unarchive still arms a resume plan");
+            .expect("id-kind unarchive resumes into the same terminal id");
+        // Resumed, not merely armed — unarchive spawns the runtime itself now, so the
+        // plan is consumed. The point of this test is unchanged: an id-kind ref that
+        // merely LOOKS like a path is not probed for existence, and still resumes.
+        assert!(terminal.pending_agent_resume_plan.is_none());
         assert_eq!(
-            plan.argv,
-            vec![
-                "claude".to_string(),
-                "--resume".to_string(),
-                path_shaped_id.to_string(),
-            ]
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some(path_shaped_id)
         );
     }
 
