@@ -1256,7 +1256,10 @@ impl HeadlessServer {
                 io::ErrorKind::Unsupported,
                 "refusing a live handoff: this process is the systemd unit's main process, so \
                  exiting after the handoff would deactivate the unit and kill the replacement \
-                 and every pane with it. Restart the service instead.",
+                 and every pane with it. Deploy by swapping the binary and restarting the \
+                 service: the staged build is a SIBLING of the live path (herdr.staged), and \
+                 a restart alone re-runs the SAME binary because the swap used to happen \
+                 inside the handoff this refusal prevents.",
             ));
         }
         info!(supervision = ?supervision, "starting live handoff");
@@ -1502,8 +1505,11 @@ impl HeadlessServer {
                 io::ErrorKind::Unsupported,
                 "refusing a live handoff: this process is the systemd unit's main process, so \
                  exiting after the handoff would deactivate the unit and kill the replacement \
-                 and every pane with it. Restart the service to pick up the staged build \
-                 instead (the staged manifest is left in place).",
+                 and every pane with it. The staged manifest is left in place, but a \
+                 RESTART ALONE WILL NOT PICK IT UP: the live-path swap used to happen inside \
+                 the handoff this refusal prevents, so deploying now means moving \
+                 herdr.staged over the live binary (a rename, not a copy — the running \
+                 image is busy) and then restarting the service.",
             ));
         }
 
