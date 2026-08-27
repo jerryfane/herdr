@@ -170,6 +170,25 @@ pub struct ArchivedAgentSnapshot {
     /// Opaque open-work list, stored and returned verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parked_work: Vec<serde_json::Value>,
+    /// WHERE THE AGENT CAME FROM, so an unarchive can put it back rather than
+    /// stranding it somewhere new.
+    ///
+    /// Without these, unarchive allocated a fresh pane in a brand-new workspace and
+    /// the pane LABEL — which lived on the pane that archiving destroyed — could not
+    /// come back at all. That is not cosmetic: fleet tooling binds a role to its pane
+    /// BY LABEL, so every restored agent silently lost its binding and became
+    /// unreachable on that channel while looking perfectly healthy.
+    ///
+    /// All three are optional and `#[serde(default)]` so snapshots written before this
+    /// existed still load (same contract as `archived_agents` itself). `None` means
+    /// "origin unknown" and the restore falls back to a new workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_tab_id: Option<String>,
+    /// The pane's user-facing label at archive time (what `pane.rename` sets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_label: Option<String>,
 }
 
 /// The `archived { at, by, reason }` provenance block on an [`ArchivedAgentSnapshot`].
@@ -710,6 +729,37 @@ mod tests {
         assert!(restored.archived_agents.is_empty());
     }
 
+    /// An archived record written BEFORE the origin fields existed must still load,
+    /// with the origin simply absent — that record then restores into a new workspace,
+    /// exactly as it did before.
+    ///
+    /// Built from raw JSON rather than the struct, because the struct cannot express
+    /// "these keys were never written": constructing it with `None` would test the
+    /// defaults, not the parser.
+    #[test]
+    fn archived_record_without_origin_fields_still_parses() {
+        let raw = serde_json::json!({
+            "name": "reviewer",
+            "kind": "claude",
+            "terminal_id": "term-1",
+            "agent_session": {
+                "source": "herdr:claude",
+                "agent": "claude",
+                "kind": "id",
+                "value": "sess-123"
+            },
+            "cwd": "/work",
+            "occupant_generation": 7,
+            "archived": { "at": "2026-08-26T00:00:00Z", "by": "tester" }
+        });
+        let record: ArchivedAgentSnapshot =
+            serde_json::from_value(raw).expect("an old archived record must still load");
+        assert_eq!(record.name.as_deref(), Some("reviewer"));
+        assert!(record.origin_workspace_id.is_none());
+        assert!(record.origin_tab_id.is_none());
+        assert!(record.pane_label.is_none());
+    }
+
     #[test]
     fn archived_agents_round_trip_through_the_snapshot() {
         let snap = SessionSnapshot {
@@ -738,6 +788,9 @@ mod tests {
                     reason: Some("parked".into()),
                 },
                 parked_work: vec![serde_json::json!({"pr": 42})],
+                origin_workspace_id: Some("w1".into()),
+                origin_tab_id: Some("w1:t2".into()),
+                pane_label: Some("reviewer".into()),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();

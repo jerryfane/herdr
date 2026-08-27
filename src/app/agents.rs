@@ -203,6 +203,12 @@ impl App {
             return Err(AgentArchiveError::NoResumableSession);
         };
         let name = terminal.agent_name.clone();
+        // The pane's user-facing label, captured so an unarchive can put it back.
+        // It lives on the TERMINAL, but it identifies the PANE, and the pane is about
+        // to be destroyed — so if it is not taken here it cannot be recovered at all.
+        // Fleet tooling binds a role to its pane by this label, which is why losing it
+        // silently unhooks a restored agent from the channel that addresses it.
+        let pane_label = terminal.manual_label.clone();
         let cwd = terminal.cwd.clone();
         let occupant_generation = terminal.occupant_generation;
         let kind = terminal
@@ -226,6 +232,12 @@ impl App {
                 occupant_generation,
                 archived: crate::persist::ArchivedAgentMeta { at, by, reason },
                 parked_work,
+                // Where it came from. `info` was built above from this very pane, so
+                // both ids are already resolved public ids — the same strings
+                // `parse_tab_id` / `parse_workspace_id` take back.
+                origin_workspace_id: Some(info.workspace_id.clone()),
+                origin_tab_id: Some(info.tab_id.clone()),
+                pane_label,
             });
 
         // Release the pane's process, then remove the now-empty pane. The session
@@ -324,6 +336,35 @@ impl App {
             Some((persisted, plan))
         };
 
+        // REFUSE A SECOND PROCESS ON ONE SESSION.
+        //
+        // Nothing else stops this: resuming a session a live agent already holds puts
+        // two harness processes on one transcript, and it has happened on a real box —
+        // one agent started as a workaround while its twin was archived, then the twin
+        // was unarchived. Both then wrote org acknowledgements that could not be
+        // attributed to either process.
+        //
+        // Checked BEFORE the record is removed, so a refusal leaves the archive intact
+        // and retryable — the same fail-loud contract as the plan and session-file
+        // checks above. Skipped for `fresh`, which resumes nothing and so cannot
+        // duplicate anything.
+        if let Some((_, plan)) = resume.as_ref() {
+            let key = crate::agent_resume::dedupe_key(
+                &self.state.archived_agents[index].agent_session.source,
+                &plan.agent,
+                &crate::agent_resume::AgentSessionRef {
+                    kind: self.state.archived_agents[index].agent_session.kind,
+                    value: self.state.archived_agents[index]
+                        .agent_session
+                        .value
+                        .clone(),
+                },
+            );
+            if let Some(pane) = self.live_pane_holding_session(&key) {
+                return Err(AgentUnarchiveError::SessionInUse { pane });
+            }
+        }
+
         let record = self.state.archived_agents.remove(index);
         let terminal_id = crate::terminal::TerminalId::from_persisted(record.terminal_id.clone());
         let pane_id = crate::layout::PaneId::alloc();
@@ -360,25 +401,27 @@ impl App {
         }
         self.state.terminals.insert(terminal_id.clone(), terminal);
 
+        // Re-apply the pane label BEFORE the pane is placed, so whichever branch below
+        // takes it, the restored pane is addressable by the name it had. Fleet tooling
+        // binds a role to its pane by this label; a restored agent without one looks
+        // healthy and is unreachable on the channel that addresses it.
+        if let Some(label) = record.pane_label.clone() {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.set_manual_label(label);
+            }
+        }
+
         let moved = crate::workspace::MovedPane {
             pane_id,
             pane_state: crate::pane::PaneState::new(terminal_id.clone()),
         };
-        let workspace = crate::workspace::Workspace::from_existing_pane(
-            record.name.clone(),
-            None,
-            record.cwd.clone(),
-            moved,
-            self.event_tx.clone(),
-            self.render_notify.clone(),
-            self.render_dirty.clone(),
-        );
-        self.state.workspaces.push(workspace);
-        let ws_idx = self.state.workspaces.len() - 1;
+
+        // PUT IT BACK WHERE IT CAME FROM. Three tiers, most specific first, mirroring
+        // `recover_failed_pane_move` — an archive can outlive its tab or its whole
+        // workspace, so each tier must degrade rather than fail.
+        let ws_idx = self.restore_archived_pane(&record, moved)?;
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
-        self.state.switch_workspace(ws_idx);
         self.state.mode = crate::app::Mode::Terminal;
-        self.emit_workspace_open_events(ws_idx);
 
         // SPAWN THE RUNTIME NOW — an unarchived pane must never be advertised without
         // one.
@@ -411,6 +454,161 @@ impl App {
 
         self.agent_info(ws_idx, pane_id)
             .ok_or(AgentUnarchiveError::NoResumablePlan)
+    }
+
+    /// The public id of a LIVE pane already running the given session, if any.
+    ///
+    /// Walks panes rather than `state.terminals`, because a terminal can linger detached
+    /// after its pane is gone — matching one of those would refuse a legitimate
+    /// unarchive, which is the more damaging direction to be wrong in.
+    ///
+    /// Identity is `agent_resume::dedupe_key`, the same key the restore path already
+    /// uses to stop two panes launching one native session, so the two guards agree on
+    /// what "the same session" means.
+    fn live_pane_holding_session(&self, key: &str) -> Option<String> {
+        for (ws_idx, workspace) in self.state.workspaces.iter().enumerate() {
+            for tab in workspace.tabs.iter() {
+                for pane_id in tab.layout.pane_ids() {
+                    let Some(pane) = tab.panes.get(&pane_id) else {
+                        continue;
+                    };
+                    let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
+                    else {
+                        continue;
+                    };
+                    if !terminal.is_agent_terminal() {
+                        continue;
+                    }
+                    let Some((source, agent, session_ref)) = Self::terminal_resume_source(terminal)
+                    else {
+                        continue;
+                    };
+                    if crate::agent_resume::dedupe_key(&source, &agent, &session_ref) == key {
+                        return self
+                            .public_pane_id(ws_idx, pane_id)
+                            .or_else(|| Some(pane_id.raw().to_string()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Put an unarchived pane back where it came from, degrading in three tiers.
+    ///
+    /// An archive can outlive its tab and even its whole workspace, so each tier falls
+    /// through rather than failing:
+    ///   1. ORIGINAL TAB still exists -> insert alongside its panes.
+    ///   2. ORIGINAL WORKSPACE exists but the tab is gone -> new tab in that workspace.
+    ///   3. Neither exists (or the record predates this field) -> a new workspace, which
+    ///      is exactly the old behaviour, so nothing regresses for old snapshots.
+    ///
+    /// Returns the workspace index the pane landed in, and focuses it.
+    ///
+    /// Reuses the same helpers `pane.move` and its recovery path use — notably
+    /// `insert_moved_pane_into_tab`, which registers the public pane number that would
+    /// otherwise have to be invented here.
+    fn restore_archived_pane(
+        &mut self,
+        record: &crate::persist::ArchivedAgentSnapshot,
+        moved: crate::workspace::MovedPane,
+    ) -> Result<usize, AgentUnarchiveError> {
+        let pane_id = moved.pane_id;
+
+        // Tier 1: the original tab. `parse_tab_id` returns None if EITHER the workspace
+        // or the tab is gone, so a hit here means both are live.
+        if let Some((ws_idx, tab_idx)) = record
+            .origin_tab_id
+            .as_deref()
+            .and_then(|tab_id| self.parse_tab_id(tab_id))
+        {
+            let target = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.tabs.get(tab_idx))
+                .map(|tab| tab.root_pane);
+            if let Some(target) = target {
+                let moved = match self.state.workspaces[ws_idx].insert_moved_pane_into_tab(
+                    tab_idx,
+                    target,
+                    moved,
+                    ratatui::layout::Direction::Horizontal,
+                    0.5,
+                    true,
+                ) {
+                    Ok(_) => {
+                        self.state.switch_workspace_tab(ws_idx, tab_idx);
+                        self.emit_restored_pane_created(ws_idx, pane_id);
+                        self.emit_layout_updated_event(ws_idx, tab_idx);
+                        return Ok(ws_idx);
+                    }
+                    // The layout rejected the target pane; fall through with the pane
+                    // handed back intact rather than losing it.
+                    Err(moved) => moved,
+                };
+                return self.restore_into_new_workspace(record, moved);
+            }
+        }
+
+        // Tier 2: the workspace survived, the tab did not.
+        if let Some(ws_idx) = record
+            .origin_workspace_id
+            .as_deref()
+            .and_then(|ws_id| self.parse_workspace_id(ws_id))
+        {
+            let tab_idx = self.state.workspaces[ws_idx].create_tab_from_existing_pane(
+                moved,
+                record.name.clone(),
+                self.event_tx.clone(),
+                self.render_notify.clone(),
+                self.render_dirty.clone(),
+            );
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.emit_tab_created_events(ws_idx, tab_idx);
+            self.emit_restored_pane_created(ws_idx, pane_id);
+            return Ok(ws_idx);
+        }
+
+        // Tier 3: nothing to go back to.
+        self.restore_into_new_workspace(record, moved)
+    }
+
+    /// Announce a restored pane the same way `pane.split` announces a new one, so
+    /// clients learn about it. The new-workspace tier does not need this — its
+    /// `emit_workspace_open_events` already covers the pane.
+    fn emit_restored_pane_created(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneCreated,
+            data: crate::api::schema::EventData::PaneCreated { pane },
+        });
+    }
+
+    /// The pre-existing restore behaviour, kept as the last tier: a brand-new workspace
+    /// for the restored pane. Reached when the origin is gone, or when the record was
+    /// written before the origin was captured at all.
+    fn restore_into_new_workspace(
+        &mut self,
+        record: &crate::persist::ArchivedAgentSnapshot,
+        moved: crate::workspace::MovedPane,
+    ) -> Result<usize, AgentUnarchiveError> {
+        let workspace = crate::workspace::Workspace::from_existing_pane(
+            record.name.clone(),
+            None,
+            record.cwd.clone(),
+            moved,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        );
+        self.state.workspaces.push(workspace);
+        let ws_idx = self.state.workspaces.len() - 1;
+        self.state.switch_workspace(ws_idx);
+        self.emit_workspace_open_events(ws_idx);
+        Ok(ws_idx)
     }
 
     /// Last-resort shell for a pane that unarchived without a resume plan, so the pane
@@ -507,6 +705,12 @@ impl App {
                 code: "session_lost".into(),
                 message: "archived session file no longer exists; retry with --fresh to start a clean agent"
                     .into(),
+            },
+            AgentUnarchiveError::SessionInUse { pane } => crate::api::schema::ErrorBody {
+                code: "session_in_use".into(),
+                message: format!(
+                    "pane {pane} is already running this session; retire it first, or retry with --fresh to start a clean agent"
+                ),
             },
         }
     }
@@ -1037,6 +1241,11 @@ pub(super) enum AgentUnarchiveError {
     NotFound,
     NoResumablePlan,
     SessionLost,
+    /// A LIVE agent already holds this session. Resuming would put two processes on
+    /// one transcript; the pane holding it is named so the operator can act.
+    SessionInUse {
+        pane: String,
+    },
 }
 
 /// True when an archived record is addressed by `target` — its agent name or its
