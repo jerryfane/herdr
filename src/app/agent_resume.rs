@@ -202,6 +202,42 @@ impl App {
         changed
     }
 
+    /// The child environment a resumed agent must launch with: the env armed by
+    /// `agent.restart`, or — when nothing is armed — one REBUILT from the account registry
+    /// for the account this terminal belongs to.
+    ///
+    /// The rebuild is the part that matters. "Nothing armed" is the normal state after any
+    /// restart, crash or staged update, and it used to mean the agent resumed under the
+    /// harness DEFAULT. A seat switched to a secondary account then silently began
+    /// appending to the PRIMARY transcript — which reads as hours of work vanishing, while
+    /// the records sit intact in the other account's file.
+    ///
+    /// Only the account ID is persisted, so the config-home is resolved here against the
+    /// live registry: a rotated config-home follows the registry, and no credential material
+    /// is ever written to a snapshot. An id that no longer resolves yields an empty env,
+    /// i.e. the pre-existing default behaviour rather than a failure.
+    ///
+    /// The returned env carries the config-home var, and `apply_pane_launch_env` clears the
+    /// conflicting global auth token whenever it sees one — so routing cannot be overridden
+    /// by a machine-global `CLAUDE_CODE_OAUTH_TOKEN`.
+    pub(crate) fn resume_launch_env(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        agent_kind: &str,
+    ) -> Vec<(String, String)> {
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return Vec::new();
+        };
+        if !terminal.pending_launch_env.is_empty() {
+            return terminal.pending_launch_env.clone();
+        }
+        terminal
+            .agent_account
+            .as_deref()
+            .and_then(|account_id| self.resolve_account_launch_env(account_id, agent_kind).ok())
+            .unwrap_or_default()
+    }
+
     fn start_pending_agent_resume(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -226,14 +262,21 @@ impl App {
             );
             return false;
         };
-        // Carry the account config-home env armed by `agent.restart` (empty for a
-        // plain restore) so the relaunched shell resumes under the chosen account.
-        let extra_env = self
-            .state
-            .terminals
-            .get(&terminal_id)
-            .map(|terminal| terminal.pending_launch_env.clone())
-            .unwrap_or_default();
+        // Carry the account config-home env armed by `agent.restart`, and REBUILD it from
+        // the account registry when it is absent.
+        //
+        // "Empty for a plain restore" used to be the whole story, and it is exactly how a
+        // fleet loses its account routing: a restart, crash or staged update rebuilds panes
+        // from the snapshot with no armed env, every agent resumes under the harness
+        // default, and a seat that had been switched to a secondary account silently starts
+        // appending to the PRIMARY transcript. That reads as hours of work vanishing when
+        // the records are intact in the other account's file.
+        //
+        // The snapshot persists the account ID only, so the env is resolved HERE, from the
+        // live registry — a rotated config-home follows the registry, and no credential
+        // material is ever written to disk by us. An id that no longer resolves falls back
+        // to the default, which is the pre-existing behaviour.
+        let extra_env = self.resume_launch_env(&terminal_id, &plan.agent);
         let Some(launch_env) = self
             .find_pane(pane_id)
             .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, extra_env))
@@ -385,6 +428,78 @@ mod tests {
             "-c".into(),
             "printf '%s' 'restored agent: shell quoted | marker'; sleep 5".into(),
         ]
+    }
+
+    /// A resumed agent must launch under ITS OWN account, rebuilt from the registry.
+    ///
+    /// The armed env is only present right after `agent.restart`. Every other path —
+    /// ordinary restore, crash recovery, staged update, pane respawn — has nothing armed,
+    /// and that used to mean the agent resumed under the harness DEFAULT. A seat switched
+    /// to a secondary account then silently appended to the PRIMARY transcript, which is
+    /// what made hours of work look lost while the records sat intact elsewhere.
+    #[test]
+    fn a_resumed_agent_launches_under_its_own_account() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent")];
+        app.state.ensure_test_terminals();
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "claudecrazy".into(),
+            kind: "claude".into(),
+            label: "ClaudeCrazy".into(),
+            config_dir: "/root/.claude-9".into(),
+        }];
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+
+        // Nothing armed and no account: the pre-existing default, unchanged.
+        assert!(app.resume_launch_env(&terminal_id, "claude").is_empty());
+
+        // Nothing armed, but the pane belongs to an account — rebuild from the registry.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("claudecrazy".to_string());
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/root/.claude-9".to_string()
+            )],
+            "a resumed agent must be pointed at its own config-home, not the default"
+        );
+
+        // An armed env still wins — `agent.restart` is choosing deliberately.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .pending_launch_env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/armed".to_string())];
+        assert_eq!(
+            app.resume_launch_env(&terminal_id, "claude"),
+            vec![("CLAUDE_CONFIG_DIR".to_string(), "/armed".to_string())]
+        );
+    }
+
+    /// An account id that no longer resolves must fall back to the default rather than
+    /// fail — a removed account should not make a pane unlaunchable.
+    #[test]
+    fn an_unknown_account_falls_back_to_the_default_env() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("deleted-account".to_string());
+        assert!(app.resume_launch_env(&terminal_id, "claude").is_empty());
     }
 
     #[cfg(unix)]

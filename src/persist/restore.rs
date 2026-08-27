@@ -504,6 +504,10 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        // Which account this pane was running under. The ID only — the launch env is
+        // rebuilt from the account registry when the agent is next spawned, so nothing
+        // credential-shaped is carried through the snapshot.
+        let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -554,6 +558,9 @@ fn restore_tab(
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            // Restore account routing. Without this the pane comes back on the harness
+            // default and writes to the WRONG account's transcript, which reads as lost work.
+            terminal.agent_account = saved_agent_account.clone();
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -664,6 +671,7 @@ fn restore_tab(
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
+                terminal.agent_account = saved_agent_account.clone();
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -996,6 +1004,7 @@ mod tests {
                             launch_argv: None,
                             terminal_id: None,
                             occupant_generation: 0,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1372,6 +1381,7 @@ mod tests {
                             launch_argv: None,
                             terminal_id: None,
                             occupant_generation: 0,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1450,6 +1460,7 @@ mod tests {
                             launch_argv: None,
                             terminal_id: Some("term_persisted_boot1".into()),
                             occupant_generation: 7,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1536,6 +1547,7 @@ mod tests {
                                 launch_argv: None,
                                 terminal_id: None,
                                 occupant_generation: 0,
+                                agent_account: None,
                             },
                         ),
                         (
@@ -1549,6 +1561,7 @@ mod tests {
                                 launch_argv: None,
                                 terminal_id: None,
                                 occupant_generation: 0,
+                                agent_account: None,
                             },
                         ),
                     ]),
@@ -1605,6 +1618,7 @@ mod tests {
                     launch_argv: None,
                     terminal_id: None,
                     occupant_generation: 0,
+                    agent_account: None,
                 },
             )
         };
@@ -1622,6 +1636,7 @@ mod tests {
             launch_argv: None,
             terminal_id: None,
             occupant_generation: 0,
+            agent_account: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1784,6 +1799,7 @@ mod tests {
                             launch_argv: None,
                             terminal_id: None,
                             occupant_generation: 0,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1948,6 +1964,7 @@ mod tests {
                 launch_argv: None,
                 terminal_id: None,
                 occupant_generation: 0,
+                agent_account: None,
             },
         );
         let history = SessionHistorySnapshot {

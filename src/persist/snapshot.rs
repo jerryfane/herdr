@@ -129,6 +129,20 @@ pub struct PaneSnapshot {
     /// Additive: an old snapshot defaults it to 0.
     #[serde(default)]
     pub occupant_generation: u64,
+    /// WHICH ACCOUNT THIS PANE RUNS UNDER — the registry id only.
+    ///
+    /// Account routing was previously not persisted at all, so every restore put every
+    /// pane back on the harness default. A fleet that had been switched to a secondary
+    /// account came back on the primary and kept writing to the PRIMARY transcript, which
+    /// looked exactly like hours of work vanishing — the records were intact the whole
+    /// time, in the other account's file.
+    ///
+    /// An ID, never an environment or a token. The launch env is REBUILT from the account
+    /// registry at restore time, so a rotated config-home follows the registry and no
+    /// credential material is ever written to the snapshot. An id that no longer resolves
+    /// simply restores to the default, which is the old behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +442,9 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        // Capture the account BEFORE the terminal is gone; without it a restore silently
+        // re-homes the pane onto the harness default.
+        let agent_account = terminal.and_then(|terminal| terminal.agent_account.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -462,6 +479,7 @@ fn capture_tab(
                 occupant_generation: terminal
                     .map(|terminal| terminal.occupant_generation)
                     .unwrap_or(0),
+                agent_account,
             },
         );
     }
@@ -760,6 +778,74 @@ mod tests {
         assert!(record.pane_label.is_none());
     }
 
+    /// Account routing is CAPTURED FROM LIVE STATE and survives the round trip.
+    ///
+    /// It previously was not persisted at all, so every restore re-homed every pane onto
+    /// the harness default. A fleet switched to a secondary account came back on the
+    /// primary and appended to the PRIMARY transcript — which looked exactly like hours of
+    /// work disappearing, while the records sat intact in the other account's file.
+    ///
+    /// This drives the real `capture` path rather than building a `PaneSnapshot` literal:
+    /// a literal-based test passes even when the capture drops the field, which makes it a
+    /// test of serde and not of the behaviour.
+    #[test]
+    fn pane_account_routing_is_captured_and_round_trips() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("agent")];
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("claudecrazy".to_string());
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .get(&pane_id.raw())
+            .expect("pane captured");
+        assert_eq!(
+            pane.agent_account.as_deref(),
+            Some("claudecrazy"),
+            "the pane's account must be captured, or a restore silently re-homes it"
+        );
+
+        // And it survives the wire, carrying an ID and nothing credential-shaped.
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(json.contains("claudecrazy"));
+        assert!(
+            !json.to_lowercase().contains("oauth_token"),
+            "the snapshot must never carry credential material"
+        );
+        let back: SessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.workspaces[0].tabs[0].panes[&pane_id.raw()]
+                .agent_account
+                .as_deref(),
+            Some("claudecrazy")
+        );
+    }
+
+    /// A pane written before routing was persisted must still load, with no account — which
+    /// restores to the default, i.e. exactly the old behaviour.
+    #[test]
+    fn a_pane_without_account_routing_still_parses() {
+        let raw = serde_json::json!({
+            "cwd": "/work",
+            "label": "reviewer",
+            "terminal_id": "term-1",
+            "occupant_generation": 0
+        });
+        let pane: PaneSnapshot =
+            serde_json::from_value(raw).expect("an old pane record must still load");
+        assert!(pane.agent_account.is_none());
+        assert_eq!(pane.label.as_deref(), Some("reviewer"));
+    }
+
     #[test]
     fn archived_agents_round_trip_through_the_snapshot() {
         let snap = SessionSnapshot {
@@ -840,6 +926,7 @@ mod tests {
                 launch_argv: None,
                 terminal_id: None,
                 occupant_generation: 0,
+                agent_account: None,
             },
         );
         panes.insert(
@@ -853,6 +940,7 @@ mod tests {
                 launch_argv: None,
                 terminal_id: None,
                 occupant_generation: 0,
+                agent_account: None,
             },
         );
 
@@ -1464,6 +1552,7 @@ mod tests {
                 launch_argv: None,
                 terminal_id: None,
                 occupant_generation: 0,
+                agent_account: None,
             },
         );
         panes.insert(
@@ -1479,6 +1568,7 @@ mod tests {
                 launch_argv: None,
                 terminal_id: None,
                 occupant_generation: 0,
+                agent_account: None,
             },
         );
 
