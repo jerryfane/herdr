@@ -961,6 +961,9 @@ mod tests {
         state_change_seq: u64,
     ) -> crate::api::schema::AgentInfo {
         crate::api::schema::AgentInfo {
+            account: None,
+            account_config_dir: None,
+            account_unresolved: false,
             terminal_id: "term_1".into(),
             name: Some("reviewer".into()),
             agent: Some("claude".into()),

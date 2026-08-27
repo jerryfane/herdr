@@ -12,7 +12,7 @@ Herdr uses several state paths for different situations.
 | Detach and reattach | Yes | Yes | Yes, from the live terminal | Yes, because the process never stopped |
 | Server restart | No | Yes | Only with pane screen history | Only with native agent session restore |
 | Update without `--handoff` | Compatible servers keep running; restart-required servers may need stop/restart | Yes after restart | Only with pane screen history | Only with native agent session restore |
-| Update with `--handoff` | Best effort for supported running servers | Yes | Yes, from the live terminal if handoff succeeds | Yes, because the process keeps running if handoff succeeds |
+| Update with `--handoff` | Best effort for supported running servers; refused outright under a service manager such as systemd | Yes | Yes, from the live terminal if handoff succeeds | Yes, because the process keeps running if handoff succeeds |
 
 ## Live persistence
 
@@ -106,3 +106,5 @@ herdr --remote workbox --handoff
 Plain `herdr update` and plain `herdr --remote workbox` use the normal restart/stop flow by default.
 
 `herdr update --handoff` only applies to installs managed by Herdr's own updater. Homebrew, mise, and Nix installs are updated through their package managers, so `herdr update` is disabled there and cannot perform live handoff.
+
+Opting in does not guarantee a handoff. The running server refuses one when its own exit would destroy the replacement — notably when Herdr is the main process of a systemd unit, because a `Type=simple` unit deactivates when its main process exits and the default `KillMode=control-group` then kills the replacement and every pane with it. The refusal happens before anything is torn down, so the existing panes keep running and the request returns an error rather than a partial handoff. Update supervised installs by replacing the binary and restarting the service; see [Install Herdr](/docs/install/#update).

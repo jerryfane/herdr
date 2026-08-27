@@ -635,7 +635,11 @@ impl App {
             Some(terminal) => terminal.cwd.clone(),
             None => return false,
         };
-        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
+        let Some(launch_env) = self.pane_launch_env(
+            ws_idx,
+            pane_id,
+            crate::config::AccountLaunchEnv::unselected(),
+        ) else {
             return false;
         };
         let runtime = match crate::terminal::TerminalRuntime::spawn(
@@ -780,7 +784,7 @@ impl App {
         };
 
         let argv = agent_launch_argv(
-            account_env.as_ref().map(|(_, env)| env.as_slice()),
+            account_env.as_ref().map(|(_, env)| env),
             crate::detect::interactive_agent_executable(kind),
             params.args,
         );
@@ -979,6 +983,17 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        // Account routing, read from the RECORDED account and resolved against the live
+        // registry. `account_config_dir` is None either because no account is recorded or
+        // because the recorded one is gone; `account_unresolved` separates those.
+        let account = terminal.agent_account.clone();
+        let resolved_account = account.as_deref().and_then(|id| {
+            self.loaded_accounts
+                .iter()
+                .find(|candidate| candidate.id == id)
+        });
+        let account_unresolved = account.is_some() && resolved_account.is_none();
+        let account_config_dir = resolved_account.map(|entry| entry.config_dir.clone());
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -1017,6 +1032,9 @@ impl App {
             // separately in `collect_agent_infos`.
             archived: None,
             parked_work: Vec::new(),
+            account,
+            account_config_dir,
+            account_unresolved,
         })
     }
 
@@ -1047,29 +1065,26 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
 /// prefix that exec-replaces itself with the agent, so detection still sees the
 /// harness process. Without an account the argv is `[executable, ..args]`.
 fn agent_launch_argv(
-    account_env: Option<&[(String, String)]>,
+    account_env: Option<&crate::config::AccountLaunchEnv>,
     executable: &str,
     args: Vec<String>,
 ) -> Vec<String> {
     let mut argv = Vec::new();
-    // An empty account env (a primary account on the harness default config-home,
-    // issue #94) carries no overrides, so it must launch byte-identically to no
-    // account — no `env` prefix.
+    // Only a launch with NOTHING to set and NOTHING to clear is byte-identical to no
+    // account. A primary account on the harness default config-home sets no override
+    // (issue #94) but still has a token to clear, and treating that as "nothing to do"
+    // let a machine-global token silently outrank an explicit account selection.
     if let Some(env) = account_env.filter(|env| !env.is_empty()) {
         argv.push("env".to_string());
-        // Clear conflicting auth tokens FIRST so the config-home override is the
-        // authoritative account selector. A machine-global CLAUDE_CODE_OAUTH_TOKEN
-        // otherwise wins over CLAUDE_CONFIG_DIR and the swap silently keeps the old
-        // authenticated account (gitmoot workflow-note row 86147).
-        for (key, _) in env {
-            if let Some(kind) = crate::config::kind_for_config_env_var(key) {
-                for var in crate::config::auth_env_vars_to_clear(kind) {
-                    argv.push("-u".to_string());
-                    argv.push((*var).to_string());
-                }
-            }
+        // Clear conflicting auth tokens FIRST so the account selection is
+        // authoritative. A machine-global CLAUDE_CODE_OAUTH_TOKEN otherwise wins over
+        // CLAUDE_CONFIG_DIR and the swap silently keeps the old authenticated account
+        // (gitmoot workflow-note row 86147).
+        for var in &env.clear_vars {
+            argv.push("-u".to_string());
+            argv.push(var.clone());
         }
-        for (key, value) in env {
+        for (key, value) in &env.vars {
             argv.push(format!("{key}={value}"));
         }
     }
@@ -1304,6 +1319,11 @@ fn archived_agent_info(
             reason: record.archived.reason.clone(),
         }),
         parked_work: record.parked_work.clone(),
+        // An archived agent has no live terminal, so no routing has been applied yet.
+        // It resolves its account when it is unarchived and resumed.
+        account: None,
+        account_config_dir: None,
+        account_unresolved: false,
     }
 }
 
@@ -1380,7 +1400,10 @@ mod tests {
 
     #[test]
     fn agent_launch_argv_prefixes_account_env() {
-        let env = [("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())];
+        let env = crate::config::AccountLaunchEnv {
+            vars: vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+            clear_vars: Vec::new(),
+        };
         assert_eq!(
             agent_launch_argv(Some(&env), "codex", vec!["--yolo".to_string()]),
             vec![
@@ -1397,10 +1420,13 @@ mod tests {
         // A claude account override must clear the machine-global CLAUDE_CODE_OAUTH_TOKEN
         // (via `env -u`) so the config-home selects the account, not the inherited token
         // (workflow-note row 86147). The `-u` must precede the KEY=VALUE assignment.
-        let env = [(
-            "CLAUDE_CONFIG_DIR".to_string(),
-            "/root/.claude-2".to_string(),
-        )];
+        let env = crate::config::AccountLaunchEnv {
+            vars: vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/root/.claude-2".to_string(),
+            )],
+            clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+        };
         assert_eq!(
             agent_launch_argv(
                 Some(&env),
@@ -1422,7 +1448,10 @@ mod tests {
     #[test]
     fn agent_launch_argv_does_not_clear_tokens_for_codex() {
         // codex has no token lever today, so its override must not gain a `-u` flag.
-        let env = [("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())];
+        let env = crate::config::AccountLaunchEnv {
+            vars: vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+            clear_vars: Vec::new(),
+        };
         let argv = agent_launch_argv(Some(&env), "codex", vec![]);
         assert!(!argv.iter().any(|a| a == "-u"), "unexpected -u in {argv:?}");
     }
@@ -1435,15 +1464,53 @@ mod tests {
         );
     }
 
+    /// A primary CLAUDE account on the default config-home injects no config-home
+    /// override (issue #94) but MUST still clear the conflicting token.
+    ///
+    /// This test previously asserted the opposite — that such an account launches
+    /// byte-identically to no account at all. That was the bug: `agent.start` on the
+    /// primary account inherited a machine-global CLAUDE_CODE_OAUTH_TOKEN, which
+    /// outranks config-home routing, so the agent authenticated as whichever account
+    /// minted the token and wrote to ITS transcript. "Sets no override" and "has
+    /// nothing to clear" are different facts and conflating them is what cost history.
     #[test]
-    fn agent_launch_argv_empty_account_env_is_byte_identical() {
-        // A primary account on the harness default config-home resolves to an
-        // empty env (issue #94); it must launch with no `env` prefix, exactly
-        // like no account at all.
-        let empty: [(String, String); 0] = [];
+    fn a_default_config_home_account_still_clears_a_conflicting_token() {
+        let primary_claude = crate::config::AccountLaunchEnv {
+            vars: Vec::new(),
+            clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+        };
         assert_eq!(
-            agent_launch_argv(Some(&empty), "claude", vec!["--resume".to_string()]),
-            agent_launch_argv(None, "claude", vec!["--resume".to_string()])
+            agent_launch_argv(
+                Some(&primary_claude),
+                "claude",
+                vec!["--resume".to_string()]
+            ),
+            vec![
+                "env".to_string(),
+                "-u".to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "claude".to_string(),
+                "--resume".to_string(),
+            ],
+            "a selected primary account must still strip a token that outranks it"
+        );
+        // No config-home override is injected, which is the half issue #94 cares about.
+        assert!(
+            !agent_launch_argv(Some(&primary_claude), "claude", vec![])
+                .iter()
+                .any(|arg| arg.starts_with("CLAUDE_CONFIG_DIR=")),
+            "injecting the override on a default config-home strands ~/.claude.json"
+        );
+    }
+
+    /// The genuinely byte-identical case: an account with nothing to set AND nothing to
+    /// clear (a codex primary — codex has no token lever) launches exactly as no account.
+    #[test]
+    fn an_account_with_nothing_to_apply_is_byte_identical() {
+        let primary_codex = crate::config::AccountLaunchEnv::default();
+        assert_eq!(
+            agent_launch_argv(Some(&primary_codex), "codex", vec!["--yolo".to_string()]),
+            agent_launch_argv(None, "codex", vec!["--yolo".to_string()])
         );
     }
 

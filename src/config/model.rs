@@ -428,20 +428,82 @@ pub fn is_default_config_dir(kind: &str, config_dir: &str) -> bool {
     }
 }
 
+/// What launching under a selected account must do to the child's environment.
+///
+/// Two INDEPENDENT halves, and conflating them was a live routing bug. `vars` is
+/// empty for a primary account on the harness default config-home (issue #94),
+/// but `clear` is populated for EVERY selected account of a kind that has an auth
+/// lever. Deriving "which tokens to clear" from "which vars were set" means a
+/// default-config-home account clears nothing and a machine-global
+/// `CLAUDE_CODE_OAUTH_TOKEN` silently outranks the selection — the exact mechanism
+/// that re-homed this fleet's agents onto the wrong account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountLaunchEnv {
+    /// Config-home overrides to SET. Empty means "this account needs no override",
+    /// never "no account was selected".
+    pub vars: Vec<(String, String)>,
+    /// Auth variables to REMOVE so the selected account's own credentials are
+    /// authoritative. Independent of `vars` being empty.
+    pub clear_vars: Vec<String>,
+}
+
+impl AccountLaunchEnv {
+    /// The launch env for a pane that selected no account: change nothing.
+    pub fn unselected() -> Self {
+        Self::default()
+    }
+
+    /// Wrap already-resolved override vars, deriving the clear-list from the
+    /// config-home levers they set. For env that was resolved earlier and stored
+    /// without its account (a pending `agent.restart` env), this is the most that
+    /// can be recovered — it cannot see an account whose override set was empty.
+    pub fn from_resolved_vars(vars: Vec<(String, String)>) -> Self {
+        let clear_vars = vars
+            .iter()
+            .filter_map(|(key, _)| kind_for_config_env_var(key))
+            .flat_map(|kind| {
+                auth_env_vars_to_clear(kind)
+                    .iter()
+                    .map(|var| (*var).to_string())
+            })
+            .collect();
+        Self { vars, clear_vars }
+    }
+
+    /// Whether this selects an account at all (anything to set or to clear).
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty() && self.clear_vars.is_empty()
+    }
+}
+
 impl AccountConfig {
-    /// The launch env that points this account's harness at its config-home.
-    /// `None` when the kind has no config-home lever (an unknown/misconfigured
-    /// kind). A primary account whose `config_dir` is the harness DEFAULT
-    /// config-home resolves to an EMPTY env: it stays selectable/rememberable
-    /// while launching exactly as a default install, because injecting the
-    /// override would strand a harness whose config file is a sibling of the dir
-    /// rather than inside it (issue #94).
-    pub fn launch_env(&self) -> Option<Vec<(String, String)>> {
+    /// The launch env that points this account's harness at its config-home and
+    /// clears credentials that would outrank it. `None` when the kind has no
+    /// config-home lever (an unknown/misconfigured kind).
+    ///
+    /// A primary account whose `config_dir` is the harness DEFAULT config-home
+    /// sets NO override: it stays selectable/rememberable while launching exactly
+    /// as a default install, because injecting the override would strand a harness
+    /// whose config file is a sibling of the dir rather than inside it (issue #94).
+    /// It still CLEARS conflicting auth tokens — clearing a token that authenticates
+    /// as a different account strands nothing, and skipping it is what let a global
+    /// token override an explicit selection of the primary account.
+    pub fn launch_env(&self) -> Option<AccountLaunchEnv> {
         let env_var = env_var_for_kind(&self.kind)?;
+        let clear_vars = auth_env_vars_to_clear(&self.kind)
+            .iter()
+            .map(|var| (*var).to_string())
+            .collect();
         if is_default_config_dir(&self.kind, &self.config_dir) {
-            return Some(Vec::new());
+            return Some(AccountLaunchEnv {
+                vars: Vec::new(),
+                clear_vars,
+            });
         }
-        Some(vec![(env_var.to_string(), self.config_dir.clone())])
+        Some(AccountLaunchEnv {
+            vars: vec![(env_var.to_string(), self.config_dir.clone())],
+            clear_vars,
+        })
     }
 }
 
@@ -1477,10 +1539,11 @@ mod tests {
         };
         assert_eq!(
             account.launch_env(),
-            Some(vec![(
-                "CODEX_HOME".to_string(),
-                "/home/x/.codex-work".to_string()
-            )])
+            Some(AccountLaunchEnv {
+                vars: vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+                // codex has no auth-token lever today, so nothing to clear.
+                clear_vars: Vec::new(),
+            })
         );
 
         let unknown = AccountConfig {
@@ -1524,16 +1587,29 @@ mod tests {
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", "/home/tester");
 
-        // Primary account at the DEFAULT config-home -> empty env, so it launches
-        // byte-identically to a default install (issue #94) while staying
-        // selectable.
+        // Primary account at the DEFAULT config-home -> NO config-home override, so it
+        // launches like a default install (issue #94) while staying selectable. It still
+        // clears the conflicting auth token: a global CLAUDE_CODE_OAUTH_TOKEN authenticates
+        // as whichever account minted it and would silently outrank this explicit choice.
         let primary = AccountConfig {
             id: "claude-main".into(),
             kind: "claude".into(),
             label: "main".into(),
             config_dir: "/home/tester/.claude".into(),
         };
-        assert_eq!(primary.launch_env(), Some(Vec::new()));
+        let primary_env = primary
+            .launch_env()
+            .expect("claude has a config-home lever");
+        assert!(
+            primary_env.vars.is_empty(),
+            "injecting the override on a default config-home strands ~/.claude.json (issue #94)"
+        );
+        assert_eq!(
+            primary_env.clear_vars,
+            vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            "a selected account must clear credentials that outrank it, even when it sets \
+             no override — skipping this is how a global token silently re-homed the fleet"
+        );
         assert!(is_default_config_dir("claude", "/home/tester/.claude"));
         // Trailing slash still resolves as the default (component-wise compare).
         assert!(is_default_config_dir("claude", "/home/tester/.claude/"));
@@ -1547,10 +1623,13 @@ mod tests {
         };
         assert_eq!(
             secondary.launch_env(),
-            Some(vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                "/home/tester/.claude-2".to_string()
-            )])
+            Some(AccountLaunchEnv {
+                vars: vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/tester/.claude-2".to_string()
+                )],
+                clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            })
         );
         assert!(!is_default_config_dir("claude", "/home/tester/.claude-2"));
 
@@ -1581,10 +1660,13 @@ config_dir = "/home/x/.claude-personal"
         assert_eq!(config.accounts[1].kind, "claude");
         assert_eq!(
             config.accounts[1].launch_env(),
-            Some(vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                "/home/x/.claude-personal".to_string()
-            )])
+            Some(AccountLaunchEnv {
+                vars: vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/x/.claude-personal".to_string()
+                )],
+                clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            })
         );
 
         // Absent section defaults to an empty registry.

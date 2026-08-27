@@ -1513,6 +1513,12 @@ impl App {
 
         if !invalid_section("accounts") {
             self.loaded_accounts = config.accounts.clone();
+            // Give every pane whose resume was refused for an unresolved account another
+            // chance: the registry just changed, so the account it wants may now exist.
+            // Without this, re-adding an account leaves the agent blocked until restart.
+            for terminal in self.state.terminals.values_mut() {
+                terminal.account_resume_blocked = None;
+            }
         }
 
         if !invalid_section("keys") {

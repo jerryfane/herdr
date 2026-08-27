@@ -7891,6 +7891,24 @@
         },
         "AgentInfo": {
           "properties": {
+            "account": {
+              "description": "The credential/config-home account id this agent runs under, or `None` when it\nruns on the harness default. Reported because a pane silently coming back on the\nWRONG account is what this fleet experienced as hours of lost history, and the\nonly evidence was in each child's `/proc/<pid>/environ`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "account_config_dir": {
+              "description": "The config-home directory `account` resolves to in the registry (a PATH, never a\ncredential). `None` when no account is recorded, or when the recorded one no\nlonger resolves — `account_unresolved` distinguishes those.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "account_unresolved": {
+              "description": "The recorded account is NOT in the registry, so this agent will refuse to resume\nrather than come back on the default account and append to the wrong transcript.\nAn error state to surface, not a transient: it persists until the account is\nre-registered.",
+              "type": "boolean"
+            },
             "agent": {
               "type": [
                 "string",

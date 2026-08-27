@@ -89,6 +89,11 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
+    /// Auth variables to remove because a specific account was selected. Carried
+    /// separately from `extra` because a selected account can legitimately set NO
+    /// override (a primary account on the default config-home, issue #94) while
+    /// still needing a conflicting global token cleared.
+    clear_vars: Vec<String>,
     identity: PaneLaunchIdentity,
 }
 
@@ -108,6 +113,17 @@ impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
+            clear_vars: Vec::new(),
+            identity: PaneLaunchIdentity::Inherit,
+        }
+    }
+
+    /// Build from a resolved account selection, keeping the "set these" and
+    /// "clear those" halves distinct all the way to the child.
+    pub(crate) fn from_account(account_env: crate::config::AccountLaunchEnv) -> Self {
+        Self {
+            extra: account_env.vars,
+            clear_vars: account_env.clear_vars,
             identity: PaneLaunchIdentity::Inherit,
         }
     }
@@ -139,11 +155,23 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         // When this launch applies a config-home override, clear conflicting auth
         // tokens so the selected account's own credentials are authoritative — a
         // global CLAUDE_CODE_OAUTH_TOKEN otherwise overrides CLAUDE_CONFIG_DIR
-        // (gitmoot workflow-note row 86147).
+        // (gitmoot workflow-note row 86147). This covers launches that set a
+        // config-home var WITHOUT going through the account registry, e.g. a
+        // config.toml `extra_env`.
         if let Some(kind) = crate::config::kind_for_config_env_var(key) {
             for var in crate::config::auth_env_vars_to_clear(kind) {
                 cmd.env_remove(var);
             }
+        }
+    }
+    // The account-selected clear-list, which the loop above CANNOT derive: a primary
+    // account on the harness default config-home sets no override (issue #94), so
+    // `extra` is empty and the loop never runs — while a global token still outranks
+    // the selection. Skips anything this launch explicitly set, so an override always
+    // beats a clear.
+    for var in &launch_env.clear_vars {
+        if !launch_env.extra.iter().any(|(key, _)| key == var) {
+            cmd.env_remove(var);
         }
     }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
@@ -3445,6 +3473,59 @@ mod tests {
                 .and_then(std::ffi::OsStr::to_str),
             Some("ambient-token"),
             "the token is cleared only when an account override is actually applied"
+        );
+    }
+
+    /// THE HOLE THIS CLOSES: a selected account that sets NO config-home override must
+    /// still defeat a machine-global token.
+    ///
+    /// A primary account whose config_dir IS the harness default deliberately injects no
+    /// `CLAUDE_CONFIG_DIR` — doing so strands `~/.claude.json` (issue #94). The token
+    /// clearing used to be derived from the override vars, so an empty override set meant
+    /// nothing was cleared, and a global `CLAUDE_CODE_OAUTH_TOKEN` authenticated the agent
+    /// as whichever account minted it. That is the incident's exact mechanism, aimed at
+    /// the very account the incident dumped everything into.
+    ///
+    /// Judged by the symptom: what decides the transcript is what the CHILD can see.
+    #[test]
+    fn a_default_config_home_account_still_defeats_a_global_token() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "global-token-for-another-account",
+        );
+        // Baseline proving the assertion below is about the clear, not about absence:
+        // the ambient config-home must survive untouched.
+        cmd.env("CLAUDE_CONFIG_DIR", "/home/tester/.claude");
+
+        // A primary claude account on the default config-home: nothing to SET, something
+        // to CLEAR. Built as the account registry resolves it, not hand-assembled.
+        let account = crate::config::AccountConfig {
+            id: "primary".into(),
+            kind: "claude".into(),
+            label: "Primary".into(),
+            config_dir: "/home/tester/.claude".into(),
+        };
+        let account_env = crate::config::AccountLaunchEnv {
+            vars: Vec::new(),
+            clear_vars: crate::config::auth_env_vars_to_clear(&account.kind)
+                .iter()
+                .map(|var| (*var).to_string())
+                .collect(),
+        };
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::from_account(account_env));
+
+        assert!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN").is_none(),
+            "a global OAuth token outranks config-home routing; leaving it set on an \
+             explicitly selected account sends that agent's writes to the WRONG account's \
+             transcript, which is what the user experiences as lost history"
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/home/tester/.claude"),
+            "a default-config-home account must not gain an injected override (issue #94)"
         );
     }
 

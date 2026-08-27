@@ -324,6 +324,23 @@ pub struct AgentInfo {
     /// Absent (empty) for active agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parked_work: Vec<serde_json::Value>,
+    /// The credential/config-home account id this agent runs under, or `None` when it
+    /// runs on the harness default. Reported because a pane silently coming back on the
+    /// WRONG account is what this fleet experienced as hours of lost history, and the
+    /// only evidence was in each child's `/proc/<pid>/environ`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The config-home directory `account` resolves to in the registry (a PATH, never a
+    /// credential). `None` when no account is recorded, or when the recorded one no
+    /// longer resolves — `account_unresolved` distinguishes those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_config_dir: Option<String>,
+    /// The recorded account is NOT in the registry, so this agent will refuse to resume
+    /// rather than come back on the default account and append to the wrong transcript.
+    /// An error state to surface, not a transient: it persists until the account is
+    /// re-registered.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub account_unresolved: bool,
 }
 
 /// The `archived { at, by, reason }` provenance surfaced on an archived
