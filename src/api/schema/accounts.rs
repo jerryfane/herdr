@@ -43,6 +43,15 @@ pub struct AccountsCreateParams {
     pub config_dir: Option<String>,
 }
 
+/// `accounts.remove` — unregister an account (in-app remove-account). Removes its
+/// `[[accounts]]` entry from config.toml and reloads. Does NOT delete the config-home
+/// directory or any credentials — the entry can be re-added later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AccountsRemoveParams {
+    /// The account id to unregister.
+    pub id: String,
+}
+
 /// One rate-limit window for an account (e.g. a 5-hour or weekly bucket).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct UsageWindow {

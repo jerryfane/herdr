@@ -1569,6 +1569,19 @@
           ],
           "type": "object"
         },
+        "AccountsRemoveParams": {
+          "description": "`accounts.remove` — unregister an account (in-app remove-account). Removes its\n`[[accounts]]` entry from config.toml and reloads. Does NOT delete the config-home\ndirectory or any credentials — the entry can be re-added later.",
+          "properties": {
+            "id": {
+              "description": "The account id to unregister.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
         "AgentArchiveParams": {
           "description": "`agent.archive` — take an agent out of active rotation (issue #173). The pane\nis released but the session ref is preserved, so `agent.unarchive` can resume\n(not recreate) it later. Rejected when the agent is mid-turn unless `force`.",
           "properties": {
@@ -6178,6 +6191,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AccountsCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "accounts.remove",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AccountsRemoveParams"
             }
           },
           "required": [

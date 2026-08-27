@@ -626,6 +626,50 @@ fn toml_basic_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Remove the `[[accounts]]` array-of-tables entry whose `id == account_id` from a
+/// config.toml body, preserving everything else (comments, other accounts, formatting).
+/// A no-op that returns the input unchanged when no entry matches. The block spans from
+/// its `[[accounts]]` header through to (but not including) the next top-level `[`/`[[`
+/// header or EOF — so its trailing blank line goes with it and blanks don't accumulate.
+/// Used by `accounts.remove`.
+pub fn remove_accounts_block(content: &str, account_id: &str) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[accounts]]" {
+            let start = i;
+            let mut j = i + 1;
+            let mut block_id: Option<&str> = None;
+            while j < lines.len() && !lines[j].trim_start().starts_with('[') {
+                if block_id.is_none() {
+                    block_id = accounts_block_id_from_line(lines[j]);
+                }
+                j += 1;
+            }
+            if block_id == Some(account_id) {
+                i = j; // drop [start, j)
+                continue;
+            }
+            out.extend_from_slice(&lines[start..j]);
+            i = j;
+        } else {
+            out.push(lines[i]);
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
+
+/// Parse the `id` value from a `id = "..."` line inside an `[[accounts]]` block.
+fn accounts_block_id_from_line(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("id")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
 /// Write a key = value pair in a TOML section (creates section if missing).
 pub fn upsert_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
     upsert_section_raw(content, section, key, value)
@@ -808,6 +852,35 @@ mod tests {
             accounts[0].get("id").and_then(|value| value.as_str()),
             Some("claude-2")
         );
+    }
+
+    #[test]
+    fn remove_accounts_block_drops_the_matching_entry_and_keeps_the_rest() {
+        let base = "# top comment\n[server]\nheadless_cols = 120\n\n";
+        let with_two = append_accounts_block(
+            &append_accounts_block(base, "keep", "claude", "Keep", "/root/.claude"),
+            "gone",
+            "claude",
+            "Gone",
+            "/root/.claude-2",
+        );
+        let out = remove_accounts_block(&with_two, "gone");
+        assert!(out.contains("# top comment"), "comments preserved");
+        assert!(out.contains("headless_cols = 120"));
+        // still valid TOML with only the kept account.
+        let parsed: toml::Value = toml::from_str(&out).expect("valid TOML");
+        let accounts = parsed
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].get("id").and_then(|v| v.as_str()), Some("keep"));
+    }
+
+    #[test]
+    fn remove_accounts_block_is_a_noop_for_an_unknown_id() {
+        let content = append_accounts_block("[server]\n", "a", "claude", "A", "/root/.a");
+        assert_eq!(remove_accounts_block(&content, "nope"), content);
     }
 
     #[test]

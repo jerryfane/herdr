@@ -12,8 +12,8 @@ mod window_title;
 pub use self::{
     io::{
         append_accounts_block, config_diagnostic_summary, config_dir, config_path,
-        load_live_config, remove_keybinding_config_sections, remove_section_key, state_dir,
-        upsert_section_bool, upsert_section_value,
+        load_live_config, remove_accounts_block, remove_keybinding_config_sections,
+        remove_section_key, state_dir, upsert_section_bool, upsert_section_value,
     },
     keybinds::{
         format_key_combo, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
