@@ -448,7 +448,11 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // NOT `#[cfg(unix)]`: the PTY-spawning tests below are unix-only, but constructing an
+    // `App` is portable (see `app_with_agent` in api/agents.rs, which is ungated). The
+    // account-routing tests need this on every platform — the routing logic they cover is
+    // not unix-specific, and gating them would drop Windows coverage of the exact bug that
+    // sent a fleet's work to the wrong account.
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
