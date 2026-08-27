@@ -10,6 +10,10 @@ pub struct AccountInfo {
     pub id: String,
     pub kind: String,
     pub label: String,
+    /// The account's config-home directory (e.g. `/root/.claude-2`) — where its
+    /// credentials live. A non-secret path, not a credential. The app needs it to
+    /// point a login/logout at the right account (`CLAUDE_CONFIG_DIR=<config_dir>`).
+    pub config_dir: String,
     /// Whether the account is usable right now. `false` only when local usage
     /// data proves exhaustion (Codex over quota / rate-limit-reached); `true`
     /// otherwise, including when exhaustion cannot be detected locally.
