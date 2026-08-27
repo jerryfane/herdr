@@ -3049,6 +3049,10 @@ impl AppState {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                // Stamp when this status began, so the app can render a compact
+                // "time in current state" badge (#173). Only here, inside the
+                // previous_state != state guard, so a same-status refresh never resets it.
+                terminal.agent_status_since_unix_ms = Some(current_unix_ms());
                 if is_background_completion_transition(change.previous_state, change.state)
                     && (change.previous_agent_label.is_some() || change.agent_label.is_some())
                 {
@@ -5024,6 +5028,59 @@ mod tests {
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+    }
+
+    #[test]
+    fn status_transition_stamps_time_in_state_and_a_same_status_refresh_does_not_reset_it() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let emit = |state: &mut AppState, agent_state: AgentState| {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let since = |state: &AppState| {
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .agent_status_since_unix_ms
+        };
+
+        // A transition into Working stamps the time-in-state.
+        emit(&mut state, AgentState::Working);
+        let stamped = since(&state);
+        assert!(
+            stamped.is_some(),
+            "a status transition must stamp agent_status_since_unix_ms"
+        );
+
+        // The same status again must NOT reset it (only a DIFFERENT state does).
+        emit(&mut state, AgentState::Working);
+        assert_eq!(
+            since(&state),
+            stamped,
+            "a same-status refresh must not reset time-in-state"
+        );
+
+        // A different status re-stamps (never earlier than the previous stamp).
+        emit(&mut state, AgentState::Idle);
+        assert!(
+            since(&state) >= stamped,
+            "a new status must re-stamp time-in-state"
+        );
     }
 
     #[test]

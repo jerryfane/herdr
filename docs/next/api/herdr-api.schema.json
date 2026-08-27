@@ -7972,6 +7972,15 @@
               },
               "type": "object"
             },
+            "status_since_unix_ms": {
+              "description": "Wall-clock ms when the agent entered its CURRENT status (its last transition).\n`None` until the first detected transition, and after a restore/respawn (time in\nstate restarts). The app derives a compact \"5m/2h/3d\" badge from `now - this` (#173).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "tab_id": {
               "type": "string"
             },

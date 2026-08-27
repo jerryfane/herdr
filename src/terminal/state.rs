@@ -267,6 +267,11 @@ pub struct TerminalState {
     /// at the moment the watch is discarded.
     pub(crate) prompt_claim_retired: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    /// Wall-clock ms when the agent's CURRENT status began — set at each transition to
+    /// a DIFFERENT state. None until the first detected transition. NOT persisted, so it
+    /// resets on restore/respawn (time-in-state restarts for a freshly relaunched agent,
+    /// which is correct). Drives the app's compact "5m/2h/3d" time-in-state badge (#173).
+    pub agent_status_since_unix_ms: Option<u64>,
     pub turn: u64,
     pub turn_epoch: u64,
     /// Monotonic count of how many times a DIFFERENT agent has seized this
@@ -330,6 +335,7 @@ impl TerminalState {
             displaced_submit_unknown: false,
             prompt_claim_retired: false,
             last_agent_state_change_seq: None,
+            agent_status_since_unix_ms: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
             occupant_generation: 0,
@@ -2437,6 +2443,7 @@ impl TerminalState {
         self.input_prompt_kind = None;
         self.composer_write = None;
         self.last_agent_state_change_seq = None;
+        self.agent_status_since_unix_ms = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
