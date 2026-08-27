@@ -42,6 +42,7 @@ impl App {
                     id: account.id.clone(),
                     kind: account.kind.clone(),
                     label: account.label.clone(),
+                    config_dir: account.config_dir.clone(),
                     active,
                     email: account_email(account),
                     usage,
