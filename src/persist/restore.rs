@@ -1190,6 +1190,98 @@ mod tests {
         assert_eq!(restored_worktree_space_membership(Some(membership)), None);
     }
 
+    /// ACCOUNT ROUTING SURVIVES A RESTART — the receipt's core clause, asserted end to end
+    /// through the real capture/parse/restore path.
+    ///
+    /// The incident: a staged update rebuilt every pane from the snapshot, the selected
+    /// account was not persisted, and eleven agents came back on the DEFAULT account and
+    /// appended to the primary transcript. The owner experienced that as one to two hours
+    /// of history disappearing.
+    ///
+    /// Deliberately not asserted here: pane count, session-id presence, or that a process
+    /// exists. All three passed during the incident and are disqualified as evidence.
+    #[tokio::test]
+    async fn a_secondary_account_survives_snapshot_and_restore() {
+        let cwd = std::env::temp_dir();
+        let snapshot = SessionSnapshot {
+            version: crate::persist::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: Some("herdr-app".into()),
+                            agent_name: Some("herdr-app".into()),
+                            managed_agent_kind: Some("claude".into()),
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "sess-crazy".into(),
+                            }),
+                            launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
+                            agent_account: Some("claudecrazy".into()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
+        };
+
+        // Through the real wire, not the in-memory struct: a snapshot that cannot survive
+        // serialization is a snapshot that cannot survive a restart.
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let reparsed = crate::persist::snapshot::parse_snapshot(&json).expect("parse");
+
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, _runtimes) = restore(
+            &reparsed,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals.values().next().expect("restored terminal");
+        assert_eq!(
+            terminal.agent_account.as_deref(),
+            Some("claudecrazy"),
+            "the restored pane lost its account; it would resume on the default and append \
+             to the WRONG transcript, which is what reads as lost history"
+        );
+        // The receipt also requires names and labels to survive, by assertion rather than
+        // by the eventual re-registration that happened to rescue us during the incident.
+        assert_eq!(terminal.manual_label.as_deref(), Some("herdr-app"));
+    }
+
     #[test]
     fn restore_plan_respects_opt_in_and_allowlist() {
         let pi_session_path = test_session_path("pi-session.jsonl");
