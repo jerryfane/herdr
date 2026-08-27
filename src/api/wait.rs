@@ -986,6 +986,7 @@ mod tests {
             launch_pending: false,
             interactive_ready: true,
             state_change_seq,
+            status_since_unix_ms: None,
             cwd: None,
             foreground_cwd: None,
             revision: 1,

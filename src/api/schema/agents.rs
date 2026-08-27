@@ -292,6 +292,11 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// Wall-clock ms when the agent entered its CURRENT status (its last transition).
+    /// `None` until the first detected transition, and after a restore/respawn (time in
+    /// state restarts). The app derives a compact "5m/2h/3d" badge from `now - this` (#173).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_since_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
