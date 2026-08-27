@@ -1241,7 +1241,25 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
-        info!("starting live handoff");
+        // The single choke point for every handoff, however it was requested. See
+        // `crate::server::supervision`: this process exiting after the handoff deactivates
+        // a systemd unit and the cgroup kill takes the replacement and every imported pane
+        // with it. Refuse here, before a socket is opened or a child is spawned.
+        let supervision = crate::server::supervision::detect();
+        if supervision.forbids_process_handoff() {
+            warn!(
+                supervision = ?supervision,
+                pid = std::process::id(),
+                "refusing live handoff: exiting would deactivate the supervising unit and kill the panes"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing a live handoff: this process is the systemd unit's main process, so \
+                 exiting after the handoff would deactivate the unit and kill the replacement \
+                 and every pane with it. Restart the service instead.",
+            ));
+        }
+        info!(supervision = ?supervision, "starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
@@ -1466,6 +1484,28 @@ impl HeadlessServer {
     /// a deleted path — the replacement spawn would fail ENOENT and nothing would ever activate.)
     fn apply_staged_update(&mut self) -> io::Result<crate::persist::staged_build::ApplyOutcome> {
         use crate::persist::staged_build::{self, ApplyOutcome};
+
+        // REFUSE BEFORE ANYTHING IS TORN DOWN.
+        //
+        // The handoff below hands the sockets and PTYs to a replacement and then lets THIS
+        // process exit. Under a `Type=simple` systemd unit that exit deactivates the unit,
+        // and the default `KillMode=control-group` kills everything still in the cgroup —
+        // the replacement and every pane it just imported.
+        //
+        // The handoff cannot notice: spawn, import and version validation all succeed, the
+        // API answers `ok`, and the supervisor kills the lot a moment later. On this fleet
+        // that took 30 live panes down and they came back from the snapshot under the wrong
+        // account. So the check must be here, before the first destructive step, and it
+        // must fail closed.
+        if crate::server::supervision::detect().forbids_process_handoff() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing a live handoff: this process is the systemd unit's main process, so \
+                 exiting after the handoff would deactivate the unit and kill the replacement \
+                 and every pane with it. Restart the service to pick up the staged build \
+                 instead (the staged manifest is left in place).",
+            ));
+        }
 
         let staged = staged_build::load()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
@@ -3737,6 +3777,15 @@ impl HeadlessServer {
                     id: msg.request.id,
                     result: api::schema::ResponseResult::Ok {},
                 }),
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "handoff_refused_supervised".into(),
+                            message: err.to_string(),
+                        },
+                    })
+                }
                 Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
                     id: msg.request.id,
                     error: api::schema::ErrorBody {
@@ -3779,6 +3828,19 @@ impl HeadlessServer {
                                       not updated; a future restart may run the previous build until \
                                       re-applied"
                                 .into(),
+                        },
+                    })
+                }
+                // A supervision refusal is NOT a failure to distinguish from a broken build —
+                // nothing was attempted and nothing was torn down. Give it its own code so a
+                // caller (and the fleet) can tell "declined for safety, old server still
+                // serving" from "the update itself went wrong".
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "apply_staged_update_refused_supervised".into(),
+                            message: err.to_string(),
                         },
                     })
                 }

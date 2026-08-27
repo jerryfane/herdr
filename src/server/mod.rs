@@ -12,4 +12,5 @@ pub(crate) mod keybindings;
 pub(crate) mod notifications;
 pub(crate) mod render_stream;
 pub mod socket_paths;
+pub(crate) mod supervision;
 pub(crate) mod terminal_attach;
