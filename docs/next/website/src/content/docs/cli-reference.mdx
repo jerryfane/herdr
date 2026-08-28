@@ -52,14 +52,18 @@ Connect the herdr app to this machine by scanning a QR code, instead of copying 
 
 ```bash
 herdr pair                 # print a QR bound to this machine's Tailscale address
-herdr pair --lan           # pair over a private LAN instead (RFC1918 addresses only)
-herdr pair --ttl 120       # how long the code stays valid (default 300, max 3600)
+herdr pair --lan           # pair over a private LAN instead (Linux only; RFC1918 addresses only)
+herdr pair --ttl 120       # seconds the code stays valid (default 300, max 3600)
 herdr pair --port 4021     # listen on a fixed port instead of one the OS picks
 ```
 
 The phone generates its own SSH keypair and sends only the **public** half, which is appended to `~/.ssh/authorized_keys`. No private key is ever displayed, transported, or stored by this command.
 
+**Your machine's SSH server must be running before you pair.** Pairing only adds a key to `~/.ssh/authorized_keys`; it does not start or configure a server. If SSH is off, pairing succeeds and the app then cannot connect. On macOS this is off by default — enable **System Settings → General → Sharing → Remote Login**. On most Linux distributions `sshd` is already running; check with `systemctl status ssh`.
+
 Pairing binds to your Tailscale address, so the listener is not reachable from the internet. Without Tailscale it refuses to bind unless you pass `--lan`, and `--lan` accepts only private addresses — a public one is refused either way. Tailscale is preferred whenever it is available, so passing the flag cannot silently move you onto a weaker path.
+
+`--lan` currently works on **Linux only** — it resolves the address with `hostname -I`, which BSD and macOS `hostname` do not support, so on macOS it finds no address and pairing is refused. It also picks the **first** private address that command lists, which is not necessarily the interface you meant on a machine with several; use `--port` and check the printed address before scanning.
 
 The code is single-use and expires on its own, so a photograph of it is worthless once redeemed. The QR also carries this machine's SSH host-key fingerprint, which lets the app pin the host before its first connection rather than trusting whatever answers.
 
