@@ -940,7 +940,28 @@ impl TerminalState {
         }
         if agent_released {
             self.composer_write = None;
-            self.clear_agent_name();
+            // A DELIBERATE SAME-SEAT RESTART IS NOT A RELEASE (issue #128).
+            //
+            // `agent.restart` — which is also how an account SWAP is performed — arms
+            // `pending_agent_resume_plan` and then kills the process on purpose, so the
+            // PaneDied that follows is our own doing. Treating it as "the agent let go of
+            // this pane" wiped the seat's name, and gitmoot resolves role -> pane BY NAME,
+            // so the seat went quietly unaddressable.
+            //
+            // Keep the identity, release only the SESSION ANCHOR: the replacement resumes
+            // under a new session ref, and an owner whose `session_ref` is None is ADOPTED
+            // by `reconcile_agent_name_owner` rather than treated as a mismatch. That is
+            // the same idiom `restore_managed_agent` and the daemon-restart restore path
+            // already use, so one release covers both the exit here and the SessionStart
+            // that arrives afterwards.
+            //
+            // Everything that is NOT a deliberate restart still releases: a genuine exit,
+            // a different agent seizing the pane, a launch command that finished.
+            if self.pending_agent_resume_plan.is_some() {
+                self.release_agent_name_session_anchor();
+            } else {
+                self.clear_agent_name();
+            }
         }
         TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -2431,6 +2452,22 @@ impl TerminalState {
             kind,
             phase: ManagedAgentPhase::Active,
         });
+    }
+
+    /// Keep the seat's name but forget WHICH session owned it.
+    ///
+    /// Used when this pane is deliberately restarted into a new session of the SAME seat
+    /// (an `agent.restart`, including an account swap). `reconcile_agent_name_owner`
+    /// adopts an incoming session ref when the owner holds none, so the name transfers to
+    /// the resumed session instead of being disowned as a mismatch.
+    ///
+    /// Deliberately does NOT touch `managed_agent`: the seat is still running the same
+    /// kind of agent, and that field is what exempts a managed agent from the
+    /// replacement check at all.
+    pub fn release_agent_name_session_anchor(&mut self) {
+        if let Some(owner) = self.agent_name_owner.as_mut() {
+            owner.session_ref = None;
+        }
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -5974,6 +6011,110 @@ mod tests {
 
         assert!(terminal.agent_name.is_none());
         assert_eq!(terminal.effective_known_agent(), Some(Agent::Claude));
+    }
+
+    /// A DELIBERATE RESTART KEEPS THE SEAT'S NAME (issue #128).
+    ///
+    /// `agent.restart` — which is how an account swap is done — arms a resume plan and
+    /// kills the process itself. The resulting exit was being read as "the agent released
+    /// this pane", wiping the name; gitmoot resolves role -> pane by NAME, so the seat
+    /// went quietly unaddressable. The replacement then resumes under a NEW session ref,
+    /// which is the second way the name was lost, so both are exercised here.
+    #[test]
+    fn a_deliberate_same_seat_restart_keeps_the_name_across_a_new_session() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            crate::agent_resume::AgentSessionRef::path(test_session_path("before.jsonl")).unwrap(),
+        );
+        terminal.set_agent_name("keephair".into());
+        assert_eq!(terminal.agent_name.as_deref(), Some("keephair"));
+
+        // What `agent.restart` does before killing the process.
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "pi".into(),
+            argv: vec!["pi".into(), "--resume".into()],
+            dedupe_key: "k".into(),
+        });
+
+        // The kill we asked for.
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true, // process_exited
+        );
+        assert_eq!(
+            terminal.agent_name.as_deref(),
+            Some("keephair"),
+            "our own restart must not be read as the agent letting go of the pane"
+        );
+        // The MECHANISM, asserted directly rather than inferred. The replacement resumes
+        // under a new session ref, and only an owner holding NO anchor gets adopted
+        // instead of being treated as a takeover. Asserting just "the name survived"
+        // passed even with the anchor left in place, because the adoption path is not
+        // always reached from here — so that assertion alone could not see this go wrong.
+        assert!(
+            terminal
+                .agent_name_owner
+                .as_ref()
+                .is_some_and(|owner| owner.session_ref.is_none()),
+            "the session anchor must be released so the resumed session is adopted"
+        );
+
+        // The replacement comes back under a DIFFERENT session ref, via the SessionStart
+        // the resumed harness actually emits. The released anchor must let it be adopted
+        // rather than treated as a takeover.
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::path(test_session_path("after.jsonl")),
+            Some(40),
+            None,
+        );
+
+        assert_eq!(
+            terminal.agent_name.as_deref(),
+            Some("keephair"),
+            "the name must transfer to the resumed session"
+        );
+    }
+
+    /// THE MIRROR, and the half that keeps the fix scoped rather than merely disabled.
+    ///
+    /// With no armed resume plan, a process exit is a genuine release and must still drop
+    /// the name. Without this, "never clear on exit" would pass the test above too, and a
+    /// name would follow a pane that some other agent had taken over.
+    #[test]
+    fn an_exit_without_an_armed_restart_still_releases_the_name() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            crate::agent_resume::AgentSessionRef::path(test_session_path("only.jsonl")).unwrap(),
+        );
+        terminal.set_agent_name("keephair".into());
+        assert!(terminal.pending_agent_resume_plan.is_none());
+
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true, // process_exited
+        );
+        assert!(
+            terminal.agent_name.is_none(),
+            "an unasked-for exit is a real release and must still clear the name"
+        );
     }
 
     #[test]
