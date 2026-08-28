@@ -616,6 +616,31 @@ fn claude_account_has_credentials(config_dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Where Claude Code actually keeps `.claude.json` for a given config-home.
+///
+/// TWO LAYOUTS, AND READING THE WRONG ONE REFUSES A SWAP THAT WOULD HAVE WORKED.
+/// A config-home reached via `CLAUDE_CONFIG_DIR` keeps the file INSIDE it. The DEFAULT
+/// home does not: Claude Code keeps its main config as a SIBLING, at `~/.claude.json`.
+/// That is the same quirk `AccountConfig::launch_env` already handles for issue #94 —
+/// which is why a default-home account injects no override at all.
+///
+/// Measured when this was fixed (issue #127): `/root/.claude.json` held 289 projects and
+/// trusted the seat's directory, while `/root/.claude/.claude.json` held a stale 102 and
+/// did not. The gate read the stale one and refused the swap. A non-default home
+/// (`/root/.claude-9`) had the file inside and NO sibling, so both cases are real and the
+/// choice cannot be "whichever exists".
+///
+/// Note `.credentials.json` is NOT like this — it lives inside every config-home,
+/// including the default one, so `claude_account_has_credentials` is correct as written.
+fn claude_config_file(config_dir: &str) -> std::path::PathBuf {
+    if crate::config::is_default_config_dir("claude", config_dir) {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::Path::new(&home).join(".claude.json");
+        }
+    }
+    std::path::Path::new(config_dir).join(".claude.json")
+}
+
 /// Why a target account cannot host a resumed agent yet. Each variant names the stage that
 /// failed, so a caller can say what to fix instead of reporting a bare failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -674,7 +699,7 @@ pub(super) fn claude_account_launch_blocker(
     if !claude_account_has_credentials(config_dir) {
         return Some(ClaudeLaunchBlocker::LoggedOut);
     }
-    let config = std::fs::read_to_string(std::path::Path::new(config_dir).join(".claude.json"))
+    let config = std::fs::read_to_string(claude_config_file(config_dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     // No parsable config at all is the un-onboarded case: a fresh config-home has no
@@ -869,6 +894,76 @@ mod tests {
         // Non-empty creds → authenticated.
         std::fs::write(&creds, "{\"token\":\"x\"}").unwrap();
         assert!(claude_account_has_credentials(&home.to_string_lossy()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A DEFAULT config-home is judged by the SIBLING `~/.claude.json`, not the one
+    /// inside the directory (issue #127).
+    ///
+    /// This is the regression that refused to swap live seats onto `claude-primary`:
+    /// `/root/.claude.json` trusted the seat's cwd, `/root/.claude/.claude.json` was a
+    /// stale copy that did not, and the gate read the stale one. Both files existed, so
+    /// nothing looked wrong — the refusal was simply, confidently, false.
+    #[test]
+    fn a_default_config_home_is_judged_by_the_sibling_config_file() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let home = swap_temp_root("sibling");
+        std::env::set_var("HOME", &home);
+
+        // The DEFAULT config-home for claude, i.e. what `claude-primary` registers.
+        let config_dir = home.join(".claude");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(".credentials.json"), "{\"token\":\"x\"}").unwrap();
+        let dir = config_dir.to_string_lossy().to_string();
+        let cwd = "/work/repo";
+
+        // Onboarded + trusted, written ONLY into the sibling — the real file.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{\"/work/repo\":{\"hasTrustDialogAccepted\":true}}}",
+        )
+        .unwrap();
+        // A STALE file inside the directory that trusts nothing. Before the fix this is
+        // what was read, and it produced a DirectoryNotTrusted refusal.
+        std::fs::write(
+            config_dir.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{}}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            None,
+            "a default-home account must be judged by ~/.claude.json, which trusts this cwd"
+        );
+
+        // THE MIRROR, and the half that keeps the fix honest: trust present ONLY inside
+        // the directory must NOT satisfy a default-home account. Without this, "always
+        // read whichever file has the answer" would pass too, and the gate would be
+        // trusting a file Claude Code never reads.
+        std::fs::write(
+            home.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{}}",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join(".claude.json"),
+            "{\"hasCompletedOnboarding\":true,\"projects\":{\"/work/repo\":{\"hasTrustDialogAccepted\":true}}}",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_account_launch_blocker(&dir, Some(cwd)),
+            Some(ClaudeLaunchBlocker::DirectoryNotTrusted {
+                cwd: cwd.to_string()
+            }),
+            "the in-directory file must not speak for a default-home account"
+        );
+
+        match prev_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
