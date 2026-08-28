@@ -33,6 +33,7 @@ mod layout;
 mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
+mod pairing;
 mod pane;
 mod pane_graphics_files;
 mod persist;
@@ -621,6 +622,7 @@ fn main() -> io::Result<()> {
         println!("       herdr notification <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
+        println!("       herdr pair [--lan] [--ttl <seconds>]");
         println!("       herdr session <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
         println!();
@@ -679,6 +681,7 @@ fn main() -> io::Result<()> {
                 "herdr pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
+            ("herdr pair", "Connect a phone by scanning a QR code"),
             (
                 "herdr session <subcommand>",
                 "Manage named persistent sessions",
