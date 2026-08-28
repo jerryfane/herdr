@@ -50,6 +50,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
 schemars = { version = "1.2.1", features = ["derive"] }
+# Cryptographic randomness for pairing tokens. Already present transitively via p256;
+# promoted to a direct dep because `generate_machine_id` is explicitly disclaimed as
+# non-secret and must not be reused for a credential.
+getrandom = "0.2"
+# Zero-dependency QR encoder (Project Nayuki), for `herdr pair`. Chosen over the
+# alternatives because it adds NO transitive dependencies, which matters in a tree
+# that has deliberately avoided pulling in rand/uuid/hex.
+qrcodegen = "1.8.0"
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
