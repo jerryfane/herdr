@@ -64,14 +64,29 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     // a pre-authentication endpoint somewhere it should not be, so it happens before a
     // token exists, before a socket is opened, and before anything is printed.
     let tailscale = pairing::detect_tailscale_address();
-    let lan_addr = if lan { first_private_address() } else { None };
-    let bind_ip = match pairing::choose_bind_address(tailscale, lan_addr) {
-        Ok(addr) => addr,
-        Err(refusal) => {
-            eprintln!("herdr pair: {refusal}");
-            return Ok(1);
+    // Resolve --lan BEFORE consulting the bind policy, and report ITS failure with ITS own
+    // cause. The original defect was here: an unresolvable LAN address fell through as
+    // `None`, indistinguishable from "no Tailscale", so a macOS user was told Tailscale was
+    // missing when the real problem was that we could not enumerate their interfaces.
+    // Tailscale still wins when available, so this cannot downgrade the chosen path.
+    let mut lan_choice = None;
+    if lan && tailscale.is_none() {
+        match pairing::choose_lan_address(&crate::platform::local_ipv4_addresses()) {
+            Ok(found) => lan_choice = Some(found),
+            Err(refusal) => {
+                eprintln!("herdr pair: {refusal}");
+                return Ok(1);
+            }
         }
-    };
+    }
+    let bind_ip =
+        match pairing::choose_bind_address(tailscale, lan_choice.as_ref().map(|c| c.address)) {
+            Ok(addr) => addr,
+            Err(refusal) => {
+                eprintln!("herdr pair: {refusal}");
+                return Ok(1);
+            }
+        };
 
     let listener = match std::net::TcpListener::bind((bind_ip, port)) {
         Ok(listener) => listener,
@@ -125,10 +140,13 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     writeln!(
         out,
         "  network    {}",
-        if tailscale.is_some() {
-            "Tailscale"
-        } else {
-            "private LAN (--lan)"
+        match (&tailscale, &lan_choice) {
+            (Some(_), _) => "Tailscale".to_string(),
+            // Name the interface: on a machine with docker bridges or several NICs the
+            // address alone does not tell the user whether the right one was picked, and
+            // this address is the one they are about to scan.
+            (None, Some(choice)) => format!("private LAN via {} (--lan)", choice.interface),
+            (None, None) => "private LAN (--lan)".to_string(),
         }
     )?;
     writeln!(out, "  expires    in {}s", ttl.as_secs())?;
@@ -181,23 +199,6 @@ fn home_dir() -> std::path::PathBuf {
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/root"))
-}
-
-/// Find a private address to bind when `--lan` is passed.
-///
-/// Deliberately narrow: only RFC1918 addresses are considered, and
-/// `choose_bind_address` checks the result again. Returning something public here would be
-/// caught there rather than bound.
-fn first_private_address() -> Option<std::net::Ipv4Addr> {
-    let out = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-        .ok()?;
-    String::from_utf8(out.stdout)
-        .ok()?
-        .split_whitespace()
-        .filter_map(|token| token.parse::<std::net::Ipv4Addr>().ok())
-        .find(|addr| pairing::is_private_address(*addr) && !addr.is_loopback())
 }
 
 /// Render the SAME help clap builds for `herdr pair --help`, taken from `spec.rs`.

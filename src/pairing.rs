@@ -121,6 +121,73 @@ pub fn is_private_address(addr: Ipv4Addr) -> bool {
     addr.is_private() || addr.is_loopback()
 }
 
+/// Why no usable LAN address could be chosen. Each variant names the REAL cause.
+///
+/// This type exists because the original defect was a refusal that blamed the wrong
+/// subsystem: `--lan` on macOS found nothing and the user was told Tailscale was missing.
+/// A refusal that misnames its cause sends someone to fix the wrong thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanRefusal {
+    /// The platform cannot enumerate interfaces (Windows has no `getifaddrs`).
+    Unsupported,
+    /// Interfaces were found, but none carried a usable private IPv4 address.
+    NoPrivateAddress { seen: usize },
+}
+
+impl fmt::Display for LanRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => write!(
+                f,
+                "--lan cannot enumerate network interfaces on this platform"
+            ),
+            Self::NoPrivateAddress { seen } => write!(
+                f,
+                "--lan found no private (RFC1918) address on any active interface \
+                 ({seen} address(es) checked). Connect to a local network, or use \
+                 Tailscale and drop --lan"
+            ),
+        }
+    }
+}
+
+/// Pick the LAN address to bind, from whatever the platform enumerated.
+///
+/// SEPARATE FROM THE ENUMERATION ON PURPOSE, the same split `choose_bind_address` already
+/// uses: the acceptance rules are the security property, so they must be provable without
+/// a network interface. Everything here is a pure function of its input.
+///
+/// THE ORDERING RULE, stated because a user scans whichever address this returns: candidates
+/// are sorted by (interface name, address) and the first is taken. Not "best" — there is no
+/// non-arbitrary best on a multi-homed machine — but STABLE, so two runs on an unchanged
+/// machine cannot print different addresses. The caller prints the interface alongside the
+/// address so the choice is visible rather than implied.
+pub fn choose_lan_address(
+    candidates: &[crate::platform::InterfaceAddress],
+) -> Result<crate::platform::InterfaceAddress, LanRefusal> {
+    if candidates.is_empty() {
+        return Err(LanRefusal::Unsupported);
+    }
+    let mut usable: Vec<_> = candidates
+        .iter()
+        // `is_private_address` accepts loopback too (choose_bind_address relies on that),
+        // so loopback is excluded explicitly here rather than assumed away.
+        .filter(|c| c.address.is_private() && !c.address.is_loopback())
+        .cloned()
+        .collect();
+    if usable.is_empty() {
+        return Err(LanRefusal::NoPrivateAddress {
+            seen: candidates.len(),
+        });
+    }
+    usable.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then_with(|| a.address.octets().cmp(&b.address.octets()))
+    });
+    Ok(usable.remove(0))
+}
+
 /// Decide what to bind, given what Tailscale reported and whether `--lan` was passed.
 ///
 /// Split from the subprocess call so the policy is unit-testable — the refusals are the
@@ -934,6 +1001,124 @@ mod tests {
 
     /// THE SECURITY PROPERTY: a pre-authentication endpoint must never land on a public
     /// interface. Every refusal below is the point of the feature, not an edge case.
+    fn ifaddr(iface: &str, addr: &str) -> crate::platform::InterfaceAddress {
+        crate::platform::InterfaceAddress {
+            interface: iface.into(),
+            address: addr.parse().unwrap(),
+        }
+    }
+
+    /// DIFFERENTIAL CHECK against the instrument this replaces, on the one platform where
+    /// both work. `hostname -I` is Linux-only -- that is the whole defect -- so this cannot
+    /// prove the macOS path, and is `ignore`d rather than pretending to. Run it with
+    /// `cargo nextest run -E 'test(getifaddrs_agrees)' --run-ignored all` on Linux.
+    ///
+    /// It exists because "getifaddrs returns something" is not evidence: an empty list would
+    /// also return something. Agreement with an INDEPENDENT enumerator is.
+    #[test]
+    #[ignore = "Linux-only differential check; hostname -I does not exist on macOS"]
+    fn getifaddrs_agrees_with_hostname_dash_i_on_linux() {
+        let out = std::process::Command::new("hostname")
+            .arg("-I")
+            .output()
+            .expect("hostname -I must exist to run this check");
+        let expected: std::collections::BTreeSet<Ipv4Addr> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|t| t.parse::<Ipv4Addr>().ok())
+            .collect();
+        let found: std::collections::BTreeSet<Ipv4Addr> = crate::platform::local_ipv4_addresses()
+            .into_iter()
+            .map(|c| c.address)
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "hostname -I reported nothing; this machine cannot serve as a control"
+        );
+        // getifaddrs may legitimately see MORE (it reports every UP interface), but it must
+        // not MISS anything the old instrument found -- that would be a regression.
+        let missing: Vec<_> = expected.difference(&found).collect();
+        assert!(
+            missing.is_empty(),
+            "getifaddrs missed addresses hostname -I found: {missing:?} (found: {found:?})"
+        );
+    }
+
+    /// A REFUSAL MUST NAME ITS OWN CAUSE. This is the whole defect restated as a test:
+    /// `--lan` on macOS could not enumerate interfaces, returned nothing, and the user was
+    /// told TAILSCALE was missing. Someone reading that goes and installs Tailscale to fix
+    /// a problem that was never about Tailscale.
+    #[test]
+    fn a_lan_refusal_names_the_real_cause_not_tailscale() {
+        // Nothing enumerated at all -- the platform cannot do it.
+        assert_eq!(choose_lan_address(&[]), Err(LanRefusal::Unsupported));
+        assert!(LanRefusal::Unsupported.to_string().contains("enumerate"));
+
+        // Interfaces exist but none is usable: a DIFFERENT cause, reported differently.
+        let public_only = [ifaddr("eth0", "203.0.113.7"), ifaddr("eth1", "8.8.8.8")];
+        assert_eq!(
+            choose_lan_address(&public_only),
+            Err(LanRefusal::NoPrivateAddress { seen: 2 })
+        );
+        let message = LanRefusal::NoPrivateAddress { seen: 2 }.to_string();
+        assert!(message.contains("private"), "{message}");
+        // It may MENTION Tailscale as a remedy, but must not present it as the cause.
+        assert!(
+            !message.starts_with("no Tailscale"),
+            "the refusal must not blame Tailscale: {message}"
+        );
+    }
+
+    /// Only RFC1918, and never loopback. `is_private_address` deliberately accepts loopback
+    /// (choose_bind_address depends on that), so this path must exclude it itself rather
+    /// than inheriting the looser rule.
+    #[test]
+    fn only_private_non_loopback_addresses_are_selectable() {
+        let mixed = [
+            ifaddr("lo", "127.0.0.1"),
+            ifaddr("eth0", "203.0.113.7"),
+            ifaddr("eth1", "192.168.1.50"),
+        ];
+        let chosen = choose_lan_address(&mixed).expect("one private address is present");
+        assert_eq!(chosen.address, "192.168.1.50".parse::<Ipv4Addr>().unwrap());
+
+        // Loopback ALONE is not a fallback -- binding pairing to 127.0.0.1 would advertise
+        // an address the phone can never reach.
+        assert_eq!(
+            choose_lan_address(&[ifaddr("lo", "127.0.0.1")]),
+            Err(LanRefusal::NoPrivateAddress { seen: 1 })
+        );
+        // All three RFC1918 blocks qualify.
+        for addr in ["10.1.2.3", "172.16.5.6", "192.168.9.9"] {
+            assert!(
+                choose_lan_address(&[ifaddr("eth0", addr)]).is_ok(),
+                "{addr}"
+            );
+        }
+        // Carrier-grade NAT is NOT RFC1918 and must not be treated as a LAN.
+        assert_eq!(
+            choose_lan_address(&[ifaddr("eth0", "100.64.0.1")]),
+            Err(LanRefusal::NoPrivateAddress { seen: 1 })
+        );
+    }
+
+    /// STABLE, NOT "BEST". There is no non-arbitrary best address on a multi-homed machine,
+    /// but two runs on an unchanged machine must not print different addresses -- the user
+    /// scans whichever one this returns.
+    #[test]
+    fn the_chosen_lan_address_is_deterministic_regardless_of_enumeration_order() {
+        let a = ifaddr("docker0", "172.17.0.1");
+        let b = ifaddr("eth0", "192.168.1.50");
+        let c = ifaddr("eth0", "10.0.0.5");
+        let forward = choose_lan_address(&[a.clone(), b.clone(), c.clone()]).unwrap();
+        let reverse = choose_lan_address(&[c.clone(), b.clone(), a.clone()]).unwrap();
+        assert_eq!(
+            forward, reverse,
+            "order of enumeration must not change the choice"
+        );
+        // And the rule is the one documented: sorted by (interface, address).
+        assert_eq!(forward, a);
+    }
+
     #[test]
     fn binding_refuses_every_way_of_reaching_the_internet() {
         let public: Ipv4Addr = "37.27.59.89".parse().unwrap();
