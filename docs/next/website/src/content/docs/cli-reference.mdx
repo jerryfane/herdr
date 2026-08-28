@@ -65,13 +65,15 @@ Pairing binds to your Tailscale address, so the listener is not reachable from t
 
 `--lan` currently works on **Linux only** — it resolves the address with `hostname -I`, which BSD and macOS `hostname` do not support, so on macOS it finds no address and pairing is refused. It also picks the **first** private address that command lists, which is not necessarily the interface you meant on a machine with several; use `--port` and check the printed address before scanning.
 
-The code is single-use and expires on its own, so a photograph of it is worthless once redeemed. The QR also carries this machine's SSH host-key fingerprint, which lets the app pin the host before its first connection rather than trusting whatever answers.
+The code is single-use and expires on its own, so a photograph of it is worthless once redeemed. The QR also carries this machine's SSH host-key fingerprint when Herdr can read one, which lets the app pin the host before its first connection. If it cannot, `herdr pair` reports the host key as `UNKNOWN` and the app trusts the first key it is offered instead.
 
-Every key added this way is tagged so you can find and revoke it:
+Every key added this way is tagged so you can locate the entry before revoking it:
 
 ```bash
 grep herdr-pair ~/.ssh/authorized_keys
 ```
+
+`grep` only displays matching lines; it does not revoke access. To revoke a device, open `~/.ssh/authorized_keys`, delete the complete `herdr-pair` line for that device, and save the file. Leave every unrelated line unchanged.
 
 ## Shell completions
 
