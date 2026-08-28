@@ -44,6 +44,29 @@ herdr api schema --output herdr-api.schema.json
 
 `herdr api schema` 会打印安装的二进制中包含的 socket 协议 schema 简短摘要。需要完整 JSON Schema 文档时使用 `--json`;要写入文件则使用 `--output PATH`。
 
+## 与手机配对
+
+扫描二维码即可将 herdr 应用连接到本机，无需手动复制 SSH 密钥。
+
+```bash
+herdr pair                 # 打印绑定到本机 Tailscale 地址的二维码
+herdr pair --lan           # 改为通过私有局域网配对（仅限 RFC1918 地址）
+herdr pair --ttl 120       # 二维码的有效时长（默认 300 秒，最长 3600 秒）
+herdr pair --port 4021     # 监听固定端口，而不是由系统随机选择
+```
+
+手机会自行生成 SSH 密钥对，并且只发送**公钥**，该公钥会被追加到 `~/.ssh/authorized_keys`。此命令绝不会显示、传输或存储任何私钥。
+
+配对绑定到你的 Tailscale 地址，因此监听端口不会暴露在公网上。若没有 Tailscale，除非传入 `--lan`，否则将拒绝绑定；而 `--lan` 只接受私有地址，公网地址在任何情况下都会被拒绝。只要 Tailscale 可用就会优先使用，因此传入该标志不会在你不知情的情况下降级到更弱的路径。
+
+二维码只能使用一次并会自动过期，所以一旦被兑换，它的照片就毫无价值。二维码还包含本机的 SSH 主机密钥指纹，使应用能够在首次连接前固定主机，而不是信任任何应答方。
+
+通过这种方式添加的每个密钥都会带有标记，方便你日后查找并撤销：
+
+```bash
+grep herdr-pair ~/.ssh/authorized_keys
+```
+
 ## Shell 补全
 
 ```bash

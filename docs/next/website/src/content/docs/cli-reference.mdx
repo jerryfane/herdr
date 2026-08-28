@@ -46,6 +46,29 @@ herdr api schema --output herdr-api.schema.json
 with the installed binary. Use `--json` for the full JSON Schema document, or
 `--output PATH` to write that document to a file.
 
+## Pairing a phone
+
+Connect the herdr app to this machine by scanning a QR code, instead of copying an SSH key by hand.
+
+```bash
+herdr pair                 # print a QR bound to this machine's Tailscale address
+herdr pair --lan           # pair over a private LAN instead (RFC1918 addresses only)
+herdr pair --ttl 120       # how long the code stays valid (default 300, max 3600)
+herdr pair --port 4021     # listen on a fixed port instead of one the OS picks
+```
+
+The phone generates its own SSH keypair and sends only the **public** half, which is appended to `~/.ssh/authorized_keys`. No private key is ever displayed, transported, or stored by this command.
+
+Pairing binds to your Tailscale address, so the listener is not reachable from the internet. Without Tailscale it refuses to bind unless you pass `--lan`, and `--lan` accepts only private addresses — a public one is refused either way. Tailscale is preferred whenever it is available, so passing the flag cannot silently move you onto a weaker path.
+
+The code is single-use and expires on its own, so a photograph of it is worthless once redeemed. The QR also carries this machine's SSH host-key fingerprint, which lets the app pin the host before its first connection rather than trusting whatever answers.
+
+Every key added this way is tagged so you can find and revoke it:
+
+```bash
+grep herdr-pair ~/.ssh/authorized_keys
+```
+
 ## Shell completions
 
 ```bash

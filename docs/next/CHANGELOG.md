@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `herdr pair` connects a phone by printing a QR code, so the app no longer requires generating an SSH key on a computer and pasting it in. The phone generates its own keypair and sends only the public half, which is appended to `~/.ssh/authorized_keys` with a `herdr-pair` marker so it can be revoked. Pairing binds to the machine's Tailscale address by default and refuses a public one; the code is single-use, expires on its own, and carries the SSH host-key fingerprint so the app pins the host before its first connection. (#126)
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
 ### Changed
