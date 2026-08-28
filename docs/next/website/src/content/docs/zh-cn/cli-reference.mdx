@@ -57,7 +57,7 @@ herdr pair --port 4021     # 监听固定端口，而不是由系统随机选择
 
 手机会自行生成 SSH 密钥对，并且只发送**公钥**，该公钥会被追加到 `~/.ssh/authorized_keys`。此命令绝不会显示、传输或存储任何私钥。
 
-**配对前，你的机器必须已在运行 SSH 服务。** 配对只会把密钥追加到 `~/.ssh/authorized_keys`，并不会启动或配置任何服务。如果 SSH 未开启，配对本身会成功，但应用随后无法连接。macOS 默认关闭此功能，请启用**系统设置 → 通用 → 共享 → 远程登录**。多数 Linux 发行版已在运行 `sshd`，可用 `systemctl status ssh` 检查。
+**配对前，你的机器必须已在运行 SSH 服务。** 配对只会把密钥追加到 `~/.ssh/authorized_keys`，并不会启动或配置任何服务。如果 SSH 未开启，配对本身会成功，但应用随后无法连接。macOS 默认关闭此功能，请启用**系统设置 → 通用 → 共享 → 远程登录**。在 Linux 上，请按照发行版的说明安装并启动 OpenSSH 服务器。在使用 systemd 的系统上，Debian 或 Ubuntu 可用 `systemctl status ssh` 检查，Fedora 或 RHEL 则使用 `systemctl status sshd`。
 
 配对绑定到你的 Tailscale 地址，因此监听端口不会暴露在公网上。若没有 Tailscale，除非传入 `--lan`，否则将拒绝绑定；而 `--lan` 只接受私有地址，公网地址在任何情况下都会被拒绝。只要 Tailscale 可用就会优先使用，因此传入该标志不会在你不知情的情况下降级到更弱的路径。
 

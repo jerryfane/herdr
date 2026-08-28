@@ -59,7 +59,7 @@ herdr pair --port 4021     # listen on a fixed port instead of one the OS picks
 
 The phone generates its own SSH keypair and sends only the **public** half, which is appended to `~/.ssh/authorized_keys`. No private key is ever displayed, transported, or stored by this command.
 
-**Your machine's SSH server must be running before you pair.** Pairing only adds a key to `~/.ssh/authorized_keys`; it does not start or configure a server. If SSH is off, pairing succeeds and the app then cannot connect. On macOS this is off by default — enable **System Settings → General → Sharing → Remote Login**. On most Linux distributions `sshd` is already running; check with `systemctl status ssh`.
+**Your machine's SSH server must be running before you pair.** Pairing only adds a key to `~/.ssh/authorized_keys`; it does not start or configure a server. If SSH is off, pairing succeeds and the app then cannot connect. On macOS this is off by default — enable **System Settings → General → Sharing → Remote Login**. On Linux, install and start the OpenSSH server using your distribution's instructions. On systemd systems, check `systemctl status ssh` on Debian or Ubuntu and `systemctl status sshd` on Fedora or RHEL.
 
 Pairing binds to your Tailscale address, so the listener is not reachable from the internet. Without Tailscale it refuses to bind unless you pass `--lan`, and `--lan` accepts only private addresses — a public one is refused either way. Tailscale is preferred whenever it is available, so passing the flag cannot silently move you onto a weaker path.
 
