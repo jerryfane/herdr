@@ -790,12 +790,14 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "ctrlc",
+ "getrandom 0.2.17",
  "interprocess",
  "jsonc-parser",
  "libc",
  "p256",
  "png",
  "portable-pty",
+ "qrcodegen",
  "ratatui",
  "regex",
  "schemars",
@@ -1417,6 +1419,12 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "quote"

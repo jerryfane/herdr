@@ -40,6 +40,7 @@ pub(super) fn command() -> Command {
         .subcommand(gram_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
+        .subcommand(pair_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
@@ -127,6 +128,35 @@ fn update_command() -> Command {
     Command::new("update")
         .about("Download and install the latest version")
         .arg(flag("handoff").help("Try live handoff after installing"))
+}
+
+fn pair_command() -> Command {
+    Command::new("pair")
+        .about("Connect a phone by scanning a QR code")
+        .long_about(
+            "Print a QR code that connects a phone to this machine.\n\n\
+             The phone generates its own SSH keypair and sends only the public half, which \
+             is added to ~/.ssh/authorized_keys. No private key is ever displayed, \
+             transported, or stored by this command.\n\n\
+             Pairing binds to this machine's Tailscale address, so the listener is not \
+             reachable from the internet. The QR carries a single-use code that stops \
+             working the moment it is redeemed.",
+        )
+        .arg(
+            flag("lan").help(
+                "Pair over a private local network instead of Tailscale (RFC1918 only; a public address is refused)",
+            ),
+        )
+        .arg(
+            option("ttl", "SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..=3600))
+                .help("How long the code stays valid (default 300)"),
+        )
+        .arg(
+            option("port", "PORT")
+                .value_parser(clap::value_parser!(u16))
+                .help("Listen on a fixed port instead of one the OS picks"),
+        )
 }
 
 fn status_command() -> Command {
