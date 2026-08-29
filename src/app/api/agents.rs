@@ -839,7 +839,10 @@ fn migrate_session_for_account_swap(
 mod tests {
     use super::*;
     use crate::{
-        api::schema::{AgentStatus, SuccessResponse},
+        api::schema::{
+            AgentSessionTransferHarness, AgentSessionTransferPhase, AgentStatus,
+            AgentTransferSessionParams, PaneReportAgentSessionParams, SuccessResponse,
+        },
         app::Mode,
         config::Config,
         detect::{Agent, AgentState},
@@ -2146,6 +2149,1293 @@ mod tests {
         );
         // The imminent PaneDied must respawn the pane (with resume), not close it.
         assert!(terminal.respawn_shell_on_exit);
+    }
+
+    /// Characterize the identity/persistence boundary a same-pane replacement relies on.
+    ///
+    /// Arming a deliberate restart is not the ownership commit. Until the replacement
+    /// reports its native session, the source session and all logical pane identity must
+    /// remain authoritative so a daemon restart or launch failure can resume the source
+    /// instead of forking or losing it.
+    #[tokio::test]
+    async fn armed_same_pane_replacement_keeps_source_ownership_and_identity() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(0, pane_id).expect("public pane id");
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let source_session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("source-thread").unwrap(),
+        };
+        let original_cwd = app.state.terminals[&terminal_id].cwd.clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_manual_label("session-transfer".into());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+            terminal.set_persisted_agent_session(source_session.clone());
+            terminal.agent_account = Some("work".into());
+        }
+        app.loaded_accounts = vec![crate::config::AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        }];
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentRestartParams {
+                target: "reviewer".into(),
+                account: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+
+        let pane_after = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal survives");
+        assert_eq!(
+            pane_after, terminal_id,
+            "the pane keeps its terminal identity"
+        );
+        assert_eq!(
+            app.public_pane_id(0, pane_id).as_deref(),
+            Some(public_pane_id.as_str())
+        );
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("session-transfer"));
+        assert_eq!(terminal.cwd, original_cwd);
+        assert_eq!(terminal.agent_account.as_deref(), Some("work"));
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref(),
+            Some(&source_session)
+        );
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal.respawn_shell_on_exit);
+    }
+
+    fn arm_ready_session_transfer(
+        app: &mut App,
+    ) -> (
+        crate::terminal::TerminalId,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let terminal_id = crate::terminal::TerminalId::from_persisted(arm_resumable_claude(
+            app,
+            "reviewer",
+            AgentState::Idle,
+        ));
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let source_home = swap_temp_root("transfer-source");
+        let target_home = swap_temp_root("transfer-target");
+        let source_path = source_home.join("projects/source/sess-123.jsonl");
+        let target_path = target_home.join("sessions/target-thread.jsonl");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\r\n",
+                "{\"type\":\"progress\",\"provider\":\"claude\"}\r\n",
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"world\"}]}}\r\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &target_path,
+            concat!(
+                "{\"payload\":{\"id\":\"target-thread\"},\"type\":\"session_meta\"}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\",\"images\":[],\"local_images\":[]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"content\":[{\"text\":\"hello\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"test\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"world\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let source_fingerprint =
+            crate::session_transfer::fingerprint_transcript(&source_home, &source_path).unwrap();
+        let target_fingerprint =
+            crate::session_transfer::fingerprint_transcript(&target_home, &target_path).unwrap();
+        let source_session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-123").unwrap(),
+        };
+        app.loaded_accounts = vec![
+            crate::config::AccountConfig {
+                id: "claude-source".into(),
+                kind: "claude".into(),
+                label: "Claude source".into(),
+                config_dir: source_home.to_string_lossy().into_owned(),
+            },
+            crate::config::AccountConfig {
+                id: "codex-target".into(),
+                kind: "codex".into(),
+                label: "Codex target".into(),
+                config_dir: target_home.to_string_lossy().into_owned(),
+            },
+        ];
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.manual_label = Some("session-transfer".into());
+        terminal.agent_account = Some("claude-source".into());
+        terminal.set_persisted_agent_session(source_session.clone());
+        terminal.session_transfer = Some(crate::session_transfer::RuntimeSessionTransfer {
+            id: "transfer-1".into(),
+            source_kind: crate::session_transfer::HarnessKind::Claude,
+            source_session,
+            source_account: Some("claude-source".into()),
+            source_config_home: source_home.clone(),
+            target_kind: crate::session_transfer::HarnessKind::Codex,
+            target_account: Some("codex-target".into()),
+            target_config_home: target_home.clone(),
+            phase: AgentSessionTransferPhase::Ready,
+            message_count: 3,
+            omissions: Default::default(),
+            error: None,
+            source_path: Some(source_path),
+            source_fingerprint: Some(source_fingerprint),
+            target_session_id: Some("target-thread".into()),
+            target_transcript_path: Some(target_path),
+            target_fingerprint: Some(target_fingerprint),
+            target_deadline: None,
+            target_process: None,
+            source_rollback_process: None,
+            verification_in_flight: None,
+            verification_observation_deadline: None,
+            awaiting_deferred_target_report: false,
+        });
+        (terminal_id, source_home, target_home)
+    }
+
+    fn confirm_transfer_params() -> AgentTransferSessionParams {
+        AgentTransferSessionParams {
+            target: "reviewer".into(),
+            to: AgentSessionTransferHarness::Codex,
+            account: Some("codex-target".into()),
+            transfer_id: Some("transfer-1".into()),
+            confirm: true,
+        }
+    }
+
+    fn reverse_confirm_transfer_params() -> AgentTransferSessionParams {
+        AgentTransferSessionParams {
+            target: "reviewer".into(),
+            to: AgentSessionTransferHarness::Claude,
+            account: Some("claude-source".into()),
+            transfer_id: Some("transfer-1".into()),
+            confirm: true,
+        }
+    }
+
+    fn reverse_ready_session_transfer(
+        app: &mut App,
+    ) -> (
+        crate::terminal::TerminalId,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (terminal_id, claude_home, codex_home) = arm_ready_session_transfer(app);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let transfer = terminal.session_transfer.as_mut().unwrap();
+        let claude_path = transfer.source_path.take().unwrap();
+        let claude_fingerprint = transfer.source_fingerprint.take().unwrap();
+        let codex_path = transfer.target_transcript_path.take().unwrap();
+        let codex_fingerprint = transfer.target_fingerprint.take().unwrap();
+        transfer.source_kind = crate::session_transfer::HarnessKind::Codex;
+        transfer.source_session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("target-thread").unwrap(),
+        };
+        transfer.source_account = Some("codex-target".into());
+        transfer.source_config_home = codex_home.clone();
+        transfer.source_path = Some(codex_path);
+        transfer.source_fingerprint = Some(codex_fingerprint);
+        transfer.target_kind = crate::session_transfer::HarnessKind::Claude;
+        transfer.target_account = Some("claude-source".into());
+        transfer.target_config_home = claude_home.clone();
+        transfer.target_session_id = Some("sess-123".into());
+        transfer.target_transcript_path = Some(claude_path);
+        transfer.target_fingerprint = Some(claude_fingerprint);
+        let source_session = transfer.source_session.clone();
+        terminal.hook_authority = None;
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_persisted_agent_session(source_session);
+        terminal.agent_account = Some("codex-target".into());
+        terminal.set_agent_name("reviewer".into());
+        (terminal_id, claude_home, codex_home)
+    }
+
+    fn codex_resume_job(pid: u32, session_id: &str) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: pid,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid,
+                name: "codex".into(),
+                argv0: Some("/usr/bin/codex".into()),
+                argv: Some(vec![
+                    "/usr/bin/codex".into(),
+                    "resume".into(),
+                    session_id.into(),
+                ]),
+                cmdline: Some(format!("/usr/bin/codex resume {session_id}")),
+            }],
+        }
+    }
+
+    fn confirm_and_finish_cutover_verification(
+        app: &mut App,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> String {
+        let response = app.handle_agent_transfer_session("req".into(), confirm_transfer_params());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = &success.result else {
+            panic!("expected agent info");
+        };
+        assert_eq!(
+            agent.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::VerifyingCutover
+        );
+        assert!(app.handle_agent_session_transfer_cutover_verified(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            Ok(())
+        ));
+        response
+    }
+
+    fn launch_ready_codex_transfer(
+        app: &mut App,
+    ) -> (
+        crate::terminal::TerminalId,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(app);
+        let response = confirm_and_finish_cutover_verification(app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::AwaitingTarget
+        );
+        (terminal_id, source_home, target_home)
+    }
+
+    fn finish_codex_transfer_from_destination_proof(
+        app: &mut App,
+        terminal_id: &crate::terminal::TerminalId,
+        pid: u32,
+    ) {
+        let observed_at = std::time::Instant::now();
+        let job = codex_resume_job(pid, "target-thread");
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            terminal_id,
+            observed_at,
+            Some(&job)
+        ));
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::AwaitingTarget,
+            "process observation alone must not cut over before the settle point"
+        );
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            terminal_id,
+            observed_at + crate::app::agents::AGENT_START_SETTLE_DELAY,
+            Some(&job)
+        ));
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .verification_in_flight,
+            Some(crate::session_transfer::RuntimeVerificationKind::Target)
+        );
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::Target,
+            pid,
+            Ok(()),
+            Some(&job),
+        ));
+        finish_codex_target_blocker_observation(app, terminal_id, pid, &job);
+    }
+
+    fn finish_codex_target_blocker_observation(
+        app: &mut App,
+        terminal_id: &crate::terminal::TerminalId,
+        pid: u32,
+        job: &crate::platform::ForegroundJob,
+    ) {
+        let observation_deadline = app.state.terminals[terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .verification_observation_deadline
+            .expect("the first JSONL pass starts blocker observation");
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::AwaitingTarget,
+            "the first JSONL pass must not complete before blocker observation"
+        );
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            terminal_id,
+            observation_deadline,
+            Some(job),
+        ));
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::Target,
+            pid,
+            Ok(()),
+            Some(job),
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_completes_from_exact_destination_and_process_proof() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+
+        finish_codex_transfer_from_destination_proof(&mut app, &terminal_id, 4242);
+
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Completed);
+        assert_eq!(transfer.target_process.unwrap().pid, 4242);
+        assert!(transfer.awaiting_deferred_target_report);
+        assert_eq!(terminal.agent_account.as_deref(), Some("codex-target"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("session-transfer"));
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.agent.as_str(), session.session_ref.value.as_str())),
+            Some(("codex", "target-thread"))
+        );
+
+        let reverse_while_deferred = app.handle_agent_transfer_session(
+            "reverse".into(),
+            AgentTransferSessionParams {
+                target: "reviewer".into(),
+                to: AgentSessionTransferHarness::Claude,
+                account: Some("claude-source".into()),
+                transfer_id: None,
+                confirm: false,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&reverse_while_deferred).unwrap();
+        assert_eq!(error.error.code, "session_transfer_in_progress");
+
+        app.reconcile_agent_session_transfer_report(
+            pane_id,
+            "herdr:codex",
+            "codex",
+            crate::agent_resume::AgentSessionRef::id("target-thread").as_ref(),
+            true,
+        );
+        assert!(
+            !app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .awaiting_deferred_target_report
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_proceeds_at_deadline_when_jsonl_and_exact_process_verify() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        let now = std::time::Instant::now();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .target_deadline = Some(now);
+        let job = codex_resume_job(5151, "target-thread");
+
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            &terminal_id,
+            now,
+            Some(&job)
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::AwaitingTarget,
+            "the deadline starts the load-bearing JSONL check; it does not itself approve cutover"
+        );
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::Target,
+            5151,
+            Ok(()),
+            Some(&job),
+        ));
+        finish_codex_target_blocker_observation(&mut app, &terminal_id, 5151, &job);
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::Completed,
+            "verified content and process proof win after bounded blocker observation"
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_rolls_back_when_jsonl_differs_after_settle() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        let observed_at = std::time::Instant::now();
+        let job = codex_resume_job(6161, "target-thread");
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            &terminal_id,
+            observed_at,
+            Some(&job)
+        ));
+        let target_path = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .target_transcript_path
+            .clone()
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(target_path)
+                .unwrap(),
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "extra"}]
+                }
+            })
+        )
+        .unwrap();
+
+        assert!(app.reconcile_codex_session_transfer_readiness_with_job(
+            &terminal_id,
+            observed_at + crate::app::agents::AGENT_START_SETTLE_DELAY,
+            Some(&job)
+        ));
+        let transfer = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .clone();
+        let verification = transfer.verified_visible_destination();
+        assert!(verification.is_err());
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::Target,
+            6161,
+            verification,
+            Some(&job),
+        ));
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::RollingBack
+        );
+        assert!(terminal
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("destination transcript did not verify"));
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(terminal.pending_agent_resume_plan.is_some());
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_rolls_back_on_blocker_or_wrong_session_timeout() {
+        let mut blocked = app_with_agent();
+        let (blocked_id, source_home, target_home) = launch_ready_codex_transfer(&mut blocked);
+        let observed_at = std::time::Instant::now();
+        let job = codex_resume_job(7171, "target-thread");
+        assert!(blocked.reconcile_codex_session_transfer_readiness_with_job(
+            &blocked_id,
+            observed_at,
+            Some(&job)
+        ));
+        assert!(blocked.reconcile_codex_session_transfer_readiness_with_job(
+            &blocked_id,
+            observed_at + crate::app::agents::AGENT_START_SETTLE_DELAY,
+            Some(&job)
+        ));
+        assert!(
+            blocked.handle_agent_session_transfer_runtime_verified_with_job(
+                blocked_id.clone(),
+                "transfer-1".into(),
+                crate::session_transfer::RuntimeVerificationKind::Target,
+                7171,
+                Ok(()),
+                Some(&job),
+            )
+        );
+        assert!(blocked.state.terminals[&blocked_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .verification_observation_deadline
+            .is_some());
+        blocked
+            .state
+            .terminals
+            .get_mut(&blocked_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Blocked);
+        assert!(blocked.reconcile_codex_session_transfer_readiness_with_job(
+            &blocked_id,
+            observed_at + crate::app::agents::AGENT_START_SETTLE_DELAY,
+            Some(&job)
+        ));
+        assert_eq!(
+            blocked.state.terminals[&blocked_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::RollingBack
+        );
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+
+        let mut timed_out = app_with_agent();
+        let (timed_out_id, source_home, target_home) = launch_ready_codex_transfer(&mut timed_out);
+        let now = std::time::Instant::now();
+        timed_out
+            .state
+            .terminals
+            .get_mut(&timed_out_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .target_deadline = Some(now);
+        let wrong_job = codex_resume_job(8181, "different-thread");
+        assert!(
+            timed_out.reconcile_codex_session_transfer_readiness_with_job(
+                &timed_out_id,
+                now,
+                Some(&wrong_job)
+            )
+        );
+        let transfer = timed_out.state.terminals[&timed_out_id]
+            .session_transfer
+            .as_ref()
+            .unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::RollingBack);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("exact Codex resume process for session target-thread"));
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn deferred_codex_report_mismatch_rolls_back_to_the_source() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        finish_codex_transfer_from_destination_proof(&mut app, &terminal_id, 9191);
+
+        app.reconcile_agent_session_transfer_report(
+            pane_id,
+            "herdr:codex",
+            "codex",
+            crate::agent_resume::AgentSessionRef::id("wrong-thread").as_ref(),
+            true,
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::RollingBack
+        );
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("sess-123")
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn confirmed_session_transfer_arms_target_but_keeps_source_ownership() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+
+        let response = confirm_and_finish_cutover_verification(&mut app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info");
+        };
+        assert_eq!(
+            agent
+                .session_transfer
+                .as_ref()
+                .and_then(|transfer| transfer.target_account.as_deref()),
+            Some("codex-target"),
+            "clients must be able to reopen a prepared confirmation with the exact target account"
+        );
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::LaunchingTarget);
+        assert_eq!(terminal.agent_account.as_deref(), Some("codex-target"));
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("sess-123"),
+            "the source remains the durable owner until the target reports"
+        );
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.as_slice()),
+            Some(
+                ["codex", "resume", "target-thread"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            terminal.pending_launch_env,
+            vec![(
+                "CODEX_HOME".into(),
+                target_home.to_string_lossy().into_owned()
+            )]
+        );
+
+        assert!(
+            app.begin_agent_session_transfer_rollback(&terminal_id, "forced target launch failure")
+        );
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::RollingBack
+        );
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.as_slice()),
+            Some(
+                ["claude", "--resume", "sess-123"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            terminal.pending_launch_env,
+            vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                source_home.to_string_lossy().into_owned()
+            )]
+        );
+        assert!(app.fail_agent_session_transfer_rollback_launch(
+            &terminal_id,
+            "forced source shell failure"
+        ));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::Failed
+        );
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.respawn_shell_on_exit);
+        assert!(terminal
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("source rollback could not launch"));
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn target_shell_exit_during_rollback_keeps_the_source_resume_armed() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+
+        let response = confirm_and_finish_cutover_verification(&mut app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+        assert!(app.begin_agent_session_transfer_rollback(
+            &terminal_id,
+            "target did not report the staged session"
+        ));
+
+        assert!(
+            !app.session_transfer_process_exited(pane_id),
+            "the target shell killed to begin rollback is not the resumed source exiting"
+        );
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::RollingBack
+        );
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.as_slice()),
+            Some(
+                ["claude", "--resume", "sess-123"]
+                    .map(str::to_string)
+                    .as_slice()
+            ),
+            "the old target PaneDied must leave the source resume plan intact"
+        );
+
+        app.mark_session_transfer_runtime_launched(&terminal_id, "claude");
+        assert!(
+            app.session_transfer_process_exited(pane_id),
+            "after the source launch starts, its exit is a real rollback failure"
+        );
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::Failed
+        );
+        assert!(terminal.pending_agent_resume_plan.is_none());
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_source_rollback_uses_exact_process_and_native_jsonl_proof() {
+        let mut app = app_with_agent();
+        let (terminal_id, claude_home, codex_home) = reverse_ready_session_transfer(&mut app);
+        let original_cwd = app.state.terminals[&terminal_id].cwd.clone();
+        let response =
+            app.handle_agent_transfer_session("req".into(), reverse_confirm_transfer_params());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        assert!(app.handle_agent_session_transfer_cutover_verified(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            Ok(()),
+        ));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "claude");
+        assert!(
+            app.begin_agent_session_transfer_rollback(&terminal_id, "forced Claude target failure")
+        );
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+
+        let observed_at = std::time::Instant::now();
+        let job = codex_resume_job(9292, "target-thread");
+        assert!(app.reconcile_codex_session_transfer_rollback_with_job(
+            &terminal_id,
+            observed_at,
+            Some(&job),
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::RollingBack,
+            "the exact process observation alone must not approve rollback"
+        );
+        assert!(app.reconcile_codex_session_transfer_rollback_with_job(
+            &terminal_id,
+            observed_at + crate::app::agents::AGENT_START_SETTLE_DELAY,
+            Some(&job),
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .verification_in_flight,
+            Some(crate::session_transfer::RuntimeVerificationKind::SourceRollback)
+        );
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::SourceRollback,
+            9292,
+            Ok(()),
+            Some(&job),
+        ));
+        let observation_deadline = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .verification_observation_deadline
+            .expect("the first source JSONL pass starts blocker observation");
+        assert!(app.reconcile_codex_session_transfer_rollback_with_job(
+            &terminal_id,
+            observation_deadline,
+            Some(&job),
+        ));
+        assert!(app.handle_agent_session_transfer_runtime_verified_with_job(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            crate::session_transfer::RuntimeVerificationKind::SourceRollback,
+            9292,
+            Ok(()),
+            Some(&job),
+        ));
+
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::RolledBack);
+        assert_eq!(transfer.source_rollback_process.unwrap().pid, 9292);
+        assert_eq!(terminal.agent_account.as_deref(), Some("codex-target"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("session-transfer"));
+        assert_eq!(terminal.cwd, original_cwd);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.agent.as_str(), session.session_ref.value.as_str())),
+            Some(("codex", "target-thread"))
+        );
+
+        std::fs::remove_dir_all(claude_home).ok();
+        std::fs::remove_dir_all(codex_home).ok();
+    }
+
+    #[tokio::test]
+    async fn detected_target_process_exit_starts_rollback_before_the_deadline() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+
+        app.handle_internal_event_with_render_impact(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Codex),
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::RollingBack);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Codex target process exited"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("session-transfer"));
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.as_slice()),
+            Some(
+                ["claude", "--resume", "sess-123"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn official_session_report_api_finishes_cutover_and_rollback() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+
+        let response = confirm_and_finish_cutover_verification(&mut app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let report = app.handle_pane_report_agent_session(
+            "target-report".into(),
+            PaneReportAgentSessionParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                seq: Some(1),
+                agent_session_id: Some("target-thread".into()),
+                agent_session_path: Some(
+                    target_home
+                        .join("sessions/target-thread.jsonl")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                session_start_source: Some("resume".into()),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&report).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::Completed,
+            "the real pane.report_agent_session API path must finalize target ownership"
+        );
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+        let response = confirm_and_finish_cutover_verification(&mut app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+        assert!(app.begin_agent_session_transfer_rollback(&terminal_id, "forced target failure"));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "claude");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        let report = app.handle_pane_report_agent_session(
+            "source-report".into(),
+            PaneReportAgentSessionParams {
+                pane_id: public_pane_id,
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                seq: Some(2),
+                agent_session_id: Some("sess-123".into()),
+                agent_session_path: None,
+                session_start_source: Some("resume".into()),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&report).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::RolledBack,
+            "the source integration report must close the rollback transaction"
+        );
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn rejected_stale_session_report_cannot_reconcile_a_transfer() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        finish_codex_transfer_from_destination_proof(&mut app, &terminal_id, 9393);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert!(terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRef::id("target-thread"),
+                Some(100),
+                Some("resume".into()),
+            )
+            .is_some());
+
+        app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent_label: "codex".into(),
+                seq: Some(99),
+                session_ref: crate::agent_resume::AgentSessionRef::id("wrong-stale-thread"),
+                session_path: None,
+                session_start_source: Some("resume".into()),
+            },
+        );
+
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Completed);
+        assert!(transfer.awaiting_deferred_target_report);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("target-thread")
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn accepted_wrong_rollback_report_fails_and_restores_intended_authority() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        assert!(app.begin_agent_session_transfer_rollback(&terminal_id, "forced target failure"));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "claude");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:claude".into(),
+                agent_label: "claude".into(),
+                seq: Some(10_000),
+                session_ref: crate::agent_resume::AgentSessionRef::id("wrong-source-session"),
+                session_path: None,
+                session_start_source: Some("resume".into()),
+            },
+        );
+
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Failed);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("source rollback reported a different native session"));
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("sess-123")
+        );
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn confirmation_refuses_changed_destination_without_stopping_source() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+        let target_path = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .target_transcript_path
+            .clone()
+            .unwrap();
+        std::fs::write(target_path, b"tampered after review\n").unwrap();
+
+        let response = app.handle_agent_transfer_session("req".into(), confirm_transfer_params());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        let transfer = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .clone();
+        let verification = crate::session_transfer::verify_unchanged_transcripts(
+            &transfer.source_config_home,
+            transfer.source_path.as_ref().unwrap(),
+            transfer.source_fingerprint.as_ref().unwrap(),
+            &transfer.target_config_home,
+            transfer.target_transcript_path.as_ref().unwrap(),
+            transfer.target_fingerprint.as_ref().unwrap(),
+        );
+        assert!(verification.is_err());
+        assert!(!app.handle_agent_session_transfer_cutover_verified(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            verification,
+        ));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::Failed
+        );
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_some());
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn cutover_refuses_target_account_registry_drift_before_stopping_source() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+
+        let response = app.handle_agent_transfer_session("req".into(), confirm_transfer_params());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.loaded_accounts
+            .retain(|account| account.id != "codex-target");
+
+        assert!(!app.handle_agent_session_transfer_cutover_verified(
+            terminal_id.clone(),
+            "transfer-1".into(),
+            Ok(()),
+        ));
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Failed);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("target account routing is no longer available"));
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_some());
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn cutover_verification_timeout_fails_without_stopping_source() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+        let response = app.handle_agent_transfer_session("req".into(), confirm_transfer_params());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        let deadline = app.state.terminals[&terminal_id]
+            .session_transfer
+            .as_ref()
+            .unwrap()
+            .target_deadline
+            .unwrap();
+
+        assert!(app.expire_session_transfer_deadlines(deadline));
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Failed);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("source stayed running"));
+        assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_some());
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_source_account_registry_drift_without_false_recovery() {
+        let mut app = app_with_agent();
+        let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = None;
+        app.loaded_accounts
+            .retain(|account| account.id != "claude-source");
+
+        assert!(app.begin_agent_session_transfer_rollback(&terminal_id, "forced target failure"));
+        let terminal = &app.state.terminals[&terminal_id];
+        let transfer = terminal.session_transfer.as_ref().unwrap();
+        assert_eq!(transfer.phase, AgentSessionTransferPhase::Failed);
+        assert!(transfer
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("source rollback account routing is no longer available"));
+        assert_eq!(terminal.agent_account.as_deref(), Some("codex-target"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
     }
 
     #[tokio::test]

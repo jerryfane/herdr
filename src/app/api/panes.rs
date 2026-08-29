@@ -1543,21 +1543,34 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
-        self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
-            pane_id,
-            session_ref: crate::agent_resume::session_ref_from_report(
-                &params.source,
-                &agent_label,
-                params.agent_session_id,
-                params.agent_session_path,
-            ),
-            source: params.source,
-            agent_label,
-            seq: params.seq,
-            session_start_source: crate::agent_resume::normalize_session_start_source(
-                params.session_start_source,
-            ),
-        });
+        let session_path = crate::agent_resume::session_path_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_path.clone(),
+        );
+        // Use the App-level event wrapper, not the pure AppState dispatcher:
+        // session-transfer completion/rollback is reconciled there after the
+        // official integration report updates terminal ownership. Calling
+        // `handle_internal_event` directly left real socket reports stuck in
+        // AwaitingTarget/RollingBack even though the correct harness was live.
+        self.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                session_ref: crate::agent_resume::session_ref_from_report(
+                    &params.source,
+                    &agent_label,
+                    params.agent_session_id,
+                    params.agent_session_path,
+                ),
+                session_path,
+                source: params.source,
+                agent_label,
+                seq: params.seq,
+                session_start_source: crate::agent_resume::normalize_session_start_source(
+                    params.session_start_source,
+                ),
+            },
+        );
 
         encode_success(id, ResponseResult::Ok {})
     }

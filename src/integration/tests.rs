@@ -1223,7 +1223,7 @@ fn codex_v2_integration_status_is_outdated() {
 
     assert_eq!(codex.path, hook_path);
     assert_eq!(codex.installed_version, Some(2));
-    assert_eq!(codex.expected_version, 8);
+    assert_eq!(codex.expected_version, CODEX_INTEGRATION_VERSION);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -2789,6 +2789,10 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(
         CODEX_HOOK_ASSET.contains("agent_session_id")
             || CODEX_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        CODEX_HOOK_ASSET.contains("agent_session_path")
+            || CODEX_HOOK_ASSET.contains("--agent-session-path")
     );
     assert!(
         CODEX_HOOK_ASSET.contains("session_start_source")

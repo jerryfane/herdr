@@ -961,6 +961,7 @@ fn success_response_round_trips() {
                 live_handoff: true,
                 detached_server_daemon: true,
                 pane_input_stream: false,
+                agent_session_transfer: true,
             }),
         },
     };

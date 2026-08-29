@@ -165,6 +165,8 @@ pub enum Method {
     AgentWait(AgentWaitParams),
     #[serde(rename = "agent.restart")]
     AgentRestart(AgentRestartParams),
+    #[serde(rename = "agent.transfer_session")]
+    AgentTransferSession(AgentTransferSessionParams),
     #[serde(rename = "accounts.list")]
     AccountsList(EmptyParams),
     #[serde(rename = "accounts.create")]

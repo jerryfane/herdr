@@ -173,7 +173,8 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
             AllowedAt(Admin)
         }
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
-        // notification(s).*, client.window_title.*, agent.start, pane.close,
+        // notification(s).*, client.window_title.*, agent.start,
+        // agent.transfer_session (account-home filesystem authority), pane.close,
         // popup.close, every workspace/worktree/tab/layout/pane mutation except
         // the Admin `pane.set_pty_size` width-lease call above, the
         // pane.report_*/authority calls, and pane.graphics.set/clear/stream) is
@@ -342,6 +343,7 @@ mod tests {
         // Default-deny for anything unlisted, including an unknown/new name.
         assert_eq!(federation_access("server.stop"), Denied);
         assert_eq!(federation_access("agent.start"), Denied);
+        assert_eq!(federation_access("agent.transfer_session"), Denied);
         assert_eq!(federation_access("pane.close"), Denied);
         assert_eq!(federation_access("some.method.added.later"), Denied);
     }

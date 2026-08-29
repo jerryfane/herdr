@@ -385,6 +385,18 @@ impl App {
                     err = %err,
                     "failed to start shell for deferred agent resume"
                 );
+                if self.begin_agent_session_transfer_rollback(
+                    &terminal_id,
+                    format!("could not launch the target harness shell: {err}"),
+                ) {
+                    return self.resume_pending_agent_for_pane(pane_id);
+                }
+                if self.fail_agent_session_transfer_rollback_launch(
+                    &terminal_id,
+                    format!("could not launch the source harness shell: {err}"),
+                ) {
+                    return false;
+                }
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.clear_agent_runtime_identity_after_respawn();
                 }
@@ -403,6 +415,18 @@ impl App {
                 "failed to send deferred agent resume command to shell"
             );
             runtime.shutdown();
+            if self.begin_agent_session_transfer_rollback(
+                &terminal_id,
+                format!("could not submit the target harness resume command: {err}"),
+            ) {
+                return self.resume_pending_agent_for_pane(pane_id);
+            }
+            if self.fail_agent_session_transfer_rollback_launch(
+                &terminal_id,
+                format!("could not submit the source harness resume command: {err}"),
+            ) {
+                return false;
+            }
             return false;
         }
 
@@ -413,6 +437,7 @@ impl App {
             terminal.respawn_shell_on_exit = false;
             terminal.account_resume_blocked = None;
         }
+        self.mark_session_transfer_runtime_launched(&terminal_id, &plan.agent);
         // Say which account this pane actually came back on. Emitted AFTER the runtime is
         // inserted, so it reports what launched rather than what was intended.
         crate::logging::agent_account_routing(

@@ -69,6 +69,19 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+pub fn session_path_from_report(
+    source: &str,
+    agent: &str,
+    agent_session_path: Option<String>,
+) -> Option<String> {
+    if !is_official_agent_source(source, agent) {
+        return None;
+    }
+    agent_session_path
+        .and_then(AgentSessionRef::path)
+        .map(|session_ref| session_ref.value)
+}
+
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(

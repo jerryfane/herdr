@@ -4,6 +4,7 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
+- Running Claude Code and Codex agents can now transfer their visible conversation into the other harness in the same pane. Herdr stages and rereads the destination transcript before confirmation, reports omitted tool/reasoning/system records, and restores the source session and account when target launch verification fails.
 
 ### Changed
 - Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.

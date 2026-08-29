@@ -226,6 +226,74 @@ pub struct AgentRestartParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTransferSessionParams {
+    pub target: String,
+    pub to: AgentSessionTransferHarness,
+    /// Optional target credential/config-home account. Absent selects the
+    /// target harness default; it never reuses an account from another kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The id returned by the prepare call. Required when `confirm` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_id: Option<String>,
+    /// Replace the source runtime only after the staged transcript has been
+    /// reviewed through `agent.session_transfer` on the returned agent.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionTransferHarness {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionTransferPhase {
+    Preparing,
+    Ready,
+    VerifyingCutover,
+    LaunchingTarget,
+    AwaitingTarget,
+    Completed,
+    RollingBack,
+    RolledBack,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSessionTransferOmissions {
+    pub tool_records: u64,
+    pub reasoning_records: u64,
+    pub system_records: u64,
+    pub attachment_records: u64,
+    pub metadata_records: u64,
+    pub unsupported_blocks: u64,
+    pub sidechain_records: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSessionTransferInfo {
+    pub id: String,
+    pub source: AgentSessionTransferHarness,
+    pub target: AgentSessionTransferHarness,
+    /// The selected target account id, or `None` for the target harness default.
+    /// Surfacing this lets a client safely reopen a prepared confirmation without
+    /// guessing which account must be echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_account: Option<String>,
+    pub phase: AgentSessionTransferPhase,
+    #[serde(default)]
+    pub message_count: u64,
+    #[serde(default)]
+    pub omissions: AgentSessionTransferOmissions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentPromptParams {
     pub target: String,
     pub text: String,
@@ -341,6 +409,11 @@ pub struct AgentInfo {
     /// re-registered.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub account_unresolved: bool,
+    /// Present while an agent session is being moved between Claude Code and
+    /// Codex, and retained with the final completed/rolled-back outcome until a
+    /// later transfer replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_transfer: Option<AgentSessionTransferInfo>,
 }
 
 /// The `archived { at, by, reason }` provenance surfaced on an archived

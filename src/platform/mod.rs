@@ -189,6 +189,20 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+/// Create a new user-private file without exposing a permissive mode between
+/// creation and a later chmod. Unix applies 0600 atomically; Windows inherits
+/// the private ACL of the account-owned config directory.
+pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteSshConfigPaths {
     pub(crate) user_config: Option<std::path::PathBuf>,

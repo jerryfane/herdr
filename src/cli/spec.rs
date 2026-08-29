@@ -475,6 +475,27 @@ fn agent_command() -> Command {
             "Restart an agent (close its session, reopen with --resume)",
         ))
         .subcommand(
+            Command::new("transfer-session")
+                .about("Stage or confirm a Claude Code/Codex session transfer")
+                .override_usage("herdr agent transfer-session <TARGET> --to claude|codex [OPTIONS]")
+                .arg(required("target", "TARGET"))
+                .arg(
+                    option("to", "HARNESS")
+                        .required(true)
+                        .value_parser(["claude", "codex"]),
+                )
+                .arg(option("account", "ID").help("Target harness account id"))
+                .arg(flag("yes").help("Confirm immediately after staging and verification"))
+                .arg(
+                    option("confirm", "TRANSFER_ID")
+                        .help("Confirm an already staged transfer"),
+                )
+                .group(ArgGroup::new("cutover").args(["yes", "confirm"]).multiple(false))
+                .after_help(
+                    "Without --yes or --confirm, Herdr stages and verifies the destination, leaves the source running, and prints the transfer id for a later confirmation.",
+                ),
+        )
+        .subcommand(
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")
                 .override_usage("herdr agent wait <TARGET> [OPTIONS]")

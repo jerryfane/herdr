@@ -84,6 +84,15 @@ Wait for an agent:
 herdr agent wait w1:p1 --until done
 ```
 
+Stage and review a Claude Code/Codex session transfer, then confirm it:
+
+```bash
+herdr agent transfer-session jarvis --to codex --account codex-work
+herdr agent transfer-session jarvis --to codex --account codex-work --confirm <transfer-id>
+```
+
+Use `--yes` for a one-command stage, verify, and confirm flow.
+
 Read pane output:
 
 ```bash
@@ -107,7 +116,7 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.transfer_session`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -117,6 +126,8 @@ Raw socket method names use dot notation:
 A message may carry one file. Because a single request is size-capped (near 65 KiB over the app's SSH path, 1 MiB on the local socket), a file is uploaded in chunks with `gram.upload_chunk` (`{upload_id, offset, data_base64}`; `offset` is the byte position this chunk starts at, and `offset: 0` restarts the upload) and then attached by passing that `upload_id` in a `gram.send`/`gram.post` `file` object. `gram.get_file` returns the bytes inline as base64 in one reply (the response path is not size-capped). `gram.delete` removes a message and its file bytes for good. The owner (no `caller_pane_id`) may delete any message; an agent that supplies its caller pane may delete or download only a message it can see (the same audience as `gram.list`). That audience check is **cooperative filtering within the flat local trust domain, not an authenticated boundary** — every local process can already read the store directly, and "owner" is just the absence of a caller pane. Its value for a short-lived secret (a temporary API key) is that deletion genuinely purges the bytes, keeping the secret out of the persistent store once you delete it.
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait. Successful prompts include optional `delivery` evidence: `written_to_pty` after the complete text+Enter batch is acknowledged, or `submitted` after an attributable lifecycle advance or after the same writer-attributed composer attempt is observed and clears. Persistent attributed input returns `agent_prompt_unsubmitted`; uncertain disposition returns `agent_prompt_stalled`. Bracketed paste uses writer provenance and does not depend on rendered token text. A visible modal returns `agent_input_pending` before any bytes are written.
+
+`agent.transfer_session` supports Claude Code and Codex native sessions on the local server. The first request supplies `target`, `to`, and optional target `account`; it parses the source once, creates a native destination session, rereads the actual destination JSONL, and leaves the source running with phase `ready`. Review `message_count`, `omissions`, and the echoed `target_account` in the returned agent's `session_transfer`, then repeat the request with the same target fields plus `transfer_id` and `confirm: true`. Herdr rechecks both transcript fingerprints before replacing the runtime. Claude must report the exact staged session through its official integration. Codex 0.150.1 defers that report until the first prompt, so a Codex target may instead complete when Herdr verifies the native destination JSONL and an exact `codex resume <session-id>` process, recording the selected PID. The three-second observation window can reveal an interactive blocker but is not the proof gate: verified content proceeds even when the window expires, while a content mismatch rolls back even if the process looks ready. Comparison requires the same visible roles, order, and text, while allowing provider metadata, JSON field ordering, non-visible record ordering, and CRLF JSONL line endings. The first later Codex integration report must still match. Any blocker, exit, timeout, content mismatch, or identity mismatch restores the original harness, session, account, name, label, and working directory. The method is intentionally unavailable over federation because it has selected-account filesystem authority.
 
 `pane.get` returns an additive `composer` object with `state` (`empty`, `draft_present`, or `unknown`), optional `attempt_id`, and provenance, region, cursor, style, and frame-stability evidence. Suggestion text drawn by a hosted CLI is not a draft because it lacks writer provenance and is strictly right of the cursor. Region-not-found, mid-repaint, conflicting evidence, and old responses without the object resolve to `unknown`, not `empty`. Style is only a tripwire that can downgrade confidence.
 
