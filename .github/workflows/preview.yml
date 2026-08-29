@@ -649,11 +649,18 @@ jobs:
           DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_PAGES_DEPLOY_HOOK }}
         run: |
           if [ -z "$DEPLOY_HOOK" ]; then
-            echo "CLOUDFLARE_PAGES_DEPLOY_HOOK not set; relying on Cloudflare git auto-deploy"
-            exit 0
+            echo "::error::Create the repository Actions secret CLOUDFLARE_PAGES_DEPLOY_HOOK for ${GITHUB_REPOSITORY}; no preview website deployment was triggered"
+            exit 1
           fi
           curl -fsS -X POST "$DEPLOY_HOOK" > /dev/null
           echo "Triggered Cloudflare Pages production deploy"
+
+      - name: Verify public preview deployment
+        run: |
+          python3 scripts/preview.py verify-deployment \
+            --manifest website/preview.json \
+            --url https://herdr.dev/preview.json \
+            --token "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Mark preview-released issues
         continue-on-error: true
