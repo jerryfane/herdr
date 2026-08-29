@@ -7,6 +7,11 @@ on:
         description: Optional master commit SHA to publish
         required: false
         type: string
+      actions_pr_probe:
+        description: Test Actions branch and PR creation without touching master
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -20,7 +25,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  actions-pr-probe:
+    if: inputs.actions_pr_probe == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create a disposable branch and pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_NAME" = "master" ]; then
+            echo "refusing to run the Actions PR probe on master" >&2
+            exit 1
+          fi
+          branch="actions-token-pr-probe-output-${GITHUB_RUN_ID}"
+          git switch -c "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf 'run=%s\n' "$GITHUB_RUN_ID" > .github/actions-token-pr-probe.txt
+          git add .github/actions-token-pr-probe.txt
+          git commit -m "test(ci): record actions pull request probe"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$remote" "HEAD:refs/heads/${branch}"
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$GITHUB_REF_NAME" \
+            --head "$branch" \
+            --title "test(ci): probe actions pull request creation" \
+            --body "Disposable Actions-token capability probe from run ${GITHUB_RUN_ID}."
+
   preflight:
+    if: inputs.actions_pr_probe != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
