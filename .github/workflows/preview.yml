@@ -769,9 +769,20 @@ jobs:
           set -euo pipefail
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if ! git push "$remote" --delete "$PUBLICATION_BRANCH"; then
-            if git ls-remote --exit-code --heads "$remote" "refs/heads/${PUBLICATION_BRANCH}" >/dev/null; then
-              echo "error: failed to delete publication branch $PUBLICATION_BRANCH" >&2
-              exit 1
-            fi
-            echo "Publication branch $PUBLICATION_BRANCH is already absent."
+            lookup_status=0
+            git ls-remote --exit-code --heads "$remote" "refs/heads/${PUBLICATION_BRANCH}" >/dev/null \
+              || lookup_status=$?
+            case "$lookup_status" in
+              0)
+                echo "error: failed to delete publication branch $PUBLICATION_BRANCH" >&2
+                exit 1
+                ;;
+              2)
+                echo "Publication branch $PUBLICATION_BRANCH is already absent."
+                ;;
+              *)
+                echo "error: could not verify deletion of publication branch $PUBLICATION_BRANCH" >&2
+                exit "$lookup_status"
+                ;;
+            esac
           fi
