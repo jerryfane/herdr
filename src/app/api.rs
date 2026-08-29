@@ -63,6 +63,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
+        if !self.detector_event_runtime_matches(&ev) {
+            if let Some((pane_id, runtime_epoch)) = ev.detector_runtime() {
+                tracing::debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored detector event from a retired pane runtime"
+                );
+            }
+            return false;
+        }
         match ev {
             AppEvent::GitStatusRefreshed {
                 results,
@@ -116,8 +126,17 @@ impl App {
                 process_exited: true,
                 ..
             } => {
+                let transfer_owns_exit = self
+                    .find_pane(pane_id)
+                    .and_then(|(_, pane)| self.state.terminals.get(&pane.attached_terminal_id))
+                    .is_some_and(|terminal| terminal.session_transfer.is_some());
+                if transfer_owns_exit {
+                    // During a transfer, only PaneDied is process-exit authority.
+                    // Even a current-runtime detector exit can race replacement
+                    // teardown and cannot prove which managed resume command exited.
+                    return false;
+                }
                 self.handle_internal_event(ev);
-                self.session_transfer_process_exited(pane_id);
                 true
             }
             ev @ AppEvent::AgentSessionReported { .. } => {
@@ -227,10 +246,91 @@ impl App {
         let _ = self.handle_internal_event_with_pane_updates(ev);
     }
 
+    pub(crate) fn pane_runtime_epoch_matches(
+        &self,
+        pane_id: crate::layout::PaneId,
+        runtime_epoch: Option<u64>,
+    ) -> bool {
+        let Some(runtime_epoch) = runtime_epoch else {
+            return true;
+        };
+        if let Some(current_epoch) = self.current_pane_runtime_epoch(pane_id) {
+            return current_epoch == runtime_epoch;
+        }
+        self.expected_pane_exit_epochs.get(&pane_id) == Some(&runtime_epoch)
+    }
+
+    fn current_pane_runtime_epoch(&self, pane_id: crate::layout::PaneId) -> Option<u64> {
+        if let Some(popup) = self
+            .state
+            .popup_pane
+            .as_ref()
+            .filter(|popup| popup.pane_id == pane_id)
+        {
+            return self
+                .terminal_runtimes
+                .get(&popup.terminal_id)
+                .map(crate::terminal::TerminalRuntime::epoch);
+        }
+        let (_, pane) = self.find_pane(pane_id)?;
+        self.terminal_runtimes
+            .get(&pane.attached_terminal_id)
+            .map(crate::terminal::TerminalRuntime::epoch)
+    }
+
+    pub(crate) fn detector_event_runtime_matches(&self, ev: &AppEvent) -> bool {
+        let Some((pane_id, runtime_epoch)) = ev.detector_runtime() else {
+            return true;
+        };
+        let Some(runtime_epoch) = runtime_epoch else {
+            return true;
+        };
+        self.current_pane_runtime_epoch(pane_id) == Some(runtime_epoch)
+    }
+
+    pub(crate) fn consume_expected_pane_exit_epoch(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        runtime_epoch: Option<u64>,
+    ) {
+        if runtime_epoch.is_some()
+            && self.expected_pane_exit_epochs.get(&pane_id).copied() == runtime_epoch
+        {
+            self.expected_pane_exit_epochs.remove(&pane_id);
+        }
+    }
+
     pub(crate) fn handle_internal_event_with_pane_updates(
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        if !self.detector_event_runtime_matches(&ev) {
+            if let Some((pane_id, runtime_epoch)) = ev.detector_runtime() {
+                tracing::debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored detector event from a retired pane runtime"
+                );
+            }
+            return Vec::new();
+        }
+        if let AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch,
+        } = &ev
+        {
+            let matches = self.pane_runtime_epoch_matches(*pane_id, *runtime_epoch);
+            self.consume_expected_pane_exit_epoch(*pane_id, *runtime_epoch);
+            if !matches {
+                tracing::debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored PaneDied from a retired pane runtime"
+                );
+                return Vec::new();
+            }
+        }
+
         if let AppEvent::TerminalBell { count, .. } = ev {
             if let Err(err) =
                 crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)
@@ -330,7 +430,7 @@ impl App {
             return Vec::new();
         }
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self
                 .state
                 .popup_pane
@@ -385,7 +485,7 @@ impl App {
             }
         }
 
-        let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
+        let overlay_state = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.overlay_panes.remove(pane_id).map(|overlay| {
                 let was_overlay_active =
                     self.state
@@ -409,7 +509,7 @@ impl App {
             None
         };
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
                 if let Some(public_pane_id) = self.public_pane_id(ws_idx, *pane_id) {
                     self.emit_event(crate::api::schema::EventEnvelope {
@@ -422,7 +522,7 @@ impl App {
                 }
             }
         }
-        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id } = &ev {
+        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.find_pane(*pane_id).and_then(|(ws_idx, _)| {
                 self.layout_update_target_after_pane_removal(ws_idx, *pane_id)
             })
@@ -3012,6 +3112,7 @@ mod tests {
         app.terminal_runtimes.insert(terminal_id, runtime);
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
@@ -3021,6 +3122,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
@@ -3105,6 +3207,7 @@ mod tests {
         app.terminal_runtimes.insert(terminal_id, runtime);
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
@@ -3114,6 +3217,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
@@ -3151,6 +3255,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            runtime_epoch: None,
         });
 
         let overlay_tab = &app.state.workspaces[0].tabs[0];
@@ -3177,7 +3282,10 @@ mod tests {
         app.state.ensure_test_terminals();
         let tab_id = app.public_tab_id(0, 0).unwrap();
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id: dead_pane });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            runtime_epoch: None,
+        });
 
         let events = event_hub.events_after(0);
         let pane_exited = events
@@ -3220,6 +3328,7 @@ mod tests {
             }
 
             app.handle_internal_event(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
@@ -3274,6 +3383,7 @@ mod tests {
         terminal.set_agent_name("reviewer".into());
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
@@ -3326,6 +3436,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            runtime_epoch: None,
         });
 
         let events = event_hub.events_after(0);
@@ -3351,6 +3462,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            runtime_epoch: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -3370,6 +3482,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            runtime_epoch: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -3408,7 +3521,10 @@ mod tests {
                 .expect("test session id should be valid"),
         });
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch: None,
+        });
 
         assert!(
             app.find_pane(pane_id).is_some(),
@@ -3426,6 +3542,37 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn intentional_runtime_shutdown_claims_only_its_exact_exit_epoch() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("runtime-epoch");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let epoch = runtime.epoch();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        app.shutdown_terminal_runtime(terminal_id);
+
+        assert!(app.pane_runtime_epoch_matches(pane_id, Some(epoch)));
+        assert!(!app.pane_runtime_epoch_matches(pane_id, Some(epoch.wrapping_add(1))));
+        assert!(!app.pane_runtime_epoch_matches(
+            crate::layout::PaneId::from_raw(pane_id.raw().wrapping_add(1000)),
+            Some(epoch)
+        ));
+        app.consume_expected_pane_exit_epoch(pane_id, Some(epoch));
+        assert!(!app.pane_runtime_epoch_matches(pane_id, Some(epoch)));
     }
 
     #[tokio::test]
@@ -3464,7 +3611,10 @@ mod tests {
             dedupe_key: "claude:sess-x".into(),
         });
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch: None,
+        });
 
         assert!(
             app.find_pane(pane_id).is_some(),
@@ -3495,6 +3645,7 @@ mod tests {
         app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(crate::detect::Agent::OpenCode),
             state: AgentState::Idle,
@@ -3561,6 +3712,7 @@ mod tests {
         app.state.toast_config.delivery = crate::config::ToastDelivery::Terminal;
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
@@ -3581,6 +3733,7 @@ mod tests {
         });
 
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
@@ -3613,6 +3766,7 @@ mod tests {
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Kimi),
             state: AgentState::Working,
@@ -3647,6 +3801,7 @@ mod tests {
         let baseline_event_sequence = event_hub.current_sequence();
 
         app.handle_internal_event(AppEvent::InputStateChanged {
+            runtime_epoch: None,
             pane_id,
             kind: Some(crate::detect::InputPromptKind::Select),
         });
@@ -3685,6 +3840,7 @@ mod tests {
         ));
 
         app.handle_internal_event(AppEvent::InputStateChanged {
+            runtime_epoch: None,
             pane_id,
             kind: None,
         });

@@ -304,6 +304,109 @@ pub(crate) fn quote_powershell_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn managed_unix_resume_shell_command(
+    argv: &[String],
+    shell_name: &str,
+    replace_shell: bool,
+    quote_posix_arg: fn(&str) -> String,
+) -> Option<String> {
+    if is_powershell_process_name(shell_name) {
+        return managed_unix_powershell_resume_shell_command(argv, replace_shell);
+    }
+
+    let command = argv
+        .iter()
+        .map(|arg| quote_posix_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if command.is_empty() {
+        return None;
+    }
+
+    let shell = normalized_process_name(shell_name);
+    if shell == "fish" {
+        // Fish resolves functions before builtins. Select its real `command`
+        // and `exec` builtins so a function with either name cannot intercept
+        // the managed launch.
+        return if replace_shell {
+            Some(format!(
+                "builtin exec {command}; set -l __herdr_resume_status $status; builtin exit $__herdr_resume_status"
+            ))
+        } else {
+            Some(format!("builtin command {command}"))
+        };
+    }
+
+    let helper = match shell.as_str() {
+        "bash" | "zsh" => {
+            // Bash and zsh permit functions named `command` and `exec`. Their
+            // `builtin` builtin selects the real builtins even in that profile.
+            r"\builtin"
+        }
+        "sh" | "dash" | "ksh" | "mksh" | "ash" => {
+            // POSIX shells such as dash reserve `command` and reject a function
+            // by that name; the escape additionally suppresses alias expansion.
+            r"\command"
+        }
+        _ => {
+            // Nu, Elvish, Xonsh, csh, and tcsh do not share POSIX command/exec
+            // syntax. Preserve their existing direct launch behavior instead
+            // of injecting syntax from another shell language.
+            return Some(command);
+        }
+    };
+
+    if replace_shell {
+        // The exec builtin performs its normal PATH search after the interactive
+        // shell initialized PATH, without relying on a fixed `env` filesystem path.
+        // An interactive shell stays alive when exec cannot resolve the program,
+        // so explicitly exit with that status to make transfer rollback immediate.
+        let exit = if helper == r"\builtin" {
+            r#"\builtin exit "$__herdr_resume_status""#
+        } else {
+            r#"\command exit "$__herdr_resume_status""#
+        };
+        Some(format!(
+            "{helper} exec {command}; __herdr_resume_status=$?; {exit}"
+        ))
+    } else {
+        // POSIX `command` skips aliases and functions for the harness lookup while
+        // preserving the PATH initialized by the pane's interactive shell.
+        if helper == r"\builtin" {
+            Some(format!("{helper} command {command}"))
+        } else {
+            Some(format!("{helper} {command}"))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_unix_powershell_resume_shell_command(
+    argv: &[String],
+    replace_shell: bool,
+) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let program = quote_powershell_arg(program);
+    let mut launch = format!(
+        "$herdrCommand=@(Microsoft.PowerShell.Core\\Get-Command -Name {program} -CommandType Application -ErrorAction Stop)[0].Source; & $herdrCommand"
+    );
+    for arg in args {
+        launch.push(' ');
+        launch.push_str(&quote_powershell_arg(arg));
+    }
+    let launch_error = format!(
+        "[Console]::Error.WriteLine(('Herdr could not launch executable ' + {program} + ': ' + $_.Exception.Message))"
+    );
+    if replace_shell {
+        Some(format!(
+            "try {{ {launch}; $herdrExit=$LASTEXITCODE }} catch {{ {launch_error}; exit 127 }}; exit $herdrExit"
+        ))
+    } else {
+        Some(format!("try {{ {launch} }} catch {{ {launch_error} }}"))
+    }
+}
+
 pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     let normalized = normalized_process_name(name);
     matches!(
@@ -479,6 +582,139 @@ mod tests {
         assert_eq!(
             interactive_shell_command(&argv, "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn managed_resume_command_bypasses_aliases_and_replaces_transfer_shell() {
+        let argv = vec![
+            "codex".into(),
+            "resume".into(),
+            "session with ' quote".into(),
+        ];
+        assert_eq!(
+            managed_resume_shell_command(&argv, "bash", false).as_deref(),
+            Some("\\builtin command codex resume 'session with '\\'' quote'")
+        );
+        assert_eq!(
+            managed_resume_shell_command(&argv, "bash", true).as_deref(),
+            Some(
+                "\\builtin exec codex resume 'session with '\\'' quote'; __herdr_resume_status=$?; \\builtin exit \"$__herdr_resume_status\""
+            )
+        );
+        assert_eq!(
+            managed_resume_shell_command(&argv, "/bin/sh", true).as_deref(),
+            Some(
+                "\\command exec codex resume 'session with '\\'' quote'; __herdr_resume_status=$?; \\command exit \"$__herdr_resume_status\""
+            )
+        );
+        assert_eq!(
+            managed_resume_shell_command(&argv, "/usr/bin/fish", false).as_deref(),
+            Some("builtin command codex resume 'session with '\\'' quote'")
+        );
+        assert_eq!(
+            managed_resume_shell_command(&argv, "/usr/bin/fish", true).as_deref(),
+            Some(
+                "builtin exec codex resume 'session with '\\'' quote'; set -l __herdr_resume_status $status; builtin exit $__herdr_resume_status"
+            )
+        );
+        assert_eq!(
+            managed_resume_shell_command(&argv, "/usr/bin/nu", true).as_deref(),
+            Some("codex resume 'session with '\\'' quote'")
+        );
+        let powershell = managed_resume_shell_command(&argv, "pwsh", true)
+            .expect("PowerShell managed resume command");
+        assert!(powershell.contains("Microsoft.PowerShell.Core\\Get-Command"));
+        assert!(powershell.contains("-CommandType Application"));
+        assert!(powershell.ends_with("; exit $herdrExit"));
+        assert_eq!(managed_resume_shell_command(&[], "bash", true), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn managed_resume_uses_initialized_path_without_alias_or_function_lookup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-managed-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        let capture = root.join("capture");
+        let hijack = root.join("hijack");
+        std::fs::create_dir_all(&bin).expect("create fake executable directory");
+        let executable = bin.join("codex");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HERDR_MANAGED_RESUME_CAPTURE\"\n",
+        )
+        .expect("write fake executable");
+        let mut permissions = executable
+            .metadata()
+            .expect("fake executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("make fake executable runnable");
+
+        let argv = vec!["codex".into(), "resume".into(), "session id".into()];
+        let ordinary =
+            managed_resume_shell_command(&argv, "bash", false).expect("managed resume command");
+        let transfer =
+            managed_resume_shell_command(&argv, "bash", true).expect("managed resume command");
+        let script = format!(
+            "codex() {{ printf function > \"$HERDR_MANAGED_RESUME_HIJACK\"; }}\n\
+             alias codex='printf alias > \"$HERDR_MANAGED_RESUME_HIJACK\"'\n\
+             command() {{ printf command-function > \"$HERDR_MANAGED_RESUME_HIJACK\"; }}\n\
+             exec() {{ printf exec-function > \"$HERDR_MANAGED_RESUME_HIJACK\"; }}\n\
+             PATH=\"$HERDR_MANAGED_RESUME_BIN:$PATH\"\n\
+             export PATH\n\
+             {ordinary}\n\
+             {transfer}"
+        );
+        let status = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-ic", &script])
+            .env("HERDR_MANAGED_RESUME_BIN", &bin)
+            .env("HERDR_MANAGED_RESUME_CAPTURE", &capture)
+            .env("HERDR_MANAGED_RESUME_HIJACK", &hijack)
+            .status()
+            .expect("run alias-shadowed interactive shell");
+        assert!(status.success(), "managed resume command should run");
+        assert_eq!(
+            std::fs::read_to_string(&capture).expect("read captured argv"),
+            "resume\nsession id\n"
+        );
+        assert!(!hijack.exists(), "alias or function intercepted the resume");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_transfer_executable_exits_before_the_deadline_path() {
+        let argv = vec!["herdr-definitely-missing-resume-binary".into()];
+        let command = managed_resume_shell_command(&argv, "bash", true)
+            .expect("managed transfer resume command");
+        let survived = std::env::temp_dir().join(format!(
+            "herdr-managed-resume-survived-{}",
+            std::process::id()
+        ));
+        std::fs::remove_file(&survived).ok();
+        let script = format!(r#"{command}; printf survived > "$HERDR_MANAGED_RESUME_SURVIVED""#);
+        let status = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-ic", &script])
+            .env("HERDR_MANAGED_RESUME_SURVIVED", &survived)
+            .status()
+            .expect("run missing managed transfer executable");
+
+        assert_eq!(status.code(), Some(127));
+        assert!(
+            !survived.exists(),
+            "the interactive shell continued after the failed transfer exec"
         );
     }
 

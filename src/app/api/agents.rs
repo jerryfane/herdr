@@ -2982,6 +2982,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_target_pane_died_cannot_fail_a_launched_source_rollback() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, source_home, target_home) = arm_ready_session_transfer(&mut app);
+
+        let response = confirm_and_finish_cutover_verification(&mut app, &terminal_id);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        app.mark_session_transfer_runtime_launched(&terminal_id, "codex");
+        assert!(app.begin_agent_session_transfer_rollback(
+            &terminal_id,
+            "target did not report the staged session"
+        ));
+
+        let (retired_target_runtime, _target_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let retired_target_epoch = retired_target_runtime.epoch();
+        let (source_runtime, _source_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let source_epoch = source_runtime.epoch();
+        assert_ne!(retired_target_epoch, source_epoch);
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch: Some(retired_target_epoch),
+        });
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::RollingBack,
+            "an unclaimed retired-runtime exit must be rejected during the no-runtime window"
+        );
+
+        app.terminal_runtimes
+            .insert(terminal_id.clone(), source_runtime);
+        app.mark_session_transfer_runtime_launched(&terminal_id, "claude");
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch: Some(retired_target_epoch),
+        });
+
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_transfer.as_ref().unwrap().phase,
+            AgentSessionTransferPhase::RollingBack,
+            "a delayed target exit must not be attributed to the live source runtime"
+        );
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .map(crate::terminal::TerminalRuntime::epoch),
+            Some(source_epoch),
+            "the source rollback runtime must remain installed"
+        );
+
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.session_transfer = None;
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.set_input_prompt_kind(None);
+        }
+        let observed_at = std::time::Instant::now();
+        assert!(!app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentProcessDetected {
+                pane_id,
+                runtime_epoch: Some(retired_target_epoch),
+                agent: Agent::Codex,
+                observed_at,
+            }
+        ));
+        assert!(!app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::StateChanged {
+                pane_id,
+                runtime_epoch: Some(retired_target_epoch),
+                agent: Some(Agent::Codex),
+                state: AgentState::Blocked,
+                visible_blocker: true,
+                visible_working: false,
+                process_exited: false,
+                observed_at,
+            }
+        ));
+        assert!(!app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::InputStateChanged {
+                pane_id,
+                runtime_epoch: Some(retired_target_epoch),
+                kind: Some(crate::detect::InputPromptKind::Confirm),
+            }
+        ));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(terminal.detected_agent, Some(Agent::Claude));
+        assert_eq!(terminal.fallback_state, AgentState::Idle);
+        assert_eq!(terminal.input_prompt_kind, None);
+
+        retired_target_runtime.shutdown();
+        if let Some(runtime) = app.terminal_runtimes.remove(&terminal_id) {
+            runtime.shutdown();
+        }
+        std::fs::remove_dir_all(source_home).ok();
+        std::fs::remove_dir_all(target_home).ok();
+    }
+
+    #[tokio::test]
     async fn codex_source_rollback_uses_exact_process_and_native_jsonl_proof() {
         let mut app = app_with_agent();
         let (terminal_id, claude_home, codex_home) = reverse_ready_session_transfer(&mut app);
@@ -3079,12 +3186,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detected_target_process_exit_starts_rollback_before_the_deadline() {
+    async fn epoch_bound_pane_exit_starts_rollback_before_the_deadline() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let (terminal_id, source_home, target_home) = launch_ready_codex_transfer(&mut app);
 
         app.handle_internal_event_with_render_impact(crate::events::AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Unknown,
@@ -3094,6 +3202,17 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .session_transfer
+                .as_ref()
+                .unwrap()
+                .phase,
+            AgentSessionTransferPhase::AwaitingTarget,
+            "a detector exit without runtime identity is not transfer authority"
+        );
+        assert!(app.session_transfer_process_exited(pane_id));
+
         let terminal = &app.state.terminals[&terminal_id];
         let transfer = terminal.session_transfer.as_ref().unwrap();
         assert_eq!(transfer.phase, AgentSessionTransferPhase::RollingBack);
@@ -3101,7 +3220,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap()
-            .contains("Codex target process exited"));
+            .contains("Codex resume command exited"));
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert_eq!(terminal.manual_label.as_deref(), Some("session-transfer"));
         assert_eq!(terminal.agent_account.as_deref(), Some("claude-source"));

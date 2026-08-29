@@ -36,6 +36,16 @@ impl App {
         };
         self.release_input_target_headless(&target);
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+            if let Some(pane_id) = self.state.workspaces.iter().find_map(|workspace| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(pane_id, pane)| {
+                        (pane.attached_terminal_id == terminal_id).then_some(*pane_id)
+                    })
+                })
+            }) {
+                self.expected_pane_exit_epochs
+                    .insert(pane_id, runtime.epoch());
+            }
             runtime.shutdown();
         }
     }

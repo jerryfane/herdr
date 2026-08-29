@@ -10,6 +10,7 @@
 - Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.
 
 ### Fixed
+- Managed Claude Code and Codex session resumes now bypass shell aliases and functions in common POSIX shells, Fish, PowerShell, cmd, and Git Bash while preserving shell-initialized PATH; transfer launch failures in those shells are detected immediately and restore the source instead of waiting for the launch deadline.
 - Agents pinned to an account whose config-home is the harness default no longer inherit a conflicting global auth token, which previously outranked the account selection and sent the agent's writes to a different account. (#94)
 - `agent.list` and `agent.get` now report the account each agent runs under, its config-home, and whether that account no longer resolves, so a restore that re-homes an agent onto the wrong account is visible instead of silent.
 - An agent whose recorded account no longer resolves is now refused once and reported, instead of being retried on every tick and logging the same error each time.

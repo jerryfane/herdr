@@ -115,6 +115,11 @@ pub struct App {
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// One-shot identity of a runtime Herdr intentionally removed while its
+    /// child-exit event is still in flight. This lets that exact event drive a
+    /// managed respawn without accepting unrelated retired-runtime exits during
+    /// the no-runtime replacement window.
+    pub(crate) expected_pane_exit_epochs: HashMap<crate::layout::PaneId, u64>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -802,6 +807,7 @@ impl App {
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
+            expected_pane_exit_epochs: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -5278,6 +5284,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
@@ -5302,6 +5309,7 @@ mod tests {
 
         let tx = app.event_tx.clone();
         let send = tx.send(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,

@@ -2434,6 +2434,36 @@ impl HeadlessServer {
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
     fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
+        if !self.app.detector_event_runtime_matches(&ev) {
+            if let Some((pane_id, runtime_epoch)) = ev.detector_runtime() {
+                debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored detector event from a retired pane runtime"
+                );
+            }
+            return false;
+        }
+        if let AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch,
+        } = &ev
+        {
+            if !self
+                .app
+                .pane_runtime_epoch_matches(*pane_id, *runtime_epoch)
+            {
+                self.app
+                    .consume_expected_pane_exit_epoch(*pane_id, *runtime_epoch);
+                debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored PaneDied from a retired pane runtime"
+                );
+                return false;
+            }
+        }
+
         match &ev {
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
@@ -2692,7 +2722,7 @@ impl HeadlessServer {
 
                 true
             }
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, .. } => {
                 let pane_id_val = *pane_id;
                 let terminal_id = self.app.state.workspaces.iter().find_map(|ws| {
                     ws.tabs.iter().find_map(|tab| {
@@ -7384,7 +7414,12 @@ next_tab = ""
         );
         assert_eq!(server.terminal_attach_owners.get(&terminal_id), Some(&7));
 
-        assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneDied { pane_id }));
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                runtime_epoch: None,
+            })
+        );
 
         assert!(!server.clients.contains_key(&7));
         assert!(!server.terminal_attach_owners.contains_key(&terminal_id));
@@ -11608,6 +11643,7 @@ next_tab = ""
 
         assert!(
             server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+                runtime_epoch: None,
                 pane_id,
                 agent: crate::detect::Agent::Pi,
                 observed_at: Instant::now(),
@@ -11636,6 +11672,7 @@ next_tab = ""
 
         assert!(
             server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(crate::detect::Agent::Pi),
                 state: crate::detect::AgentState::Idle,
@@ -11684,6 +11721,7 @@ next_tab = ""
         server.sync_foreground_client_state();
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Blocked,
@@ -11773,6 +11811,7 @@ next_tab = ""
 
         assert!(
             server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(crate::detect::Agent::Pi),
                 state: crate::detect::AgentState::Blocked,

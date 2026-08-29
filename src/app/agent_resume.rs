@@ -290,13 +290,42 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        let transfer_resume = transfer_resume_replaces_shell(
+            self.state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.session_transfer.as_ref())
+                .map(|transfer| transfer.phase),
+        );
+        let shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        let shell_name = crate::pane::resolved_pane_shell(shell_config);
+        let Some(resume_command) =
+            crate::platform::managed_resume_shell_command(&plan.argv, &shell_name, transfer_resume)
+        else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
                 agent = %plan.agent,
-                "failed to start deferred agent resume with empty argv"
+                shell = %shell_name,
+                "failed to encode deferred agent resume command"
             );
+            if self.begin_agent_session_transfer_rollback(
+                &terminal_id,
+                format!(
+                    "could not encode the target harness resume command for shell {shell_name:?}"
+                ),
+            ) {
+                return self.resume_pending_agent_for_pane(pane_id);
+            }
+            if self.fail_agent_session_transfer_rollback_launch(
+                &terminal_id,
+                format!(
+                    "could not encode the source harness resume command for shell {shell_name:?}"
+                ),
+            ) {
+                return false;
+            }
             return false;
         };
         // Carry the account config-home env armed by `agent.restart`, and REBUILD it from
@@ -370,7 +399,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
             self.state.host_terminal_appearance,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            shell_config,
             &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
@@ -434,7 +463,11 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
             terminal.pending_launch_env.clear();
-            terminal.respawn_shell_on_exit = false;
+            // Transfer resumes replace the initialized shell so command-not-found and
+            // early target exits become an immediate PaneDied. Keep shell respawn armed
+            // so the pane survives both rollback failure and a later normal agent exit.
+            // Ordinary restore/restart resumes retain the historical shell lifetime.
+            terminal.respawn_shell_on_exit = transfer_resume;
             terminal.account_resume_blocked = None;
         }
         self.mark_session_transfer_runtime_launched(&terminal_id, &plan.agent);
@@ -449,6 +482,18 @@ impl App {
         );
         true
     }
+}
+
+fn transfer_resume_replaces_shell(
+    phase: Option<crate::api::schema::AgentSessionTransferPhase>,
+) -> bool {
+    matches!(
+        phase,
+        Some(
+            crate::api::schema::AgentSessionTransferPhase::LaunchingTarget
+                | crate::api::schema::AgentSessionTransferPhase::RollingBack
+        )
+    )
 }
 
 fn derived_pending_agent_resume_pane_infos(
@@ -486,33 +531,6 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
-fn shell_command_from_argv(argv: &[String]) -> Option<String> {
-    let mut parts = argv.iter();
-    let first = shell_quote(parts.next()?);
-    let mut command = first;
-    for part in parts {
-        command.push(' ');
-        command.push_str(&shell_quote(part));
-    }
-    Some(command)
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='
-            )
-    }) {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +549,29 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn only_transfer_launches_replace_the_initialized_shell() {
+        use crate::api::schema::AgentSessionTransferPhase as Phase;
+
+        assert!(transfer_resume_replaces_shell(Some(Phase::LaunchingTarget)));
+        assert!(transfer_resume_replaces_shell(Some(Phase::RollingBack)));
+        for phase in [
+            None,
+            Some(Phase::Preparing),
+            Some(Phase::Ready),
+            Some(Phase::VerifyingCutover),
+            Some(Phase::AwaitingTarget),
+            Some(Phase::Completed),
+            Some(Phase::RolledBack),
+            Some(Phase::Failed),
+        ] {
+            assert!(
+                !transfer_resume_replaces_shell(phase),
+                "phase {phase:?} must not replace the pane shell"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1166,20 +1207,5 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
-    }
-
-    #[test]
-    fn shell_command_from_argv_quotes_resume_arguments() {
-        let argv = vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            "session with ' quote".to_string(),
-        ];
-
-        assert_eq!(
-            shell_command_from_argv(&argv).as_deref(),
-            Some("claude --resume 'session with '\\'' quote'")
-        );
-        assert_eq!(shell_command_from_argv(&[]), None);
     }
 }
