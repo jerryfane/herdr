@@ -5,9 +5,11 @@
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 - Running Claude Code and Codex agents can now transfer their visible conversation into the other harness in the same pane. Herdr stages and rereads the destination transcript before confirmation, verifies Codex's readable text projection of Claude tool activity, reports native structures and reasoning/system records that were flattened or omitted, and restores the source session and account when target launch verification fails.
+- The Herdrup fork installer now downloads and checksum-verifies the current prebuilt preview binary, so app users can install the compatible daemon without Rust, Cargo, Zig, or a source checkout.
 
 ### Changed
 - Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.
+- Direct preview binaries now follow the fork's preview update manifest by default on macOS and Linux as well as Windows, preventing a Herdrup-compatible install from being replaced by an upstream binary.
 
 ### Fixed
 - Managed Claude Code and Codex session resumes now bypass shell aliases and functions in common POSIX shells, Fish, PowerShell, cmd, and Git Bash while preserving shell-initialized PATH; transfer launch failures in those shells are detected immediately and restore the source instead of waiting for the launch deadline.

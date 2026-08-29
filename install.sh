@@ -1,30 +1,19 @@
 #!/bin/sh
-# Install the herdr fork used by the herdrup app.
+# Install the prebuilt herdr fork used by the herdrup app.
 #
 # herdr.dev/install.sh installs upstream Herdr, which does not have this fork's
-# `api-bridge` subcommand. This installer builds an authenticated fork revision
-# and installs only one binary under the invoking user's home directory.
+# `api-bridge` subcommand. This installer selects the latest published preview
+# asset from the fork's checked-in manifest, verifies its SHA-256 digest, and
+# installs only one binary under the invoking user's home directory.
 set -eu
 set -f
 umask 077
 
-DEFAULT_REPO="https://github.com/jerryfane/herdr.git"
-# Keep this immutable. Updating the installed source is an explicit reviewed
-# change to this script, not an implicit consequence of a moving branch.
-DEFAULT_REV="00b5cc8723dc3887b75b3e03df0cdadfdd554e1b"
-TOOLCHAIN="1.96.1"
-STATE_MARKER="herdr-fork-installer-v1"
+DEFAULT_MANIFEST_URL="https://raw.githubusercontent.com/jerryfane/herdr/master/website/preview.json"
+EXPECTED_RELEASE_ROOT="https://github.com/jerryfane/herdr/releases/download"
 
-REPO="${HERDR_REPO:-$DEFAULT_REPO}"
-REV="${HERDR_REV:-$DEFAULT_REV}"
+MANIFEST_URL="${HERDR_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}"
 BIN_DIR_REQUESTED="${HERDR_BIN_DIR:-$HOME/.local/bin}"
-STATE_DIR_REQUESTED="$HOME/.cache/herdr-fork-installer"
-
-# Persistent build state is confined to STATE_DIR/{cargo,rustup,zig}. Each run's
-# authenticated checkout and target directory live under STATE_DIR/run.* and are
-# removed on exit. The only other write is the final binary under BIN_DIR.
-# Compiling trusted, pinned source still executes its build scripts as the user;
-# this is a constrained layout, not an operating-system sandbox.
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
@@ -128,43 +117,19 @@ prepare_home_directory() {
     PREPARED_DIR=$prepared_dir
 }
 
-prepare_state_subdirectory() {
-    state_subdir=$1
-    if [ -L "$state_subdir" ]; then
-        die "$state_subdir is a symlink; refusing to use it."
-    elif [ -e "$state_subdir" ]; then
-        require_safe_directory "$state_subdir"
-    else
-        mkdir "$state_subdir" || die "could not create $state_subdir."
-        require_safe_directory "$state_subdir"
-    fi
-}
-
-require_version_at_least() {
-    version_label=$1
-    actual_version=$2
-    required_major=$3
-    required_minor=$4
-    required_patch=$5
-    version_core=${actual_version%%[-+]*}
-
-    saved_ifs=$IFS
-    IFS=.
-    set -- $version_core
-    IFS=$saved_ifs
-    [ "$#" -eq 3 ] || die "$version_label returned an unrecognized version: $actual_version"
-    actual_major=$1
-    actual_minor=$2
-    actual_patch=$3
-    case "$actual_major$actual_minor$actual_patch" in
-        ''|*[!0-9]*) die "$version_label returned an unrecognized version: $actual_version" ;;
-    esac
-
-    if [ "$actual_major" -lt "$required_major" ] ||
-       { [ "$actual_major" -eq "$required_major" ] && [ "$actual_minor" -lt "$required_minor" ]; } ||
-       { [ "$actual_major" -eq "$required_major" ] && [ "$actual_minor" -eq "$required_minor" ] && [ "$actual_patch" -lt "$required_patch" ]; }; then
-        die "$version_label $actual_version is too old; version $required_major.$required_minor.$required_patch or newer is required."
-    fi
+manifest_value() {
+    metadata_key=$1
+    awk -v wanted="$metadata_key" '
+        index($0, wanted "=") == 1 {
+            count += 1
+            value = $0
+            sub(/^[^=]*=/, "", value)
+        }
+        END {
+            if (count != 1 || value == "") exit 1
+            print value
+        }
+    ' "$METADATA_FILE"
 }
 
 case "$HOME" in
@@ -174,19 +139,22 @@ esac
 [ "$HOME" != "/" ] || die "refusing to install with HOME set to /."
 validate_home_path "$BIN_DIR_REQUESTED"
 
-case "$REV" in
-    ''|*[!0-9a-f]*) die "HERDR_REV must be an exact lowercase 40-character Git commit." ;;
-esac
-[ "${#REV}" -eq 40 ] || die "HERDR_REV must be an exact lowercase 40-character Git commit."
-
-for required_command in git cargo zig cat chmod cp id mkdir mktemp mv rm stat uname; do
+for required_command in awk chmod cp curl id mkdir mktemp mv rm stat uname; do
     require_command "$required_command"
 done
 
 case $(uname -s 2>/dev/null || :) in
-    Linux|Darwin) ;;
-    *) die "this source installer supports Linux and macOS only." ;;
+    Linux) target_os=linux ;;
+    Darwin) target_os=macos ;;
+    *) die "this binary installer supports Linux and macOS only." ;;
 esac
+case $(uname -m 2>/dev/null || :) in
+    x86_64|amd64) target_arch=x86_64 ;;
+    aarch64|arm64) target_arch=aarch64 ;;
+    *) die "this installer does not have a binary for this CPU architecture." ;;
+esac
+TARGET=$target_os-$target_arch
+ASSET_NAME=herdr-$TARGET
 
 INSTALL_UID=$(id -u 2>/dev/null) || die "could not determine the current user."
 case "$INSTALL_UID" in
@@ -194,68 +162,11 @@ case "$INSTALL_UID" in
 esac
 inspect_existing_home_path "$BIN_DIR_REQUESTED"
 
-zig_version=$(zig version 2>/dev/null) || die "could not read the Zig version."
-zig_core=${zig_version%%[-+]*}
-saved_ifs=$IFS
-IFS=.
-set -- $zig_core
-IFS=$saved_ifs
-if [ "$#" -ne 3 ] || [ "$1" != 0 ] || [ "$2" != 15 ]; then
-    die "Zig $zig_version is unsupported; install Zig 0.15.2 or newer in the 0.15 series."
-fi
-case "$3" in
-    ''|*[!0-9]*) die "Zig returned an unrecognized version: $zig_version" ;;
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/herdr-fork-installer.XXXXXX") || die "could not create a private download directory."
+case "$RUN_DIR" in
+    /*/herdr-fork-installer.*) ;;
+    *) die "mktemp returned an unsafe download directory." ;;
 esac
-[ "$3" -ge 2 ] || die "Zig $zig_version is too old; install Zig 0.15.2 or newer in the 0.15 series."
-
-state_existed=0
-if [ -e "$STATE_DIR_REQUESTED" ] || [ -L "$STATE_DIR_REQUESTED" ]; then
-    state_existed=1
-fi
-prepare_home_directory "$STATE_DIR_REQUESTED"
-STATE_DIR=$PREPARED_DIR
-marker_file=$STATE_DIR/.owner
-if [ "$state_existed" -eq 1 ]; then
-    [ -f "$marker_file" ] && [ ! -L "$marker_file" ] || die "$STATE_DIR was not created by this installer; move it aside and try again."
-    marker_value=$(cat "$marker_file") || die "could not read $marker_file."
-    [ "$marker_value" = "$STATE_MARKER" ] || die "$STATE_DIR has an invalid ownership marker; move it aside and try again."
-else
-    printf '%s\n' "$STATE_MARKER" > "$marker_file" || die "could not mark $STATE_DIR as installer-owned."
-fi
-
-prepare_state_subdirectory "$STATE_DIR/cargo"
-prepare_state_subdirectory "$STATE_DIR/rustup"
-prepare_state_subdirectory "$STATE_DIR/zig"
-export CARGO_HOME=$STATE_DIR/cargo
-export RUSTUP_HOME=$STATE_DIR/rustup
-export ZIG_GLOBAL_CACHE_DIR=$STATE_DIR/zig
-unset CARGO_TARGET_DIR RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
-unset RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT RUSTUP_TOOLCHAIN ZIG_LOCAL_CACHE_DIR
-
-USE_RUSTUP=0
-if command -v rustup >/dev/null 2>&1; then
-    USE_RUSTUP=1
-    say "Preparing Rust $TOOLCHAIN"
-    rustup toolchain install "$TOOLCHAIN" --profile minimal >/dev/null || die "rustup could not install Rust $TOOLCHAIN."
-    cargo_output=$(rustup run "$TOOLCHAIN" cargo --version 2>/dev/null) || die "Rust $TOOLCHAIN does not provide a working Cargo."
-    rustc_output=$(rustup run "$TOOLCHAIN" rustc --version 2>/dev/null) || die "Rust $TOOLCHAIN does not provide a working rustc."
-else
-    require_command rustc
-    cargo_output=$(cargo --version 2>/dev/null) || die "could not read the Cargo version."
-    rustc_output=$(rustc --version 2>/dev/null) || die "could not read the rustc version."
-fi
-case "$cargo_output" in
-    cargo\ *) cargo_version=${cargo_output#cargo }; cargo_version=${cargo_version%% *} ;;
-    *) die "Cargo returned an unrecognized version: $cargo_output" ;;
-esac
-case "$rustc_output" in
-    rustc\ *) rustc_version=${rustc_output#rustc }; rustc_version=${rustc_version%% *} ;;
-    *) die "rustc returned an unrecognized version: $rustc_output" ;;
-esac
-require_version_at_least Cargo "$cargo_version" 1 96 1
-require_version_at_least rustc "$rustc_version" 1 96 1
-
-RUN_DIR=$(mktemp -d "$STATE_DIR/run.XXXXXX") || die "could not create a private build directory in $STATE_DIR."
 TEMP_BINARY=
 cleanup() {
     cleanup_status=$?
@@ -266,7 +177,7 @@ cleanup() {
         esac
     fi
     case "$RUN_DIR" in
-        "$STATE_DIR"/run.*) rm -rf "$RUN_DIR" || : ;;
+        /*/herdr-fork-installer.*) rm -rf "$RUN_DIR" || : ;;
     esac
     exit "$cleanup_status"
 }
@@ -275,36 +186,123 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-SRC=$RUN_DIR/source
-export CARGO_TARGET_DIR=$RUN_DIR/target
+MANIFEST_FILE=$RUN_DIR/preview.json
+METADATA_FILE=$RUN_DIR/asset.env
+DOWNLOADED_BINARY=$RUN_DIR/herdr
 
-# Ignore Git environment redirections. The remote may be overridden, but the
-# exact source object must still match REV before any source code is compiled.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_REPLACE_REF_BASE GIT_CONFIG_COUNT
-export GIT_CONFIG_GLOBAL=/dev/null
-export GIT_CONFIG_SYSTEM=/dev/null
-export GIT_TERMINAL_PROMPT=0
+say "Fetching the latest herdrup-compatible Herdr build"
+curl -q --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+    --max-filesize 5242880 \
+    "$MANIFEST_URL" -o "$MANIFEST_FILE" || die "could not download the fork preview manifest."
+[ -s "$MANIFEST_FILE" ] && [ ! -L "$MANIFEST_FILE" ] || die "the fork preview manifest is empty or unsafe."
 
-say "Fetching authenticated source $REV"
-mkdir "$SRC" || die "could not create the source directory."
-git -C "$SRC" init --quiet || die "could not initialize the private source checkout."
-git -C "$SRC" remote add origin "$REPO" || die "could not configure the source remote."
-git -C "$SRC" fetch --quiet --depth 1 origin "$REV" || die "could not fetch source revision $REV from $REPO."
-fetched_rev=$(git -C "$SRC" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || die "the fetched source is not a commit."
-[ "$fetched_rev" = "$REV" ] || die "source verification failed: expected $REV but fetched $fetched_rev."
-git -C "$SRC" checkout --quiet --detach "$REV" || die "could not check out verified source revision $REV."
-checked_out_rev=$(git -C "$SRC" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || die "could not verify the checked-out source."
-[ "$checked_out_rev" = "$REV" ] || die "checked-out source does not match verified revision $REV."
+BUILD_ID=$(awk -F '"' '
+    /^  "build_id"[[:space:]]*:/ { print $4; count += 1 }
+    END { if (count != 1) exit 1 }
+' "$MANIFEST_FILE") || die "the fork preview manifest does not contain one current build_id."
+case "$BUILD_ID" in
+    ''|*[!A-Za-z0-9._-]*) die "the fork preview manifest contains an invalid build_id." ;;
+esac
 
-say "Building (this takes a few minutes the first time)"
-if [ "$USE_RUSTUP" -eq 1 ]; then
-    (cd "$SRC" && rustup run "$TOOLCHAIN" cargo build --release --locked) || die "the Herdr build failed; the installed binary was not changed."
+# Read only builds[build_id].assets[target]. The manifest also archives older
+# builds with the same target names, so selecting the first matching target
+# would silently install the wrong release.
+awk -v wanted_build="$BUILD_ID" -v wanted_target="$TARGET" '
+    function indentation(line, prefix) {
+        prefix = line
+        sub(/[^[:space:]].*$/, "", prefix)
+        return length(prefix)
+    }
+    function trimmed(line) {
+        sub(/^[[:space:]]*/, "", line)
+        return line
+    }
+    function quoted_value(line, parts) {
+        split(line, parts, "\"")
+        return parts[4]
+    }
+    {
+        indent = indentation($0)
+        line = trimmed($0)
+
+        if (indent == 2 && line ~ /^"builds"[[:space:]]*:/) {
+            in_builds = 1
+            next
+        }
+        if (in_builds && indent == 4 && line ~ /^"/) {
+            split(line, key_parts, "\"")
+            in_build = (key_parts[2] == wanted_build)
+            in_assets = 0
+            in_target = 0
+            next
+        }
+        if (!in_build) next
+
+        if (indent == 6 && line ~ /^"tag"[[:space:]]*:/) {
+            print "tag=" quoted_value(line)
+            next
+        }
+        if (indent == 6 && line ~ /^"assets"[[:space:]]*:/) {
+            in_assets = 1
+            next
+        }
+        if (in_assets && indent == 8 && line ~ /^"/) {
+            split(line, key_parts, "\"")
+            in_target = (key_parts[2] == wanted_target)
+            next
+        }
+        if (!in_target) next
+        if (indent == 10 && line ~ /^"url"[[:space:]]*:/) {
+            print "url=" quoted_value(line)
+        } else if (indent == 10 && line ~ /^"sha256"[[:space:]]*:/) {
+            print "sha256=" quoted_value(line)
+        }
+    }
+' "$MANIFEST_FILE" > "$METADATA_FILE" || die "could not parse the fork preview manifest."
+
+TAG=$(manifest_value tag) || die "the current fork preview build is missing one release tag."
+URL=$(manifest_value url) || die "the current fork preview build has no binary for $TARGET."
+SHA256=$(manifest_value sha256) || die "the current fork preview build has no checksum for $TARGET."
+
+case "$TAG" in
+    preview-*) ;;
+    *) die "the fork preview manifest contains an invalid release tag." ;;
+esac
+tag_suffix=${TAG#preview-}
+[ -n "$tag_suffix" ] || die "the fork preview manifest contains an empty release tag."
+case "$TAG" in
+    *[!A-Za-z0-9._-]*) die "the fork preview manifest contains an invalid release tag." ;;
+esac
+EXPECTED_URL=$EXPECTED_RELEASE_ROOT/$TAG/$ASSET_NAME
+[ "$URL" = "$EXPECTED_URL" ] || die "the fork preview asset URL does not resolve to jerryfane/herdr: $URL"
+case "$SHA256" in
+    *[!0-9A-Fa-f]*) die "the fork preview asset checksum is not hexadecimal." ;;
+esac
+[ "${#SHA256}" -eq 64 ] || die "the fork preview asset checksum is not a SHA-256 digest."
+SHA256=$(printf '%s\n' "$SHA256" | awk '{ print tolower($0) }')
+
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_TOOL=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+    SHA256_TOOL=shasum
+elif command -v openssl >/dev/null 2>&1; then
+    SHA256_TOOL=openssl
 else
-    (cd "$SRC" && cargo build --release --locked) || die "the Herdr build failed; the installed binary was not changed."
+    die "SHA-256 verification requires sha256sum, shasum, or openssl."
 fi
 
-built_binary=$CARGO_TARGET_DIR/release/herdr
-[ -f "$built_binary" ] && [ ! -L "$built_binary" ] || die "the build did not produce a regular Herdr binary."
+say "Downloading $TAG for $TARGET"
+curl -q --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+    --max-filesize 104857600 \
+    "$URL" -o "$DOWNLOADED_BINARY" || die "could not download $ASSET_NAME; the installed binary was not changed."
+[ -s "$DOWNLOADED_BINARY" ] && [ ! -L "$DOWNLOADED_BINARY" ] || die "the downloaded Herdr binary is empty or unsafe."
+
+case "$SHA256_TOOL" in
+    sha256sum) ACTUAL_SHA256=$(sha256sum < "$DOWNLOADED_BINARY" | awk '{ print $1 }') ;;
+    shasum) ACTUAL_SHA256=$(shasum -a 256 < "$DOWNLOADED_BINARY" | awk '{ print $1 }') ;;
+    openssl) ACTUAL_SHA256=$(openssl dgst -sha256 < "$DOWNLOADED_BINARY" | awk '{ print $NF }') ;;
+esac
+[ "$ACTUAL_SHA256" = "$SHA256" ] || die "downloaded Herdr checksum did not match; the installed binary was not changed."
 
 prepare_home_directory "$BIN_DIR_REQUESTED"
 BIN_DIR=$PREPARED_DIR
@@ -316,11 +314,11 @@ destination=$BIN_DIR/herdr
 # A failed copy or chmod leaves an existing binary untouched; a successful mv
 # atomically replaces it.
 TEMP_BINARY=$(mktemp "$BIN_DIR/.herdr-install.XXXXXX") || die "could not create an installation staging file in $BIN_DIR."
-cp "$built_binary" "$TEMP_BINARY" || die "could not stage the new Herdr binary; the installed binary was not changed."
+cp "$DOWNLOADED_BINARY" "$TEMP_BINARY" || die "could not stage the new Herdr binary; the installed binary was not changed."
 chmod 0755 "$TEMP_BINARY" || die "could not make the staged Herdr binary executable; the installed binary was not changed."
 mv -f "$TEMP_BINARY" "$destination" || die "could not activate the new Herdr binary; the installed binary was not changed."
 TEMP_BINARY=
-say "Installed $destination from verified revision $REV"
+say "Installed $destination from $TAG"
 
 hash -r 2>/dev/null || :
 resolved_herdr=$(command -v herdr 2>/dev/null || :)
@@ -334,8 +332,8 @@ if [ "$resolved_herdr" != "$destination" ]; then
     say "Add this installation directory to PATH in your shell configuration:"
     say "  $BIN_DIR"
     say "Then run 'herdr pair'."
-    say "You can also invoke the installed file directly with the 'pair' argument:"
-    say "  $destination"
+    say "You can also run it directly:"
+    say "  $destination pair"
 else
     say ""
     say "Next: run  herdr pair  and scan the code with the herdrup app."
