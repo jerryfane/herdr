@@ -97,6 +97,24 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 
 `notification show` 使用配置的 `[ui.toast]` 投递方式。`--position` 只影响 Herdr 应用内的 toast。`--sound` 默认为 `none`;`done` 和 `request` 只在通知实际显示时播放已有的完成音和需要关注音。
 
+## Gram
+
+Gram 是在 Herdr 应用中呈现的所有者↔智能体消息通道。
+
+```bash
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # 给所有者发消息(推送通知)
+herdr gram list [--queue] [--unread] [--owner]  # --owner 以所有者身份查看
+herdr gram grab <id> [--as LABEL]               # 认领共享队列中的一项(先到先得)
+herdr gram get-file <id> -o PATH                # 下载消息附带的文件
+herdr gram post "<text>" [--to AGENT]           # 所有者:共享队列,或指定某个智能体
+herdr gram mark-read <id>                       # 所有者:将消息标记为已读
+herdr gram delete <id> [--owner]                # 彻底删除一条消息(及其附件)
+```
+
+智能体的身份来自 `HERDR_PANE_ID`,解析为其智能体名称(没有名称则为窗格 id)。该名称在重启或部署交接后仍然保持,但它是一个名称:重命名、清除或复用它会改变 `gram list` 中显示为“我的”的项。认领(grab)本身始终是先到先得且原子的,与身份无关——两个智能体永远无法认领同一项。归属信息(`from` 以及所有者发布的消息)仅供参考,并非经过认证。
+
+`send --file` 附加一个文件(说明文字可选),并分块上传以适应请求大小上限;`get-file` 用于下载。`delete` 会彻底删除消息及其附件字节——适合只发送一次随后即弃的短期机密(例如临时 API 密钥)。你可以删除自己发送的、认领的或发给你的消息;`--owner` 可删除任意消息。
+
 ## 会话
 
 ```bash
@@ -290,6 +308,10 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
 `agent prompt` 遵循当前的 bracketed paste 模式,即使智能体处于 working 也会先发送文本,短暂延迟后再发送编码后的 Enter。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在五秒内产生可观察的生命周期变化，否则 Herdr 返回 `agent_prompt_stalled`；调用方超时不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+
+使用 `--wait` 时，最初处于 settled 状态的智能体若生命周期序列前进，会返回 `delivery: "submitted"`。Herdr 会给 PTY 批次附加不透明的 composer attempt id。同一个 attempt 留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`，被观察到后清空时返回 `submitted`。bracketed paste 不依赖渲染后的 token 文本。
+
+写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。
 
 `idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 
