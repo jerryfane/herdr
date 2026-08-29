@@ -1,5 +1,60 @@
 use std::path::{Path, PathBuf};
 
+/// Every IPv4 address on an UP, non-loopback Unix interface.
+///
+/// This replaces `hostname -I`, which is unavailable on macOS. The caller keeps private
+/// address selection as policy; this function only reports what `getifaddrs` enumerates and
+/// preserves a failed system call as an error rather than conflating it with an empty list.
+pub(crate) fn local_ipv4_addresses(
+) -> Result<Vec<super::InterfaceAddress>, super::LocalIpv4AddressError> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes `head` on success. On failure, the list is not owned
+    // and the OS error is returned without reading or freeing `head`.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(super::LocalIpv4AddressError::Enumeration(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` points into the successful getifaddrs list.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr is non-null; sa_family is readable on every sockaddr.
+        let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+        if family != libc::AF_INET {
+            continue;
+        }
+        let flags = ifa.ifa_flags as i32;
+        if flags & libc::IFF_UP == 0 || flags & libc::IFF_LOOPBACK != 0 {
+            continue;
+        }
+        // SAFETY: family is AF_INET, so the sockaddr is a sockaddr_in.
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let octets = u32::from_be(sin.sin_addr.s_addr).to_be_bytes();
+        let name = if ifa.ifa_name.is_null() {
+            String::new()
+        } else {
+            // SAFETY: ifa_name is a NUL-terminated C string owned by the list.
+            unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        out.push(super::InterfaceAddress {
+            interface: name,
+            address: std::net::Ipv4Addr::from(octets),
+        });
+    }
+    // SAFETY: `head` came from a successful getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;

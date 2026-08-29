@@ -71,7 +71,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     // Tailscale still wins when available, so this cannot downgrade the chosen path.
     let mut lan_choice = None;
     if lan && tailscale.is_none() {
-        match pairing::choose_lan_address(&crate::platform::local_ipv4_addresses()) {
+        match pairing::choose_lan_address(crate::platform::local_ipv4_addresses()) {
             Ok(found) => lan_choice = Some(found),
             Err(refusal) => {
                 eprintln!("herdr pair: {refusal}");

@@ -130,6 +130,8 @@ pub fn is_private_address(addr: Ipv4Addr) -> bool {
 pub enum LanRefusal {
     /// The platform cannot enumerate interfaces (Windows has no `getifaddrs`).
     Unsupported,
+    /// The platform supports enumeration, but its system call failed.
+    EnumerationFailed { message: String },
     /// Interfaces were found, but none carried a usable private IPv4 address.
     NoPrivateAddress { seen: usize },
 }
@@ -141,6 +143,9 @@ impl fmt::Display for LanRefusal {
                 f,
                 "--lan cannot enumerate network interfaces on this platform"
             ),
+            Self::EnumerationFailed { message } => {
+                write!(f, "--lan could not enumerate network interfaces: {message}")
+            }
             Self::NoPrivateAddress { seen } => write!(
                 f,
                 "--lan found no private (RFC1918) address on any active interface \
@@ -163,10 +168,24 @@ impl fmt::Display for LanRefusal {
 /// machine cannot print different addresses. The caller prints the interface alongside the
 /// address so the choice is visible rather than implied.
 pub fn choose_lan_address(
-    candidates: &[crate::platform::InterfaceAddress],
+    enumeration: Result<
+        Vec<crate::platform::InterfaceAddress>,
+        crate::platform::LocalIpv4AddressError,
+    >,
 ) -> Result<crate::platform::InterfaceAddress, LanRefusal> {
+    let candidates = match enumeration {
+        Ok(candidates) => candidates,
+        Err(crate::platform::LocalIpv4AddressError::Unsupported) => {
+            return Err(LanRefusal::Unsupported);
+        }
+        Err(crate::platform::LocalIpv4AddressError::Enumeration(err)) => {
+            return Err(LanRefusal::EnumerationFailed {
+                message: err.to_string(),
+            });
+        }
+    };
     if candidates.is_empty() {
-        return Err(LanRefusal::Unsupported);
+        return Err(LanRefusal::NoPrivateAddress { seen: 0 });
     }
     let mut usable: Vec<_> = candidates
         .iter()
@@ -999,13 +1018,18 @@ mod tests {
         assert!(!is_tailnet_address("37.27.59.89".parse().unwrap()));
     }
 
-    /// THE SECURITY PROPERTY: a pre-authentication endpoint must never land on a public
-    /// interface. Every refusal below is the point of the feature, not an edge case.
     fn ifaddr(iface: &str, addr: &str) -> crate::platform::InterfaceAddress {
         crate::platform::InterfaceAddress {
             interface: iface.into(),
             address: addr.parse().unwrap(),
         }
+    }
+
+    fn enumerated(
+        candidates: &[crate::platform::InterfaceAddress],
+    ) -> Result<Vec<crate::platform::InterfaceAddress>, crate::platform::LocalIpv4AddressError>
+    {
+        Ok(candidates.to_vec())
     }
 
     /// DIFFERENTIAL CHECK against the instrument this replaces, on the one platform where
@@ -1027,6 +1051,7 @@ mod tests {
             .filter_map(|t| t.parse::<Ipv4Addr>().ok())
             .collect();
         let found: std::collections::BTreeSet<Ipv4Addr> = crate::platform::local_ipv4_addresses()
+            .expect("getifaddrs must succeed to run this differential check")
             .into_iter()
             .map(|c| c.address)
             .collect();
@@ -1048,15 +1073,40 @@ mod tests {
     /// told TAILSCALE was missing. Someone reading that goes and installs Tailscale to fix
     /// a problem that was never about Tailscale.
     #[test]
-    fn a_lan_refusal_names_the_real_cause_not_tailscale() {
-        // Nothing enumerated at all -- the platform cannot do it.
-        assert_eq!(choose_lan_address(&[]), Err(LanRefusal::Unsupported));
+    fn unsupported_lan_enumeration_names_the_real_cause() {
+        assert_eq!(
+            choose_lan_address(Err(crate::platform::LocalIpv4AddressError::Unsupported)),
+            Err(LanRefusal::Unsupported)
+        );
         assert!(LanRefusal::Unsupported.to_string().contains("enumerate"));
+    }
 
-        // Interfaces exist but none is usable: a DIFFERENT cause, reported differently.
+    #[test]
+    fn failed_lan_enumeration_names_the_system_failure() {
+        let refusal = choose_lan_address(Err(crate::platform::LocalIpv4AddressError::Enumeration(
+            std::io::Error::other("synthetic enumeration failure"),
+        )));
+        assert_eq!(
+            refusal,
+            Err(LanRefusal::EnumerationFailed {
+                message: "synthetic enumeration failure".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn successful_empty_lan_enumeration_means_no_private_address() {
+        assert_eq!(
+            choose_lan_address(enumerated(&[])),
+            Err(LanRefusal::NoPrivateAddress { seen: 0 })
+        );
+    }
+
+    #[test]
+    fn enumerated_but_unusable_lan_addresses_report_the_count() {
         let public_only = [ifaddr("eth0", "203.0.113.7"), ifaddr("eth1", "8.8.8.8")];
         assert_eq!(
-            choose_lan_address(&public_only),
+            choose_lan_address(enumerated(&public_only)),
             Err(LanRefusal::NoPrivateAddress { seen: 2 })
         );
         let message = LanRefusal::NoPrivateAddress { seen: 2 }.to_string();
@@ -1078,25 +1128,26 @@ mod tests {
             ifaddr("eth0", "203.0.113.7"),
             ifaddr("eth1", "192.168.1.50"),
         ];
-        let chosen = choose_lan_address(&mixed).expect("one private address is present");
+        let chosen =
+            choose_lan_address(enumerated(&mixed)).expect("one private address is present");
         assert_eq!(chosen.address, "192.168.1.50".parse::<Ipv4Addr>().unwrap());
 
         // Loopback ALONE is not a fallback -- binding pairing to 127.0.0.1 would advertise
         // an address the phone can never reach.
         assert_eq!(
-            choose_lan_address(&[ifaddr("lo", "127.0.0.1")]),
+            choose_lan_address(enumerated(&[ifaddr("lo", "127.0.0.1")])),
             Err(LanRefusal::NoPrivateAddress { seen: 1 })
         );
         // All three RFC1918 blocks qualify.
         for addr in ["10.1.2.3", "172.16.5.6", "192.168.9.9"] {
             assert!(
-                choose_lan_address(&[ifaddr("eth0", addr)]).is_ok(),
+                choose_lan_address(enumerated(&[ifaddr("eth0", addr)])).is_ok(),
                 "{addr}"
             );
         }
         // Carrier-grade NAT is NOT RFC1918 and must not be treated as a LAN.
         assert_eq!(
-            choose_lan_address(&[ifaddr("eth0", "100.64.0.1")]),
+            choose_lan_address(enumerated(&[ifaddr("eth0", "100.64.0.1")])),
             Err(LanRefusal::NoPrivateAddress { seen: 1 })
         );
     }
@@ -1109,8 +1160,8 @@ mod tests {
         let a = ifaddr("docker0", "172.17.0.1");
         let b = ifaddr("eth0", "192.168.1.50");
         let c = ifaddr("eth0", "10.0.0.5");
-        let forward = choose_lan_address(&[a.clone(), b.clone(), c.clone()]).unwrap();
-        let reverse = choose_lan_address(&[c.clone(), b.clone(), a.clone()]).unwrap();
+        let forward = choose_lan_address(enumerated(&[a.clone(), b.clone(), c.clone()])).unwrap();
+        let reverse = choose_lan_address(enumerated(&[c.clone(), b.clone(), a.clone()])).unwrap();
         assert_eq!(
             forward, reverse,
             "order of enumeration must not change the choice"
@@ -1119,6 +1170,8 @@ mod tests {
         assert_eq!(forward, a);
     }
 
+    /// THE SECURITY PROPERTY: a pre-authentication endpoint must never land on a public
+    /// interface. Every refusal below is the point of the feature, not an edge case.
     #[test]
     fn binding_refuses_every_way_of_reaching_the_internet() {
         let public: Ipv4Addr = "37.27.59.89".parse().unwrap();

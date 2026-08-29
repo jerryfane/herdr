@@ -3,6 +3,11 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+pub(crate) fn local_ipv4_addresses(
+) -> Result<Vec<super::InterfaceAddress>, super::LocalIpv4AddressError> {
+    Err(super::LocalIpv4AddressError::Unsupported)
+}
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 

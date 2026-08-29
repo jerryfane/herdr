@@ -15,6 +15,11 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn local_ipv4_addresses(
+) -> Result<Vec<super::InterfaceAddress>, super::LocalIpv4AddressError> {
+    Err(super::LocalIpv4AddressError::Unsupported)
+}
+
 pub(crate) fn set_default_plugin_pane_pwd(
     _env: &mut Vec<(String, String)>,
     _cwd: &std::path::Path,

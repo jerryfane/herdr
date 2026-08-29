@@ -131,73 +131,19 @@ pub struct InterfaceAddress {
     pub address: std::net::Ipv4Addr,
 }
 
-/// Every IPv4 address on an UP, non-loopback interface.
-///
-/// REPLACES SHELLING OUT TO `hostname -I`, which is a GNU extension: BSD and macOS
-/// `hostname` have no `-I`, so on macOS that returned nothing and `herdr pair --lan`
-/// reported "no Tailscale" — blaming the wrong subsystem entirely. macOS is the primary
-/// target for pairing, so the platform this failed on was the one that mattered.
-///
-/// Filtering here is only what the OS can tell us (address family, interface flags).
-/// Whether an address is ACCEPTABLE — private, not loopback — is policy and stays in
-/// `pairing::choose_lan_address`, so the security rules remain testable without a network.
-#[cfg(unix)]
-pub fn local_ipv4_addresses() -> Vec<InterfaceAddress> {
-    let mut out = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs writes a linked list we own and free below; on failure it
-    // returns non-zero and leaves `head` untouched, so nothing is freed or read.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return out;
-    }
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: `cur` is non-null and points into the list getifaddrs just built.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-
-        if ifa.ifa_addr.is_null() {
-            continue;
-        }
-        // SAFETY: ifa_addr is non-null; sa_family is readable on every sockaddr.
-        let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
-        if family != libc::AF_INET {
-            continue;
-        }
-        let flags = ifa.ifa_flags as i32;
-        if flags & libc::IFF_UP == 0 || flags & libc::IFF_LOOPBACK != 0 {
-            continue;
-        }
-        // SAFETY: family is AF_INET, so the sockaddr is a sockaddr_in.
-        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-        let octets = u32::from_be(sin.sin_addr.s_addr).to_be_bytes();
-        let name = if ifa.ifa_name.is_null() {
-            String::new()
-        } else {
-            // SAFETY: ifa_name is a NUL-terminated C string owned by the list.
-            unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        out.push(InterfaceAddress {
-            interface: name,
-            address: std::net::Ipv4Addr::from(octets),
-        });
-    }
-    // SAFETY: `head` came from a successful getifaddrs and is freed exactly once.
-    unsafe { libc::freeifaddrs(head) };
-    out
-}
-
-/// Windows has no `getifaddrs`; enumerating there needs `GetAdaptersAddresses`.
-///
-/// Returning empty is not a silent failure: the caller turns an empty list into a refusal
-/// that names this, rather than into "no Tailscale". Pairing writes
-/// `~/.ssh/authorized_keys`, which is not a Windows shape anyway — this exists so the
-/// crate compiles for Windows, which CI builds.
-#[cfg(not(unix))]
-pub fn local_ipv4_addresses() -> Vec<InterfaceAddress> {
-    Vec::new()
+/// Why the platform could not enumerate local IPv4 addresses.
+#[derive(Debug)]
+pub enum LocalIpv4AddressError {
+    /// This platform has no interface-enumeration implementation.
+    // Shared policy matches this on every target, but only non-Unix implementations
+    // construct it; without the target-specific allowance Unix builds warn spuriously.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unsupported,
+    /// The platform API exists, but the enumeration call failed.
+    // Only Unix implementations currently call an interface-enumeration API; other
+    // targets still match this variant at the shared policy boundary.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Enumeration(std::io::Error),
 }
 
 /// Returns whether a terminal size change was signalled since the last call.
