@@ -102,16 +102,24 @@ herdr pane read w1:p2 --source recent --lines 50
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.transfer_session` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
+`gram.*` はオーナーとエージェント間のメッセージチャネルです。`gram.grab` は共有キューの項目を取得し、ストレージ層で先着順かつアトミックなので、識別子に関わらず 2 つのエージェントが同じ項目を取得することはありません。送信者・取得者の識別子は `caller_pane_id` から解決されるエージェント名(名前がなければペイン id)で、再起動やライブハンドオフをまたいでも保持されますが、名前のセマンティクスを持ちます。名前の変更・クリア・再利用により、`gram.list` で「自分のもの」として表示される項目が変わります。`gram.list` は `caller_pane_id` を省略するとオーナービューを、指定するとそのペインのエージェントビューを返します。属性表示は参考情報であり、認証されたものではありません。
+
+メッセージは 1 つのファイルを持てます。1 リクエストのサイズには上限があるため(アプリの SSH 経路で約 65 KiB、ローカルソケットで 1 MiB)、ファイルは `gram.upload_chunk`(`{upload_id, offset, data_base64}`。`offset` はこのチャンクの開始バイト位置で、`offset: 0` はアップロードをやり直す)でチャンク単位にアップロードし、その `upload_id` を `gram.send`/`gram.post` の `file` に渡して添付します。`gram.get_file` はレスポンス経路にサイズ上限がないため、バイト列を base64 として 1 回の応答でインライン返却します。`gram.delete` はメッセージと添付バイトを完全に削除します。オーナー(`caller_pane_id` なし)は任意のメッセージを、エージェントは caller pane を渡した場合に自分が見られるメッセージ(`gram.list` と同じ範囲)のみを削除・取得できます。この範囲チェックはフラットなローカル信頼ドメイン内の協調的フィルタリングであり、認証された境界ではありません(ローカルプロセスはストアを直接読めます)。短期的な機密(一時的な API キー)にとっての利点は、削除がバイト列を確実に消去し、削除後は永続ストアに秘密が残らないことです。
+
+`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。成功時の `delivery` は、text+Enter 全体の書き込み確認後に `written_to_pty`、帰属可能なライフサイクル進行、または同じ writer-attributed composer attempt の観測後の消去で `submitted` です。残存する帰属入力は `agent_prompt_unsubmitted`、不確かな行方は `agent_prompt_stalled` です。bracketed paste は表示 token に依存しません。
+
+`agent.transfer_session` はローカルサーバー上の Claude Code と Codex のネイティブセッションを相互に移行します。最初のリクエストは移行先を作成して実際の JSONL を再読込・検証し、元のエージェントを動かしたまま `ready` で停止します。`message_count`、`omissions`、返された `target_account` を確認後、同じ対象情報に `transfer_id` と `confirm: true` を加えて送信します。Herdr はランタイムを置き換える直前に両方のトランスクリプトのフィンガープリントを再確認します。Claude の移行先は公式インテグレーションから正確なセッションを報告する必要があります。Codex 0.150.1 は最初のプロンプトまでその報告を遅延するため、Codex の移行先では、ネイティブ移行先 JSONL と正確な `codex resume <session-id>` プロセスを検証し、選択した PID を記録することでも完了できます。3 秒の観察時間は対話ブロッカーの検出に使いますが、証明の条件ではありません。時間が過ぎても内容を検証できれば続行し、プロセスが準備済みに見えても内容が一致しなければロールバックします。比較では表示される役割・順序・テキストの一致を必須とし、プロバイダーのメタデータ、JSON フィールド順、非表示レコード順、JSONL の CRLF 行末の違いは許容します。Codex から後で届く最初の公式レポートも一致しなければなりません。ブロッカー、終了、タイムアウト、内容不一致、または同一性不一致が起きると、元のハーネス、セッション、アカウント、名前、ラベル、作業ディレクトリを復元します。アカウントのファイルシステム権限を使うため federation からは利用できません。
+
+`pane.get` は `composer` オブジェクトを返します。`state` は `empty`、`draft_present`、`unknown` で、任意の `attempt_id` と provenance、領域、カーソル、style、frame stability の証拠を含みます。領域欠落、再描画途中、矛盾、またはこのフィールドを持たない古い応答は `unknown` です。style は信頼度を下げる tripwire にしか使いません。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
 
-`session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。取得後はリソースイベントを購読し、そのイベントでローカルキャッシュを更新してください。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
+`session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。ブートストラップ中のイベントを取りこぼさないよう、まず別の接続で `events.subscribe` を開いて確認応答を待ち、そのストリームをバッファしながら `session.snapshot` を呼び出します。スナップショットを適用してから、バッファしたイベントを順番に適用し、そのままストリーミングを続けます。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
 
 CLI の `herdr api snapshot` は、クライアントやエージェントが簡単にブートストラップできるよう、現在の `session.snapshot` レスポンスを JSON で出力します。
 
@@ -635,7 +643,7 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 }
 ```
 
-最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。
+最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。ライフサイクルイベントの購読はリクエストが受理された時点から始まり、それ以前に保持されていたイベントは再生しません。
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。

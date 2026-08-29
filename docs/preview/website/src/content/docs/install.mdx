@@ -19,6 +19,12 @@ On Windows, run:
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
 
+If endpoint security blocks that fileless PowerShell command, open Command Prompt and run:
+
+```cmd
+curl.exe -fsSLo install.cmd https://herdr.dev/install.cmd && install.cmd && del install.cmd
+```
+
 The installer downloads the release binary for your platform and places it on your PATH. New direct installs use the stable update channel. Existing Windows preview installs stay on preview until you switch them with `herdr channel set stable`. The Windows installer uses versioned install folders and updates a `current` junction, so updates do not need to overwrite a running `herdr.exe`.
 
 ## Install with Homebrew
@@ -142,6 +148,10 @@ herdr update --handoff
 ```
 
 Live handoff does not apply to Homebrew, mise, or Nix package-manager updates. For those installs, update with the package manager, then restart that Herdr session when you are ready to use the new server. If a running session still uses the old server, stop it with `herdr server stop` or `herdr session stop <name>`, then run Herdr again.
+
+A running server can also refuse a live handoff. Handoff works by starting a replacement and then letting the old process exit, so Herdr declines it when that exit would take the replacement down too — most importantly when Herdr is the main process of a systemd unit, where the main process exiting deactivates the unit and kills every pane in its control group. The request fails with an explicit error and nothing is torn down.
+
+Deploy to a supervised install by replacing the binary and restarting the service instead. Note that restarting the service alone does not pick up a staged build: the swap that a handoff would have performed never happens, so the unit re-runs the same file. Move the staged binary over the live path first — a rename rather than a copy, since the running image is busy — and then restart the service.
 
 ## Requirements
 

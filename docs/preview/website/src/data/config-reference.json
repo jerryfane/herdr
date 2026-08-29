@@ -171,6 +171,234 @@
           "type": "color",
           "default": "unset",
           "description": "Override the peach color token on top of the base theme. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.accent",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the accent color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.panel_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the panel_bg color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.sidebar_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the sidebar_bg color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.active_row_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the active_row_bg color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.selection_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the selection_bg color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.surface0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface0 color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.surface1",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface1 color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.surface_dim",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface_dim color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.overlay0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the overlay0 color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.overlay1",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the overlay1 color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.text",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the text color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.subtext0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the subtext0 color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.mauve",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the mauve color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.green",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the green color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.yellow",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the yellow color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.red",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the red color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.blue",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the blue color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.teal",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the teal color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.light.peach",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the peach color token when auto_switch selects a light appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.accent",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the accent color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.panel_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the panel_bg color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.sidebar_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the sidebar_bg color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.active_row_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the active_row_bg color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.selection_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the selection_bg color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.surface0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface0 color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.surface1",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface1 color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.surface_dim",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the surface_dim color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.overlay0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the overlay0 color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.overlay1",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the overlay1 color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.text",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the text color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.subtext0",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the subtext0 color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.mauve",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the mauve color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.green",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the green color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.yellow",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the yellow color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.red",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the red color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.blue",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the blue color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.teal",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the teal color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.dark.peach",
+          "type": "color",
+          "default": "unset",
+          "description": "Override the peach color token when auto_switch selects a dark appearance. Applied after theme.custom. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
         }
       ]
     },
@@ -1190,6 +1418,24 @@
       ]
     },
     {
+      "id": "federation",
+      "title": "Federation",
+      "keys": [
+        {
+          "key": "federation.listen",
+          "type": "boolean",
+          "default": "false",
+          "description": "Accept inbound federation connections over TCP. Default off. The listener only binds when `federation.listen_addr` is set and at least one peer token file yields a token; otherwise it refuses to start rather than expose an unauthenticated port. Each accepted TCP connection is authenticated by a shared token and restricted to the granting peer's `capability` tier, and inbound connections are capped so a peer cannot exhaust threads or file descriptors. The local unix socket and the SSH control path are never filtered by this setting."
+        },
+        {
+          "key": "federation.listen_addr",
+          "type": "string",
+          "default": "unset",
+          "description": "Address the federation TCP listener binds to when `federation.listen` is enabled, for example `0.0.0.0:7020` or `127.0.0.1:7020`. Leave unset to keep the listener off."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [
@@ -1254,6 +1500,48 @@
           "type": "boolean",
           "default": "false",
           "description": "While prefix mode is active, temporarily switch the host input source to an ASCII-capable mode so prefix commands are read as ASCII even when an IME is active, then restore the previous input source when prefix mode exits. On macOS this selects the ASCII-capable keyboard layout; on Windows it switches the IME to English (ASCII) input. Windows support is currently limited to the Korean IME; with an IME for any other language, the input source is left unchanged. macOS and Windows only; a no-op elsewhere and a best-effort no-op if the switch fails."
+        }
+      ]
+    },
+    {
+      "id": "push",
+      "title": "Push notifications",
+      "keys": [
+        {
+          "key": "push.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Master switch for remote APNs push delivery to registered mobile devices. Requires key_path, key_id, team_id, and topic to also be set."
+        },
+        {
+          "key": "push.key_path",
+          "type": "string",
+          "default": "unset",
+          "description": "Filesystem path to the APNs auth key (.p8, PKCS#8 PEM). Read only when a push is sent; its contents are never persisted to Herdr state and never logged."
+        },
+        {
+          "key": "push.key_id",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs auth key ID (the 10-character Key ID issued by Apple)."
+        },
+        {
+          "key": "push.team_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Apple developer Team ID used as the push token JWT issuer."
+        },
+        {
+          "key": "push.topic",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs topic — the app bundle identifier, e.g. com.example.herdr."
+        },
+        {
+          "key": "push.sandbox",
+          "type": "boolean",
+          "default": "false",
+          "description": "Deliver through the APNs sandbox host instead of production."
         }
       ]
     }

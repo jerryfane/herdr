@@ -84,6 +84,15 @@ Wait for an agent:
 herdr agent wait w1:p1 --until done
 ```
 
+Stage and review a Claude Code/Codex session transfer, then confirm it:
+
+```bash
+herdr agent transfer-session jarvis --to codex --account codex-work
+herdr agent transfer-session jarvis --to codex --account codex-work --confirm <transfer-id>
+```
+
+Use `--yes` for a one-command stage, verify, and confirm flow.
+
 Read pane output:
 
 ```bash
@@ -97,7 +106,8 @@ Raw socket method names use dot notation:
 | Area | Methods |
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
-| Notification | `notification.show` |
+| Notification | `notification.show`, `notifications.register_device` |
+| Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read`, `gram.delete`, `gram.upload_chunk`, `gram.get_file` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
@@ -106,23 +116,33 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.transfer_session`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
-`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+`gram.*` is the owner↔agent message channel. `gram.grab` claims a shared queue item and is first-wins atomic at the storage layer, so no two agents can ever claim the same item — regardless of identity. Sender and claimant identity is the caller's agent name (or pane id if it has no name), resolved from `caller_pane_id`; it is durable across a restart or live-handoff but carries name-semantics: renaming, clearing, or reusing a name changes which items an agent sees as its own in `gram.list`. `gram.list` returns the owner view when `caller_pane_id` is omitted and that pane's agent view otherwise. Attribution is advisory, not authenticated.
+
+A message may carry one file. Because a single request is size-capped (near 65 KiB over the app's SSH path, 1 MiB on the local socket), a file is uploaded in chunks with `gram.upload_chunk` (`{upload_id, offset, data_base64}`; `offset` is the byte position this chunk starts at, and `offset: 0` restarts the upload) and then attached by passing that `upload_id` in a `gram.send`/`gram.post` `file` object. `gram.get_file` returns the bytes inline as base64 in one reply (the response path is not size-capped). `gram.delete` removes a message and its file bytes for good. The owner (no `caller_pane_id`) may delete any message; an agent that supplies its caller pane may delete or download only a message it can see (the same audience as `gram.list`). That audience check is **cooperative filtering within the flat local trust domain, not an authenticated boundary** — every local process can already read the store directly, and "owner" is just the absence of a caller pane. Its value for a short-lived secret (a temporary API key) is that deletion genuinely purges the bytes, keeping the secret out of the persistent store once you delete it.
+
+`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait. Successful prompts include optional `delivery` evidence: `written_to_pty` after the complete text+Enter batch is acknowledged, or `submitted` after an attributable lifecycle advance or after the same writer-attributed composer attempt is observed and clears. Persistent attributed input returns `agent_prompt_unsubmitted`; uncertain disposition returns `agent_prompt_stalled`. Bracketed paste uses writer provenance and does not depend on rendered token text. A visible modal returns `agent_input_pending` before any bytes are written.
+
+`agent.transfer_session` supports Claude Code and Codex native sessions on the local server. The first request supplies `target`, `to`, and optional target `account`; it parses the source once, creates a native destination session, rereads the actual destination JSONL, and leaves the source running with phase `ready`. Review `message_count`, `omissions`, and the echoed `target_account` in the returned agent's `session_transfer`, then repeat the request with the same target fields plus `transfer_id` and `confirm: true`. Herdr rechecks both transcript fingerprints before replacing the runtime. Claude must report the exact staged session through its official integration. Codex 0.150.1 defers that report until the first prompt, so a Codex target may instead complete when Herdr verifies the native destination JSONL and an exact `codex resume <session-id>` process, recording the selected PID. The three-second observation window can reveal an interactive blocker but is not the proof gate: verified content proceeds even when the window expires, while a content mismatch rolls back even if the process looks ready. Comparison requires the same visible roles, order, and text, while allowing provider metadata, JSON field ordering, non-visible record ordering, and CRLF JSONL line endings. The first later Codex integration report must still match. Any blocker, exit, timeout, content mismatch, or identity mismatch restores the original harness, session, account, name, label, and working directory. The method is intentionally unavailable over federation because it has selected-account filesystem authority.
+
+`pane.get` returns an additive `composer` object with `state` (`empty`, `draft_present`, or `unknown`), optional `attempt_id`, and provenance, region, cursor, style, and frame-stability evidence. Suggestion text drawn by a hosted CLI is not a draft because it lacks writer provenance and is strictly right of the cursor. Region-not-found, mid-repaint, conflicting evidence, and old responses without the object resolve to `unknown`, not `empty`. Style is only a tripwire that can downgrade confidence.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
 focused workspace/tab/pane ids, workspace records, tab records, pane records,
-tab layout snapshots, and agent records. It is not a subscription; after reading
-it, subscribe to resource events and update the local cache from those events.
-Call `session.snapshot` again after reconnecting or when the local cache may be
-stale. Attached worktree provenance is included on workspace records. Full repo
-worktree discovery remains `worktree.list`.
+tab layout snapshots, and agent records. It is not a subscription. To avoid a
+bootstrap gap, first open `events.subscribe` on another connection and wait for
+its acknowledgement. Buffer that stream while calling `session.snapshot`,
+install the snapshot, then apply the buffered events in order and continue
+streaming. Call `session.snapshot` again after reconnecting or when the local
+cache may be stale. Attached worktree provenance is included on workspace
+records. Full repo worktree discovery remains `worktree.list`.
 
 From the CLI, `herdr api snapshot` prints the live `session.snapshot` response
 as JSON for clients and agents that want a simple bootstrap command.
@@ -742,6 +762,8 @@ If no native session reference is stored, the field is omitted.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
+Those records also expose modal input independently of lifecycle state. `input_pending: true` is paired with `input_prompt_kind` (`confirm`, `select`, `free_text`, or `unknown`); both fields are omitted when no modal is present. `pane.agent_status_changed` carries the same tuple and emits on input-only changes even when `agent_status` is unchanged. Unfiltered subscriptions provide this orthogonal transition stream, and `pane.get` / `agent.get` recover current state after reconnecting.
+
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 
 ```json
@@ -805,6 +827,8 @@ Subscribe to events when you need a long-lived stream:
 ```
 
 The first response acknowledges the subscription. Later lines are pushed events.
+Lifecycle subscriptions start when the request is accepted and do not replay
+events retained before that point.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.metadata_updated`, `workspace.renamed`, `workspace.moved`, `workspace.reordered`, `workspace.closed`, and `workspace.focused`. `workspace.metadata_updated` reports token changes and TTL expiry without invoking plugin event hooks. Other workspace events describe Herdr UI/runtime lifecycle. `workspace.created` includes optional `workspace.worktree` provenance when the workspace belongs to a worktree group. `workspace.moved` includes the moved `workspace_id`, requested `insert_index`, and updated ordered `workspaces` list. `workspace.reordered` includes the atomically moved `workspace_ids`, optional `before_workspace_id`, and authoritative ordered `workspaces` list. `workspace.closed` includes a final `workspace` snapshot when Herdr can still identify it before removal.
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,

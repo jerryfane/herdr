@@ -19,6 +19,12 @@ curl -fsSL https://herdr.dev/install.sh | sh
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
 
+如果端点安全软件阻止该无文件 PowerShell 命令，请打开命令提示符并运行：
+
+```cmd
+curl.exe -fsSLo install.cmd https://herdr.dev/install.cmd && install.cmd && del install.cmd
+```
+
 安装器会下载适合你平台的发布二进制文件并放到 PATH 上。新的直接安装默认使用稳定更新通道。现有的 Windows 预览安装会继续留在预览通道,直到你运行 `herdr channel set stable`。Windows 安装器使用带版本号的安装文件夹,并更新一个 `current` 联接点,因此更新时不需要覆盖正在运行的 `herdr.exe`。
 
 ## 用 Homebrew 安装
@@ -114,6 +120,10 @@ herdr update
 ```
 
 `herdr update` 适用于由 Herdr 自带安装器管理的安装。Homebrew、mise 和 Nix 安装请改用那些包管理器更新。
+
+运行中的服务器也可能拒绝实时移交。移交的做法是先启动一个替代进程,再让旧进程退出;如果这次退出会把替代进程一起带走,Herdr 就会拒绝移交。最典型的情况是 Herdr 是某个 systemd 单元的主进程:主进程退出会停用该单元,进而杀掉其控制组中的每一个窗格。此时请求会以明确的错误失败,不会拆除任何东西。
+
+要向受服务管理的安装发布,请改为替换二进制文件后重启服务。注意仅重启服务并不会启用已暂存的构建:移交本应完成的替换没有发生,单元只会重新运行同一个文件。请先把暂存的二进制文件移动到运行路径上(用 rename 而不是复制,因为运行中的映像正被占用),然后再重启服务。
 
 Linux、macOS 和 Windows 的直接安装默认使用稳定更新通道。要启用来自 `master` 的预览构建,设置通道:
 

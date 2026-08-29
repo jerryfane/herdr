@@ -97,6 +97,24 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 
 `notification show` は設定済みの `[ui.toast]` 配信を使います。`--position` はアプリ内の Herdr トーストにのみ影響します。`--sound` のデフォルトは `none` で、`done` と `request` は通知が表示されたときにのみ、既存の完了音と要注意音を再生します。
 
+## Gram
+
+Gram は Herdr アプリに表示される、オーナーとエージェント間のメッセージチャネルです。
+
+```bash
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # オーナーにメッセージを送る(プッシュ通知)
+herdr gram list [--queue] [--unread] [--owner]  # --owner はオーナーとして読む
+herdr gram grab <id> [--as LABEL]               # 共有キューの項目を取得する(先着順)
+herdr gram get-file <id> -o PATH                # メッセージの添付ファイルをダウンロードする
+herdr gram post "<text>" [--to AGENT]           # オーナー:共有キュー、または特定のエージェント宛
+herdr gram mark-read <id>                       # オーナー:メッセージを既読にする
+herdr gram delete <id> [--owner]                # メッセージ(と添付ファイル)を完全に削除する
+```
+
+エージェントの識別子は `HERDR_PANE_ID` から解決され、エージェント名(名前がなければペイン id)になります。この名前は再起動やデプロイのハンドオフをまたいでも保持されますが、あくまで「名前」です。名前の変更・クリア・再利用により、`gram list` で「自分のもの」として表示される項目が変わります。取得(grab)自体は識別子に関わらず常に先着順でアトミックであり、2 つのエージェントが同じ項目を取得することはありません。属性表示(`from` やオーナー投稿のメッセージ)は参考情報であり、認証されたものではありません。
+
+`send --file` はファイルを添付し(キャプションは任意)、リクエストサイズの上限に収まるようチャンク単位でアップロードします。`get-file` はダウンロードします。`delete` はメッセージと添付データを完全に削除します。使い捨ての機密情報(一時的な API キーなど)を一度だけ送って破棄する用途に便利です。削除できるのは自分が送った・取得した・自分宛てのメッセージで、`--owner` は任意のメッセージを削除します。
+
 ## セッション
 
 ```bash
@@ -290,6 +308,10 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 成功した start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。起動中の検出状態が `blocked` の場合、コマンドは直ちに `agent_not_ready` を返します。名前は `agent read` と `agent send-keys` で引き続き使用でき、検出状態が `idle` になるとプロンプトを送信できるようになります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 
 `agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストを送信してから短い遅延の後にエンコード済み Enter を送信します。エージェントがすでに `blocked` の場合は、入力を送信せずに `agent_blocked` を返します。`--wait` を使う場合、別の non-working 状態から受け付けたプロンプトは 5 秒以内に観測可能なライフサイクル変化を起こす必要があり、変化がなければ Herdr は `agent_prompt_stalled` を返します。呼び出し側のタイムアウトが 5 秒以下なら、通常の `timeout` エラーを維持します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+
+`--wait` では、最初に settled だったエージェントのライフサイクルシーケンスが進むと `delivery: "submitted"` になります。Herdr は PTY バッチに不透明な composer attempt id を付けます。同じ attempt がカーソルで裏付けられたコンポーザーに残れば `agent_prompt_unsubmitted`、観測後に消えれば `submitted` です。bracketed paste は表示された token の文字列に依存しません。
+
+書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。
 
 `idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 
