@@ -23,8 +23,8 @@ pub(crate) use super::unix_common::{
 /// Name of the interface carrying the preferred IPv4 default route.
 ///
 /// `/proc/net/route` is kernel-owned, requires no optional userspace tool, and exposes the
-/// same interface names as `getifaddrs`. Route lookup is best-effort because selecting a LAN
-/// address can still proceed deterministically on machines without a default route.
+/// same interface names as `getifaddrs`. The caller fails closed rather than guessing from
+/// another interface when this best-effort lookup cannot identify a usable default route.
 pub(crate) fn default_route_interface() -> Option<String> {
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     default_route_interface_from_proc(&routes)

@@ -24,7 +24,7 @@ pub(crate) use super::unix_common::{
 ///
 /// macOS does not expose Linux's `/proc/net/route`; `/sbin/route` is part of the base OS.
 /// Its output is used only to prefer an interface already returned by `getifaddrs`, never as
-/// an address or command input, so unexpected output safely degrades to deterministic choice.
+/// an address or command input, so unexpected output safely causes the caller to fail closed.
 pub(crate) fn default_route_interface() -> Option<String> {
     let output = Command::new("/sbin/route")
         .args(["-n", "get", "default"])
