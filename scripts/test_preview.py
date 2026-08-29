@@ -111,6 +111,29 @@ class PreviewNotesTests(unittest.TestCase):
                 ["website/preview.json", ".github/workflows/preview.yml"]
             )
 
+    def test_publication_files_reject_renamed_source_outside_allowlist(self):
+        with self.assertRaisesRegex(ValueError, "unexpected path"):
+            preview.validate_publication_files(
+                [
+                    [
+                        {
+                            "filename": "docs/preview/website/workflow.yml",
+                            "previous_filename": ".github/workflows/preview.yml",
+                            "status": "renamed",
+                        },
+                        {"filename": "website/preview.json", "status": "modified"},
+                    ]
+                ]
+            )
+
+    def test_publication_files_accept_generated_paths_across_pages(self):
+        preview.validate_publication_files(
+            [
+                [{"filename": "docs/preview/website/astro.config.mjs"}],
+                [{"filename": "website/preview.json"}],
+            ]
+        )
+
     def test_latest_publishable_commit_keeps_release_commits(self):
         output = "\n".join(
             [

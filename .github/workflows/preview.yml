@@ -582,10 +582,9 @@ jobs:
           PUBLICATION_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          gh api --paginate \
+          gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --jq '.[].filename' \
-            | python3 scripts/preview.py validate-publication-paths
+            | python3 scripts/preview.py validate-publication-files
 
           preview_commit="$(python3 scripts/preview.py current-commit --manifest website/preview.json)"
           expected_branch="$(python3 scripts/preview.py publication-branch --commit "$preview_commit")"
@@ -767,5 +766,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_BRANCH: ${{ steps.publication.outputs.branch }}
         run: |
+          set -euo pipefail
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$remote" --delete "$PUBLICATION_BRANCH"
+          if ! git push "$remote" --delete "$PUBLICATION_BRANCH"; then
+            if git ls-remote --exit-code --heads "$remote" "refs/heads/${PUBLICATION_BRANCH}" >/dev/null; then
+              echo "error: failed to delete publication branch $PUBLICATION_BRANCH" >&2
+              exit 1
+            fi
+            echo "Publication branch $PUBLICATION_BRANCH is already absent."
+          fi

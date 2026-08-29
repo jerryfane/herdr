@@ -141,6 +141,30 @@ def validate_publication_paths(paths: list[str]) -> None:
         )
 
 
+def validate_publication_files(pages: object) -> None:
+    if not isinstance(pages, list):
+        raise ValueError("preview publication file response must be a list of pages")
+    paths = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise ValueError("preview publication file page must be a list")
+        for file in page:
+            if not isinstance(file, dict):
+                raise ValueError("preview publication file entry must be an object")
+            filename = file.get("filename")
+            if not isinstance(filename, str) or not filename:
+                raise ValueError("preview publication file entry must have a filename")
+            paths.append(filename)
+            previous_filename = file.get("previous_filename")
+            if previous_filename is not None:
+                if not isinstance(previous_filename, str) or not previous_filename:
+                    raise ValueError(
+                        "preview publication previous filename must be a non-empty string"
+                    )
+                paths.append(previous_filename)
+    validate_publication_paths(paths)
+
+
 def humanize_subject(subject: str) -> tuple[str, str]:
     match = COMMIT_RE.match(subject)
     if not match:
@@ -326,6 +350,14 @@ def cmd_validate_publication_paths(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_publication_files(_args: argparse.Namespace) -> int:
+    try:
+        validate_publication_files(json.load(sys.stdin))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Preview channel release helpers")
     sub = parser.add_subparsers(required=True)
@@ -373,6 +405,9 @@ def main() -> int:
 
     publication_paths = sub.add_parser("validate-publication-paths")
     publication_paths.set_defaults(func=cmd_validate_publication_paths)
+
+    publication_files = sub.add_parser("validate-publication-files")
+    publication_files.set_defaults(func=cmd_validate_publication_files)
 
     args = parser.parse_args()
     return args.func(args)
