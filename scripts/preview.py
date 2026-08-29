@@ -328,8 +328,15 @@ def build_manifest(
 ) -> str:
     urls = default_asset_urls(repo, tag)
     assets = asset_objects(urls, shas)
-    current = read_json(output) or {}
-    builds = current.get("builds") if isinstance(current.get("builds"), dict) else {}
+    current = read_json(output)
+    if current is None:
+        builds = {}
+    elif not isinstance(current, dict):
+        raise ValueError("existing preview manifest must be an object")
+    else:
+        builds = current.get("builds")
+        if not isinstance(builds, dict):
+            raise ValueError("existing preview manifest builds must be an object")
     builds = rebind_retained_builds(dict(builds), repo)
     builds[build_id] = {
         "base_version": normalize_version(base_version),
