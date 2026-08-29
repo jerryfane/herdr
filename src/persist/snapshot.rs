@@ -430,7 +430,7 @@ fn capture_tab(
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
-        let (agent_name, managed_agent_kind) = terminal
+        let (mut agent_name, mut managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
                 (
@@ -441,31 +441,48 @@ fn capture_tab(
                 )
             })
             .unwrap_or_default();
+        let guarded_transfer = terminal
+            .and_then(|terminal| terminal.session_transfer.as_ref())
+            .filter(|transfer| transfer.restart_owns_source());
+        if let Some(transfer) = guarded_transfer {
+            agent_name = terminal.and_then(|terminal| terminal.agent_name.clone());
+            managed_agent_kind = Some(transfer.source_kind.label().to_string());
+        }
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         // Capture the account BEFORE the terminal is gone; without it a restore silently
         // re-homes the pane onto the harness default.
-        let agent_account = terminal.and_then(|terminal| terminal.agent_account.clone());
-        let agent_session = terminal.and_then(|terminal| {
-            if let Some(authority) = terminal.hook_authority.as_ref() {
-                if let Some(session_ref) = authority.session_ref.as_ref() {
-                    return Some(PaneAgentSessionSnapshot {
-                        source: authority.source.clone(),
-                        agent: authority.agent_label.clone(),
-                        kind: session_ref.kind,
-                        value: session_ref.value.clone(),
-                    });
-                }
-            }
-            terminal
-                .persisted_agent_session
-                .as_ref()
-                .map(|session| PaneAgentSessionSnapshot {
-                    source: session.source.clone(),
-                    agent: session.agent.clone(),
-                    kind: session.session_ref.kind,
-                    value: session.session_ref.value.clone(),
+        let agent_account = guarded_transfer
+            .map(|transfer| transfer.source_account.clone())
+            .unwrap_or_else(|| terminal.and_then(|terminal| terminal.agent_account.clone()));
+        let agent_session = guarded_transfer
+            .map(|transfer| PaneAgentSessionSnapshot {
+                source: transfer.source_session.source.clone(),
+                agent: transfer.source_session.agent.clone(),
+                kind: transfer.source_session.session_ref.kind,
+                value: transfer.source_session.session_ref.value.clone(),
+            })
+            .or_else(|| {
+                terminal.and_then(|terminal| {
+                    if let Some(authority) = terminal.hook_authority.as_ref() {
+                        if let Some(session_ref) = authority.session_ref.as_ref() {
+                            return Some(PaneAgentSessionSnapshot {
+                                source: authority.source.clone(),
+                                agent: authority.agent_label.clone(),
+                                kind: session_ref.kind,
+                                value: session_ref.value.clone(),
+                            });
+                        }
+                    }
+                    terminal.persisted_agent_session.as_ref().map(|session| {
+                        PaneAgentSessionSnapshot {
+                            source: session.source.clone(),
+                            agent: session.agent.clone(),
+                            kind: session.session_ref.kind,
+                            value: session.session_ref.value.clone(),
+                        }
+                    })
                 })
-        });
+            });
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -1516,6 +1533,140 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Id
         );
         assert_eq!(agent_session.value, "opencode-session");
+    }
+
+    #[test]
+    fn transfer_snapshot_keeps_source_ownership_until_target_is_verified() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.agent_account = Some("codex-work".into());
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::detect::AgentState::Idle,
+            None,
+            Some(crate::agent_resume::AgentSessionRef::id("codex-target").unwrap()),
+            Some(20),
+        );
+        terminal.begin_managed_agent(
+            "jarvis".into(),
+            crate::detect::Agent::Codex,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(30),
+        );
+        terminal.session_transfer = Some(crate::session_transfer::RuntimeSessionTransfer {
+            id: "transfer-1".into(),
+            source_kind: crate::session_transfer::HarnessKind::Claude,
+            source_session: crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("claude-source").unwrap(),
+            },
+            source_account: Some("claude-work".into()),
+            source_config_home: PathBuf::from("/tmp/claude-home"),
+            target_kind: crate::session_transfer::HarnessKind::Codex,
+            target_account: Some("codex-work".into()),
+            target_config_home: PathBuf::from("/tmp/codex-home"),
+            phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
+            message_count: 3,
+            omissions: Default::default(),
+            error: None,
+            source_path: None,
+            source_fingerprint: None,
+            target_session_id: Some("codex-target".into()),
+            target_transcript_path: None,
+            target_fingerprint: None,
+            target_deadline: None,
+            target_process: None,
+            source_rollback_process: None,
+            verification_in_flight: None,
+            verification_observation_deadline: None,
+            awaiting_deferred_target_report: false,
+        });
+
+        let guarded = capture_from_state(&state);
+        let pane = &guarded.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("source session");
+        assert_eq!(session.source, "herdr:claude");
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.value, "claude-source");
+        assert_eq!(pane.agent_account.as_deref(), Some("claude-work"));
+        assert_eq!(pane.managed_agent_kind.as_deref(), Some("claude"));
+        assert_eq!(
+            pane.agent_name.as_deref(),
+            Some("jarvis"),
+            "a guarded transfer snapshot must retain the durable name even while the target launch is pending"
+        );
+
+        #[cfg(unix)]
+        {
+            let (events, _event_rx) = tokio::sync::mpsc::channel(4);
+            let (_workspaces, restored_terminals, restored_runtimes) =
+                crate::persist::restore::restore(
+                    &guarded,
+                    None,
+                    24,
+                    80,
+                    0,
+                    "/bin/sh",
+                    crate::config::ShellModeConfig::NonLogin,
+                    true,
+                    events,
+                    std::sync::Arc::new(tokio::sync::Notify::new()),
+                    std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+                );
+            assert!(restored_runtimes.is_empty());
+            let restored = restored_terminals.values().next().unwrap();
+            assert_eq!(restored.agent_name.as_deref(), Some("jarvis"));
+            assert_eq!(
+                restored.managed_agent_kind(),
+                Some(crate::detect::Agent::Claude)
+            );
+        }
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_managed_agent("jarvis".into(), crate::detect::Agent::Codex);
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .phase = crate::api::schema::AgentSessionTransferPhase::Completed;
+        let completed = capture_from_state(&state);
+        let pane = &completed.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("target session");
+        assert_eq!(session.source, "herdr:codex");
+        assert_eq!(session.agent, "codex");
+        assert_eq!(session.value, "codex-target");
+        assert_eq!(pane.agent_account.as_deref(), Some("codex-work"));
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .awaiting_deferred_target_report = true;
+        let deferred = capture_from_state(&state);
+        let pane = &deferred.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("source session");
+        assert_eq!(session.source, "herdr:claude");
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.value, "claude-source");
+        assert_eq!(pane.agent_account.as_deref(), Some("claude-work"));
+        assert_eq!(pane.agent_name.as_deref(), Some("jarvis"));
     }
 
     #[test]

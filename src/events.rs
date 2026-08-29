@@ -94,7 +94,35 @@ pub enum AppEvent {
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        session_path: Option<String>,
         session_start_source: Option<String>,
+    },
+    /// Background transcript staging and destination-file verification finished.
+    AgentSessionTransferPrepared {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        result: Box<
+            Result<
+                crate::session_transfer::PreparedTransfer,
+                crate::session_transfer::TransferError,
+            >,
+        >,
+    },
+    /// Background source/destination fingerprint verification finished after
+    /// the user confirmed, while the source runtime was still alive.
+    AgentSessionTransferCutoverVerified {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        result: Result<(), crate::session_transfer::TransferError>,
+    },
+    /// Background native JSONL verification finished for an exact Codex
+    /// target or rollback process.
+    AgentSessionTransferRuntimeVerified {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        kind: crate::session_transfer::RuntimeVerificationKind,
+        process_pid: u32,
+        result: Result<(), crate::session_transfer::TransferError>,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {

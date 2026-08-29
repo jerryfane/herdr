@@ -2876,16 +2876,31 @@ impl AppState {
                 agent_label,
                 seq,
                 session_ref,
+                session_path,
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let source_for_path = source.clone();
+                    let agent_for_path = agent_label.clone();
+                    let session_ref_for_path = session_ref.clone();
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    );
+                    if mutation.is_some() {
+                        if let Some(session_ref) = session_ref_for_path.as_ref() {
+                            terminal.set_reported_agent_session_path(
+                                &source_for_path,
+                                &agent_for_path,
+                                session_ref,
+                                session_path,
+                            );
+                        }
+                    }
+                    mutation
                 })
                 .into_iter()
                 .collect(),
@@ -2985,6 +3000,11 @@ impl AppState {
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
             AppEvent::UsageRefreshed { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            // The server-owned App wrapper intercepts transfer worker results
+            // before delegating ordinary state events to this pure state layer.
+            AppEvent::AgentSessionTransferPrepared { .. }
+            | AppEvent::AgentSessionTransferCutoverVerified { .. }
+            | AppEvent::AgentSessionTransferRuntimeVerified { .. } => Vec::new(),
         }
     }
 

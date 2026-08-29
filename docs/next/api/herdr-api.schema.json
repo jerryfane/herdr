@@ -1745,6 +1745,13 @@
           ],
           "type": "object"
         },
+        "AgentSessionTransferHarness": {
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "type": "string"
+        },
         "AgentStartParams": {
           "properties": {
             "account": {
@@ -1804,6 +1811,39 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "AgentTransferSessionParams": {
+          "properties": {
+            "account": {
+              "description": "Optional target credential/config-home account. Absent selects the\ntarget harness default; it never reuses an account from another kind.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "confirm": {
+              "description": "Replace the source runtime only after the staged transcript has been\nreviewed through `agent.session_transfer` on the returned agent.",
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            },
+            "to": {
+              "$ref": "#/schemas/request/$defs/AgentSessionTransferHarness"
+            },
+            "transfer_id": {
+              "description": "The id returned by the prepare call. Required when `confirm` is true.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "target",
+            "to"
           ],
           "type": "object"
         },
@@ -6170,6 +6210,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.transfer_session",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTransferSessionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "accounts.list",
               "type": "string"
             },
@@ -8053,6 +8109,17 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "session_transfer": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionTransferInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present while an agent session is being moved between Claude Code and\nCodex, and retained with the final completed/rolled-back outcome until a\nlater transfer replaces it."
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",
@@ -8252,6 +8319,130 @@
           "enum": [
             "id",
             "path"
+          ],
+          "type": "string"
+        },
+        "AgentSessionTransferHarness": {
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "type": "string"
+        },
+        "AgentSessionTransferInfo": {
+          "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "message_count": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "omissions": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionTransferOmissions",
+              "default": {
+                "attachment_records": 0,
+                "metadata_records": 0,
+                "reasoning_records": 0,
+                "sidechain_records": 0,
+                "system_records": 0,
+                "tool_records": 0,
+                "unsupported_blocks": 0
+              }
+            },
+            "phase": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionTransferPhase"
+            },
+            "source": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionTransferHarness"
+            },
+            "target": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionTransferHarness"
+            },
+            "target_account": {
+              "description": "The selected target account id, or `None` for the target harness default.\nSurfacing this lets a client safely reopen a prepared confirmation without\nguessing which account must be echoed back.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "source",
+            "target",
+            "phase"
+          ],
+          "type": "object"
+        },
+        "AgentSessionTransferOmissions": {
+          "properties": {
+            "attachment_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "metadata_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reasoning_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sidechain_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "system_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unsupported_blocks": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "tool_records",
+            "reasoning_records",
+            "system_records",
+            "attachment_records",
+            "metadata_records",
+            "unsupported_blocks",
+            "sidechain_records"
+          ],
+          "type": "object"
+        },
+        "AgentSessionTransferPhase": {
+          "enum": [
+            "preparing",
+            "ready",
+            "verifying_cutover",
+            "launching_target",
+            "awaiting_target",
+            "completed",
+            "rolling_back",
+            "rolled_back",
+            "failed"
           ],
           "type": "string"
         },
@@ -12552,6 +12743,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_session_transfer": {
+              "default": false,
+              "description": "The server can transactionally transfer visible session history between\nClaude Code and Codex in the same logical pane.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

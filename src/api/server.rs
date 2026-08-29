@@ -186,6 +186,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         pane_input_stream: true,
+        agent_session_transfer: true,
     })
 }
 
@@ -1233,6 +1234,10 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
         Method::AgentRestart(params) => Some(&mut params.target),
+        // Session transfer is deliberately local-only. It reads account-home
+        // transcripts and changes harness identity, so an alias-shaped target
+        // must not silently gain federation filesystem authority.
+        Method::AgentTransferSession(_) => None,
         Method::PaneRead(params) => Some(&mut params.pane_id),
         Method::PaneTurns(params) => Some(&mut params.pane_id),
         Method::PaneSendText(params) => Some(&mut params.pane_id),
@@ -1655,6 +1660,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::AgentRestart(_) => "agent.restart",
+        Method::AgentTransferSession(_) => "agent.transfer_session",
         Method::AccountsList(_) => "accounts.list",
         Method::AccountsCreate(_) => "accounts.create",
         Method::AccountsRemove(_) => "accounts.remove",
@@ -2340,6 +2346,7 @@ mod tests {
                 live_handoff: true,
                 detached_server_daemon: true,
                 pane_input_stream: false,
+                agent_session_transfer: true,
             }),
             None,
             None,
@@ -3202,6 +3209,7 @@ mod federation_tests {
             ("agent.focus", AllowedAt(Admin)),
             ("agent.start", Denied),
             ("agent.restart", AllowedAt(Admin)),
+            ("agent.transfer_session", Denied),
             ("accounts.list", AllowedAt(Observe)),
             ("accounts.create", Denied),
             ("accounts.remove", Denied),

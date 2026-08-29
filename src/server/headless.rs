@@ -5033,6 +5033,7 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        changed |= self.app.expire_session_transfer_deadlines(now);
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;

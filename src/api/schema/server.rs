@@ -23,4 +23,8 @@ pub struct ServerCapabilities {
     /// fall back to per-call `pane.send_text` / `pane.send_input`.
     #[serde(default)]
     pub pane_input_stream: bool,
+    /// The server can transactionally transfer visible session history between
+    /// Claude Code and Codex in the same logical pane.
+    #[serde(default)]
+    pub agent_session_transfer: bool,
 }

@@ -388,6 +388,7 @@ impl App {
         changed |= self.expire_due_metadata(now);
         changed |= self.expire_pty_leases_and_apply_shrinks(now);
         changed |= self.handle_tab_bar_status_tasks(now);
+        changed |= self.expire_session_transfer_deadlines(now);
 
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;

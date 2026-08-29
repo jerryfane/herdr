@@ -2,9 +2,10 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentArchiveParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
-    AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    AgentUnarchiveParams, AgentWaitParams, EmptyParams, Method, PaneProcessInfoParams, PaneTarget,
-    ReadFormat, ReadSource, Request,
+    AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentSessionTransferHarness,
+    AgentStartParams, AgentTarget, AgentTransferSessionParams, AgentUnarchiveParams,
+    AgentWaitParams, EmptyParams, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -30,6 +31,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "restart" => agent_restart(&args[1..]),
+        "transfer-session" => agent_transfer_session(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -530,6 +532,237 @@ fn agent_restart(args: &[String]) -> std::io::Result<i32> {
             account,
         }),
     })?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AgentTransferCliArgs {
+    target: String,
+    to: AgentSessionTransferHarness,
+    account: Option<String>,
+    confirm: Option<String>,
+    yes: bool,
+}
+
+fn parse_agent_transfer_args(args: &[String]) -> Result<AgentTransferCliArgs, i32> {
+    const USAGE: &str = "usage: herdr agent transfer-session <target> --to claude|codex [--account <id>] [--yes | --confirm <transfer-id>]";
+    let Some(target) = args.first() else {
+        eprintln!("{USAGE}");
+        return Err(2);
+    };
+    let mut to = None;
+    let mut account = None;
+    let mut confirm = None;
+    let mut yes = false;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--to" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                to = match value.as_str() {
+                    "claude" => Some(AgentSessionTransferHarness::Claude),
+                    "codex" => Some(AgentSessionTransferHarness::Codex),
+                    _ => {
+                        eprintln!("{USAGE}");
+                        return Err(2);
+                    }
+                };
+            }
+            "--account" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                account = Some(value.clone());
+            }
+            "--confirm" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                confirm = Some(value.clone());
+            }
+            "--yes" => yes = true,
+            "help" | "--help" | "-h" => {
+                eprintln!("{USAGE}");
+                return Err(0);
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Err(2);
+            }
+        }
+    }
+    let Some(to) = to else {
+        eprintln!("{USAGE}");
+        return Err(2);
+    };
+    if confirm.is_some() && yes {
+        eprintln!("{USAGE}");
+        return Err(2);
+    }
+    Ok(AgentTransferCliArgs {
+        target: target.clone(),
+        to,
+        account,
+        confirm,
+        yes,
+    })
+}
+
+fn agent_transfer_session(args: &[String]) -> std::io::Result<i32> {
+    let parsed = match parse_agent_transfer_args(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+    if let Some(transfer_id) = parsed.confirm {
+        let response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:confirm".into(),
+            method: Method::AgentTransferSession(AgentTransferSessionParams {
+                target: parsed.target.clone(),
+                to: parsed.to,
+                account: parsed.account,
+                transfer_id: Some(transfer_id),
+                confirm: true,
+            }),
+        })?;
+        return wait_for_session_transfer_outcome(&parsed.target, response);
+    }
+
+    let mut response = super::send_request(&Request {
+        id: "cli:agent:transfer-session:prepare".into(),
+        method: Method::AgentTransferSession(AgentTransferSessionParams {
+            target: parsed.target.clone(),
+            to: parsed.to,
+            account: parsed.account.clone(),
+            transfer_id: None,
+            confirm: false,
+        }),
+    })?;
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let poll_target = session_transfer_poll_target(&response, &parsed.target);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let transfer = response
+            .pointer("/result/agent/session_transfer")
+            .and_then(serde_json::Value::as_object);
+        let phase = transfer
+            .and_then(|transfer| transfer.get("phase"))
+            .and_then(serde_json::Value::as_str);
+        match phase {
+            Some("ready") => {
+                let message_count = transfer
+                    .and_then(|transfer| transfer.get("message_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let transfer_id = transfer
+                    .and_then(|transfer| transfer.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                if !parsed.yes {
+                    eprintln!(
+                        "staged {message_count} visible messages; source is still running. Re-run with --confirm <transfer-id> to cut over"
+                    );
+                    return super::print_response(&response);
+                }
+                let Some(transfer_id) = transfer_id else {
+                    eprintln!("session transfer became ready without a transfer id");
+                    return Ok(1);
+                };
+                let response = super::send_request(&Request {
+                    id: "cli:agent:transfer-session:confirm".into(),
+                    method: Method::AgentTransferSession(AgentTransferSessionParams {
+                        target: parsed.target.clone(),
+                        to: parsed.to,
+                        account: parsed.account,
+                        transfer_id: Some(transfer_id),
+                        confirm: true,
+                    }),
+                })?;
+                return wait_for_session_transfer_outcome(&poll_target, response);
+            }
+            Some("failed" | "rolled_back") => {
+                println!("{response}");
+                return Ok(1);
+            }
+            Some("completed") => return super::print_response(&response),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            eprintln!("timed out waiting for the staged session transfer");
+            println!("{response}");
+            return Ok(1);
+        }
+        std::thread::sleep(AGENT_START_POLL_INTERVAL);
+        response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:poll".into(),
+            method: Method::AgentGet(AgentTarget {
+                target: poll_target.clone(),
+            }),
+        })?;
+        if response.get("error").is_some() && !session_transfer_poll_may_retry(&response) {
+            return super::print_response(&response);
+        }
+    }
+}
+
+fn session_transfer_poll_target(response: &serde_json::Value, fallback: &str) -> String {
+    response
+        .pointer("/result/agent/pane_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn wait_for_session_transfer_outcome(
+    target: &str,
+    mut response: serde_json::Value,
+) -> std::io::Result<i32> {
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let target = session_transfer_poll_target(&response, target);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let phase = response
+            .pointer("/result/agent/session_transfer/phase")
+            .and_then(serde_json::Value::as_str);
+        match phase {
+            Some("completed") => return super::print_response(&response),
+            Some("failed" | "rolled_back") => {
+                println!("{response}");
+                return Ok(1);
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            eprintln!("timed out waiting for the target harness to verify its session");
+            println!("{response}");
+            return Ok(1);
+        }
+        std::thread::sleep(AGENT_START_POLL_INTERVAL);
+        response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:cutover-poll".into(),
+            method: Method::AgentGet(AgentTarget {
+                target: target.clone(),
+            }),
+        })?;
+        if response.get("error").is_some() && !session_transfer_poll_may_retry(&response) {
+            return super::print_response(&response);
+        }
+    }
+}
+
+fn session_transfer_poll_may_retry(response: &serde_json::Value) -> bool {
+    response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_not_found")
 }
 
 fn agent_attach(args: &[String]) -> std::io::Result<i32> {
@@ -1081,6 +1314,7 @@ fn print_agent_help() {
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent restart <target>");
+    eprintln!("  herdr agent transfer-session <target> --to claude|codex [--account ID] [--yes | --confirm ID]");
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
@@ -1115,5 +1349,84 @@ mod tests {
             parse_agent_list_args(&["--json".to_string(), "--bogus".to_string()]),
             Err(2)
         );
+    }
+
+    #[test]
+    fn transfer_session_args_keep_prepare_and_confirm_explicit() {
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "codex".into(),
+                "--account".into(),
+                "codex-work".into(),
+            ]),
+            Ok(AgentTransferCliArgs {
+                target: "jarvis".into(),
+                to: AgentSessionTransferHarness::Codex,
+                account: Some("codex-work".into()),
+                confirm: None,
+                yes: false,
+            })
+        );
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "claude".into(),
+                "--confirm".into(),
+                "transfer-1".into(),
+            ]),
+            Ok(AgentTransferCliArgs {
+                target: "jarvis".into(),
+                to: AgentSessionTransferHarness::Claude,
+                account: None,
+                confirm: Some("transfer-1".into()),
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn transfer_session_args_reject_implicit_or_double_confirmation() {
+        assert_eq!(
+            parse_agent_transfer_args(&["jarvis".into(), "--to".into(), "other".into()]),
+            Err(2)
+        );
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "codex".into(),
+                "--yes".into(),
+                "--confirm".into(),
+                "transfer-1".into(),
+            ]),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn transfer_session_polling_prefers_the_stable_pane_id() {
+        let response = serde_json::json!({
+            "result": {
+                "agent": {
+                    "pane_id": "w2:p7",
+                    "name": "jarvis"
+                }
+            }
+        });
+
+        assert_eq!(session_transfer_poll_target(&response, "jarvis"), "w2:p7");
+        assert_eq!(
+            session_transfer_poll_target(&serde_json::json!({}), "jarvis"),
+            "jarvis"
+        );
+        assert!(session_transfer_poll_may_retry(&serde_json::json!({
+            "error": { "code": "agent_not_found" }
+        })));
+        assert!(!session_transfer_poll_may_retry(&serde_json::json!({
+            "error": { "code": "agent_blocked" }
+        })));
     }
 }

@@ -12,6 +12,7 @@ mod panes;
 pub(crate) mod plugins;
 mod responses;
 mod session;
+mod session_transfer;
 mod tabs;
 pub(crate) mod usage_fetch;
 mod workspaces;
@@ -77,6 +78,93 @@ impl App {
                 // Live usage is surfaced only through the `accounts.list` API,
                 // never the TUI, so it never dirties a render.
                 false
+            }
+            AppEvent::AgentSessionTransferPrepared {
+                terminal_id,
+                transfer_id,
+                result,
+            } => self.handle_agent_session_transfer_prepared(terminal_id, transfer_id, *result),
+            AppEvent::AgentSessionTransferCutoverVerified {
+                terminal_id,
+                transfer_id,
+                result,
+            } => self.handle_agent_session_transfer_cutover_verified(
+                terminal_id,
+                transfer_id,
+                result,
+            ),
+            AppEvent::AgentSessionTransferRuntimeVerified {
+                terminal_id,
+                transfer_id,
+                kind,
+                process_pid,
+                result,
+            } => self.handle_agent_session_transfer_runtime_verified(
+                terminal_id,
+                transfer_id,
+                kind,
+                process_pid,
+                result,
+            ),
+            ev @ AppEvent::AgentProcessDetected { pane_id, agent, .. } => {
+                self.handle_internal_event(ev);
+                self.reconcile_codex_session_transfer_process(pane_id, agent);
+                true
+            }
+            ev @ AppEvent::StateChanged {
+                pane_id,
+                process_exited: true,
+                ..
+            } => {
+                self.handle_internal_event(ev);
+                self.session_transfer_process_exited(pane_id);
+                true
+            }
+            ev @ AppEvent::AgentSessionReported { .. } => {
+                let report = if let AppEvent::AgentSessionReported {
+                    pane_id,
+                    source,
+                    agent_label,
+                    session_ref,
+                    ..
+                } = &ev
+                {
+                    Some((
+                        *pane_id,
+                        source.clone(),
+                        agent_label.clone(),
+                        session_ref.clone(),
+                    ))
+                } else {
+                    None
+                };
+                let accepted_generation_before = report.as_ref().and_then(|(pane_id, ..)| {
+                    let (_, pane) = self.find_pane(*pane_id)?;
+                    self.state
+                        .terminals
+                        .get(&pane.attached_terminal_id)
+                        .map(|terminal| terminal.accepted_session_report_generation())
+                });
+                self.handle_internal_event(ev);
+                if let Some((pane_id, source, agent_label, session_ref)) = report {
+                    let accepted = accepted_generation_before.is_some_and(|before| {
+                        self.find_pane(pane_id)
+                            .and_then(|(_, pane)| {
+                                self.state.terminals.get(&pane.attached_terminal_id)
+                            })
+                            .is_some_and(|terminal| {
+                                terminal.accepted_session_report_generation() != before
+                            })
+                    });
+                    self.reconcile_agent_session_transfer_report(
+                        pane_id,
+                        &source,
+                        &agent_label,
+                        session_ref.as_ref(),
+                        accepted,
+                    );
+                }
+                true
             }
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
@@ -270,6 +358,10 @@ impl App {
                 self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
                 self.emit_live_activity_updates();
             }
+            // A replacement that exits before reporting the exact staged
+            // session is a transfer failure, not an ordinary pane exit. Arm the
+            // source rollback before choosing the respawn action below.
+            self.session_transfer_process_exited(*pane_id);
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell {
                 // A per-agent `agent.restart` arms a pending resume plan before
                 // killing the process; the single PaneDied it triggers relaunches
@@ -693,7 +785,7 @@ impl App {
     /// started. The old runtime was already removed by `agent.restart`'s
     /// `shutdown_terminal_runtime`, so the launcher (which requires no live
     /// runtime) proceeds.
-    fn resume_pending_agent_for_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+    pub(super) fn resume_pending_agent_for_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
         let Some((_, pane)) = self.find_pane(pane_id) else {
             return false;
         };
@@ -1407,6 +1499,9 @@ impl App {
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
+            Method::AgentTransferSession(params) => {
+                return self.handle_agent_transfer_session(request.id, params)
+            }
             Method::AccountsList(_) => return self.handle_accounts_list(request.id),
             Method::AccountsCreate(params) => {
                 return self.handle_accounts_create(request.id, params)
