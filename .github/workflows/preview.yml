@@ -50,10 +50,12 @@ jobs:
       - name: Select preview commit
         id: plan
         shell: bash
+        env:
+          REQUESTED_COMMIT: ${{ github.event.inputs.commit || '' }}
         run: |
           set -euo pipefail
           git fetch origin master --tags
-          requested="${{ github.event.inputs.commit || '' }}"
+          requested="$REQUESTED_COMMIT"
           if [ -n "$requested" ]; then
             commit="$(git rev-parse "$requested^{commit}")"
             if ! git merge-base --is-ancestor "$commit" origin/master; then
