@@ -51,11 +51,14 @@ impl Default for UpdateConfig {
 }
 
 fn default_update_channel() -> UpdateChannelConfig {
-    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+    default_update_channel_for_build(crate::build_info::is_preview())
 }
 
-fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
-    if is_windows && is_preview {
+fn default_update_channel_for_build(is_preview: bool) -> UpdateChannelConfig {
+    // A direct preview binary must keep following the preview manifest on every
+    // platform. Defaulting a macOS/Linux preview install back to stable can
+    // replace the herdrup-compatible fork with an upstream stable binary.
+    if is_preview {
         UpdateChannelConfig::Preview
     } else {
         UpdateChannelConfig::Stable
@@ -1721,19 +1724,14 @@ sandbox = true
         assert!(config.push.sandbox);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn update_channel_default_follows_windows_build_identity() {
+    fn update_channel_default_follows_build_identity_on_every_platform() {
         assert_eq!(
-            default_update_channel_for_build(true, true),
+            default_update_channel_for_build(true),
             UpdateChannelConfig::Preview
         );
         assert_eq!(
-            default_update_channel_for_build(true, false),
-            UpdateChannelConfig::Stable
-        );
-        assert_eq!(
-            default_update_channel_for_build(false, true),
+            default_update_channel_for_build(false),
             UpdateChannelConfig::Stable
         );
     }
