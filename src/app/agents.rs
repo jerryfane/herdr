@@ -1040,6 +1040,10 @@ impl App {
             account,
             account_config_dir,
             account_unresolved,
+            session_transfer: terminal
+                .session_transfer
+                .as_ref()
+                .map(|transfer| transfer.info()),
         })
     }
 
@@ -1329,6 +1333,7 @@ fn archived_agent_info(
         account: None,
         account_config_dir: None,
         account_unresolved: false,
+        session_transfer: None,
     }
 }
 

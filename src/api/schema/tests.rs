@@ -1047,6 +1047,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 pane_input_stream: false,
+                agent_session_transfer: true,
             }),
         },
     };

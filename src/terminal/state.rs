@@ -38,6 +38,14 @@ pub(crate) struct TurnRecord {
     pub agent_session_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportedAgentSessionPath {
+    source: String,
+    agent: String,
+    session_id: String,
+    path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub(crate) enum TurnCounterResetPath {
@@ -238,6 +246,7 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    pub(crate) reported_agent_session_path: Option<ReportedAgentSessionPath>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -245,6 +254,7 @@ pub struct TerminalState {
     managed_agent: Option<ManagedAgent>,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
     hook_report_sequences: HashMap<String, u64>,
+    accepted_session_report_generation: u64,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
     metadata_report_sequences: HashMap<String, u64>,
@@ -314,6 +324,9 @@ pub struct TerminalState {
     /// Not persisted: re-derived on the next restore attempt, and cleared when the
     /// accounts registry reloads so a re-added account is picked straight up.
     pub account_resume_blocked: Option<String>,
+    /// Server-owned Claude Code <-> Codex session-transfer transaction. Kept
+    /// separate from presentation state; the API projects it into `AgentInfo`.
+    pub(crate) session_transfer: Option<crate::session_transfer::RuntimeSessionTransfer>,
 }
 
 impl TerminalState {
@@ -329,6 +342,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            reported_agent_session_path: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -336,6 +350,7 @@ impl TerminalState {
             managed_agent: None,
             managed_agent_launch_session: None,
             hook_report_sequences: HashMap::new(),
+            accepted_session_report_generation: 0,
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
@@ -364,6 +379,7 @@ impl TerminalState {
             pending_launch_env: Vec::new(),
             account_resume_blocked: None,
             agent_account: None,
+            session_transfer: None,
         }
     }
 
@@ -746,7 +762,14 @@ impl TerminalState {
         self.detected_agent = agent;
         if let Some(agent) = agent {
             let agent_label = crate::detect::agent_label(agent);
-            self.reconcile_agent_name_owner(agent_label, None);
+            let transfer_is_changing_owner = process_exited
+                && self
+                    .session_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit());
+            if !transfer_is_changing_owner {
+                self.reconcile_agent_name_owner(agent_label, None);
+            }
         }
         if !process_exited {
             self.clear_full_lifecycle_hook_suppression_for_detected_agent(
@@ -941,10 +964,15 @@ impl TerminalState {
             self.composer_write = None;
         }
         // Release the name only once the agent actually leaves the pane. A
-        // deliberate restart keeps the seat identity but drops its old session
-        // anchor so the resumed session can adopt it.
+        // deliberate restart or in-place transfer keeps the seat identity but
+        // drops its old session anchor so the replacement can adopt it.
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
-            if self.pending_agent_resume_plan.is_some() {
+            if self.pending_agent_resume_plan.is_some()
+                || self
+                    .session_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit())
+            {
                 self.release_agent_name_session_anchor();
             } else {
                 self.clear_agent_name();
@@ -1754,6 +1782,41 @@ impl TerminalState {
     ) {
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
+    pub(crate) fn set_reported_agent_session_path(
+        &mut self,
+        source: &str,
+        agent: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        path: Option<String>,
+    ) {
+        self.reported_agent_session_path = match (session_ref.kind, path) {
+            (crate::agent_resume::AgentSessionRefKind::Id, Some(path)) => {
+                Some(ReportedAgentSessionPath {
+                    source: source.to_string(),
+                    agent: agent.to_string(),
+                    session_id: session_ref.value.clone(),
+                    path,
+                })
+            }
+            _ => None,
+        };
+    }
+
+    pub(crate) fn reported_agent_session_path_for(
+        &self,
+        source: &str,
+        agent: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> Option<&str> {
+        self.reported_agent_session_path
+            .as_ref()
+            .filter(|reported| {
+                session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && reported.source == source
+                    && reported.agent == agent
+                    && reported.session_id == session_ref.value
+            })
+            .map(|reported| reported.path.as_str())
     }
 
     pub fn set_agent_session_ref(
@@ -1882,7 +1945,7 @@ impl TerminalState {
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
                 let current_session = self.current_session_identity_for_persistence();
-                return Some(TerminalStateMutation {
+                let mutation = TerminalStateMutation {
                     effective_state_change: self.recompute_effective_state(
                         previous_agent_label,
                         previous_known_agent,
@@ -1892,7 +1955,10 @@ impl TerminalState {
                     ),
                     session_ref_changed: previous_session != current_session,
                     agent_released: false,
-                });
+                };
+                self.accepted_session_report_generation =
+                    self.accepted_session_report_generation.wrapping_add(1);
+                return Some(mutation);
             }
             return None;
         }
@@ -1986,7 +2052,7 @@ impl TerminalState {
         }
         self.persisted_agent_session = Some(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
-        Some(TerminalStateMutation {
+        let mutation = TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
                 previous_known_agent,
@@ -1996,7 +2062,14 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session != current_session,
             agent_released: false,
-        })
+        };
+        self.accepted_session_report_generation =
+            self.accepted_session_report_generation.wrapping_add(1);
+        Some(mutation)
+    }
+
+    pub(crate) fn accepted_session_report_generation(&self) -> u64 {
+        self.accepted_session_report_generation
     }
 
     fn known_agent_label_conflicts_with_detected_agent(&self, agent_label: &str) -> bool {
@@ -2365,6 +2438,10 @@ impl TerminalState {
         let Some(managed) = self.managed_agent else {
             return false;
         };
+        let transfer_preserves_name = self
+            .session_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit());
         let known_agent = self.effective_known_agent();
         let observed_expected = match managed.phase {
             ManagedAgentPhase::Pending {
@@ -2372,11 +2449,12 @@ impl TerminalState {
             } => observed_expected || known_agent == Some(managed.kind),
             ManagedAgentPhase::Blocked | ManagedAgentPhase::Active => false,
         };
-        let clear = process_exited
-            || known_agent.is_some_and(|agent| agent != managed.kind)
-            || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
-                && observed_expected
-                && known_agent.is_none();
+        let clear = !transfer_preserves_name
+            && (process_exited
+                || known_agent.is_some_and(|agent| agent != managed.kind)
+                || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
+                    && observed_expected
+                    && known_agent.is_none());
         if clear {
             self.clear_agent_name();
             return true;
@@ -2405,7 +2483,7 @@ impl TerminalState {
                 });
                 return true;
             }
-            if now >= deadline {
+            if now >= deadline && !transfer_preserves_name {
                 self.clear_agent_name();
                 return true;
             }
@@ -2523,6 +2601,28 @@ impl TerminalState {
         session_ref: Option<&crate::agent_resume::AgentSessionRef>,
     ) {
         if self.agent_name.is_none() {
+            return;
+        }
+        if self
+            .session_transfer
+            .as_ref()
+            .and_then(crate::session_transfer::RuntimeSessionTransfer::expected_agent_name_owner)
+            == Some(agent_label)
+        {
+            match self.agent_name_owner.as_mut() {
+                Some(owner) => {
+                    owner.agent_label = agent_label.to_string();
+                    if session_ref.is_some() {
+                        owner.session_ref = session_ref.cloned();
+                    }
+                }
+                None => {
+                    self.agent_name_owner = Some(AgentNameOwner {
+                        agent_label: agent_label.to_string(),
+                        session_ref: session_ref.cloned(),
+                    });
+                }
+            }
             return;
         }
         if self.managed_agent.is_some_and(|managed| {
@@ -6302,6 +6402,92 @@ mod tests {
             terminal.agent_name.as_deref(),
             Some("keephair"),
             "the name must transfer to the resumed session"
+        );
+    }
+
+    /// A session-transfer resume plan is consumed before the replacement process starts.
+    /// The source PaneDied event may arrive in that interval, so the active transaction—not
+    /// only the one-shot plan—must keep ownership of the durable pane name.
+    #[test]
+    fn an_active_session_transfer_keeps_the_name_after_its_plan_is_consumed() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Claude,
+            "herdr:claude",
+            "claude",
+            crate::agent_resume::AgentSessionRef::id("source-session").unwrap(),
+        );
+        let managed_at = Instant::now();
+        terminal.begin_managed_agent(
+            "jarvis".into(),
+            Agent::Codex,
+            managed_at,
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.pending_agent_resume_plan = None;
+        terminal.session_transfer = Some(crate::session_transfer::RuntimeSessionTransfer {
+            id: "transfer-1".into(),
+            source_kind: crate::session_transfer::HarnessKind::Claude,
+            source_session: crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("source-session").unwrap(),
+            },
+            source_account: Some("claude-source".into()),
+            source_config_home: PathBuf::from("/tmp/claude-source"),
+            target_kind: crate::session_transfer::HarnessKind::Codex,
+            target_account: Some("codex-target".into()),
+            target_config_home: PathBuf::from("/tmp/codex-target"),
+            phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
+            message_count: 2,
+            omissions: Default::default(),
+            error: None,
+            source_path: None,
+            source_fingerprint: None,
+            target_session_id: Some("target-session".into()),
+            target_transcript_path: None,
+            target_fingerprint: None,
+            target_deadline: None,
+            target_process: None,
+            source_rollback_process: None,
+            verification_in_flight: None,
+            verification_observation_deadline: None,
+            awaiting_deferred_target_report: false,
+        });
+
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(terminal.agent_name.as_deref(), Some("jarvis"));
+        assert!(
+            terminal
+                .agent_name_owner
+                .as_ref()
+                .is_some_and(|owner| owner.session_ref.is_none()),
+            "the target session must be able to adopt the preserved name"
+        );
+
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert_eq!(terminal.agent_name.as_deref(), Some("jarvis"));
+        assert!(terminal
+            .agent_name_owner
+            .as_ref()
+            .is_some_and(|owner| { owner.agent_label == "codex" && owner.session_ref.is_none() }));
+
+        terminal.set_detected_state(None, AgentState::Unknown);
+        terminal.reconcile_managed_agent_at(managed_at + Duration::from_secs(31), false);
+        assert_eq!(
+            terminal.agent_name.as_deref(),
+            Some("jarvis"),
+            "a vanished target must leave the name available for rollback even after the managed-agent deadline"
         );
     }
 

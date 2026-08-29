@@ -1041,6 +1041,7 @@ mod tests {
             last_known_status: None,
             archived: None,
             parked_work: Vec::new(),
+            session_transfer: None,
         }
     }
 

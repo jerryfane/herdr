@@ -2928,6 +2928,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     pane_input_stream: false,
+                    agent_session_transfer: false,
                 }),
             },
         };

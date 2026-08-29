@@ -41,6 +41,7 @@ impl App {
     }
 
 
+
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
