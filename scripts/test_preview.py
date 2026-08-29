@@ -81,10 +81,58 @@ class PreviewNotesTests(unittest.TestCase):
                 )
 
     def test_hidden_subjects_include_preview_manifest_commits(self):
+        self.assertTrue(preview.hidden_subject("docs: publish preview 2026-08-29-deadbeef"))
         self.assertTrue(preview.hidden_subject("docs: update preview manifest"))
         self.assertTrue(preview.hidden_subject("docs: update website manifest"))
         self.assertFalse(preview.hidden_subject("release: v0.7.0"))
         self.assertFalse(preview.hidden_subject("fix: repair preview manifest"))
+
+    def test_publication_branch_is_bound_to_full_commit(self):
+        commit = "abcdef1234567890abcdef1234567890abcdef12"
+        self.assertEqual(
+            preview.publication_branch(commit),
+            "automation/preview-abcdef123456",
+        )
+        with self.assertRaisesRegex(ValueError, "40-character SHA"):
+            preview.publication_branch("abcdef123456")
+
+    def test_publication_paths_allow_only_generated_preview_files(self):
+        preview.validate_publication_paths(
+            [
+                "docs/preview/website/astro.config.mjs\n",
+                "docs/preview/website/src/content/docs/index.mdx\n",
+                "website/preview.json\n",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "must update website/preview.json"):
+            preview.validate_publication_paths(["docs/preview/website/astro.config.mjs"])
+        with self.assertRaisesRegex(ValueError, "unexpected path"):
+            preview.validate_publication_paths(
+                ["website/preview.json", ".github/workflows/preview.yml"]
+            )
+
+    def test_publication_files_reject_renamed_source_outside_allowlist(self):
+        with self.assertRaisesRegex(ValueError, "unexpected path"):
+            preview.validate_publication_files(
+                [
+                    [
+                        {
+                            "filename": "docs/preview/website/workflow.yml",
+                            "previous_filename": ".github/workflows/preview.yml",
+                            "status": "renamed",
+                        },
+                        {"filename": "website/preview.json", "status": "modified"},
+                    ]
+                ]
+            )
+
+    def test_publication_files_accept_generated_paths_across_pages(self):
+        preview.validate_publication_files(
+            [
+                [{"filename": "docs/preview/website/astro.config.mjs"}],
+                [{"filename": "website/preview.json"}],
+            ]
+        )
 
     def test_latest_publishable_commit_keeps_release_commits(self):
         output = "\n".join(

@@ -5,6 +5,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ EXPECTED_ASSET_NAMES = {
     "windows-x86_64": "herdr-windows-x86_64.zip",
 }
 HIDDEN_SUBJECTS = (
+    "docs: publish preview",
     "docs: update website manifest",
     "docs: update preview manifest",
     "chore: approve contributor",
@@ -37,6 +39,7 @@ TYPE_HEADINGS = {
 }
 TYPE_ORDER = ("Added", "Fixed", "Performance", "Maintenance", "Other")
 COMMIT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+(?P<body>.+)$")
+PUBLICATION_BRANCH_PREFIX = "automation/preview-"
 
 
 def run_git(args: list[str]) -> str:
@@ -115,6 +118,51 @@ def preview_range_base(previous: str, commit: str) -> str:
     if git_is_ancestor(previous, stable) and git_is_ancestor(stable, commit):
         return stable
     return previous
+
+
+def publication_branch(commit: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("preview publication commit must be a lowercase 40-character SHA")
+    return f"{PUBLICATION_BRANCH_PREFIX}{commit[:12]}"
+
+
+def validate_publication_paths(paths: list[str]) -> None:
+    normalized = {path.strip() for path in paths if path.strip()}
+    if "website/preview.json" not in normalized:
+        raise ValueError("preview publication must update website/preview.json")
+    invalid = sorted(
+        path
+        for path in normalized
+        if path != "website/preview.json" and not path.startswith("docs/preview/")
+    )
+    if invalid:
+        raise ValueError(
+            "preview publication contains unexpected path(s): " + ", ".join(invalid)
+        )
+
+
+def validate_publication_files(pages: object) -> None:
+    if not isinstance(pages, list):
+        raise ValueError("preview publication file response must be a list of pages")
+    paths = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise ValueError("preview publication file page must be a list")
+        for file in page:
+            if not isinstance(file, dict):
+                raise ValueError("preview publication file entry must be an object")
+            filename = file.get("filename")
+            if not isinstance(filename, str) or not filename:
+                raise ValueError("preview publication file entry must have a filename")
+            paths.append(filename)
+            previous_filename = file.get("previous_filename")
+            if previous_filename is not None:
+                if not isinstance(previous_filename, str) or not previous_filename:
+                    raise ValueError(
+                        "preview publication previous filename must be a non-empty string"
+                    )
+                paths.append(previous_filename)
+    validate_publication_paths(paths)
 
 
 def humanize_subject(subject: str) -> tuple[str, str]:
@@ -289,6 +337,27 @@ def cmd_range_base(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_publication_branch(args: argparse.Namespace) -> int:
+    print(publication_branch(args.commit))
+    return 0
+
+
+def cmd_validate_publication_paths(_args: argparse.Namespace) -> int:
+    try:
+        validate_publication_paths(sys.stdin.readlines())
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return 0
+
+
+def cmd_validate_publication_files(_args: argparse.Namespace) -> int:
+    try:
+        validate_publication_files(json.load(sys.stdin))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Preview channel release helpers")
     sub = parser.add_subparsers(required=True)
@@ -329,6 +398,16 @@ def main() -> int:
     range_base.add_argument("--previous", required=True)
     range_base.add_argument("--commit", required=True)
     range_base.set_defaults(func=cmd_range_base)
+
+    publication = sub.add_parser("publication-branch")
+    publication.add_argument("--commit", required=True)
+    publication.set_defaults(func=cmd_publication_branch)
+
+    publication_paths = sub.add_parser("validate-publication-paths")
+    publication_paths.set_defaults(func=cmd_validate_publication_paths)
+
+    publication_files = sub.add_parser("validate-publication-files")
+    publication_files.set_defaults(func=cmd_validate_publication_files)
 
     args = parser.parse_args()
     return args.func(args)

@@ -7,6 +7,12 @@ on:
         description: Optional master commit SHA to publish
         required: false
         type: string
+  pull_request:
+    branches: [master]
+    types: [closed]
+    paths:
+      - docs/preview/**
+      - website/preview.json
 
 permissions:
   contents: read
@@ -21,6 +27,7 @@ concurrency:
 
 jobs:
   preflight:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,10 +50,12 @@ jobs:
       - name: Select preview commit
         id: plan
         shell: bash
+        env:
+          REQUESTED_COMMIT: ${{ github.event.inputs.commit || '' }}
         run: |
           set -euo pipefail
           git fetch origin master --tags
-          requested="${{ github.event.inputs.commit || '' }}"
+          requested="$REQUESTED_COMMIT"
           if [ -n "$requested" ]; then
             commit="$(git rev-parse "$requested^{commit}")"
             if ! git merge-base --is-ancestor "$commit" origin/master; then
@@ -291,7 +300,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
-      issues: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -388,6 +397,119 @@ jobs:
           echo "already_published=true" >> "$GITHUB_OUTPUT"
           echo "$PREVIEW_TAG is already published with the expected assets; continuing the interrupted run."
 
+      - name: Update preview documentation and manifest
+        run: |
+          node website/scripts/docs-preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
+          python3 scripts/preview.py manifest \
+            --output website/preview.json \
+            --tag '${{ needs.preflight.outputs.tag }}' \
+            --build-id '${{ needs.preflight.outputs.build_id }}' \
+            --commit '${{ needs.preflight.outputs.commit }}' \
+            --built-at '${{ needs.preflight.outputs.built_at }}' \
+            --base-version '${{ needs.preflight.outputs.base_version }}' \
+            --protocol '${{ needs.preflight.outputs.protocol }}' \
+            --notes PREVIEW_NOTES.md \
+            --sha-file preview-sha256.json \
+            --retain 30
+          (cd website && bun install --frozen-lockfile)
+
+      - name: Prepare preview publication pull request
+        id: publication-pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_COMMIT: ${{ needs.preflight.outputs.commit }}
+          PREVIEW_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          publication_branch="$(python3 scripts/preview.py publication-branch --commit "$PREVIEW_COMMIT")"
+          pr_number="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base master \
+            --head "$publication_branch" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ] && [ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != "true" ]; then
+            gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY" --undo
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A docs/preview website/preview.json
+          if git diff --cached --quiet; then
+            echo "error: preview preflight requested publication but generated no changes" >&2
+            exit 1
+          fi
+          git commit -m "docs: publish preview ${PREVIEW_BUILD_ID}"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          pushed=false
+          for attempt in 1 2 3; do
+            git pull --rebase "$remote" master
+            node website/scripts/docs-preview.mjs check
+            node website/scripts/docs-versions.mjs check
+            (cd website && bun run build)
+            remote_head="$(git ls-remote "$remote" "refs/heads/${publication_branch}" | awk 'NR == 1 {print $1}')"
+            if [ -n "$remote_head" ]; then
+              if git push \
+                --force-with-lease="refs/heads/${publication_branch}:${remote_head}" \
+                "$remote" \
+                "HEAD:refs/heads/${publication_branch}"; then
+                pushed=true
+                break
+              fi
+            elif git push "$remote" "HEAD:refs/heads/${publication_branch}"; then
+              pushed=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "preview publication branch changed; retrying ($attempt/3)"
+              sleep $((attempt * 2))
+            fi
+          done
+          if [ "$pushed" != "true" ]; then
+            echo "failed to push preview publication branch after 3 attempts" >&2
+            exit 1
+          fi
+
+          body_file="${RUNNER_TEMP}/preview-publication-pr.md"
+          {
+            echo '<!-- herdr:preview-publication -->'
+            echo
+            echo "Automated preview publication for \`${PREVIEW_COMMIT}\`."
+            echo
+            echo "Build: \`${PREVIEW_BUILD_ID}\`"
+            echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "This PR changes only generated preview documentation and \`website/preview.json\`."
+            echo "Merge it only after this workflow publishes the matching prerelease and marks the PR ready."
+          } > "$body_file"
+
+          if [ -z "$pr_number" ]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base master \
+              --head "$publication_branch" \
+              --draft \
+              --title "docs: publish preview ${PREVIEW_BUILD_ID}" \
+              --body-file "$body_file"
+            pr_number="$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base master \
+              --head "$publication_branch" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty')"
+          fi
+          if [ -z "$pr_number" ]; then
+            echo "error: preview publication PR was not created" >&2
+            exit 1
+          fi
+          pr_url="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          echo "branch=$publication_branch" >> "$GITHUB_OUTPUT"
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "Prepared draft preview publication PR: $pr_url"
+
       - name: Create preview draft
         if: steps.existing-preview.outputs.already_published != 'true'
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
@@ -415,46 +537,107 @@ jobs:
           PREVIEW_TAG: ${{ needs.preflight.outputs.tag }}
         run: gh release edit "$PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
 
-      - name: Update preview documentation and manifest
-        run: |
-          node website/scripts/docs-preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
-          python3 scripts/preview.py manifest \
-            --output website/preview.json \
-            --tag '${{ needs.preflight.outputs.tag }}' \
-            --build-id '${{ needs.preflight.outputs.build_id }}' \
-            --commit '${{ needs.preflight.outputs.commit }}' \
-            --built-at '${{ needs.preflight.outputs.built_at }}' \
-            --base-version '${{ needs.preflight.outputs.base_version }}' \
-            --protocol '${{ needs.preflight.outputs.protocol }}' \
-            --notes PREVIEW_NOTES.md \
-            --sha-file preview-sha256.json \
-            --retain 30
-          (cd website && bun install --frozen-lockfile)
-
-      - name: Commit preview publication
+      - name: Mark publication pull request ready
+        shell: bash
         env:
-          KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_PR: ${{ steps.publication-pr.outputs.number }}
         run: |
-          git config user.name "kangal-bot"
-          git config user.email "285672167+kangal-bot@users.noreply.github.com"
-          git add -A docs/preview website/preview.json
-          git diff --cached --quiet || git commit -m "docs: publish preview documentation"
-          remote="https://x-access-token:${KANGAL_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          for attempt in 1 2 3; do
-            git pull --rebase "$remote" master
-            node website/scripts/docs-preview.mjs check
-            node website/scripts/docs-versions.mjs check
-            (cd website && bun run build)
-            if git push "$remote" HEAD:master; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "master changed during preview publishing; retrying ($attempt/3)"
-              sleep $((attempt * 2))
-            fi
-          done
-          echo "failed to publish preview documentation after 3 attempts" >&2
-          exit 1
+          set -euo pipefail
+          if [ "$(gh pr view "$PUBLICATION_PR" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh pr ready "$PUBLICATION_PR" --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "Preview publication is ready for merge: ${{ steps.publication-pr.outputs.url }}"
+
+  finalize-publication:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'automation/preview-')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docs-publish-master
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify merged preview publication
+        id: publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PUBLICATION_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            | python3 scripts/preview.py validate-publication-files
+
+          preview_commit="$(python3 scripts/preview.py current-commit --manifest website/preview.json)"
+          expected_branch="$(python3 scripts/preview.py publication-branch --commit "$preview_commit")"
+          if [ "$PUBLICATION_BRANCH" != "$expected_branch" ]; then
+            echo "error: merged branch $PUBLICATION_BRANCH does not match $expected_branch" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$preview_commit" "$MERGE_SHA"; then
+            echo "error: preview commit $preview_commit is not reachable from merged master $MERGE_SHA" >&2
+            exit 1
+          fi
+
+          build_id="$(jq -er '.build_id | select(type == "string" and length > 0)' website/preview.json)"
+          tag="$(jq -er --arg build "$build_id" '.builds[$build].tag | select(type == "string" and length > 0)' website/preview.json)"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          if [ "$(jq -r '.draft' <<<"$release")" != "false" ] || [ "$(jq -r '.prerelease' <<<"$release")" != "true" ]; then
+            echo "error: $tag is not a published prerelease" >&2
+            exit 1
+          fi
+          expected_assets="$(jq -S '{
+            "herdr-linux-x86_64": .assets["linux-x86_64"].sha256,
+            "herdr-linux-aarch64": .assets["linux-aarch64"].sha256,
+            "herdr-macos-x86_64": .assets["macos-x86_64"].sha256,
+            "herdr-macos-aarch64": .assets["macos-aarch64"].sha256,
+            "herdr-windows-x86_64.zip": .assets["windows-x86_64"].sha256
+          }' website/preview.json)"
+          actual_assets="$(jq -S '[
+            .assets[] | select(.digest | type == "string") |
+            {key: .name, value: (.digest | sub("^sha256:"; ""))}
+          ] | from_entries' <<<"$release")"
+          if [ "$actual_assets" != "$expected_assets" ]; then
+            echo "error: $tag assets do not match website/preview.json" >&2
+            exit 1
+          fi
+          tag_commit="$(git ls-remote origin "refs/tags/${tag}" | awk 'NR == 1 {print $1}')"
+          if [ "$tag_commit" != "$preview_commit" ]; then
+            echo "error: $tag points at $tag_commit, expected $preview_commit" >&2
+            exit 1
+          fi
+
+          previous="$(git show "${BASE_SHA}:website/preview.json" | jq -r '.commit // empty' || true)"
+          if [ -z "$previous" ]; then
+            previous="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "$preview_commit")"
+          fi
+          range_base="$(python3 scripts/preview.py range-base \
+            --previous "$previous" \
+            --commit "$preview_commit")"
+          echo "commit=$preview_commit" >> "$GITHUB_OUTPUT"
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "range_base=$range_base" >> "$GITHUB_OUTPUT"
+          echo "branch=$PUBLICATION_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Trigger website deploy
         env:
@@ -471,19 +654,17 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PREVIEW_RELEASED_LABEL: preview-released
+          PREVIEW_COMMIT: ${{ steps.publication.outputs.commit }}
+          PREVIEW_TAG: ${{ steps.publication.outputs.tag }}
+          PREVIEW_BUILD_ID: ${{ steps.publication.outputs.build_id }}
+          PREVIOUS_PREVIEW_COMMIT: ${{ steps.publication.outputs.previous }}
+          PREVIEW_RANGE_BASE: ${{ steps.publication.outputs.range_base }}
         run: |
           set -euo pipefail
 
           echo "Using GitHub token for $(gh api user --jq .login)."
-
-          PREVIEW_COMMIT='${{ needs.preflight.outputs.commit }}'
-          PREVIEW_TAG='${{ needs.preflight.outputs.tag }}'
-          PREVIEW_BUILD_ID='${{ needs.preflight.outputs.build_id }}'
-          PREVIOUS_PREVIEW_COMMIT='${{ steps.previous-preview.outputs.commit }}'
-          PREVIEW_RANGE_BASE='${{ steps.previous-preview.outputs.range_base }}'
-
           echo "Previous preview commit: $PREVIOUS_PREVIEW_COMMIT"
           echo "Scanning preview commits in $PREVIEW_RANGE_BASE..$PREVIEW_COMMIT for refs #<issue> mentions."
           mapfile -t ISSUES < <(
@@ -579,3 +760,29 @@ jobs:
             [ -n "$tag" ] || continue
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < old-preview-tags.txt
+
+      - name: Delete publication branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_BRANCH: ${{ steps.publication.outputs.branch }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if ! git push "$remote" --delete "$PUBLICATION_BRANCH"; then
+            lookup_status=0
+            git ls-remote --exit-code --heads "$remote" "refs/heads/${PUBLICATION_BRANCH}" >/dev/null \
+              || lookup_status=$?
+            case "$lookup_status" in
+              0)
+                echo "error: failed to delete publication branch $PUBLICATION_BRANCH" >&2
+                exit 1
+                ;;
+              2)
+                echo "Publication branch $PUBLICATION_BRANCH is already absent."
+                ;;
+              *)
+                echo "error: could not verify deletion of publication branch $PUBLICATION_BRANCH" >&2
+                exit "$lookup_status"
+                ;;
+            esac
+          fi
