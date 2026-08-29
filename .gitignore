@@ -1,4 +1,7 @@
 /target
+# Build output from the staged-deploy path. 1,506 files and a 25 MB binary were
+# committed here by accident in #115 because .gitignore only covered /target.
+/target-staging
 node_modules/
 /vendor/libghostty-vt/zig-pkg/
 __pycache__/
