@@ -20,6 +20,45 @@ pub(crate) use super::unix_common::{
     status_commands_supported, StatusCommandGuard,
 };
 
+/// Name of the interface carrying the preferred IPv4 default route.
+///
+/// `/proc/net/route` is kernel-owned, requires no optional userspace tool, and exposes the
+/// same interface names as `getifaddrs`. Route lookup is best-effort because selecting a LAN
+/// address can still proceed deterministically on machines without a default route.
+pub(crate) fn default_route_interface() -> Option<String> {
+    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+    default_route_interface_from_proc(&routes)
+}
+
+fn default_route_interface_from_proc(routes: &str) -> Option<String> {
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 8
+                || !fields[1].eq_ignore_ascii_case("00000000")
+                || !fields[7].eq_ignore_ascii_case("00000000")
+            {
+                return None;
+            }
+            let flags = u32::from_str_radix(fields[3], 16).ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let metric = fields[6].parse::<u64>().ok()?;
+            Some((metric, fields[0]))
+        })
+        .min_by(
+            |(left_metric, left_interface), (right_metric, right_interface)| {
+                left_metric
+                    .cmp(right_metric)
+                    .then_with(|| left_interface.cmp(right_interface))
+            },
+        )
+        .map(|(_, interface)| interface.to_string())
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -759,6 +798,31 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn default_route_parser_prefers_the_lowest_metric_up_route() {
+        let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+docker0 00000000 010011AC 0001 0 0 100 00000000 0 0 0\n\
+eth0 00000000 0101A8C0 0003 0 0 25 00000000 0 0 0\n\
+eth1 0001A8C0 00000000 0001 0 0 5 00FFFFFF 0 0 0\n";
+
+        assert_eq!(
+            default_route_interface_from_proc(routes).as_deref(),
+            Some("eth0")
+        );
+    }
+
+    #[test]
+    fn default_route_parser_ignores_routes_that_are_not_up() {
+        let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+docker0 00000000 010011AC 0000 0 0 1 00000000 0 0 0\n\
+eth0 00000000 0101A8C0 0003 0 0 25 00000000 0 0 0\n";
+
+        assert_eq!(
+            default_route_interface_from_proc(routes).as_deref(),
+            Some("eth0")
+        );
     }
 
     #[test]

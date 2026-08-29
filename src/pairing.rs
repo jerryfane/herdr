@@ -162,16 +162,18 @@ impl fmt::Display for LanRefusal {
 /// uses: the acceptance rules are the security property, so they must be provable without
 /// a network interface. Everything here is a pure function of its input.
 ///
-/// THE ORDERING RULE, stated because a user scans whichever address this returns: candidates
-/// are sorted by (interface name, address) and the first is taken. Not "best" — there is no
-/// non-arbitrary best on a multi-homed machine — but STABLE, so two runs on an unchanged
-/// machine cannot print different addresses. The caller prints the interface alongside the
-/// address so the choice is visible rather than implied.
+/// THE ORDERING RULE, stated because a user scans whichever address this returns: prefer a
+/// usable address on the interface carrying the default route, then sort by (interface name,
+/// address) as a deterministic fallback. Interface-name ordering alone is not reachability:
+/// it would commonly put `docker0` or `bridge100` ahead of the physical LAN interface and
+/// advertise an address the phone cannot reach. The caller prints the chosen interface too,
+/// so the decision is visible rather than implied.
 pub fn choose_lan_address(
     enumeration: Result<
         Vec<crate::platform::InterfaceAddress>,
         crate::platform::LocalIpv4AddressError,
     >,
+    default_route_interface: Option<&str>,
 ) -> Result<crate::platform::InterfaceAddress, LanRefusal> {
     let candidates = match enumeration {
         Ok(candidates) => candidates,
@@ -204,6 +206,14 @@ pub fn choose_lan_address(
             .cmp(&b.interface)
             .then_with(|| a.address.octets().cmp(&b.address.octets()))
     });
+    if let Some(preferred) = default_route_interface {
+        if let Some(index) = usable
+            .iter()
+            .position(|candidate| candidate.interface == preferred)
+        {
+            return Ok(usable.remove(index));
+        }
+    }
     Ok(usable.remove(0))
 }
 
@@ -1075,7 +1085,10 @@ mod tests {
     #[test]
     fn unsupported_lan_enumeration_names_the_real_cause() {
         assert_eq!(
-            choose_lan_address(Err(crate::platform::LocalIpv4AddressError::Unsupported)),
+            choose_lan_address(
+                Err(crate::platform::LocalIpv4AddressError::Unsupported),
+                None,
+            ),
             Err(LanRefusal::Unsupported)
         );
         assert!(LanRefusal::Unsupported.to_string().contains("enumerate"));
@@ -1083,9 +1096,12 @@ mod tests {
 
     #[test]
     fn failed_lan_enumeration_names_the_system_failure() {
-        let refusal = choose_lan_address(Err(crate::platform::LocalIpv4AddressError::Enumeration(
-            std::io::Error::other("synthetic enumeration failure"),
-        )));
+        let refusal = choose_lan_address(
+            Err(crate::platform::LocalIpv4AddressError::Enumeration(
+                std::io::Error::other("synthetic enumeration failure"),
+            )),
+            None,
+        );
         assert_eq!(
             refusal,
             Err(LanRefusal::EnumerationFailed {
@@ -1097,7 +1113,7 @@ mod tests {
     #[test]
     fn successful_empty_lan_enumeration_means_no_private_address() {
         assert_eq!(
-            choose_lan_address(enumerated(&[])),
+            choose_lan_address(enumerated(&[]), None),
             Err(LanRefusal::NoPrivateAddress { seen: 0 })
         );
     }
@@ -1106,7 +1122,7 @@ mod tests {
     fn enumerated_but_unusable_lan_addresses_report_the_count() {
         let public_only = [ifaddr("eth0", "203.0.113.7"), ifaddr("eth1", "8.8.8.8")];
         assert_eq!(
-            choose_lan_address(enumerated(&public_only)),
+            choose_lan_address(enumerated(&public_only), None),
             Err(LanRefusal::NoPrivateAddress { seen: 2 })
         );
         let message = LanRefusal::NoPrivateAddress { seen: 2 }.to_string();
@@ -1129,45 +1145,70 @@ mod tests {
             ifaddr("eth1", "192.168.1.50"),
         ];
         let chosen =
-            choose_lan_address(enumerated(&mixed)).expect("one private address is present");
+            choose_lan_address(enumerated(&mixed), None).expect("one private address is present");
         assert_eq!(chosen.address, "192.168.1.50".parse::<Ipv4Addr>().unwrap());
 
         // Loopback ALONE is not a fallback -- binding pairing to 127.0.0.1 would advertise
         // an address the phone can never reach.
         assert_eq!(
-            choose_lan_address(enumerated(&[ifaddr("lo", "127.0.0.1")])),
+            choose_lan_address(enumerated(&[ifaddr("lo", "127.0.0.1")]), None),
             Err(LanRefusal::NoPrivateAddress { seen: 1 })
         );
         // All three RFC1918 blocks qualify.
         for addr in ["10.1.2.3", "172.16.5.6", "192.168.9.9"] {
             assert!(
-                choose_lan_address(enumerated(&[ifaddr("eth0", addr)])).is_ok(),
+                choose_lan_address(enumerated(&[ifaddr("eth0", addr)]), None).is_ok(),
                 "{addr}"
             );
         }
         // Carrier-grade NAT is NOT RFC1918 and must not be treated as a LAN.
         assert_eq!(
-            choose_lan_address(enumerated(&[ifaddr("eth0", "100.64.0.1")])),
+            choose_lan_address(enumerated(&[ifaddr("eth0", "100.64.0.1")]), None,),
             Err(LanRefusal::NoPrivateAddress { seen: 1 })
         );
     }
 
-    /// STABLE, NOT "BEST". There is no non-arbitrary best address on a multi-homed machine,
-    /// but two runs on an unchanged machine must not print different addresses -- the user
-    /// scans whichever one this returns.
+    /// When route discovery is unavailable, two runs on an unchanged machine must still not
+    /// print different addresses -- the user scans whichever one this returns.
     #[test]
     fn the_chosen_lan_address_is_deterministic_regardless_of_enumeration_order() {
         let a = ifaddr("docker0", "172.17.0.1");
         let b = ifaddr("eth0", "192.168.1.50");
         let c = ifaddr("eth0", "10.0.0.5");
-        let forward = choose_lan_address(enumerated(&[a.clone(), b.clone(), c.clone()])).unwrap();
-        let reverse = choose_lan_address(enumerated(&[c.clone(), b.clone(), a.clone()])).unwrap();
+        let forward =
+            choose_lan_address(enumerated(&[a.clone(), b.clone(), c.clone()]), None).unwrap();
+        let reverse =
+            choose_lan_address(enumerated(&[c.clone(), b.clone(), a.clone()]), None).unwrap();
         assert_eq!(
             forward, reverse,
             "order of enumeration must not change the choice"
         );
         // And the rule is the one documented: sorted by (interface, address).
         assert_eq!(forward, a);
+    }
+
+    /// A virtual bridge often sorts before the real NIC but is not reachable from the phone.
+    /// The default route is the OS's reachability signal and must win over name ordering.
+    #[test]
+    fn default_route_interface_beats_an_earlier_virtual_bridge() {
+        let bridge = ifaddr("bridge100", "192.168.64.1");
+        let physical = ifaddr("en0", "192.168.1.50");
+
+        let chosen = choose_lan_address(enumerated(&[bridge, physical.clone()]), Some("en0"))
+            .expect("the default-route interface has a private address");
+
+        assert_eq!(chosen, physical);
+    }
+
+    #[test]
+    fn unusable_default_route_interface_keeps_the_deterministic_fallback() {
+        let bridge = ifaddr("bridge100", "192.168.64.1");
+        let physical = ifaddr("en0", "192.168.1.50");
+
+        let chosen = choose_lan_address(enumerated(&[physical, bridge.clone()]), Some("utun5"))
+            .expect("private fallback addresses remain usable");
+
+        assert_eq!(chosen, bridge);
     }
 
     /// THE SECURITY PROPERTY: a pre-authentication endpoint must never land on a public

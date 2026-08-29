@@ -20,6 +20,32 @@ pub(crate) use super::unix_common::{
     status_commands_supported, StatusCommandGuard,
 };
 
+/// Name of the interface carrying the preferred IPv4 default route.
+///
+/// macOS does not expose Linux's `/proc/net/route`; `/sbin/route` is part of the base OS.
+/// Its output is used only to prefer an interface already returned by `getifaddrs`, never as
+/// an address or command input, so unexpected output safely degrades to deterministic choice.
+pub(crate) fn default_route_interface() -> Option<String> {
+    let output = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    default_route_interface_from_route_output(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn default_route_interface_from_route_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "interface")
+            .then(|| value.trim())
+            .filter(|interface| !interface.is_empty())
+            .map(str::to_string)
+    })
+}
+
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
@@ -998,6 +1024,23 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_route_parser_extracts_the_interface() {
+        let output = "   route to: default\n\
+destination: default\n\
+  interface: en0\n\
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+
+        assert_eq!(
+            default_route_interface_from_route_output(output).as_deref(),
+            Some("en0")
+        );
+        assert_eq!(
+            default_route_interface_from_route_output("route to: default"),
+            None
+        );
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

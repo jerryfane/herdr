@@ -20,6 +20,10 @@ pub(crate) fn local_ipv4_addresses(
     Err(super::LocalIpv4AddressError::Unsupported)
 }
 
+pub(crate) fn default_route_interface() -> Option<String> {
+    None
+}
+
 pub(crate) fn set_default_plugin_pane_pwd(
     _env: &mut Vec<(String, String)>,
     _cwd: &std::path::Path,

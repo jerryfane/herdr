@@ -8,6 +8,10 @@ pub(crate) fn local_ipv4_addresses(
     Err(super::LocalIpv4AddressError::Unsupported)
 }
 
+pub(crate) fn default_route_interface() -> Option<String> {
+    None
+}
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 
