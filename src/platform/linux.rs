@@ -118,6 +118,14 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     super::interactive_unix_shell_command(argv, shell_name, shell_quote)
 }
 
+pub(crate) fn managed_resume_shell_command(
+    argv: &[String],
+    shell_name: &str,
+    replace_shell: bool,
+) -> Option<String> {
+    super::managed_unix_resume_shell_command(argv, shell_name, replace_shell, shell_quote)
+}
+
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {

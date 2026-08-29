@@ -514,6 +514,75 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     }
 }
 
+pub(crate) fn managed_resume_shell_command(
+    argv: &[String],
+    shell_name: &str,
+    replace_shell: bool,
+) -> Option<String> {
+    let shell_name = shell_name.to_ascii_lowercase();
+    let powershell = shell_name.contains("powershell") || shell_name.contains("pwsh");
+    let cmd = shell_name
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| matches!(name, "cmd" | "cmd.exe"));
+    let script = managed_resume_powershell_script(argv, replace_shell)?;
+    if powershell {
+        Some(script)
+    } else {
+        let command = cmd_encoded_powershell_command(&script);
+        let command = if cmd {
+            command
+        } else {
+            // Git Bash permits aliases and functions named `powershell.exe`.
+            // Select the application through Bash's real builtins.
+            format!(r"\builtin command {command}")
+        };
+        if replace_shell {
+            // The encoded PowerShell exits with the harness status. Exit the outer
+            // shell too so a failed transfer launch becomes an immediate PaneDied.
+            if cmd {
+                Some(format!("{command} & exit /b"))
+            } else {
+                // Git Bash and other supported POSIX shells use `;`, not cmd's
+                // backgrounding `&`, and must not receive cmd's `/b` argument.
+                Some(format!(r"{command}; \command exit $?"))
+            }
+        } else {
+            Some(command)
+        }
+    }
+}
+
+fn managed_resume_powershell_script(argv: &[String], replace_shell: bool) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let mut start = format!(
+        "$p=Microsoft.PowerShell.Management\\Start-Process -FilePath {}",
+        super::quote_powershell_arg(program),
+    );
+    if !args.is_empty() {
+        let command_line = args
+            .iter()
+            .map(|arg| quote_windows_command_line_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        start.push_str(" -ArgumentList ");
+        start.push_str(&super::quote_powershell_arg(&command_line));
+    }
+    start.push_str(" -NoNewWindow -Wait -PassThru -ErrorAction Stop");
+
+    let launch_error = format!(
+        "[Console]::Error.WriteLine(('Herdr could not launch executable ' + {} + ': ' + $_.Exception.Message))",
+        super::quote_powershell_arg(program),
+    );
+    if replace_shell {
+        Some(format!(
+            "try {{ {start} }} catch {{ {launch_error}; exit 127 }}; exit $p.ExitCode"
+        ))
+    } else {
+        Some(format!("try {{ {start} }} catch {{ {launch_error} }}"))
+    }
+}
+
 fn powershell_agent_script(argv: &[String]) -> Option<String> {
     let (program, args) = argv.split_first()?;
     if args.is_empty() {
@@ -2674,6 +2743,68 @@ mod tests {
             String::from_utf16(&utf16).unwrap(),
             "$p=Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b' -NoNewWindow -Wait -PassThru"
         );
+    }
+
+    #[test]
+    fn managed_resume_uses_application_only_powershell_launch_and_transfer_exit() {
+        let argv = vec![
+            "codex".into(),
+            "resume".into(),
+            "session with ' quote".into(),
+        ];
+
+        let ordinary = super::managed_resume_shell_command(&argv, "powershell.exe", false)
+            .expect("ordinary managed resume command");
+        assert!(ordinary.contains("Microsoft.PowerShell.Management\\Start-Process"));
+        assert!(ordinary.contains("-FilePath codex"));
+        assert!(ordinary.contains("-ErrorAction Stop"));
+        assert!(ordinary.contains("Herdr could not launch executable"));
+        assert!(!ordinary.ends_with("exit $p.ExitCode"));
+
+        let transfer = super::managed_resume_shell_command(&argv, "powershell.exe", true)
+            .expect("transfer managed resume command");
+        assert!(transfer.ends_with("; exit $p.ExitCode"));
+        assert!(transfer.contains("catch { [Console]::Error.WriteLine"));
+        assert!(transfer.contains("exit 127"));
+    }
+
+    #[test]
+    fn managed_cmd_resume_exits_outer_shell_after_encoded_transfer_command() {
+        use base64::Engine as _;
+
+        let argv = vec!["claude".into(), "--resume".into(), "session id".into()];
+        let command = super::managed_resume_shell_command(&argv, "cmd.exe", true)
+            .expect("cmd transfer managed resume command");
+        let encoded_command = command
+            .strip_suffix(" & exit /b")
+            .expect("cmd transfer must exit its outer shell");
+        let encoded = encoded_command
+            .split_whitespace()
+            .last()
+            .expect("encoded PowerShell payload");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode PowerShell payload");
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let script = String::from_utf16(&utf16).expect("PowerShell payload is UTF-16");
+        assert!(script.contains("Microsoft.PowerShell.Management\\Start-Process"));
+        assert!(script.contains("-FilePath claude"));
+        assert!(script.ends_with("; exit $p.ExitCode"));
+    }
+
+    #[test]
+    fn managed_git_bash_resume_waits_then_exits_with_the_target_status() {
+        let argv = vec!["codex".into(), "resume".into(), "session id".into()];
+        let command =
+            super::managed_resume_shell_command(&argv, r"C:\Program Files\Git\bin\bash.exe", true)
+                .expect("Git Bash transfer managed resume command");
+
+        assert!(command.starts_with("\\builtin command powershell.exe -NoProfile -EncodedCommand "));
+        assert!(command.ends_with(r"; \command exit $?"));
+        assert!(!command.contains(" & exit /b"));
     }
 
     #[test]

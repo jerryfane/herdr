@@ -55,16 +55,27 @@ pub struct WorktreeRemoveResult {
 #[derive(Debug)]
 pub enum AppEvent {
     /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    PaneDied {
+        pane_id: PaneId,
+        /// Identifies the exact PTY runtime that exited. `None` is reserved for
+        /// synthetic/test events that intentionally target the current runtime.
+        runtime_epoch: Option<u64>,
+    },
     /// Process detection identified an agent before its screen state was confirmed.
     AgentProcessDetected {
         pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
         agent: Agent,
         observed_at: Instant,
     },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
         agent: Option<Agent>,
         state: AgentState,
         visible_blocker: bool,
@@ -75,6 +86,9 @@ pub enum AppEvent {
     /// Orthogonal live input-prompt presence changed in a pane.
     InputStateChanged {
         pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
         kind: Option<crate::detect::InputPromptKind>,
     },
     /// Hook-authoritative agent state was reported for a pane.
@@ -211,4 +225,27 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+}
+
+impl AppEvent {
+    pub(crate) fn detector_runtime(&self) -> Option<(PaneId, Option<u64>)> {
+        match self {
+            Self::AgentProcessDetected {
+                pane_id,
+                runtime_epoch,
+                ..
+            }
+            | Self::StateChanged {
+                pane_id,
+                runtime_epoch,
+                ..
+            }
+            | Self::InputStateChanged {
+                pane_id,
+                runtime_epoch,
+                ..
+            } => Some((*pane_id, *runtime_epoch)),
+            _ => None,
+        }
+    }
 }
