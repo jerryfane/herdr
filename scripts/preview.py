@@ -6,6 +6,10 @@ import json
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -313,6 +317,78 @@ def validate_manifest_repository(manifest: object, repo: str) -> None:
         )
 
 
+def cache_busted_url(url: str, token: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query.append(("herdr_deploy_verify", token))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
+    )
+
+
+def fetch_json(url: str, timeout: float) -> tuple[object, str]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+            "User-Agent": "herdr-preview-deploy-verifier/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response), response.headers.get("cf-cache-status", "unknown")
+
+
+def manifests_match(expected: object, observed: object) -> bool:
+    return first_manifest_difference(expected, observed) is None
+
+
+def json_path(parent: str, key: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key):
+        return f"{parent}.{key}"
+    return f"{parent}[{json.dumps(key)}]"
+
+
+def first_manifest_difference(
+    expected: object, observed: object, path: str = "$"
+) -> str | None:
+    if type(expected) is not type(observed):
+        return path
+    if isinstance(expected, dict) and isinstance(observed, dict):
+        for key in sorted(set(expected) | set(observed)):
+            child = json_path(path, key)
+            if key not in expected or key not in observed:
+                return child
+            difference = first_manifest_difference(expected[key], observed[key], child)
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(expected, list) and isinstance(observed, list):
+        for index, (expected_item, observed_item) in enumerate(zip(expected, observed)):
+            difference = first_manifest_difference(
+                expected_item, observed_item, f"{path}[{index}]"
+            )
+            if difference is not None:
+                return difference
+        return None if len(expected) == len(observed) else f"{path}.length"
+    return None if expected == observed else path
+
+
+def validate_deployment_options(args: argparse.Namespace) -> None:
+    if args.attempts < 1:
+        raise SystemExit("deployment verification attempts must be at least 1")
+    if args.delay < 0:
+        raise SystemExit("deployment verification delay must not be negative")
+    if args.timeout <= 0:
+        raise SystemExit("deployment verification timeout must be greater than 0")
+    try:
+        parts = urllib.parse.urlsplit(args.url)
+    except ValueError as error:
+        raise SystemExit(f"invalid deployment verification URL: {error}") from error
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise SystemExit("deployment verification URL must be an absolute HTTP(S) URL")
+
+
 def build_manifest(
     output: Path,
     repo: str,
@@ -442,6 +518,74 @@ def cmd_validate_manifest_repository(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_deployment(args: argparse.Namespace) -> int:
+    validate_deployment_options(args)
+    expected = read_json(Path(args.manifest))
+    if not isinstance(expected, dict):
+        raise SystemExit("expected preview manifest must be a JSON object")
+
+    expected_commit = expected.get("commit", "missing")
+    started = time.monotonic()
+    last_commit: object = "unavailable"
+    last_cache_status = "unavailable"
+    last_error = "none"
+    last_dynamic_difference: str | None = None
+    for attempt in range(1, args.attempts + 1):
+        url = cache_busted_url(args.url, f"{args.token}-{attempt}")
+        try:
+            observed, last_cache_status = fetch_json(url, args.timeout)
+            last_error = "none"
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TimeoutError,
+            urllib.error.URLError,
+        ) as error:
+            observed = None
+            last_cache_status = "unavailable"
+            last_error = str(error)
+
+        difference = first_manifest_difference(expected, observed)
+        if last_cache_status.upper() == "DYNAMIC" and difference is None:
+            elapsed = time.monotonic() - started
+            print(
+                "verified public preview manifest "
+                f"commit={expected_commit} cf-cache-status={last_cache_status} "
+                f"elapsed={elapsed:.1f}s"
+            )
+            return 0
+
+        if isinstance(observed, dict):
+            last_commit = observed.get("commit", "missing")
+        else:
+            last_commit = "unavailable"
+        if last_cache_status.upper() == "DYNAMIC":
+            last_dynamic_difference = difference
+            detail = f"origin mismatch at {difference}"
+        else:
+            detail = "origin response not observed; response is inconclusive"
+        elapsed = time.monotonic() - started
+        print(
+            f"waiting for the exact preview manifest ({attempt}/{args.attempts}, "
+            f"elapsed={elapsed:.1f}s): {detail}; expected commit={expected_commit}, "
+            f"observed commit={last_commit}, cf-cache-status={last_cache_status}",
+            file=sys.stderr,
+        )
+        if attempt < args.attempts:
+            time.sleep(args.delay)
+
+    elapsed = time.monotonic() - started
+    if last_dynamic_difference is None:
+        detail = "no DYNAMIC origin response was observed; cached responses were inconclusive"
+    else:
+        detail = f"DYNAMIC origin remained mismatched at {last_dynamic_difference}"
+    raise SystemExit(
+        f"public preview deployment timed out after {elapsed:.1f}s: {detail}; "
+        f"expected commit={expected_commit}, observed commit={last_commit}, "
+        f"cf-cache-status={last_cache_status}, last_error={last_error}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Preview channel release helpers")
     sub = parser.add_subparsers(required=True)
@@ -497,6 +641,15 @@ def main() -> int:
     manifest_repository.add_argument("--manifest", default="website/preview.json")
     manifest_repository.add_argument("--repo", required=True)
     manifest_repository.set_defaults(func=cmd_validate_manifest_repository)
+
+    verify_deployment = sub.add_parser("verify-deployment")
+    verify_deployment.add_argument("--manifest", default="website/preview.json")
+    verify_deployment.add_argument("--url", required=True)
+    verify_deployment.add_argument("--token", required=True)
+    verify_deployment.add_argument("--attempts", type=int, default=60)
+    verify_deployment.add_argument("--delay", type=float, default=10)
+    verify_deployment.add_argument("--timeout", type=float, default=15)
+    verify_deployment.set_defaults(func=cmd_verify_deployment)
 
     args = parser.parse_args()
     return args.func(args)

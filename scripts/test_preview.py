@@ -163,6 +163,156 @@ class PreviewNotesTests(unittest.TestCase):
                     retain=30,
                 )
 
+    def test_deployment_match_compares_full_manifest_not_only_commit(self):
+        expected = {
+            "commit": "abcdef",
+            "assets": {
+                "linux-x86_64": {
+                    "url": "https://github.com/jerryfane/herdr/releases/download/preview-new/herdr-linux-x86_64"
+                }
+            },
+        }
+        wrong_repository = {
+            **expected,
+            "assets": {
+                "linux-x86_64": {
+                    "url": "https://github.com/herdrdev/herdr/releases/download/preview-new/herdr-linux-x86_64"
+                }
+            },
+        }
+        self.assertFalse(preview.manifests_match(expected, wrong_repository))
+        self.assertEqual(
+            preview.first_manifest_difference(expected, wrong_repository),
+            "$.assets.linux-x86_64.url",
+        )
+        self.assertTrue(preview.manifests_match(expected, json.loads(json.dumps(expected))))
+
+    def test_verify_deployment_retries_until_full_manifest_matches(self):
+        expected = {
+            "commit": "abcdef",
+            "assets": {"linux-x86_64": {"url": "https://example.test/right"}},
+        }
+        stale = {
+            "commit": "abcdef",
+            "assets": {"linux-x86_64": {"url": "https://example.test/wrong"}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "preview.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            args = mock.Mock(
+                manifest=str(manifest),
+                url="https://herdr.dev/preview.json?existing=1",
+                token="test-run",
+                attempts=2,
+                delay=0,
+                timeout=1,
+            )
+            with mock.patch.object(
+                preview,
+                "fetch_json",
+                side_effect=[(stale, "DYNAMIC"), (expected, "DYNAMIC")],
+            ) as fetch:
+                self.assertEqual(preview.cmd_verify_deployment(args), 0)
+
+        self.assertEqual(fetch.call_count, 2)
+        first_url = fetch.call_args_list[0].args[0]
+        self.assertIn("existing=1", first_url)
+        self.assertIn("herdr_deploy_verify=test-run-1", first_url)
+
+    def test_verify_deployment_treats_cache_hit_as_inconclusive(self):
+        expected = {"commit": "abcdef", "assets": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "preview.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            args = mock.Mock(
+                manifest=str(manifest),
+                url="https://herdr.dev/preview.json",
+                token="test-run",
+                attempts=2,
+                delay=0,
+                timeout=1,
+            )
+            with mock.patch.object(
+                preview,
+                "fetch_json",
+                side_effect=[(expected, "HIT"), (expected, "DYNAMIC")],
+            ) as fetch:
+                self.assertEqual(preview.cmd_verify_deployment(args), 0)
+
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_verify_deployment_fails_when_dynamic_origin_stays_stale(self):
+        expected = {"commit": "new", "assets": {}}
+        stale = {"commit": "old", "assets": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "preview.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            args = mock.Mock(
+                manifest=str(manifest),
+                url="https://herdr.dev/preview.json",
+                token="test-run",
+                attempts=1,
+                delay=0,
+                timeout=1,
+            )
+            with (
+                mock.patch.object(
+                    preview,
+                    "fetch_json",
+                    return_value=(stale, "DYNAMIC"),
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    r"timed out after .* DYNAMIC origin remained mismatched at \$\.commit",
+                ),
+            ):
+                preview.cmd_verify_deployment(args)
+
+    def test_verify_deployment_retries_malformed_utf8_without_traceback(self):
+        expected = {"commit": "new", "assets": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "preview.json"
+            manifest.write_text(json.dumps(expected), encoding="utf-8")
+            args = mock.Mock(
+                manifest=str(manifest),
+                url="https://herdr.dev/preview.json",
+                token="test-run",
+                attempts=1,
+                delay=0,
+                timeout=1,
+            )
+            malformed = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            with (
+                mock.patch.object(preview, "fetch_json", side_effect=malformed),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "no DYNAMIC origin response was observed",
+                ),
+            ):
+                preview.cmd_verify_deployment(args)
+
+    def test_verify_deployment_rejects_invalid_polling_options(self):
+        base = {
+            "manifest": "website/preview.json",
+            "url": "https://herdr.dev/preview.json",
+            "token": "test-run",
+            "attempts": 1,
+            "delay": 0,
+            "timeout": 1,
+        }
+        invalid = (
+            ({"attempts": 0}, "attempts must be at least 1"),
+            ({"delay": -1}, "delay must not be negative"),
+            ({"timeout": 0}, "timeout must be greater than 0"),
+            ({"url": "not-a-url"}, "absolute HTTP\\(S\\) URL"),
+            ({"url": "https://[invalid"}, "invalid deployment verification URL"),
+        )
+        for changes, message in invalid:
+            with self.subTest(changes=changes):
+                args = mock.Mock(**{**base, **changes})
+                with self.assertRaisesRegex(SystemExit, message):
+                    preview.validate_deployment_options(args)
+
     def test_hidden_subjects_include_preview_manifest_commits(self):
         self.assertTrue(preview.hidden_subject("docs: publish preview 2026-08-29-deadbeef"))
         self.assertTrue(preview.hidden_subject("docs: update preview manifest"))
