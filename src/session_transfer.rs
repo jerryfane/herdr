@@ -12,7 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap as _, SerializeSeq as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
@@ -21,6 +23,157 @@ const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ROLLOUT_FILES_SCANNED: usize = 50_000;
+// Codex 0.150.1's external Claude-session importer flattens native tool
+// activity into visible assistant messages. These values and tags deliberately
+// mirror that independently verified target representation. If Codex changes
+// it, exact destination verification must fail closed until this projection is
+// reviewed and updated.
+const CODEX_IMPORT_NOTE_MAX_CHARS: usize = 2_000;
+const CODEX_IMPORT_TOOL_RESULT_MAX_CHARS: usize = 4_000;
+const CODEX_IMPORT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
+const CODEX_IMPORT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
+
+/// JSON value that retains source object-key order for the one Codex importer
+/// representation where order is visible: fallback tool-input notes. Herdr's
+/// normal `serde_json::Value` intentionally keeps its existing global ordering
+/// behavior; changing that dependency feature would alter unrelated API JSON.
+#[derive(Debug, Clone)]
+enum OrderedJson {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<OrderedJson>),
+    Object(Vec<(String, OrderedJson)>),
+}
+
+impl OrderedJson {
+    fn get(&self, key: &str) -> Option<&Self> {
+        let Self::Object(entries) = self else {
+            return None;
+        };
+        entries
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value))
+    }
+
+    fn as_array(&self) -> Option<&[Self]> {
+        let Self::Array(values) = self else {
+            return None;
+        };
+        Some(values)
+    }
+}
+
+struct OrderedJsonVisitor;
+
+impl<'de> Visitor<'de> for OrderedJsonVisitor {
+    type Value = OrderedJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(OrderedJson::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(OrderedJson::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(OrderedJson::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(OrderedJson::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(OrderedJson::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(OrderedJson::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(OrderedJson::String(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(OrderedJson::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let capacity = map.size_hint().unwrap_or(0);
+        let mut entries: Vec<(String, OrderedJson)> = Vec::with_capacity(capacity);
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(capacity);
+        while let Some((key, value)) = map.next_entry::<String, OrderedJson>()? {
+            if !seen.insert(key.clone()) {
+                return Err(<A::Error as serde::de::Error>::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            entries.push((key, value));
+        }
+        Ok(OrderedJson::Object(entries))
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(OrderedJsonVisitor)
+    }
+}
+
+impl Serialize for OrderedJson {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Number(value) => value.serialize(serializer),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(value)?;
+                }
+                sequence.end()
+            }
+            Self::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -234,7 +387,12 @@ impl RuntimeSessionTransfer {
                 "transfer has no staged destination transcript path".to_string(),
             )
         })?;
-        let source = read_transcript(self.source_kind, &self.source_config_home, source_path)?;
+        let source = read_transfer_source(
+            self.source_kind,
+            self.target_kind,
+            &self.source_config_home,
+            source_path,
+        )?;
         let target = read_transcript(self.target_kind, &self.target_config_home, target_path)?;
         verify_destination(&source.messages, &target)
     }
@@ -336,6 +494,7 @@ pub(crate) enum TransferError {
     EmptyTranscript,
     DestinationMismatch(String),
     CodexImport(String),
+    UnsupportedTranscript(String),
     Timeout,
 }
 
@@ -369,6 +528,12 @@ impl fmt::Display for TransferError {
                 write!(f, "destination transcript verification failed: {message}")
             }
             Self::CodexImport(message) => write!(f, "Codex session import failed: {message}"),
+            Self::UnsupportedTranscript(message) => {
+                write!(
+                    f,
+                    "session transfer cannot preserve source transcript: {message}"
+                )
+            }
             Self::Timeout => write!(f, "Codex session import timed out"),
         }
     }
@@ -399,8 +564,9 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
         &request.source_session_id,
         request.source_transcript_path.as_deref(),
     )?;
-    let source = read_transcript(
+    let source = read_transfer_source(
         request.source_kind,
+        request.target_kind,
         &request.source_config_home,
         &source_path,
     )?;
@@ -573,7 +739,7 @@ pub(crate) fn verify_destination(
         .position(|(left, right)| left != right)
         .unwrap_or_else(|| expected.len().min(actual.messages.len()));
     Err(TransferError::DestinationMismatch(format!(
-        "expected {} messages, found {}; first difference at message {}",
+        "expected {} target-visible messages, found {}; first difference at message {}",
         expected.len(),
         actual.messages.len(),
         first_difference + 1
@@ -656,23 +822,50 @@ pub(crate) fn validate_transcript_path(
     Ok(canonical_candidate)
 }
 
+fn read_transfer_source(
+    source_kind: HarnessKind,
+    target_kind: HarnessKind,
+    config_home: &Path,
+    path: &Path,
+) -> Result<CanonicalTranscript, TransferError> {
+    let trusted_path = validate_transcript_path(config_home, path)?;
+    let bytes = read_transcript_snapshot(&trusted_path)?;
+    let mut source = parse_jsonl_snapshot(&bytes, source_kind)?;
+    if source_kind == HarnessKind::Claude && target_kind == HarnessKind::Codex {
+        source.messages = claude_to_codex_import_projection(&bytes)?;
+    }
+    Ok(source)
+}
+
 fn read_jsonl(path: &Path, kind: HarnessKind) -> Result<CanonicalTranscript, TransferError> {
     // Parse and fingerprint the SAME byte snapshot. Hashing with a second read
     // can bless bytes appended after parsing, letting the pre-cutover recheck
     // pass even though those messages were never staged.
+    let bytes = read_transcript_snapshot(path)?;
+    parse_jsonl_snapshot(&bytes, kind)
+}
+
+fn read_transcript_snapshot(path: &Path) -> Result<Vec<u8>, TransferError> {
     let bytes = fs::read(path).map_err(|err| TransferError::io("read transcript", err))?;
     if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
         return Err(TransferError::TranscriptTooLarge {
             bytes: bytes.len() as u64,
         });
     }
+    Ok(bytes)
+}
+
+fn parse_jsonl_snapshot(
+    bytes: &[u8],
+    kind: HarnessKind,
+) -> Result<CanonicalTranscript, TransferError> {
     // Codex persists hidden runtime context in role=user response items. The
     // user_message events are the records its own UI exposes as submitted user
     // turns, so collect their texts from this same immutable byte snapshot and
     // require every response-item user message to be either paired with one or
     // a recognized runtime context envelope.
     let codex_visible_user_events = if kind == HarnessKind::Codex {
-        codex_visible_user_event_texts(&bytes)?
+        codex_visible_user_event_texts(bytes)?
     } else {
         std::collections::HashSet::new()
     };
@@ -714,7 +907,7 @@ fn read_jsonl(path: &Path, kind: HarnessKind) -> Result<CanonicalTranscript, Tra
     Ok(CanonicalTranscript {
         messages,
         omissions,
-        fingerprint: fingerprint_bytes(&bytes),
+        fingerprint: fingerprint_bytes(bytes),
     })
 }
 
@@ -772,6 +965,12 @@ fn parse_claude_record(
     };
     if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         omissions.sidechain_records += 1;
+        return Ok(());
+    }
+    if matches!(record_type, "user" | "assistant")
+        && value.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
+        omissions.metadata_records += 1;
         return Ok(());
     }
     match record_type {
@@ -877,6 +1076,307 @@ fn parse_claude_message(
             message: "Claude message content is neither text nor blocks".to_string(),
         }),
     }
+}
+
+/// Independently project a Claude transcript into the visible message shape
+/// produced by Codex 0.150.1's supported external-session importer.
+///
+/// This must remain destination-aware instead of changing Claude's ordinary
+/// canonical parser: Codex deliberately renders tool activity as assistant
+/// text, while a Claude destination receives only the provider-neutral visible
+/// conversation. Exact verification against this projection proves what the
+/// importer actually wrote without trusting the importer to attest to itself.
+fn claude_to_codex_import_projection(bytes: &[u8]) -> Result<Vec<VisibleMessage>, TransferError> {
+    let mut messages = Vec::new();
+    let mut saw_user_message = false;
+    for (index, line) in BufReader::new(Cursor::new(bytes)).split(b'\n').enumerate() {
+        let line_number = index + 1;
+        let mut line = line.map_err(|err| TransferError::io("read transcript", err))?;
+        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            return Err(TransferError::LineTooLarge { line: line_number });
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value =
+            serde_json::from_slice(&line).map_err(|err| TransferError::InvalidJson {
+                line: line_number,
+                message: err.to_string(),
+            })?;
+        let ordered: OrderedJson =
+            serde_json::from_slice(&line).map_err(|err| TransferError::InvalidJson {
+                line: line_number,
+                message: err.to_string(),
+            })?;
+        project_claude_record_for_codex(
+            line_number,
+            &value,
+            &ordered,
+            &mut saw_user_message,
+            &mut messages,
+        )?;
+    }
+    if messages.is_empty() {
+        return Err(TransferError::EmptyTranscript);
+    }
+    Ok(messages)
+}
+
+fn project_claude_record_for_codex(
+    line: usize,
+    value: &Value,
+    ordered: &OrderedJson,
+    saw_user_message: &mut bool,
+    messages: &mut Vec<VisibleMessage>,
+) -> Result<(), TransferError> {
+    let Some(record_type @ ("assistant" | "user")) = value.get("type").and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(());
+    }
+    let message = value
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| TransferError::AmbiguousRecord {
+            line,
+            message: "Claude message record has no message object".to_string(),
+        })?;
+    if message.get("role").and_then(Value::as_str) != Some(record_type) {
+        return Err(TransferError::AmbiguousRecord {
+            line,
+            message: format!("Claude {record_type} record has a conflicting role"),
+        });
+    }
+    let content = message
+        .get("content")
+        .ok_or_else(|| TransferError::AmbiguousRecord {
+            line,
+            message: "Claude message has no content".to_string(),
+        })?;
+    let ordered_content = ordered
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .ok_or_else(|| TransferError::AmbiguousRecord {
+            line,
+            message: "Claude message order projection has no content".to_string(),
+        })?;
+    let Some(extracted) = extract_codex_import_message(line, content, ordered_content)? else {
+        return Ok(());
+    };
+    let role = if record_type == "assistant" || extracted.only_tool_result {
+        VisibleRole::Assistant
+    } else {
+        VisibleRole::User
+    };
+    let text = if role == VisibleRole::User {
+        unwrap_codex_import_user_query(extracted.text)
+    } else {
+        extracted.text
+    };
+    if role == VisibleRole::Assistant && !*saw_user_message {
+        return Err(TransferError::UnsupportedTranscript(
+            "Codex omits assistant messages that appear before the first user turn".to_string(),
+        ));
+    }
+    if role == VisibleRole::User {
+        *saw_user_message = true;
+    }
+    push_visible_message(messages, role, &text)
+}
+
+struct CodexImportMessage {
+    text: String,
+    only_tool_result: bool,
+}
+
+fn extract_codex_import_message(
+    line: usize,
+    content: &Value,
+    ordered_content: &OrderedJson,
+) -> Result<Option<CodexImportMessage>, TransferError> {
+    if let Some(text) = content.as_str() {
+        return Ok((!text.trim().is_empty()).then(|| CodexImportMessage {
+            text: text.to_string(),
+            only_tool_result: false,
+        }));
+    }
+    let blocks = content
+        .as_array()
+        .ok_or_else(|| TransferError::AmbiguousRecord {
+            line,
+            message: "Claude message content is neither text nor blocks".to_string(),
+        })?;
+    let ordered_blocks =
+        ordered_content
+            .as_array()
+            .ok_or_else(|| TransferError::AmbiguousRecord {
+                line,
+                message: "Claude message order projection is not a block array".to_string(),
+            })?;
+    if blocks.len() != ordered_blocks.len() {
+        return Err(TransferError::AmbiguousRecord {
+            line,
+            message: "Claude message order projection changed block count".to_string(),
+        });
+    }
+    let mut parts = Vec::new();
+    let mut only_tool_result = !blocks.is_empty();
+    for (block, ordered_block) in blocks.iter().zip(ordered_blocks) {
+        let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+            TransferError::AmbiguousRecord {
+                line,
+                message: "Claude content block has no type".to_string(),
+            }
+        })?;
+        match block_type {
+            "text" => {
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    TransferError::AmbiguousRecord {
+                        line,
+                        message: "Claude text block has non-string text".to_string(),
+                    }
+                })?;
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                    only_tool_result = false;
+                }
+            }
+            "tool_use" => {
+                parts.push(codex_import_tool_call_note(line, block, ordered_block)?);
+                only_tool_result = false;
+            }
+            "tool_result" => parts.push(codex_import_tool_result_note(block)),
+            "thinking" => {}
+            other => {
+                parts.push(format!("[external unsupported block: {other}]"));
+                only_tool_result = false;
+            }
+        }
+    }
+    let text = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok((!text.is_empty()).then_some(CodexImportMessage {
+        text,
+        only_tool_result,
+    }))
+}
+
+fn codex_import_tool_call_note(
+    line: usize,
+    block: &Value,
+    ordered_block: &OrderedJson,
+) -> Result<String, TransferError> {
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut lines = vec![format!("[{CODEX_IMPORT_TOOL_CALL_TAG}: {name}]")];
+    if let Some(input) = block.get("input").and_then(Value::as_object) {
+        if let Some(description) = input.get("description").and_then(Value::as_str) {
+            lines.push(format!("description: {description}"));
+        }
+        if let Some(command) = input.get("command").and_then(Value::as_str) {
+            lines.push(format!("command: {command}"));
+        }
+        if let Some(file) = input
+            .get("file_path")
+            .or_else(|| input.get("file"))
+            .and_then(Value::as_str)
+        {
+            lines.push(format!("file: {file}"));
+        }
+        if lines.len() == 1 {
+            let input = ordered_codex_import_tool_input(line, ordered_block)?;
+            lines.push(format!(
+                "input: {}",
+                truncate_codex_import_text(&input, CODEX_IMPORT_NOTE_MAX_CHARS,)
+            ));
+        }
+    } else if block.get("input").is_some() {
+        let input = ordered_codex_import_tool_input(line, ordered_block)?;
+        lines.push(format!(
+            "input: {}",
+            truncate_codex_import_text(&input, CODEX_IMPORT_NOTE_MAX_CHARS)
+        ));
+    }
+    lines.push(format!("[/{CODEX_IMPORT_TOOL_CALL_TAG}]"));
+    Ok(lines.join("\n"))
+}
+
+fn ordered_codex_import_tool_input(
+    line: usize,
+    ordered_block: &OrderedJson,
+) -> Result<String, TransferError> {
+    let input = ordered_block
+        .get("input")
+        .ok_or_else(|| TransferError::AmbiguousRecord {
+            line,
+            message: "Claude tool input was missing from its order projection".to_string(),
+        })?;
+    serde_json::to_string(input).map_err(|err| TransferError::AmbiguousRecord {
+        line,
+        message: format!("Claude tool input order projection could not be serialized: {err}"),
+    })
+}
+
+fn codex_import_tool_result_note(block: &Value) -> String {
+    let label = if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        format!("[{CODEX_IMPORT_TOOL_RESULT_TAG}: error]")
+    } else {
+        format!("[{CODEX_IMPORT_TOOL_RESULT_TAG}]")
+    };
+    let text = match block.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    if text.is_empty() {
+        format!("{label}\n[/{CODEX_IMPORT_TOOL_RESULT_TAG}]")
+    } else {
+        format!(
+            "{label}\n{}\n[/{CODEX_IMPORT_TOOL_RESULT_TAG}]",
+            truncate_codex_import_text(&text, CODEX_IMPORT_TOOL_RESULT_MAX_CHARS)
+        )
+    }
+}
+
+fn truncate_codex_import_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let prefix = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    format!("{prefix}...")
+}
+
+fn unwrap_codex_import_user_query(text: String) -> String {
+    let trimmed = text.trim();
+    let Some(inner) = trimmed
+        .strip_prefix("<user_query>")
+        .and_then(|inner| inner.strip_suffix("</user_query>"))
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+    else {
+        return text;
+    };
+    inner.to_string()
 }
 
 fn parse_codex_record(
@@ -1786,6 +2286,7 @@ mod tests {
                     {"type":"tool_use","name":"shell"}
                 ]}}),
                 json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"hidden"}]}}),
+                json!({"type":"user","isMeta":true,"message":{"role":"user","content":"internal metadata"}}),
                 json!({"type":"attachment","fileName":"image.png"}),
                 json!({"type":"future-metadata","counter":3}),
             ],
@@ -1807,8 +2308,251 @@ mod tests {
         assert_eq!(transcript.omissions.reasoning_records, 1);
         assert_eq!(transcript.omissions.tool_records, 2);
         assert_eq!(transcript.omissions.attachment_records, 1);
-        assert_eq!(transcript.omissions.metadata_records, 1);
+        assert_eq!(transcript.omissions.metadata_records, 2);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_to_codex_projection_matches_codex_importer_semantics() {
+        let root = temp_root("claude-codex-projection");
+        let path = root.join("source.jsonl");
+        write_fixture(
+            &path,
+            &[
+                json!({"type":"user","message":{"role":"user","content":" \n<user_query>\r\nhello\r\nworld\n</user_query>\n "}}),
+                json!({"type":"user","isMeta":true,"message":{"role":"user","content":"hidden metadata"}}),
+                json!({"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"hidden branch"}]}}),
+                json!({"type":"assistant","message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"hidden reasoning"},
+                    {"type":"text","text":"answer"},
+                    {"type":"tool_use","name":"shell","input":{
+                        "description":"inspect",
+                        "command":"ls",
+                        "file_path":"/tmp/a"
+                    }}
+                ]}}),
+                json!({"type":"user","message":{"role":"user","content":[
+                    {"type":"tool_result","is_error":true,"content":[{"type":"text","text":"failed"}]}
+                ]}}),
+                json!({"type":"assistant","message":{"role":"assistant","content":[
+                    {"type":"redacted_thinking","data":"hidden"}
+                ]}}),
+                json!({"type":"assistant","message":{"role":"assistant","content":[
+                    {"type":"image","source":{"type":"base64","data":"hidden"}}
+                ]}}),
+                json!({"type":"user","message":{"role":"user","content":[
+                    {"type":"text","text":"follow-up"},
+                    {"type":"tool_result","content":"context"}
+                ]}}),
+            ],
+        );
+
+        let ordinary = read_transcript(HarnessKind::Claude, &root, &path).unwrap();
+        let projected =
+            read_transfer_source(HarnessKind::Claude, HarnessKind::Codex, &root, &path).unwrap();
+
+        assert_eq!(ordinary.messages.len(), 3);
+        assert_eq!(projected.fingerprint, ordinary.fingerprint);
+        assert_eq!(projected.omissions, ordinary.omissions);
+        assert_eq!(projected.omissions.metadata_records, 1);
+        assert_eq!(projected.omissions.sidechain_records, 1);
+        assert_eq!(projected.omissions.reasoning_records, 2);
+        assert_eq!(projected.omissions.tool_records, 3);
+        assert_eq!(projected.omissions.attachment_records, 1);
+        assert_eq!(
+            projected.messages,
+            vec![
+                VisibleMessage {
+                    role: VisibleRole::User,
+                    text: "hello\nworld".into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: concat!(
+                        "answer\n\n",
+                        "[external_agent_tool_call: shell]\n",
+                        "description: inspect\n",
+                        "command: ls\n",
+                        "file: /tmp/a\n",
+                        "[/external_agent_tool_call]"
+                    )
+                    .into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: concat!(
+                        "[external_agent_tool_result: error]\n",
+                        "failed\n",
+                        "[/external_agent_tool_result]"
+                    )
+                    .into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: "[external unsupported block: redacted_thinking]".into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: "[external unsupported block: image]".into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::User,
+                    text: concat!(
+                        "follow-up\n\n",
+                        "[external_agent_tool_result]\n",
+                        "context\n",
+                        "[/external_agent_tool_result]"
+                    )
+                    .into(),
+                },
+            ]
+        );
+
+        let target_path = root.join("rollout-imported.jsonl");
+        let answer_with_tool = concat!(
+            "answer\n\n",
+            "[external_agent_tool_call: shell]\n",
+            "description: inspect\n",
+            "command: ls\n",
+            "file: /tmp/a\n",
+            "[/external_agent_tool_call]"
+        );
+        let failed_tool_result = concat!(
+            "[external_agent_tool_result: error]\n",
+            "failed\n",
+            "[/external_agent_tool_result]"
+        );
+        let follow_up = concat!(
+            "follow-up\n\n",
+            "[external_agent_tool_result]\n",
+            "context\n",
+            "[/external_agent_tool_result]"
+        );
+        write_fixture(
+            &target_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"imported"}}),
+                json!({"type":"event_msg","payload":{"type":"turn_started"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"hello\r\nworld"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello\r\nworld"}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":answer_with_tool}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer_with_tool}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":failed_tool_result}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":failed_tool_result}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":"[external unsupported block: redacted_thinking]"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[external unsupported block: redacted_thinking]"}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":"[external unsupported block: image]"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[external unsupported block: image]"}]}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":follow_up}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":follow_up}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":"<EXTERNAL SESSION IMPORTED>"}}),
+                json!({"type":"event_msg","payload":{"type":"turn_complete"}}),
+            ],
+        );
+        let actual = read_transcript(HarnessKind::Codex, &root, &target_path).unwrap();
+        verify_destination(&projected.messages, &actual).unwrap();
+        let mut changed = actual;
+        changed.messages[1].text.push('!');
+        let error = verify_destination(&projected.messages, &changed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("target-visible"));
+        assert!(error.contains("message 2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_import_projection_truncates_by_unicode_scalar_count() {
+        let text = "🦀".repeat(CODEX_IMPORT_NOTE_MAX_CHARS + 1);
+        let truncated = truncate_codex_import_text(&text, CODEX_IMPORT_NOTE_MAX_CHARS);
+        assert_eq!(truncated.chars().count(), CODEX_IMPORT_NOTE_MAX_CHARS);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(
+            truncated
+                .chars()
+                .filter(|character| *character == '🦀')
+                .count(),
+            CODEX_IMPORT_NOTE_MAX_CHARS - 3
+        );
+    }
+
+    #[test]
+    fn codex_import_projection_preserves_fallback_tool_input_key_order() {
+        let bytes = br#"{"type":"user","message":{"role":"user","content":"request"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"question":"Choose","header":"Backend","multiSelect":false}}]}}
+"#;
+        let projected = claude_to_codex_import_projection(bytes).unwrap();
+        assert_eq!(
+            projected,
+            vec![
+                VisibleMessage {
+                    role: VisibleRole::User,
+                    text: "request".into(),
+                },
+                VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: concat!(
+                        "[external_agent_tool_call: AskUserQuestion]\n",
+                        "input: {\"question\":\"Choose\",\"header\":\"Backend\",\"multiSelect\":false}\n",
+                        "[/external_agent_tool_call]"
+                    )
+                    .into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_import_projection_rejects_duplicate_object_keys() {
+        let bytes = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"shell","input":{"command":"first","command":"second"}}]}}
+"#;
+        assert!(matches!(
+            claude_to_codex_import_projection(bytes),
+            Err(TransferError::InvalidJson { message, .. })
+                if message.contains("duplicate JSON object key")
+        ));
+    }
+
+    #[test]
+    fn codex_import_projection_handles_many_unique_object_keys() {
+        use std::fmt::Write as _;
+
+        let mut input = String::from("{");
+        for index in 0..5_000 {
+            if index > 0 {
+                input.push(',');
+            }
+            write!(&mut input, "\"key{index}\":{index}").unwrap();
+        }
+        input.push('}');
+        let bytes = format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"request\"}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"name\":\"large\",\"input\":{input}}}]}}}}\n"
+        );
+        let projected = claude_to_codex_import_projection(bytes.as_bytes()).unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[1].role, VisibleRole::Assistant);
+        assert_eq!(
+            projected[1].text.chars().count(),
+            CODEX_IMPORT_NOTE_MAX_CHARS
+                + "[external_agent_tool_call: large]\ninput: \n[/external_agent_tool_call]"
+                    .chars()
+                    .count()
+        );
+    }
+
+    #[test]
+    fn codex_import_projection_refuses_assistant_records_before_first_user_turn() {
+        let bytes = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"leading answer"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"leading tool result"}]}}
+{"type":"user","message":{"role":"user","content":"first request"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"kept answer"}]}}
+"#;
+        assert!(matches!(
+            claude_to_codex_import_projection(bytes),
+            Err(TransferError::UnsupportedTranscript(message))
+                if message.contains("before the first user turn")
+        ));
     }
 
     #[test]
@@ -1936,6 +2680,25 @@ mod tests {
         let root = temp_root("ambiguous");
         let path = root.join("source.jsonl");
         write_fixture(&path, &[json!({"type":"future","text":"maybe visible"})]);
+        assert!(matches!(
+            read_transcript(HarnessKind::Claude, &root, &path),
+            Err(TransferError::AmbiguousRecord { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn is_meta_does_not_hide_an_unknown_record_with_visible_content() {
+        let root = temp_root("ambiguous-meta");
+        let path = root.join("source.jsonl");
+        write_fixture(
+            &path,
+            &[json!({
+                "type":"future-visible",
+                "isMeta":true,
+                "message":{"role":"user","content":"must not disappear"}
+            })],
+        );
         assert!(matches!(
             read_transcript(HarnessKind::Claude, &root, &path),
             Err(TransferError::AmbiguousRecord { .. })

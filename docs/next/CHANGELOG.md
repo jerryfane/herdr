@@ -12,7 +12,7 @@
 - Hold Ctrl over a link to highlight it before opening it. Wrapped URLs and OSC 8 links remain clickable even when their beginning or end is outside the viewport. (#1282)
 - Sidebar token rules can now hide matching tokens and their separators with `hide = true`; rows disappear when no tokens remain. (#3925)
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
-- Running Claude Code and Codex agents can now transfer their visible conversation into the other harness in the same pane. Herdr stages and rereads the destination transcript before confirmation, reports omitted tool/reasoning/system records, and restores the source session and account when target launch verification fails.
+- Running Claude Code and Codex agents can now transfer their visible conversation into the other harness in the same pane. Herdr stages and rereads the destination transcript before confirmation, verifies Codex's readable text projection of Claude tool activity, reports native structures and reasoning/system records that were flattened or omitted, and restores the source session and account when target launch verification fails.
 
 ### Changed
 - Workspace keyboard navigation now spans connected machines in sidebar order, with a visible highlight before Enter switches machines. Collapsed machine and worktree groups remain navigable without accidentally sending actions to the wrong machine. (#3754)
