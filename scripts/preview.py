@@ -244,6 +244,75 @@ def asset_objects(urls: dict[str, str], shas: dict[str, str]) -> dict[str, dict[
     return assets
 
 
+def rebind_asset_urls(assets: object, repo: str, tag: str) -> dict[str, dict[str, str]]:
+    if not isinstance(assets, dict):
+        raise ValueError("preview build assets must be an object")
+    expected_urls = default_asset_urls(repo, tag)
+    rebound: dict[str, dict[str, str]] = {}
+    for target, entry in assets.items():
+        if target not in expected_urls:
+            raise ValueError(f"preview build contains unexpected asset target: {target}")
+        if not isinstance(entry, dict):
+            raise ValueError(f"preview asset {target} must be an object")
+        rebound[target] = {**entry, "url": expected_urls[target]}
+    return rebound
+
+
+def rebind_retained_builds(builds: dict[str, Any], repo: str) -> dict[str, Any]:
+    rebound = {}
+    for build_id, build in builds.items():
+        if not isinstance(build, dict):
+            raise ValueError(f"preview build {build_id} must be an object")
+        tag = build.get("tag")
+        if not isinstance(tag, str) or not tag:
+            raise ValueError(f"preview build {build_id} tag is missing")
+        rebound[build_id] = {
+            **build,
+            "assets": rebind_asset_urls(build.get("assets"), repo, tag),
+        }
+    return rebound
+
+
+def validate_manifest_repository(manifest: object, repo: str) -> None:
+    if not isinstance(manifest, dict):
+        raise ValueError("preview manifest must be an object")
+    build_id = manifest.get("build_id")
+    builds = manifest.get("builds")
+    if not isinstance(build_id, str) or not isinstance(builds, dict):
+        raise ValueError("preview manifest must contain build_id and builds")
+    current_build = builds.get(build_id)
+    if not isinstance(current_build, dict):
+        raise ValueError("preview manifest current build is missing")
+    current_tag = current_build.get("tag")
+    if not isinstance(current_tag, str) or not current_tag:
+        raise ValueError("preview manifest current build tag is missing")
+
+    def validate_assets(assets: object, tag: str, context: str) -> None:
+        if not isinstance(assets, dict):
+            raise ValueError(f"{context} assets must be an object")
+        expected_urls = default_asset_urls(repo, tag)
+        for target, entry in assets.items():
+            if target not in expected_urls:
+                raise ValueError(f"{context} contains unexpected asset target: {target}")
+            if not isinstance(entry, dict) or entry.get("url") != expected_urls[target]:
+                raise ValueError(
+                    f"{context} asset {target} does not resolve to repository {repo}"
+                )
+
+    validate_assets(manifest.get("assets"), current_tag, "preview manifest")
+    for archived_id, archived_build in builds.items():
+        if not isinstance(archived_build, dict):
+            raise ValueError(f"preview build {archived_id} must be an object")
+        archived_tag = archived_build.get("tag")
+        if not isinstance(archived_tag, str) or not archived_tag:
+            raise ValueError(f"preview build {archived_id} tag is missing")
+        validate_assets(
+            archived_build.get("assets"),
+            archived_tag,
+            f"preview build {archived_id}",
+        )
+
+
 def build_manifest(
     output: Path,
     repo: str,
@@ -259,9 +328,16 @@ def build_manifest(
 ) -> str:
     urls = default_asset_urls(repo, tag)
     assets = asset_objects(urls, shas)
-    current = read_json(output) or {}
-    builds = current.get("builds") if isinstance(current.get("builds"), dict) else {}
-    builds = dict(builds)
+    current = read_json(output)
+    if current is None:
+        builds = {}
+    elif not isinstance(current, dict):
+        raise ValueError("existing preview manifest must be an object")
+    else:
+        builds = current.get("builds")
+        if not isinstance(builds, dict):
+            raise ValueError("existing preview manifest builds must be an object")
+    builds = rebind_retained_builds(dict(builds), repo)
     builds[build_id] = {
         "base_version": normalize_version(base_version),
         "commit": commit,
@@ -358,6 +434,14 @@ def cmd_validate_publication_files(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_manifest_repository(args: argparse.Namespace) -> int:
+    try:
+        validate_manifest_repository(read_json(Path(args.manifest)), args.repo)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Preview channel release helpers")
     sub = parser.add_subparsers(required=True)
@@ -368,13 +452,13 @@ def main() -> int:
     notes.add_argument("--commit", required=True)
     notes.add_argument("--build-id", required=True)
     notes.add_argument("--base-version", required=True)
-    notes.add_argument("--repo", default="herdrdev/herdr")
+    notes.add_argument("--repo", required=True)
     notes.add_argument("--output", required=True)
     notes.set_defaults(func=cmd_notes)
 
     manifest = sub.add_parser("manifest")
     manifest.add_argument("--output", default="website/preview.json")
-    manifest.add_argument("--repo", default="herdrdev/herdr")
+    manifest.add_argument("--repo", required=True)
     manifest.add_argument("--tag", required=True)
     manifest.add_argument("--build-id", required=True)
     manifest.add_argument("--commit", required=True)
@@ -408,6 +492,11 @@ def main() -> int:
 
     publication_files = sub.add_parser("validate-publication-files")
     publication_files.set_defaults(func=cmd_validate_publication_files)
+
+    manifest_repository = sub.add_parser("validate-manifest-repository")
+    manifest_repository.add_argument("--manifest", default="website/preview.json")
+    manifest_repository.add_argument("--repo", required=True)
+    manifest_repository.set_defaults(func=cmd_validate_manifest_repository)
 
     args = parser.parse_args()
     return args.func(args)

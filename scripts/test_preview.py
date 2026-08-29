@@ -80,6 +80,89 @@ class PreviewNotesTests(unittest.TestCase):
                     retain=1,
                 )
 
+    def test_manifest_rebinds_retained_builds_to_requested_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "preview.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        "builds": {
+                            "old": {
+                                "built_at": "2026-06-01T00:00:00Z",
+                                "tag": "preview-old",
+                                "assets": {
+                                    "linux-x86_64": {
+                                        "url": "https://github.com/herdrdev/herdr/releases/download/preview-old/herdr-linux-x86_64",
+                                        "sha256": "a" * 64,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            content = preview.build_manifest(
+                output=output,
+                repo="jerryfane/herdr",
+                tag="preview-new",
+                build_id="new",
+                commit="abcdef",
+                built_at="2026-06-02T00:00:00Z",
+                base_version="0.6.6",
+                protocol=12,
+                notes="test",
+                shas={"windows-x86_64": "b" * 64},
+                retain=30,
+            )
+            manifest = json.loads(content)
+            preview.validate_manifest_repository(manifest, "jerryfane/herdr")
+            self.assertEqual(
+                manifest["builds"]["old"]["assets"]["linux-x86_64"]["url"],
+                "https://github.com/jerryfane/herdr/releases/download/preview-old/herdr-linux-x86_64",
+            )
+
+    def test_manifest_repository_guard_rejects_live_wrong_repository(self):
+        manifest = {
+            "build_id": "new",
+            "assets": {
+                "linux-x86_64": {
+                    "url": "https://github.com/herdrdev/herdr/releases/download/preview-new/herdr-linux-x86_64"
+                }
+            },
+            "builds": {
+                "new": {
+                    "tag": "preview-new",
+                    "assets": {
+                        "linux-x86_64": {
+                            "url": "https://github.com/herdrdev/herdr/releases/download/preview-new/herdr-linux-x86_64"
+                        }
+                    },
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "repository jerryfane/herdr"):
+            preview.validate_manifest_repository(manifest, "jerryfane/herdr")
+
+    def test_manifest_generation_rejects_malformed_retained_builds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "preview.json"
+            output.write_text(json.dumps({"builds": []}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "builds must be an object"):
+                preview.build_manifest(
+                    output=output,
+                    repo="jerryfane/herdr",
+                    tag="preview-new",
+                    build_id="new",
+                    commit="abcdef",
+                    built_at="2026-06-02T00:00:00Z",
+                    base_version="0.6.6",
+                    protocol=12,
+                    notes="test",
+                    shas={"windows-x86_64": "b" * 64},
+                    retain=30,
+                )
+
     def test_hidden_subjects_include_preview_manifest_commits(self):
         self.assertTrue(preview.hidden_subject("docs: publish preview 2026-08-29-deadbeef"))
         self.assertTrue(preview.hidden_subject("docs: update preview manifest"))

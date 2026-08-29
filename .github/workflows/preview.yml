@@ -338,6 +338,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/preview.py notes \
+            --repo "$GITHUB_REPOSITORY" \
             --previous '${{ steps.previous-preview.outputs.range_base }}' \
             --commit '${{ needs.preflight.outputs.commit }}' \
             --build-id '${{ needs.preflight.outputs.build_id }}' \
@@ -401,6 +402,7 @@ jobs:
         run: |
           node website/scripts/docs-preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
           python3 scripts/preview.py manifest \
+            --repo "$GITHUB_REPOSITORY" \
             --output website/preview.json \
             --tag '${{ needs.preflight.outputs.tag }}' \
             --build-id '${{ needs.preflight.outputs.build_id }}' \
@@ -411,6 +413,9 @@ jobs:
             --notes PREVIEW_NOTES.md \
             --sha-file preview-sha256.json \
             --retain 30
+          python3 scripts/preview.py validate-manifest-repository \
+            --manifest website/preview.json \
+            --repo "$GITHUB_REPOSITORY"
           (cd website && bun install --frozen-lockfile)
 
       - name: Prepare preview publication pull request
