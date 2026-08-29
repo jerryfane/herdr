@@ -2,35 +2,65 @@
   "schema_version": 1,
   "channel": "preview",
   "base_version": "0.8.2",
-  "build_id": "2026-08-29-32b2b45b14c7",
-  "commit": "32b2b45b14c73f067f941878ab5fddc033226f2e",
-  "built_at": "2026-08-29T19:22:20Z",
+  "build_id": "2026-08-29-15e730b81633",
+  "commit": "15e730b8163308848a3d5195c519d882e1cec7c0",
+  "built_at": "2026-08-29T21:15:27Z",
   "protocol": 20,
-  "notes": "Preview build 2026-08-29-32b2b45b14c7\n\nBuilt from `32b2b45b14c7` on `master`.\nBase stable: v0.8.2\nCompare: https://github.com/jerryfane/herdr/compare/b5c4a0176e9183924df552eb8aecb94ed5f9e732...32b2b45b14c73f067f941878ab5fddc033226f2e\n\n### Added\n- Transfer sessions between claude and codex\n- Add `herdr pair` so a phone can connect by scanning a QR (#129)\n- Add accounts.remove to unregister an account (#119)\n- Add accounts.create to register a new account (#118)\n- Expose config_dir on accounts.list (#117)\n- Expose status_since_unix_ms for a time-in-state badge (#116)\n- Unarchive --fresh and lost-session guard, list --json (#113)\n- Archive and unarchive agents, preserving the session (#112)\n- Herdr accounts list --json \u2014 offline account-definitions contract (#111)\n- Refuse credential-shaped file attachments on get-file (#110)\n- Add fs.list_dir and agent.kinds read methods (#107)\n- Report the running commit sha in --version and server.staged_update (#106)\n- Server.apply_staged_update \u2014 activate a staged build via live_handoff (#104)\n- Add server.staged_update to report the running + staged build (#102)\n- Stamp a stable store origin id on every gram (#100)\n- Redact credential-looking bodies in gram list (issue #95) (#96)\n- Claude live usage from ratelimit-unified response headers (#91)\n- Derive codex window label from duration + add account email (#90)\n- Live provider usage via background curl fetch + TTL cache (#89)\n- Per-harness account registry + swap an agent onto another subscription (#87)\n- Restart an agent in place \u2014 close its session, reopen with --resume (#86)\n- Per-viewer width leases replace the identity-less size pin (#85)\n- Route pane.send_text and pane.send_input to the owning peer (#84)\n- Reuse ssh connections via controlmaster multiplexing + connect timeout (#83)\n- Hot add/remove peers on reload-config (#82)\n- Federation cross-restart identity \u2014 machine_id, terminal_id, occupant generation (W6) (#80)\n- Federation pane.stream proxy \u2014 watch a remote agent's terminal (W5) (#79)\n- Federation write/read proxy \u2014 drive remote agents (W4) (#78)\n- Federation peer manager \u2014 remote agents in agent.list (W3) (#77)\n- Federation capability allowlist + versioned handshake + hardening (W2) (#76)\n- Federation transport layer \u2014 ApiStream + TCP/SSH client + gated listener (W1) (#75)\n- Add persistent pane.input.stream write channel (#64)\n- Carry workingSince in the live-activity content state (#60)\n- Per-device per-agent mute for notifications (#58)\n- Background live activity updates for the widget (#54)\n- Raise attachment cap to 100 MiB (#52)\n- File attachments and message deletion (P3) (#50)\n- Owner<->agent message channel \u2014 text core (P1) (#48)\n- Add apns remote push sender for agent notifications (#46)\n- Add pane.stream raw pty output firehose (#44)\n- Add pane.set_pty_size api method (#43)\n- Api-bridge accepts the request as a base64 argument (#39)\n- Add api-bridge subcommand for remote API clients (#38)\n- Input_pending pane state + verifiable prompt submission (#5) (#7)\n\n### Fixed\n- Bypass shell aliases for managed resumes (#139)\n- Verify claude imports with codex projection (#138)\n- Let a seat swap to a default-config-home account, and keep its name (#131)\n- Clear a conflicting token when an account sets no override, and report each agent's account (#124)\n- Stop a restart from silently re-homing agents onto the wrong account (#123)\n- Prove a swap target can host an agent before killing the old one (#122)\n- Restore an unarchived agent to its own workspace, tab and label (#121)\n- Spawn the runtime on unarchive instead of deferring it (#120)\n- Clear conflicting auth token on account swap and fail closed on a logged-out target (#115)\n- Migrate the session file on account swap instead of killing the seat (#114)\n- Restore an agent's name across a restart (#101)\n- Launch the primary Claude account as a default install (#99)\n- Refresh the claude oauth token on expiry (#93)\n- Treat allowed_warning as serving, not exhausted (#92)\n- Rank codex session logs by recency within the scan bound (#88)\n- Post-merge cleanup \u2014 id delimiter, sharper pin test, ssh child kill, pin doc (#81)\n- Pane.input.stream text frames send raw, not bracketed-paste (#65)\n- Compile+lint fixes for the merged tree on Windows\n- Leave the alternate screen when an agent process exits (#61)\n- Trim + cap the stored muted-pane set (#59)\n- Use the agent name in notification titles (#57)\n- Bound apns payload size and document register_device (#47)\n- A submitted prompt stops owning the composer it emptied (#33)\n- Re-check pane occupancy before writing the delayed submit key (#32)\n- Build the test target after the AtomicBool -> RenderSignal rename\n- Recognise Claude paste-token composer evidence so pasted deliveries are not reported stalled (#19)\n- Allow dead_code for SelfUpdateHandoff on Windows\n- Keep detected agent identity across hook-authority clear\n\n### Maintenance\n- Bump nixpkgs so crate downloads use the CDN, not the rate-limited API (#130)\n- Stop tracking target-staging build output (#134)\n- Merge upstream/master (v0.8.2) into fork master (#108)\n- Make the proxy peer platform-stable (macos accept flags + close race) (#105)\n- Add Herdrup fork build-from-source install steps (#53)\n- Add standalone herdrup-gram-skill for raw-URL install (#51)\n- Correct causal explanation for the Windows native-throw pin (#14)\n- Make Windows check steps report independently (#11)\n- Run owner-automation workflows only on the canonical repository\n\n### Other\n- Merge pull request #137 from jerryfane/feat/agent-session-transfer\n- Merge pull request #63 from jerryfane/sync/upstream-20260817\n- Merge upstream/master (herdrdev/herdr d2cbcd41) into fork master\n- Merge pull request #27 from jerryfane/sync/upstream-20260731-fix\n- Gitmoot implement adhoc-a3b78581\n- Gitmoot implement adhoc-962d5c5f\n- Staged upstream merge with conflict markers (DO NOT MERGE)\n- Gitmoot merge adhoc-b77950b1\n- Merge pull request #10 from jerryfane/fix/windows-selfupdatehandoff-deadcode\n- Merge pull request #4 from jerryfane/feat/turn-api\n- Gitmoot implement adhoc-9bd7aa33\n- Gitmoot implement adhoc-9bd7aa33",
+  "notes": "Preview build 2026-08-29-15e730b81633\n\nBuilt from `15e730b81633` on `master`.\nBase stable: v0.8.2\nCompare: https://github.com/jerryfane/herdr/compare/32b2b45b14c73f067f941878ab5fddc033226f2e...15e730b8163308848a3d5195c519d882e1cec7c0\n\n### Fixed\n- Install the herdrup fork without a Rust toolchain (#133)\n- Verify preview deployment at public endpoint (#145)\n- Bind preview manifests to release repository (#144)\n- Publish previews with github token (#142)",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-32b2b45b14c7/herdr-linux-x86_64",
-      "sha256": "7a003d33164864078ec38f4015d438fa72683a0538b34436e0b5b3cb336f1676"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-linux-x86_64",
+      "sha256": "e42e25a30befb5fa7997fa46829277823f00134fc667672c1eff8cacee120ed4"
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-32b2b45b14c7/herdr-linux-aarch64",
-      "sha256": "fc1e8880d906b718a0c68f902c7488bbc99110ae668824ffe48710de864e0a0e"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-linux-aarch64",
+      "sha256": "e30cb188cec916fec58a66fa89af86f698dba53a1a7468c55b9220965f2ef099"
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-32b2b45b14c7/herdr-macos-x86_64",
-      "sha256": "a720699ba0231bdf5544f0a4e0169f43e8f143cc939c8c8bca0d62312277e117"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-macos-x86_64",
+      "sha256": "02153d08dd260cd5316cf564cc0d9be1de0f3730f216753df981e000be3a818d"
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-32b2b45b14c7/herdr-macos-aarch64",
-      "sha256": "6a2db17907feda5d38709a5705120d41424b4283739e3d650112bd59509db519"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-macos-aarch64",
+      "sha256": "faf8726ed9fc85fb15cde140be402f6f95836e1ffc8815d176f6b178bd96150e"
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-32b2b45b14c7/herdr-windows-x86_64.zip",
-      "sha256": "e54c25b1e087d86628673e42d51bb7b85674c851e4eaa11e2b237422f70be6cd",
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-windows-x86_64.zip",
+      "sha256": "cf7c2797a0cfc36f2de21cf927d57aa9fb205a633c12da9b6093303597f5c93f",
       "format": "zip"
     }
   },
   "builds": {
+    "2026-08-29-15e730b81633": {
+      "base_version": "0.8.2",
+      "commit": "15e730b8163308848a3d5195c519d882e1cec7c0",
+      "built_at": "2026-08-29T21:15:27Z",
+      "protocol": 20,
+      "tag": "preview-2026-08-29-15e730b81633",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-linux-x86_64",
+          "sha256": "e42e25a30befb5fa7997fa46829277823f00134fc667672c1eff8cacee120ed4"
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-linux-aarch64",
+          "sha256": "e30cb188cec916fec58a66fa89af86f698dba53a1a7468c55b9220965f2ef099"
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-macos-x86_64",
+          "sha256": "02153d08dd260cd5316cf564cc0d9be1de0f3730f216753df981e000be3a818d"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-macos-aarch64",
+          "sha256": "faf8726ed9fc85fb15cde140be402f6f95836e1ffc8815d176f6b178bd96150e"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-29-15e730b81633/herdr-windows-x86_64.zip",
+          "sha256": "cf7c2797a0cfc36f2de21cf927d57aa9fb205a633c12da9b6093303597f5c93f",
+          "format": "zip"
+        }
+      }
+    },
     "2026-08-29-32b2b45b14c7": {
       "base_version": "0.8.2",
       "commit": "32b2b45b14c73f067f941878ab5fddc033226f2e",
