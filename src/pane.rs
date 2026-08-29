@@ -253,6 +253,7 @@ fn active_pending_release(
 async fn publish_state_changed_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
+    runtime_epoch: u64,
     agent: Option<Agent>,
     state: AgentState,
     visible_blocker: bool,
@@ -266,6 +267,7 @@ async fn publish_state_changed_event(
     if let Err(e) = state_events
         .send(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: Some(runtime_epoch),
             agent,
             state,
             visible_blocker,
@@ -283,15 +285,38 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_input_state_changed_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    runtime_epoch: u64,
+    kind: Option<crate::detect::InputPromptKind>,
+) {
+    if let Err(err) = state_events
+        .send(AppEvent::InputStateChanged {
+            pane_id,
+            runtime_epoch: Some(runtime_epoch),
+            kind,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %err,
+            "failed to deliver InputStateChanged event"
+        );
+    }
+}
 async fn publish_agent_process_detected_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
+    runtime_epoch: u64,
     agent: Agent,
     observed_at: std::time::Instant,
 ) {
     if let Err(e) = state_events
         .send(AppEvent::AgentProcessDetected {
             pane_id,
+            runtime_epoch: Some(runtime_epoch),
             agent,
             observed_at,
         })
@@ -324,6 +349,7 @@ async fn publish_input_state_changed_event(
 
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
+    runtime_epoch: u64,
     state: AgentState,
     visible_idle: bool,
     visible_blocker: bool,
@@ -359,6 +385,7 @@ async fn apply_agent_detection_publish_update(
     publish_state_changed_event(
         state_events,
         pane_id,
+        update.runtime_epoch,
         agent,
         update.state,
         update.visible_blocker,
@@ -769,6 +796,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
+    runtime_epoch: u64,
     child_pid: Arc<AtomicU32>,
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
@@ -819,6 +847,7 @@ fn spawn_basic_detection_task(
                         publish_input_state_changed_event(
                             state_events.clone(),
                             pane_id,
+                            runtime_epoch,
                             None,
                         ).await;
                     }
@@ -945,6 +974,7 @@ fn spawn_basic_detection_task(
                             publish_agent_process_detected_event(
                                 state_events.clone(),
                                 pane_id,
+                                runtime_epoch,
                                 agent,
                                 now,
                             )
@@ -964,7 +994,13 @@ fn spawn_basic_detection_task(
             if process_exited || agent.is_none() {
                 last_input_screen_scan_detection_content_seq = input_content_seq;
                 if last_input_prompt_kind.take().is_some() {
-                    publish_input_state_changed_event(state_events.clone(), pane_id, None).await;
+                    publish_input_state_changed_event(
+                        state_events.clone(),
+                        pane_id,
+                        runtime_epoch,
+                        None,
+                    )
+                    .await;
                 }
             } else if input_content_seq != last_input_screen_scan_detection_content_seq
                 || agent_changed
@@ -985,7 +1021,13 @@ fn spawn_basic_detection_task(
                 last_input_screen_scan_detection_content_seq = input_content_seq;
                 if kind != last_input_prompt_kind {
                     last_input_prompt_kind = kind;
-                    publish_input_state_changed_event(state_events.clone(), pane_id, kind).await;
+                    publish_input_state_changed_event(
+                        state_events.clone(),
+                        pane_id,
+                        runtime_epoch,
+                        kind,
+                    )
+                    .await;
                 }
             }
 
@@ -1085,6 +1127,7 @@ fn spawn_basic_detection_task(
                         pane_id,
                         agent,
                         AgentDetectionPublishUpdate {
+                            runtime_epoch,
                             state: new_state,
                             visible_idle,
                             visible_blocker,
@@ -1860,6 +1903,10 @@ impl<'a> PaneShellConfig<'a> {
     }
 }
 
+pub(crate) fn resolved_pane_shell(shell_config: PaneShellConfig<'_>) -> String {
+    pane_shell(shell_config.default_shell)
+}
+
 /// Target platform for shell launch policy. Parameterized (instead of raw
 /// `cfg!` checks at each decision point) so every branch stays testable on
 /// every host platform.
@@ -2422,6 +2469,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let epoch = next_pane_epoch();
 
         let io = {
             let terminal = terminal.clone();
@@ -2490,6 +2538,9 @@ impl PaneRuntime {
                 let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
                     pane_id,
                     exit_reason: crate::platform::ChildExitReason::Handoff,
+                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
+                    pane_id,
+                    runtime_epoch: Some(epoch),
                 }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
@@ -2505,6 +2556,7 @@ impl PaneRuntime {
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
+            epoch,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
@@ -2530,6 +2582,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             compression,
             epoch: next_pane_epoch(),
+            epoch,
             detect_handle: Some(detect_handle),
         })
     }
@@ -2585,6 +2638,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let epoch = next_pane_epoch();
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
@@ -2613,6 +2667,7 @@ impl PaneRuntime {
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
                     pane_id,
                     exit_reason,
+                    runtime_epoch: Some(epoch),
                 })) {
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
                 }
@@ -2764,6 +2819,7 @@ impl PaneRuntime {
                                 publish_input_state_changed_event(
                                     state_events.clone(),
                                     pane_id,
+                                    epoch,
                                     None,
                                 ).await;
                             }
@@ -2931,6 +2987,7 @@ impl PaneRuntime {
                                         publish_agent_process_detected_event(
                                             state_events.clone(),
                                             pane_id,
+                                            epoch,
                                             agent,
                                             now,
                                         )
@@ -2980,8 +3037,13 @@ impl PaneRuntime {
                     if process_exited || agent.is_none() {
                         last_input_screen_scan_detection_content_seq = input_content_seq;
                         if last_input_prompt_kind.take().is_some() {
-                            publish_input_state_changed_event(state_events.clone(), pane_id, None)
-                                .await;
+                            publish_input_state_changed_event(
+                                state_events.clone(),
+                                pane_id,
+                                epoch,
+                                None,
+                            )
+                            .await;
                         }
                     } else if input_content_seq != last_input_screen_scan_detection_content_seq
                         || agent_changed
@@ -3002,8 +3064,13 @@ impl PaneRuntime {
                         last_input_screen_scan_detection_content_seq = input_content_seq;
                         if kind != last_input_prompt_kind {
                             last_input_prompt_kind = kind;
-                            publish_input_state_changed_event(state_events.clone(), pane_id, kind)
-                                .await;
+                            publish_input_state_changed_event(
+                                state_events.clone(),
+                                pane_id,
+                                epoch,
+                                kind,
+                            )
+                            .await;
                         }
                     }
 
@@ -3103,6 +3170,7 @@ impl PaneRuntime {
                                 pane_id,
                                 agent,
                                 AgentDetectionPublishUpdate {
+                                    runtime_epoch: epoch,
                                     state: new_state,
                                     visible_idle,
                                     visible_blocker,
@@ -3149,6 +3217,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             compression,
             epoch: next_pane_epoch(),
+            epoch,
             detect_handle,
         })
     }
@@ -3188,6 +3257,8 @@ impl PaneRuntime {
 
     pub(crate) fn content_seq(&self) -> u64 {
         self.content_seq.load(Ordering::Acquire)
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Attach a `pane.stream` viewer, lazily creating this pane's bounded output
@@ -5920,6 +5991,7 @@ mod tests {
         let publish = publish_state_changed_event(
             tx.clone(),
             pane_id,
+            7,
             Some(Agent::Pi),
             AgentState::Idle,
             false,
@@ -5958,6 +6030,7 @@ mod tests {
             second,
             AppEvent::StateChanged {
                 pane_id: delivered_pane,
+                runtime_epoch: Some(7),
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 visible_blocker: false,

@@ -1220,9 +1220,9 @@ impl App {
         match transfer_state {
             Some((AgentSessionTransferPhase::AwaitingTarget, _, target_kind)) => {
                 let reason = if target_kind == HarnessKind::Codex {
-                    "the Codex target process exited before destination cutover was verified"
+                    "the Codex resume command exited before destination cutover was verified"
                 } else {
-                    "target exited before reporting the verified session"
+                    "the Claude resume command exited before reporting the verified session"
                 };
                 self.begin_agent_session_transfer_rollback(&terminal_id, reason)
             }
@@ -1234,7 +1234,7 @@ impl App {
             Some((AgentSessionTransferPhase::RollingBack, true, _)) => self
                 .fail_agent_session_transfer_rollback_launch(
                     &terminal_id,
-                    "the resumed source exited before reporting its native session",
+                    "the source resume command exited before reporting its native session",
                 ),
             _ => false,
         }

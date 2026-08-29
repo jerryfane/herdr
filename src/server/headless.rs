@@ -2006,6 +2006,396 @@ impl HeadlessServer {
         .unwrap_or_else(|_| "{}".to_string())
     }
 
+    fn forward_api_notification_sound(&mut self, sound: api::schema::NotificationShowSound) {
+        let Some(sound) = sound.to_sound() else {
+            return;
+        };
+        self.send_notify_to_foreground_client(
+            protocol::NotifyKind::Sound,
+            sound_notify_message(sound),
+            None,
+        );
+    }
+
+    /// Handles a single internal event with forwarding logic for clipboard,
+    /// sound, and toast notifications to connected clients.
+    ///
+    /// ALL internal events MUST be routed through this method to ensure
+    /// clipboard/notify forwarding is never bypassed. Do not call
+    /// `self.app.handle_internal_event()` directly for any internal event
+    /// in the headless server — use this method instead.
+    ///
+    /// Returns true if the event changed visual state (requiring a re-render).
+    fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
+        if !self.app.detector_event_runtime_matches(&ev) {
+            if let Some((pane_id, runtime_epoch)) = ev.detector_runtime() {
+                debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored detector event from a retired pane runtime"
+                );
+            }
+            return false;
+        }
+        if let AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch,
+        } = &ev
+        {
+            if !self
+                .app
+                .pane_runtime_epoch_matches(*pane_id, *runtime_epoch)
+            {
+                self.app
+                    .consume_expected_pane_exit_epoch(*pane_id, *runtime_epoch);
+                debug!(
+                    pane = pane_id.raw(),
+                    ?runtime_epoch,
+                    "ignored PaneDied from a retired pane runtime"
+                );
+                return false;
+            }
+        }
+
+        match &ev {
+            AppEvent::TerminalBell { pane_id, count } => {
+                if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
+                    debug!(
+                        pane = pane_id.raw(),
+                        count, "dropped terminal bell without a foreground client"
+                    );
+                }
+                false
+            }
+            AppEvent::ClipboardWrite { content } => {
+                // Clipboard writes are client-local side effects. Forward them only to
+                // the foreground client instead of broadcasting to every attached client.
+                let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+                if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+                    self.app.show_clipboard_feedback();
+                }
+                true
+            }
+            AppEvent::PrefixInputSource { active } => {
+                // Input-source switching is a client-local host side effect; forward it to the
+                // foreground client (which owns the real TIS switch + run-loop pump), like clipboard.
+                self.send_to_foreground_client(ServerMessage::PrefixInputSource {
+                    active: *active,
+                });
+                true
+            }
+            AppEvent::StateChanged { pane_id, agent, .. } => {
+                // Capture toast before handling.
+                let toast_before = self.app.state.toast.clone();
+                let pane_id_val = *pane_id;
+                let agent_val = *agent;
+
+                // Find the previous effective state of this pane before the event
+                // is processed. Notifications must follow effective state changes,
+                // not raw fallback reports that may be masked by hook authority.
+                let prev_state = self.pane_effective_state(pane_id_val);
+                let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
+
+                // Handle the state change (updates pane state, sets toast on AppState).
+                // Headless mode disables local sound playback separately from the
+                // sound policy so reloads can keep server-side notification policy live.
+                self.sync_foreground_client_state();
+                let suppress_completion = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev)
+                    .iter()
+                    .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
+
+                // Forward sound notification to clients when server-side sound policy allows it.
+                let is_active_tab = self
+                    .app
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+                    .is_some_and(|ws| {
+                        ws.find_tab_index_for_pane(pane_id_val)
+                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
+                    });
+
+                let suppress_active_tab_notifications =
+                    self.active_tab_suppresses_notifications(is_active_tab);
+
+                let next_state = self.pane_effective_state(pane_id_val);
+                let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+
+                if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
+                    && self.app.state.sound.allows(agent_val)
+                {
+                    if let Some(sound) =
+                        crate::app::actions::notification_sound_for_state_change_with_agent_labels(
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                            prev_agent_label.as_deref(),
+                            next_agent_label.as_deref(),
+                        )
+                    {
+                        self.send_notify_to_foreground_client(
+                            protocol::NotifyKind::Sound,
+                            sound_notify_message(sound),
+                            None,
+                        );
+                    }
+                }
+
+                let toast_msg = if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
+                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                    } else {
+                        toast_message_from_state_change(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            pane_id_val,
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                            prev_agent_label.as_deref(),
+                        )
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(msg) = toast_msg {
+                    self.send_flat_toast_to_foreground_client(
+                        toast_notify_kind(self.app.state.toast_config.delivery)
+                            .expect("toast forwarding requires a client notification kind"),
+                        msg,
+                    );
+                }
+
+                true
+            }
+            AppEvent::HookStateReported {
+                pane_id,
+                agent_label,
+                ..
+            } => {
+                // Hook reports can be stale or no-op after sequence rejection.
+                // Forward only effective state changes observed after handling.
+                let toast_before = self.app.state.toast.clone();
+                let pane_id_val = *pane_id;
+                let agent_val = crate::detect::parse_agent_label(agent_label);
+
+                // Capture the previous effective state for this pane. Hook reports
+                // are already folded into pane.state; raw hook transitions must not
+                // produce a second notification path.
+                let prev_state = self.pane_effective_state(pane_id_val);
+                let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
+
+                self.sync_foreground_client_state();
+                let suppress_completion = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev)
+                    .iter()
+                    .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
+
+                // Forward sound notification based on the effective transition when
+                // server-side sound policy allows it.
+                let is_active_tab = self
+                    .app
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+                    .is_some_and(|ws| {
+                        ws.find_tab_index_for_pane(pane_id_val)
+                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
+                    });
+
+                let suppress_active_tab_notifications =
+                    self.active_tab_suppresses_notifications(is_active_tab);
+
+                let next_state = self.pane_effective_state(pane_id_val);
+                let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+
+                if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
+                    && self.app.state.sound.allows(agent_val)
+                {
+                    if let Some(sound) =
+                        crate::app::actions::notification_sound_for_state_change_with_agent_labels(
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                            prev_agent_label.as_deref(),
+                            next_agent_label.as_deref(),
+                        )
+                    {
+                        self.send_notify_to_foreground_client(
+                            protocol::NotifyKind::Sound,
+                            sound_notify_message(sound),
+                            None,
+                        );
+                    }
+                }
+
+                let toast_msg = if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
+                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                    } else {
+                        toast_message_from_state_change(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            pane_id_val,
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                            prev_agent_label.as_deref(),
+                        )
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(msg) = toast_msg {
+                    self.send_flat_toast_to_foreground_client(
+                        toast_notify_kind(self.app.state.toast_config.delivery)
+                            .expect("toast forwarding requires a client notification kind"),
+                        msg,
+                    );
+                }
+
+                true
+            }
+            AppEvent::UpdateReady {
+                version,
+                install_command,
+            } => {
+                let toast_before = self.app.state.toast.clone();
+                let version = version.clone();
+                let install_command = install_command.clone();
+
+                self.app.handle_internal_event(ev);
+
+                let toast_msg =
+                    if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+                        if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                            self.app
+                                .state
+                                .toast
+                                .as_ref()
+                                .map(|toast| format!("{}: {}", toast.title, toast.context))
+                        } else {
+                            Some(format!(
+                                "v{version} available: {}",
+                                crate::update::update_install_instruction(&install_command)
+                            ))
+                        }
+                    } else {
+                        None
+                    };
+
+                if let Some(msg) = toast_msg {
+                    self.send_flat_toast_to_foreground_client(
+                        toast_notify_kind(self.app.state.toast_config.delivery)
+                            .expect("toast forwarding requires a client notification kind"),
+                        msg,
+                    );
+                }
+
+                true
+            }
+            AppEvent::PaneDied { pane_id, .. } => {
+                let pane_id_val = *pane_id;
+                let terminal_id = self.app.state.workspaces.iter().find_map(|ws| {
+                    ws.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .get(pane_id)
+                            .map(|pane| pane.attached_terminal_id.to_string())
+                    })
+                });
+                if let Some(update) = self
+                    .app
+                    .state
+                    .publish_pane_process_exit_if_agent(pane_id_val)
+                {
+                    self.app.emit_pane_state_update(&update);
+                    self.forward_pane_state_update_notifications_to_clients(&update);
+                }
+
+                self.app.handle_internal_event(ev);
+
+                if self.app.find_pane(pane_id_val).is_none() {
+                    if let Some(terminal_id) = terminal_id {
+                        self.shutdown_terminal_stream_clients(
+                            &terminal_id,
+                            format!("terminal {terminal_id} exited"),
+                        );
+                    }
+                }
+
+                true
+            }
+            _ => self.app.handle_internal_event_with_render_impact(ev),
+        }
+    }
+
+    /// Drains internal events, forwarding clipboard, sound, and toast
+    /// notifications to connected clients instead of processing them locally.
+    ///
+    /// In the monolithic mode:
+    /// - `ClipboardWrite` events are written to stdout via `write_osc52_bytes`.
+    /// - Sound notifications are played locally via `sound::play`.
+    /// - Toast notifications are set on AppState and rendered into the frame.
+    ///
+    /// In the headless server, there is no stdout terminal or audio subsystem,
+    /// so we:
+    /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the
+    ///   foreground client only.
+    /// - Detect when a sound would be played and forward as
+    ///   `ServerMessage::Notify { kind: Sound }` to the foreground client.
+    /// - Detect when a toast is set on AppState and forward as
+    ///   `ServerMessage::Notify` to the foreground client for terminal/system delivery.
+    fn drain_internal_events_with_forwarding(&mut self) -> bool {
+        self.drain_internal_events_with_forwarding_up_to(crate::app::APP_EVENT_DRAIN_LIMIT)
+            .1
+    }
+
+    fn drain_all_internal_events_with_forwarding(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let (had_event, batch_changed) =
+                self.drain_internal_events_with_forwarding_up_to(crate::app::APP_EVENT_DRAIN_LIMIT);
+            changed |= batch_changed;
+            if !had_event || self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        changed
+    }
+
+    fn drain_internal_events_with_forwarding_up_to(&mut self, limit: usize) -> (bool, bool) {
+        let mut had_event = false;
+        let mut changed = false;
+        for _ in 0..limit {
+            let Ok(ev) = self.app.event_rx.try_recv() else {
+                break;
+            };
+            had_event = true;
+            changed |= self.handle_internal_event_with_forwarding(ev);
+        }
+        (had_event, changed)
+    }
     fn drain_client_config_reload_request(&mut self) {
         if !self.app.state.request_client_config_reload {
             return;

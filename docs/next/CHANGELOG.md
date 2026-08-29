@@ -24,6 +24,7 @@
 - Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.
 
 ### Fixed
+- Managed Claude Code and Codex session resumes now bypass shell aliases and functions in common POSIX shells, Fish, PowerShell, cmd, and Git Bash while preserving shell-initialized PATH; transfer launch failures in those shells are detected immediately and restore the source instead of waiting for the launch deadline.
 - Remote typing, switching, and popup interaction no longer resend the entire pane screen for small changes. Busy SSH sessions use less bandwidth, and idle attached clients avoid unnecessary redraw work. (#3769, #3745, #3822)
 - A stalled SSH machine no longer traps the client away from Local. Clicking a local workspace or agent cancels the unfinished remote switch, and a recovered remote workspace refreshes without an away-and-back selection. Stale screens from before a reconnect are not reused. (#3903, #3842)
 - Idle SSH connections use less CPU without losing final output. Repeated connection failures back off instead of reconnecting rapidly, and supported idle bridges clean up without stopping remote panes. (#3728, #4083)

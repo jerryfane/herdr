@@ -468,6 +468,7 @@ mod tests {
             .clone();
         let started_at = std::time::Instant::now();
         state.handle_app_event(crate::events::AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
@@ -536,6 +537,7 @@ mod tests {
             panic!("confirmed idle should publish exactly once");
         };
         state.handle_app_event(crate::events::AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Codex),
             state: completed_state,

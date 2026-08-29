@@ -997,6 +997,9 @@ action = "bootstrap"
 
     #[test]
     fn plugin_link_creates_stable_config_and_state_dirs() {
+        // Env-dependent paths: hold the shared config env lock so another test
+        // cannot move HOME/XDG between resolving these dirs and asserting on them.
+        let _env_guard = crate::config::test_config_env_lock().lock();
         let mut app = test_app();
         let root = unique_temp_path("plugin-link-dirs");
         let config_dir = super::env::plugin_config_dir("example.config-dirs");
@@ -1026,6 +1029,9 @@ platforms = ["linux", "macos", "windows"]
 
     #[test]
     fn plugin_link_seeds_stable_config_dir_from_legacy_unhashed_dir() {
+        // Env-dependent paths: hold the shared config env lock so another test
+        // cannot move HOME/XDG between resolving these dirs and asserting on them.
+        let _env_guard = crate::config::test_config_env_lock().lock();
         let mut app = test_app();
         let root = unique_temp_path("plugin-link-legacy-config");
         let config_dir = super::env::plugin_config_dir("example.legacy-config");
@@ -1966,6 +1972,13 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
     #[cfg(unix)]
     #[tokio::test]
     async fn plugin_pane_open_injects_plugin_paths_and_protects_overrides() {
+        // Same race as manifest_action_invoke_injects_plugin_paths: the child
+        // captures these dirs at spawn while other tests mutate HOME/XDG, so the
+        // expectation is snapshotted here, under the shared config env lock,
+        // instead of recomputed at assert time.
+        let _env_guard = crate::config::test_config_env_lock().lock();
+        let expected_config_dir = crate::config::config_dir();
+        let expected_state_dir = crate::config::state_dir();
         let mut app = test_app();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-path-env")];
         app.state.ensure_test_terminals();
@@ -2033,7 +2046,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
         assert_eq!(
             lines.next(),
             Some(
-                crate::config::config_dir()
+                expected_config_dir
                     .join("plugins")
                     .join("config")
                     .join("example.path-env")
@@ -2045,7 +2058,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
         assert_eq!(
             lines.next(),
             Some(
-                crate::config::state_dir()
+                expected_state_dir
                     .join("plugins")
                     .join("example.path-env")
                     .display()
@@ -2405,6 +2418,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id: opened_pane_id,
+            runtime_epoch: None,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
         assert!(app.state.popup_pane.is_none());
@@ -2563,7 +2577,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
     #[test]
     fn non_cli_plugin_consumers_refresh_global_enabled_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-global-refresh");
         std::env::set_var("XDG_CONFIG_HOME", &base);
@@ -2725,6 +2739,14 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_ACTION_ID\""]
     #[cfg(unix)]
     #[test]
     fn manifest_action_invoke_injects_plugin_paths() {
+        // The child process captures HERDR_PLUGIN_CONFIG_DIR / _STATE_DIR at spawn,
+        // so the expectation has to be captured at the same moment and under the
+        // same lock. Recomputing `config_dir()` at assert time races every other
+        // test that mutates HOME/XDG, which is why this passed alone and failed in
+        // the full suite.
+        let _env_guard = crate::config::test_config_env_lock().lock();
+        let expected_config_dir = crate::config::config_dir();
+        let expected_state_dir = crate::config::state_dir();
         let mut app = test_app();
         let root = unique_temp_path("plugin-action-path-env");
         write_manifest_content(
@@ -2787,7 +2809,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
         assert_eq!(
             lines.next(),
             Some(
-                crate::config::config_dir()
+                expected_config_dir
                     .join("plugins")
                     .join("config")
                     .join("example.action-paths")
@@ -2799,7 +2821,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
         assert_eq!(
             lines.next(),
             Some(
-                crate::config::state_dir()
+                expected_state_dir
                     .join("plugins")
                     .join("example.action-paths")
                     .display()
@@ -3646,6 +3668,7 @@ command = ["sh", "-c", "echo ok"]
 
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id,
+            runtime_epoch: None,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
 

@@ -17,6 +17,10 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.0.epoch()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

@@ -29,6 +29,16 @@ impl App {
 
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+            if let Some(pane_id) = self.state.workspaces.iter().find_map(|workspace| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(pane_id, pane)| {
+                        (pane.attached_terminal_id == terminal_id).then_some(*pane_id)
+                    })
+                })
+            }) {
+                self.expected_pane_exit_epochs
+                    .insert(pane_id, runtime.epoch());
+            }
             runtime.shutdown();
         }
     }
