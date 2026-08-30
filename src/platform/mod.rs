@@ -203,6 +203,34 @@ pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<std
     options.open(path)
 }
 
+/// One executable that can answer `tailscale ip -4` on this platform.
+///
+/// macOS has more than one legitimate installation layout, including an app-bundle
+/// binary that needs `TAILSCALE_BE_CLI=1`. Keeping the candidates and their environment
+/// here prevents pairing policy from growing target-specific branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TailscaleCliCandidate {
+    pub(crate) program: std::path::PathBuf,
+    pub(crate) force_cli_mode: bool,
+}
+
+impl TailscaleCliCandidate {
+    pub(crate) fn new(program: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            force_cli_mode: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn app_bundle(program: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            force_cli_mode: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteSshConfigPaths {
     pub(crate) user_config: Option<std::path::PathBuf>,

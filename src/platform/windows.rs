@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
@@ -1985,6 +1988,52 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
             result as isize
         )))
     }
+}
+
+pub(crate) fn open_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    let operation = wide_null("open");
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize > 32 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::other(format!(
+            "failed to open file with ShellExecuteW: code {}",
+            result as isize
+        )))
+    }
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![super::TailscaleCliCandidate::new("tailscale")]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "LAN pairing is not available on Windows in this build. Connect Tailscale and run `herdr pair` without `--lan`.",
+    ))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (unavailable on Windows)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Start the Windows OpenSSH Server service, then run `herdr pair` again."
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {

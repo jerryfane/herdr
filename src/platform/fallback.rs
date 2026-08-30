@@ -227,6 +227,32 @@ pub fn open_url(_url: &str) -> std::io::Result<Option<std::process::Child>> {
     ))
 }
 
+pub(crate) fn open_path(_path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening files is not supported on this platform",
+    ))
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![super::TailscaleCliCandidate::new("tailscale")]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "LAN pairing is not available on this platform in this build.",
+    ))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (unavailable on this platform)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Enable the SSH server, then run `herdr pair` again."
+}
+
 /// Unsupported platform stub.
 // Windows does not wire clipboard-image bridging into semantic input yet.
 #[cfg_attr(windows, allow(dead_code))]

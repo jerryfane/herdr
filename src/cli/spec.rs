@@ -142,10 +142,12 @@ fn pair_command() -> Command {
              reachable from the internet. The QR carries a single-use code that stops \
              working the moment it is redeemed.",
         )
+        .arg(flag("lan").help(crate::platform::lan_pairing_help()))
+        .arg(flag("open").help("Open a clean QR image and also print it in the terminal"))
         .arg(
-            flag("lan").help(
-                "Pair over a private local network instead of Tailscale (RFC1918 only; a public address is refused)",
-            ),
+            option("qr-file", "PATH")
+                .value_hint(ValueHint::FilePath)
+                .help("Write the pairing QR as an SVG without overwriting an existing file"),
         )
         .arg(
             option("ttl", "SECONDS")
@@ -1429,6 +1431,17 @@ mod tests {
             path.join(" ")
         );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn pair_help_exposes_both_non_terminal_qr_paths() {
+        let help = long_help(&["pair"]);
+        assert!(help.contains("--open"), "missing open-QR option: {help}");
+        assert!(
+            help.contains("--qr-file <PATH>"),
+            "missing SVG file option: {help}"
+        );
+        assert!(help.contains(crate::platform::lan_pairing_help()));
     }
 
     #[test]

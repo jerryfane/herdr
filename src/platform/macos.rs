@@ -541,6 +541,47 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
         .map(Some)
 }
 
+pub(crate) fn open_path(path: &Path) -> std::io::Result<Option<std::process::Child>> {
+    let status = Command::new("/usr/bin/open")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(None)
+    } else {
+        Err(std::io::Error::other(format!(
+            "macOS open exited with {status}"
+        )))
+    }
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![
+        super::TailscaleCliCandidate::new("tailscale"),
+        super::TailscaleCliCandidate::new("/usr/local/bin/tailscale"),
+        super::TailscaleCliCandidate::app_bundle(
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        ),
+    ]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "LAN pairing is not available on macOS in this build. Connect Tailscale and run `herdr pair` without `--lan`.",
+    ))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (Linux only; unavailable on macOS)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Turn on System Settings > General > Sharing > Remote Login, then run `herdr pair` again."
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     let path = std::env::temp_dir().join(format!(
         "herdr-clipboard-image-{}-{}.png",
@@ -1006,6 +1047,36 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailscale_search_order_covers_path_cli_integration_and_app_store() {
+        let candidates = tailscale_cli_candidates();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.program.to_string_lossy().into_owned(),
+                    candidate.force_cli_mode,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tailscale".into(), false),
+                ("/usr/local/bin/tailscale".into(), false),
+                (
+                    "/Applications/Tailscale.app/Contents/MacOS/Tailscale".into(),
+                    true,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_lan_pairing_refuses_with_the_real_platform_cause() {
+        let error = private_lan_ipv4().expect_err("macOS LAN pairing is not implemented");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("not available on macOS"));
+        assert!(lan_pairing_help().contains("Linux only"));
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
