@@ -24,6 +24,12 @@ const TRANSFER_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45);
 // after the window can still follow an otherwise verified cutover.
 const TRANSFER_BLOCKER_OBSERVATION_DELAY: Duration = Duration::from_secs(1);
 
+struct TransferAccountRoute {
+    config_home: PathBuf,
+    sessions_root: PathBuf,
+    launch_env: crate::config::AccountLaunchEnv,
+}
+
 impl App {
     pub(super) fn handle_agent_transfer_session(
         &mut self,
@@ -68,6 +74,8 @@ impl App {
             transfer_active,
             cwd,
             source_transcript_path,
+            source_cursor,
+            source_process_pid,
         ) = {
             let Some(terminal) = self.state.terminals.get(&terminal_id) else {
                 return encode_error(id, "agent_not_found", "agent was not found");
@@ -81,7 +89,13 @@ impl App {
             };
             let source_transcript_path = terminal
                 .reported_agent_session_path_for(&source, &agent, &session_ref)
-                .map(PathBuf::from);
+                .map(PathBuf::from)
+                .or_else(|| {
+                    (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
+                        .then(|| PathBuf::from(&session_ref.value))
+                });
+            let source_runtime =
+                terminal.reported_agent_session_runtime_for(&source, &agent, &session_ref);
             (
                 source,
                 agent,
@@ -103,6 +117,8 @@ impl App {
                 }),
                 live_cwd.unwrap_or_else(|| terminal.cwd.clone()),
                 source_transcript_path,
+                source_runtime.and_then(|runtime| runtime.cursor.clone()),
+                source_runtime.and_then(|runtime| runtime.process_pid),
             )
         };
         if source_state != AgentState::Idle || launch_pending {
@@ -119,20 +135,29 @@ impl App {
                 "this agent already has a session transfer in progress",
             );
         }
-        if source_session_ref.kind != crate::agent_resume::AgentSessionRefKind::Id {
-            return encode_error(
-                id,
-                "unsupported_session_reference",
-                "only native Claude Code and Codex session ids can be transferred",
-            );
-        }
         let Some(source_kind) = HarnessKind::from_agent_label(&source_agent) else {
             return encode_error(
                 id,
                 "unsupported_source_harness",
-                "agent session transfer supports only Claude Code and Codex",
+                "agent session transfer supports Claude Code, Codex, and OMP",
             );
         };
+        let expected_ref_kind = if source_kind == HarnessKind::Omp {
+            crate::agent_resume::AgentSessionRefKind::Path
+        } else {
+            crate::agent_resume::AgentSessionRefKind::Id
+        };
+        if source_session_ref.kind != expected_ref_kind {
+            return encode_error(
+                id,
+                "unsupported_session_reference",
+                format!(
+                    "{} session transfer requires a native {:?} reference",
+                    source_kind.label(),
+                    expected_ref_kind
+                ),
+            );
+        }
         if source != source_kind.source() {
             return encode_error(
                 id,
@@ -149,19 +174,47 @@ impl App {
             );
         }
 
-        let (source_config_home, _) =
+        let source_route =
             match self.resolve_transfer_account(source_kind, source_account.as_deref()) {
                 Ok(resolved) => resolved,
                 Err(error) => return encode_error_body(id, error),
             };
-        let (target_config_home, target_launch_env) =
+        let target_route =
             match self.resolve_transfer_account(target_kind, params.account.as_deref()) {
                 Ok(resolved) => resolved,
                 Err(error) => return encode_error_body(id, error),
             };
+        if source_kind == HarnessKind::Omp {
+            let (Some(cursor), Some(process_pid)) = (source_cursor.as_deref(), source_process_pid)
+            else {
+                return encode_error(
+                    id,
+                    "omp_session_proof_missing",
+                    "the official OMP integration has not reported its active leaf and process PID; update the integration and retry",
+                );
+            };
+            let foreground_job = self
+                .terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|runtime| runtime.child_pid())
+                .and_then(crate::detect::foreground_job);
+            if foreground_job
+                .as_ref()
+                .and_then(|job| crate::session_transfer::omp_reported_process(job, process_pid))
+                != Some(process_pid)
+            {
+                return encode_error(
+                    id,
+                    "omp_session_process_mismatch",
+                    format!(
+                        "OMP reported process {process_pid} for leaf {cursor}, but that PID is not the current foreground OMP process"
+                    ),
+                );
+            }
+        }
         if target_kind == HarnessKind::Claude {
             if let Some(blocker) = super::agents::claude_account_launch_blocker(
-                target_config_home.to_string_lossy().as_ref(),
+                target_route.config_home.to_string_lossy().as_ref(),
                 Some(cwd.to_string_lossy().as_ref()),
             ) {
                 return encode_error(
@@ -186,17 +239,22 @@ impl App {
             source_kind,
             source_session: source_session.clone(),
             source_account: source_account.clone(),
-            source_config_home: source_config_home.clone(),
+            source_config_home: source_route.config_home.clone(),
+            source_sessions_root: source_route.sessions_root.clone(),
+            source_cursor: source_cursor.clone(),
+            source_process_pid,
             target_kind,
             target_account: params.account.clone(),
-            target_config_home: target_config_home.clone(),
+            target_config_home: target_route.config_home.clone(),
+            target_sessions_root: target_route.sessions_root.clone(),
             phase: AgentSessionTransferPhase::Preparing,
             message_count: 0,
             omissions: OmissionSummary::default(),
             error: None,
             source_path: None,
             source_fingerprint: None,
-            target_session_id: None,
+            target_session_ref: None,
+            target_cursor: None,
             target_transcript_path: None,
             target_fingerprint: None,
             target_deadline: None,
@@ -205,6 +263,7 @@ impl App {
             verification_in_flight: None,
             verification_observation_deadline: None,
             awaiting_deferred_target_report: false,
+            target_report_accepted: false,
         };
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.session_transfer = Some(transfer);
@@ -215,12 +274,14 @@ impl App {
 
         let request = PrepareRequest {
             source_kind,
-            source_config_home,
-            source_session_id: source_session_ref.value,
+            source_sessions_root: source_route.sessions_root,
+            source_session_ref,
+            source_cursor,
             source_transcript_path,
             target_kind,
-            target_config_home,
-            target_launch_env,
+            target_config_home: target_route.config_home,
+            target_sessions_root: target_route.sessions_root,
+            target_launch_env: target_route.launch_env,
             cwd,
             timeout: TRANSFER_PREPARE_TIMEOUT,
         };
@@ -374,24 +435,17 @@ impl App {
             return encode_error(id, "session_transfer_changed", reason);
         }
 
-        let Some(target_session_id) = transfer.target_session_id.as_ref() else {
+        let Some(target_ref) = transfer.target_session_ref.as_ref() else {
             return encode_error(
                 id,
                 "session_transfer_failed",
-                "the prepared transfer is missing its target session id",
-            );
-        };
-        let Some(target_ref) = AgentSessionRef::id(target_session_id.clone()) else {
-            return encode_error(
-                id,
-                "session_transfer_failed",
-                "the staged target returned an invalid session id",
+                "the prepared transfer is missing its typed target session reference",
             );
         };
         let Some(plan) = crate::agent_resume::plan(
             transfer.target_kind.source(),
             transfer.target_kind.label(),
-            &target_ref,
+            target_ref,
         ) else {
             return encode_error(
                 id,
@@ -415,16 +469,16 @@ impl App {
         let event_tx = self.event_tx.clone();
         let worker_terminal_id = terminal_id.clone();
         let worker_transfer_id = transfer.id.clone();
-        let source_config_home = transfer.source_config_home.clone();
-        let target_config_home = transfer.target_config_home.clone();
+        let source_sessions_root = transfer.source_sessions_root.clone();
+        let target_sessions_root = transfer.target_sessions_root.clone();
         let worker = std::thread::Builder::new()
             .name(format!("herdr-session-cutover-{}", transfer.id))
             .spawn(move || {
                 let result = crate::session_transfer::verify_unchanged_transcripts(
-                    &source_config_home,
+                    &source_sessions_root,
                     &source_path,
                     &source_fingerprint,
-                    &target_config_home,
+                    &target_sessions_root,
                     &target_path,
                     &target_fingerprint,
                 );
@@ -472,24 +526,27 @@ impl App {
         kind: HarnessKind,
         account: Option<&str>,
         expected_home: &std::path::Path,
+        expected_sessions_root: &std::path::Path,
         role: &str,
     ) -> Result<crate::config::AccountLaunchEnv, String> {
-        let (current_home, launch_env) =
-            self.resolve_transfer_account(kind, account)
-                .map_err(|error| {
-                    format!(
-                        "{role} account routing is no longer available: {}",
-                        error.message
-                    )
-                })?;
-        if current_home != expected_home {
+        let route = self
+            .resolve_transfer_account(kind, account)
+            .map_err(|error| {
+                format!(
+                    "{role} account routing is no longer available: {}",
+                    error.message
+                )
+            })?;
+        if route.config_home != expected_home || route.sessions_root != expected_sessions_root {
             return Err(format!(
-                "{role} account routing changed from {} to {}; cutover was refused",
+                "{role} account routing changed from config {} / sessions {} to config {} / sessions {}; cutover was refused",
                 expected_home.display(),
-                current_home.display()
+                expected_sessions_root.display(),
+                route.config_home.display(),
+                route.sessions_root.display(),
             ));
         }
-        Ok(launch_env)
+        Ok(route.launch_env)
     }
 
     fn verify_transfer_account_routes(
@@ -500,12 +557,14 @@ impl App {
             transfer.source_kind,
             transfer.source_account.as_deref(),
             &transfer.source_config_home,
+            &transfer.source_sessions_root,
             "source",
         )?;
         self.resolve_unchanged_transfer_account(
             transfer.target_kind,
             transfer.target_account.as_deref(),
             &transfer.target_config_home,
+            &transfer.target_sessions_root,
             "target",
         )?;
         Ok(())
@@ -515,14 +574,36 @@ impl App {
         &self,
         kind: HarnessKind,
         account_id: Option<&str>,
-    ) -> Result<(PathBuf, crate::config::AccountLaunchEnv), ErrorBody> {
+    ) -> Result<TransferAccountRoute, ErrorBody> {
         let Some(account_id) = account_id else {
+            if kind == HarnessKind::Omp
+                && ["OMP_PROFILE", "PI_PROFILE"].into_iter().any(|key| {
+                    std::env::var_os(key).is_some_and(|value| {
+                        let value = value.to_string_lossy();
+                        !value.trim().is_empty() && value.trim() != "default"
+                    })
+                })
+            {
+                return Err(ErrorBody {
+                    code: "omp_profile_unsupported".into(),
+                    message: "OMP named profiles are not supported by agent session transfer yet; use the default profile or a Herdr OMP account".into(),
+                });
+            }
             let config_home =
                 crate::config::default_config_dir(kind.label()).ok_or_else(|| ErrorBody {
                     code: "config_home_unavailable".into(),
                     message: format!("could not resolve the default {} config home", kind.label()),
                 })?;
-            return Ok((config_home, crate::config::AccountLaunchEnv::unselected()));
+            let sessions_root = if kind == HarnessKind::Omp {
+                crate::config::omp_sessions_dir(&config_home)
+            } else {
+                config_home.clone()
+            };
+            return Ok(TransferAccountRoute {
+                config_home,
+                sessions_root,
+                launch_env: crate::config::AccountLaunchEnv::unselected(),
+            });
         };
         let account = self
             .loaded_accounts
@@ -546,7 +627,17 @@ impl App {
             code: "unknown_account".into(),
             message: format!("account {account_id} has no supported config-home routing"),
         })?;
-        Ok((PathBuf::from(&account.config_dir), env))
+        let config_home = PathBuf::from(&account.config_dir);
+        let sessions_root = if kind == HarnessKind::Omp {
+            crate::config::omp_sessions_dir(&config_home)
+        } else {
+            config_home.clone()
+        };
+        Ok(TransferAccountRoute {
+            config_home,
+            sessions_root,
+            launch_env: env,
+        })
     }
 
     pub(crate) fn handle_agent_session_transfer_prepared(
@@ -628,7 +719,8 @@ impl App {
             transfer.omissions = prepared.staged.transcript.omissions;
             transfer.source_path = Some(prepared.source_path);
             transfer.source_fingerprint = Some(prepared.source_fingerprint);
-            transfer.target_session_id = Some(prepared.staged.session_id);
+            transfer.target_session_ref = Some(prepared.staged.session_ref);
+            transfer.target_cursor = prepared.staged.cursor;
             transfer.target_transcript_path = Some(prepared.staged.transcript_path);
             transfer.target_fingerprint = Some(prepared.staged.transcript.fingerprint);
             transfer.error = None;
@@ -694,20 +786,46 @@ impl App {
             return false;
         }
 
-        let Some(target_session_id) = snapshot.target_session_id.as_ref() else {
+        let Some(target_ref) = snapshot.target_session_ref.clone() else {
             self.fail_session_transfer_before_cutover(
                 &terminal_id,
-                "the verified transfer is missing its target session id",
+                "the verified transfer is missing its typed target session reference",
             );
             return false;
         };
-        let Some(target_ref) = AgentSessionRef::id(target_session_id.clone()) else {
-            self.fail_session_transfer_before_cutover(
-                &terminal_id,
-                "the verified target returned an invalid session id",
-            );
-            return false;
-        };
+        if snapshot.source_kind == HarnessKind::Omp {
+            let source_proof_still_current = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| {
+                    terminal.reported_agent_session_runtime_for(
+                        &snapshot.source_session.source,
+                        &snapshot.source_session.agent,
+                        &snapshot.source_session.session_ref,
+                    )
+                })
+                .is_some_and(|proof| {
+                    proof.cursor == snapshot.source_cursor
+                        && proof.process_pid == snapshot.source_process_pid
+                });
+            let process_still_current = snapshot.source_process_pid.is_some_and(|pid| {
+                self.terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(|runtime| runtime.child_pid())
+                    .and_then(crate::detect::foreground_job)
+                    .as_ref()
+                    .and_then(|job| crate::session_transfer::omp_reported_process(job, pid))
+                    == Some(pid)
+            });
+            if !source_proof_still_current || !process_still_current {
+                self.fail_session_transfer_before_cutover(
+                    &terminal_id,
+                    "OMP active leaf or foreground process changed during confirmation; source stayed running",
+                );
+                return false;
+            }
+        }
         let Some(plan) = crate::agent_resume::plan(
             snapshot.target_kind.source(),
             snapshot.target_kind.label(),
@@ -723,6 +841,7 @@ impl App {
             snapshot.target_kind,
             snapshot.target_account.as_deref(),
             &snapshot.target_config_home,
+            &snapshot.target_sessions_root,
             "target",
         ) {
             Ok(env) => env.vars,
@@ -801,6 +920,7 @@ impl App {
                 transfer.verification_in_flight = None;
                 transfer.verification_observation_deadline = None;
                 transfer.awaiting_deferred_target_report = false;
+                transfer.target_report_accepted = false;
             }
             transfer.target_deadline = Some(Instant::now() + TRANSFER_LAUNCH_TIMEOUT);
         }
@@ -832,10 +952,12 @@ impl App {
         let source_kind = transfer.source_kind;
         let source_account = transfer.source_account.clone();
         let source_config_home = transfer.source_config_home.clone();
+        let source_sessions_root = transfer.source_sessions_root.clone();
         let source_env = match self.resolve_unchanged_transfer_account(
             source_kind,
             source_account.as_deref(),
             &source_config_home,
+            &source_sessions_root,
             "source rollback",
         ) {
             Ok(env) => env.vars,
@@ -945,6 +1067,8 @@ impl App {
         source: &str,
         agent_label: &str,
         session_ref: Option<&AgentSessionRef>,
+        session_cursor: Option<&str>,
+        process_pid: Option<u32>,
         accepted: bool,
     ) {
         if !accepted {
@@ -963,30 +1087,48 @@ impl App {
             return;
         };
         let phase = transfer.phase;
-        let expected = match phase {
+        let (expected_source, expected_agent, expected_ref, expected_kind, trust_root) = match phase
+        {
             AgentSessionTransferPhase::AwaitingTarget => (
                 transfer.target_kind.source(),
                 transfer.target_kind.label(),
-                transfer.target_session_id.as_deref(),
+                transfer.target_session_ref.as_ref(),
+                transfer.target_kind,
+                transfer.target_sessions_root.clone(),
             ),
             AgentSessionTransferPhase::Completed if transfer.awaiting_deferred_target_report => (
                 transfer.target_kind.source(),
                 transfer.target_kind.label(),
-                transfer.target_session_id.as_deref(),
+                transfer.target_session_ref.as_ref(),
+                transfer.target_kind,
+                transfer.target_sessions_root.clone(),
             ),
             AgentSessionTransferPhase::RollingBack => (
                 transfer.source_session.source.as_str(),
                 transfer.source_session.agent.as_str(),
-                Some(transfer.source_session.session_ref.value.as_str()),
+                Some(&transfer.source_session.session_ref),
+                transfer.source_kind,
+                transfer.source_sessions_root.clone(),
             ),
             _ => return,
         };
-        let report_matches = source == expected.0
-            && agent_label == expected.1
-            && session_ref.is_some_and(|session_ref| {
-                session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
-                    && Some(session_ref.value.as_str()) == expected.2
-            });
+        let normalized_report_ref = session_ref.and_then(|reported| {
+            if expected_kind != HarnessKind::Omp {
+                return Some(reported.clone());
+            }
+            if reported.kind != crate::agent_resume::AgentSessionRefKind::Path {
+                return None;
+            }
+            crate::session_transfer::validate_transcript_path(
+                &trust_root,
+                std::path::Path::new(&reported.value),
+            )
+            .ok()
+            .and_then(|path| AgentSessionRef::path(path.to_string_lossy().into_owned()))
+        });
+        let report_matches = source == expected_source
+            && agent_label == expected_agent
+            && normalized_report_ref.as_ref() == expected_ref;
         if !report_matches {
             if phase == AgentSessionTransferPhase::AwaitingTarget
                 || phase == AgentSessionTransferPhase::Completed
@@ -1017,6 +1159,83 @@ impl App {
             }
             return;
         }
+
+        if expected_kind == HarnessKind::Omp {
+            let (Some(cursor), Some(process_pid)) = (session_cursor, process_pid) else {
+                if phase == AgentSessionTransferPhase::RollingBack {
+                    self.fail_agent_session_transfer_rollback_launch(
+                        &terminal_id,
+                        "the official OMP source report omitted its active leaf or process PID",
+                    );
+                } else {
+                    self.begin_agent_session_transfer_rollback(
+                        &terminal_id,
+                        "the official OMP target report omitted its active leaf or process PID",
+                    );
+                }
+                return;
+            };
+            let foreground_job = self
+                .terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|runtime| runtime.child_pid())
+                .and_then(crate::detect::foreground_job);
+            if foreground_job
+                .as_ref()
+                .and_then(|job| crate::session_transfer::omp_reported_process(job, process_pid))
+                != Some(process_pid)
+            {
+                if phase == AgentSessionTransferPhase::RollingBack {
+                    self.fail_agent_session_transfer_rollback_launch(
+                        &terminal_id,
+                        format!("OMP source report named PID {process_pid}, which is not the current foreground OMP process"),
+                    );
+                } else {
+                    self.begin_agent_session_transfer_rollback(
+                        &terminal_id,
+                        format!("OMP target report named PID {process_pid}, which is not the current foreground OMP process"),
+                    );
+                }
+                return;
+            }
+            let now = Instant::now();
+            if let Some(transfer) = self
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .and_then(|terminal| terminal.session_transfer.as_mut())
+            {
+                let proof = VerifiedTargetProcess {
+                    pid: process_pid,
+                    observed_at: now,
+                };
+                match phase {
+                    AgentSessionTransferPhase::AwaitingTarget => {
+                        transfer.target_cursor = Some(cursor.to_string());
+                        transfer.target_process = Some(proof);
+                        transfer.target_report_accepted = true;
+                    }
+                    AgentSessionTransferPhase::RollingBack => {
+                        transfer.source_cursor = Some(cursor.to_string());
+                        transfer.source_rollback_process = Some(proof);
+                    }
+                    _ => {}
+                }
+            }
+            self.schedule_session_save();
+            self.reconcile_codex_session_transfer_readiness_with_job(
+                &terminal_id,
+                now,
+                foreground_job.as_ref(),
+            );
+            self.reconcile_codex_session_transfer_rollback_with_job(
+                &terminal_id,
+                now,
+                foreground_job.as_ref(),
+            );
+            return;
+        }
+
         let terminal = self
             .state
             .terminals
@@ -1031,6 +1250,7 @@ impl App {
                 transfer.phase = AgentSessionTransferPhase::Completed;
                 transfer.error = None;
                 transfer.awaiting_deferred_target_report = false;
+                transfer.target_report_accepted = true;
             }
             AgentSessionTransferPhase::Completed => {
                 transfer.awaiting_deferred_target_report = false;
@@ -1049,7 +1269,10 @@ impl App {
         pane_id: crate::layout::PaneId,
         agent: crate::detect::Agent,
     ) -> bool {
-        if agent != crate::detect::Agent::Codex {
+        if !matches!(
+            agent,
+            crate::detect::Agent::Codex | crate::detect::Agent::Omp
+        ) {
             return false;
         }
         let Some((_, pane)) = self.find_pane(pane_id) else {
@@ -1094,18 +1317,26 @@ impl App {
             return false;
         };
         if snapshot.phase != AgentSessionTransferPhase::AwaitingTarget
-            || snapshot.target_kind != HarnessKind::Codex
+            || !matches!(snapshot.target_kind, HarnessKind::Codex | HarnessKind::Omp)
         {
             return false;
         }
-        let Some(target_session_id) = snapshot.target_session_id.as_deref() else {
+        let Some(target_ref) = snapshot.target_session_ref.as_ref() else {
             return self.begin_agent_session_transfer_rollback(
                 terminal_id,
-                "target launch is missing the staged Codex session id",
+                "target launch is missing its staged native session reference",
             );
         };
-        let current_pid = foreground_job
-            .and_then(|job| crate::session_transfer::codex_resume_process(job, target_session_id));
+        let target_session = target_ref.value.as_str();
+        let current_pid = foreground_job.and_then(|job| match snapshot.target_kind {
+            HarnessKind::Codex => {
+                crate::session_transfer::codex_resume_process(job, target_session)
+            }
+            HarnessKind::Omp => snapshot
+                .target_process
+                .and_then(|proof| crate::session_transfer::omp_reported_process(job, proof.pid)),
+            HarnessKind::Claude => None,
+        });
         let mut changed = false;
         if let Some(pid) = current_pid {
             let proof = match snapshot.target_process {
@@ -1128,9 +1359,10 @@ impl App {
                 tracing::info!(
                     transfer = %snapshot.id,
                     terminal = %terminal_id,
-                    target_session = %target_session_id,
+                    target_session = %target_session,
                     target_pid = pid,
-                    "bound Codex session transfer to the exact resume process"
+                    target_harness = %snapshot.target_kind.label(),
+                    "bound session transfer to the exact target process"
                 );
             }
         }
@@ -1144,7 +1376,8 @@ impl App {
             return self.begin_agent_session_transfer_rollback(
                 terminal_id,
                 format!(
-                    "Codex resume for session {target_session_id} stopped at an interactive blocker"
+                    "{} resume for session {target_session} stopped at an interactive blocker",
+                    snapshot.target_kind.label()
                 ),
             ) || changed;
         }
@@ -1178,11 +1411,15 @@ impl App {
         let Some(pid) = current_pid else {
             let reason = match proof {
                 Some(proof) => format!(
-                    "exact Codex resume process {} for session {target_session_id} exited before cutover verification",
-                    proof.pid
+                    "exact {} resume process {} for session {target_session} exited before cutover verification",
+                    snapshot.target_kind.label(), proof.pid
+                ),
+                None if snapshot.target_kind == HarnessKind::Codex => format!(
+                    "target did not expose the exact Codex resume process for session {target_session} before the launch deadline"
                 ),
                 None => format!(
-                    "target did not expose an exact Codex resume process for session {target_session_id} before the launch deadline"
+                    "target did not expose the exact verified {} process for session {target_session} before the launch deadline",
+                    snapshot.target_kind.label()
                 ),
             };
             return self.begin_agent_session_transfer_rollback(terminal_id, reason) || changed;
@@ -1219,10 +1456,16 @@ impl App {
             });
         match transfer_state {
             Some((AgentSessionTransferPhase::AwaitingTarget, _, target_kind)) => {
-                let reason = if target_kind == HarnessKind::Codex {
-                    "the Codex resume command exited before destination cutover was verified"
-                } else {
-                    "the Claude resume command exited before reporting the verified session"
+                let reason = match target_kind {
+                    HarnessKind::Codex => {
+                        "the Codex resume command exited before destination cutover was verified"
+                    }
+                    HarnessKind::Omp => {
+                        "the OMP resume command exited before its session, leaf, and transcript were verified"
+                    }
+                    HarnessKind::Claude => {
+                        "the Claude resume command exited before reporting the verified session"
+                    }
                 };
                 self.begin_agent_session_transfer_rollback(&terminal_id, reason)
             }
@@ -1256,13 +1499,20 @@ impl App {
             return false;
         };
         if snapshot.phase != AgentSessionTransferPhase::RollingBack
-            || snapshot.source_kind != HarnessKind::Codex
+            || !matches!(snapshot.source_kind, HarnessKind::Codex | HarnessKind::Omp)
         {
             return false;
         }
         let source_session_id = snapshot.source_session.session_ref.value.as_str();
-        let current_pid = foreground_job
-            .and_then(|job| crate::session_transfer::codex_resume_process(job, source_session_id));
+        let current_pid = foreground_job.and_then(|job| match snapshot.source_kind {
+            HarnessKind::Codex => {
+                crate::session_transfer::codex_resume_process(job, source_session_id)
+            }
+            HarnessKind::Omp => snapshot
+                .source_rollback_process
+                .and_then(|proof| crate::session_transfer::omp_reported_process(job, proof.pid)),
+            HarnessKind::Claude => None,
+        });
         let mut changed = false;
         if let Some(pid) = current_pid {
             let proof = match snapshot.source_rollback_process {
@@ -1287,7 +1537,8 @@ impl App {
                     terminal = %terminal_id,
                     source_session = %source_session_id,
                     source_pid = pid,
-                    "bound session-transfer rollback to the exact Codex source resume process"
+                    source_harness = %snapshot.source_kind.label(),
+                    "bound session-transfer rollback to the exact source process"
                 );
             }
         }
@@ -1301,7 +1552,8 @@ impl App {
             return self.fail_agent_session_transfer_rollback_launch(
                 terminal_id,
                 format!(
-                    "the Codex source resume for session {source_session_id} stopped at an interactive blocker"
+                    "the {} source resume for session {source_session_id} stopped at an interactive blocker",
+                    snapshot.source_kind.label()
                 ),
             ) || changed;
         }
@@ -1335,11 +1587,15 @@ impl App {
         let Some(pid) = current_pid else {
             let reason = match proof {
                 Some(proof) => format!(
-                    "exact Codex source resume process {} for session {source_session_id} exited before rollback verification",
-                    proof.pid
+                    "exact {} source resume process {} for session {source_session_id} exited before rollback verification",
+                    snapshot.source_kind.label(), proof.pid
+                ),
+                None if snapshot.source_kind == HarnessKind::Codex => format!(
+                    "source rollback did not expose the exact Codex resume process for session {source_session_id} before the launch deadline"
                 ),
                 None => format!(
-                    "source rollback did not expose an exact Codex resume process for session {source_session_id} before the launch deadline"
+                    "source rollback did not expose the exact verified {} process for session {source_session_id} before the launch deadline",
+                    snapshot.source_kind.label()
                 ),
             };
             return self.fail_agent_session_transfer_rollback_launch(terminal_id, reason)
@@ -1478,14 +1734,12 @@ impl App {
         {
             return false;
         }
-        let expected_session_id = match kind {
-            RuntimeVerificationKind::Target => snapshot.target_session_id.as_deref(),
-            RuntimeVerificationKind::SourceRollback => {
-                Some(snapshot.source_session.session_ref.value.as_str())
-            }
+        let expected_session_ref = match kind {
+            RuntimeVerificationKind::Target => snapshot.target_session_ref.as_ref(),
+            RuntimeVerificationKind::SourceRollback => Some(&snapshot.source_session.session_ref),
         };
-        let Some(expected_session_id) = expected_session_id else {
-            let reason = "runtime verification is missing the expected native session id";
+        let Some(expected_session_ref) = expected_session_ref else {
+            let reason = "runtime verification is missing the expected native session reference";
             return match kind {
                 RuntimeVerificationKind::Target => {
                     self.begin_agent_session_transfer_rollback(&terminal_id, reason)
@@ -1495,12 +1749,22 @@ impl App {
                 }
             };
         };
-        let current_pid = foreground_job.and_then(|job| {
-            crate::session_transfer::codex_resume_process(job, expected_session_id)
+        let expected_session_id = expected_session_ref.value.as_str();
+        let runtime_kind = match kind {
+            RuntimeVerificationKind::Target => snapshot.target_kind,
+            RuntimeVerificationKind::SourceRollback => snapshot.source_kind,
+        };
+        let current_pid = foreground_job.and_then(|job| match runtime_kind {
+            HarnessKind::Codex => {
+                crate::session_transfer::codex_resume_process(job, expected_session_id)
+            }
+            HarnessKind::Omp => crate::session_transfer::omp_reported_process(job, process_pid),
+            HarnessKind::Claude => None,
         });
         if current_pid != Some(process_pid) {
             let reason = format!(
-                "exact Codex resume process {process_pid} for session {expected_session_id} was no longer current when transcript verification finished"
+                "exact {} resume process {process_pid} for session {expected_session_id} was no longer current when transcript verification finished",
+                runtime_kind.label()
             );
             return match kind {
                 RuntimeVerificationKind::Target => {
@@ -1518,7 +1782,8 @@ impl App {
             .is_some_and(|terminal| terminal.state == AgentState::Blocked);
         if blocked {
             let reason = format!(
-                "Codex resume for session {expected_session_id} reached an interactive blocker while transcript verification finished"
+                "{} resume for session {expected_session_id} reached an interactive blocker while transcript verification finished",
+                runtime_kind.label()
             );
             return match kind {
                 RuntimeVerificationKind::Target => {
@@ -1532,10 +1797,12 @@ impl App {
         if let Err(error) = result {
             let reason = match kind {
                 RuntimeVerificationKind::Target => format!(
-                    "Codex resume process {process_pid} for session {expected_session_id} was alive, but the destination transcript did not verify: {error}"
+                    "{} resume process {process_pid} for session {expected_session_id} was alive, but the destination transcript did not verify: {error}",
+                    runtime_kind.label()
                 ),
                 RuntimeVerificationKind::SourceRollback => format!(
-                    "Codex source resume process {process_pid} for session {expected_session_id} was alive, but the native transcript did not verify: {error}"
+                    "{} source resume process {process_pid} for session {expected_session_id} was alive, but the native transcript did not verify: {error}",
+                    runtime_kind.label()
                 ),
             };
             return match kind {
@@ -1586,9 +1853,7 @@ impl App {
         terminal.hook_authority = None;
         match kind {
             RuntimeVerificationKind::Target => {
-                let Some(target_ref) = AgentSessionRef::id(expected_session_id.to_string()) else {
-                    return false;
-                };
+                let target_ref = expected_session_ref.clone();
                 transfer.phase = AgentSessionTransferPhase::Completed;
                 transfer.error = None;
                 transfer.target_process = Some(VerifiedTargetProcess {
@@ -1597,7 +1862,8 @@ impl App {
                         .target_process
                         .map_or_else(Instant::now, |proof| proof.observed_at),
                 });
-                transfer.awaiting_deferred_target_report = true;
+                transfer.awaiting_deferred_target_report =
+                    runtime_kind == HarnessKind::Codex && !snapshot.target_report_accepted;
                 terminal.set_persisted_agent_session(PersistedAgentSession {
                     source: snapshot.target_kind.source().to_string(),
                     agent: snapshot.target_kind.label().to_string(),
@@ -1611,7 +1877,8 @@ impl App {
                     terminal = %terminal_id,
                     target_session = %expected_session_id,
                     target_pid = process_pid,
-                    "completed Codex session transfer from destination transcript and exact process proof"
+                    target_harness = %runtime_kind.label(),
+                    "completed session transfer from destination transcript and exact process proof"
                 );
             }
             RuntimeVerificationKind::SourceRollback => {
@@ -1631,7 +1898,8 @@ impl App {
                     terminal = %terminal_id,
                     source_session = %expected_session_id,
                     source_pid = process_pid,
-                    "completed session-transfer rollback from native transcript and exact Codex source process proof"
+                    source_harness = %runtime_kind.label(),
+                    "completed session-transfer rollback from native transcript and exact source process proof"
                 );
             }
         }
@@ -1641,9 +1909,9 @@ impl App {
 
     pub(crate) fn expire_session_transfer_deadlines(&mut self, now: Instant) -> bool {
         // Active transfers are rare, but this runs on the app tick. Only inspect
-        // a process tree when a Codex proof has reached its settle point or the
+        // a process tree when a Codex/OMP proof has reached its settle point or the
         // launch deadline itself has arrived; normal pane-scaled ticks stay I/O-free.
-        let codex_due: Vec<_> = self
+        let native_due: Vec<_> = self
             .state
             .terminals
             .iter()
@@ -1651,12 +1919,18 @@ impl App {
                 let transfer = terminal.session_transfer.as_ref()?;
                 let proof = match transfer.phase {
                     AgentSessionTransferPhase::AwaitingTarget
-                        if transfer.target_kind == HarnessKind::Codex =>
+                        if matches!(
+                            transfer.target_kind,
+                            HarnessKind::Codex | HarnessKind::Omp
+                        ) =>
                     {
                         transfer.target_process
                     }
                     AgentSessionTransferPhase::RollingBack
-                        if transfer.source_kind == HarnessKind::Codex =>
+                        if matches!(
+                            transfer.source_kind,
+                            HarnessKind::Codex | HarnessKind::Omp
+                        ) =>
                     {
                         transfer.source_rollback_process
                     }
@@ -1681,7 +1955,7 @@ impl App {
             })
             .collect();
         let mut changed = false;
-        for terminal_id in codex_due {
+        for terminal_id in native_due {
             let foreground_job = self
                 .terminal_runtimes
                 .get(&terminal_id)

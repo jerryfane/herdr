@@ -2996,6 +2996,21 @@ fn omp_session_reports_include_start_source() {
 }
 
 #[test]
+fn omp_session_reports_bind_leaf_and_process_identity() {
+    assert!(OMP_EXTENSION_ASSET.contains("getLeafId?.()"));
+    assert!(OMP_EXTENSION_ASSET.contains("agent_session_cursor: currentAgentSessionCursor"));
+    assert!(OMP_EXTENSION_ASSET.contains("agent_process_pid: process.pid"));
+    for event in [
+        "session_branch",
+        "session_tree",
+        "session_compact",
+        "auto_compaction_end",
+    ] {
+        assert!(OMP_EXTENSION_ASSET.contains(&format!("\"{event}\"")));
+    }
+}
+
+#[test]
 fn omp_socket_requests_are_serialized() {
     let queue = OMP_EXTENSION_ASSET
         .find("let requestQueue = Promise.resolve();")

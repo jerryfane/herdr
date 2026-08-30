@@ -1748,7 +1748,8 @@
         "AgentSessionTransferHarness": {
           "enum": [
             "claude",
-            "codex"
+            "codex",
+            "omp"
           ],
           "type": "string"
         },
@@ -3547,6 +3548,20 @@
             "agent": {
               "type": "string"
             },
+            "agent_process_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "agent_session_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "agent_session_id": {
               "type": [
                 "string",
@@ -3595,6 +3610,20 @@
           "properties": {
             "agent": {
               "type": "string"
+            },
+            "agent_process_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "agent_session_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "agent_session_id": {
               "type": [
@@ -8363,7 +8392,8 @@
         "AgentSessionTransferHarness": {
           "enum": [
             "claude",
-            "codex"
+            "codex",
+            "omp"
           ],
           "type": "string"
         },
@@ -12783,8 +12813,15 @@
           "properties": {
             "agent_session_transfer": {
               "default": false,
-              "description": "The server can transactionally transfer visible session history between\nClaude Code and Codex in the same logical pane.",
+              "description": "The server can transactionally transfer visible session history between\nClaude Code, Codex, and OMP in the same logical pane.",
               "type": "boolean"
+            },
+            "agent_session_transfer_harnesses": {
+              "description": "Native harnesses this daemon can use as session-transfer sources and\ndestinations. Empty means the older Claude/Codex-only capability shape.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AgentSessionTransferHarness"
+              },
+              "type": "array"
             },
             "detached_server_daemon": {
               "default": false,

@@ -962,11 +962,21 @@ fn success_response_round_trips() {
                 detached_server_daemon: true,
                 pane_input_stream: false,
                 agent_session_transfer: true,
+                agent_session_transfer_harnesses: vec![
+                    AgentSessionTransferHarness::Claude,
+                    AgentSessionTransferHarness::Codex,
+                    AgentSessionTransferHarness::Omp,
+                ],
             }),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["result"]["capabilities"]["agent_session_transfer_harnesses"],
+        serde_json::json!(["claude", "codex", "omp"])
+    );
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
 }

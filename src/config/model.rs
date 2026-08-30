@@ -352,7 +352,7 @@ pub struct AccountConfig {
     /// Stable identifier used to select this account on `agent.start` /
     /// `agent.restart` and to key it in `accounts.list`.
     pub id: String,
-    /// Harness this account belongs to: `claude`, `codex`, or `kimi`.
+    /// Harness this account belongs to: `claude`, `codex`, `omp`, or `kimi`.
     pub kind: String,
     /// Human-facing label shown in listings.
     pub label: String,
@@ -366,6 +366,7 @@ pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "claude" => Some("CLAUDE_CONFIG_DIR"),
         "codex" => Some("CODEX_HOME"),
+        "omp" => Some("PI_CODING_AGENT_DIR"),
         "kimi" => Some("KIMI_CODE_HOME"),
         _ => None,
     }
@@ -393,15 +394,37 @@ pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
     match var {
         "CLAUDE_CONFIG_DIR" => Some("claude"),
         "CODEX_HOME" => Some("codex"),
+        "PI_CODING_AGENT_DIR" => Some("omp"),
         "KIMI_CODE_HOME" => Some("kimi"),
         _ => None,
     }
 }
 
 /// The default config-home directory a harness uses with no override
-/// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.kimi-code`). `None` when `HOME` is
-/// unset or the kind has no config-home lever.
+/// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.omp/agent`,
+/// `$HOME/.kimi-code`). OMP honors its two native directory overrides so the
+/// integration installer, transcript verifier, and launched runtime all resolve
+/// one authoritative account home. `None` when `HOME` is unset or the kind has
+/// no config-home lever.
 pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
+    if kind == "omp" {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        if let Some(agent_dir) =
+            std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+        {
+            let agent_dir = PathBuf::from(agent_dir);
+            return Some(if let Ok(relative) = agent_dir.strip_prefix("~") {
+                home.join(relative)
+            } else {
+                agent_dir
+            });
+        }
+        let config_dir = std::env::var_os("PI_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".omp"));
+        return Some(home.join(config_dir).join("agent"));
+    }
     let sub = match kind {
         "claude" => ".claude",
         "codex" => ".codex",
@@ -410,6 +433,13 @@ pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
     };
     let home = std::env::var_os("HOME")?;
     Some(Path::new(&home).join(sub))
+}
+
+/// Resolve OMP's transcript trust root from its complete agent directory.
+/// `PI_CODING_AGENT_DIR` relocates config, credentials, extensions, and sessions
+/// together; native OMP does not use `XDG_DATA_HOME` for its session files.
+pub(crate) fn omp_sessions_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("sessions")
 }
 
 /// Whether `config_dir` points at the harness's DEFAULT config-home for `kind`.
@@ -1505,6 +1535,7 @@ mod tests {
     fn env_var_for_kind_maps_supported_harnesses() {
         assert_eq!(env_var_for_kind("claude"), Some("CLAUDE_CONFIG_DIR"));
         assert_eq!(env_var_for_kind("codex"), Some("CODEX_HOME"));
+        assert_eq!(env_var_for_kind("omp"), Some("PI_CODING_AGENT_DIR"));
         assert_eq!(env_var_for_kind("kimi"), Some("KIMI_CODE_HOME"));
         assert_eq!(env_var_for_kind("gemini"), None);
         assert_eq!(env_var_for_kind(""), None);
@@ -1517,6 +1548,7 @@ mod tests {
             &["CLAUDE_CODE_OAUTH_TOKEN"]
         );
         assert_eq!(auth_env_vars_to_clear("codex"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear("omp"), &[] as &[&str]);
         assert_eq!(auth_env_vars_to_clear("kimi"), &[] as &[&str]);
         assert_eq!(auth_env_vars_to_clear("gemini"), &[] as &[&str]);
         assert_eq!(auth_env_vars_to_clear(""), &[] as &[&str]);
@@ -1524,7 +1556,7 @@ mod tests {
 
     #[test]
     fn kind_for_config_env_var_is_the_reverse_of_env_var_for_kind() {
-        for kind in ["claude", "codex", "kimi"] {
+        for kind in ["claude", "codex", "omp", "kimi"] {
             let var = env_var_for_kind(kind).expect("supported kind has a config var");
             assert_eq!(kind_for_config_env_var(var), Some(kind));
         }
@@ -1566,8 +1598,11 @@ mod tests {
     #[test]
     fn default_config_dir_is_home_relative_per_kind() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
-        let prev = std::env::var_os("HOME");
+        let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
+            .map(|key| (key, std::env::var_os(key)));
         std::env::set_var("HOME", "/home/tester");
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::remove_var("PI_CONFIG_DIR");
         assert_eq!(
             default_config_dir("claude"),
             Some(PathBuf::from("/home/tester/.claude"))
@@ -1580,8 +1615,51 @@ mod tests {
             default_config_dir("kimi"),
             Some(PathBuf::from("/home/tester/.kimi-code"))
         );
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/.omp/agent"))
+        );
         assert_eq!(default_config_dir("gemini"), None);
-        restore_home(prev);
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn omp_default_config_dir_honors_native_overrides() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
+            .map(|key| (key, std::env::var_os(key)));
+        std::env::set_var("HOME", "/home/tester");
+        std::env::set_var("PI_CODING_AGENT_DIR", "~/omp-work");
+        std::env::remove_var("PI_CONFIG_DIR");
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/omp-work"))
+        );
+
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::set_var("PI_CONFIG_DIR", ".omp-alt");
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/.omp-alt/agent"))
+        );
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn omp_session_root_is_below_the_complete_agent_directory() {
+        let agent_dir = PathBuf::from("/home/tester/.omp/agent");
+        assert_eq!(omp_sessions_dir(&agent_dir), agent_dir.join("sessions"));
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! new native destination artifact, then rereads that artifact for verification.
 //! The caller owns the later same-pane cutover transaction.
 
+mod omp;
+
 use std::fmt;
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Cursor, Write as _};
@@ -180,6 +182,7 @@ impl Serialize for OrderedJson {
 pub(crate) enum HarnessKind {
     Claude,
     Codex,
+    Omp,
 }
 
 impl HarnessKind {
@@ -187,6 +190,7 @@ impl HarnessKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Omp => "omp",
         }
     }
 
@@ -194,6 +198,7 @@ impl HarnessKind {
         match label {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -202,6 +207,7 @@ impl HarnessKind {
         match self {
             Self::Claude => "herdr:claude",
             Self::Codex => "herdr:codex",
+            Self::Omp => "herdr:omp",
         }
     }
 
@@ -209,6 +215,7 @@ impl HarnessKind {
         match self {
             Self::Claude => crate::api::schema::AgentSessionTransferHarness::Claude,
             Self::Codex => crate::api::schema::AgentSessionTransferHarness::Codex,
+            Self::Omp => crate::api::schema::AgentSessionTransferHarness::Omp,
         }
     }
 
@@ -216,6 +223,7 @@ impl HarnessKind {
         match self {
             Self::Claude => crate::detect::Agent::Claude,
             Self::Codex => crate::detect::Agent::Codex,
+            Self::Omp => crate::detect::Agent::Omp,
         }
     }
 }
@@ -225,6 +233,7 @@ impl From<crate::api::schema::AgentSessionTransferHarness> for HarnessKind {
         match value {
             crate::api::schema::AgentSessionTransferHarness::Claude => Self::Claude,
             crate::api::schema::AgentSessionTransferHarness::Codex => Self::Codex,
+            crate::api::schema::AgentSessionTransferHarness::Omp => Self::Omp,
         }
     }
 }
@@ -281,7 +290,8 @@ pub(crate) struct TranscriptFingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedSession {
-    pub(crate) session_id: String,
+    pub(crate) session_ref: crate::agent_resume::AgentSessionRef,
+    pub(crate) cursor: Option<String>,
     pub(crate) transcript_path: PathBuf,
     pub(crate) transcript: CanonicalTranscript,
 }
@@ -289,11 +299,13 @@ pub(crate) struct StagedSession {
 #[derive(Debug, Clone)]
 pub(crate) struct PrepareRequest {
     pub(crate) source_kind: HarnessKind,
-    pub(crate) source_config_home: PathBuf,
-    pub(crate) source_session_id: String,
+    pub(crate) source_sessions_root: PathBuf,
+    pub(crate) source_session_ref: crate::agent_resume::AgentSessionRef,
+    pub(crate) source_cursor: Option<String>,
     pub(crate) source_transcript_path: Option<PathBuf>,
     pub(crate) target_kind: HarnessKind,
     pub(crate) target_config_home: PathBuf,
+    pub(crate) target_sessions_root: PathBuf,
     pub(crate) target_launch_env: crate::config::AccountLaunchEnv,
     pub(crate) cwd: PathBuf,
     pub(crate) timeout: Duration,
@@ -313,16 +325,21 @@ pub(crate) struct RuntimeSessionTransfer {
     pub(crate) source_session: crate::agent_resume::PersistedAgentSession,
     pub(crate) source_account: Option<String>,
     pub(crate) source_config_home: PathBuf,
+    pub(crate) source_sessions_root: PathBuf,
+    pub(crate) source_cursor: Option<String>,
+    pub(crate) source_process_pid: Option<u32>,
     pub(crate) target_kind: HarnessKind,
     pub(crate) target_account: Option<String>,
     pub(crate) target_config_home: PathBuf,
+    pub(crate) target_sessions_root: PathBuf,
     pub(crate) phase: crate::api::schema::AgentSessionTransferPhase,
     pub(crate) message_count: u64,
     pub(crate) omissions: OmissionSummary,
     pub(crate) error: Option<String>,
     pub(crate) source_path: Option<PathBuf>,
     pub(crate) source_fingerprint: Option<TranscriptFingerprint>,
-    pub(crate) target_session_id: Option<String>,
+    pub(crate) target_session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    pub(crate) target_cursor: Option<String>,
     pub(crate) target_transcript_path: Option<PathBuf>,
     pub(crate) target_fingerprint: Option<TranscriptFingerprint>,
     pub(crate) target_deadline: Option<std::time::Instant>,
@@ -331,6 +348,7 @@ pub(crate) struct RuntimeSessionTransfer {
     pub(crate) verification_in_flight: Option<RuntimeVerificationKind>,
     pub(crate) verification_observation_deadline: Option<std::time::Instant>,
     pub(crate) awaiting_deferred_target_report: bool,
+    pub(crate) target_report_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,10 +408,16 @@ impl RuntimeSessionTransfer {
         let source = read_transfer_source(
             self.source_kind,
             self.target_kind,
-            &self.source_config_home,
+            &self.source_sessions_root,
             source_path,
+            self.source_cursor.as_deref(),
         )?;
-        let target = read_transcript(self.target_kind, &self.target_config_home, target_path)?;
+        let target = read_transcript_at_cursor(
+            self.target_kind,
+            &self.target_sessions_root,
+            target_path,
+            self.target_cursor.as_deref(),
+        )?;
         verify_destination(&source.messages, &target)
     }
 
@@ -450,6 +474,28 @@ pub(crate) fn codex_resume_process(
                 .is_some_and(|(agent, _)| agent == crate::detect::Agent::Codex)
         })
         .min_by_key(|process| (!direct_codex_process(process), process.pid))
+        .map(|process| process.pid)
+}
+
+/// Prove that one reported PID is the exact foreground OMP process. OMP 18
+/// rewrites its argv to just `omp`, so launch arguments are not reliable after
+/// startup; the official extension's PID plus Herdr's process identification is
+/// the binding evidence.
+pub(crate) fn omp_reported_process(
+    job: &crate::platform::ForegroundJob,
+    reported_pid: u32,
+) -> Option<u32> {
+    job.processes
+        .iter()
+        .find(|process| process.pid == reported_pid)
+        .filter(|process| {
+            let process_job = crate::platform::ForegroundJob {
+                process_group_id: process.pid,
+                processes: vec![(*process).clone()],
+            };
+            crate::detect::identify_agent_in_job(&process_job)
+                .is_some_and(|(agent, _)| agent == crate::detect::Agent::Omp)
+        })
         .map(|process| process.pid)
 }
 
@@ -548,57 +594,133 @@ impl std::error::Error for TransferError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_transcript(
     kind: HarnessKind,
-    config_home: &Path,
+    trust_root: &Path,
     path: &Path,
 ) -> Result<CanonicalTranscript, TransferError> {
-    let trusted_path = validate_transcript_path(config_home, path)?;
+    read_transcript_at_cursor(kind, trust_root, path, None)
+}
+
+pub(crate) fn read_transcript_at_cursor(
+    kind: HarnessKind,
+    trust_root: &Path,
+    path: &Path,
+    cursor: Option<&str>,
+) -> Result<CanonicalTranscript, TransferError> {
+    let trusted_path = validate_transcript_path(trust_root, path)?;
+    if kind == HarnessKind::Omp {
+        let bytes = read_transcript_snapshot(&trusted_path)?;
+        return Ok(omp::parse(&bytes, cursor)?.transcript);
+    }
     read_jsonl(&trusted_path, kind)
 }
 
 pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer, TransferError> {
     let source_path = select_native_transcript(
         request.source_kind,
-        &request.source_config_home,
-        &request.source_session_id,
+        &request.source_sessions_root,
+        &request.source_session_ref,
         request.source_transcript_path.as_deref(),
     )?;
-    let source = read_transfer_source(
+    let mut source = read_transfer_source(
         request.source_kind,
         request.target_kind,
-        &request.source_config_home,
+        &request.source_sessions_root,
         &source_path,
+        request.source_cursor.as_deref(),
     )?;
-    let expected = source.messages.clone();
-    let (session_id, transcript_path) = match request.target_kind {
+    if request.source_kind == HarnessKind::Omp {
+        let snapshot = omp::parse(
+            &read_transcript_snapshot(&source_path)?,
+            request.source_cursor.as_deref(),
+        )?;
+        let Some(cursor) = request.source_cursor.as_deref() else {
+            return Err(TransferError::UnsupportedTranscript(
+                "OMP source integration did not report its active leaf".to_string(),
+            ));
+        };
+        if snapshot.selected_leaf_id != cursor || snapshot.physical_leaf_id != cursor {
+            return Err(TransferError::UnsupportedTranscript(format!(
+                "OMP active leaf {cursor:?} is not the durable resumable leaf {:?}",
+                snapshot.physical_leaf_id
+            )));
+        }
+        source = snapshot.transcript;
+    }
+    let mut expected = source.messages.clone();
+    let (session_ref, target_cursor, transcript_path) = match request.target_kind {
         HarnessKind::Claude => {
-            write_claude_session(&request.target_config_home, &request.cwd, &expected)?
+            let (session_id, path) =
+                write_claude_session(&request.target_config_home, &request.cwd, &expected)?;
+            (
+                crate::agent_resume::AgentSessionRef::id(session_id)
+                    .expect("generated Claude session id is valid"),
+                None,
+                path,
+            )
         }
         HarnessKind::Codex => {
+            let bridge = if request.source_kind == HarnessKind::Claude {
+                None
+            } else {
+                let bridge = PrivateClaudeBridge::write(
+                    &request.target_config_home,
+                    &request.cwd,
+                    &source.messages,
+                )?;
+                expected =
+                    claude_to_codex_import_projection(&read_transcript_snapshot(bridge.path())?)?;
+                Some(bridge)
+            };
+            let import_path = bridge
+                .as_ref()
+                .map_or(source_path.as_path(), |bridge| bridge.path());
             let session_id = import_claude_session_to_codex(
                 &request.target_config_home,
-                &source_path,
+                import_path,
                 &request.cwd,
                 &request.target_launch_env,
                 request.timeout,
             )
             .await?;
             let path = find_codex_rollout(&request.target_config_home, &session_id)?;
-            (session_id, path)
+            (
+                crate::agent_resume::AgentSessionRef::id(session_id)
+                    .expect("imported Codex session id is valid"),
+                None,
+                path,
+            )
+        }
+        HarnessKind::Omp => {
+            let (_session_id, path, leaf) =
+                omp::write(&request.target_sessions_root, &request.cwd, &expected)?;
+            let canonical = fs::canonicalize(&path)
+                .map_err(|error| TransferError::io("canonicalize staged OMP transcript", error))?;
+            (
+                crate::agent_resume::AgentSessionRef::path(
+                    canonical.to_string_lossy().into_owned(),
+                )
+                .expect("generated OMP session path is valid"),
+                Some(leaf),
+                canonical,
+            )
         }
     };
-    let destination = read_transcript(
+    let destination = read_transcript_at_cursor(
         request.target_kind,
-        &request.target_config_home,
+        &request.target_sessions_root,
         &transcript_path,
+        target_cursor.as_deref(),
     )?;
     verify_destination(&expected, &destination)?;
     Ok(PreparedTransfer {
         source_path,
         source_fingerprint: source.fingerprint,
         staged: StagedSession {
-            session_id,
+            session_ref,
+            cursor: target_cursor,
             transcript_path,
             transcript: CanonicalTranscript {
                 messages: destination.messages,
@@ -613,20 +735,44 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
 
 fn select_native_transcript(
     kind: HarnessKind,
-    config_home: &Path,
-    session_id: &str,
+    trust_root: &Path,
+    session_ref: &crate::agent_resume::AgentSessionRef,
     reported_path: Option<&Path>,
 ) -> Result<PathBuf, TransferError> {
-    let Some(reported_path) = reported_path else {
-        return find_native_transcript(kind, config_home, session_id);
+    let expected_kind = if kind == HarnessKind::Omp {
+        crate::agent_resume::AgentSessionRefKind::Path
+    } else {
+        crate::agent_resume::AgentSessionRefKind::Id
     };
-    let path = validate_transcript_path(config_home, reported_path)?;
+    if session_ref.kind != expected_kind {
+        return Err(TransferError::InvalidPath(format!(
+            "{} session reference must use {:?}, not {:?}",
+            kind.label(),
+            expected_kind,
+            session_ref.kind
+        )));
+    }
+    if kind == HarnessKind::Omp {
+        let path = Path::new(&session_ref.value);
+        if reported_path.is_some_and(|reported| reported != path) {
+            return Err(TransferError::InvalidPath(
+                "OMP reported session path disagrees with its native path reference".to_string(),
+            ));
+        }
+        return validate_transcript_path(trust_root, path);
+    }
+    let session_id = &session_ref.value;
+    let Some(reported_path) = reported_path else {
+        return find_native_transcript(kind, trust_root, session_id);
+    };
+    let path = validate_transcript_path(trust_root, reported_path)?;
     let identity_matches = match kind {
         HarnessKind::Claude => path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .is_some_and(|name| name == format!("{session_id}.jsonl")),
         HarnessKind::Codex => codex_rollout_declares_thread(&path, session_id)?,
+        HarnessKind::Omp => unreachable!("OMP path references return above"),
     };
     if !identity_matches {
         return Err(TransferError::InvalidPath(format!(
@@ -645,6 +791,9 @@ pub(crate) fn find_native_transcript(
     match kind {
         HarnessKind::Claude => find_claude_transcript(config_home, session_id),
         HarnessKind::Codex => find_codex_rollout(config_home, session_id),
+        HarnessKind::Omp => Err(TransferError::InvalidPath(
+            "OMP sessions are selected by an exact native path, not by id".to_string(),
+        )),
     }
 }
 
@@ -825,12 +974,17 @@ pub(crate) fn validate_transcript_path(
 fn read_transfer_source(
     source_kind: HarnessKind,
     target_kind: HarnessKind,
-    config_home: &Path,
+    trust_root: &Path,
     path: &Path,
+    cursor: Option<&str>,
 ) -> Result<CanonicalTranscript, TransferError> {
-    let trusted_path = validate_transcript_path(config_home, path)?;
+    let trusted_path = validate_transcript_path(trust_root, path)?;
     let bytes = read_transcript_snapshot(&trusted_path)?;
-    let mut source = parse_jsonl_snapshot(&bytes, source_kind)?;
+    let mut source = if source_kind == HarnessKind::Omp {
+        omp::parse(&bytes, cursor)?.transcript
+    } else {
+        parse_jsonl_snapshot(&bytes, source_kind)?
+    };
     if source_kind == HarnessKind::Claude && target_kind == HarnessKind::Codex {
         source.messages = claude_to_codex_import_projection(&bytes)?;
     }
@@ -899,6 +1053,7 @@ fn parse_jsonl_snapshot(
                 &mut messages,
                 &mut omissions,
             )?,
+            HarnessKind::Omp => unreachable!("OMP snapshots use their tree-aware parser"),
         }
     }
     if messages.is_empty() {
@@ -1694,6 +1849,106 @@ pub(crate) fn write_claude_session(
     })
 }
 
+/// Ephemeral native-Claude bridge used only to invoke Codex's supported
+/// external-session importer for non-Claude sources. The bridge is private,
+/// durable before import, and deleted on every return path.
+struct PrivateClaudeBridge {
+    path: PathBuf,
+}
+
+impl PrivateClaudeBridge {
+    fn write(
+        codex_home: &Path,
+        cwd: &Path,
+        messages: &[VisibleMessage],
+    ) -> Result<Self, TransferError> {
+        if !codex_home.is_absolute() {
+            return Err(TransferError::InvalidPath(
+                "Codex home for the private import bridge must be absolute".to_string(),
+            ));
+        }
+        fs::create_dir_all(codex_home)
+            .map_err(|error| TransferError::io("create Codex home", error))?;
+        let canonical_home = fs::canonicalize(codex_home)
+            .map_err(|error| TransferError::io("canonicalize Codex home", error))?;
+        let staging = canonical_home.join(".herdr/session-transfer");
+        #[cfg(unix)]
+        let existed = staging.exists();
+        fs::create_dir_all(&staging)
+            .map_err(|error| TransferError::io("create Codex import staging directory", error))?;
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                TransferError::io("protect Codex import staging directory", error)
+            })?;
+        }
+        reject_symlinks_below(&canonical_home, &staging)?;
+        for _ in 0..32 {
+            let session_id = random_uuid()?;
+            let path = staging.join(format!("{session_id}.jsonl"));
+            let file = match crate::platform::create_private_file(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(TransferError::io(
+                        "create private Claude import bridge",
+                        error,
+                    ))
+                }
+            };
+            if let Err(error) = write_claude_records(file, cwd, &session_id, messages) {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+            sync_parent_directory(&staging)?;
+            return Ok(Self { path });
+        }
+        Err(TransferError::Io {
+            context: "allocate private Claude import bridge",
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "repeated random bridge-id collision",
+            ),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateClaudeBridge {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "could not remove private session-transfer import bridge"
+                );
+            }
+        }
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), TransferError> {
+    match fs::File::open(path).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(TransferError::io("sync transfer staging directory", error)),
+    }
+}
+
 fn reject_symlinks_below(base: &Path, target: &Path) -> Result<(), TransferError> {
     let relative = target.strip_prefix(base).map_err(|_| {
         TransferError::InvalidPath("destination is outside the selected account home".to_string())
@@ -2273,6 +2528,147 @@ mod tests {
     }
 
     #[test]
+    fn omp_process_proof_requires_the_reported_foreground_omp_pid() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 20,
+            processes: vec![
+                foreground_process(20, "omp", &["omp"]),
+                foreground_process(30, "codex", &["codex", "resume", "thread"]),
+            ],
+        };
+        assert_eq!(omp_reported_process(&job, 20), Some(20));
+        assert_eq!(omp_reported_process(&job, 30), None);
+        assert_eq!(omp_reported_process(&job, 999), None);
+    }
+
+    #[tokio::test]
+    async fn omp_to_claude_stages_exact_visible_history_and_rejects_a_stale_leaf() {
+        let root = temp_root("omp-to-claude");
+        let source_root = root.join("omp-sessions");
+        let target_home = root.join("claude");
+        let messages = vec![
+            VisibleMessage {
+                role: VisibleRole::User,
+                text: "question".into(),
+            },
+            VisibleMessage {
+                role: VisibleRole::Assistant,
+                text: "answer".into(),
+            },
+        ];
+        let (_session_id, source_path, leaf) = omp::write(&source_root, &root, &messages).unwrap();
+        let source_ref =
+            crate::agent_resume::AgentSessionRef::path(source_path.to_string_lossy().into_owned())
+                .unwrap();
+        let request = |cursor: String| PrepareRequest {
+            source_kind: HarnessKind::Omp,
+            source_sessions_root: source_root.clone(),
+            source_session_ref: source_ref.clone(),
+            source_cursor: Some(cursor),
+            source_transcript_path: Some(source_path.clone()),
+            target_kind: HarnessKind::Claude,
+            target_config_home: target_home.clone(),
+            target_sessions_root: target_home.clone(),
+            target_launch_env: crate::config::AccountLaunchEnv::unselected(),
+            cwd: root.clone(),
+            timeout: Duration::from_secs(1),
+        };
+        let prepared = prepare(request(leaf)).await.unwrap();
+        assert_eq!(prepared.staged.transcript.messages, messages);
+        assert_eq!(
+            prepared.staged.session_ref.kind,
+            crate::agent_resume::AgentSessionRefKind::Id
+        );
+
+        assert!(matches!(
+            prepare(request("missing-leaf".into())).await,
+            Err(TransferError::UnsupportedTranscript(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_to_omp_stages_a_native_path_reference_and_leaf() {
+        let root = temp_root("claude-to-omp");
+        let source_home = root.join("claude");
+        let target_root = root.join("omp-sessions");
+        let messages = vec![
+            VisibleMessage {
+                role: VisibleRole::User,
+                text: "hello".into(),
+            },
+            VisibleMessage {
+                role: VisibleRole::Assistant,
+                text: "hi".into(),
+            },
+        ];
+        let (source_id, source_path) =
+            write_claude_session(&source_home, &root, &messages).unwrap();
+        let prepared = prepare(PrepareRequest {
+            source_kind: HarnessKind::Claude,
+            source_sessions_root: source_home.clone(),
+            source_session_ref: crate::agent_resume::AgentSessionRef::id(source_id).unwrap(),
+            source_cursor: None,
+            source_transcript_path: Some(source_path),
+            target_kind: HarnessKind::Omp,
+            target_config_home: root.join("omp-agent"),
+            target_sessions_root: target_root.clone(),
+            target_launch_env: crate::config::AccountLaunchEnv::unselected(),
+            cwd: root.clone(),
+            timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.staged.session_ref.kind,
+            crate::agent_resume::AgentSessionRefKind::Path
+        );
+        assert!(prepared.staged.cursor.is_some());
+        assert_eq!(prepared.staged.transcript.messages, messages);
+        let canonical_target_root = fs::canonicalize(target_root).unwrap();
+        assert!(
+            prepared
+                .staged
+                .transcript_path
+                .starts_with(canonical_target_root),
+            "the staged path must stay below the canonical OMP sessions root"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_claude_codex_bridge_is_private_exact_and_removed_on_drop() {
+        let root = temp_root("codex-bridge");
+        let codex_home = root.join("codex");
+        let messages = vec![
+            VisibleMessage {
+                role: VisibleRole::User,
+                text: "one".into(),
+            },
+            VisibleMessage {
+                role: VisibleRole::Assistant,
+                text: "two".into(),
+            },
+        ];
+        let bridge = PrivateClaudeBridge::write(&codex_home, &root, &messages).unwrap();
+        let path = bridge.path().to_path_buf();
+        let projection =
+            claude_to_codex_import_projection(&fs::read(bridge.path()).unwrap()).unwrap();
+        assert_eq!(projection, messages);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(bridge);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn claude_parser_keeps_visible_text_and_reports_omissions() {
         let root = temp_root("claude-parse");
         let path = root.join("source.jsonl");
@@ -2349,7 +2745,8 @@ mod tests {
 
         let ordinary = read_transcript(HarnessKind::Claude, &root, &path).unwrap();
         let projected =
-            read_transfer_source(HarnessKind::Claude, HarnessKind::Codex, &root, &path).unwrap();
+            read_transfer_source(HarnessKind::Claude, HarnessKind::Codex, &root, &path, None)
+                .unwrap();
 
         assert_eq!(ordinary.messages.len(), 3);
         assert_eq!(projected.fingerprint, ordinary.fingerprint);
@@ -2864,15 +3261,25 @@ mod tests {
         fs::write(&second, b"{}\n").unwrap();
         assert!(find_native_transcript(HarnessKind::Claude, &root, "session-1").is_err());
         assert_eq!(
-            select_native_transcript(HarnessKind::Claude, &root, "session-1", Some(&second))
-                .unwrap(),
+            select_native_transcript(
+                HarnessKind::Claude,
+                &root,
+                &crate::agent_resume::AgentSessionRef::id("session-1").unwrap(),
+                Some(&second),
+            )
+            .unwrap(),
             second.canonicalize().unwrap()
         );
 
         let mismatched = root.join("projects/first/other.jsonl");
         fs::write(&mismatched, b"{}\n").unwrap();
         assert!(matches!(
-            select_native_transcript(HarnessKind::Claude, &root, "session-1", Some(&mismatched)),
+            select_native_transcript(
+                HarnessKind::Claude,
+                &root,
+                &crate::agent_resume::AgentSessionRef::id("session-1").unwrap(),
+                Some(&mismatched),
+            ),
             Err(TransferError::InvalidPath(_))
         ));
         fs::remove_dir_all(root).unwrap();

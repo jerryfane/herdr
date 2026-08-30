@@ -2879,6 +2879,8 @@ impl AppState {
                 seq,
                 session_ref,
                 session_path,
+                session_cursor,
+                process_pid,
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
@@ -2899,6 +2901,13 @@ impl AppState {
                                 &agent_for_path,
                                 session_ref,
                                 session_path,
+                            );
+                            terminal.set_reported_agent_session_runtime(
+                                &source_for_path,
+                                &agent_for_path,
+                                session_ref,
+                                session_cursor,
+                                process_pid,
                             );
                         }
                     }

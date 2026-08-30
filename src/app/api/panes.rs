@@ -1563,6 +1563,8 @@ impl App {
                     params.agent_session_path,
                 ),
                 session_path,
+                session_cursor: params.agent_session_cursor,
+                process_pid: params.agent_process_pid,
                 source: params.source,
                 agent_label,
                 seq: params.seq,

@@ -109,6 +109,8 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_path: Option<String>,
+        session_cursor: Option<String>,
+        process_pid: Option<u32>,
         session_start_source: Option<String>,
     },
     /// Background transcript staging and destination-file verification finished.

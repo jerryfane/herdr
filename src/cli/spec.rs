@@ -478,13 +478,15 @@ fn agent_command() -> Command {
         ))
         .subcommand(
             Command::new("transfer-session")
-                .about("Stage or confirm a Claude Code/Codex session transfer")
-                .override_usage("herdr agent transfer-session <TARGET> --to claude|codex [OPTIONS]")
+                .about("Stage or confirm a Claude Code/Codex/OMP session transfer")
+                .override_usage(
+                    "herdr agent transfer-session <TARGET> --to claude|codex|omp [OPTIONS]",
+                )
                 .arg(required("target", "TARGET"))
                 .arg(
                     option("to", "HARNESS")
                         .required(true)
-                        .value_parser(["claude", "codex"]),
+                        .value_parser(["claude", "codex", "omp"]),
                 )
                 .arg(option("account", "ID").help("Target harness account id"))
                 .arg(flag("yes").help("Confirm immediately after staging and verification"))

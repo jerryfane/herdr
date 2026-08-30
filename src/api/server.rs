@@ -187,6 +187,11 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         pane_input_stream: true,
         agent_session_transfer: true,
+        agent_session_transfer_harnesses: vec![
+            crate::api::schema::AgentSessionTransferHarness::Claude,
+            crate::api::schema::AgentSessionTransferHarness::Codex,
+            crate::api::schema::AgentSessionTransferHarness::Omp,
+        ],
     })
 }
 
@@ -2347,6 +2352,11 @@ mod tests {
                 detached_server_daemon: true,
                 pane_input_stream: false,
                 agent_session_transfer: true,
+                agent_session_transfer_harnesses: vec![
+                    crate::api::schema::AgentSessionTransferHarness::Claude,
+                    crate::api::schema::AgentSessionTransferHarness::Codex,
+                    crate::api::schema::AgentSessionTransferHarness::Omp,
+                ],
             }),
             None,
             None,

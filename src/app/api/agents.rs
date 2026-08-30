@@ -2299,16 +2299,21 @@ mod tests {
             source_session,
             source_account: Some("claude-source".into()),
             source_config_home: source_home.clone(),
+            source_sessions_root: source_home.clone(),
+            source_cursor: None,
+            source_process_pid: None,
             target_kind: crate::session_transfer::HarnessKind::Codex,
             target_account: Some("codex-target".into()),
             target_config_home: target_home.clone(),
+            target_sessions_root: target_home.clone(),
             phase: AgentSessionTransferPhase::Ready,
             message_count: 3,
             omissions: Default::default(),
             error: None,
             source_path: Some(source_path),
             source_fingerprint: Some(source_fingerprint),
-            target_session_id: Some("target-thread".into()),
+            target_session_ref: crate::agent_resume::AgentSessionRef::id("target-thread"),
+            target_cursor: None,
             target_transcript_path: Some(target_path),
             target_fingerprint: Some(target_fingerprint),
             target_deadline: None,
@@ -2317,6 +2322,7 @@ mod tests {
             verification_in_flight: None,
             verification_observation_deadline: None,
             awaiting_deferred_target_report: false,
+            target_report_accepted: false,
         });
         (terminal_id, source_home, target_home)
     }
@@ -2363,12 +2369,14 @@ mod tests {
         };
         transfer.source_account = Some("codex-target".into());
         transfer.source_config_home = codex_home.clone();
+        transfer.source_sessions_root = codex_home.clone();
         transfer.source_path = Some(codex_path);
         transfer.source_fingerprint = Some(codex_fingerprint);
         transfer.target_kind = crate::session_transfer::HarnessKind::Claude;
         transfer.target_account = Some("claude-source".into());
         transfer.target_config_home = claude_home.clone();
-        transfer.target_session_id = Some("sess-123".into());
+        transfer.target_sessions_root = claude_home.clone();
+        transfer.target_session_ref = crate::agent_resume::AgentSessionRef::id("sess-123");
         transfer.target_transcript_path = Some(claude_path);
         transfer.target_fingerprint = Some(claude_fingerprint);
         let source_session = transfer.source_session.clone();
@@ -2565,6 +2573,8 @@ mod tests {
             "herdr:codex",
             "codex",
             crate::agent_resume::AgentSessionRef::id("target-thread").as_ref(),
+            None,
+            None,
             true,
         );
         assert!(
@@ -2808,6 +2818,8 @@ mod tests {
             "herdr:codex",
             "codex",
             crate::agent_resume::AgentSessionRef::id("wrong-thread").as_ref(),
+            None,
+            None,
             true,
         );
         let terminal = &app.state.terminals[&terminal_id];
@@ -3270,6 +3282,8 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                 ),
+                agent_session_cursor: None,
+                agent_process_pid: None,
                 session_start_source: Some("resume".into()),
             },
         );
@@ -3310,6 +3324,8 @@ mod tests {
                 seq: Some(2),
                 agent_session_id: Some("sess-123".into()),
                 agent_session_path: None,
+                agent_session_cursor: None,
+                agent_process_pid: None,
                 session_start_source: Some("resume".into()),
             },
         );
@@ -3353,6 +3369,8 @@ mod tests {
                 seq: Some(99),
                 session_ref: crate::agent_resume::AgentSessionRef::id("wrong-stale-thread"),
                 session_path: None,
+                session_cursor: None,
+                process_pid: None,
                 session_start_source: Some("resume".into()),
             },
         );
@@ -3394,6 +3412,8 @@ mod tests {
                 seq: Some(10_000),
                 session_ref: crate::agent_resume::AgentSessionRef::id("wrong-source-session"),
                 session_path: None,
+                session_cursor: None,
+                process_pid: None,
                 session_start_source: Some("resume".into()),
             },
         );
