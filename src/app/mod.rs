@@ -13,6 +13,11 @@ mod api;
 pub(crate) use api::test_support::exiting_test_command;
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
+// Claude config-home layout, shared with the CLI so `herdr accounts prepare` writes the
+// same file the readiness gate reads — including the default-config-home sibling rule
+// (issue #94), which must not be re-derived anywhere.
+pub(crate) use api::agents::{claude_account_has_credentials, claude_config_file};
+mod config_io;
 mod creation;
 mod custom_commands;
 mod git_refresh;

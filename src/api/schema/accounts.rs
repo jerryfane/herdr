@@ -25,6 +25,33 @@ pub struct AccountInfo {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AccountUsage>,
+    /// Whether this account could host a resumed agent right now, and if not, the
+    /// first reason why. `None` means NOT ASSESSED for this kind — it does not mean
+    /// ready. Only Claude accounts have a readiness gate today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<AccountReadiness>,
+}
+
+/// Whether an account is in a state that can host a resumed agent.
+///
+/// This exists because authentication is not readiness. An account can hold valid
+/// credentials and still strand every agent moved onto it: a config-home that has
+/// never completed Claude Code's first run opens the theme picker instead of resuming,
+/// which is how the Aug 27 bulk-switch destroyed eleven live seats. The daemon has
+/// always known this at swap time; reporting it in `accounts.list` is what lets a
+/// client say so BEFORE someone moves a seat onto the account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AccountReadiness {
+    /// True when nothing detectable locally would stop a resumed agent from launching.
+    pub ready: bool,
+    /// Stable machine code of the FIRST blocker found, e.g. `account_not_authenticated`
+    /// or `account_onboarding_incomplete`. `None` when `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    /// Human-readable explanation of that blocker, suitable for showing to a person.
+    /// `None` when `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `accounts.create` — register a NEW credential account (in-app add-account). Creates
