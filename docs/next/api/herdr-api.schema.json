@@ -8423,7 +8423,8 @@
                 "sidechain_records": 0,
                 "system_records": 0,
                 "tool_records": 0,
-                "unsupported_blocks": 0
+                "unsupported_blocks": 0,
+                "windowed_records": 0
               }
             },
             "phase": {
@@ -8484,6 +8485,13 @@
               "type": "integer"
             },
             "unsupported_blocks": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "windowed_records": {
+              "default": 0,
+              "description": "Older records dropped because the transcript exceeded the transfer window.\nUnlike the other fields this is not a record CLASS — it is history left\nbehind, and a non-zero value means the transfer is lossy and needs a\nperson's approval before cutover.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
