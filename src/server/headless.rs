@@ -7690,6 +7690,8 @@ next_tab = ""
                 message: None,
                 seq: None,
                 session_ref: None,
+                session_cursor: None,
+                process_pid: None,
             })
         );
         assert!(

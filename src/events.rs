@@ -100,6 +100,10 @@ pub enum AppEvent {
         message: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// Active native tree leaf reported with this state observation.
+        session_cursor: Option<String>,
+        /// Harness process that owns `session_cursor`.
+        process_pid: Option<u32>,
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {

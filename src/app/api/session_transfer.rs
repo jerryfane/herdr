@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,24 @@ struct TransferAccountRoute {
     config_home: PathBuf,
     sessions_root: PathBuf,
     launch_env: crate::config::AccountLaunchEnv,
+}
+
+fn omp_named_profile_is_active() -> bool {
+    omp_profile_value_is_named(
+        std::env::var_os("OMP_PROFILE").as_deref(),
+        std::env::var_os("PI_PROFILE").as_deref(),
+    )
+}
+
+fn omp_profile_value_is_named(omp_profile: Option<&OsStr>, pi_profile: Option<&OsStr>) -> bool {
+    // Native OMP gives OMP_PROFILE precedence whenever it is defined, including
+    // the empty and `default` values. PI_PROFILE is only its legacy fallback.
+    let Some(value) = omp_profile.or(pi_profile) else {
+        return false;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !value.is_empty() && value != "default"
 }
 
 impl App {
@@ -576,14 +595,7 @@ impl App {
         account_id: Option<&str>,
     ) -> Result<TransferAccountRoute, ErrorBody> {
         let Some(account_id) = account_id else {
-            if kind == HarnessKind::Omp
-                && ["OMP_PROFILE", "PI_PROFILE"].into_iter().any(|key| {
-                    std::env::var_os(key).is_some_and(|value| {
-                        let value = value.to_string_lossy();
-                        !value.trim().is_empty() && value.trim() != "default"
-                    })
-                })
-            {
+            if kind == HarnessKind::Omp && omp_named_profile_is_active() {
                 return Err(ErrorBody {
                     code: "omp_profile_unsupported".into(),
                     message: "OMP named profiles are not supported by agent session transfer yet; use the default profile or a Herdr OMP account".into(),
@@ -2042,5 +2054,66 @@ impl App {
             self.schedule_session_save();
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{omp_profile_value_is_named, App, HarnessKind};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn omp_profile_precedence_matches_native_resolution() {
+        assert!(omp_profile_value_is_named(
+            Some(OsStr::new("work")),
+            Some(OsStr::new("legacy")),
+        ));
+        assert!(!omp_profile_value_is_named(
+            Some(OsStr::new("default")),
+            Some(OsStr::new("work")),
+        ));
+        assert!(!omp_profile_value_is_named(
+            Some(OsStr::new("")),
+            Some(OsStr::new("work")),
+        ));
+        assert!(omp_profile_value_is_named(None, Some(OsStr::new("work")),));
+        assert!(!omp_profile_value_is_named(None, None));
+    }
+
+    #[test]
+    fn default_omp_transfer_route_uses_native_profile_precedence() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let keys = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"];
+        let previous = keys.map(|key| (key, std::env::var_os(key)));
+        std::env::set_var("HOME", "/tmp/herdr-omp-profile-home");
+        std::env::set_var("PI_CODING_AGENT_DIR", "/tmp/herdr-omp-selected");
+        std::env::set_var("PI_PROFILE", "work");
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        std::env::set_var("OMP_PROFILE", "default");
+        assert!(app.resolve_transfer_account(HarnessKind::Omp, None).is_ok());
+        std::env::set_var("OMP_PROFILE", "");
+        assert!(app.resolve_transfer_account(HarnessKind::Omp, None).is_ok());
+        std::env::remove_var("OMP_PROFILE");
+        let error = match app.resolve_transfer_account(HarnessKind::Omp, None) {
+            Ok(_) => panic!("legacy PI_PROFILE is active only when OMP_PROFILE is absent"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "omp_profile_unsupported");
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

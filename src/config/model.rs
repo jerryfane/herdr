@@ -372,16 +372,16 @@ pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// The auth-credential environment variables that applying a config-home
-/// override for `kind` must CLEAR so the selected account's own credentials are
-/// authoritative. A machine-global `CLAUDE_CODE_OAUTH_TOKEN` otherwise overrides
-/// every per-account credential regardless of `CLAUDE_CONFIG_DIR`, so an account
-/// swap that only sets the config dir keeps authenticating as the token's
-/// account and hits its quota (gitmoot workflow-note row 86147, 2026-08-26).
-/// Empty for kinds with no such token lever today (codex/kimi/unknown).
+/// The environment variables that applying a config-home override for `kind`
+/// must CLEAR so the selected account is authoritative. A machine-global
+/// `CLAUDE_CODE_OAUTH_TOKEN` otherwise overrides every per-account credential
+/// regardless of `CLAUDE_CONFIG_DIR`. OMP's profile selectors similarly override
+/// `PI_CODING_AGENT_DIR`, including the account's credentials and extensions.
+/// Empty for kinds with no such overriding lever today (codex/kimi/unknown).
 pub fn auth_env_vars_to_clear(kind: &str) -> &'static [&'static str] {
     match kind {
         "claude" => &["CLAUDE_CODE_OAUTH_TOKEN"],
+        "omp" => &["OMP_PROFILE", "PI_PROFILE"],
         _ => &[],
     }
 }
@@ -1542,13 +1542,16 @@ mod tests {
     }
 
     #[test]
-    fn auth_env_vars_to_clear_covers_claude_token_only() {
+    fn auth_env_vars_to_clear_covers_account_overrides() {
         assert_eq!(
             auth_env_vars_to_clear("claude"),
             &["CLAUDE_CODE_OAUTH_TOKEN"]
         );
         assert_eq!(auth_env_vars_to_clear("codex"), &[] as &[&str]);
-        assert_eq!(auth_env_vars_to_clear("omp"), &[] as &[&str]);
+        assert_eq!(
+            auth_env_vars_to_clear("omp"),
+            &["OMP_PROFILE", "PI_PROFILE"]
+        );
         assert_eq!(auth_env_vars_to_clear("kimi"), &[] as &[&str]);
         assert_eq!(auth_env_vars_to_clear("gemini"), &[] as &[&str]);
         assert_eq!(auth_env_vars_to_clear(""), &[] as &[&str]);
@@ -1581,9 +1584,28 @@ mod tests {
             })
         );
 
+        let omp = AccountConfig {
+            id: "omp-work".into(),
+            kind: "omp".into(),
+            label: "OMP Work".into(),
+            config_dir: "/home/x/.omp-work/agent".into(),
+        };
+        let omp_env = AccountLaunchEnv {
+            vars: vec![(
+                "PI_CODING_AGENT_DIR".to_string(),
+                "/home/x/.omp-work/agent".to_string(),
+            )],
+            clear_vars: vec!["OMP_PROFILE".to_string(), "PI_PROFILE".to_string()],
+        };
+        assert_eq!(omp.launch_env(), Some(omp_env.clone()));
+        assert_eq!(
+            AccountLaunchEnv::from_resolved_vars(omp_env.vars.clone()),
+            omp_env
+        );
+
         let unknown = AccountConfig {
             kind: "gemini".into(),
-            ..account
+            ..omp
         };
         assert_eq!(unknown.launch_env(), None);
     }
