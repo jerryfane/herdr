@@ -31,6 +31,7 @@ mod integration;
 mod machine;
 mod notification;
 mod pair;
+mod pair_qr;
 mod pane;
 mod plugin;
 mod protocol_guard;

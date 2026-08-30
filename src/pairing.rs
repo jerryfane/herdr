@@ -145,27 +145,103 @@ pub fn choose_bind_address(
     }
 }
 
-/// Ask Tailscale for this machine's tailnet IPv4, or `None` if it is not usable.
+/// Why Tailscale could not supply the address pairing needs.
 ///
-/// Deliberately shells out rather than naming an interface: on this fleet `tailscale0`
-/// does not appear in `ip addr` at all (userspace/TUN routing), while `tailscale ip -4`
-/// resolves cleanly. Any failure is `None`, never an error — "no Tailscale" is an ordinary
-/// state that `choose_bind_address` already has a message for.
-pub fn detect_tailscale_address() -> Option<Ipv4Addr> {
-    let out = std::process::Command::new("tailscale")
-        .args(["ip", "-4"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// These are deliberately distinct. "Not installed" and "installed but disconnected"
+/// have different fixes, and collapsing both into `None` produced the misleading
+/// `NoTailscale` error on macOS even when the app was installed and connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailscaleDetectionError {
+    CliNotFound,
+    Unavailable,
+    InvalidOutput,
+}
+
+impl fmt::Display for TailscaleDetectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CliNotFound => write!(
+                f,
+                "could not find the Tailscale CLI. Install and open Tailscale, connect it, then run `herdr pair` again."
+            ),
+            Self::Unavailable => write!(
+                f,
+                "Tailscale was found but could not report a usable IPv4 address. Open Tailscale, make sure it is connected, then run `herdr pair` again."
+            ),
+            Self::InvalidOutput => write!(
+                f,
+                "Tailscale returned something other than an IPv4 address. Refusing to choose a network address by guessing."
+            ),
+        }
     }
-    String::from_utf8(out.stdout)
-        .ok()?
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TailscaleCommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+/// Ask Tailscale for this machine's tailnet IPv4.
+///
+/// Deliberately shells out rather than naming an interface: userspace-networking installs
+/// need not expose a `tailscale0` interface. The candidate list is platform-owned because
+/// the App Store build on macOS lives inside its app bundle and requires CLI mode.
+pub fn detect_tailscale_address() -> Result<Ipv4Addr, TailscaleDetectionError> {
+    detect_tailscale_address_with(&crate::platform::tailscale_cli_candidates(), |candidate| {
+        tailscale_command(candidate)
+            .output()
+            .map(|output| TailscaleCommandOutput {
+                success: output.status.success(),
+                stdout: output.stdout,
+            })
+    })
+}
+
+fn tailscale_command(candidate: &crate::platform::TailscaleCliCandidate) -> std::process::Command {
+    let mut command = std::process::Command::new(&candidate.program);
+    command.args(["ip", "-4"]);
+    if candidate.force_cli_mode {
+        command.env("TAILSCALE_BE_CLI", "1");
+    }
+    command
+}
+
+fn detect_tailscale_address_with(
+    candidates: &[crate::platform::TailscaleCliCandidate],
+    mut run: impl FnMut(&crate::platform::TailscaleCliCandidate) -> io::Result<TailscaleCommandOutput>,
+) -> Result<Ipv4Addr, TailscaleDetectionError> {
+    let mut found_executable = false;
+    for candidate in candidates {
+        let output = match run(candidate) {
+            Ok(output) => {
+                found_executable = true;
+                output
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                found_executable = true;
+                continue;
+            }
+        };
+        if !output.success {
+            continue;
+        }
+        let text =
+            String::from_utf8(output.stdout).map_err(|_| TailscaleDetectionError::InvalidOutput)?;
+        let Some(address) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+            continue;
+        };
+        return address
+            .parse()
+            .map_err(|_| TailscaleDetectionError::InvalidOutput);
+    }
+
+    if found_executable {
+        Err(TailscaleDetectionError::Unavailable)
+    } else {
+        Err(TailscaleDetectionError::CliNotFound)
+    }
 }
 
 /// What the QR actually carries.
@@ -237,6 +313,29 @@ pub fn render_qr_terminal(data: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Render the same QR as a standalone scalable image.
+///
+/// The payload itself is never embedded as SVG text or metadata. Only the encoder's dark
+/// module coordinates are written, so user-controlled fields cannot become markup.
+pub fn render_qr_svg(data: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let modules = qr_modules(data)?;
+    let size = modules.len();
+    let pixels = size * 8;
+    let mut path = String::new();
+    for (y, row) in modules.iter().enumerate() {
+        for (x, dark) in row.iter().enumerate() {
+            if *dark {
+                let _ = write!(path, "M{x} {y}h1v1h-1z");
+            }
+        }
+    }
+    Ok(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" width=\"{pixels}\" height=\"{pixels}\" shape-rendering=\"crispEdges\">\n<rect width=\"{size}\" height=\"{size}\" fill=\"#fff\"/>\n<path fill=\"#000\" d=\"{path}\"/>\n</svg>\n"
+    ))
+}
+
 /// Upper half block: its FOREGROUND paints the top module, its BACKGROUND the bottom one.
 /// Two module rows per text line, so a 61-module QR fits in 61 columns instead of 122.
 const HALF_BLOCK: char = '\u{2580}';
@@ -264,32 +363,48 @@ pub struct QrCell {
     pub bottom_light: bool,
 }
 
+/// Square QR module matrix including its quiet zone. `true` means DARK.
+///
+/// Both the terminal and SVG renderers consume this representation. A new renderer cannot
+/// silently change polarity, geometry, or margin without changing their shared tests.
+pub fn qr_modules(data: &str) -> Result<Vec<Vec<bool>>, String> {
+    use qrcodegen::{QrCode, QrCodeEcc};
+    let qr = QrCode::encode_text(data, QrCodeEcc::Medium)
+        .map_err(|err| format!("could not encode the pairing QR: {err}"))?;
+    let lo = -QUIET_MODULES;
+    let hi = qr.size() + QUIET_MODULES;
+    let mut modules = Vec::with_capacity((hi - lo) as usize);
+    for y in lo..hi {
+        let mut row = Vec::with_capacity((hi - lo) as usize);
+        for x in lo..hi {
+            row.push(qr.get_module(x, y));
+        }
+        modules.push(row);
+    }
+    Ok(modules)
+}
+
 /// The QR as half-block cells, with the quiet zone included.
 ///
 /// Split from the colouring so the GEOMETRY (quiet zone, row pairing, the odd final row)
 /// can be checked against the encoder's own matrix without parsing escape sequences.
 pub fn qr_cells(data: &str) -> Result<Vec<Vec<QrCell>>, String> {
-    use qrcodegen::{QrCode, QrCodeEcc};
-    let qr = QrCode::encode_text(data, QrCodeEcc::Medium)
-        .map_err(|err| format!("could not encode the pairing QR: {err}"))?;
-    let size = qr.size();
-    let lo = -QUIET_MODULES;
-    let hi = size + QUIET_MODULES;
-
-    // `true` = a LIGHT module, so the sense is explicit at every use site.
-    let light = |x: i32, y: i32| -> bool { !qr.get_module(x, y) };
-
+    let modules = qr_modules(data)?;
     let mut rows = Vec::new();
-    let mut y = lo;
-    while y < hi {
-        let mut row = Vec::with_capacity((hi - lo) as usize);
-        for x in lo..hi {
+    let mut y = 0usize;
+    while y < modules.len() {
+        let mut row = Vec::with_capacity(modules.len());
+        for x in 0..modules.len() {
             row.push(QrCell {
-                top_light: light(x, y),
+                top_light: !modules[y][x],
                 // An odd module count leaves the last line half empty; that half is quiet
                 // zone, so it must be LIGHT. Painting it dark would put ink hard against
                 // the QR's bottom edge and cost the margin the spec requires.
-                bottom_light: if y + 1 < hi { light(x, y + 1) } else { true },
+                bottom_light: if y + 1 < modules.len() {
+                    !modules[y + 1][x]
+                } else {
+                    true
+                },
             });
         }
         rows.push(row);
@@ -763,6 +878,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn svg_and_terminal_renderers_share_the_exact_module_matrix() {
+        let data = sample_payload().to_json();
+        let modules = qr_modules(&data).expect("module matrix");
+        let cells = qr_cells(&data).expect("terminal cells");
+        let svg = render_qr_svg(&data).expect("SVG");
+
+        assert_eq!(modules.len(), modules[0].len(), "QR matrix must be square");
+        assert!(
+            modules[0].iter().all(|dark| !dark)
+                && modules.iter().all(|row| !row[0] && !row[row.len() - 1]),
+            "the shared matrix must include its light quiet zone"
+        );
+
+        let dark_modules = modules.iter().flatten().filter(|dark| **dark).count();
+        assert_eq!(
+            svg.matches('M').count(),
+            dark_modules,
+            "the SVG must draw every dark module exactly once"
+        );
+        for (y, row) in modules.iter().enumerate() {
+            for (x, dark) in row.iter().enumerate() {
+                let cell = cells[y / 2][x];
+                let terminal_dark = if y % 2 == 0 {
+                    !cell.top_light
+                } else {
+                    !cell.bottom_light
+                };
+                assert_eq!(terminal_dark, *dark, "renderer drift at ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn svg_contains_only_geometry_not_the_pairing_payload() {
+        let data = sample_payload().to_json();
+        let svg = render_qr_svg(&data).expect("SVG");
+        assert!(svg.starts_with("<svg "));
+        assert!(svg.contains("shape-rendering=\"crispEdges\""));
+        for secret_or_field in ["tok", "jerry", "100.106.218.88", "SHA256:"] {
+            assert!(
+                !svg.contains(secret_or_field),
+                "payload text must not be embedded in SVG markup"
+            );
+        }
+    }
+
     /// THE RENDERED OUTPUT MUST NOT DEPEND ON THE TERMINAL'S THEME.
     ///
     /// Measured defect, not a hypothetical: the first version drew light modules as glyphs
@@ -930,6 +1092,92 @@ mod tests {
         assert!(!is_tailnet_address("100.63.255.255".parse().unwrap()));
         assert!(!is_tailnet_address("100.128.0.0".parse().unwrap()));
         assert!(!is_tailnet_address("37.27.59.89".parse().unwrap()));
+    }
+
+    #[test]
+    fn tailscale_candidates_are_tried_in_declared_order_until_one_works() {
+        let candidates = vec![
+            crate::platform::TailscaleCliCandidate::new("first"),
+            crate::platform::TailscaleCliCandidate::new("second"),
+            crate::platform::TailscaleCliCandidate {
+                program: "app-bundle".into(),
+                force_cli_mode: true,
+            },
+        ];
+        let mut seen = Vec::new();
+        let address = detect_tailscale_address_with(&candidates, |candidate| {
+            seen.push((candidate.program.clone(), candidate.force_cli_mode));
+            match candidate.program.to_string_lossy().as_ref() {
+                "first" => Err(io::ErrorKind::NotFound.into()),
+                "second" => Ok(TailscaleCommandOutput {
+                    success: false,
+                    stdout: Vec::new(),
+                }),
+                _ => Ok(TailscaleCommandOutput {
+                    success: true,
+                    stdout: b"100.90.80.70\n".to_vec(),
+                }),
+            }
+        })
+        .expect("fallback candidate");
+        assert_eq!(
+            address,
+            "100.90.80.70".parse::<Ipv4Addr>().expect("address")
+        );
+        assert_eq!(
+            seen,
+            vec![
+                (PathBuf::from("first"), false),
+                (PathBuf::from("second"), false),
+                (PathBuf::from("app-bundle"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_bundle_candidate_forces_tailscale_cli_mode() {
+        let candidate = crate::platform::TailscaleCliCandidate {
+            program: "app-bundle".into(),
+            force_cli_mode: true,
+        };
+        let command = tailscale_command(&candidate);
+        assert_eq!(command.get_program(), "app-bundle");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("ip"), std::ffi::OsStr::new("-4")]
+        );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "TAILSCALE_BE_CLI" && value == Some(std::ffi::OsStr::new("1"))
+        }));
+    }
+
+    #[test]
+    fn tailscale_absence_failure_and_invalid_output_have_different_causes() {
+        let candidates = vec![crate::platform::TailscaleCliCandidate::new("tailscale")];
+        assert_eq!(
+            detect_tailscale_address_with(&candidates, |_candidate| {
+                Err(io::ErrorKind::NotFound.into())
+            }),
+            Err(TailscaleDetectionError::CliNotFound)
+        );
+        assert_eq!(
+            detect_tailscale_address_with(&candidates, |_candidate| {
+                Ok(TailscaleCommandOutput {
+                    success: false,
+                    stdout: Vec::new(),
+                })
+            }),
+            Err(TailscaleDetectionError::Unavailable)
+        );
+        assert_eq!(
+            detect_tailscale_address_with(&candidates, |_candidate| {
+                Ok(TailscaleCommandOutput {
+                    success: true,
+                    stdout: b"not-an-address\n".to_vec(),
+                })
+            }),
+            Err(TailscaleDetectionError::InvalidOutput)
+        );
     }
 
     /// THE SECURITY PROPERTY: a pre-authentication endpoint must never land on a public
