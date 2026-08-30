@@ -1,7 +1,9 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::api::schema::{AccountInfo, AccountUsage, ResponseResult, UsageWindow};
+use crate::api::schema::{
+    AccountInfo, AccountReadiness, AccountUsage, ResponseResult, UsageWindow,
+};
 use crate::app::App;
 use crate::config::AccountConfig;
 
@@ -102,6 +104,7 @@ impl App {
                     active,
                     email: account_email(account),
                     usage,
+                    readiness: account_readiness(account),
                 }
             })
             .collect();
@@ -621,6 +624,37 @@ fn account_email(account: &AccountConfig) -> Option<String> {
     }
 }
 
+/// Whether an account could host a resumed agent, for `accounts.list`.
+///
+/// Delegates to the SAME gate the swap path enforces
+/// (`super::agents::claude_account_launch_blocker`) rather than restating its rules —
+/// a second copy would drift, and then the list would promise a readiness the swap
+/// refuses. Passing `cwd: None` deliberately limits this to account-wide blockers
+/// (logged out, first run incomplete); per-directory trust is not an account property
+/// and cannot be judged without knowing where an agent would resume.
+///
+/// Returns `None` for kinds with no readiness gate. `None` is NOT "ready" — the field
+/// is documented as "not assessed" so a client cannot read a missing value as a pass.
+fn account_readiness(account: &AccountConfig) -> Option<AccountReadiness> {
+    if account.kind != "claude" {
+        return None;
+    }
+    Some(
+        match super::agents::claude_account_launch_blocker(&account.config_dir, None) {
+            None => AccountReadiness {
+                ready: true,
+                blocker: None,
+                detail: None,
+            },
+            Some(blocker) => AccountReadiness {
+                ready: false,
+                blocker: Some(blocker.code().to_string()),
+                detail: Some(blocker.message(&account.id)),
+            },
+        },
+    )
+}
+
 /// Claude email: `<config_dir>/.claude.json` -> `oauthAccount.emailAddress`
 /// (a scoped lookup — `.claude.json` is large, so avoid a tree-wide search).
 fn read_claude_email(config_dir: &str) -> Option<String> {
@@ -829,6 +863,35 @@ mod tests {
         assert_eq!(account["usage"]["plan"], "pro");
         // A fresh cache hit is served WITHOUT scheduling another fetch.
         assert!(!app.usage_refresh_inflight.contains("work"));
+    }
+
+    #[test]
+    fn accounts_list_response_carries_readiness_on_the_wire() {
+        // The struct field is not the deliverable — the client reads JSON. This asserts the
+        // shape a client actually receives, including that a codex account carries NO
+        // readiness key at all rather than an optimistic one.
+        let dir = std::env::temp_dir().join(format!("herdr-wire-readiness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".credentials.json"), "{\"claudeAiOauth\":{}}").unwrap();
+        std::fs::write(dir.join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
+
+        let mut app = test_app_with_accounts(vec![
+            account("signed-in", "claude", &dir.display().to_string()),
+            account("cx", "codex", "/tmp/does-not-exist-codex-readiness"),
+        ]);
+        let response = app.handle_accounts_list("req".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let claude = &value["result"]["accounts"][0];
+        assert_eq!(claude["readiness"]["ready"], serde_json::json!(false));
+        assert_eq!(
+            claude["readiness"]["blocker"],
+            serde_json::json!("account_onboarding_incomplete")
+        );
+        // Absent, not `ready: true` — a client must not read silence as a pass.
+        assert!(value["result"]["accounts"][1].get("readiness").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1128,6 +1191,95 @@ mod tests {
             codex_local_window_label(Some(&serde_json::json!({})), "fb"),
             "fb"
         );
+    }
+
+    fn claude_account(id: &str, config_dir: &str) -> AccountConfig {
+        AccountConfig {
+            id: id.to_string(),
+            kind: "claude".to_string(),
+            label: id.to_string(),
+            config_dir: config_dir.to_string(),
+        }
+    }
+
+    #[test]
+    fn readiness_reports_signed_in_but_unprepared_as_not_ready() {
+        // The exact shape `claude auth login` leaves behind, and the reason this field
+        // exists: credentials present, first run never completed. `accounts.list` used to
+        // show this account as a normal signed-in account, so nothing warned anybody
+        // until a swap destroyed the seat.
+        let dir = std::env::temp_dir().join(format!("herdr-readiness-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".credentials.json"), "{\"claudeAiOauth\":{}}").unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"emailAddress": "user@example.com"}}).to_string(),
+        )
+        .unwrap();
+
+        let readiness =
+            account_readiness(&claude_account("acc", &dir.display().to_string())).unwrap();
+        assert!(!readiness.ready);
+        assert_eq!(
+            readiness.blocker.as_deref(),
+            Some("account_onboarding_incomplete")
+        );
+        assert!(readiness
+            .detail
+            .is_some_and(|detail| detail.contains("acc")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readiness_is_ready_once_first_run_is_complete_and_ignores_per_directory_trust() {
+        // Trust is per working directory and cannot be judged from a list with no cwd, so
+        // an onboarded account with NO trusted directories must still read ready here.
+        // Reporting it as blocked would make every account look broken in the list.
+        let dir = std::env::temp_dir().join(format!("herdr-readiness-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".credentials.json"), "{\"claudeAiOauth\":{}}").unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            serde_json::json!({"hasCompletedOnboarding": true, "projects": {}}).to_string(),
+        )
+        .unwrap();
+
+        let readiness =
+            account_readiness(&claude_account("acc", &dir.display().to_string())).unwrap();
+        assert!(readiness.ready);
+        assert_eq!(readiness.blocker, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readiness_reports_a_logged_out_account_before_onboarding() {
+        // Order matters: an empty config-home is logged out, not un-onboarded. Reporting
+        // onboarding here would send someone to run `prepare` on an account that needs a
+        // login, and the wall would just move.
+        let dir = std::env::temp_dir().join(format!("herdr-readiness-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let readiness =
+            account_readiness(&claude_account("acc", &dir.display().to_string())).unwrap();
+        assert!(!readiness.ready);
+        assert_eq!(
+            readiness.blocker.as_deref(),
+            Some("account_not_authenticated")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readiness_is_none_for_kinds_with_no_gate() {
+        // None means NOT ASSESSED. A client that reads a missing value as "ready" is
+        // wrong, which is why the field is documented that way and codex returns None
+        // rather than an optimistic `ready: true`.
+        let mut account = claude_account("cx", "/nonexistent");
+        account.kind = "codex".to_string();
+        assert!(account_readiness(&account).is_none());
     }
 
     #[test]

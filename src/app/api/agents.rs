@@ -609,7 +609,7 @@ fn now_rfc3339() -> String {
 /// onto it would strand it at a login screen, so restart fails closed on this (workflow-note row 86147).
 /// A present file is treated as authenticated here — a deeper `claude auth status` probe (to also catch
 /// present-but-expired credentials) is left as a follow-up so the request handler stays subprocess-free.
-fn claude_account_has_credentials(config_dir: &str) -> bool {
+pub(crate) fn claude_account_has_credentials(config_dir: &str) -> bool {
     let creds = std::path::Path::new(config_dir).join(".credentials.json");
     std::fs::metadata(&creds)
         .map(|meta| meta.len() > 0)
@@ -632,7 +632,7 @@ fn claude_account_has_credentials(config_dir: &str) -> bool {
 ///
 /// Note `.credentials.json` is NOT like this — it lives inside every config-home,
 /// including the default one, so `claude_account_has_credentials` is correct as written.
-fn claude_config_file(config_dir: &str) -> std::path::PathBuf {
+pub(crate) fn claude_config_file(config_dir: &str) -> std::path::PathBuf {
     if crate::config::is_default_config_dir("claude", config_dir) {
         if let Some(home) = std::env::var_os("HOME") {
             return std::path::Path::new(&home).join(".claude.json");
