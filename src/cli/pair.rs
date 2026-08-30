@@ -10,18 +10,24 @@
 //! photograph of it is worthless once redeemed.
 
 use std::io::Write as _;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::pair_qr::{open_qr_with, PairingQrFile};
 use crate::pairing;
 
 /// How long a pairing window stays open. Long enough to walk to another room and find the
 /// app; short enough that an unattended terminal is not a standing invitation.
 const DEFAULT_TTL: Duration = Duration::from_secs(300);
+const SSH_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     let mut lan = false;
     let mut ttl = DEFAULT_TTL;
     let mut port: u16 = 0; // 0 = let the OS choose
+    let mut open_qr = false;
+    let mut qr_file: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -31,6 +37,17 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
                 return Ok(0);
             }
             "--lan" => lan = true,
+            "--open" => open_qr = true,
+            "--qr-file" => {
+                i += 1;
+                match args.get(i).filter(|value| !value.is_empty()) {
+                    Some(path) => qr_file = Some(PathBuf::from(path)),
+                    None => {
+                        eprintln!("--qr-file takes a file path");
+                        return Ok(2);
+                    }
+                }
+            }
             "--ttl" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
@@ -63,12 +80,64 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     // Decide where to listen BEFORE anything else. Every refusal here is a refusal to put
     // a pre-authentication endpoint somewhere it should not be, so it happens before a
     // token exists, before a socket is opened, and before anything is printed.
-    let tailscale = pairing::detect_tailscale_address();
-    let lan_addr = if lan { first_private_address() } else { None };
+    let lan_addr = if lan {
+        match crate::platform::private_lan_ipv4() {
+            Ok(address) => address,
+            Err(err) => {
+                eprintln!("herdr pair: {err}");
+                return Ok(1);
+            }
+        }
+    } else {
+        None
+    };
+    let tailscale_result = pairing::detect_tailscale_address();
+    let tailscale = match tailscale_result {
+        Ok(address) => Some(address),
+        Err(pairing::TailscaleDetectionError::InvalidOutput) => {
+            eprintln!(
+                "herdr pair: {}",
+                pairing::TailscaleDetectionError::InvalidOutput
+            );
+            return Ok(1);
+        }
+        Err(_err) if lan && lan_addr.is_some() => None,
+        Err(err) if lan => {
+            eprintln!(
+                "herdr pair: no RFC1918 private LAN address was found. Tailscale was also unavailable: {err}"
+            );
+            return Ok(1);
+        }
+        Err(err) => {
+            eprintln!("herdr pair: {err}");
+            return Ok(1);
+        }
+    };
     let bind_ip = match pairing::choose_bind_address(tailscale, lan_addr) {
         Ok(addr) => addr,
         Err(refusal) => {
             eprintln!("herdr pair: {refusal}");
+            return Ok(1);
+        }
+    };
+
+    // A pairing succeeds only if the app can SSH to the machine afterwards and pin the
+    // key it sees. Prove both facts before minting or exposing a code. The old path emitted
+    // `fp: ""` and an "UNKNOWN" label, even though Herdrup correctly refuses that payload.
+    let fingerprint = match ssh_readiness(bind_ip) {
+        Ok(fingerprint) => fingerprint,
+        Err(SshReadinessError::NotListening { address, cause }) => {
+            eprintln!(
+                "herdr pair: SSH is not accepting connections at {address}: {cause}. {}",
+                crate::platform::ssh_pairing_setup_hint()
+            );
+            return Ok(1);
+        }
+        Err(SshReadinessError::MissingHostKey { address }) => {
+            eprintln!(
+                "herdr pair: SSH is reachable at {address}, but its host-key fingerprint could not be read. Pairing stopped because Herdrup requires a pinned host identity. {}",
+                crate::platform::ssh_pairing_setup_hint()
+            );
             return Ok(1);
         }
     };
@@ -86,17 +155,13 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "root".into());
-    // Without the fingerprint the app has to trust-on-first-use whatever answers, so say
-    // plainly when we cannot supply it rather than letting the weaker path pass unnoticed.
-    let fingerprint = pairing::ssh_host_key_fingerprint();
-
     let payload = pairing::PairingPayload {
         v: pairing::PAIRING_PAYLOAD_VERSION,
         host: bind_ip.to_string(),
         port: local.port(),
         user: user.clone(),
         token: token.as_str().to_string(),
-        fp: fingerprint.clone().unwrap_or_default(),
+        fp: fingerprint.clone(),
     };
 
     let qr = match pairing::render_qr_terminal(&payload.to_json()) {
@@ -106,6 +171,34 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             return Ok(1);
         }
     };
+    let svg = if open_qr || qr_file.is_some() {
+        match pairing::render_qr_svg(&payload.to_json()) {
+            Ok(svg) => Some(svg),
+            Err(err) => {
+                eprintln!("herdr pair: {err}");
+                return Ok(1);
+            }
+        }
+    } else {
+        None
+    };
+    let qr_artifact = match svg.as_deref() {
+        Some(svg) => match PairingQrFile::create(svg, qr_file.as_deref()) {
+            Ok(file) => Some(file),
+            Err(err) => {
+                eprintln!("herdr pair: could not write the QR image: {err}");
+                return Ok(1);
+            }
+        },
+        None => None,
+    };
+    let open_warning = if open_qr {
+        qr_artifact
+            .as_ref()
+            .and_then(|file| open_qr_with(file.path(), crate::platform::open_path))
+    } else {
+        None
+    };
 
     let mut out = std::io::stdout().lock();
     writeln!(out)?;
@@ -114,13 +207,12 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     writeln!(out)?;
     writeln!(out, "  address    {}:{}", bind_ip, local.port())?;
     writeln!(out, "  user       {user}")?;
-    match &fingerprint {
-        Some(fp) => writeln!(out, "  host key   {fp}")?,
-        None => writeln!(
-            out,
-            "  host key   UNKNOWN — could not read this machine's SSH host key, so the \
-             app will trust the first key it is offered"
-        )?,
+    writeln!(out, "  host key   {fingerprint}")?;
+    if let Some(file) = &qr_artifact {
+        writeln!(out, "  QR image   {}", file.path().display())?;
+    }
+    if let Some(warning) = &open_warning {
+        writeln!(out, "  warning    {warning}")?;
     }
     writeln!(
         out,
@@ -183,21 +275,33 @@ fn home_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/root"))
 }
 
-/// Find a private address to bind when `--lan` is passed.
-///
-/// Deliberately narrow: only RFC1918 addresses are considered, and
-/// `choose_bind_address` checks the result again. Returning something public here would be
-/// caught there rather than bound.
-fn first_private_address() -> Option<std::net::Ipv4Addr> {
-    let out = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-        .ok()?;
-    String::from_utf8(out.stdout)
-        .ok()?
-        .split_whitespace()
-        .filter_map(|token| token.parse::<std::net::Ipv4Addr>().ok())
-        .find(|addr| pairing::is_private_address(*addr) && !addr.is_loopback())
+#[derive(Debug, PartialEq, Eq)]
+enum SshReadinessError {
+    NotListening { address: SocketAddr, cause: String },
+    MissingHostKey { address: SocketAddr },
+}
+
+fn ssh_readiness(bind_ip: Ipv4Addr) -> Result<String, SshReadinessError> {
+    ssh_readiness_with(
+        bind_ip,
+        |address, timeout| {
+            TcpStream::connect_timeout(&address, timeout)
+                .map(drop)
+                .map_err(|err| err.to_string())
+        },
+        pairing::ssh_host_key_fingerprint,
+    )
+}
+
+fn ssh_readiness_with(
+    bind_ip: Ipv4Addr,
+    connect: impl FnOnce(SocketAddr, Duration) -> Result<(), String>,
+    fingerprint: impl FnOnce() -> Option<String>,
+) -> Result<String, SshReadinessError> {
+    let address = SocketAddr::from((bind_ip, 22));
+    connect(address, SSH_READY_TIMEOUT)
+        .map_err(|cause| SshReadinessError::NotListening { address, cause })?;
+    fingerprint().ok_or(SshReadinessError::MissingHostKey { address })
 }
 
 /// Render the SAME help clap builds for `herdr pair --help`, taken from `spec.rs`.
@@ -216,5 +320,65 @@ fn print_help() {
     root.build();
     if let Some(pair) = root.find_subcommand_mut("pair") {
         let _ = pair.print_help();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_must_listen_before_the_fingerprint_is_read() {
+        let fingerprint_called = std::cell::Cell::new(false);
+        let result = ssh_readiness_with(
+            "100.64.1.2".parse().expect("address"),
+            |_address, _timeout| Err("connection refused".into()),
+            || {
+                fingerprint_called.set(true);
+                Some("SHA256:should-not-be-read".into())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(SshReadinessError::NotListening { .. })
+        ));
+        assert!(!fingerprint_called.get());
+    }
+
+    #[test]
+    fn ssh_without_a_fingerprint_is_refused() {
+        let result = ssh_readiness_with(
+            "100.64.1.2".parse().expect("address"),
+            |_address, timeout| {
+                assert_eq!(timeout, SSH_READY_TIMEOUT);
+                Ok(())
+            },
+            || None,
+        );
+        assert_eq!(
+            result,
+            Err(SshReadinessError::MissingHostKey {
+                address: "100.64.1.2:22".parse().expect("socket address")
+            })
+        );
+    }
+
+    #[test]
+    fn ssh_readiness_returns_the_exact_fingerprint() {
+        let result = ssh_readiness_with(
+            "100.64.1.2".parse().expect("address"),
+            |address, _timeout| {
+                assert_eq!(address, "100.64.1.2:22".parse().expect("socket address"));
+                Ok(())
+            },
+            || Some("SHA256:exact".into()),
+        );
+        assert_eq!(result, Ok("SHA256:exact".into()));
+    }
+
+    #[test]
+    fn qr_file_requires_a_path_before_any_network_work() {
+        let exit = run_pair_command(&["--qr-file".into()]).expect("command result");
+        assert_eq!(exit, 2);
     }
 }

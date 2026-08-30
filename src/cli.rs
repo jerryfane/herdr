@@ -30,6 +30,7 @@ mod gram;
 mod integration;
 mod notification;
 mod pair;
+mod pair_qr;
 mod pane;
 mod plugin;
 mod protocol_guard;
