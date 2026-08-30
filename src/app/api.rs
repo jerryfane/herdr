@@ -115,6 +115,8 @@ impl App {
                     source,
                     agent_label,
                     session_ref,
+                    session_cursor,
+                    process_pid,
                     ..
                 } = &ev
                 {
@@ -123,6 +125,8 @@ impl App {
                         source.clone(),
                         agent_label.clone(),
                         session_ref.clone(),
+                        session_cursor.clone(),
+                        *process_pid,
                     ))
                 } else {
                     None
@@ -135,7 +139,15 @@ impl App {
                         .map(|terminal| terminal.accepted_session_report_generation())
                 });
                 self.handle_internal_event(ev);
-                if let Some((pane_id, source, agent_label, session_ref)) = report {
+                if let Some((
+                    pane_id,
+                    source,
+                    agent_label,
+                    session_ref,
+                    session_cursor,
+                    process_pid,
+                )) = report
+                {
                     let accepted = accepted_generation_before.is_some_and(|before| {
                         self.find_pane(pane_id)
                             .and_then(|(_, pane)| {
@@ -150,6 +162,8 @@ impl App {
                         &source,
                         &agent_label,
                         session_ref.as_ref(),
+                        session_cursor.as_deref(),
+                        process_pid,
                         accepted,
                     );
                 }

@@ -83,6 +83,7 @@ const retryableErrorPattern =
 let reportSeq = Date.now() * 1000;
 let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
+let currentAgentSessionCursor: string | undefined;
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -110,14 +111,26 @@ function updateSessionRef(ctx: any): void {
   } catch {
     currentAgentSessionId = undefined;
   }
+
+  try {
+    const cursor = ctx?.sessionManager?.getLeafId?.();
+    currentAgentSessionCursor =
+      typeof cursor === "string" && cursor.length > 0 ? cursor : undefined;
+  } catch {
+    currentAgentSessionCursor = undefined;
+  }
 }
 
 function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
+  const runtime = {
+    agent_session_cursor: currentAgentSessionCursor,
+    agent_process_pid: process.pid,
+  };
   if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
+    return { ...params, agent_session_path: currentAgentSessionPath, ...runtime };
   }
   if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
+    return { ...params, agent_session_id: currentAgentSessionId, ...runtime };
   }
   return params;
 }
@@ -136,10 +149,18 @@ function parseDurationEnv(name: string, fallback: number): number {
 
 function currentSessionRef(): Record<string, unknown> | undefined {
   if (currentAgentSessionPath) {
-    return { agent_session_path: currentAgentSessionPath };
+    return {
+      agent_session_path: currentAgentSessionPath,
+      agent_session_cursor: currentAgentSessionCursor,
+      agent_process_pid: process.pid,
+    };
   }
   if (currentAgentSessionId) {
-    return { agent_session_id: currentAgentSessionId };
+    return {
+      agent_session_id: currentAgentSessionId,
+      agent_session_cursor: currentAgentSessionCursor,
+      agent_process_pid: process.pid,
+    };
   }
   return undefined;
 }
@@ -389,6 +410,16 @@ export default function (pi) {
     publishState(true);
   });
 
+  for (const eventName of ["session_branch", "session_tree", "session_compact", "auto_compaction_end"]) {
+    pi.on(eventName, (_event, ctx) => {
+      if (!rootSession && !activateRootSession(ctx)) {
+        return;
+      }
+      updateSessionRef(ctx);
+      void reportSession(eventName === "session_branch" ? "branch" : eventName === "session_tree" ? "select" : "compact");
+    });
+  }
+
   pi.on("agent_start", (_event, ctx) => {
     if (!rootSession && !activateRootSession(ctx)) {
       return;
@@ -436,7 +467,7 @@ export default function (pi) {
     deactivateBlocked();
   });
 
-  pi.on("agent_end", (event) => {
+  pi.on("agent_end", (event, ctx) => {
     if (!rootSession) {
       return;
     }
@@ -451,6 +482,9 @@ export default function (pi) {
       // Older builds omit the field and fall through as before.
       return;
     }
+
+    updateSessionRef(ctx);
+    void reportSession();
 
     agentActive = false;
 

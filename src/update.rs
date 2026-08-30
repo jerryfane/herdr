@@ -2930,6 +2930,7 @@ mod tests {
                     health_check: true,
                     pane_input_stream: false,
                     agent_session_transfer: false,
+                    agent_session_transfer_harnesses: Vec::new(),
                 }),
             },
         };
