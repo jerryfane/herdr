@@ -7844,6 +7844,17 @@
             "label": {
               "type": "string"
             },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AccountReadiness"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Whether this account could host a resumed agent right now, and if not, the\nfirst reason why. `None` means NOT ASSESSED for this kind — it does not mean\nready. Only Claude accounts have a readiness gate today."
+            },
             "usage": {
               "anyOf": [
                 {
@@ -7861,6 +7872,33 @@
             "label",
             "config_dir",
             "active"
+          ],
+          "type": "object"
+        },
+        "AccountReadiness": {
+          "description": "Whether an account is in a state that can host a resumed agent.\n\nThis exists because authentication is not readiness. An account can hold valid\ncredentials and still strand every agent moved onto it: a config-home that has\nnever completed Claude Code's first run opens the theme picker instead of resuming,\nwhich is how the Aug 27 bulk-switch destroyed eleven live seats. The daemon has\nalways known this at swap time; reporting it in `accounts.list` is what lets a\nclient say so BEFORE someone moves a seat onto the account.",
+          "properties": {
+            "blocker": {
+              "description": "Stable machine code of the FIRST blocker found, e.g. `account_not_authenticated`\nor `account_onboarding_incomplete`. `None` when `ready`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "detail": {
+              "description": "Human-readable explanation of that blocker, suitable for showing to a person.\n`None` when `ready`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ready": {
+              "description": "True when nothing detectable locally would stop a resumed agent from launching.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ready"
           ],
           "type": "object"
         },
