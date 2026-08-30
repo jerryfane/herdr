@@ -476,17 +476,37 @@ impl RuntimeSessionTransfer {
             source_path,
             self.source_cursor.as_deref(),
         )?;
-        let target = read_transcript_at_cursor(
-            self.target_kind,
-            &self.target_sessions_root,
-            target_path,
-            self.target_cursor.as_deref(),
-        )?;
-        // Whole, never windowed — `read_transcript_at_cursor` guarantees that for every
-        // destination read; see the note there. The destination is generated FROM the
-        // source window and expands, so reading its tail and comparing it against the
-        // full source projection fails a transfer that actually worked.
-        verify_destination(&source.0.messages, &target)
+        // THE SAME ROUTING AS `prepare`, AND FOR THE SAME REASON. Both reviewers found
+        // that fixing the destination read in `prepare` alone left THIS path — the
+        // post-launch re-verification, which drives rollback — still going through the
+        // whole-file reader and its 64 MiB refusal. A legitimate near-window source
+        // whose Codex destination expands past that would verify at staging and then be
+        // rolled back after launch, which is worse than refusing it outright.
+        //
+        // Second site of one defect. The routing decision belongs in one place; it is
+        // duplicated here only because the two callers hold `expected` differently, and
+        // that is worth revisiting if a third appears.
+        match self.target_kind {
+            HarnessKind::Claude | HarnessKind::Codex => {
+                read_destination_transcript(
+                    self.target_kind,
+                    &self.target_sessions_root,
+                    target_path,
+                    &source.0.messages,
+                )?;
+                // Comparison happened during the read; reaching here means it matched.
+                Ok(())
+            }
+            HarnessKind::Omp => {
+                let target = read_transcript_at_cursor(
+                    self.target_kind,
+                    &self.target_sessions_root,
+                    target_path,
+                    self.target_cursor.as_deref(),
+                )?;
+                verify_destination(&source.0.messages, &target)
+            }
+        }
     }
 
     pub(crate) fn info(&self) -> crate::api::schema::AgentSessionTransferInfo {
@@ -1234,20 +1254,35 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
     // called only from tests, and clippy caught it as an unused budget constant rather
     // than anything failing.
     //
-    // KNOWN GAP, STATED RATHER THAN IMPLIED: no test distinguishes THIS ROUTE from
+    // KNOWN GAP, STATED RATHER THAN IMPLIED, AND IT APPLIES AT BOTH ROUTING SITES (here
+    // and `verified_visible_destination`): no test distinguishes THIS ROUTE from
     // sending Claude/Codex through `read_transcript_at_cursor` + `verify_destination`.
     // Mutation-checked: that substitution passes the whole suite. The two differ only on
     // a destination larger than TRANSFER_WINDOW_BYTES — this reader accepts it with
     // bounded retention, the other refuses it — and producing one through `prepare`
     // requires a real Codex import rather than a fixture. The reader-level tests pin the
     // behaviour; the ROUTING is currently held by reasoning alone.
+    // EVERY EXIT BELOW THIS POINT HAS A TARGET ON DISK, so each one reports it. Round 15:
+    // the two report sites covered only Codex failures BEFORE a rollout was found, which
+    // is the narrowest slice of the abandonment surface — a destination that fails
+    // verification has already created a Claude session, a Codex thread or an OMP
+    // transcript, and said nothing.
+    let report_this_target = |reason: &str| {
+        report_abandoned_targets(
+            request.target_kind,
+            &request.target_config_home,
+            std::slice::from_ref(&session_ref.value),
+            reason,
+        );
+    };
     let destination = match request.target_kind {
         HarnessKind::Claude | HarnessKind::Codex => read_destination_transcript(
             request.target_kind,
             &request.target_sessions_root,
             &transcript_path,
             &expected,
-        )?,
+        )
+        .inspect_err(|_| report_this_target("the staged destination failed verification"))?,
         // OMP's parser needs the whole document — leaf selection is a property of the
         // graph, not of one record — so there is nothing to stream, and the comparison
         // is a separate step.
@@ -1257,8 +1292,11 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
                 &request.target_sessions_root,
                 &transcript_path,
                 target_cursor.as_deref(),
-            )?;
-            verify_destination(&expected, &destination)?;
+            )
+            .inspect_err(|_| report_this_target("the staged destination could not be read"))?;
+            verify_destination(&expected, &destination).inspect_err(|_| {
+                report_this_target("the staged destination failed verification")
+            })?;
             destination
         }
     };
@@ -1676,14 +1714,38 @@ fn read_transcript_snapshot(
     read_transcript_snapshot_with_budget(path, TRANSFER_WINDOW_BYTES as usize, kind)
 }
 
-/// The pre-window behaviour, kept for OMP: read it all, refuse if it is too big.
-fn read_transcript_whole(path: &Path) -> Result<TranscriptSnapshot, TransferError> {
-    let bytes = fs::read(path).map_err(|err| TransferError::io("read transcript", err))?;
-    if bytes.len() as u64 > TRANSFER_WINDOW_BYTES {
+/// Read everything up to `cap`, refusing WITHOUT allocating past it.
+///
+/// SPLIT OUT SO THE BOUND IS OBSERVABLE. Both implementations — this one and a plain
+/// `fs::read` followed by a length check — return the same error for an oversize file,
+/// so the error proves nothing; only BYTES CONSUMED tells them apart, and that needs a
+/// reader a test can inspect. Mutation showed the check-after-allocate version passing
+/// every test before this existed.
+fn read_whole_within<R: std::io::Read>(reader: R, cap: u64) -> Result<Vec<u8>, TransferError> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(reader, cap + 1), &mut bytes)
+        .map_err(|err| TransferError::io("read transcript", err))?;
+    if bytes.len() as u64 > cap {
         return Err(TransferError::TranscriptTooLarge {
             bytes: bytes.len() as u64,
         });
     }
+    Ok(bytes)
+}
+
+/// The pre-window behaviour, kept for OMP: read it all, refuse if it is too big.
+fn read_transcript_whole(path: &Path) -> Result<TranscriptSnapshot, TransferError> {
+    // BOUNDED WHILE READING, NOT AFTER. I wrote this function during the #153 rebase
+    // with `fs::read` followed by a length check — check-after-allocate, which is the
+    // exact defect this PR fixed twice already (the ledger read in round 2, the
+    // app-server response in round 9). A multi-gigabyte transcript would have exhausted
+    // memory before the refusal ran.
+    //
+    // Reading cap+1 through the descriptor means the refusal fires having allocated one
+    // byte more than the limit, and the extra byte is what distinguishes "exactly at the
+    // cap" from "over it".
+    let file = fs::File::open(path).map_err(|err| TransferError::io("read transcript", err))?;
+    let bytes = read_whole_within(file, TRANSFER_WINDOW_BYTES)?;
     let fingerprint = fingerprint_bytes(&bytes);
     Ok(TranscriptSnapshot {
         bytes,
@@ -4385,6 +4447,35 @@ mod tests {
         );
     }
 
+    /// AXIS — ROUND-15: the whole read refuses BEFORE allocating past its cap.
+    ///
+    /// I wrote `read_transcript_whole` during the #153 rebase as `fs::read` followed by a
+    /// length check — check-after-allocate, the same defect this PR already fixed twice
+    /// (the ledger read, then the app-server response). A multi-gigabyte transcript would
+    /// have exhausted memory before the refusal ran.
+    ///
+    /// ASSERTED ON BYTES CONSUMED, because both versions return the same error and the
+    /// error therefore proves nothing. Mutation confirms: reverting to `fs::read` leaves
+    /// every other test green.
+    #[test]
+    fn the_whole_read_refuses_before_allocating_past_its_cap() {
+        let cap = 4096u64;
+        let total = (cap as usize) * 8;
+        let mut cursor = std::io::Cursor::new(vec![b'x'; total]);
+        let err =
+            read_whole_within(&mut cursor, cap).expect_err("a file past the cap must be refused");
+        assert!(
+            matches!(err, TransferError::TranscriptTooLarge { .. }),
+            "expected the size refusal, got {err}"
+        );
+        let consumed = cursor.position();
+        assert!(
+            consumed <= cap + 1,
+            "the refusal must fire having read at most cap+1 bytes, not the whole file: \
+             consumed {consumed} of {total} with cap {cap}"
+        );
+    }
+
     /// AXIS — THE #153 REBASE: an OMP source is NEVER windowed.
     ///
     /// OMP transcripts open with a fixed-width `title` slot and a `session` header
@@ -4458,35 +4549,130 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// AXIS — ROUND-13, RE-AIMED AFTER THE #153 REBASE: every Codex import gets a
-    /// UNIQUE source path.
+    /// AXIS — ROUND-15: PRODUCTION `prepare` hands the importer the STAGED path, and a
+    /// different one on every attempt.
     ///
-    /// Codex decides whether to do any work by looking the import source path up in its
-    /// ledger: a path it has seen is skipped, or answered with the thread it produced
-    /// last time. Reusing one made a retry either produce nothing or adopt a previous
-    /// attempt's session.
+    /// The previous version of this constructed two `PrivateClaudeBridge` values and
+    /// compared their paths. That proves the bridge WRITER is unique and nothing about
+    /// what `prepare` actually sends — a mutant that still creates a bridge but passes
+    /// `source_path` to the importer restores Codex's retry skip/adoption bug with the
+    /// test green. Both round-15 reviewers found that independently; it is the fifth
+    /// time on this PR a fixture of mine sat beside the production path instead of on
+    /// it, so this one drives `prepare` and reads what the app-server was told.
     ///
-    /// My branch carried a `WindowFile` for this. #153 already had `PrivateClaudeBridge`
-    /// doing the same job better — random-UUID name under a 0700 staging directory,
-    /// symlink-rejected, parent fsynced — so WindowFile is deleted and this pins the
-    /// property on the mechanism that survived.
-    #[test]
-    fn every_codex_import_gets_a_distinct_staged_source_path() {
-        let root = temp_root("bridge-unique");
-        let cwd = std::path::Path::new("/tmp");
-        let messages = vec![VisibleMessage {
-            role: VisibleRole::User,
-            text: "hello".to_string(),
-        }];
-        let first = PrivateClaudeBridge::write(&root, cwd, &messages).unwrap();
-        let second = PrivateClaudeBridge::write(&root, cwd, &messages).unwrap();
-        assert_ne!(
-            first.path(),
-            second.path(),
-            "two imports must not share a source path, or Codex answers the second with \
-             the first's thread"
+    /// The shim records the import request and exits; the import failing is fine,
+    /// because the assertion is about what was SENT, not about the outcome.
+    #[tokio::test]
+    async fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
+        let root = temp_root("prepare-import-source");
+        let bin = root.join("bin");
+        let sessions = root.join("claude");
+        let target_home = root.join("codex");
+        let project = sessions.join("projects/-tmp");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&target_home).unwrap();
+        let session_id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let source = project.join(format!("{session_id}.jsonl"));
+        write_fixture(
+            &source,
+            &[
+                json!({"type":"user","cwd":"/tmp","sessionId":session_id,
+                    "message":{"role":"user","content":"hello"}}),
+                json!({"type":"assistant","cwd":"/tmp","sessionId":session_id,
+                    "message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}),
+            ],
         );
-        assert!(first.path().exists() && second.path().exists());
+
+        let log = root.join("import-requests.log");
+        let shim = bin.join("codex");
+        std::fs::write(
+            &shim,
+            format!(
+                // ANSWERS THE HANDSHAKE FIRST. The client sends `initialize` and WAITS
+                // for its response before sending anything else, so a shim that only
+                // watches for the import line blocks the exchange and times out having
+                // recorded nothing. Same mistake as the delete-protocol shim earlier.
+                "#!/bin/sh\n\
+                 head -n 1 > /dev/null\n\
+                 printf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\n\
+                 while IFS= read -r line; do\n\
+                 \x20 case \"$line\" in\n\
+                 \x20   *externalAgentConfig/import*)\n\
+                 \x20     printf '%s\\n' \"$line\" >> '{}'\n\
+                 \x20     exit 0;;\n\
+                 \x20 esac\n\
+                 done\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let previous = std::env::var_os("PATH");
+        // SAFETY: nextest gives each test its own process.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    previous.as_ref().and_then(|p| p.to_str()).unwrap_or("")
+                ),
+            );
+        }
+        for _ in 0..2 {
+            let _ = prepare(PrepareRequest {
+                source_kind: HarnessKind::Claude,
+                source_sessions_root: sessions.clone(),
+                source_session_ref: crate::agent_resume::AgentSessionRef::id(
+                    session_id.to_string(),
+                )
+                .expect("valid session id"),
+                source_cursor: None,
+                source_transcript_path: Some(source.clone()),
+                target_kind: HarnessKind::Codex,
+                target_config_home: target_home.clone(),
+                target_sessions_root: target_home.clone(),
+                target_launch_env: crate::config::AccountLaunchEnv::default(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                timeout: Duration::from_secs(10),
+            })
+            .await;
+        }
+        if let Some(previous) = previous {
+            unsafe { std::env::set_var("PATH", previous) };
+        }
+
+        let recorded = std::fs::read_to_string(&log).expect("the importer must be invoked");
+        let paths: Vec<String> = recorded
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| {
+                value["params"]["migrationItems"][0]["details"]["sessions"][0]["path"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "both attempts must reach the importer: {recorded}"
+        );
+        assert!(
+            paths.iter().all(|path| path != &source.to_string_lossy()),
+            "the ORIGINAL transcript path must never be sent — Codex would look it up in \
+             its import ledger and skip or reuse: {paths:?}"
+        );
+        assert_ne!(
+            paths[0], paths[1],
+            "two attempts must present DIFFERENT staged paths, or the second is skipped \
+             or answered with the first attempt's thread"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
