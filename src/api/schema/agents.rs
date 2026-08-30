@@ -247,6 +247,7 @@ pub struct AgentTransferSessionParams {
 pub enum AgentSessionTransferHarness {
     Claude,
     Codex,
+    Omp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

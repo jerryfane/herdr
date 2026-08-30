@@ -10,6 +10,7 @@ pub(crate) const HERDR_TAB_ID_ENV_VAR: &str = "HERDR_TAB_ID";
 pub(crate) const HERDR_WORKSPACE_ID_ENV_VAR: &str = "HERDR_WORKSPACE_ID";
 
 pub(crate) const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const OMP_CONFIG_DIR_ENV_VAR: &str = "PI_CONFIG_DIR";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 pub(crate) const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
@@ -40,19 +41,9 @@ pub(crate) fn pi_extension_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn omp_extension_dir() -> io::Result<PathBuf> {
-    if let Some(value) =
-        std::env::var_os(PI_CODING_AGENT_DIR_ENV_VAR).filter(|value| !value.is_empty())
-    {
-        return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("extensions"));
-    }
-
-    let config_dir = std::env::var_os(OMP_CONFIG_DIR_ENV_VAR)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| ".omp".into());
-    Ok(home_dir()?
-        .join(config_dir)
-        .join("agent")
-        .join("extensions"))
+    crate::config::default_config_dir("omp")
+        .map(|path| path.join("extensions"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
 }
 
 pub(crate) fn claude_dir() -> io::Result<PathBuf> {

@@ -243,6 +243,8 @@ herdr pane report-agent-session <pane_id> \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH] \
+  [--agent-session-cursor ID] \
+  [--agent-process-pid PID] \
   [--session-start-source SOURCE]
 
 herdr pane release-agent <pane_id> \
@@ -251,7 +253,7 @@ herdr pane release-agent <pane_id> \
   [--seq N]
 ```
 
-`report-agent-session` はライフサイクル状態を報告せずにネイティブセッション識別子を更新します。`release-agent` は、そのエージェントプロセスが終了したときに、そのソースのライフサイクル権限を終了します。
+`report-agent-session` はライフサイクル状態を報告せずにネイティブセッション識別子を更新します。ツリー形式のセッションログを使うインテグレーションは、`--agent-session-cursor` で選択中のリーフを、`--agent-process-pid` でその報告に対応する正確なハーネスプロセスを指定できます。`release-agent` は、そのエージェントプロセスが終了したときに、そのソースのライフサイクル権限を終了します。
 
 公式インテグレーションがネイティブセッション参照を報告している場合、`pane get`、`pane list`、`agent get`、`agent list` は読み取り専用の `agent_session` オブジェクトを含みます。ネイティブセッション参照が保存されていない場合、このフィールドは省略されます。
 

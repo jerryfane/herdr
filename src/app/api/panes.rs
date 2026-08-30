@@ -1522,6 +1522,8 @@ impl App {
                 params.agent_session_id,
                 params.agent_session_path,
             ),
+            session_cursor: params.agent_session_cursor,
+            process_pid: params.agent_process_pid,
             source: params.source,
             agent_label,
             state: detect_state_from_api(params.state),
@@ -1563,6 +1565,8 @@ impl App {
                     params.agent_session_path,
                 ),
                 session_path,
+                session_cursor: params.agent_session_cursor,
+                process_pid: params.agent_process_pid,
                 source: params.source,
                 agent_label,
                 seq: params.seq,
@@ -2282,6 +2286,76 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn pane_report_agent_refreshes_omp_runtime_proof_under_the_state_sequence_gate() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let session_path = std::env::current_dir()
+            .unwrap()
+            .join("omp-runtime-proof.jsonl")
+            .display()
+            .to_string();
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: session_ref.clone(),
+            });
+            terminal.set_reported_agent_session_runtime(
+                "herdr:omp",
+                "omp",
+                &session_ref,
+                Some("stale-leaf".into()),
+                Some(41),
+            );
+        }
+
+        let report =
+            |seq: u64, cursor: Option<&str>, process_pid: Option<u32>| PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                state: crate::api::schema::PaneAgentState::Idle,
+                message: None,
+                seq: Some(seq),
+                agent_session_id: None,
+                agent_session_path: Some(session_path.clone()),
+                agent_session_cursor: cursor.map(str::to_string),
+                agent_process_pid: process_pid,
+            };
+
+        let response = app
+            .handle_pane_report_agent("fresh".into(), report(10, Some("selected-leaf"), Some(42)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor.as_deref(), Some("selected-leaf"));
+        assert_eq!(runtime.process_pid, Some(42));
+
+        let response =
+            app.handle_pane_report_agent("stale".into(), report(9, Some("stale-again"), Some(43)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor.as_deref(), Some("selected-leaf"));
+        assert_eq!(runtime.process_pid, Some(42));
+
+        let response =
+            app.handle_pane_report_agent("missing-cursor".into(), report(11, None, Some(42)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor, None);
+        assert_eq!(runtime.process_pid, Some(42));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
-- Running Claude Code and Codex agents can now transfer their visible conversation into the other harness in the same pane. Herdr stages and rereads the destination transcript before confirmation, verifies Codex's readable text projection of Claude tool activity, reports native structures and reasoning/system records that were flattened or omitted, and restores the source session and account when target launch verification fails.
+- Running Claude Code, Codex, and OMP agents can now transfer their visible conversation into either of the other harnesses in the same pane. Herdr stages and rereads the destination transcript before confirmation, verifies exact native session identity and visible content after launch, reports native structures and reasoning/system records that were flattened or omitted, and restores the source session and account when target launch verification fails.
 - The Herdrup fork installer now downloads and checksum-verifies the current prebuilt preview binary, so app users can install the compatible daemon without Rust, Cargo, Zig, or a source checkout.
 
 ### Changed

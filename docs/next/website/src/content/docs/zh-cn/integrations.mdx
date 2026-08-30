@@ -93,7 +93,7 @@ Herdr 以两种不同方式使用集成:
 
 一些集成会上报智能体的原生会话引用。除非被 `[session] resume_agents_on_restore = false` 禁用,Herdr 会在服务器重启后使用官方会话引用恢复 Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode 和 Antigravity CLI 的窗格。
 
-原生会话恢复需要最新的 Herdr 集成: Pi 集成版本 `2`、OMP 版本 `3`、Claude Code 版本 `6`、Codex 版本 `5`、GitHub Copilot CLI 版本 `2`、Devin CLI 版本 `2`、Droid 版本 `2`、Kimi Code CLI 版本 `3`、Qoder CLI 版本 `2`、Qwen Code 版本 `1`、Cursor Agent CLI 版本 `1`、Grok CLI 版本 `1`、OpenCode 版本 `5`、Kilo Code CLI 版本 `1`、Hermes Agent 版本 `5`、MastraCode 版本 `1`、Antigravity CLI 版本 `1`。用 `herdr integration status` 查看已安装版本。
+原生会话恢复需要最新的 Herdr 集成: Pi 集成版本 `2`、OMP 版本 `10`、Claude Code 版本 `6`、Codex 版本 `5`、GitHub Copilot CLI 版本 `2`、Devin CLI 版本 `2`、Droid 版本 `2`、Kimi Code CLI 版本 `3`、Qoder CLI 版本 `2`、Qwen Code 版本 `1`、Cursor Agent CLI 版本 `1`、Grok CLI 版本 `1`、OpenCode 版本 `5`、Kilo Code CLI 版本 `1`、Hermes Agent 版本 `5`、MastraCode 版本 `1`、Antigravity CLI 版本 `1`。用 `herdr integration status` 查看已安装版本。
 
 ## Pi
 
@@ -127,7 +127,7 @@ Herdr 把内置扩展写入:
 
 如果设置了 `PI_CODING_AGENT_DIR`,Herdr 会改为写入 `$PI_CODING_AGENT_DIR/extensions/herdr-omp-agent-state.ts`。如果 OMP agent 目录已经存在,Herdr 会创建 extensions 目录。卸载只删除那个扩展文件。
 
-OMP 集成通过 Herdr 的 socket API 上报智能体标签 `omp`、生命周期状态和原生会话身份。它不需要对 `omp` 可执行文件做原生进程检测,并且 Herdr 可以在服务器重启后用 `omp --resume=<session>` 恢复 OMP 窗格。
+OMP 集成通过 Herdr 的 socket API 上报智能体标签 `omp`、生命周期状态、规范化的原生会话路径、当前选中的会话树叶节点和准确的进程 PID。Herdr 可以在服务器重启后用 `omp --resume=<session>` 恢复 OMP 窗格,并使用叶节点和 PID 报告验证 OMP 会话迁移指向请求的分支和进程。
 
 ## Claude Code
 

@@ -2850,15 +2850,19 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
+                session_cursor,
+                process_pid,
             } => {
-                if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
-                    self.update_terminal_state(pane_id, |terminal| {
+                let native_state_only =
+                    crate::agent_resume::is_reserved_native_state_source(&source, &agent_label);
+                let runtime_source = source.clone();
+                let runtime_agent = agent_label.clone();
+                let runtime_session_ref = session_ref.clone();
+                let reports_omp_runtime = source == "herdr:omp" && agent_label == "omp";
+                self.update_terminal_state(pane_id, |terminal| {
+                    let mutation = if native_state_only {
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
-                    })
-                    .into_iter()
-                    .collect()
-                } else {
-                    self.update_terminal_state(pane_id, |terminal| {
+                    } else {
                         terminal.set_hook_authority_with_session_ref(
                             source,
                             agent_label,
@@ -2867,10 +2871,25 @@ impl AppState {
                             session_ref,
                             seq,
                         )
-                    })
-                    .into_iter()
-                    .collect()
-                }
+                    };
+                    if mutation.is_some() && reports_omp_runtime {
+                        if let Some(session_ref) = runtime_session_ref.as_ref() {
+                            // OMP state reports carry the same exact leaf/PID proof as
+                            // lifecycle reports. Accept it under the same sequence gate so
+                            // a later successful state report cannot leave stale proof behind.
+                            terminal.set_reported_agent_session_runtime(
+                                &runtime_source,
+                                &runtime_agent,
+                                session_ref,
+                                session_cursor,
+                                process_pid,
+                            );
+                        }
+                    }
+                    mutation
+                })
+                .into_iter()
+                .collect()
             }
             AppEvent::AgentSessionReported {
                 pane_id,
@@ -2879,6 +2898,8 @@ impl AppState {
                 seq,
                 session_ref,
                 session_path,
+                session_cursor,
+                process_pid,
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
@@ -2899,6 +2920,13 @@ impl AppState {
                                 &agent_for_path,
                                 session_ref,
                                 session_path,
+                            );
+                            terminal.set_reported_agent_session_runtime(
+                                &source_for_path,
+                                &agent_for_path,
+                                session_ref,
+                                session_cursor,
+                                process_pid,
                             );
                         }
                     }
@@ -5542,6 +5570,8 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -5581,6 +5611,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
         state.handle_app_event(AppEvent::StateChanged {
             runtime_epoch: None,
@@ -5631,6 +5663,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
+            session_cursor: None,
+            process_pid: None,
         });
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
@@ -5743,6 +5777,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("devin-session"),
+            session_cursor: None,
+            process_pid: None,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -5767,6 +5803,8 @@ mod tests {
             message: None,
             seq: Some(20),
             session_ref: crate::agent_resume::AgentSessionRef::path(first_session),
+            session_cursor: None,
+            process_pid: None,
         });
         assert_eq!(first_updates.len(), 1);
         state.session_dirty = false;
@@ -5779,6 +5817,8 @@ mod tests {
             message: None,
             seq: Some(21),
             session_ref: crate::agent_resume::AgentSessionRef::path(second_session),
+            session_cursor: None,
+            process_pid: None,
         });
 
         assert!(second_updates.is_empty());

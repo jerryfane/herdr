@@ -2938,6 +2938,8 @@ action = "missing"
                 seq: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                agent_session_cursor: None,
+                agent_process_pid: None,
             },
         );
 

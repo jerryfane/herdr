@@ -24,7 +24,11 @@ pub struct ServerCapabilities {
     #[serde(default)]
     pub pane_input_stream: bool,
     /// The server can transactionally transfer visible session history between
-    /// Claude Code and Codex in the same logical pane.
+    /// Claude Code, Codex, and OMP in the same logical pane.
     #[serde(default)]
     pub agent_session_transfer: bool,
+    /// Native harnesses this daemon can use as session-transfer sources and
+    /// destinations. Empty means the older Claude/Codex-only capability shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_session_transfer_harnesses: Vec<super::AgentSessionTransferHarness>,
 }

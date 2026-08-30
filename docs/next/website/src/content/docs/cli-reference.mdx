@@ -261,6 +261,8 @@ herdr pane report-agent-session <pane_id> \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH] \
+  [--agent-session-cursor ID] \
+  [--agent-process-pid PID] \
   [--session-start-source SOURCE]
 
 herdr pane release-agent <pane_id> \
@@ -269,7 +271,7 @@ herdr pane release-agent <pane_id> \
   [--seq N]
 ```
 
-`report-agent-session` updates native session identity without reporting lifecycle state. `release-agent` ends that source's lifecycle authority when its agent process exits.
+`report-agent-session` updates native session identity without reporting lifecycle state. Integrations for tree-shaped session logs can also report the selected leaf with `--agent-session-cursor`; `--agent-process-pid` binds that report to the exact harness process. `release-agent` ends that source's lifecycle authority when its agent process exits.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 

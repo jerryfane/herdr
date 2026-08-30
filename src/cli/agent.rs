@@ -544,7 +544,7 @@ struct AgentTransferCliArgs {
 }
 
 fn parse_agent_transfer_args(args: &[String]) -> Result<AgentTransferCliArgs, i32> {
-    const USAGE: &str = "usage: herdr agent transfer-session <target> --to claude|codex [--account <id>] [--yes | --confirm <transfer-id>]";
+    const USAGE: &str = "usage: herdr agent transfer-session <target> --to claude|codex|omp [--account <id>] [--yes | --confirm <transfer-id>]";
     let Some(target) = args.first() else {
         eprintln!("{USAGE}");
         return Err(2);
@@ -564,6 +564,7 @@ fn parse_agent_transfer_args(args: &[String]) -> Result<AgentTransferCliArgs, i3
                 to = match value.as_str() {
                     "claude" => Some(AgentSessionTransferHarness::Claude),
                     "codex" => Some(AgentSessionTransferHarness::Codex),
+                    "omp" => Some(AgentSessionTransferHarness::Omp),
                     _ => {
                         eprintln!("{USAGE}");
                         return Err(2);
@@ -1314,7 +1315,7 @@ fn print_agent_help() {
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent restart <target>");
-    eprintln!("  herdr agent transfer-session <target> --to claude|codex [--account ID] [--yes | --confirm ID]");
+    eprintln!("  herdr agent transfer-session <target> --to claude|codex|omp [--account ID] [--yes | --confirm ID]");
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"

@@ -7690,6 +7690,8 @@ next_tab = ""
                 message: None,
                 seq: None,
                 session_ref: None,
+                session_cursor: None,
+                process_pid: None,
             })
         );
         assert!(
@@ -11956,6 +11958,8 @@ next_tab = ""
                     seq: Some(19),
                     agent_session_id: None,
                     agent_session_path: None,
+                    agent_session_cursor: None,
+                    agent_process_pid: None,
                 }),
             },
             respond_to,

@@ -127,7 +127,7 @@ impl App {
             return super::responses::encode_error(
                 id,
                 "invalid_kind",
-                format!("unknown account kind '{kind}' (expected claude, codex, or kimi)"),
+                format!("unknown account kind '{kind}' (expected claude, codex, omp, or kimi)"),
             );
         }
         if label.is_empty() {

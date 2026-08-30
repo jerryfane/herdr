@@ -240,6 +240,46 @@ test("OMP accepts POSIX and Windows session paths", async () => {
   expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
 });
 
+test("OMP reports the exact path, active leaf, and process on tree changes", async () => {
+  const requests = await startRecordingServer("omp-session-proof");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  let leaf = "leaf-one";
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-proof.jsonl",
+      getSessionId: () => "omp-proof",
+      getLeafId: () => leaf,
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent_session"));
+
+  const sessionRequests = () => requests.filter(
+    (request) => isRecord(request) && request.method === "pane.report_agent_session",
+  );
+  const first = sessionRequests()[0];
+  expect(isRecord(first) && isRecord(first.params) ? first.params.agent_session_path : null)
+    .toBe("/tmp/omp-proof.jsonl");
+  expect(isRecord(first) && isRecord(first.params) ? first.params.agent_session_cursor : null)
+    .toBe("leaf-one");
+  expect(isRecord(first) && isRecord(first.params) ? first.params.agent_process_pid : null)
+    .toBe(process.pid);
+
+  leaf = "leaf-two";
+  handlers.get("session_tree")?.({}, context);
+  await waitFor(() => sessionRequests().length === 2);
+  const second = sessionRequests()[1];
+  expect(isRecord(second) && isRecord(second.params) ? second.params.agent_session_cursor : null)
+    .toBe("leaf-two");
+  expect(isRecord(second) && isRecord(second.params) ? second.params.session_start_source : null)
+    .toBe("select");
+});
+
 test("Pi reports idle only after the agent settles", async () => {
   const requests = await startRecordingServer("pi-settled");
   const { handlers, pi } = createExtensionHarness();

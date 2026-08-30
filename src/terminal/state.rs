@@ -46,6 +46,15 @@ pub(crate) struct ReportedAgentSessionPath {
     path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportedAgentSessionRuntime {
+    source: String,
+    agent: String,
+    session_ref: crate::agent_resume::AgentSessionRef,
+    pub(crate) cursor: Option<String>,
+    pub(crate) process_pid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub(crate) enum TurnCounterResetPath {
@@ -247,6 +256,7 @@ pub struct TerminalState {
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub(crate) reported_agent_session_path: Option<ReportedAgentSessionPath>,
+    pub(crate) reported_agent_session_runtime: Option<ReportedAgentSessionRuntime>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -342,6 +352,7 @@ impl TerminalState {
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
             reported_agent_session_path: None,
+            reported_agent_session_runtime: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -1823,6 +1834,38 @@ impl TerminalState {
                     && reported.session_id == session_ref.value
             })
             .map(|reported| reported.path.as_str())
+    }
+
+    pub(crate) fn set_reported_agent_session_runtime(
+        &mut self,
+        source: &str,
+        agent: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        cursor: Option<String>,
+        process_pid: Option<u32>,
+    ) {
+        self.reported_agent_session_runtime = Some(ReportedAgentSessionRuntime {
+            source: source.to_string(),
+            agent: agent.to_string(),
+            session_ref: session_ref.clone(),
+            cursor,
+            process_pid,
+        });
+    }
+
+    pub(crate) fn reported_agent_session_runtime_for(
+        &self,
+        source: &str,
+        agent: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> Option<&ReportedAgentSessionRuntime> {
+        self.reported_agent_session_runtime
+            .as_ref()
+            .filter(|reported| {
+                reported.source == source
+                    && reported.agent == agent
+                    && &reported.session_ref == session_ref
+            })
     }
 
     pub fn set_agent_session_ref(
@@ -6220,16 +6263,21 @@ mod tests {
             },
             source_account: Some("claude-source".into()),
             source_config_home: PathBuf::from("/tmp/claude-source"),
+            source_sessions_root: PathBuf::from("/tmp/claude-source"),
+            source_cursor: None,
+            source_process_pid: None,
             target_kind: crate::session_transfer::HarnessKind::Codex,
             target_account: Some("codex-target".into()),
             target_config_home: PathBuf::from("/tmp/codex-target"),
+            target_sessions_root: PathBuf::from("/tmp/codex-target"),
             phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
             message_count: 2,
             omissions: Default::default(),
             error: None,
             source_path: None,
             source_fingerprint: None,
-            target_session_id: Some("target-session".into()),
+            target_session_ref: crate::agent_resume::AgentSessionRef::id("target-session"),
+            target_cursor: None,
             target_transcript_path: None,
             target_fingerprint: None,
             target_deadline: None,
@@ -6238,6 +6286,7 @@ mod tests {
             verification_in_flight: None,
             verification_observation_deadline: None,
             awaiting_deferred_target_report: false,
+            target_report_accepted: false,
         });
 
         terminal.set_detected_state_with_visible_blocker(

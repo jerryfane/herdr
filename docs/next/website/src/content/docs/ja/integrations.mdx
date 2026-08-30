@@ -93,7 +93,7 @@ Herdr の外では何もしないように、`HERDR_ENV=1` で必要な変数が
 
 一部のインテグレーションは、エージェントのネイティブセッション参照を報告します。Herdr は公式のセッション参照を使って、`[session] resume_agents_on_restore = false` で無効化されていない限り、Herdr サーバーの再起動後に Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode、Antigravity CLI のペインを resume します。
 
-エージェントネイティブのセッション復元には最新の Herdr インテグレーションが必要です: Pi インテグレーションはバージョン `2`、OMP は `3`、Claude Code は `6`、Codex は `5`、GitHub Copilot CLI は `2`、Devin CLI は `2`、Droid は `2`、Kimi Code CLI は `3`、Qoder CLI は `2`、Qwen Code は `1`、Cursor Agent CLI は `1`、Grok CLI は `1`、OpenCode は `5`、Kilo Code CLI は `1`、Hermes Agent は `5`、MastraCode は `1`、Antigravity CLI は `1` です。インストール済みバージョンは `herdr integration status` で確認してください。
+エージェントネイティブのセッション復元には最新の Herdr インテグレーションが必要です: Pi インテグレーションはバージョン `2`、OMP は `10`、Claude Code は `6`、Codex は `5`、GitHub Copilot CLI は `2`、Devin CLI は `2`、Droid は `2`、Kimi Code CLI は `3`、Qoder CLI は `2`、Qwen Code は `1`、Cursor Agent CLI は `1`、Grok CLI は `1`、OpenCode は `5`、Kilo Code CLI は `1`、Hermes Agent は `5`、MastraCode は `1`、Antigravity CLI は `1` です。インストール済みバージョンは `herdr integration status` で確認してください。
 
 ## Pi
 
@@ -127,7 +127,7 @@ Herdr はバンドルされた拡張を次の場所に書き込みます:
 
 `PI_CODING_AGENT_DIR` が設定されている場合は、代わりに `$PI_CODING_AGENT_DIR/extensions/herdr-omp-agent-state.ts` に書き込みます。OMP の agent ディレクトリが存在する場合、Herdr は extensions ディレクトリを作成します。アンインストールはその拡張ファイルだけを削除します。
 
-OMP インテグレーションは、Herdr のソケット API を通じてエージェントラベル `omp`、ライフサイクル状態、ネイティブセッション識別を報告します。`omp` 実行ファイルのネイティブプロセス検出は不要で、Herdr はサーバー再起動後に `omp --resume=<session>` で OMP ペインを resume できます。
+OMP インテグレーションは、Herdr のソケット API を通じてエージェントラベル `omp`、ライフサイクル状態、正規化済みのネイティブセッションパス、選択中の会話ツリーリーフ、正確なプロセス PID を報告します。Herdr はサーバー再起動後に `omp --resume=<session>` で OMP ペインを resume でき、リーフと PID の報告を使って OMP セッション移行が要求されたブランチとプロセスを対象にしていることを検証します。
 
 ## Claude Code
 
