@@ -273,6 +273,12 @@ pub struct AgentSessionTransferOmissions {
     pub metadata_records: u64,
     pub unsupported_blocks: u64,
     pub sidechain_records: u64,
+    /// Older records dropped because the transcript exceeded the transfer window.
+    /// Unlike the other fields this is not a record CLASS — it is history left
+    /// behind, and a non-zero value means the transfer is lossy and needs a
+    /// person's approval before cutover.
+    #[serde(default)]
+    pub windowed_records: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

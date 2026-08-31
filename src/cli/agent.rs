@@ -665,11 +665,30 @@ fn agent_transfer_session(args: &[String]) -> std::io::Result<i32> {
                     .and_then(|transfer| transfer.get("id"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
-                if !parsed.yes {
-                    eprintln!(
-                        "staged {message_count} visible messages; source is still running. Re-run with --confirm <transfer-id> to cut over"
-                    );
-                    return super::print_response(&response);
+                // History left behind, if the transcript was larger than the
+                // transfer window. Reported separately from the record-class
+                // omissions because it is the only one that costs the user
+                // something they might not accept.
+                let dropped = windowed_records_of(transfer);
+                match staged_transfer_decision(parsed.yes, dropped) {
+                    StagedDecision::ReportAndWait { lossy } => {
+                        eprintln!(
+                            "staged {message_count} visible messages; source is still running. Re-run with --confirm <transfer-id> to cut over"
+                        );
+                        if lossy {
+                            eprintln!(
+                                "LOSSY: the transcript exceeded the transfer window, so the {dropped} OLDEST records are NOT being transferred. Only the most recent history moves."
+                            );
+                        }
+                        return super::print_response(&response);
+                    }
+                    StagedDecision::RefuseLossyYes => {
+                        eprintln!(
+                            "refusing --yes: this transfer would drop the {dropped} oldest records (the transcript exceeds the transfer window). Re-run without --yes to see what is lost, then --confirm <transfer-id> to accept it."
+                        );
+                        return super::print_response(&response).map(|_| 1);
+                    }
+                    StagedDecision::Confirm => {}
                 }
                 let Some(transfer_id) = transfer_id else {
                     eprintln!("session transfer became ready without a transfer id");
@@ -718,6 +737,47 @@ fn session_transfer_poll_target(response: &serde_json::Value, fallback: &str) ->
         .and_then(serde_json::Value::as_str)
         .unwrap_or(fallback)
         .to_string()
+}
+
+/// What to do with a staged transfer, given `--yes` and how much history it drops.
+///
+/// EXTRACTED SO THE REFUSAL IS TESTABLE. The previous test exercised only the field
+/// lookup, so deleting the lossy `--yes` refusal, inverting it, or dropping the warning
+/// all left it green — review round 3, and the fourth test in this PR that could not
+/// reach what it claimed to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedDecision {
+    /// Print the staging summary and stop, so a person decides. `lossy` adds the
+    /// warning naming what is being left behind.
+    ReportAndWait { lossy: bool },
+    /// `--yes` was passed but the transfer would discard history. Refuse: the flag
+    /// exists to skip a confirmation nobody needed to read, and this is one they do.
+    RefuseLossyYes,
+    /// `--yes` on a lossless transfer — confirm immediately, as asked.
+    Confirm,
+}
+
+fn staged_transfer_decision(yes: bool, dropped_records: u64) -> StagedDecision {
+    match (yes, dropped_records > 0) {
+        (false, lossy) => StagedDecision::ReportAndWait { lossy },
+        (true, true) => StagedDecision::RefuseLossyYes,
+        (true, false) => StagedDecision::Confirm,
+    }
+}
+
+/// How many records a staged transfer is leaving behind.
+///
+/// Extracted so the FIELD PATH is testable. A typo anywhere in it makes this
+/// silently return 0, which reads as "nothing was dropped" — so `--yes` would wave
+/// a lossy transfer through and staging would print no warning, with nothing
+/// anywhere reporting a fault. The failure is invisible in exactly the direction
+/// that costs the user history.
+fn windowed_records_of(transfer: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+    transfer
+        .and_then(|transfer| transfer.get("omissions"))
+        .and_then(|omissions| omissions.get("windowed_records"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn wait_for_session_transfer_outcome(
@@ -1334,6 +1394,62 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AXIS — ROUND-3 FINDING 4: BOTH arms of the lossy `--yes` refusal.
+    ///
+    /// The previous test called only `windowed_records_of`, so deleting the refusal,
+    /// inverting it, or dropping the warning all left it green. This asserts the
+    /// decision itself, including the lossless arm — without which "refuses" could
+    /// quietly mean "--yes is broken for everyone".
+    #[test]
+    fn a_lossy_yes_is_refused_and_a_lossless_one_confirms() {
+        // --yes on a transfer that discards history: refuse, do not confirm.
+        assert_eq!(
+            staged_transfer_decision(true, 874),
+            StagedDecision::RefuseLossyYes
+        );
+        // --yes on a lossless transfer: confirm, as asked. THE MIRROR.
+        assert_eq!(staged_transfer_decision(true, 0), StagedDecision::Confirm);
+        // Without --yes: always report and wait, with the warning only when lossy.
+        assert_eq!(
+            staged_transfer_decision(false, 874),
+            StagedDecision::ReportAndWait { lossy: true }
+        );
+        assert_eq!(
+            staged_transfer_decision(false, 0),
+            StagedDecision::ReportAndWait { lossy: false }
+        );
+    }
+
+    /// AXIS: the field path reaches the real value, and a shape that lacks it
+    /// reads as zero rather than as a wrong number.
+    ///
+    /// This guards the silent direction: a mistyped path returns 0, which means
+    /// "nothing dropped" — staging would print no warning and `--yes` would wave a
+    /// lossy transfer through, with no error anywhere. The fixture mirrors the
+    /// live `agent.list` shape, taken from a real staged transfer.
+    #[test]
+    fn windowed_records_are_read_from_the_staged_transfer() {
+        let staged: serde_json::Value = serde_json::from_str(
+            r#"{"id":"t-1","phase":"ready","source":"claude","target":"codex",
+                "message_count":12,
+                "omissions":{"tool_records":3,"reasoning_records":0,"system_records":0,
+                             "attachment_records":0,"metadata_records":0,
+                             "unsupported_blocks":0,"sidechain_records":0,
+                             "windowed_records":874}}"#,
+        )
+        .unwrap();
+        assert_eq!(windowed_records_of(staged.as_object()), 874);
+
+        // A transfer that dropped nothing, and one from a build without the field:
+        // both must read 0 — the value that means "not lossy".
+        let clean: serde_json::Value =
+            serde_json::from_str(r#"{"omissions":{"windowed_records":0}}"#).unwrap();
+        assert_eq!(windowed_records_of(clean.as_object()), 0);
+        let legacy: serde_json::Value = serde_json::from_str(r#"{"omissions":{}}"#).unwrap();
+        assert_eq!(windowed_records_of(legacy.as_object()), 0);
+        assert_eq!(windowed_records_of(None), 0);
+    }
 
     #[test]
     fn agent_list_accepts_json_flag_as_no_op() {

@@ -39,7 +39,10 @@ pub(super) fn parse(bytes: &[u8], selected_leaf: Option<&str>) -> Result<Snapsho
         let line_number = index + 1;
         let mut line = raw_line.map_err(|error| TransferError::io("read OMP transcript", error))?;
         if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
-            return Err(TransferError::LineTooLarge { line: line_number });
+            return Err(TransferError::LineTooLarge {
+                line: line_number,
+                limit: MAX_TRANSCRIPT_LINE_BYTES,
+            });
         }
         if line.last() == Some(&b'\r') {
             line.pop();

@@ -321,11 +321,24 @@ impl App {
                     .and_then(|runtime| {
                         runtime.block_on(crate::session_transfer::prepare(request))
                     });
-                let _ = event_tx.blocking_send(AppEvent::AgentSessionTransferPrepared {
+                // A CLOSED CHANNEL DROPS A REAL TARGET. `let _ =` here meant a
+                // successful preparation could vanish with the session it created and
+                // nothing naming it — the one path where staging definitely SUCCEEDED.
+                if let Err(err) = event_tx.blocking_send(AppEvent::AgentSessionTransferPrepared {
                     terminal_id: worker_terminal_id,
                     transfer_id: worker_transfer_id,
                     result: Box::new(result),
-                });
+                }) {
+                    if let AppEvent::AgentSessionTransferPrepared { result, .. } = err.0 {
+                        if let Ok(prepared) = result.as_ref() {
+                            crate::session_transfer::report_discarded_preparation(
+                                prepared,
+                                "the transfer event channel closed before the staged \
+                                 target could be accepted",
+                            );
+                        }
+                    }
+                }
             });
         if let Err(err) = worker {
             if let Some(transfer) = self
@@ -665,11 +678,23 @@ impl App {
             .and_then(|terminal| terminal.session_transfer.as_ref())
             .cloned()
         else {
+            if let Ok(prepared) = result.as_ref() {
+                crate::session_transfer::report_discarded_preparation(
+                    prepared,
+                    "the terminal or its transfer disappeared while staging ran",
+                );
+            }
             return false;
         };
         if transfer_snapshot.id != transfer_id
             || transfer_snapshot.phase != AgentSessionTransferPhase::Preparing
         {
+            if let Ok(prepared) = result.as_ref() {
+                crate::session_transfer::report_discarded_preparation(
+                    prepared,
+                    "the transfer was replaced or had moved on before staging completed",
+                );
+            }
             return false;
         }
         let prepared = match result {
@@ -704,6 +729,10 @@ impl App {
                     )
             });
         if !terminal_still_idle {
+            crate::session_transfer::report_discarded_preparation(
+                &prepared,
+                "the source changed while the destination was being staged",
+            );
             let terminal = self
                 .state
                 .terminals
@@ -2059,8 +2088,163 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{omp_profile_value_is_named, App, HarnessKind};
+    use super::{
+        omp_profile_value_is_named, AgentSessionRef, AgentSessionTransferPhase, App, HarnessKind,
+        OmissionSummary, PersistedAgentSession, RuntimeSessionTransfer,
+    };
     use std::ffi::OsStr;
+
+    /// AXIS — ROUND-18: the DISCARD SITES report, not just the reporter.
+    ///
+    /// `report_abandoned_targets` got a regression last round; nothing observed that any
+    /// of the four call sites invokes it. Deleting the calls left state and return values
+    /// identical — I said so in my own commit message without noticing that made the
+    /// coverage vacuous. Same shape as the finding that commit closed (a receipt nobody
+    /// checks), moved one level up.
+    ///
+    /// Three of the four are reachable here; the fourth lives inside a spawned worker
+    /// and is left uncovered deliberately.
+    #[test]
+    fn every_reachable_discard_site_reports_its_staged_target() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        fn prepared() -> crate::session_transfer::PreparedTransfer {
+            crate::session_transfer::PreparedTransfer {
+                source_path: std::path::PathBuf::from("/tmp/source.jsonl"),
+                source_fingerprint: crate::session_transfer::TranscriptFingerprint {
+                    byte_len: 0,
+                    sha256: String::new(),
+                },
+                staged: crate::session_transfer::StagedSession {
+                    session_ref: crate::agent_resume::AgentSessionRef::id(
+                        "staged-thread".to_string(),
+                    )
+                    .expect("valid id"),
+                    cursor: None,
+                    transcript_path: std::path::PathBuf::from("/tmp/staged.jsonl"),
+                    transcript: crate::session_transfer::CanonicalTranscript {
+                        messages: Vec::new(),
+                        omissions: crate::session_transfer::OmissionSummary::default(),
+                        fingerprint: crate::session_transfer::TranscriptFingerprint {
+                            byte_len: 0,
+                            sha256: String::new(),
+                        },
+                    },
+                },
+                target_kind: HarnessKind::Codex,
+                target_config_home: std::path::PathBuf::from("/tmp/codex-home"),
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            // SITE 1 — no terminal at all: "the terminal or its transfer disappeared".
+            app.handle_agent_session_transfer_prepared(
+                crate::terminal::TerminalId::alloc(),
+                "transfer-gone".to_string(),
+                Ok(prepared()),
+            );
+
+            // SITE 2 — terminal present, transfer id no longer matches: "replaced or had
+            // moved on". Round 19: the previous version of this test drove ONE site while
+            // its name and doc claimed three, so two production discard paths stayed
+            // exactly as uncovered as before the test existed.
+            let terminal_id = crate::terminal::TerminalId::alloc();
+            let mut terminal =
+                crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+            terminal.session_transfer = Some(RuntimeSessionTransfer {
+                id: "a-different-transfer".to_string(),
+                source_kind: HarnessKind::Claude,
+                source_session: PersistedAgentSession {
+                    source: "claude".to_string(),
+                    agent: "claude".to_string(),
+                    session_ref: AgentSessionRef::id("s".to_string()).expect("valid"),
+                },
+                source_account: None,
+                source_sessions_root: "/tmp".into(),
+                source_config_home: "/tmp".into(),
+                source_cursor: None,
+                source_process_pid: None,
+                target_kind: HarnessKind::Codex,
+                target_account: None,
+                target_config_home: "/tmp/codex-home".into(),
+                target_sessions_root: "/tmp/codex-home".into(),
+                phase: AgentSessionTransferPhase::Preparing,
+                message_count: 0,
+                omissions: OmissionSummary::default(),
+                error: None,
+                source_path: None,
+                source_fingerprint: None,
+                target_session_ref: None,
+                target_cursor: None,
+                target_transcript_path: None,
+                target_fingerprint: None,
+                target_deadline: None,
+                target_process: None,
+                source_rollback_process: None,
+                verification_in_flight: None,
+                verification_observation_deadline: None,
+                awaiting_deferred_target_report: false,
+                target_report_accepted: false,
+            });
+            app.state.terminals.insert(terminal_id.clone(), terminal);
+            app.handle_agent_session_transfer_prepared(
+                terminal_id,
+                "the-id-we-were-told".to_string(),
+                Ok(prepared()),
+            );
+        });
+
+        let logged = String::from_utf8(capture.0.lock().expect("capture").clone()).unwrap();
+        assert!(
+            logged.contains("session_id=staged-thread"),
+            "a discarded preparation must name its staged target: {logged}"
+        );
+        assert!(
+            logged.contains("/tmp/codex-home"),
+            "and the account home it lives in: {logged}"
+        );
+        // BOTH REASONS, or this repeats the defect round 19 named: a test whose name
+        // claims several sites while only one can fail it.
+        assert!(
+            logged.contains("disappeared"),
+            "site 1 (no terminal) must report why: {logged}"
+        );
+        assert!(
+            logged.contains("replaced or had moved on"),
+            "site 2 (transfer id no longer matches) must report why: {logged}"
+        );
+    }
 
     #[test]
     fn omp_profile_precedence_matches_native_resolution() {
