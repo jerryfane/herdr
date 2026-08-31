@@ -74,49 +74,88 @@ const DESTINATION_RECORD_BUDGET_BYTES: usize = TRANSFER_WINDOW_BYTES as usize;
 /// a bound that stops an unbounded producer, not an estimate of legitimate growth.
 const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 
+/// The smallest ASSISTANT record `parse_claude_record` turns into a visible message.
+///
+/// PER ROLE, NOT GLOBAL, AND THE DISTINCTION IS LOAD-BEARING. A user record is smaller
+/// still (56 bytes; serde sorts the keys, so it is shorter than a hand-count suggests) —
+/// but it produces a user ENTRY, which the writer emits at roughly half the cost of an
+/// assistant one. Pairing the globally smallest record with the largest entry models a
+/// transcript that cannot exist and inflates the ceiling by a third. Expansion is a
+/// per-role quantity, so the model is per-role.
+///
+/// MEASURED PER FIELD, NOT PER RECORD — the check that would have caught rounds 18, 19 and
+/// 21. Each sized this from "the minimal record", meaning the minimal record THAT ROUND
+/// HAPPENED TO WRITE, and each was demolished by someone who minimised a field it had left
+/// fat. `parse_claude_message` accepts `content` as a bare JSON string for either role and
+/// `push_visible_message` does not merge consecutive same-role records, so the worst shape
+/// is an all-assistant window of
+/// `{"type":"assistant","message":{"role":"assistant","content":"a"}}` plus a newline.
+const OMP_MIN_ASSISTANT_RECORD_BYTES: u64 = 66;
+
+/// The largest entry `omp::write` emits for one visible message.
+///
+/// Fixed-width by construction: a uuid id, a uuid parentId, an RFC3339 timestamp and the
+/// api/provider/model/usage/stopReason block. The assistant form is the larger of the two,
+/// which is why it pairs with the assistant minimum above.
+/// `omp_write_entry_cost_stays_inside_the_modelled_maximum` measures the real writer and
+/// fails if a field is added — the guard this number exists for.
+const OMP_MAX_DESTINATION_ENTRY_BYTES: u64 = 512;
+
 /// The most an OMP destination may occupy IN MEMORY while being verified.
 ///
-/// A RETENTION BOUND, MEASURED AGAINST RETENTION. The OMP arm cannot stream — its parser
-/// needs the header and the whole graph — so unlike Claude and Codex it genuinely holds
-/// the file. `DESTINATION_TOTAL_BUDGET_BYTES` is bytes SCANNED and is set high precisely
-/// BECAUSE streaming retains one record at a time; borrowing it here made the feature's
-/// memory ceiling 1 GiB in a single Vec inside the long-lived TUI process.
+/// A RETENTION BOUND, MEASURED AGAINST RETENTION. The OMP arm cannot stream — `omp::parse`
+/// takes `&[u8]` because leaf selection is a property of the graph — so unlike Claude and
+/// Codex it genuinely holds the file. `DESTINATION_TOTAL_BUDGET_BYTES` is bytes SCANNED
+/// and is set high precisely BECAUSE streaming retains one record at a time; borrowing it
+/// here made the memory ceiling 1 GiB in a single Vec inside the long-lived TUI process.
 ///
-/// EIGHT WINDOWS, FROM A MEASUREMENT OF THE WORST INPUT RATHER THAN THE REPRESENTATIVE
-/// ONE. This constant has now been wrong in three distinct ways, and each way is why the
-/// current form is shaped as it is:
+/// DERIVED FROM THE WRITER, NOT GUESSED FROM A RATIO. Four rounds put four numbers here
+/// and a reviewer demolished each by computing the worst-case input rather than the
+/// representative one: 4 windows from a 205-byte pair the OMP path never sees (round 18);
+/// no bound at all (round 19); the file's own length, which cannot refuse (round 20);
+/// 8 windows from a 5.11x fixture that minimised the user record and left the assistant
+/// record in its fat array form (round 21 — the real worst shape is an all-assistant
+/// window at 7.61x, which left 5% of headroom, not the 2x I claimed).
 ///
-/// - Round 18 set it to FOUR windows from a ~3.4x figure. That figure came from a
-///   205-byte source pair carrying `cwd` and `sessionId` — fields the CODEX bridge
-///   requires and the OMP path never sees.
-/// - Round 19 found the real worst case: `parse_claude_record` accepts a 147-byte pair,
-///   which expands 5.12x, so a full window writes ~327 MiB against a 256 MiB cap. That
-///   finding was correct. Its REMEDY was not — it deleted the bound instead of raising
-///   it, which is how a too-small ceiling became no ceiling.
-/// - Round 20 then replaced the deleted bound with the file's own length, which is not a
-///   bound at all: `cap = metadata().len()` followed by "read at most cap" can never
-///   refuse, whatever the file's size.
+/// A ratio is the wrong input because it is a property of a FIXTURE. This is the same
+/// quantity expressed as what actually determines it: at most one destination entry per
+/// accepted source record, so a full window admits `WINDOW / MIN_RECORD` entries of at
+/// most `MAX_ENTRY` bytes each. The ratio is now an OUTPUT of the model — currently
+/// 7.75x — and a fixture that finds a smaller accepted record moves the bound instead of
+/// merely embarrassing it.
 ///
-/// `an_omp_destination_from_the_minimal_pair_fits_the_retention_bound` measures the
-/// ratio rather than modelling it — `omp::write` is OUR writer, so unlike the Codex
-/// figure this is the real number — and asserts this constant covers it with margin.
+/// THE MARGIN IS EXPLICIT AND THE DIRECTION IS NOT SYMMETRIC. `omp::write` PUBLISHES the
+/// session before `prepare` reads it back under this ceiling, so a ceiling below what the
+/// writer produced refuses a session that already exists and orphans it. Too low costs a
+/// valid transfer; too high costs memory. Half again over the modelled worst case.
 ///
 /// AND IT IS A CEILING, NOT A CORRECTNESS GATE. Detecting a foreign write to the staged
 /// target is `verify_unchanged_transcripts`' fingerprint compare, which runs before
 /// launch; nothing about this number establishes provenance. Round 20's comment claimed
-/// otherwise and that claim was the defect, not the number.
-const OMP_DESTINATION_RETENTION_BYTES: u64 = 8 * TRANSFER_WINDOW_BYTES;
+/// otherwise, and that claim was the defect rather than the number.
+///
+/// IT IS ALSO LARGER THAN ANYONE WANTS, AND THAT IS THE HONEST READING. Every other
+/// guessed bound on this PR was closed by DELETING it and streaming. This one cannot be,
+/// solely because `omp::parse` takes `&[u8]`. The fix that removes this constant rather
+/// than tuning it a fifth time is a two-pass parse — pass 1 indexes `id -> (parentId,
+/// byte offset)`, pass 2 seeks and projects only the selected branch, making retention
+/// O(entries) plus one record. That is a separate PR and is NOT yet filed as an issue:
+/// filing one is a GitHub write and this seat holds no row for it.
+const OMP_DESTINATION_RETENTION_BYTES: u64 =
+    (TRANSFER_WINDOW_BYTES / OMP_MIN_ASSISTANT_RECORD_BYTES) * OMP_MAX_DESTINATION_ENTRY_BYTES / 2
+        * 3;
 
 // A RETENTION BOUND MUST NOT BORROW A WORK BUDGET, and clippy was right that a runtime
 // test of two constants is the wrong instrument: this is a compile-time invariant, so it
 // is asserted at compile time. Violating it fails the BUILD rather than a review round —
-// which is the only reason the pair below is worth writing, given that the last two
-// rounds each removed one of these guards without any check noticing.
+// which is the only reason this pair is worth writing, given that two consecutive rounds
+// each removed one of these guards and no check noticed either time.
 const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET_BYTES);
-// Above the 5.16x worst expansion measured on the minimal pair the parser accepts. Six
-// windows would clear it; eight is the next power of two and leaves the margin that four
-// windows did not.
-const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES >= 6 * TRANSFER_WINDOW_BYTES);
+// Above the 7.61x worst shape, which is an ALL-ASSISTANT window of string-content
+// records. The previous floor was six windows, justified by a 5.16x figure that was not
+// the worst case — so the floor itself would have admitted a ceiling that refuses valid
+// input. Eight is the smallest whole number of windows above the measured worst.
+const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES >= 8 * TRANSFER_WINDOW_BYTES);
 
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -551,9 +590,6 @@ impl RuntimeSessionTransfer {
             target_path,
             self.target_cursor.as_deref(),
             &source.0.messages,
-            DESTINATION_RECORD_BUDGET_BYTES,
-            DESTINATION_TOTAL_BUDGET_BYTES,
-            OMP_DESTINATION_RETENTION_BYTES,
         )
         .map(|_| ())
     }
@@ -1348,9 +1384,6 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
         &transcript_path,
         target_cursor.as_deref(),
         &expected,
-        DESTINATION_RECORD_BUDGET_BYTES,
-        DESTINATION_TOTAL_BUDGET_BYTES,
-        OMP_DESTINATION_RETENTION_BYTES,
     )
     .inspect_err(|_| report_this_target("the staged destination failed verification"))?;
     // No separate verify_destination for the JSONL arm: `read_destination_transcript`
@@ -1531,7 +1564,42 @@ pub(crate) fn verify_unchanged_transcripts(
 /// destination exceeds the SOURCE ceiling, and reaching that end-to-end needed a 64 MiB
 /// import — which is why the distinction went unguarded for two rounds and I had
 /// declared it unguardable.
+/// THE ONE PRODUCTION ENTRY POINT, and it takes no budgets.
+///
+/// Round 19's regression was a WIDENING — a bound deleted rather than tightened — and the
+/// round-22 review showed the suite could not have caught it: a test that passes its own
+/// ceiling never reaches a production site, and the live-append fixture is 257 KiB, so it
+/// bounds the site from BELOW only. Any ceiling at or above that passes it.
+///
+/// No fixture fixes that, because catching a widening requires exceeding the widened
+/// bound and the bound is half a gigabyte. What CAN be fixed is the number of places a
+/// widening could happen: the constants appear here and nowhere else on a production
+/// path, so there is one site to review instead of two, and `_within` is reachable only
+/// from tests and from this function.
+///
+/// RESIDUAL GAP, STATED RATHER THAN IMPLIED: a widening inside THIS function is still
+/// undetectable by the suite. The compile-time asserts on the constants are the guard
+/// that remains, which is why they are asserts and not a test.
 fn read_verified_destination(
+    kind: HarnessKind,
+    trust_root: &Path,
+    path: &Path,
+    cursor: Option<&str>,
+    expected: &[VisibleMessage],
+) -> Result<CanonicalTranscript, TransferError> {
+    read_verified_destination_within(
+        kind,
+        trust_root,
+        path,
+        cursor,
+        expected,
+        DESTINATION_RECORD_BUDGET_BYTES,
+        DESTINATION_TOTAL_BUDGET_BYTES,
+        OMP_DESTINATION_RETENTION_BYTES,
+    )
+}
+
+fn read_verified_destination_within(
     kind: HarnessKind,
     trust_root: &Path,
     path: &Path,
@@ -1540,7 +1608,7 @@ fn read_verified_destination(
     record_budget: usize,
     total_budget: u64,
     // Injectable so a test can drive the refusal with a few kilobytes instead of half a
-    // gigabyte. Both production callers pass OMP_DESTINATION_RETENTION_BYTES.
+    // gigabyte. Production reaches this only through `read_verified_destination`.
     omp_retention: u64,
 ) -> Result<CanonicalTranscript, TransferError> {
     match kind {
@@ -3846,9 +3914,14 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Append a record whose parent is the staged leaf's own parent chain tip, so it is
-    /// OFF the branch `omp::parse` walks from `leaf`. This is what a live OMP target does
-    /// to its transcript after launch.
+    /// Append a CHILD of the staged leaf — which is exactly what a live OMP target writes
+    /// after launch, and is off the branch `omp::parse` walks because that walk goes
+    /// UPWARD from `leaf` toward the root. A child is never on its own parent's ancestry.
+    ///
+    /// (An earlier version of this comment said "the staged leaf's own parent chain tip",
+    /// describing a SIBLING. The code was right and the comment was not — the round-22
+    /// reviewer caught it, and on this PR a wrong comment beside right code has twice been
+    /// the thing that produced the next round's defect.)
     fn append_off_branch_record(path: &Path, leaf: &str, text_bytes: usize) {
         let before = std::fs::metadata(path).unwrap().len();
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -4963,7 +5036,7 @@ mod tests {
             role: VisibleRole::User,
             text: "q".to_string(),
         }];
-        let verified = read_verified_destination(
+        let verified = read_verified_destination_within(
             HarnessKind::Codex,
             &root,
             &path,
@@ -5052,7 +5125,7 @@ mod tests {
         let written = std::fs::metadata(&path).unwrap().len();
         let ceiling = written / 2;
 
-        let error = read_verified_destination(
+        let error = read_verified_destination_within(
             HarnessKind::Omp,
             &sessions,
             &path,
@@ -5073,7 +5146,7 @@ mod tests {
 
         // THE CONTROL. The same file under the real constant verifies, so the assertion
         // above is about the CEILING and not about the fixture being malformed.
-        read_verified_destination(
+        read_verified_destination_within(
             HarnessKind::Omp,
             &sessions,
             &path,
@@ -5088,43 +5161,178 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// AXIS — ROUND-21: the retention ceiling covers the WORST input, not a typical one.
+    /// AXIS — ROUND-22: the modelled ROLE is the one with the worst expansion.
     ///
-    /// Three rounds sized this constant from the wrong shape. Round 18 used a 205-byte
-    /// pair carrying `cwd` and `sessionId` — fields the CODEX bridge requires and the OMP
-    /// path never sees — and got ~3.4x. The pair `parse_claude_record` actually accepts is
-    /// 147 bytes, and it expands over 5x, so four windows was ~327 MiB of destination
-    /// against a 256 MiB cap: a ceiling that refuses a VALID transfer, which is the defect
-    /// this PR has now had in six forms.
+    /// FOUR ROUNDS SIZED THIS CEILING FROM "THE MINIMAL RECORD" AND ALL FOUR MEANT "the
+    /// minimal record I happened to write". Round 18 used a 205-byte pair carrying `cwd`
+    /// and `sessionId`, fields only the CODEX bridge requires. Round 21 dropped those but
+    /// left the assistant record in its array form, and a reviewer demolished it with an
+    /// all-assistant window of string-content records.
     ///
-    /// UNLIKE THE CODEX FIGURE THIS IS MEASURED, NOT MODELLED. `omp::write` is our own
-    /// writer, so the destination here is the real artifact rather than a hand-built
-    /// approximation of one. Shrinking the constant below the measured expansion turns
-    /// this red, and the counts are asserted with the verdict.
+    /// The first version of THIS test then repeated the shape one level up: it looked for
+    /// the globally smallest accepted record and found a 56-byte user one, which is real
+    /// but is the wrong input to the model — a user record produces a user ENTRY at about
+    /// half an assistant entry's cost, so the pair that maximises RETENTION is not the pair
+    /// containing the smallest record. Expansion is per-role, so the model is per-role, and
+    /// this asserts the role the model names is actually the worst one.
+    ///
+    /// It enumerates the forms `parse_claude_record` ACCEPTS — accepted meaning "produces a
+    /// visible message", not merely "parses" — measures the writer's cost for each role,
+    /// and requires the modelled pair to dominate. A cheaper accepted form, or a role whose
+    /// entry cost grows, turns this red instead of silently moving the true worst case out
+    /// from under the ceiling.
     #[test]
-    fn an_omp_destination_from_the_minimal_pair_fits_the_retention_bound() {
-        let root = temp_root("omp-expansion");
+    fn the_modelled_role_is_the_worst_expanding_one() {
+        let root = temp_root("worst-role");
         let sessions = root.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
 
-        let pairs = 400;
+        let smallest_accepted = |candidates: &[serde_json::Value]| -> u64 {
+            let mut best = u64::MAX;
+            for candidate in candidates {
+                let line = candidate.to_string();
+                let dir = temp_root("accepted-form");
+                let path = dir.join("t.jsonl");
+                std::fs::write(&path, format!("{line}\n")).unwrap();
+                let produces_a_message = read_transcript(HarnessKind::Claude, &dir, &path)
+                    .map(|t| !t.messages.is_empty())
+                    .unwrap_or(false);
+                let _ = fs::remove_dir_all(&dir);
+                if produces_a_message {
+                    best = best.min(line.len() as u64 + 1);
+                }
+            }
+            best
+        };
+
+        // Marginal writer cost per entry, differenced so the header cancels.
+        let entry_cost = |role: VisibleRole| -> u64 {
+            let at = |count: usize| {
+                let messages: Vec<_> = (0..count)
+                    .map(|_| VisibleMessage {
+                        role,
+                        text: "a".to_string(),
+                    })
+                    .collect();
+                let (_id, path, _leaf) =
+                    omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+                std::fs::metadata(&path).unwrap().len()
+            };
+            (at(200) - at(100)) / 100
+        };
+
+        let assistant_min = smallest_accepted(&[
+            json!({"type":"assistant","message":{"role":"assistant","content":"a"}}),
+            json!({"type":"assistant",
+                "message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}),
+        ]);
+        let user_min = smallest_accepted(&[
+            json!({"type":"user","message":{"role":"user","content":"q"}}),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"q"}]}}),
+        ]);
+        let assistant_ratio = entry_cost(VisibleRole::Assistant) as f64 / assistant_min as f64;
+        let user_ratio = entry_cost(VisibleRole::User) as f64 / user_min as f64;
+
+        assert!(
+            assistant_ratio >= user_ratio,
+            "the retention model is derived from the ASSISTANT pair, but the USER pair \
+             now expands worse ({user_ratio:.2}x vs {assistant_ratio:.2}x); re-derive \
+             OMP_DESTINATION_RETENTION_BYTES from the user pair instead"
+        );
+        assert!(
+            OMP_MIN_ASSISTANT_RECORD_BYTES <= assistant_min,
+            "the model assumes no accepted assistant record is smaller than \
+             {OMP_MIN_ASSISTANT_RECORD_BYTES} bytes, but one is {assistant_min}"
+        );
+        assert!(
+            assistant_min - OMP_MIN_ASSISTANT_RECORD_BYTES <= 8,
+            "the modelled assistant minimum ({OMP_MIN_ASSISTANT_RECORD_BYTES}) has drifted \
+             from the measured one ({assistant_min}); re-derive it rather than widening \
+             the gap, which inflates the ceiling for no reason"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// AXIS — ROUND-22: `omp::write`'s per-entry cost stays inside the modelled maximum.
+    ///
+    /// THIS IS THE GUARD THE OLD MEASUREMENT TEST WAS TRYING TO BE. Round 21's version
+    /// asserted a ratio against the ceiling, which the round-22 review showed was strictly
+    /// weaker than the compile-time assert already covering it — it could only fire below
+    /// ~5.11 windows, and the BUILD already failed below 6. Its one real role was catching
+    /// a change to `omp::write`, and at 5.11x it had 1.57x of slack while the shape that
+    /// actually ships had 1.05x. A guard aimed at the right risk, calibrated to miss it.
+    ///
+    /// Aimed at the writer directly instead: measure what `omp::write` emits per entry and
+    /// require the modelled maximum to cover it. Adding a field to the entry envelope
+    /// turns this red at the point the cost changes, rather than at the point some
+    /// unrelated ratio crosses a ceiling.
+    #[test]
+    fn omp_write_entry_cost_stays_inside_the_modelled_maximum() {
+        let root = temp_root("omp-entry-cost");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // The assistant entry is the larger of the two forms the writer emits, and the
+        // envelope is fixed-width, so per-entry cost is measured by differencing two
+        // transcripts rather than by parsing one.
+        let entry_cost = |count: usize| -> u64 {
+            let messages: Vec<_> = (0..count)
+                .map(|_| VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: "a".to_string(),
+                })
+                .collect();
+            let (_id, path, _leaf) =
+                omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+        // Differencing cancels the header, so this is the marginal entry cost.
+        let per_entry = (entry_cost(200) - entry_cost(100)) / 100;
+
+        assert!(
+            per_entry <= OMP_MAX_DESTINATION_ENTRY_BYTES,
+            "omp::write now emits {per_entry} bytes per assistant entry, above the \
+             modelled maximum of {OMP_MAX_DESTINATION_ENTRY_BYTES} that \
+             OMP_DESTINATION_RETENTION_BYTES is derived from — raise the model, because \
+             the ceiling is now below what the writer produces and `prepare` PUBLISHES \
+             the session before reading it back"
+        );
+        assert!(
+            OMP_MAX_DESTINATION_ENTRY_BYTES - per_entry <= 64,
+            "the modelled maximum ({OMP_MAX_DESTINATION_ENTRY_BYTES}) has drifted well \
+             above the measured cost ({per_entry}); that inflates the retention ceiling \
+             for no reason"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// AXIS — ROUND-22: the WORST accepted shape still fits the ceiling.
+    ///
+    /// The end-to-end check on the model above, and it uses the shape that actually
+    /// demolished round 21: an ALL-ASSISTANT window of string-content records, which no
+    /// earlier fixture wrote because every one of them assumed a conversation alternates.
+    /// Windowing cuts the HEAD of a transcript, so an assistant-heavy tail is a normal
+    /// outcome of the very feature this PR adds — not an exotic input.
+    ///
+    /// Reverting the constant to round 21's `8 * TRANSFER_WINDOW_BYTES` leaves this green
+    /// by 5%, which is exactly why the margin is asserted rather than just the fit.
+    #[test]
+    fn the_worst_accepted_shape_fits_the_retention_ceiling_with_margin() {
+        let root = temp_root("omp-worst-shape");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let entries = 800;
         let mut messages = Vec::new();
-        let mut source_bytes = 0usize;
-        for _ in 0..pairs {
-            // The MINIMAL pair the OMP path's parser accepts: no `cwd`, no `sessionId`.
-            source_bytes += json!({"type":"user","message":{"role":"user","content":"q"}})
-                .to_string()
-                .len()
-                + 1;
+        let mut source_bytes = 0u64;
+        for _ in 0..entries {
             source_bytes += json!({"type":"assistant",
-                "message":{"role":"assistant","content":[{"type":"text","text":"a"}]}})
+                "message":{"role":"assistant","content":"a"}})
             .to_string()
-            .len()
+            .len() as u64
                 + 1;
-            messages.push(VisibleMessage {
-                role: VisibleRole::User,
-                text: "q".to_string(),
-            });
             messages.push(VisibleMessage {
                 role: VisibleRole::Assistant,
                 text: "a".to_string(),
@@ -5133,30 +5341,31 @@ mod tests {
         let (_id, path, _leaf) =
             omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
         let destination_bytes = std::fs::metadata(&path).unwrap().len();
+
         let ratio = destination_bytes as f64 / source_bytes as f64;
-        let windows_held = ratio * TRANSFER_WINDOW_BYTES as f64;
+        let held_from_a_full_window = ratio * TRANSFER_WINDOW_BYTES as f64;
         let ceiling = OMP_DESTINATION_RETENTION_BYTES as f64;
+        let margin = ceiling / held_from_a_full_window;
 
         assert!(
-            windows_held < ceiling,
-            "an OMP destination written from a FULL window of the minimal accepted pair \
-             expands {ratio:.2}x ({source_bytes} -> {destination_bytes} bytes on {pairs} \
-             pairs), needing {:.0} MiB against a {:.0} MiB retention ceiling",
-            windows_held / (1024.0 * 1024.0),
+            margin >= 1.25,
+            "the worst accepted shape expands {ratio:.2}x ({source_bytes} -> \
+             {destination_bytes} bytes over {entries} entries), so a full window holds \
+             {:.0} MiB against a {:.0} MiB ceiling — margin {margin:.2}x, below the 1.25x \
+             this bound is built to keep. `prepare` publishes before it reads back, so \
+             being low orphans a session rather than merely failing.",
+            held_from_a_full_window / (1024.0 * 1024.0),
             ceiling / (1024.0 * 1024.0)
         );
         assert!(
-            ratio > 5.0,
-            "precondition: this fixture must reproduce the WORST-CASE shape, and a ratio \
-             of {ratio:.2}x means it no longer does — the constant would then be sized \
-             against an input that is not the worst one, which is exactly how rounds 18 \
-             and 19 went wrong"
+            ratio > 7.0,
+            "precondition: this fixture must reproduce the WORST shape, and {ratio:.2}x \
+             means it no longer does — the ceiling would then be validated against an \
+             input that is not the worst one, which is how rounds 18, 19 and 21 each \
+             shipped a bound a reviewer then demolished"
         );
-        assert_eq!(
-            OMP_DESTINATION_RETENTION_BYTES,
-            8 * TRANSFER_WINDOW_BYTES,
-            "the retention ceiling is a stated multiple of the window, not an inferred one"
-        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// AXIS — ROUND-16: a destination LARGER THAN THE SOURCE CEILING still verifies.
@@ -5215,7 +5424,7 @@ mod tests {
         );
 
         // The streaming arm accepts it: retention is bounded per record, not by the file.
-        let verified = read_verified_destination(
+        let verified = read_verified_destination_within(
             HarnessKind::Claude,
             &root,
             &path,
