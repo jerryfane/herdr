@@ -645,17 +645,43 @@ jobs:
           echo "branch=$PUBLICATION_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Trigger website deploy
+        id: website-deploy
+        shell: bash
         env:
           DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_PAGES_DEPLOY_HOOK }}
+          WEBSITE_DEPLOY: ${{ vars.PREVIEW_WEBSITE_DEPLOY }}
+          BUILD_ID: ${{ steps.publication.outputs.build_id }}
         run: |
+          set -euo pipefail
+          if [ "$WEBSITE_DEPLOY" = "disabled" ]; then
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PREVIEW_WEBSITE_DEPLOY=disabled: manifest ${BUILD_ID} is on master but https://herdr.dev/preview.json was NOT updated. The preview channel is intentionally stale and daemon self-update over preview is unavailable."
+            {
+              echo "### Preview website deploy SKIPPED — channel intentionally stale"
+              echo
+              echo "Repository variable \`PREVIEW_WEBSITE_DEPLOY\` is \`disabled\` for \`${GITHUB_REPOSITORY}\`."
+              echo
+              echo "| what | state |"
+              echo "| --- | --- |"
+              echo "| \`website/preview.json\` on \`master\` | \`${BUILD_ID}\` published |"
+              echo "| <https://herdr.dev/preview.json> | **NOT updated — still serving an older build** |"
+              echo "| daemon self-update over the preview channel | **unavailable** |"
+              echo
+              echo "This run is green because the skip was declared, not because the preview channel shipped."
+              echo "To resume publishing: add the \`CLOUDFLARE_PAGES_DEPLOY_HOOK\` secret, then set \`PREVIEW_WEBSITE_DEPLOY\` to anything other than \`disabled\` (or delete the variable)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ -z "$DEPLOY_HOOK" ]; then
-            echo "::error::Create the repository Actions secret CLOUDFLARE_PAGES_DEPLOY_HOOK for ${GITHUB_REPOSITORY}; no preview website deployment was triggered"
+            echo "::error::Create the repository Actions secret CLOUDFLARE_PAGES_DEPLOY_HOOK for ${GITHUB_REPOSITORY}, or declare the skip by setting the repository variable PREVIEW_WEBSITE_DEPLOY=disabled; no preview website deployment was triggered"
             exit 1
           fi
           curl -fsS -X POST "$DEPLOY_HOOK" > /dev/null
+          echo "triggered=true" >> "$GITHUB_OUTPUT"
           echo "Triggered Cloudflare Pages production deploy"
 
       - name: Verify public preview deployment
+        if: steps.website-deploy.outputs.triggered == 'true'
         run: |
           python3 scripts/preview.py verify-deployment \
             --manifest website/preview.json \
