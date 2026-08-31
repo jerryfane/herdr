@@ -1395,13 +1395,6 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
 mod tests {
     use super::*;
 
-    /// AXIS: the field path reaches the real value, and a shape that lacks it
-    /// reads as zero rather than as a wrong number.
-    ///
-    /// This guards the silent direction: a mistyped path returns 0, which means
-    /// "nothing dropped" — staging would print no warning and `--yes` would wave a
-    /// lossy transfer through, with no error anywhere. The fixture mirrors the
-    /// live `agent.list` shape, taken from a real staged transfer.
     /// AXIS — ROUND-3 FINDING 4: BOTH arms of the lossy `--yes` refusal.
     ///
     /// The previous test called only `windowed_records_of`, so deleting the refusal,
@@ -1428,6 +1421,13 @@ mod tests {
         );
     }
 
+    /// AXIS: the field path reaches the real value, and a shape that lacks it
+    /// reads as zero rather than as a wrong number.
+    ///
+    /// This guards the silent direction: a mistyped path returns 0, which means
+    /// "nothing dropped" — staging would print no warning and `--yes` would wave a
+    /// lossy transfer through, with no error anywhere. The fixture mirrors the
+    /// live `agent.list` shape, taken from a real staged transfer.
     #[test]
     fn windowed_records_are_read_from_the_staged_transfer() {
         let staged: serde_json::Value = serde_json::from_str(
