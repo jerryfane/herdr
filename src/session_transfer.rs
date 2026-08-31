@@ -29,21 +29,6 @@ use tokio::io::AsyncWriteExt as _;
 /// window becomes unreachable again.
 const TRANSFER_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The most a bridge we generate ourselves may occupy when read back.
-///
-/// A SEPARATE CEILING FROM THE SOURCE'S, BECAUSE THE ARTIFACT IS NOT THE SOURCE. The
-/// bridge is written FROM a source that already passed `TRANSFER_WINDOW_BYTES`, and
-/// re-serialising expands it: the reviewer costed a tiny message pair at ~731 bytes in
-/// OMP against ~835 in the Claude bridge, so a legitimate ~60 MiB OMP source produces a
-/// ~68.5 MiB bridge and was refused with TranscriptTooLarge BEFORE Codex was ever
-/// invoked. Reusing the source ceiling on something we generate is the same class of
-/// error as deriving a destination bound from expected messages — a limit applied to a
-/// quantity it was not measured against.
-///
-/// Twice the window covers the measured ~1.14x expansion with room to spare, and it
-/// bounds a file this process wrote rather than anything a producer controls.
-const BRIDGE_STAGING_BYTES: u64 = 2 * TRANSFER_WINDOW_BYTES;
-
 /// The most this will hold in memory for ONE destination record.
 ///
 /// A MEMORY CEILING, DERIVED FROM NOTHING IN THE FILE. Rounds 4 through 8 each refined a
@@ -634,7 +619,12 @@ pub(crate) enum TransferError {
     /// the size refusal it had before this change. Claude and Codex are windowed instead
     /// of refused, which is the point of the PR.
     TranscriptTooLarge {
+        /// How much was READ before refusing — a lower bound on the real size, since the
+        /// reader stops at cap+1 rather than measuring the file.
         bytes: u64,
+        /// The limit actually applied. Hard-coding TRANSFER_WINDOW_BYTES in the message
+        /// misreported every caller using a different one (round 17).
+        limit: u64,
     },
     /// One destination pass scanned more than the total-work budget allows.
     DestinationTooLarge {
@@ -684,10 +674,10 @@ impl fmt::Display for TransferError {
             Self::LineTooLarge { line, limit } => {
                 write!(f, "transcript line {line} exceeds {limit} bytes")
             }
-            Self::TranscriptTooLarge { bytes } => write!(
+            Self::TranscriptTooLarge { bytes, limit } => write!(
                 f,
-                "transcript is {bytes} bytes; the limit for this harness is \
-                 {TRANSFER_WINDOW_BYTES} bytes"
+                "transcript exceeds the {limit}-byte limit for this read (at least \
+                 {bytes} bytes; the reader stops once the limit is passed)"
             ),
             Self::DestinationTooLarge { scanned, limit } => write!(
                 f,
@@ -1206,10 +1196,7 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
             // re-serialising expands it past that window for a large OMP source.
             let bridge_file = fs::File::open(bridge.path())
                 .map_err(|err| TransferError::io("read staged import bridge", err))?;
-            expected = claude_to_codex_import_projection(&read_whole_within(
-                bridge_file,
-                bridge_staging_budget(),
-            )?)?;
+            expected = claude_to_codex_import_projection_streaming(bridge_file)?;
             let mut observed_targets = Vec::new();
             let session_id = match import_claude_session_to_codex(
                 &request.target_config_home,
@@ -1698,20 +1685,6 @@ fn read_bounded_file(file: fs::File, cap: u64, path: &Path) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
-/// The ceiling for reading back an artifact we generated.
-///
-/// A FUNCTION, NOT AN INLINE CONSTANT, so the choice has one asserted home. A test
-/// cannot observe which constant a call site passes without a fixture above the real
-/// limit — a >64 MiB bridge — so the mutable surface is reduced to this instead, and
-/// `the_bridge_budget_exceeds_the_source_ceiling` pins the property that matters: the
-/// artifact ceiling must be strictly larger than the source's, because writing expands.
-///
-/// STATED LIMIT: this does not prove `prepare` calls it. It proves that whatever calls
-/// it gets a value sized for a generated artifact rather than for a source.
-fn bridge_staging_budget() -> u64 {
-    BRIDGE_STAGING_BYTES
-}
-
 /// Report a PreparedTransfer that is being dropped without being accepted.
 ///
 /// WITH AUTOMATIC CLEANUP CUT, EVERY DISCARD MUST SAY SO. Round 16, both reviewers: the
@@ -1844,6 +1817,7 @@ fn read_whole_within<R: std::io::Read>(reader: R, cap: u64) -> Result<Vec<u8>, T
     if bytes.len() as u64 > cap {
         return Err(TransferError::TranscriptTooLarge {
             bytes: bytes.len() as u64,
+            limit: cap,
         });
     }
     Ok(bytes)
@@ -2324,16 +2298,46 @@ fn parse_claude_message(
 /// conversation. Exact verification against this projection proves what the
 /// importer actually wrote without trusting the importer to attest to itself.
 fn claude_to_codex_import_projection(bytes: &[u8]) -> Result<Vec<VisibleMessage>, TransferError> {
+    claude_to_codex_import_projection_streaming(Cursor::new(bytes))
+}
+
+/// Project a Claude transcript into what Codex will import, WITHOUT holding the file.
+///
+/// STREAMED SO THERE IS NO CEILING TO GUESS. The generated bridge used to be read back
+/// whole under `BRIDGE_STAGING_BYTES`, a bound I set at twice the source window and could
+/// not defend. Round 17 showed why: the ~4.3x expansion measured on a minimal message
+/// pair does NOT wash out with repetition — a 64 MiB window can hold ~327,360 such pairs
+/// and produce a ~275 MiB bridge, and nothing bounds the message COUNT to prevent that
+/// shape.
+///
+/// The fix is not a bigger number. Reading record by record means the only retention is
+/// one line plus the projection itself, and the projection is `expected`, which the
+/// caller already holds in memory regardless. So the guessed bound is deleted rather
+/// than re-guessed — the third time on this PR that the right answer was to remove the
+/// thing that needed justifying.
+fn claude_to_codex_import_projection_streaming<R: std::io::Read>(
+    reader: R,
+) -> Result<Vec<VisibleMessage>, TransferError> {
+    let mut reader = BufReader::new(reader);
     let mut messages = Vec::new();
     let mut saw_user_message = false;
-    for (index, line) in BufReader::new(Cursor::new(bytes)).split(b'\n').enumerate() {
-        let line_number = index + 1;
-        let mut line = line.map_err(|err| TransferError::io("read transcript", err))?;
-        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
-            return Err(TransferError::LineTooLarge {
-                line: line_number,
-                limit: MAX_TRANSCRIPT_LINE_BYTES,
-            });
+    let mut line_number = 0usize;
+    loop {
+        line_number += 1;
+        let mut raw = Vec::new();
+        // Per-record bound only: the file may be any size, one record may not.
+        if read_line_bounded(
+            &mut reader,
+            &mut raw,
+            line_number,
+            MAX_TRANSCRIPT_LINE_BYTES,
+        )? == 0
+        {
+            break;
+        }
+        let mut line = raw;
+        if line.last() == Some(&b'\n') {
+            line.pop();
         }
         if line.last() == Some(&b'\r') {
             line.pop();
@@ -4563,31 +4567,188 @@ mod tests {
         );
     }
 
-    /// AXIS — ROUND-16: the generated bridge is measured against its OWN ceiling.
+    /// AXIS — ROUND-17: the abandonment warning actually names what a human must clear.
     ///
-    /// The bridge is written FROM a source that already passed TRANSFER_WINDOW_BYTES,
-    /// and re-serialising expands it — review measured a 205-byte source pair becoming
-    /// ~882 bytes in the Claude bridge — so a legitimate ~60 MiB source produced a
-    /// ~68.5 MiB bridge and was refused BEFORE Codex was invoked. Reusing the source
-    /// ceiling on something we generate is the same error as deriving a destination
-    /// bound from expected messages: a limit applied to a quantity it was never
-    /// measured against.
+    /// With automatic cleanup cut, this log line is the ONLY cleanup receipt, and round
+    /// 17 found nothing observed it: removing any report call left state and return
+    /// values identical, and no test referenced the reporter at all. A receipt nobody
+    /// checks is the same shape as the cleanup that silently never ran.
+    ///
+    /// Asserts the TYPED locator per harness, which is the half that was actually wrong
+    /// before: OMP's locator is a transcript path and was being emitted as `session_id`.
     #[test]
-    fn the_bridge_budget_exceeds_the_source_ceiling() {
+    fn the_abandonment_warning_names_the_locator_a_human_would_use() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            report_abandoned_targets(
+                HarnessKind::Codex,
+                std::path::Path::new("/tmp/codex-home"),
+                &["thread-abc".to_string()],
+                "test",
+            );
+            report_abandoned_targets(
+                HarnessKind::Omp,
+                std::path::Path::new("/tmp/omp-home"),
+                &["/tmp/omp-home/sessions/leaf.jsonl".to_string()],
+                "test",
+            );
+        });
+
+        let logged = String::from_utf8(capture.0.lock().expect("capture").clone()).unwrap();
         assert!(
-            bridge_staging_budget() > TRANSFER_WINDOW_BYTES,
-            "an artifact we generate from a source must not be capped at the source's \
-             own ceiling: {} vs {TRANSFER_WINDOW_BYTES}",
-            bridge_staging_budget()
+            logged.contains("session_id=\"thread-abc\"")
+                || logged.contains("session_id=thread-abc"),
+            "a Codex thread must be named as a session id: {logged}"
         );
-        // The measured worst expansion is ~4.3x for tiny pairs (205 -> 882 bytes), but
-        // only the LARGEST source matters: a source at the ceiling must still fit after
-        // expansion. Two windows covers the ~1.14x whole-file expansion the reviewers
-        // measured on realistic transcripts with margin.
         assert!(
-            bridge_staging_budget() >= 2 * TRANSFER_WINDOW_BYTES,
-            "the artifact ceiling must leave room for the measured expansion"
+            logged.contains("transcript_path"),
+            "an OMP locator is a PATH and must not be labelled session_id: {logged}"
         );
+        assert!(
+            !logged.contains("session_id=\"/tmp/omp-home"),
+            "the OMP path must not be emitted under session_id: {logged}"
+        );
+        assert!(
+            logged.contains("/tmp/codex-home") && logged.contains("/tmp/omp-home"),
+            "the account home must be logged so the artifact can be found: {logged}"
+        );
+    }
+
+    /// AXIS — ROUND-17: the generated bridge is STREAMED, so it has no ceiling to guess.
+    ///
+    /// It used to be read back whole under a bound I set at twice the source window and
+    /// defended with "only the largest source matters". That reasoning was wrong in the
+    /// exact way the reviewers showed: a 64 MiB window can hold ~327,360 minimal message
+    /// pairs, the measured ~4.3x per-pair expansion does not wash out with repetition,
+    /// and the result is a ~275 MiB bridge — with nothing bounding message COUNT to
+    /// prevent that shape.
+    ///
+    /// So the bound is deleted rather than raised. Retention is one record plus the
+    /// projection, and the projection is `expected`, which the caller holds anyway.
+    #[test]
+    fn the_bridge_projection_streams_a_file_past_any_whole_read_ceiling() {
+        // Deliberately larger than the DESTINATION record budget would allow to be held
+        // as one blob, and far past anything a "2x the window" guess would have covered
+        // proportionally: what matters is that no total-size check exists at all.
+        let root = temp_root("bridge-streamed");
+        let path = root.join("bridge.jsonl");
+        let pairs = 20_000;
+        let mut body = String::new();
+        for index in 0..pairs {
+            body.push_str(&format!(
+                "{}\n{}\n",
+                json!({"type":"user","cwd":"/tmp","sessionId":"s",
+                    "message":{"role":"user","content":format!("q{index}")}}),
+                json!({"type":"assistant","cwd":"/tmp","sessionId":"s",
+                    "message":{"role":"assistant",
+                        "content":[{"type":"text","text":format!("a{index}")}]}})
+            ));
+        }
+        std::fs::write(&path, body.as_bytes()).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let projected = claude_to_codex_import_projection_streaming(file)
+            .expect("the projection must stream, not refuse on total size");
+        assert_eq!(
+            projected.len(),
+            pairs * 2,
+            "every record must be projected regardless of the file's total size"
+        );
+
+        // WHAT THIS DOES AND DOES NOT KILL. It proves the projection has no total-size
+        // ceiling in its signature and handles a many-thousand-record file. It does NOT
+        // kill a mutant that reintroduces a whole read at some large constant — that
+        // needs a fixture above whatever constant the mutant picks. The structural
+        // guard is that `claude_to_codex_import_projection_streaming` takes a reader and
+        // no budget, so there is no number for a reviewer to have to justify.
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// AXIS — ROUND-17: the survivor is closed. A destination past the REAL 64 MiB
+    /// source constant still verifies.
+    ///
+    /// I declared this one unclosable-without-expense twice: distinguishing the
+    /// streaming arm from a whole read at the literal TRANSFER_WINDOW_BYTES needs a
+    /// destination actually over 64 MiB. The reviewer pointed out the suite ALREADY
+    /// writes one, so this is not a new class of fixture — it is the same cost the
+    /// oversize source test already pays.
+    ///
+    /// The shape matters: bulk is IGNORED metadata, and the visible projection is tiny.
+    /// That is a real Codex destination — several records per pair, most of them not
+    /// visible messages — and it is exactly what a source-sized ceiling refuses wrongly.
+    #[test]
+    fn a_destination_past_the_real_source_constant_still_verifies() {
+        let root = temp_root("dest-past-real-cap");
+        let path = root.join("rollout-thread.jsonl");
+
+        // One metadata record over the source ceiling, plus a two-message conversation.
+        // `session_meta` is not a visible message, so the projection stays tiny while
+        // the FILE is unambiguously past TRANSFER_WINDOW_BYTES.
+        // SPREAD ACROSS MANY RECORDS, not one. My first attempt put the whole 64 MiB in
+        // a single `session_meta`, which legitimately exceeds the PER-RECORD budget and
+        // failed for the wrong reason — the file has to be oversize while every record
+        // is ordinary, which is also what a real destination looks like.
+        let chunk = "i".repeat(1024 * 1024);
+        let mut records: Vec<Value> = (0..68)
+            .map(|index| {
+                json!({"type":"session_meta",
+                    "payload":{"id":format!("thread-{index}"),"base_instructions":chunk}})
+            })
+            .collect();
+        records.push(
+            json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"q"}]}}),
+        );
+        records.push(json!({"type":"event_msg","payload":{"type":"user_message",
+            "message":"q","images":[],"local_images":[]}}));
+        write_fixture(&path, &records);
+        let total = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            total > TRANSFER_WINDOW_BYTES,
+            "precondition: the destination must exceed the SOURCE constant ({total} vs \
+             {TRANSFER_WINDOW_BYTES}), or this cannot distinguish the two readers"
+        );
+
+        let expect = vec![VisibleMessage {
+            role: VisibleRole::User,
+            text: "q".to_string(),
+        }];
+        let verified = read_verified_destination(
+            HarnessKind::Codex,
+            &root,
+            &path,
+            None,
+            &expect,
+            DESTINATION_RECORD_BUDGET_BYTES,
+            DESTINATION_TOTAL_BUDGET_BYTES,
+        )
+        .expect("a destination past the source constant must still verify");
+        assert_eq!(verified.messages, expect);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// AXIS — ROUND-16: a destination LARGER THAN THE SOURCE CEILING still verifies.
