@@ -321,11 +321,24 @@ impl App {
                     .and_then(|runtime| {
                         runtime.block_on(crate::session_transfer::prepare(request))
                     });
-                let _ = event_tx.blocking_send(AppEvent::AgentSessionTransferPrepared {
+                // A CLOSED CHANNEL DROPS A REAL TARGET. `let _ =` here meant a
+                // successful preparation could vanish with the session it created and
+                // nothing naming it — the one path where staging definitely SUCCEEDED.
+                if let Err(err) = event_tx.blocking_send(AppEvent::AgentSessionTransferPrepared {
                     terminal_id: worker_terminal_id,
                     transfer_id: worker_transfer_id,
                     result: Box::new(result),
-                });
+                }) {
+                    if let AppEvent::AgentSessionTransferPrepared { result, .. } = err.0 {
+                        if let Ok(prepared) = result.as_ref() {
+                            crate::session_transfer::report_discarded_preparation(
+                                prepared,
+                                "the transfer event channel closed before the staged \
+                                 target could be accepted",
+                            );
+                        }
+                    }
+                }
             });
         if let Err(err) = worker {
             if let Some(transfer) = self
@@ -665,11 +678,23 @@ impl App {
             .and_then(|terminal| terminal.session_transfer.as_ref())
             .cloned()
         else {
+            if let Ok(prepared) = result.as_ref() {
+                crate::session_transfer::report_discarded_preparation(
+                    prepared,
+                    "the terminal or its transfer disappeared while staging ran",
+                );
+            }
             return false;
         };
         if transfer_snapshot.id != transfer_id
             || transfer_snapshot.phase != AgentSessionTransferPhase::Preparing
         {
+            if let Ok(prepared) = result.as_ref() {
+                crate::session_transfer::report_discarded_preparation(
+                    prepared,
+                    "the transfer was replaced or had moved on before staging completed",
+                );
+            }
             return false;
         }
         let prepared = match result {
@@ -704,6 +729,10 @@ impl App {
                     )
             });
         if !terminal_still_idle {
+            crate::session_transfer::report_discarded_preparation(
+                &prepared,
+                "the source changed while the destination was being staged",
+            );
             let terminal = self
                 .state
                 .terminals

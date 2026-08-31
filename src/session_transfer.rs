@@ -29,6 +29,21 @@ use tokio::io::AsyncWriteExt as _;
 /// window becomes unreachable again.
 const TRANSFER_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most a bridge we generate ourselves may occupy when read back.
+///
+/// A SEPARATE CEILING FROM THE SOURCE'S, BECAUSE THE ARTIFACT IS NOT THE SOURCE. The
+/// bridge is written FROM a source that already passed `TRANSFER_WINDOW_BYTES`, and
+/// re-serialising expands it: the reviewer costed a tiny message pair at ~731 bytes in
+/// OMP against ~835 in the Claude bridge, so a legitimate ~60 MiB OMP source produces a
+/// ~68.5 MiB bridge and was refused with TranscriptTooLarge BEFORE Codex was ever
+/// invoked. Reusing the source ceiling on something we generate is the same class of
+/// error as deriving a destination bound from expected messages — a limit applied to a
+/// quantity it was not measured against.
+///
+/// Twice the window covers the measured ~1.14x expansion with room to spare, and it
+/// bounds a file this process wrote rather than anything a producer controls.
+const BRIDGE_STAGING_BYTES: u64 = 2 * TRANSFER_WINDOW_BYTES;
+
 /// The most this will hold in memory for ONE destination record.
 ///
 /// A MEMORY CEILING, DERIVED FROM NOTHING IN THE FILE. Rounds 4 through 8 each refined a
@@ -380,6 +395,13 @@ pub(crate) struct PreparedTransfer {
     pub(crate) source_path: PathBuf,
     pub(crate) source_fingerprint: TranscriptFingerprint,
     pub(crate) staged: StagedSession,
+    /// Which harness and account home the staged target lives in.
+    ///
+    /// Carried on the value itself so ANY site that discards it can report what was
+    /// left behind, without the caller having to still hold the request. With automatic
+    /// cleanup cut, an unreported discard is a session nothing names.
+    pub(crate) target_kind: HarnessKind,
+    pub(crate) target_config_home: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -486,27 +508,16 @@ impl RuntimeSessionTransfer {
         // Second site of one defect. The routing decision belongs in one place; it is
         // duplicated here only because the two callers hold `expected` differently, and
         // that is worth revisiting if a third appears.
-        match self.target_kind {
-            HarnessKind::Claude | HarnessKind::Codex => {
-                read_destination_transcript(
-                    self.target_kind,
-                    &self.target_sessions_root,
-                    target_path,
-                    &source.0.messages,
-                )?;
-                // Comparison happened during the read; reaching here means it matched.
-                Ok(())
-            }
-            HarnessKind::Omp => {
-                let target = read_transcript_at_cursor(
-                    self.target_kind,
-                    &self.target_sessions_root,
-                    target_path,
-                    self.target_cursor.as_deref(),
-                )?;
-                verify_destination(&source.0.messages, &target)
-            }
-        }
+        read_verified_destination(
+            self.target_kind,
+            &self.target_sessions_root,
+            target_path,
+            self.target_cursor.as_deref(),
+            &source.0.messages,
+            DESTINATION_RECORD_BUDGET_BYTES,
+            DESTINATION_TOTAL_BUDGET_BYTES,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn info(&self) -> crate::api::schema::AgentSessionTransferInfo {
@@ -736,6 +747,11 @@ pub(crate) fn read_transcript(
 /// reading its tail and comparing against the full source projection rejects a transfer
 /// that worked. That was review round 3's finding, and it is re-stated here because the
 /// windowing reader now sits one call below and would silently reintroduce it.
+/// TEST-ONLY SINCE ROUND 16. Production destination reads go through
+/// `read_verified_destination`, which routes by harness and applies the DESTINATION
+/// budgets — this carries the SOURCE ceiling and would refuse a valid expanded
+/// destination. Kept for parser tests; marked so nobody re-aims a regression at it.
+#[cfg(test)]
 pub(crate) fn read_transcript_at_cursor(
     kind: HarnessKind,
     trust_root: &Path,
@@ -764,6 +780,10 @@ pub(crate) fn read_transcript_at_cursor(
 ///
 /// Still bounded, just not by a TAIL CUT: a destination larger than the read bound is a
 /// real error rather than something to silently truncate, because we wrote it.
+/// TEST-ONLY SINCE ROUND 16: `read_verified_destination` is the production entry and
+/// passes the budgets explicitly. This wrapper hard-codes them, which is exactly the
+/// shape that made the routing untestable for two rounds.
+#[cfg(test)]
 pub(crate) fn read_destination_transcript(
     kind: HarnessKind,
     config_home: &Path,
@@ -1181,10 +1201,15 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
                 &request.cwd,
                 &source.messages,
             )?;
-            // Read WHOLE: the bridge is a file we just wrote from the window, so there
-            // is nothing further to window and the projection must see all of it.
-            expected =
-                claude_to_codex_import_projection(&read_transcript_whole(bridge.path())?.bytes)?;
+            // Read WHOLE, under the STAGING ceiling rather than the source's: the
+            // bridge is a file we just wrote from an already-bounded window, and
+            // re-serialising expands it past that window for a large OMP source.
+            let bridge_file = fs::File::open(bridge.path())
+                .map_err(|err| TransferError::io("read staged import bridge", err))?;
+            expected = claude_to_codex_import_projection(&read_whole_within(
+                bridge_file,
+                bridge_staging_budget(),
+            )?)?;
             let mut observed_targets = Vec::new();
             let session_id = match import_claude_session_to_codex(
                 &request.target_config_home,
@@ -1275,34 +1300,21 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
             reason,
         );
     };
-    let destination = match request.target_kind {
-        HarnessKind::Claude | HarnessKind::Codex => read_destination_transcript(
-            request.target_kind,
-            &request.target_sessions_root,
-            &transcript_path,
-            &expected,
-        )
-        .inspect_err(|_| report_this_target("the staged destination failed verification"))?,
-        // OMP's parser needs the whole document — leaf selection is a property of the
-        // graph, not of one record — so there is nothing to stream, and the comparison
-        // is a separate step.
-        HarnessKind::Omp => {
-            let destination = read_transcript_at_cursor(
-                request.target_kind,
-                &request.target_sessions_root,
-                &transcript_path,
-                target_cursor.as_deref(),
-            )
-            .inspect_err(|_| report_this_target("the staged destination could not be read"))?;
-            verify_destination(&expected, &destination).inspect_err(|_| {
-                report_this_target("the staged destination failed verification")
-            })?;
-            destination
-        }
-    };
+    let destination = read_verified_destination(
+        request.target_kind,
+        &request.target_sessions_root,
+        &transcript_path,
+        target_cursor.as_deref(),
+        &expected,
+        DESTINATION_RECORD_BUDGET_BYTES,
+        DESTINATION_TOTAL_BUDGET_BYTES,
+    )
+    .inspect_err(|_| report_this_target("the staged destination failed verification"))?;
     // No separate verify_destination for the JSONL arm: `read_destination_transcript`
     // compares each message as it arrives and returns the same DestinationMismatch.
     Ok(PreparedTransfer {
+        target_kind: request.target_kind,
+        target_config_home: request.target_config_home.clone(),
         source_path,
         source_fingerprint: source.fingerprint,
         staged: StagedSession {
@@ -1460,6 +1472,65 @@ pub(crate) fn verify_unchanged_transcripts(
         ));
     }
     Ok(())
+}
+
+/// Read a staged destination and prove it carries `expected`. ONE PRODUCTION HELPER,
+/// USED BY BOTH CALLERS.
+///
+/// Round 15 fixed the routing in `prepare` and missed the identical decision in
+/// `verified_visible_destination` — one site fixed, the other not, which is the shape
+/// that keeps producing findings here. Round 16 asked for the formulation that makes a
+/// third caller impossible to get wrong; this is it.
+///
+/// The budgets are parameters so a test can drive the JSONL arm with a few kilobytes.
+/// That matters beyond convenience: it is what finally distinguishes streaming the
+/// destination from reading it whole and comparing after. Those differ only when the
+/// destination exceeds the SOURCE ceiling, and reaching that end-to-end needed a 64 MiB
+/// import — which is why the distinction went unguarded for two rounds and I had
+/// declared it unguardable.
+fn read_verified_destination(
+    kind: HarnessKind,
+    trust_root: &Path,
+    path: &Path,
+    cursor: Option<&str>,
+    expected: &[VisibleMessage],
+    record_budget: usize,
+    total_budget: u64,
+) -> Result<CanonicalTranscript, TransferError> {
+    match kind {
+        // Streamed and compared AS IT READS, with no source-derived ceiling: the
+        // destination is generated FROM the window and expands, so refusing it on the
+        // source's limit rejects a transfer that worked (review round 3).
+        HarnessKind::Claude | HarnessKind::Codex => read_destination_transcript_within(
+            kind,
+            trust_root,
+            path,
+            expected,
+            record_budget,
+            total_budget,
+            record_budget,
+            total_budget,
+        ),
+        // OMP's parser needs the whole document — leaf selection is a property of the
+        // graph, not of one record — so there is nothing to stream and the comparison is
+        // a separate step.
+        HarnessKind::Omp => {
+            // BOUNDED BY THE DESTINATION BUDGET, NOT THE SOURCE'S. `read_transcript_at_cursor`
+            // carries TRANSFER_WINDOW_BYTES, and an OMP destination is GENERATED from a
+            // window that already passed it: the reviewers costed a 205-byte source pair
+            // at 697 bytes once serialised, so a valid window writes an OMP transcript
+            // over 64 MiB, the write succeeds, and verification then rejects the target
+            // it just created. Second of the two generated artifacts measured against a
+            // ceiling they were never sized by.
+            let trusted_path = validate_transcript_path(trust_root, path)?;
+            let file = fs::File::open(&trusted_path)
+                .map_err(|err| TransferError::io("read destination transcript", err))?;
+            let bytes = read_whole_within(file, total_budget)?;
+            let destination = omp::parse(&bytes, cursor)?.transcript;
+            verify_destination(expected, &destination)?;
+            Ok(destination)
+        }
+    }
 }
 
 /// Compare a destination transcript against the projection that was staged.
@@ -1627,6 +1698,37 @@ fn read_bounded_file(file: fs::File, cap: u64, path: &Path) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
+/// The ceiling for reading back an artifact we generated.
+///
+/// A FUNCTION, NOT AN INLINE CONSTANT, so the choice has one asserted home. A test
+/// cannot observe which constant a call site passes without a fixture above the real
+/// limit — a >64 MiB bridge — so the mutable surface is reduced to this instead, and
+/// `the_bridge_budget_exceeds_the_source_ceiling` pins the property that matters: the
+/// artifact ceiling must be strictly larger than the source's, because writing expands.
+///
+/// STATED LIMIT: this does not prove `prepare` calls it. It proves that whatever calls
+/// it gets a value sized for a generated artifact rather than for a source.
+fn bridge_staging_budget() -> u64 {
+    BRIDGE_STAGING_BYTES
+}
+
+/// Report a PreparedTransfer that is being dropped without being accepted.
+///
+/// WITH AUTOMATIC CLEANUP CUT, EVERY DISCARD MUST SAY SO. Round 16, both reviewers: the
+/// two reporters covered only failures INSIDE `prepare`, so a successful preparation
+/// dropped by the API layer — closed event channel, terminal gone, transfer id changed,
+/// source no longer idle — left a real session with nothing naming it. Those are the
+/// paths where staging SUCCEEDED, which makes them the ones most likely to have created
+/// something.
+pub(crate) fn report_discarded_preparation(prepared: &PreparedTransfer, reason: &str) {
+    report_abandoned_targets(
+        prepared.target_kind,
+        &prepared.target_config_home,
+        std::slice::from_ref(&prepared.staged.session_ref.value),
+        reason,
+    );
+}
+
 /// Record a target that was created and then abandoned, so it can be found by hand.
 ///
 /// NOT A DELETION. Removing it is out of scope for this change; see the note in
@@ -1638,15 +1740,29 @@ fn report_abandoned_targets(
     session_ids: &[String],
     reason: &str,
 ) {
-    for session_id in session_ids {
-        tracing::warn!(
-            harness = kind.label(),
-            session_id = %session_id,
-            config_home = %config_home.display(),
-            reason,
-            "a staged transfer target was created and then abandoned; it is left in \
-             place and must be removed by hand"
-        );
+    for locator in session_ids {
+        // NAMED FOR WHAT IT HOLDS. For Claude and Codex this is a session id; for OMP it
+        // is the canonical transcript PATH — which is the right thing to log, since it
+        // is what a human removes, but logging it under `session_id` mislabels the one
+        // receipt this warning exists to provide (round 16).
+        match kind {
+            HarnessKind::Omp => tracing::warn!(
+                harness = kind.label(),
+                transcript_path = %locator,
+                config_home = %config_home.display(),
+                reason,
+                "a staged transfer target was created and then abandoned; it is left in \
+                 place and must be removed by hand"
+            ),
+            HarnessKind::Claude | HarnessKind::Codex => tracing::warn!(
+                harness = kind.label(),
+                session_id = %locator,
+                config_home = %config_home.display(),
+                reason,
+                "a staged transfer target was created and then abandoned; it is left in \
+                 place and must be removed by hand"
+            ),
+        }
     }
 }
 
@@ -4447,6 +4563,116 @@ mod tests {
         );
     }
 
+    /// AXIS — ROUND-16: the generated bridge is measured against its OWN ceiling.
+    ///
+    /// The bridge is written FROM a source that already passed TRANSFER_WINDOW_BYTES,
+    /// and re-serialising expands it — review measured a 205-byte source pair becoming
+    /// ~882 bytes in the Claude bridge — so a legitimate ~60 MiB source produced a
+    /// ~68.5 MiB bridge and was refused BEFORE Codex was invoked. Reusing the source
+    /// ceiling on something we generate is the same error as deriving a destination
+    /// bound from expected messages: a limit applied to a quantity it was never
+    /// measured against.
+    #[test]
+    fn the_bridge_budget_exceeds_the_source_ceiling() {
+        assert!(
+            bridge_staging_budget() > TRANSFER_WINDOW_BYTES,
+            "an artifact we generate from a source must not be capped at the source's \
+             own ceiling: {} vs {TRANSFER_WINDOW_BYTES}",
+            bridge_staging_budget()
+        );
+        // The measured worst expansion is ~4.3x for tiny pairs (205 -> 882 bytes), but
+        // only the LARGEST source matters: a source at the ceiling must still fit after
+        // expansion. Two windows covers the ~1.14x whole-file expansion the reviewers
+        // measured on realistic transcripts with margin.
+        assert!(
+            bridge_staging_budget() >= 2 * TRANSFER_WINDOW_BYTES,
+            "the artifact ceiling must leave room for the measured expansion"
+        );
+    }
+
+    /// AXIS — ROUND-16: a destination LARGER THAN THE SOURCE CEILING still verifies.
+    ///
+    /// THIS IS THE GAP I DECLARED UNGUARDABLE FOR TWO ROUNDS, and the reviewers were
+    /// right that it was not. I believed distinguishing "stream the destination" from
+    /// "read it whole and compare after" needed a 64 MiB end-to-end import, because the
+    /// two differ only when the destination exceeds the SOURCE ceiling. Extracting one
+    /// helper with injectable budgets makes the same distinction cost a few kilobytes:
+    /// pass a small whole-read budget, exceed it, and only the streaming arm survives.
+    ///
+    /// The property is the whole point of the PR. A destination is GENERATED from the
+    /// window and expands — measured by review at ~205 source bytes per pair becoming
+    /// ~882 in the Claude bridge and ~697 in OMP — so any ceiling sized for the source
+    /// rejects transfers that worked.
+    ///
+    /// WHAT THIS STILL DOES NOT CATCH, narrowed but not gone: a mutant that reads the
+    /// destination whole under the REAL 64 MiB source constant survives, because this
+    /// fixture is kilobytes and never reaches it. Catching that specific substitution
+    /// needs a genuinely oversize destination. What changed in round 16 is the scope of
+    /// the hole: before the helper existed, the entire routing decision was unguarded at
+    /// both sites; now only the hard-coded-constant variant is.
+    #[test]
+    fn a_destination_past_the_source_ceiling_still_verifies() {
+        let root = temp_root("dest-past-source-cap");
+        let path = root.join("session.jsonl");
+        let expect: Vec<VisibleMessage> = (0..40)
+            .map(|index| VisibleMessage {
+                role: if index % 2 == 0 {
+                    VisibleRole::User
+                } else {
+                    VisibleRole::Assistant
+                },
+                text: format!("m{index} {}", "x".repeat(200)),
+            })
+            .collect();
+        let mut records = Vec::new();
+        for message in &expect {
+            records.push(match message.role {
+                VisibleRole::User => json!({"type":"user",
+                    "message":{"role":"user","content":message.text}}),
+                VisibleRole::Assistant => json!({"type":"assistant",
+                    "message":{"role":"assistant",
+                        "content":[{"type":"text","text":message.text}]}}),
+            });
+        }
+        write_fixture(&path, &records);
+        let total = std::fs::metadata(&path).unwrap().len();
+
+        // A budget the destination EXCEEDS — standing in for the source ceiling that a
+        // real expanded destination overshoots.
+        let source_ceiling = total / 2;
+        assert!(
+            source_ceiling > 0 && total > source_ceiling,
+            "precondition: {total} > {source_ceiling}"
+        );
+
+        // The streaming arm accepts it: retention is bounded per record, not by the file.
+        let verified = read_verified_destination(
+            HarnessKind::Claude,
+            &root,
+            &path,
+            None,
+            &expect,
+            DESTINATION_RECORD_BUDGET_BYTES,
+            DESTINATION_TOTAL_BUDGET_BYTES,
+        )
+        .expect("a destination past the source ceiling must still verify");
+        assert_eq!(verified.messages, expect);
+
+        // THE CONTROL, and it is what makes the assertion above mean something: reading
+        // the same file whole under that ceiling REFUSES it. If this ever stops
+        // refusing, the test above has stopped discriminating.
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(
+            matches!(
+                read_whole_within(file, source_ceiling),
+                Err(TransferError::TranscriptTooLarge { .. })
+            ),
+            "precondition: the whole reader must refuse at this ceiling, or the streaming \
+             arm is not being distinguished from anything"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// AXIS — ROUND-15: the whole read refuses BEFORE allocating past its cap.
     ///
     /// I wrote `read_transcript_whole` during the #153 rebase as `fs::read` followed by a
@@ -4474,6 +4700,16 @@ mod tests {
             "the refusal must fire having read at most cap+1 bytes, not the whole file: \
              consumed {consumed} of {total} with cap {cap}"
         );
+
+        // AND THE EXACT BOUNDARY, which the assertion above cannot see. Round 16: a
+        // `take(cap)` + refuse-at-`>= cap` implementation also consumes no more than
+        // cap+1 and also refuses the oversize fixture, so it survived — while wrongly
+        // rejecting a file of EXACTLY cap bytes. The cap is inclusive; only a fixture
+        // sitting on it can say so.
+        let exact = std::io::Cursor::new(vec![b'y'; cap as usize]);
+        let bytes = read_whole_within(exact, cap)
+            .expect("a file of exactly the cap must be accepted, not refused");
+        assert_eq!(bytes.len(), cap as usize);
     }
 
     /// AXIS — THE #153 REBASE: an OMP source is NEVER windowed.
