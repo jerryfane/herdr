@@ -2088,7 +2088,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{omp_profile_value_is_named, App, HarnessKind};
+    use super::{
+        omp_profile_value_is_named, AgentSessionRef, AgentSessionTransferPhase, App, HarnessKind,
+        OmissionSummary, PersistedAgentSession, RuntimeSessionTransfer,
+    };
     use std::ffi::OsStr;
 
     /// AXIS — ROUND-18: the DISCARD SITES report, not just the reporter.
@@ -2165,10 +2168,59 @@ mod tests {
                 api_rx,
                 crate::api::EventHub::default(),
             );
-            // NO TERMINAL: the "terminal or transfer disappeared while staging ran" path.
+            // SITE 1 — no terminal at all: "the terminal or its transfer disappeared".
             app.handle_agent_session_transfer_prepared(
                 crate::terminal::TerminalId::alloc(),
                 "transfer-gone".to_string(),
+                Ok(prepared()),
+            );
+
+            // SITE 2 — terminal present, transfer id no longer matches: "replaced or had
+            // moved on". Round 19: the previous version of this test drove ONE site while
+            // its name and doc claimed three, so two production discard paths stayed
+            // exactly as uncovered as before the test existed.
+            let terminal_id = crate::terminal::TerminalId::alloc();
+            let mut terminal =
+                crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+            terminal.session_transfer = Some(RuntimeSessionTransfer {
+                id: "a-different-transfer".to_string(),
+                source_kind: HarnessKind::Claude,
+                source_session: PersistedAgentSession {
+                    source: "claude".to_string(),
+                    agent: "claude".to_string(),
+                    session_ref: AgentSessionRef::id("s".to_string()).expect("valid"),
+                },
+                source_account: None,
+                source_sessions_root: "/tmp".into(),
+                source_config_home: "/tmp".into(),
+                source_cursor: None,
+                source_process_pid: None,
+                target_kind: HarnessKind::Codex,
+                target_account: None,
+                target_config_home: "/tmp/codex-home".into(),
+                target_sessions_root: "/tmp/codex-home".into(),
+                phase: AgentSessionTransferPhase::Preparing,
+                message_count: 0,
+                omissions: OmissionSummary::default(),
+                error: None,
+                source_path: None,
+                source_fingerprint: None,
+                target_session_ref: None,
+                target_cursor: None,
+                target_transcript_path: None,
+                target_fingerprint: None,
+                target_deadline: None,
+                target_process: None,
+                source_rollback_process: None,
+                verification_in_flight: None,
+                verification_observation_deadline: None,
+                awaiting_deferred_target_report: false,
+                target_report_accepted: false,
+            });
+            app.state.terminals.insert(terminal_id.clone(), terminal);
+            app.handle_agent_session_transfer_prepared(
+                terminal_id,
+                "the-id-we-were-told".to_string(),
                 Ok(prepared()),
             );
         });
@@ -2182,9 +2234,15 @@ mod tests {
             logged.contains("/tmp/codex-home"),
             "and the account home it lives in: {logged}"
         );
+        // BOTH REASONS, or this repeats the defect round 19 named: a test whose name
+        // claims several sites while only one can fail it.
         assert!(
             logged.contains("disappeared"),
-            "and why it was discarded, so the reason is recoverable from the log: {logged}"
+            "site 1 (no terminal) must report why: {logged}"
+        );
+        assert!(
+            logged.contains("replaced or had moved on"),
+            "site 2 (transfer id no longer matches) must report why: {logged}"
         );
     }
 

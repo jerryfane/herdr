@@ -25,8 +25,16 @@ use tokio::io::AsyncWriteExt as _;
 ///
 /// A WINDOW, NOT A LIMIT — the distinction is the whole of review finding 1. While this
 /// was a limit, an oversize transcript was refused and the seat could never move; now it
-/// bounds how much is taken from the tail. Nothing upstream may refuse on size, or the
-/// window becomes unreachable again.
+/// bounds how much is taken from the tail. Nothing upstream may refuse a WINDOWED source
+/// on size, or the window becomes unreachable again.
+///
+/// SCOPED, BECAUSE ONE HARNESS IS DELIBERATELY EXEMPT. OMP sources are NOT windowed —
+/// their format opens with a fixed-width title slot and a session header that a tail cut
+/// would drop — so `read_transcript_whole` still refuses an OMP source above this size,
+/// which is the pre-window behaviour for that harness and unchanged by this PR. Round 19
+/// was right that the unscoped wording claimed a universal the code does not hold; that
+/// is how a reader concludes the refusal is a bug and removes it. Windowing OMP needs a
+/// header-preserving design and its own review.
 const TRANSFER_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The most this will hold in memory for ONE destination record.
@@ -66,31 +74,21 @@ const DESTINATION_RECORD_BUDGET_BYTES: usize = TRANSFER_WINDOW_BYTES as usize;
 /// a bound that stops an unbounded producer, not an estimate of legitimate growth.
 const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 
-/// The most an OMP destination may occupy IN MEMORY while being verified.
+/// Slack allowed above an OMP destination's OWN size when reading it back.
 ///
-/// A RETENTION BOUND, MEASURED AGAINST RETENTION. The OMP arm cannot stream — its parser
-/// needs the header and the whole graph — so unlike Claude and Codex it genuinely holds
-/// the file. It previously reused DESTINATION_TOTAL_BUDGET_BYTES, which documents itself
-/// as "the most this will SCAN in one destination pass" and is set at sixteen windows
-/// precisely BECAUSE streaming retains one record at a time. Passing a work budget to a
-/// retention site made the feature's memory ceiling 1 GiB in a single Vec inside the
-/// long-lived TUI process — the fourth time on this PR a limit was applied to a quantity
-/// it was not measured against, and the first one I introduced while fixing the third.
+/// NOT A PREDICTED EXPANSION. Two rounds guessed a multiple of the source window and both
+/// guesses were wrong in the same way: round 17 demolished 2x for the bridge, and round 19
+/// demolished 4x here by finding a 147-byte source pair the parser accepts — `cwd` and
+/// `sessionId` are required by the CODEX bridge, not by the parse that feeds `omp::write`
+/// — which expands 5.12x, so a full window writes 303-327 MiB against a 256 MiB cap. And
+/// `omp::write` PUBLISHES THE SESSION before the read refuses it, so the guess being low
+/// costs a valid transfer after the target exists.
 ///
-/// Four windows covers the ~3.4x expansion measured writing an OMP destination from a
-/// full window, with margin, and is a number about BYTES HELD rather than bytes scanned.
-const OMP_DESTINATION_RETENTION_BYTES: u64 = 4 * TRANSFER_WINDOW_BYTES;
-
-// A RETENTION BOUND MUST NOT BORROW A WORK BUDGET, and clippy was right that a runtime
-// test of two constants is the wrong instrument: this is a compile-time invariant, so it
-// is asserted at compile time. Violating it now fails the build rather than a test run.
-//
-// The fourth instance on this PR of a limit applied to a quantity it was not measured
-// against — and the first I introduced while fixing the third. DESTINATION_TOTAL_BUDGET
-// is bytes SCANNED, safe to set high because streaming holds one record; this one is
-// bytes HELD, because the OMP parser needs the whole graph.
-const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET_BYTES);
-const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES >= 4 * TRANSFER_WINDOW_BYTES);
+/// The destination is a file WE JUST WROTE, so its size is not something to predict: it is
+/// something to measure. The bound is the observed length plus this slack, which exists
+/// only so a legitimate trailing newline or a filesystem rounding cannot trip it. A file
+/// larger than what we wrote means something else wrote it, and refusing THAT is correct.
+const OMP_DESTINATION_SLACK_BYTES: u64 = 64 * 1024;
 
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -1540,8 +1538,27 @@ fn read_verified_destination(
             let trusted_path = validate_transcript_path(trust_root, path)?;
             let file = fs::File::open(&trusted_path)
                 .map_err(|err| TransferError::io("read destination transcript", err))?;
-            // The RETENTION constant, not the scan budget: this arm holds the file.
-            let bytes = read_whole_within(file, OMP_DESTINATION_RETENTION_BYTES)?;
+            // BOUNDED BY THE FILE'S OWN OBSERVED LENGTH, not by a predicted expansion.
+            // This arm genuinely holds the document — omp::parse needs the header and the
+            // whole graph — so it needs a retention bound; but the destination is a file
+            // WE wrote, so the honest bound is what is actually there plus slack, not a
+            // multiple of the source that two rounds guessed wrong.
+            //
+            // stat-then-read is not a TOCTOU hazard here the way it is for an untrusted
+            // ledger: growth between the two only RAISES the observed length, and a file
+            // that grew past its own measured size plus slack is exactly what should be
+            // refused — we are the only writer.
+            //
+            // STATED LIMIT: no test distinguishes this from a guessed multiple, because
+            // the two only differ on an OMP destination above ~256 MiB and no fixture
+            // reaches that. What changed is structural rather than covered — there is no
+            // predicted multiple left in the code to be wrong. Two rounds guessed one and
+            // both guesses were demolished by someone computing the worst-case pair size.
+            let observed = fs::metadata(&trusted_path)
+                .map_err(|err| TransferError::io("stat destination transcript", err))?
+                .len();
+            let bytes =
+                read_whole_within(file, observed.saturating_add(OMP_DESTINATION_SLACK_BYTES))?;
             let destination = omp::parse(&bytes, cursor)?.transcript;
             verify_destination(expected, &destination)?;
             Ok(destination)
