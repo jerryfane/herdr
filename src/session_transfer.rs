@@ -90,6 +90,13 @@ const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 /// `push_visible_message` does not merge consecutive same-role records, so the worst shape
 /// is an all-assistant window of
 /// `{"type":"assistant","message":{"role":"assistant","content":"a"}}` plus a newline.
+///
+/// AND CLAUDE IS THE VERTEX ACROSS EVERY SOURCE KIND, NOT JUST THE ONE THIS IS NAMED FOR.
+/// Codex and OMP sources also feed `omp::write`, each capped at one window, so any of the
+/// three could hold the worst rate. Measured: Claude 66, OMP 88 (marginal entry on a valid
+/// parent chain with single-character ids), Codex 112.
+/// `the_modelled_role_is_the_worst_expanding_one` asserts Claude stays the smallest, so a
+/// later relaxation of either other parser moves the vertex loudly rather than silently.
 const OMP_MIN_ASSISTANT_RECORD_BYTES: u64 = 66;
 
 /// The largest entry `omp::write` emits for one visible message.
@@ -141,21 +148,68 @@ const OMP_MAX_DESTINATION_ENTRY_BYTES: u64 = 512;
 /// byte offset)`, pass 2 seeks and projects only the selected branch, making retention
 /// O(entries) plus one record. That is a separate PR and is NOT yet filed as an issue:
 /// filing one is a GitHub write and this seat holds no row for it.
-const OMP_DESTINATION_RETENTION_BYTES: u64 =
-    (TRANSFER_WINDOW_BYTES / OMP_MIN_ASSISTANT_RECORD_BYTES) * OMP_MAX_DESTINATION_ENTRY_BYTES / 2
-        * 3;
+///
+/// THE MARGIN HAS A SECOND JOB, AND IT WAS ACCIDENTAL UNTIL ROUND 23 NAMED IT. This ceiling
+/// bounds the read at `prepare`, where the file is what `omp::write` just produced — and
+/// again at `verified_visible_destination`, AFTER launch, when the live target has been
+/// appending to that same file. So the headroom is not only slack against a mis-modelled
+/// writer; it is the room a running agent has to grow the transcript before the
+/// post-launch read refuses and ROLLS BACK a session the user is actively working in.
+/// That is why the margin is 1.5x and not 1.1x. Exhausting it needs ~233 MiB appended on
+/// top of an already adversarial source, so this is headroom rather than a live risk.
+const OMP_DESTINATION_MODELLED_WORST_BYTES: u64 =
+    (TRANSFER_WINDOW_BYTES / OMP_MIN_ASSISTANT_RECORD_BYTES) * OMP_MAX_DESTINATION_ENTRY_BYTES;
+
+/// Headroom over the modelled worst case, as an explicit fraction.
+///
+/// NAMED SO THE GUARD CAN SIT ON THE THING A FUTURE ROUND WOULD ACTUALLY EDIT. Round 22
+/// replaced an exact `assert_eq!` pin with a one-sided floor and left the constant with no
+/// upper bound but the 16-window scan budget — 1.37x above the derived value, in the
+/// widening direction this PR has already regressed in twice. Nothing would have caught
+/// `/ 2 * 3` becoming `/ 2 * 4`: every assert and every test stays green while the resident
+/// ceiling rises a third. That gap was created by the round that was fixing the previous
+/// widening, which is the whole reason the margin is a named quantity now.
+const OMP_RETENTION_MARGIN_NUMERATOR: u64 = 3;
+const OMP_RETENTION_MARGIN_DENOMINATOR: u64 = 2;
+
+const OMP_DESTINATION_RETENTION_BYTES: u64 = OMP_DESTINATION_MODELLED_WORST_BYTES
+    / OMP_RETENTION_MARGIN_DENOMINATOR
+    * OMP_RETENTION_MARGIN_NUMERATOR;
 
 // A RETENTION BOUND MUST NOT BORROW A WORK BUDGET, and clippy was right that a runtime
 // test of two constants is the wrong instrument: this is a compile-time invariant, so it
 // is asserted at compile time. Violating it fails the BUILD rather than a review round —
-// which is the only reason this pair is worth writing, given that two consecutive rounds
-// each removed one of these guards and no check noticed either time.
+// which is the only reason these are worth writing, given that three consecutive rounds
+// each removed or loosened one and no check noticed any of the three times.
 const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET_BYTES);
-// Above the 7.61x worst shape, which is an ALL-ASSISTANT window of string-content
-// records. The previous floor was six windows, justified by a 5.16x figure that was not
-// the worst case — so the floor itself would have admitted a ceiling that refuses valid
-// input. Eight is the smallest whole number of windows above the measured worst.
-const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES >= 8 * TRANSFER_WINDOW_BYTES);
+
+// BOUNDED FROM BOTH SIDES, AND AGAINST THE MODEL RATHER THAN AGAINST A WINDOW COUNT.
+//
+// The previous floor was `>= 8 * TRANSFER_WINDOW_BYTES`, which had stopped checking
+// anything once the ceiling became derived: 8 windows is below the derivation by
+// construction, so the only way it could fire was on a change making the writer CHEAPER.
+// Shrink `OMP_MAX_DESTINATION_ENTRY_BYTES` to a correctly-measured 350 and the build fails
+// on a change that is right and makes the bound tighter — a guard rejecting a run that
+// should succeed, which is the exact failure the comment above it accused the SIX-window
+// floor of having. A guard that can only fire spuriously is worse than no guard.
+//
+// Asserting the margin instead cannot fire spuriously, because it is scale-free: any
+// honest re-measurement of the writer or the parser moves the modelled worst and the
+// ceiling together, leaving the fraction untouched. Only a deliberate change to the
+// headroom itself trips these, which is precisely the edit that needs review.
+const _: () = assert!(4 * OMP_RETENTION_MARGIN_NUMERATOR >= 5 * OMP_RETENTION_MARGIN_DENOMINATOR);
+//
+// THE FIRST VERSION OF THIS UPPER GUARD DID NOT HOLD, AND A MUTANT SAID SO. It read
+// `NUMERATOR <= 2 * DENOMINATOR`, i.e. margin <= 2.0 — and the widening it was written to
+// stop, `/ 2 * 3` becoming `/ 2 * 4`, is margin EXACTLY 2.0. It passed, the ceiling still
+// rose to 993 MiB, and the suite still went green. A bound written against a scenario has
+// to EXCLUDE that scenario, not touch it. That off-by-one-step is the shape of every wrong
+// bound on this PR, this time in the guard rather than in the value it guards.
+//
+// 1.25 <= margin <= 1.5. The current 3/2 sits at the top edge deliberately: this is
+// headroom, and a round that wants MORE of it should have to argue for it in review
+// rather than receive it silently.
+const _: () = assert!(2 * OMP_RETENTION_MARGIN_NUMERATOR <= 3 * OMP_RETENTION_MARGIN_DENOMINATOR);
 
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -5249,6 +5303,93 @@ mod tests {
             "the modelled assistant minimum ({OMP_MIN_ASSISTANT_RECORD_BYTES}) has drifted \
              from the measured one ({assistant_min}); re-derive it rather than widening \
              the gap, which inflates the ceiling for no reason"
+        );
+
+        // ALL THREE SOURCE KINDS FEED `omp::write`, SO ALL THREE COMPETE FOR THE VERTEX.
+        //
+        // The model is derived from the CLAUDE parser, but `read_transfer_source` windows
+        // Claude and Codex and refuses an oversize OMP source, so every kind delivers at
+        // most one window into the writer and any of them could be the worst case. Round
+        // 23 pointed out that nothing recorded which one actually is — so a later
+        // relaxation of the Codex or OMP parser could move the vertex with no test
+        // noticing, which is the same silent-move shape as rounds 18 through 22.
+        //
+        // Measured here rather than asserted: Claude 66, OMP 88, Codex 112.
+        let codex_min = {
+            let dir = temp_root("codex-min");
+            let path = dir.join("rollout.jsonl");
+            let record = json!({"type":"response_item","payload":{"type":"message",
+                "role":"assistant","content":[{"type":"text","text":"a"}]}})
+            .to_string();
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            let accepted = read_transcript(HarnessKind::Codex, &dir, &path)
+                .map(|t| !t.messages.is_empty())
+                .unwrap_or(false);
+            let _ = fs::remove_dir_all(&dir);
+            assert!(
+                accepted,
+                "the Codex probe must actually produce a visible message"
+            );
+            record.len() as u64 + 1
+        };
+
+        // For OMP the MARGINAL entry is what a rate depends on, so it is measured on a
+        // valid parent chain rather than on one orphan record. Ids are single characters
+        // here, which is the cheapest an entry can be; the real parser also rejects
+        // duplicates, so ids must lengthen as an entry count rises and this is a floor.
+        let omp_min = {
+            let dir = temp_root("omp-min");
+            let sessions = dir.join("s");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let (_id, seed, _leaf) = omp::write(
+                &sessions,
+                std::path::Path::new("/tmp"),
+                &[VisibleMessage {
+                    role: VisibleRole::Assistant,
+                    text: "a".to_string(),
+                }],
+            )
+            .unwrap();
+            let seed_text = std::fs::read_to_string(&seed).unwrap();
+            let mut header = seed_text.lines();
+            let pad = header.next().expect("pad line").to_string();
+            let session = header.next().expect("session line").to_string();
+
+            let mut body = format!("{pad}\n{session}\n");
+            let mut marginal = 0u64;
+            for index in 0..8u32 {
+                let entry = if index == 0 {
+                    json!({"id":"0","parentId":Value::Null,"type":"message",
+                        "message":{"role":"assistant","content":"x"}})
+                } else {
+                    json!({"id":index.to_string(),"parentId":(index - 1).to_string(),
+                        "type":"message","message":{"role":"assistant","content":"x"}})
+                }
+                .to_string();
+                marginal = entry.len() as u64 + 1;
+                body.push_str(&entry);
+                body.push('\n');
+            }
+            let path = dir.join("chain.jsonl");
+            std::fs::write(&path, &body).unwrap();
+            let messages = read_transcript(HarnessKind::Omp, &dir, &path)
+                .map(|t| t.messages.len())
+                .unwrap_or(0);
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(
+                messages, 8,
+                "the OMP probe chain must parse to one message per entry"
+            );
+            marginal
+        };
+
+        assert!(
+            assistant_min <= codex_min && assistant_min <= omp_min,
+            "the retention model takes the CLAUDE assistant record as the cheapest source \
+             byte-per-message across every kind that feeds omp::write, but that is no \
+             longer true (claude {assistant_min}, codex {codex_min}, omp {omp_min}); the \
+             vertex has moved and OMP_DESTINATION_RETENTION_BYTES must be re-derived from \
+             whichever kind is now smallest"
         );
 
         let _ = fs::remove_dir_all(&root);
