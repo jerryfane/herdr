@@ -93,10 +93,18 @@ const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 ///
 /// AND CLAUDE IS THE VERTEX ACROSS EVERY SOURCE KIND, NOT JUST THE ONE THIS IS NAMED FOR.
 /// Codex and OMP sources also feed `omp::write`, each capped at one window, so any of the
-/// three could hold the worst rate. Measured: Claude 66, OMP 88 (marginal entry on a valid
-/// parent chain with single-character ids), Codex 112.
-/// `the_modelled_role_is_the_worst_expanding_one` asserts Claude stays the smallest, so a
-/// later relaxation of either other parser moves the vertex loudly rather than silently.
+/// three could hold the worst rate.
+///
+/// WHAT IS GUARANTEED IS THE RATE, NOT THE RECORD SIZE — and the difference is the whole
+/// reason the check was rewritten. `the_modelled_role_is_the_worst_expanding_one` does NOT
+/// assert this is the smallest accepted record anywhere; a Codex `event_msg` user record
+/// is 69 bytes and a Claude user record is 56, both smaller. It asserts that no
+/// (kind, role) pair reaches a higher ENTRY-COST-OVER-RECORD-COST rate than the Claude
+/// assistant pair, which is what the bound is actually derived from. Comparing raw minima
+/// instead — as an earlier version of that test did — is wrong in both directions: it can
+/// fail on a transcript that is cheaper per byte, and pass while a worse assistant form
+/// exists. A cheap record producing a USER message costs a user entry, about half an
+/// assistant one, so it cannot move a bound derived from the assistant vertex.
 const OMP_MIN_ASSISTANT_RECORD_BYTES: u64 = 66;
 
 /// The largest entry `omp::write` emits for one visible message.
@@ -193,11 +201,6 @@ const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET
 // should succeed, which is the exact failure the comment above it accused the SIX-window
 // floor of having. A guard that can only fire spuriously is worse than no guard.
 //
-// Asserting the margin instead cannot fire spuriously, because it is scale-free: any
-// honest re-measurement of the writer or the parser moves the modelled worst and the
-// ceiling together, leaving the fraction untouched. Only a deliberate change to the
-// headroom itself trips these, which is precisely the edit that needs review.
-const _: () = assert!(4 * OMP_RETENTION_MARGIN_NUMERATOR >= 5 * OMP_RETENTION_MARGIN_DENOMINATOR);
 //
 // ASSERTED ON THE VALUE, NOT ON THE FRACTION — AND THE FRACTION VERSION WAS THE FOURTH
 // LEVEL OF ONE MISTAKE. Round 23 named the margin and asserted `1.25 <= NUM/DEN <= 1.5`,
@@ -211,8 +214,17 @@ const _: () = assert!(4 * OMP_RETENTION_MARGIN_NUMERATOR >= 5 * OMP_RETENTION_MA
 // NOT AN INPUT THAT CURRENTLY DETERMINES IT. Round 19 guarded nothing; round 22 guarded a
 // window count that stopped tracking the model; round 23 guarded a fraction the derivation
 // is free to stop using. These bind the ceiling directly to the modelled worst case, so
-// they hold however the expression is rewritten — and they subsume the fraction asserts,
-// which is why those are gone rather than merely redundant.
+// they hold however the expression is rewritten.
+//
+// THEY ARE THE WHOLE GUARD SET FOR THE MARGIN, and the fraction asserts that used to sit
+// beside them are gone because these are STRICTLY STRONGER, verified in both directions
+// rather than asserted: R = floor(M/DEN)*NUM <= M*NUM/DEN, so a fraction below 1.25 forces
+// 4R < 5M; and a fraction above 1.5 forces 2R > 3M unless NUM*DEN exceeds 260,300,800.
+// Strictly stronger, because integer truncation can push R outside a band the fraction
+// still satisfies, and because these survive the derivation dropping NUM/DEN entirely.
+// (Round 25 caught the lower fraction assert still sitting here while this comment already
+// claimed both were gone — a guard set whose own description is wrong is how the round-19
+// and round-22 deletions passed review, one level of prose up.)
 //
 // 1.25 <= ceiling / modelled worst <= 1.5. The upper bound holds with exact equality at
 // this head, deliberately: this is headroom, and a round wanting more should argue for it
