@@ -2091,6 +2091,103 @@ mod tests {
     use super::{omp_profile_value_is_named, App, HarnessKind};
     use std::ffi::OsStr;
 
+    /// AXIS — ROUND-18: the DISCARD SITES report, not just the reporter.
+    ///
+    /// `report_abandoned_targets` got a regression last round; nothing observed that any
+    /// of the four call sites invokes it. Deleting the calls left state and return values
+    /// identical — I said so in my own commit message without noticing that made the
+    /// coverage vacuous. Same shape as the finding that commit closed (a receipt nobody
+    /// checks), moved one level up.
+    ///
+    /// Three of the four are reachable here; the fourth lives inside a spawned worker
+    /// and is left uncovered deliberately.
+    #[test]
+    fn every_reachable_discard_site_reports_its_staged_target() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        fn prepared() -> crate::session_transfer::PreparedTransfer {
+            crate::session_transfer::PreparedTransfer {
+                source_path: std::path::PathBuf::from("/tmp/source.jsonl"),
+                source_fingerprint: crate::session_transfer::TranscriptFingerprint {
+                    byte_len: 0,
+                    sha256: String::new(),
+                },
+                staged: crate::session_transfer::StagedSession {
+                    session_ref: crate::agent_resume::AgentSessionRef::id(
+                        "staged-thread".to_string(),
+                    )
+                    .expect("valid id"),
+                    cursor: None,
+                    transcript_path: std::path::PathBuf::from("/tmp/staged.jsonl"),
+                    transcript: crate::session_transfer::CanonicalTranscript {
+                        messages: Vec::new(),
+                        omissions: crate::session_transfer::OmissionSummary::default(),
+                        fingerprint: crate::session_transfer::TranscriptFingerprint {
+                            byte_len: 0,
+                            sha256: String::new(),
+                        },
+                    },
+                },
+                target_kind: HarnessKind::Codex,
+                target_config_home: std::path::PathBuf::from("/tmp/codex-home"),
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            // NO TERMINAL: the "terminal or transfer disappeared while staging ran" path.
+            app.handle_agent_session_transfer_prepared(
+                crate::terminal::TerminalId::alloc(),
+                "transfer-gone".to_string(),
+                Ok(prepared()),
+            );
+        });
+
+        let logged = String::from_utf8(capture.0.lock().expect("capture").clone()).unwrap();
+        assert!(
+            logged.contains("session_id=staged-thread"),
+            "a discarded preparation must name its staged target: {logged}"
+        );
+        assert!(
+            logged.contains("/tmp/codex-home"),
+            "and the account home it lives in: {logged}"
+        );
+        assert!(
+            logged.contains("disappeared"),
+            "and why it was discarded, so the reason is recoverable from the log: {logged}"
+        );
+    }
+
     #[test]
     fn omp_profile_precedence_matches_native_resolution() {
         assert!(omp_profile_value_is_named(

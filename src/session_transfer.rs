@@ -66,6 +66,32 @@ const DESTINATION_RECORD_BUDGET_BYTES: usize = TRANSFER_WINDOW_BYTES as usize;
 /// a bound that stops an unbounded producer, not an estimate of legitimate growth.
 const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 
+/// The most an OMP destination may occupy IN MEMORY while being verified.
+///
+/// A RETENTION BOUND, MEASURED AGAINST RETENTION. The OMP arm cannot stream — its parser
+/// needs the header and the whole graph — so unlike Claude and Codex it genuinely holds
+/// the file. It previously reused DESTINATION_TOTAL_BUDGET_BYTES, which documents itself
+/// as "the most this will SCAN in one destination pass" and is set at sixteen windows
+/// precisely BECAUSE streaming retains one record at a time. Passing a work budget to a
+/// retention site made the feature's memory ceiling 1 GiB in a single Vec inside the
+/// long-lived TUI process — the fourth time on this PR a limit was applied to a quantity
+/// it was not measured against, and the first one I introduced while fixing the third.
+///
+/// Four windows covers the ~3.4x expansion measured writing an OMP destination from a
+/// full window, with margin, and is a number about BYTES HELD rather than bytes scanned.
+const OMP_DESTINATION_RETENTION_BYTES: u64 = 4 * TRANSFER_WINDOW_BYTES;
+
+// A RETENTION BOUND MUST NOT BORROW A WORK BUDGET, and clippy was right that a runtime
+// test of two constants is the wrong instrument: this is a compile-time invariant, so it
+// is asserted at compile time. Violating it now fails the build rather than a test run.
+//
+// The fourth instance on this PR of a limit applied to a quantity it was not measured
+// against — and the first I introduced while fixing the third. DESTINATION_TOTAL_BUDGET
+// is bytes SCANNED, safe to set high because streaming holds one record; this one is
+// bytes HELD, because the OMP parser needs the whole graph.
+const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET_BYTES);
+const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES >= 4 * TRANSFER_WINDOW_BYTES);
+
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ROLLOUT_FILES_SCANNED: usize = 50_000;
@@ -1191,9 +1217,11 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
                 &request.cwd,
                 &source.messages,
             )?;
-            // Read WHOLE, under the STAGING ceiling rather than the source's: the
-            // bridge is a file we just wrote from an already-bounded window, and
-            // re-serialising expands it past that window for a large OMP source.
+            // STREAMED, so there is no ceiling here at all — see the note on
+            // `claude_to_codex_import_projection_streaming`. This comment previously
+            // described a whole read under a staging ceiling that no longer exists; on a
+            // PR whose comments carry the justification for every bound, a comment
+            // naming a deleted constant is how one gets reintroduced.
             let bridge_file = fs::File::open(bridge.path())
                 .map_err(|err| TransferError::io("read staged import bridge", err))?;
             expected = claude_to_codex_import_projection_streaming(bridge_file)?;
@@ -1512,7 +1540,8 @@ fn read_verified_destination(
             let trusted_path = validate_transcript_path(trust_root, path)?;
             let file = fs::File::open(&trusted_path)
                 .map_err(|err| TransferError::io("read destination transcript", err))?;
-            let bytes = read_whole_within(file, total_budget)?;
+            // The RETENTION constant, not the scan budget: this arm holds the file.
+            let bytes = read_whole_within(file, OMP_DESTINATION_RETENTION_BYTES)?;
             let destination = omp::parse(&bytes, cursor)?.transcript;
             verify_destination(expected, &destination)?;
             Ok(destination)
@@ -4628,8 +4657,18 @@ mod tests {
             logged.contains("transcript_path"),
             "an OMP locator is a PATH and must not be labelled session_id: {logged}"
         );
+        // ASSERTED ON THE VALUE, UNQUOTED. `%locator` records a DisplayValue that the
+        // fmt layer renders WITHOUT quotes, so the previous form — looking for
+        // `session_id="/tmp/omp-home` — could not fire for the regression it names: the
+        // natural way of writing the bug produces output it accepts. One of three
+        // assertions in this test could not print a failure.
         assert!(
-            !logged.contains("session_id=\"/tmp/omp-home"),
+            logged.contains("transcript_path=/tmp/omp-home/sessions/leaf.jsonl"),
+            "the OMP locator must appear as a transcript_path VALUE, not just the field \
+             name: {logged}"
+        );
+        assert!(
+            !logged.contains("session_id=/tmp/omp-home"),
             "the OMP path must not be emitted under session_id: {logged}"
         );
         assert!(
@@ -4679,12 +4718,82 @@ mod tests {
             "every record must be projected regardless of the file's total size"
         );
 
-        // WHAT THIS DOES AND DOES NOT KILL. It proves the projection has no total-size
-        // ceiling in its signature and handles a many-thousand-record file. It does NOT
-        // kill a mutant that reintroduces a whole read at some large constant — that
-        // needs a fixture above whatever constant the mutant picks. The structural
-        // guard is that `claude_to_codex_import_projection_streaming` takes a reader and
-        // no budget, so there is no number for a reviewer to have to justify.
+        // AND THE SURVIVOR IS CLOSED, WITHOUT A FILE. I called this expensive twice; the
+        // reviewer pointed out the projection takes any `R: Read`, so a generator works:
+        // two real records followed by hundreds of MiB of records the projection IGNORES
+        // (`project_claude_record_for_codex` returns Ok(()) for any type that is not
+        // user/assistant). Streaming retention stays at one line plus two messages, so
+        // this costs a parse and no allocation — while any whole read under any constant
+        // below the generated size fails.
+        //
+        // Third time a gap I declared expensive turned out cheap once someone else
+        // looked at it. The pattern: I kept sizing the fixture to the FILE, when the
+        // property only needed the READER to be large.
+        struct Endless {
+            emitted: u64,
+            limit: u64,
+            pending: Vec<u8>,
+            at: usize,
+            filler: Vec<u8>,
+        }
+        impl std::io::Read for Endless {
+            // BULK COPY, NOT BYTE AT A TIME. The first version drained a VecDeque one
+            // byte per iteration and took 17s; changing the record SIZE made no
+            // difference, which is what showed the cost was the reader rather than the
+            // parse I had assumed.
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at >= self.pending.len() {
+                    if self.emitted >= self.limit {
+                        return Ok(0);
+                    }
+                    self.pending = self.filler.clone();
+                    self.at = 0;
+                    self.emitted += self.pending.len() as u64;
+                }
+                let take = (self.pending.len() - self.at).min(buf.len());
+                buf[..take].copy_from_slice(&self.pending[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let head = Vec::from(
+            format!(
+                "{}\n{}\n",
+                json!({"type":"user","cwd":"/tmp","sessionId":"s",
+                    "message":{"role":"user","content":"only-q"}}),
+                json!({"type":"assistant","cwd":"/tmp","sessionId":"s",
+                    "message":{"role":"assistant",
+                        "content":[{"type":"text","text":"only-a"}]}})
+            )
+            .as_bytes(),
+        );
+        // Well past twice the window, so any reintroduced whole read at a plausible
+        // constant refuses. Nothing of this size is ever held.
+        //
+        // The filler records are LARGE (256 KiB) on purpose: the cost here is one serde
+        // parse per record, so the same coverage at 4 KiB records took 17s of a ~40s
+        // suite. Same bytes generated, ~64x fewer parses.
+        let generated = 3 * TRANSFER_WINDOW_BYTES;
+        let filler = format!(
+            "{}\n",
+            json!({"type":"system","subtype":"filler","content":"y".repeat(256 * 1024)})
+        )
+        .into_bytes();
+        let endless = Endless {
+            emitted: 0,
+            limit: generated,
+            pending: head,
+            at: 0,
+            filler,
+        };
+        let streamed = claude_to_codex_import_projection_streaming(endless)
+            .expect("the projection must stream a source larger than any whole-read cap");
+        assert_eq!(
+            streamed.len(),
+            2,
+            "only the two real messages are retained; the filler is parsed and dropped"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
