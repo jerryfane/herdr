@@ -74,21 +74,35 @@ const DESTINATION_RECORD_BUDGET_BYTES: usize = TRANSFER_WINDOW_BYTES as usize;
 /// a bound that stops an unbounded producer, not an estimate of legitimate growth.
 const DESTINATION_TOTAL_BUDGET_BYTES: u64 = 16 * TRANSFER_WINDOW_BYTES;
 
-/// Slack allowed above an OMP destination's OWN size when reading it back.
+/// How an OMP destination's read-back is bounded — and it differs by CALLER, because the
+/// premise differs by caller.
 ///
-/// NOT A PREDICTED EXPANSION. Two rounds guessed a multiple of the source window and both
-/// guesses were wrong in the same way: round 17 demolished 2x for the bridge, and round 19
-/// demolished 4x here by finding a 147-byte source pair the parser accepts — `cwd` and
-/// `sessionId` are required by the CODEX bridge, not by the parse that feeds `omp::write`
-/// — which expands 5.12x, so a full window writes 303-327 MiB against a 256 MiB cap. And
-/// `omp::write` PUBLISHES THE SESSION before the read refuses it, so the guess being low
-/// costs a valid transfer after the target exists.
+/// TWO ROUNDS GUESSED A MULTIPLE OF THE SOURCE WINDOW AND BOTH WERE DEMOLISHED. Round 19
+/// then accepted "bound it by the file's own length, we are the only writer" — which is
+/// true at staging and FALSE after launch, where the target is a live OMP process
+/// appending to that same transcript. Round 20 found that, and the evidence is in the
+/// parser: `omp::parse` walks from the selected leaf upward, so entries appended past the
+/// staged leaf are not on the compared branch. Growth there is EXPECTED and tolerated on
+/// purpose — `target_cursor` exists for it — so a byte bound derived from the staged size
+/// would refuse a valid live transfer and trigger rollback.
 ///
-/// The destination is a file WE JUST WROTE, so its size is not something to predict: it is
-/// something to measure. The bound is the observed length plus this slack, which exists
-/// only so a legitimate trailing newline or a filesystem rounding cannot trip it. A file
-/// larger than what we wrote means something else wrote it, and refusing THAT is correct.
-const OMP_DESTINATION_SLACK_BYTES: u64 = 64 * 1024;
+/// So there is no single right answer, and pretending otherwise is what produced three
+/// wrong bounds in three rounds.
+/// How far past the staged length this test's append must reach to discriminate.
+#[cfg(test)]
+const OMP_LIVE_APPEND_PROBE_BYTES: u64 = 1024;
+
+#[derive(Clone, Copy)]
+enum OmpReadBound {
+    /// Staging: we just wrote the file, nothing else holds it, and its length is a FACT
+    /// rather than a prediction. `omp::write` flushes and `sync_all`s before returning,
+    /// so the measured length is final — no slack is needed and adding some would only
+    /// widen what counts as "ours".
+    JustWritten,
+    /// After launch: the target is live and appending. The bound here cannot be about the
+    /// artifact's expected size at all; it is a MEMORY ceiling and is named as one.
+    LiveTarget(u64),
+}
 
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -525,6 +539,9 @@ impl RuntimeSessionTransfer {
             &source.0.messages,
             DESTINATION_RECORD_BUDGET_BYTES,
             DESTINATION_TOTAL_BUDGET_BYTES,
+            // The target is running and appending to this transcript; bound the memory,
+            // not the artifact.
+            OmpReadBound::LiveTarget(DESTINATION_TOTAL_BUDGET_BYTES),
         )
         .map(|_| ())
     }
@@ -1321,6 +1338,7 @@ pub(crate) async fn prepare(request: PrepareRequest) -> Result<PreparedTransfer,
         &expected,
         DESTINATION_RECORD_BUDGET_BYTES,
         DESTINATION_TOTAL_BUDGET_BYTES,
+        OmpReadBound::JustWritten,
     )
     .inspect_err(|_| report_this_target("the staged destination failed verification"))?;
     // No separate verify_destination for the JSONL arm: `read_destination_transcript`
@@ -1509,6 +1527,7 @@ fn read_verified_destination(
     expected: &[VisibleMessage],
     record_budget: usize,
     total_budget: u64,
+    omp_bound: OmpReadBound,
 ) -> Result<CanonicalTranscript, TransferError> {
     match kind {
         // Streamed and compared AS IT READS, with no source-derived ceiling: the
@@ -1538,27 +1557,29 @@ fn read_verified_destination(
             let trusted_path = validate_transcript_path(trust_root, path)?;
             let file = fs::File::open(&trusted_path)
                 .map_err(|err| TransferError::io("read destination transcript", err))?;
-            // BOUNDED BY THE FILE'S OWN OBSERVED LENGTH, not by a predicted expansion.
-            // This arm genuinely holds the document — omp::parse needs the header and the
-            // whole graph — so it needs a retention bound; but the destination is a file
-            // WE wrote, so the honest bound is what is actually there plus slack, not a
-            // multiple of the source that two rounds guessed wrong.
-            //
-            // stat-then-read is not a TOCTOU hazard here the way it is for an untrusted
-            // ledger: growth between the two only RAISES the observed length, and a file
-            // that grew past its own measured size plus slack is exactly what should be
-            // refused — we are the only writer.
-            //
-            // STATED LIMIT: no test distinguishes this from a guessed multiple, because
-            // the two only differ on an OMP destination above ~256 MiB and no fixture
-            // reaches that. What changed is structural rather than covered — there is no
-            // predicted multiple left in the code to be wrong. Two rounds guessed one and
-            // both guesses were demolished by someone computing the worst-case pair size.
-            let observed = fs::metadata(&trusted_path)
-                .map_err(|err| TransferError::io("stat destination transcript", err))?
-                .len();
-            let bytes =
-                read_whole_within(file, observed.saturating_add(OMP_DESTINATION_SLACK_BYTES))?;
+            let cap = match omp_bound {
+                // MEASURED ON THE DESCRIPTOR, NOT THE PATH. Round 20: statting the path
+                // after opening can describe a DIFFERENT inode — and link swapping in
+                // that directory is not hypothetical, `omp::write` publishes with
+                // hard_link plus remove, so it is a shape this code already performs.
+                // The descriptor is the file we are about to read.
+                //
+                // No slack. `omp::write` flushes and sync_all's before returning, so the
+                // length is final at this point; the slack I added last round was
+                // justified by a trailing newline that is already counted and by
+                // block rounding that st_size does not do. Both reasons were false.
+                OmpReadBound::JustWritten => file
+                    .metadata()
+                    .map_err(|err| TransferError::io("stat destination transcript", err))?
+                    .len(),
+                // A MEMORY CEILING, and honestly named as one. The target is live and
+                // appending here, so no bound derived from the staged size is correct —
+                // and the comparison tolerates that growth on purpose, because
+                // `omp::parse` walks from the selected leaf upward and appended entries
+                // are not on the compared branch.
+                OmpReadBound::LiveTarget(ceiling) => ceiling,
+            };
+            let bytes = read_whole_within(file, cap)?;
             let destination = omp::parse(&bytes, cursor)?.transcript;
             verify_destination(expected, &destination)?;
             Ok(destination)
@@ -4871,9 +4892,91 @@ mod tests {
             &expect,
             DESTINATION_RECORD_BUDGET_BYTES,
             DESTINATION_TOTAL_BUDGET_BYTES,
+            OmpReadBound::JustWritten,
         )
         .expect("a destination past the source constant must still verify");
         assert_eq!(verified.messages, expect);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// AXIS — ROUND-20: a LIVE OMP target may append, and verification must survive it.
+    ///
+    /// Round 19 accepted "bound the read by the file's own length, we are the only
+    /// writer". True at staging; FALSE after launch, where the target is a live OMP
+    /// process appending to that same transcript. The evidence is in the parser:
+    /// `omp::parse` walks from the SELECTED LEAF upward, so entries appended past the
+    /// staged leaf are not on the compared branch — growth there is tolerated ON PURPOSE,
+    /// which is what `target_cursor` is for. A byte bound derived from the staged size
+    /// would have refused a valid live transfer and driven a rollback.
+    ///
+    /// COVERED: the LiveTarget ARM. Mutating it to a staged-size bound turns this red.
+    ///
+    /// NOT COVERED, AND SAID PLAINLY: that `verified_visible_destination` PASSES
+    /// LiveTarget. This drives `read_verified_destination` directly, so swapping the
+    /// post-launch caller back to JustWritten survives — the same beside-the-path shape
+    /// the reviewers have found in my fixtures five times. Closing it needs a
+    /// RuntimeSessionTransfer fixture with real source and target roots; I judged that
+    /// more than this round should carry, and would rather be told it is cheap than
+    /// claim coverage I do not have.
+    #[test]
+    fn a_live_omp_target_may_append_between_staging_and_verification() {
+        let root = temp_root("omp-live-append");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let messages = vec![
+            VisibleMessage {
+                role: VisibleRole::User,
+                text: "q".to_string(),
+            },
+            VisibleMessage {
+                role: VisibleRole::Assistant,
+                text: "a".to_string(),
+            },
+        ];
+        let (_session_id, path, leaf) =
+            omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+        let staged_len = std::fs::metadata(&path).unwrap().len();
+
+        // The live target appends past the staged leaf — a different branch, which the
+        // comparison ignores by design.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            format!(
+                "{}\n",
+                json!({"type":"message","id":"appended-by-the-target","parentId":leaf,
+                    "timestamp":"2026-08-31T02:00:00Z",
+                    "message":{"role":"user",
+                        "content":[{"type":"text","text":"y".repeat(256 * 1024)}],
+                        "timestamp":1}})
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        let grown_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            grown_len > staged_len + OMP_LIVE_APPEND_PROBE_BYTES,
+            "precondition: the append must exceed the staged length by enough that a \
+             staged-size bound would refuse it ({staged_len} -> {grown_len})"
+        );
+
+        // LiveTarget: the post-launch path. Must still verify.
+        read_verified_destination(
+            HarnessKind::Omp,
+            &sessions,
+            &path,
+            Some(leaf.as_str()),
+            &messages,
+            DESTINATION_RECORD_BUDGET_BYTES,
+            DESTINATION_TOTAL_BUDGET_BYTES,
+            OmpReadBound::LiveTarget(DESTINATION_TOTAL_BUDGET_BYTES),
+        )
+        .expect("a live target's append must not fail verification");
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -4941,6 +5044,7 @@ mod tests {
             &expect,
             DESTINATION_RECORD_BUDGET_BYTES,
             DESTINATION_TOTAL_BUDGET_BYTES,
+            OmpReadBound::JustWritten,
         )
         .expect("a destination past the source ceiling must still verify");
         assert_eq!(verified.messages, expect);
