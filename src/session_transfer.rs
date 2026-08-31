@@ -155,7 +155,7 @@ const OMP_MAX_DESTINATION_ENTRY_BYTES: u64 = 512;
 /// appending to that same file. So the headroom is not only slack against a mis-modelled
 /// writer; it is the room a running agent has to grow the transcript before the
 /// post-launch read refuses and ROLLS BACK a session the user is actively working in.
-/// That is why the margin is 1.5x and not 1.1x. Exhausting it needs ~233 MiB appended on
+/// That is why the margin is 1.5x and not 1.1x. Exhausting it needs 248 MiB appended on
 /// top of an already adversarial source, so this is headroom rather than a live risk.
 const OMP_DESTINATION_MODELLED_WORST_BYTES: u64 =
     (TRANSFER_WINDOW_BYTES / OMP_MIN_ASSISTANT_RECORD_BYTES) * OMP_MAX_DESTINATION_ENTRY_BYTES;
@@ -199,17 +199,28 @@ const _: () = assert!(OMP_DESTINATION_RETENTION_BYTES < DESTINATION_TOTAL_BUDGET
 // headroom itself trips these, which is precisely the edit that needs review.
 const _: () = assert!(4 * OMP_RETENTION_MARGIN_NUMERATOR >= 5 * OMP_RETENTION_MARGIN_DENOMINATOR);
 //
-// THE FIRST VERSION OF THIS UPPER GUARD DID NOT HOLD, AND A MUTANT SAID SO. It read
-// `NUMERATOR <= 2 * DENOMINATOR`, i.e. margin <= 2.0 — and the widening it was written to
-// stop, `/ 2 * 3` becoming `/ 2 * 4`, is margin EXACTLY 2.0. It passed, the ceiling still
-// rose to 993 MiB, and the suite still went green. A bound written against a scenario has
-// to EXCLUDE that scenario, not touch it. That off-by-one-step is the shape of every wrong
-// bound on this PR, this time in the guard rather than in the value it guards.
+// ASSERTED ON THE VALUE, NOT ON THE FRACTION — AND THE FRACTION VERSION WAS THE FOURTH
+// LEVEL OF ONE MISTAKE. Round 23 named the margin and asserted `1.25 <= NUM/DEN <= 1.5`,
+// which guards the constants a widening would edit ONLY IF the derivation keeps using
+// them. It need not: rewrite the expression above as `MODELLED_WORST / 10 * 19` and NUM
+// stays 3, DEN stays 2, both fraction asserts pass, the value-level test passes MORE
+// easily because it only checks a lower bound, and the resident ceiling goes to 943 MiB.
+// Same edit site and same direction as the round-19 and round-22 regressions.
 //
-// 1.25 <= margin <= 1.5. The current 3/2 sits at the top edge deliberately: this is
-// headroom, and a round that wants MORE of it should have to argue for it in review
-// rather than receive it silently.
-const _: () = assert!(2 * OMP_RETENTION_MARGIN_NUMERATOR <= 3 * OMP_RETENTION_MARGIN_DENOMINATOR);
+// The lesson each round has re-taught at a higher level: GUARD THE QUANTITY THAT MATTERS,
+// NOT AN INPUT THAT CURRENTLY DETERMINES IT. Round 19 guarded nothing; round 22 guarded a
+// window count that stopped tracking the model; round 23 guarded a fraction the derivation
+// is free to stop using. These bind the ceiling directly to the modelled worst case, so
+// they hold however the expression is rewritten — and they subsume the fraction asserts,
+// which is why those are gone rather than merely redundant.
+//
+// 1.25 <= ceiling / modelled worst <= 1.5. The upper bound holds with exact equality at
+// this head, deliberately: this is headroom, and a round wanting more should argue for it
+// in review rather than receive it silently.
+const _: () =
+    assert!(4 * OMP_DESTINATION_RETENTION_BYTES >= 5 * OMP_DESTINATION_MODELLED_WORST_BYTES);
+const _: () =
+    assert!(2 * OMP_DESTINATION_RETENTION_BYTES <= 3 * OMP_DESTINATION_MODELLED_WORST_BYTES);
 
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -5307,42 +5318,56 @@ mod tests {
 
         // ALL THREE SOURCE KINDS FEED `omp::write`, SO ALL THREE COMPETE FOR THE VERTEX.
         //
-        // The model is derived from the CLAUDE parser, but `read_transfer_source` windows
-        // Claude and Codex and refuses an oversize OMP source, so every kind delivers at
-        // most one window into the writer and any of them could be the worst case. Round
-        // 23 pointed out that nothing recorded which one actually is — so a later
-        // relaxation of the Codex or OMP parser could move the vertex with no test
-        // noticing, which is the same silent-move shape as rounds 18 through 22.
+        // `read_transfer_source` windows Claude and Codex and refuses an oversize OMP
+        // source, so every kind delivers at most one window into the writer and any could
+        // hold the worst rate.
         //
-        // Measured here rather than asserted: Claude 66, OMP 88, Codex 112.
-        let codex_min = {
-            let dir = temp_root("codex-min");
-            let path = dir.join("rollout.jsonl");
-            let record = json!({"type":"response_item","payload":{"type":"message",
-                "role":"assistant","content":[{"type":"text","text":"a"}]}})
-            .to_string();
-            std::fs::write(&path, format!("{record}\n")).unwrap();
-            let accepted = read_transcript(HarnessKind::Codex, &dir, &path)
-                .map(|t| !t.messages.is_empty())
-                .unwrap_or(false);
-            let _ = fs::remove_dir_all(&dir);
-            assert!(
-                accepted,
-                "the Codex probe must actually produce a visible message"
-            );
-            record.len() as u64 + 1
+        // COMPARED AS RATES PER ROLE, NOT AS RAW MINIMA — round 24 caught the first
+        // version doing the latter, and it was wrong in both directions. A cheap record
+        // producing a USER message says nothing about a bound derived from an ASSISTANT
+        // pair: the assistant entry costs about twice the user one, so comparing a Codex
+        // user minimum against a Claude assistant minimum can fail on a transcript that is
+        // cheaper per byte (false-fail, the same spurious-fire mode the 8-window floor was
+        // deleted for) and can pass while a genuinely worse assistant form exists
+        // (false-pass). What the LP argument actually maximises is retained bytes per
+        // source byte AT A VERTEX, and a vertex is one role — so the comparison is
+        // per-role, entry cost over record cost.
+        //
+        // AND EACH KIND IS SWEPT, NOT SAMPLED. Round 21 died because one probe was assumed
+        // minimal; round 24 found the same assumption here, where the Codex probe wrote
+        // only the `response_item` form and missed the `event_msg` one at 69 bytes.
+        let cheapest = |kind: HarnessKind, role: VisibleRole, forms: &[String]| -> u64 {
+            let mut best = u64::MAX;
+            for body in forms {
+                let dir = temp_root("form");
+                let path = dir.join("t.jsonl");
+                std::fs::write(&path, body).unwrap();
+                let hit = read_transcript(kind, &dir, &path)
+                    .map(|t| t.messages.iter().any(|m| m.role == role))
+                    .unwrap_or(false);
+                let _ = fs::remove_dir_all(&dir);
+                if hit {
+                    // Marginal cost of the LAST record, which is what a rate depends on.
+                    best = best.min(
+                        body.lines()
+                            .next_back()
+                            .map(|l| l.len() as u64 + 1)
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+            }
+            best
         };
+        let one = |v: serde_json::Value| format!("{v}\n");
 
-        // For OMP the MARGINAL entry is what a rate depends on, so it is measured on a
-        // valid parent chain rather than on one orphan record. Ids are single characters
-        // here, which is the cheapest an entry can be; the real parser also rejects
-        // duplicates, so ids must lengthen as an entry count rises and this is a floor.
-        let omp_min = {
-            let dir = temp_root("omp-min");
-            let sessions = dir.join("s");
-            std::fs::create_dir_all(&sessions).unwrap();
+        // OMP needs a real header and a valid parent chain; an orphan entry is rejected
+        // and a root entry needs an explicit `"parentId": null` rather than an absent one.
+        let omp_chain = |role: &str| -> String {
+            let dir = temp_root("omp-seed");
+            let seeds = dir.join("s");
+            std::fs::create_dir_all(&seeds).unwrap();
             let (_id, seed, _leaf) = omp::write(
-                &sessions,
+                &seeds,
                 std::path::Path::new("/tmp"),
                 &[VisibleMessage {
                     role: VisibleRole::Assistant,
@@ -5350,47 +5375,125 @@ mod tests {
                 }],
             )
             .unwrap();
-            let seed_text = std::fs::read_to_string(&seed).unwrap();
-            let mut header = seed_text.lines();
-            let pad = header.next().expect("pad line").to_string();
-            let session = header.next().expect("session line").to_string();
-
-            let mut body = format!("{pad}\n{session}\n");
-            let mut marginal = 0u64;
+            let text = std::fs::read_to_string(&seed).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            let mut header = text.lines();
+            let mut out = format!(
+                "{}\n{}\n",
+                header.next().expect("pad"),
+                header.next().expect("session")
+            );
             for index in 0..8u32 {
                 let entry = if index == 0 {
                     json!({"id":"0","parentId":Value::Null,"type":"message",
-                        "message":{"role":"assistant","content":"x"}})
+                        "message":{"role":role,"content":"x"}})
                 } else {
                     json!({"id":index.to_string(),"parentId":(index - 1).to_string(),
-                        "type":"message","message":{"role":"assistant","content":"x"}})
-                }
-                .to_string();
-                marginal = entry.len() as u64 + 1;
-                body.push_str(&entry);
-                body.push('\n');
+                        "type":"message","message":{"role":role,"content":"x"}})
+                };
+                out.push_str(&entry.to_string());
+                out.push('\n');
             }
-            let path = dir.join("chain.jsonl");
-            std::fs::write(&path, &body).unwrap();
-            let messages = read_transcript(HarnessKind::Omp, &dir, &path)
-                .map(|t| t.messages.len())
-                .unwrap_or(0);
-            let _ = fs::remove_dir_all(&dir);
-            assert_eq!(
-                messages, 8,
-                "the OMP probe chain must parse to one message per entry"
-            );
-            marginal
+            out
         };
 
-        assert!(
-            assistant_min <= codex_min && assistant_min <= omp_min,
-            "the retention model takes the CLAUDE assistant record as the cheapest source \
-             byte-per-message across every kind that feeds omp::write, but that is no \
-             longer true (claude {assistant_min}, codex {codex_min}, omp {omp_min}); the \
-             vertex has moved and OMP_DESTINATION_RETENTION_BYTES must be re-derived from \
-             whichever kind is now smallest"
-        );
+        let rates = [
+            (
+                "claude/assistant",
+                VisibleRole::Assistant,
+                cheapest(
+                    HarnessKind::Claude,
+                    VisibleRole::Assistant,
+                    &[
+                        one(
+                            json!({"type":"assistant","message":{"role":"assistant","content":"a"}}),
+                        ),
+                        one(json!({"type":"assistant","message":{"role":"assistant",
+                            "content":[{"type":"text","text":"a"}]}})),
+                    ],
+                ),
+            ),
+            (
+                "claude/user",
+                VisibleRole::User,
+                cheapest(
+                    HarnessKind::Claude,
+                    VisibleRole::User,
+                    &[
+                        one(json!({"type":"user","message":{"role":"user","content":"q"}})),
+                        one(json!({"type":"user","message":{"role":"user",
+                            "content":[{"type":"text","text":"q"}]}})),
+                    ],
+                ),
+            ),
+            (
+                "codex/assistant",
+                VisibleRole::Assistant,
+                cheapest(
+                    HarnessKind::Codex,
+                    VisibleRole::Assistant,
+                    &[
+                        one(json!({"type":"response_item","payload":{"type":"message",
+                            "role":"assistant","content":[{"type":"text","text":"a"}]}})),
+                        one(json!({"type":"event_msg","payload":{"type":"agent_message",
+                            "message":"a"}})),
+                    ],
+                ),
+            ),
+            (
+                "codex/user",
+                VisibleRole::User,
+                cheapest(
+                    HarnessKind::Codex,
+                    VisibleRole::User,
+                    &[
+                        one(json!({"type":"event_msg","payload":{"type":"user_message",
+                            "message":"a"}})),
+                        one(json!({"type":"response_item","payload":{"type":"message",
+                            "role":"user","content":[{"type":"input_text","text":"q"}]}})),
+                    ],
+                ),
+            ),
+            (
+                "omp/assistant",
+                VisibleRole::Assistant,
+                cheapest(
+                    HarnessKind::Omp,
+                    VisibleRole::Assistant,
+                    &[omp_chain("assistant")],
+                ),
+            ),
+            (
+                "omp/user",
+                VisibleRole::User,
+                cheapest(HarnessKind::Omp, VisibleRole::User, &[omp_chain("user")]),
+            ),
+        ];
+
+        let assistant_entry = entry_cost(VisibleRole::Assistant) as f64;
+        let user_entry = entry_cost(VisibleRole::User) as f64;
+        let modelled = assistant_entry / OMP_MIN_ASSISTANT_RECORD_BYTES as f64;
+
+        for (label, role, min_record) in rates {
+            assert!(
+                min_record != u64::MAX,
+                "no candidate form for {label} produced a visible message of that role — \
+                 the probe has gone stale and is silently measuring nothing"
+            );
+            let entry = if role == VisibleRole::Assistant {
+                assistant_entry
+            } else {
+                user_entry
+            };
+            let rate = entry / min_record as f64;
+            assert!(
+                rate <= modelled,
+                "the retention model takes the CLAUDE assistant pair as the worst rate \
+                 ({modelled:.2} retained bytes per source byte), but {label} now reaches \
+                 {rate:.2} ({min_record} B per record, {entry:.0} B per entry); the vertex \
+                 has moved and OMP_DESTINATION_RETENTION_BYTES must be re-derived from it"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
