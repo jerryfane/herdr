@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `agent prompt --wait` now distinguishes a prompt whose disposition could not be OBSERVED from one that could not be observed AT ALL. A pane whose agent declares no `[composer]` region, or whose screen detection is skipped, returns `agent_prompt_unverifiable` instead of `agent_prompt_stalled`. Measured on a 31-agent fleet, every live pane reported `composer.evidence.region = "unavailable"`, so `agent_prompt_unsubmitted` was unreachable and `stalled` was the only possible verdict — which supervisors then read as proof that a wake had not been delivered. Neither verdict is such proof. (#5)
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 - Running Claude Code, Codex, and OMP agents can now transfer their visible conversation into either of the other harnesses in the same pane. Herdr stages and rereads the destination transcript before confirmation, verifies exact native session identity and visible content after launch, reports native structures and reasoning/system records that were flattened or omitted, and restores the source session and account when target launch verification fails.
 - The Herdrup fork installer now downloads and checksum-verifies the current prebuilt preview binary, so app users can install the compatible daemon without Rust, Cargo, Zig, or a source checkout.
