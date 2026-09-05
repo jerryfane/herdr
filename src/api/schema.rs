@@ -263,6 +263,15 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneInputStreamOpen(PaneInputStreamParams),
+    // Dotted third segment follows the STREAMING convention (`pane.input.stream`),
+    // not the `gram.upload_chunk` snake_case one: it is a streaming channel, and the
+    // wire name is what `api_method_name` and the federation audit key on.
+    #[serde(rename = "gram.upload.stream")]
+    #[schemars(skip)]
+    GramUploadStream(GramUploadStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    GramUploadStreamOpen(GramUploadStreamParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]

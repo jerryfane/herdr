@@ -40,7 +40,7 @@ use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
     GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileParams,
     GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo, GramPostParams,
-    GramSendParams, GramUploadChunkParams, ResponseResult,
+    GramSendParams, GramUploadChunkParams, GramUploadStreamParams, ResponseResult,
 };
 use crate::app::App;
 use crate::persist::gram::{
@@ -416,6 +416,21 @@ impl App {
             }
             Err(err) => encode_error(id, "gram_file_error", err.to_string()),
         }
+    }
+
+    /// Validates a streaming upload before the server thread starts reading frames.
+    /// `no_session` is the ONLY app-owned state the per-chunk handler consults; every
+    /// other step (base64 decode, `append_chunk`) is pure filesystem and runs on the
+    /// server thread, so this is the whole app-side cost of a streamed upload.
+    pub(super) fn handle_gram_upload_stream_open(
+        &mut self,
+        id: String,
+        _params: GramUploadStreamParams,
+    ) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        encode_success(id, ResponseResult::Ok {})
     }
 
     pub(super) fn handle_gram_get_file(&mut self, id: String, params: GramGetFileParams) -> String {

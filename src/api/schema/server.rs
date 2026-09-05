@@ -23,6 +23,11 @@ pub struct ServerCapabilities {
     /// fall back to per-call `pane.send_text` / `pane.send_input`.
     #[serde(default)]
     pub pane_input_stream: bool,
+    /// The daemon serves `gram.upload.stream`, uploading a whole file over one
+    /// connection instead of one connection per chunk. Clients feature-detect this
+    /// and otherwise fall back to per-chunk `gram.upload_chunk`.
+    #[serde(default)]
+    pub gram_upload_stream: bool,
     /// The server can transactionally transfer visible session history between
     /// Claude Code, Codex, and OMP in the same logical pane.
     #[serde(default)]

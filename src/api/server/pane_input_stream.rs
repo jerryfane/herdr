@@ -15,14 +15,13 @@
 //! per call, which also preserves order by construction (a single ordered
 //! channel, unlike today's per-call channels).
 //!
-//! The line-framing read machinery below mirrors `pane_graphics_stream.rs`.
-//! It is kept local so this stays a purely additive module; a shared extraction
-//! is a reasonable follow-up.
+//! The line-framing read machinery lives in `stream_read`, shared with
+//! `pane_graphics_stream.rs` and `gram_upload_stream.rs`; only this channel's
+//! own byte cap and deadlines are set here.
 
-use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneInputStreamParams, PaneSendInputParams,
@@ -31,10 +30,10 @@ use crate::api::schema::{
 use crate::api::{ApiRequestSender, ApiStream};
 use crate::ipc::is_connection_closed_error;
 
+use super::stream_read::{read_line, stream_is_running};
 use super::{
     api_response_outcome, dispatch_stream_open, dispatch_to_app_with_timeout, write_json_line,
     write_json_line_allow_disconnect, write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
-    CONNECTION_POLL_INTERVAL,
 };
 
 // A whole input frame (incl. JSON encoding of pasted text) is one line. Large
@@ -45,8 +44,6 @@ const MAX_INPUT_FRAME_BYTES: usize = 1024 * 1024;
 // design — only a mid-frame stall (a partially written line) is deadlined.
 const INPUT_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_FRAME_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const INPUT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const INPUT_FALLBACK_FAST_POLLS: u8 = 32;
 
 /// One inbound input frame. A text-only frame dispatches as `pane.send_text`
 /// (raw bytes); a frame carrying named `keys` dispatches as `pane.send_input`.
@@ -165,6 +162,7 @@ fn serve_frames(
             MAX_INPUT_FRAME_BYTES,
             INPUT_FRAME_IDLE_TIMEOUT,
             INPUT_FRAME_TOTAL_TIMEOUT,
+            "input frame",
         )?
         else {
             return Ok(());
@@ -256,196 +254,6 @@ fn serve_frames(
     }
 
     Ok(())
-}
-
-fn stream_is_running(running: &AtomicBool, stream_active: &AtomicBool) -> bool {
-    running.load(Ordering::Relaxed) && stream_active.load(Ordering::Acquire)
-}
-
-// ---------------------------------------------------------------------------
-// Line-framing read machinery, mirrored from `pane_graphics_stream.rs`.
-// ---------------------------------------------------------------------------
-
-fn read_line(
-    stream: &mut ApiStream,
-    running: &Arc<AtomicBool>,
-    stream_active: &Arc<AtomicBool>,
-    max_bytes: usize,
-    idle_timeout: Duration,
-    total_timeout: Duration,
-) -> std::io::Result<Option<String>> {
-    with_timed_reads(stream, |stream, mut wait| {
-        let mut bytes = Vec::new();
-        let mut byte = [0_u8; 1];
-        let mut total_deadline = None;
-        let mut idle_deadline = None;
-
-        loop {
-            if !stream_is_running(running, stream_active) {
-                return Ok(None);
-            }
-            ensure_before_deadlines(
-                idle_deadline,
-                total_deadline,
-                "timed out reading input frame",
-            )?;
-            match stream.read(&mut byte) {
-                Ok(0) => return Ok(None),
-                Ok(_) => {
-                    wait.on_progress();
-                    let now = Instant::now();
-                    let total_deadline_at =
-                        *total_deadline.get_or_insert_with(|| now + total_timeout);
-                    idle_deadline = Some(now + idle_timeout);
-                    if now >= total_deadline_at {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "timed out reading input frame",
-                        ));
-                    }
-                    bytes.push(byte[0]);
-                    if byte[0] == b'\n' {
-                        return String::from_utf8(bytes)
-                            .map(Some)
-                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
-                    }
-                    if bytes.len() > max_bytes {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "input frame is too large",
-                        ));
-                    }
-                }
-                Err(err) if read_should_retry(&err) => {
-                    wait.after_retry(idle_deadline, total_deadline);
-                }
-                Err(err) if is_connection_closed_error(&err) => return Ok(None),
-                Err(err) => return Err(err),
-            }
-        }
-    })
-}
-
-#[derive(Clone, Copy)]
-enum ReadWait {
-    SocketTimeout,
-    Poll(PollBackoff),
-}
-
-impl ReadWait {
-    fn after_retry(&mut self, idle_deadline: Option<Instant>, total_deadline: Option<Instant>) {
-        if let Self::Poll(backoff) = self {
-            sleep_until_poll(idle_deadline, total_deadline, backoff.interval);
-            backoff.advance();
-        }
-    }
-
-    fn on_progress(&mut self) {
-        if let Self::Poll(backoff) = self {
-            backoff.reset();
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PollBackoff {
-    interval: Duration,
-    fast_polls_remaining: u8,
-}
-
-impl PollBackoff {
-    fn new() -> Self {
-        Self {
-            interval: INPUT_FALLBACK_POLL_INTERVAL,
-            fast_polls_remaining: INPUT_FALLBACK_FAST_POLLS,
-        }
-    }
-
-    fn advance(&mut self) {
-        if self.fast_polls_remaining > 0 {
-            self.fast_polls_remaining -= 1;
-            return;
-        }
-        self.interval = (self.interval * 2).min(CONNECTION_POLL_INTERVAL);
-    }
-
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-}
-
-fn with_timed_reads<T>(
-    stream: &mut ApiStream,
-    read: impl FnOnce(&mut ApiStream, ReadWait) -> std::io::Result<Option<T>>,
-) -> std::io::Result<Option<T>> {
-    match stream.set_recv_timeout(Some(CONNECTION_POLL_INTERVAL)) {
-        Ok(()) => {
-            let result = read(stream, ReadWait::SocketTimeout);
-            finish_timed_read(result, || stream.set_recv_timeout(None))
-        }
-        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-            stream.set_nonblocking(true)?;
-            let result = read(stream, ReadWait::Poll(PollBackoff::new()));
-            finish_timed_read(result, || stream.set_nonblocking(false))
-        }
-        // A peer can disconnect after the caller's running check but before
-        // setsockopt; macOS reports that closed-socket race as EINVAL.
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn finish_timed_read<T>(
-    result: std::io::Result<Option<T>>,
-    reset: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<Option<T>> {
-    match result {
-        Ok(None) => Ok(None),
-        Ok(value) => {
-            reset()?;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = reset();
-            Err(err)
-        }
-    }
-}
-
-fn ensure_before_deadlines(
-    idle_deadline: Option<Instant>,
-    total_deadline: Option<Instant>,
-    message: &str,
-) -> std::io::Result<()> {
-    let now = Instant::now();
-    if idle_deadline.is_some_and(|deadline| now >= deadline)
-        || total_deadline.is_some_and(|deadline| now >= deadline)
-    {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, message));
-    }
-    Ok(())
-}
-
-fn sleep_until_poll(
-    idle_deadline: Option<Instant>,
-    total_deadline: Option<Instant>,
-    poll_interval: Duration,
-) {
-    let now = Instant::now();
-    let until_deadline = [idle_deadline, total_deadline]
-        .into_iter()
-        .flatten()
-        .filter_map(|deadline| deadline.checked_duration_since(now))
-        .min()
-        .unwrap_or(poll_interval);
-    std::thread::sleep(poll_interval.min(until_deadline));
-}
-
-fn read_should_retry(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-    )
 }
 
 #[cfg(test)]
