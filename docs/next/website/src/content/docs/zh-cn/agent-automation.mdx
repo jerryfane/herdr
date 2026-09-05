@@ -75,7 +75,7 @@ herdr agent rename w1:p2 reviewer
 
 除非智能体已经是 `blocked`,`agent prompt --wait` 会立即提交提示。已经是 `blocked` 时,它不会开始等待,而是返回 `agent_blocked`。已接受的提示从其他非 working 状态开始时,Herdr 首先要求在五秒内观察到生命周期变化。如果状态序列没有前进，它会返回 `agent_prompt_stalled`，而不是无限等待；调用方设置的 `--timeout` 不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
 
-`agent prompt --wait` 会区分 Herdr 在 PTY 确认写入后能够证明的投递状态。对于最初处于 settled 状态的智能体，生命周期序列前进会返回 `delivery: "submitted"`。Herdr 还会给 PTY 批次附加不透明的 attempt id，并在 writer 侧跟踪编辑器输入。同一个 attempt 仍留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`；该 attempt 被观察到后清空时返回 `submitted`。bracketed paste 不再依赖宿主 CLI 渲染的 paste token 文本。字节已经写入但无法证明其去向时，Herdr 返回 `agent_prompt_stalled`。
+`agent prompt --wait` 会区分 Herdr 在 PTY 确认写入后能够证明的投递状态。对于最初处于 settled 状态的智能体，生命周期序列前进会返回 `delivery: "submitted"`。Herdr 还会给 PTY 批次附加不透明的 attempt id，并在 writer 侧跟踪编辑器输入。同一个 attempt 仍留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`；该 attempt 被观察到后清空时返回 `submitted`。bracketed paste 不再依赖宿主 CLI 渲染的 paste token 文本。字节已经写入但无法证明其去向时，Herdr 返回 `agent_prompt_stalled`。 该判定现在表示 Herdr **能够**观察 composer，但未获得任何方向的证据。当该窗格完全不暴露 composer 观察时（智能体清单未声明 `[composer]` 区域，或对其跳过了屏幕检测），Herdr 会改为返回 `agent_prompt_unverifiable`。两种判定都不能证明未送达；`agent_prompt_unverifiable` 报告的是缺少观测手段，而不是缺少提示，监督方不得据此按提示被拒绝来升级处理。
 
 `pane get` 的 `composer.state` 为 `empty`、`draft_present` 或 `unknown`，`attempt_id` 和 `evidence` 会说明来源及视觉佐证。Herdr 未写入、且仅出现在光标右侧的建议文本不是草稿。找不到编辑器区域、画面正在重绘、证据冲突，或旧 daemon 未返回 `composer` 时都必须是 `unknown`，绝不能静默变成 `empty`。光标只用于佐证 writer provenance；颜色本身不能产生确定结论。
 

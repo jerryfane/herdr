@@ -313,7 +313,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 使用 `--wait` 时，最初处于 settled 状态的智能体若生命周期序列前进，会返回 `delivery: "submitted"`。Herdr 会给 PTY 批次附加不透明的 composer attempt id。同一个 attempt 留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`，被观察到后清空时返回 `submitted`。bracketed paste 不依赖渲染后的 token 文本。
 
-写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。
+写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。对于完全不暴露 composer 观察的窗格，返回 `agent_prompt_unverifiable` 而非 `agent_prompt_stalled`，以便调用方区分“已观察但无证据”与“无法观察”；两者都不能证明未送达。
 
 `idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 

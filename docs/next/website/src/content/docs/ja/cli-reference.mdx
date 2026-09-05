@@ -313,7 +313,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 `--wait` では、最初に settled だったエージェントのライフサイクルシーケンスが進むと `delivery: "submitted"` になります。Herdr は PTY バッチに不透明な composer attempt id を付けます。同じ attempt がカーソルで裏付けられたコンポーザーに残れば `agent_prompt_unsubmitted`、観測後に消えれば `submitted` です。bracketed paste は表示された token の文字列に依存しません。
 
-書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。
+書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。コンポーザー観測をまったく公開しないペインでは、`agent_prompt_stalled` ではなく `agent_prompt_unverifiable` を返します。呼び出し側は「観測したが何もなかった」と「観測できなかった」を区別できます。どちらも未送信の証明ではありません。
 
 `idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 
