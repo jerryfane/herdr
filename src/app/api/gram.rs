@@ -619,6 +619,21 @@ fn attach_file(
     if let Some(err) = validate_mime(request_id, &upload.mime) {
         return Err(err);
     }
+    // Finalize is the OTHER writer on a staging file, and it is no longer serialized
+    // against appends: before streaming, every chunk ran on this single-threaded app
+    // loop, so a finalize could not overlap one. Now appends run on the API server
+    // thread, and `finalize` reads the size, hashes the file, then renames it — so a
+    // frame landing mid-sequence would record a sha256 taken over more bytes than the
+    // recorded size, and an append after the rename would land INSIDE the finalized
+    // message file. That is silent corruption of the integrity fields a client
+    // verifies a download against, so refuse while a stream owns the upload.
+    if crate::api::upload_id_is_streaming(&upload.upload_id) {
+        return Err(encode_error(
+            request_id.to_string(),
+            "upload_in_progress",
+            "a stream is still uploading this upload_id; close it before attaching",
+        ));
+    }
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
         Ok(finalized) => Ok(Some(GramFile {
             name: finalized.name,

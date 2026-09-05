@@ -856,6 +856,102 @@ mod tests {
         assert_eq!(staged_bytes("up-mixed"), b"streamed");
     }
 
+    /// `gram.post` FINALIZES a staging file — reads its size, hashes it, renames it —
+    /// and is the other writer that appends are no longer serialized against. While a
+    /// stream owns the upload it must be refused: a frame landing mid-sequence would
+    /// record a sha256 taken over more bytes than the recorded size, and a frame
+    /// after the rename would land inside the finalized message file. Both are silent
+    /// corruption of the integrity fields a client verifies a download against.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_finalize_an_upload_a_stream_still_owns() {
+        let _config = isolate_config_dir("finalize");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-finalize");
+        write_line(&mut client, &frame(1, 0, b"half"));
+        let ack: UploadAck = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert!(ack.ok);
+
+        let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            false,
+            None,
+            app_rx,
+            crate::api::EventHub::default(),
+        );
+        let post = |upload_id: &str| crate::api::schema::Request {
+            id: "post".into(),
+            method: Method::GramPost(crate::api::schema::GramPostParams {
+                text: String::new(),
+                to: None,
+                file: Some(crate::api::schema::GramFileUpload {
+                    upload_id: upload_id.to_string(),
+                    name: "half.bin".into(),
+                    mime: "application/octet-stream".into(),
+                }),
+            }),
+        };
+
+        let refused: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(post("up-finalize"))).unwrap();
+        assert_eq!(refused["error"]["code"], "upload_in_progress");
+        // Refused BEFORE finalize ran: the staging file is untouched, so the upload
+        // can still be completed and attached once the channel closes.
+        assert_eq!(staged_bytes("up-finalize"), b"half");
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        assert!(server_thread.join().unwrap().is_ok());
+
+        // With the claim released, the same post succeeds and consumes staging.
+        let posted: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(post("up-finalize"))).unwrap();
+        assert_eq!(posted["result"]["message"]["file"]["size"], 4);
+        assert!(!staging_path("up-finalize").exists());
+    }
+
+    /// A client that writes bytes and NEVER a newline is the only thing that can grow
+    /// the reader's buffer without bound: `take_line` never returns, so nothing
+    /// consumes `pending`. The unterminated cap is that bound, and it is the one
+    /// check the terminated-frame test above cannot reach.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_an_unterminated_frame_past_the_cap() {
+        let _config = isolate_config_dir("unterminated");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-unterminated");
+
+        // No newline, ever. The write may fail partway once the server closes, which
+        // is itself the pass condition, so a broken pipe here is not a test failure.
+        let blob = vec![b'x'; MAX_UPLOAD_FRAME_BYTES + 4096];
+        let _ = client.write_all(&blob);
+        let _ = client.flush();
+
+        // NOT stopping `running` first: a stop makes the reader return a clean
+        // `Ok(None)`, which would mask the cap and let this test pass against a
+        // daemon with no bound at all. The connection must fail on its own.
+        let err = server_thread
+            .join()
+            .unwrap()
+            .expect_err("an unterminated over-cap frame must fail the connection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("upload frame is too large"),
+            "got: {err}"
+        );
+        assert!(!staging_path("up-unterminated").exists());
+        running.store(false, Ordering::Relaxed);
+    }
+
     #[cfg(unix)]
     #[test]
     fn reports_open_error_when_the_app_has_no_session() {

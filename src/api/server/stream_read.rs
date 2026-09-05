@@ -145,9 +145,14 @@ impl LineReader {
         total_timeout: Duration,
         label: &str,
     ) -> std::io::Result<Option<String>> {
-        // A line already buffered from a previous over-read still owes the cap check:
-        // the loop below can only test the UNTERMINATED remainder, so without this a
-        // frame whose newline arrived in the same read as its overflow would slip past.
+        // A line already buffered from a previous over-read goes through the same cap
+        // check as one just read. With today's only caller it cannot actually trip:
+        // `pending` only accumulates while it holds no newline, so the remainder
+        // `take_line` leaves is a strict suffix of ONE read — at most
+        // `BODY_READ_CHUNK_BYTES` (64 KiB), well under the 1 MiB upload frame cap.
+        // It is here so a future caller with a cap below the read chunk size does not
+        // silently get an unchecked line; the same-read overflow case is caught by
+        // the in-loop check.
         if let Some(line) = take_line(&mut self.pending)? {
             return oversize_or_line(line, max_bytes, label);
         }
