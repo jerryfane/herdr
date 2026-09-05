@@ -1719,6 +1719,16 @@ impl App {
             Method::PaneInputStreamOpen(params) => {
                 return self.handle_pane_input_stream_open(request.id, params);
             }
+            Method::GramUploadStream(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "stream_transport_required",
+                    "gram.upload.stream requires the streaming socket transport",
+                );
+            }
+            Method::GramUploadStreamOpen(params) => {
+                return self.handle_gram_upload_stream_open(request.id, params);
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

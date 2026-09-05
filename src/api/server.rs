@@ -43,9 +43,17 @@ use crate::ipc::{
     socket_file_identity, SocketFileIdentity,
 };
 
+mod gram_upload_stream;
 mod pane_graphics_stream;
 mod pane_input_stream;
 mod pane_output_stream;
+mod stream_read;
+
+/// The single-writer claim on a gram `upload_id`, held by every writer:
+/// `gram.upload.stream` for a channel's lifetime, `gram.upload_chunk` for one
+/// append, and `finalize` for its size/hash/rename sequence. Acquiring it IS the
+/// check — a predicate consulted before writing leaves the window open.
+pub(crate) use gram_upload_stream::UploadClaim;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -186,6 +194,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         pane_input_stream: true,
+        gram_upload_stream: true,
         agent_session_transfer: true,
         agent_session_transfer_harnesses: vec![
             crate::api::schema::AgentSessionTransferHarness::Claude,
@@ -1101,6 +1110,22 @@ fn handle_connection_with_stop(
             }
             result
         }
+        Method::GramUploadStream(params) => {
+            let result =
+                gram_upload_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
                 stream,
@@ -1709,6 +1734,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneStreamClose(_) => "pane.stream.close",
         Method::PaneInputStream(_) => "pane.input.stream",
         Method::PaneInputStreamOpen(_) => "pane.input.stream.open",
+        Method::GramUploadStream(_) => "gram.upload.stream",
+        Method::GramUploadStreamOpen(_) => "gram.upload.stream.open",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -2351,6 +2378,7 @@ mod tests {
                 live_handoff: true,
                 detached_server_daemon: true,
                 pane_input_stream: false,
+                gram_upload_stream: false,
                 agent_session_transfer: true,
                 agent_session_transfer_harnesses: vec![
                     crate::api::schema::AgentSessionTransferHarness::Claude,
@@ -3265,6 +3293,8 @@ mod federation_tests {
             ("pane.stream.close", Denied),
             ("pane.input.stream", Denied),
             ("pane.input.stream.open", Denied),
+            ("gram.upload.stream", Denied),
+            ("gram.upload.stream.open", Denied),
             ("pane.report_agent", Denied),
             ("pane.report_agent_session", Denied),
             ("pane.report_metadata", Denied),

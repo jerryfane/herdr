@@ -12835,6 +12835,11 @@
               "default": false,
               "type": "boolean"
             },
+            "gram_upload_stream": {
+              "default": false,
+              "description": "The daemon serves `gram.upload.stream`, uploading a whole file over one\nconnection instead of one connection per chunk. Clients feature-detect this\nand otherwise fall back to per-chunk `gram.upload_chunk`.",
+              "type": "boolean"
+            },
             "live_handoff": {
               "type": "boolean"
             },
