@@ -352,10 +352,23 @@ enum PromptObservationVerdict {
 ///
 /// `composer_observable` is what separates the two negative verdicts, and the
 /// distinction is the whole point of this function. `Stalled` means the daemon
-/// could see the composer and saw no evidence either way. `Unverifiable` means it
-/// had no composer to look at — no `[composer]` region for this agent, or screen
-/// detection skipped for this pane — so it never had the instrument that
-/// `Unsubmitted` requires.
+/// LOCATED and READ the composer region and saw no evidence either way.
+/// `Unverifiable` means it had no composer to look at — no loadable manifest for
+/// this agent, or a manifest with no `[composer]` section — so it never had the
+/// instrument that `Unsubmitted` requires.
+///
+/// Deliberately NOT claimed here: that a pane whose SCREEN DETECTION is skipped
+/// reports `Unverifiable`. It does not. `screen_detection_skipped` gates STATE
+/// detection only; the composer is built unconditionally, so a hook-authority pane
+/// still yields a readable region and still reports `Stalled`.
+///
+/// One residual class, named rather than hidden: `ComposerRegionEvidence::Missing`
+/// — a manifest that DOES declare `[composer]` whose region cannot be located on
+/// screen (alternate screen buffer, a transcript view, manifest drift) — counts as
+/// observable and reports `Stalled`. That is a narrower instance of the same
+/// conflation this function fixes. It is left as-is deliberately: folding it into
+/// the unobservable set would report `Unverifiable` for a pane the daemon can
+/// normally read, which would hide a real stall behind a drifted region.
 ///
 /// Collapsing the two is how a supervisor ends up escalating on the absence of an
 /// instrument: `agent_prompt_stalled` is honest about a pane whose disposition is
@@ -415,6 +428,9 @@ fn observe_prompt_effect(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
+    // Latched across polls: once the daemon has had a composer to look at, a later
+    // sample that momentarily reports none must not downgrade the verdict.
+    let mut composer_ever_observable = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -450,11 +466,23 @@ fn observe_prompt_effect(
             composer_clear_observed = true;
         }
         // Whether the daemon has a composer to look at AT ALL for this pane. Its
-        // absence is structural — no `[composer]` region for the agent, or screen
-        // detection skipped — not a negative observation, and it must not be
-        // reported as one.
-        let composer_observable = current.composer.evidence.region
-            != crate::api::schema::ComposerRegionEvidence::Unavailable;
+        // absence is structural — no loadable manifest for the agent, or a manifest
+        // with no `[composer]` section — not a negative observation, and it must not
+        // be reported as one.
+        //
+        // LATCHED, mirroring `composer_observed` above. Recomputing it from the final
+        // sample alone meant a pane that was observable for the whole window reported
+        // `unverifiable` if its LAST `agent_get` happened to return a default composer
+        // (momentarily unresolved agent label, or a failed runtime lookup reaching
+        // `unwrap_or_default()`). That loses the stronger "we looked and saw nothing"
+        // signal in the one direction that makes the answer look more benign, which is
+        // the failure this whole distinction exists to prevent.
+        if current.composer.evidence.region
+            != crate::api::schema::ComposerRegionEvidence::Unavailable
+        {
+            composer_ever_observable = true;
+        }
+        let composer_observable = composer_ever_observable;
 
         match classify_prompt_observation(
             initially_working,
@@ -1481,6 +1509,64 @@ mod tests {
         assert!(
             message.contains("do not treat this as non-delivery"),
             "the verdict must tell the caller what it may not conclude: {message}"
+        );
+    }
+
+    /// Observability is LATCHED: a pane the daemon could read for most of the window
+    /// must not be downgraded to `unverifiable` because the FINAL sample happened to
+    /// report no composer (an unresolved agent label or a failed runtime lookup both
+    /// reach `unwrap_or_default()`). Without the latch the verdict flips on the last
+    /// poll alone, and it flips toward the more benign answer — losing the stronger
+    /// "we looked and saw nothing" signal in exactly the direction that hides a real
+    /// stall.
+    #[test]
+    fn prompt_agent_keeps_stalled_when_only_the_last_sample_is_unobservable() {
+        let observable = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Empty,
+            None,
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let blind = test_agent(crate::api::schema::AgentStatus::Idle, 10);
+        assert_eq!(
+            observable.composer.evidence.region,
+            crate::api::schema::ComposerRegionEvidence::Empty,
+            "first sample must be observable, or this pins nothing"
+        );
+        assert_eq!(
+            blind.composer.evidence.region,
+            crate::api::schema::ComposerRegionEvidence::Unavailable,
+            "last sample must be unobservable, or this pins nothing"
+        );
+
+        // The window must span SEVERAL polls, with the DECIDING sample blind:
+        // `CONNECTION_POLL_INTERVAL` is 100ms and the verdict is taken on whichever
+        // sample is in hand once the deadline passes, so a cap of 0 (what the other
+        // negative-verdict tests use) would decide on the very first in-loop sample
+        // and could not exercise a latch at all. 1200ms leaves room for several polls
+        // even on a loaded box.
+        //
+        // The queue feeds `AgentGet`s in order and then repeats `prompted` forever
+        // (`pop_front().unwrap_or_else(|| prompted.clone())`). The FIRST `AgentGet` is
+        // the pre-prompt snapshot, so two observable entries are needed to put one
+        // observable sample inside the loop; every later poll — including the one that
+        // decides — is blind.
+        let response = run_prompt_harness(
+            "latched",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            1200,
+            PromptHarness {
+                agents: VecDeque::from([observable.clone(), observable]),
+                prompted: blind,
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_stalled",
+            "the daemon DID have an instrument during the window; \
+             a blind final sample must not rewrite that into 'never had one'"
         );
     }
 
