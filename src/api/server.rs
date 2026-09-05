@@ -49,13 +49,11 @@ mod pane_input_stream;
 mod pane_output_stream;
 mod stream_read;
 
-/// Whether a `gram.upload.stream` channel currently owns this `upload_id`. The
-/// per-chunk `gram.upload_chunk` handler consults this to refuse a second writer:
-/// an `offset: 0` chunk truncates the staging file, which would discard bytes a
-/// live stream has already acked.
-pub(crate) fn upload_id_is_streaming(upload_id: &str) -> bool {
-    gram_upload_stream::upload_is_streaming(upload_id)
-}
+/// The single-writer claim on a gram `upload_id`, held by every writer:
+/// `gram.upload.stream` for a channel's lifetime, `gram.upload_chunk` for one
+/// append, and `finalize` for its size/hash/rename sequence. Acquiring it IS the
+/// check — a predicate consulted before writing leaves the window open.
+pub(crate) use gram_upload_stream::UploadClaim;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);

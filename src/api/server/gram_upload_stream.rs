@@ -54,35 +54,34 @@ const UPLOAD_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// stream's 30s would fail a legitimate upload on a weak link.
 const UPLOAD_FRAME_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Upload ids with a live streaming channel. `append_chunk` is read-then-write
-/// with no lock, and the app loop no longer serializes chunks, so two writers on
-/// one `upload_id` could interleave. The offset rule makes that LOUD rather than
-/// silent, but a second writer is always a client bug — refuse it. Consulted by
-/// BOTH writers: a second stream is refused at open here, and a concurrent
-/// per-chunk `gram.upload_chunk` is refused by the app handler through
-/// [`upload_is_streaming`] (an `offset: 0` chunk would otherwise TRUNCATE bytes
-/// this channel has already acked).
+/// Upload ids with a live writer. `append_chunk` is read-then-write with no lock
+/// and `finalize` is read-then-hash-then-rename with no lock, and the app loop no
+/// longer serializes either against a stream, so two writers on one `upload_id`
+/// could interleave.
+///
+/// Held by ALL THREE writers, each through [`UploadClaim`]: the streaming channel
+/// for its whole lifetime, `gram.upload_chunk` for one append, and `finalize` for
+/// the size/hash/rename sequence. A predicate would not do for the latter two —
+/// checking and then writing leaves the window open — so the claim IS the check.
 static STREAMING_UPLOADS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Whether a streaming channel currently owns this `upload_id`.
-pub(super) fn upload_is_streaming(upload_id: &str) -> bool {
-    STREAMING_UPLOADS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(upload_id)
-}
-
-/// Holds the single-writer claim on one `upload_id` for the channel's lifetime.
+/// Holds the single-writer claim on one `upload_id` for as long as the value lives.
 /// `Drop` releases it, so every exit path — EOF, frame error, timeout, server
-/// shutdown, a write failure to a vanished peer — frees the id.
-struct UploadClaim {
+/// shutdown, a write failure to a vanished peer, an unwind — frees the id.
+///
+/// ORDERING GUARANTEE, relied on by clients: in `serve_with_open_timeout` the claim
+/// is a body local and the connection is a parameter, so Rust drops the claim BEFORE
+/// the socket. A client that reads its upload connection to EOF therefore knows the
+/// claim is already gone, and can attach immediately. Closing its own write half is
+/// NOT sufficient — the claim lives until the serve thread observes that EOF.
+pub(crate) struct UploadClaim {
     upload_id: String,
 }
 
 impl UploadClaim {
-    /// `None` when another channel already holds this `upload_id`.
-    fn acquire(upload_id: &str) -> Option<Self> {
+    /// `None` when another writer already holds this `upload_id`.
+    pub(crate) fn acquire(upload_id: &str) -> Option<Self> {
         let mut live = STREAMING_UPLOADS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -913,6 +912,54 @@ mod tests {
             serde_json::from_str(&app.handle_api_request(post("up-finalize"))).unwrap();
         assert_eq!(posted["result"]["message"]["file"]["size"], 4);
         assert!(!staging_path("up-finalize").exists());
+    }
+
+    /// The synchronization point a client needs, pinned: the claim is released
+    /// BEFORE the connection, so once the client's read half reports EOF the upload
+    /// can be attached immediately. Closing its own write half is NOT enough — the
+    /// claim lives until the serve thread observes that EOF — which is why the
+    /// refusal message names reading to EOF rather than "closing".
+    ///
+    /// The guarantee is a drop-order property (`_claim` is a body local, `stream` is
+    /// a parameter), so it is exactly the kind of thing a later refactor breaks
+    /// silently.
+    #[cfg(unix)]
+    #[test]
+    fn releases_the_claim_before_the_client_sees_eof() {
+        let _config = isolate_config_dir("claimorder");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-order");
+        write_line(&mut client, &frame(1, 0, b"done"));
+        let ack: UploadAck = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert!(ack.ok);
+
+        // While the channel is live the id is claimed, so no other writer can take it.
+        assert!(
+            UploadClaim::acquire("up-order").is_none(),
+            "a live channel must hold its claim"
+        );
+
+        // Ask the daemon to end the upload, then read until EOF — the signal a real
+        // client waits on before attaching.
+        let mut reader = BufReader::new(&mut client);
+        running.store(false, Ordering::Relaxed);
+        let mut trailing = String::new();
+        reader.read_line(&mut trailing).unwrap();
+        assert!(trailing.is_empty(), "expected EOF, got: {trailing}");
+
+        // EOF observed => the claim is already gone, so an attach cannot be refused.
+        let claim = UploadClaim::acquire("up-order");
+        assert!(
+            claim.is_some(),
+            "the claim must be released before the socket the client reads"
+        );
+        drop(claim);
+
+        assert!(server_thread.join().unwrap().is_ok());
     }
 
     /// A client that writes bytes and NEVER a newline is the only thing that can grow
