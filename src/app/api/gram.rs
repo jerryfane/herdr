@@ -230,11 +230,20 @@ impl App {
         // Store order is oldest-first; clients want newest-first.
         let messages: Vec<GramMessageInfo> =
             filtered.into_iter().rev().map(gram_item_to_info).collect();
+        let store_id = crate::persist::machine::get_or_create();
+        let digest = list_digest(&store_id, &messages);
+        // Conditional fetch. The digest covers the store id as well as the messages, so
+        // a client that has been pointed at a DIFFERENT store can never be told
+        // "unchanged" while holding another store's list.
+        if params.if_unchanged_digest.as_deref() == Some(digest.as_str()) {
+            return encode_success(id, ResponseResult::GramListUnchanged { store_id, digest });
+        }
         encode_success(
             id,
             ResponseResult::GramList {
                 messages,
-                store_id: crate::persist::machine::get_or_create(),
+                store_id,
+                digest,
             },
         )
     }
@@ -824,6 +833,28 @@ fn filter_owner_view(items: &[GramItem], only_queue: bool, unread_only: bool) ->
         .collect()
 }
 
+/// Fingerprint of a `gram.list` answer, for conditional polling.
+///
+/// Hashed over the SERIALIZED payload rather than a hand-picked set of fields: the
+/// digest then changes exactly when the reply would differ, and a new field on
+/// `GramMessageInfo` cannot silently fall outside it. The store id is mixed in so a
+/// client pointed at a different store is never told "unchanged" for a list it does
+/// not hold.
+fn list_digest(store_id: &str, messages: &[GramMessageInfo]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(store_id.as_bytes());
+    hasher.update(b"\0");
+    match serde_json::to_vec(messages) {
+        Ok(bytes) => hasher.update(&bytes),
+        // Cannot happen for these types, and must not be papered over with a
+        // constant: mix in the error so the digest is at least unique per failure
+        // rather than equal across unrelated answers.
+        Err(err) => hasher.update(format!("serialize_error:{err}").as_bytes()),
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1163,139 @@ mod tests {
                 .unwrap_or(""),
             store_id
         );
+
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The digest must be a function of the ANSWER, so an unchanged store yields the
+    /// same fingerprint on every call. Without this the conditional poll never matches
+    /// and the whole store ships every 6 seconds, which is the bug being fixed.
+    #[test]
+    fn list_digest_is_stable_for_the_same_answer() {
+        let messages = vec![gram_item_to_info(owner_shared("g1"))];
+        assert_eq!(
+            list_digest("store-1", &messages),
+            list_digest("store-1", &messages)
+        );
+    }
+
+    /// ...and a function of the CONTENT, so any change the client would render also
+    /// changes the digest. Hashing the serialized payload is what buys this for every
+    /// field at once, including ones added later.
+    #[test]
+    fn list_digest_changes_with_content_and_with_the_store() {
+        let base = vec![gram_item_to_info(owner_shared("g1"))];
+        let mut read = owner_shared("g1");
+        read.read_by_owner = false;
+        let flipped = vec![gram_item_to_info(read)];
+        let two = vec![
+            gram_item_to_info(owner_shared("g1")),
+            gram_item_to_info(owner_shared("g2")),
+        ];
+
+        let digest = list_digest("store-1", &base);
+        assert_ne!(
+            digest,
+            list_digest("store-1", &flipped),
+            "a read flag change"
+        );
+        assert_ne!(digest, list_digest("store-1", &two), "a new message");
+        assert_ne!(digest, list_digest("store-2", &base), "a different store");
+    }
+
+    /// End to end through the real dispatch: a matching digest answers
+    /// `gram_list_unchanged` and carries NO messages, and a stale one answers in full.
+    /// The "no messages" half is the point — an answer that still shipped the list
+    /// would save nothing.
+    #[test]
+    fn conditional_list_answers_unchanged_only_while_the_digest_matches() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-gram-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            false,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let list = |app: &mut App, digest: Option<&str>| -> serde_json::Value {
+            let raw = app.handle_gram_list(
+                "req".to_string(),
+                GramListParams {
+                    caller_pane_id: None,
+                    only_queue: false,
+                    unread_only: false,
+                    if_unchanged_digest: digest.map(str::to_string),
+                },
+            );
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        // Seed one message so the answer is not trivially empty.
+        app.handle_gram_send(
+            "seed".to_string(),
+            GramSendParams {
+                text: "ping".to_string(),
+                caller_pane_id: None,
+                from: Some("tester".to_string()),
+                file: None,
+            },
+        );
+
+        let full = list(&mut app, None);
+        assert_eq!(full["result"]["type"], "gram_list");
+        assert_eq!(full["result"]["messages"].as_array().unwrap().len(), 1);
+        let digest = full["result"]["digest"].as_str().unwrap().to_string();
+
+        // Omitting the parameter must ALWAYS produce a full list: an old client that
+        // knows nothing about digests can never be answered "unchanged".
+        assert_eq!(list(&mut app, None)["result"]["type"], "gram_list");
+
+        let unchanged = list(&mut app, Some(&digest));
+        assert_eq!(unchanged["result"]["type"], "gram_list_unchanged");
+        assert!(
+            unchanged["result"]["messages"].is_null(),
+            "an unchanged answer must not carry the list it just saved sending"
+        );
+        assert_eq!(unchanged["result"]["digest"], digest.as_str());
+
+        // A stale digest is answered in full.
+        let stale = list(&mut app, Some("not-the-digest"));
+        assert_eq!(stale["result"]["type"], "gram_list");
+        assert_eq!(stale["result"]["messages"].as_array().unwrap().len(), 1);
+
+        // And a real change invalidates the digest the client holds.
+        app.handle_gram_send(
+            "seed-2".to_string(),
+            GramSendParams {
+                text: "second".to_string(),
+                caller_pane_id: None,
+                from: Some("tester".to_string()),
+                file: None,
+            },
+        );
+        let after = list(&mut app, Some(&digest));
+        assert_eq!(
+            after["result"]["type"], "gram_list",
+            "a store that moved must not be reported unchanged"
+        );
+        assert_eq!(after["result"]["messages"].as_array().unwrap().len(), 2);
 
         match prev_xdg {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),

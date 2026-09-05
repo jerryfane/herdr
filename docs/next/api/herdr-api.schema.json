@@ -2673,6 +2673,13 @@
                 "null"
               ]
             },
+            "if_unchanged_digest": {
+              "description": "Conditional fetch: the `digest` from a previous `gram.list` answer. When it\nstill matches, the reply is `gram_list_unchanged` — store id and digest only,\nno messages — so a polling client pays a few hundred bytes instead of the whole\nstore. The app polls every 6s over one SSH channel, where a full owner view is\n~900 KB for ~870 messages; re-sending that unchanged payload is what made the\ninbox slow to open and starved the channel everything else shares.\n\nDeliberately a DIGEST rather than a `limit`/cursor: truncating the window would\nsilently narrow search, Read-all and the unread badge, all of which read the\nfull list. Clients keep the complete list and skip only the transfer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "only_queue": {
               "default": false,
               "description": "Restrict to the shared, still-ungrabbed queue (either audience).",
@@ -12696,6 +12703,10 @@
             },
             {
               "properties": {
+                "digest": {
+                  "description": "Fingerprint of THIS answer. Send it back as `if_unchanged_digest` to make\nthe next poll conditional. Computed over the serialized payload itself, so\nit changes exactly when the answer would differ — there is no field list to\nkeep in step as `GramMessageInfo` grows.",
+                  "type": "string"
+                },
                 "messages": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
@@ -12714,7 +12725,29 @@
               "required": [
                 "type",
                 "messages",
-                "store_id"
+                "store_id",
+                "digest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`gram.list` with an `if_unchanged_digest` that still matches: nothing has\nchanged, so the messages are omitted entirely. A client holding that digest\nalready has the list; one that never sent the parameter never receives this.",
+              "properties": {
+                "digest": {
+                  "type": "string"
+                },
+                "store_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "gram_list_unchanged",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "store_id",
+                "digest"
               ],
               "type": "object"
             },
