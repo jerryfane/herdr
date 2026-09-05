@@ -558,6 +558,71 @@ mod tests {
         assert!(api_rx.try_recv().is_err(), "no frame reached the app loop");
     }
 
+    /// The frame cap is INCLUSIVE, matching the byte-at-a-time reader the other
+    /// streams use: a line of exactly `MAX_UPLOAD_FRAME_BYTES` (plus its newline) is
+    /// served, one byte more is refused. Worth pinning in the ACCEPT direction — a
+    /// cap that counts the terminator is silently one byte tighter than the reference,
+    /// and an over-cap line closes the channel with no protocol error line, which is
+    /// indistinguishable from a dropped connection.
+    ///
+    /// The length is padded with an ignored field rather than payload: 1 MiB of base64
+    /// would decode past `MAX_CHUNK_BYTES` and be refused for a different reason.
+    #[cfg(unix)]
+    #[test]
+    fn accepts_a_frame_at_the_cap_and_refuses_one_byte_more() {
+        let _config = isolate_config_dir("framecap");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-framecap");
+
+        // Pad the frame to an exact wire length with a field the daemon ignores.
+        let padded = |seq: u64, offset: u64, total: usize| {
+            let head = format!(
+                r#"{{"seq":{seq},"offset":{offset},"data_base64":"{}","pad":""#,
+                base64::engine::general_purpose::STANDARD.encode(b"hi")
+            );
+            let tail = r#""}"#;
+            let pad = total - head.len() - tail.len();
+            format!("{head}{}{tail}", "x".repeat(pad))
+        };
+
+        write_line(&mut client, &padded(1, 0, MAX_UPLOAD_FRAME_BYTES));
+        let ack: UploadAck = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert_eq!(
+            (ack.seq, ack.ok),
+            (1, true),
+            "a frame AT the cap must be served"
+        );
+
+        // One byte past the cap: the read fails, so the channel closes without a
+        // protocol line rather than acking.
+        write_line(&mut client, &padded(2, 2, MAX_UPLOAD_FRAME_BYTES + 1));
+        let mut reader = BufReader::new(&mut client);
+        let mut trailing = String::new();
+        reader.read_line(&mut trailing).unwrap();
+        assert!(
+            trailing.is_empty(),
+            "an over-cap frame was served: {trailing}"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        // The over-cap read is an `InvalidData` error, propagated by `serve_frames`,
+        // so the connection ends in Err rather than the clean EOF an upload gets.
+        let outcome = server_thread.join().unwrap();
+        let err = outcome.expect_err("an over-cap frame must fail the connection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("upload frame is too large"),
+            "got: {err}"
+        );
+
+        // Only the in-cap frame's payload landed.
+        assert_eq!(staged_bytes("up-framecap"), b"hi");
+    }
+
     /// The round-trip claim, measured: 8 MiB uploads as 16 frames of 512 KiB over
     /// a SINGLE `handle_connection` call. A per-chunk implementation cannot
     /// satisfy this — each chunk would need its own connection and its own app

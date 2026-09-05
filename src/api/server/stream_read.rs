@@ -218,12 +218,18 @@ fn take_line(pending: &mut Vec<u8>) -> std::io::Result<Option<String>> {
 /// the buffered reader RETURNS, not only on the unterminated remainder: a frame
 /// whose newline lands in the same read that pushes it past `max_bytes` never
 /// leaves an over-cap remainder behind to catch.
+///
+/// The terminator is excluded from the measurement, because `take_line` returns it
+/// and the byte-at-a-time [`read_line`] counts only non-newline bytes. Measuring
+/// the whole line would make this reader one byte tighter than the reference — and
+/// tighter than the sibling remainder check in the same function.
 fn oversize_or_line(
     line: String,
     max_bytes: usize,
     label: &str,
 ) -> std::io::Result<Option<String>> {
-    if line.len() > max_bytes {
+    let payload = line.strip_suffix('\n').unwrap_or(&line).len();
+    if payload > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{label} is too large"),
