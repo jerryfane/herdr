@@ -79,6 +79,18 @@ pub struct GramListParams {
     /// Owner view only: restrict to unread agent->owner messages.
     #[serde(default)]
     pub unread_only: bool,
+    /// Conditional fetch: the `digest` from a previous `gram.list` answer. When it
+    /// still matches, the reply is `gram_list_unchanged` — store id and digest only,
+    /// no messages — so a polling client pays a few hundred bytes instead of the whole
+    /// store. The app polls every 6s over one SSH channel, where a full owner view is
+    /// ~900 KB for ~870 messages; re-sending that unchanged payload is what made the
+    /// inbox slow to open and starved the channel everything else shares.
+    ///
+    /// Deliberately a DIGEST rather than a `limit`/cursor: truncating the window would
+    /// silently narrow search, Read-all and the unread badge, all of which read the
+    /// full list. Clients keep the complete list and skip only the transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_unchanged_digest: Option<String>,
 }
 
 /// `gram.grab` — an agent claims a shared-queue item. The claim is first-wins and

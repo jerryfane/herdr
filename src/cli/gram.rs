@@ -287,6 +287,9 @@ fn gram_list(args: &[String]) -> std::io::Result<i32> {
             caller_pane_id,
             only_queue: parsed.only_queue,
             unread_only: parsed.unread_only,
+            // The CLI holds no previous list, so it has nothing to validate a digest
+            // against and always asks unconditionally.
+            if_unchanged_digest: None,
         }),
     })?;
     // Redact credential-looking bodies before printing so a routine `gram list`

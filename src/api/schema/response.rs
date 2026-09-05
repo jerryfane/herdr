@@ -312,6 +312,18 @@ pub enum ResponseResult {
         /// responding daemon's `machine` id). Present even when `messages` is empty,
         /// so a reader can tell which store it is looking at when it appears empty.
         store_id: String,
+        /// Fingerprint of THIS answer. Send it back as `if_unchanged_digest` to make
+        /// the next poll conditional. Computed over the serialized payload itself, so
+        /// it changes exactly when the answer would differ — there is no field list to
+        /// keep in step as `GramMessageInfo` grows.
+        digest: String,
+    },
+    /// `gram.list` with an `if_unchanged_digest` that still matches: nothing has
+    /// changed, so the messages are omitted entirely. A client holding that digest
+    /// already has the list; one that never sent the parameter never receives this.
+    GramListUnchanged {
+        store_id: String,
+        digest: String,
     },
     GramGrabbed {
         message: GramMessageInfo,
