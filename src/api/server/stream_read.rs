@@ -131,10 +131,16 @@ impl LineReader {
         }
     }
 
-    /// Next complete line, or `None` on peer close / channel stop. Semantics
-    /// match [`read_line`]: the deadlines cover a frame that has STARTED
-    /// arriving, an idle wait between frames is unbounded, and a partial line
-    /// at EOF is discarded with the close.
+    /// Next complete line, or `None` on peer close / channel stop.
+    ///
+    /// `idle_timeout`/`total_timeout` cover a frame that has STARTED arriving, as in
+    /// [`read_line`]. `between_frames_timeout` covers the wait BEFORE a frame starts:
+    /// `None` leaves it unbounded (right for a channel held open for a human's whole
+    /// session), `Some` bounds it (right for a transfer, where a channel that has
+    /// gone silent is dead and is holding resources — for gram uploads, the
+    /// process-wide single-writer claim on its `upload_id`).
+    ///
+    /// A partial line at EOF is discarded with the close.
     pub(super) fn read_line(
         &mut self,
         stream: &mut ApiStream,
@@ -143,6 +149,7 @@ impl LineReader {
         max_bytes: usize,
         idle_timeout: Duration,
         total_timeout: Duration,
+        between_frames_timeout: Option<Duration>,
         label: &str,
     ) -> std::io::Result<Option<String>> {
         // A line already buffered from a previous over-read goes through the same cap
@@ -161,9 +168,10 @@ impl LineReader {
         let pending = &mut self.pending;
         let scratch = &mut self.scratch;
         with_timed_reads(stream, |stream, mut wait| {
-            // A frame already half-received is on the clock from the first read.
+            // A frame already half-received is on the clock from the first read; an
+            // idle channel is on the between-frames clock from now.
             let mut total_deadline = (!pending.is_empty()).then(|| Instant::now() + total_timeout);
-            let mut idle_deadline = None;
+            let mut idle_deadline = between_frames_timeout.map(|gap| Instant::now() + gap);
 
             loop {
                 if !stream_is_running(running, stream_active) {

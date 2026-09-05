@@ -53,6 +53,19 @@ const UPLOAD_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Total budget for one frame — 1 MiB at ~100 kbit/s is ~84s, so the input
 /// stream's 30s would fail a legitimate upload on a weak link.
 const UPLOAD_FRAME_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Budget for the wait BETWEEN frames, i.e. for a channel that has gone silent.
+///
+/// The input stream leaves this unbounded on purpose — it is held open for a
+/// human's whole session — but an upload is a transfer: a client with more bytes to
+/// send sends them. An unbounded gap here is not merely an idle thread and fd, it
+/// pins the process-wide single-writer claim on that `upload_id`, so the upload
+/// could never be attached and no other writer could ever take the id. That is
+/// reachable without malice: a half-open TCP after a cell handoff, or a client whose
+/// own close deadline expires while its SSH channel stays up.
+///
+/// Generous against a stalled uplink between frames, and far below the 24h staging
+/// sweep that would otherwise be the only reclaimer.
+const UPLOAD_IDLE_BETWEEN_FRAMES: Duration = Duration::from_secs(60);
 
 /// Upload ids with a live writer. `append_chunk` is read-then-write with no lock
 /// and `finalize` is read-then-hash-then-rename with no lock, and the app loop no
@@ -67,12 +80,13 @@ static STREAMING_UPLOADS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Holds the single-writer claim on one `upload_id` for as long as the value lives.
-/// `Drop` releases it, so every exit path — EOF, frame error, timeout, server
-/// shutdown, a write failure to a vanished peer, an unwind — frees the id.
+/// `Drop` releases it, so every exit path frees the id: EOF, a frame error, a
+/// per-frame timeout, the [`UPLOAD_IDLE_BETWEEN_FRAMES`] silence budget, server
+/// shutdown, a write failure to a vanished peer, or an unwind.
 ///
-/// ORDERING GUARANTEE, relied on by clients: in `serve_with_open_timeout` the claim
-/// is a body local and the connection is a parameter, so Rust drops the claim BEFORE
-/// the socket. A client that reads its upload connection to EOF therefore knows the
+/// ORDERING GUARANTEE, relied on by clients: in `serve_with_timeouts` the claim is a
+/// body local and the connection is a parameter, so Rust drops the claim BEFORE the
+/// socket. A client that reads its upload connection to EOF therefore knows the
 /// claim is already gone, and can attach immediately. Closing its own write half is
 /// NOT sufficient — the claim lives until the serve thread observes that EOF.
 pub(crate) struct UploadClaim {
@@ -134,23 +148,25 @@ pub(super) fn serve(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    serve_with_open_timeout(
+    serve_with_timeouts(
         stream,
         request_id,
         params,
         api_tx,
         running,
         APP_RESPONSE_TIMEOUT,
+        UPLOAD_IDLE_BETWEEN_FRAMES,
     )
 }
 
-fn serve_with_open_timeout(
+fn serve_with_timeouts(
     mut stream: ApiStream,
     request_id: String,
     params: GramUploadStreamParams,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     open_timeout: Duration,
+    between_frames: Duration,
 ) -> std::io::Result<()> {
     let upload_id = params.upload_id.clone();
     let stream_active = Arc::new(AtomicBool::new(true));
@@ -207,6 +223,7 @@ fn serve_with_open_timeout(
         &upload_id,
         running,
         &stream_active,
+        between_frames,
     );
     stream_active.store(false, Ordering::Release);
     result
@@ -218,6 +235,7 @@ fn serve_frames(
     upload_id: &str,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
+    between_frames: Duration,
 ) -> std::io::Result<()> {
     let mut last_seq: Option<u64> = None;
     // One reader for the channel: it holds the tail of a partially received
@@ -232,6 +250,7 @@ fn serve_frames(
             MAX_UPLOAD_FRAME_BYTES,
             UPLOAD_FRAME_IDLE_TIMEOUT,
             UPLOAD_FRAME_TOTAL_TIMEOUT,
+            Some(between_frames),
             "upload frame",
         )?
         else {
@@ -914,18 +933,23 @@ mod tests {
         assert!(!staging_path("up-finalize").exists());
     }
 
-    /// The synchronization point a client needs, pinned: the claim is released
-    /// BEFORE the connection, so once the client's read half reports EOF the upload
-    /// can be attached immediately. Closing its own write half is NOT enough — the
-    /// claim lives until the serve thread observes that EOF — which is why the
-    /// refusal message names reading to EOF rather than "closing".
+    /// The claim's lifetime, pinned in the two directions a test can pin
+    /// DETERMINISTICALLY: held while the channel is live, and released once the serve
+    /// thread has returned.
     ///
-    /// The guarantee is a drop-order property (`_claim` is a body local, `stream` is
-    /// a parameter), so it is exactly the kind of thing a later refactor breaks
-    /// silently.
+    /// It deliberately does NOT assert the stronger client-facing property — that the
+    /// claim is already free at the instant the client's read half reports EOF. That
+    /// property is real and rests on drop order (`_claim` is a body local, `stream` a
+    /// parameter, so the claim drops first), but an earlier version of this test
+    /// asserted it by racing the serve thread from the client, and measurement showed
+    /// it caught a deliberately swapped drop order only ~4% of the time (192/200 runs
+    /// passed while mutated). A test that green-lights the mutation it exists to catch
+    /// 96% of the time is worse than no test, because it reads as coverage. The
+    /// ordering is documented on `UploadClaim` instead; pinning it would need the
+    /// serve thread to record its own release-vs-close order, not a client race.
     #[cfg(unix)]
     #[test]
-    fn releases_the_claim_before_the_client_sees_eof() {
+    fn holds_the_claim_while_live_and_releases_it_when_the_channel_ends() {
         let _config = isolate_config_dir("claimorder");
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair();
@@ -937,29 +961,76 @@ mod tests {
         let ack: UploadAck = serde_json::from_str(&read_response_line(&mut client)).unwrap();
         assert!(ack.ok);
 
-        // While the channel is live the id is claimed, so no other writer can take it.
+        // Live channel: the id is claimed, so no other writer can take it.
         assert!(
             UploadClaim::acquire("up-order").is_none(),
             "a live channel must hold its claim"
         );
 
-        // Ask the daemon to end the upload, then read until EOF — the signal a real
-        // client waits on before attaching.
-        let mut reader = BufReader::new(&mut client);
+        drop(client);
         running.store(false, Ordering::Relaxed);
-        let mut trailing = String::new();
-        reader.read_line(&mut trailing).unwrap();
-        assert!(trailing.is_empty(), "expected EOF, got: {trailing}");
+        assert!(server_thread.join().unwrap().is_ok());
 
-        // EOF observed => the claim is already gone, so an attach cannot be refused.
+        // Serve thread returned: the claim is free, so the upload can be attached.
         let claim = UploadClaim::acquire("up-order");
         assert!(
             claim.is_some(),
-            "the claim must be released before the socket the client reads"
+            "the claim must be released when the channel ends"
         );
-        drop(claim);
+    }
 
-        assert!(server_thread.join().unwrap().is_ok());
+    /// A channel that opens and then goes SILENT must be reaped on the
+    /// between-frames budget. Without that budget nothing bounds it — the per-frame
+    /// deadlines only start at a frame's first byte — so its claim would pin the
+    /// `upload_id` until the daemon restarted, and that upload could never be
+    /// attached by anyone. Reachable without malice: a half-open TCP, or a client
+    /// whose own close deadline expires while its SSH channel stays up.
+    #[cfg(unix)]
+    #[test]
+    fn reaps_a_channel_that_goes_silent_between_frames() {
+        let _config = isolate_config_dir("silent");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+
+        // A 300 ms silence budget stands in for the shipped 60 s: the bound is only
+        // provable if a test can shorten it, so this drives `serve_with_timeouts`
+        // directly, the same way the open-timeout tests do.
+        let server_thread = std::thread::spawn(move || {
+            serve_with_timeouts(
+                ApiStream::Local(server),
+                "up_silent".to_string(),
+                GramUploadStreamParams {
+                    upload_id: "up-silent".into(),
+                },
+                &api_tx,
+                &server_running,
+                APP_RESPONSE_TIMEOUT,
+                Duration::from_millis(300),
+            )
+        });
+
+        // Answer the open handshake, consume the ack, then send NOTHING.
+        respond_ok(api_rx.blocking_recv().unwrap());
+        let ack: SuccessResponse = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert_eq!(ack.result, ResponseResult::Ok {});
+
+        let started = std::time::Instant::now();
+        let outcome = server_thread.join().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(outcome.is_err(), "a silent channel must be reaped");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "reaping took {elapsed:?} against a 300 ms budget"
+        );
+        assert!(
+            UploadClaim::acquire("up-silent").is_some(),
+            "the reaped channel must release its claim"
+        );
+        drop(client);
+        let _ = std::fs::remove_file(path);
     }
 
     /// A client that writes bytes and NEVER a newline is the only thing that can grow

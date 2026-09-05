@@ -625,13 +625,19 @@ fn attach_file(
     // against appends: before streaming, every chunk ran on this single-threaded app
     // loop, so a finalize could not overlap one. Now appends run on the API server
     // thread, and `finalize` reads the size, hashes the file, then renames it — so a
-    // frame landing mid-sequence records a sha256 taken over MORE bytes than the
-    // recorded size, and an append after the rename lands INSIDE the finalized
-    // message file. Both are silent corruption of the integrity fields a client
-    // verifies a download against.
+    // frame landing between the size read and the hash records a sha256 taken over
+    // MORE bytes than the recorded size. That is silent corruption of the integrity
+    // fields a client verifies a download against, and it is the hazard this lock
+    // exists for.
     //
-    // So the claim is HELD ACROSS the whole sequence, not merely consulted before it:
-    // a check that releases the lock and then finalizes still admits a stream that
+    // A frame arriving after the RENAME is NOT part of it: staging and message paths
+    // are `gram-files/.staging/<upload_id>` and `gram-files/<message_id>/<name>`, and
+    // the second is not derivable from an upload_id, so a late append creates a fresh
+    // orphaned staging file rather than writing into the attachment. Do not widen or
+    // narrow this lock on the strength of that; the size/hash window is the reason.
+    //
+    // The claim is HELD ACROSS the whole sequence, not merely consulted before it: a
+    // check that releases the lock and then finalizes still admits a stream that
     // opens in between, which is the same corruption with a narrower window.
     let Some(_claim) = crate::api::UploadClaim::acquire(&upload.upload_id) else {
         return Err(encode_error(
