@@ -136,6 +136,19 @@ pub struct GramUploadChunkParams {
     pub data_base64: String,
 }
 
+/// `gram.upload.stream` — open a streaming upload channel for one file.
+///
+/// The per-chunk `gram.upload_chunk` method costs one API connection per chunk, and
+/// over the app's SSH transport one process spawn per chunk (a 100 MB file is ~2100).
+/// This opens ONE connection, acks it, then reads newline-delimited chunk frames on
+/// the same connection until EOF. Chunks still land through `gram_files::append_chunk`
+/// under `upload_id`, and the file is still attached by passing the same `upload_id`
+/// in a later `gram.send`/`gram.post` `file` — so nothing downstream changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramUploadStreamParams {
+    pub upload_id: String,
+}
+
 /// `gram.get_file` — download the file attached to a message. The bytes come back
 /// inline as base64 in one reply (the response path is not size-capped). The owner
 /// (no `caller_pane_id`) may download any file; an agent supplies its

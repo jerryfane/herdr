@@ -40,7 +40,7 @@ use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
     GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileParams,
     GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo, GramPostParams,
-    GramSendParams, GramUploadChunkParams, ResponseResult,
+    GramSendParams, GramUploadChunkParams, GramUploadStreamParams, ResponseResult,
 };
 use crate::app::App;
 use crate::persist::gram::{
@@ -403,6 +403,20 @@ impl App {
         if self.no_session {
             return gram_unavailable(id);
         }
+        // Single writer per upload_id, and the CLAIM is the check: a predicate read
+        // before appending would leave the window open, since a stream can open
+        // between the read and the write. A live `gram.upload.stream` channel appends
+        // on the server thread with no lock, and an `offset: 0` chunk here would
+        // TRUNCATE the staging file, discarding bytes that channel already acked. The
+        // offset rule would make that loud rather than silent, but a second writer on
+        // one upload is always a client bug: refuse it. Held only for this append.
+        let Some(_claim) = crate::api::UploadClaim::acquire(&params.upload_id) else {
+            return encode_error(
+                id,
+                "upload_in_progress",
+                "another writer owns this upload_id",
+            );
+        };
         let bytes = match base64::engine::general_purpose::STANDARD
             .decode(params.data_base64.as_bytes())
         {
@@ -416,6 +430,21 @@ impl App {
             }
             Err(err) => encode_error(id, "gram_file_error", err.to_string()),
         }
+    }
+
+    /// Validates a streaming upload before the server thread starts reading frames.
+    /// `no_session` is the ONLY app-owned state the per-chunk handler consults; every
+    /// other step (base64 decode, `append_chunk`) is pure filesystem and runs on the
+    /// server thread, so this is the whole app-side cost of a streamed upload.
+    pub(super) fn handle_gram_upload_stream_open(
+        &mut self,
+        id: String,
+        _params: GramUploadStreamParams,
+    ) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        encode_success(id, ResponseResult::Ok {})
     }
 
     pub(super) fn handle_gram_get_file(&mut self, id: String, params: GramGetFileParams) -> String {
@@ -592,6 +621,35 @@ fn attach_file(
     if let Some(err) = validate_mime(request_id, &upload.mime) {
         return Err(err);
     }
+    // Finalize is the THIRD writer on a staging file, and it is no longer serialized
+    // against appends: before streaming, every chunk ran on this single-threaded app
+    // loop, so a finalize could not overlap one. Now appends run on the API server
+    // thread, and `finalize` reads the size, hashes the file, then renames it — so a
+    // frame landing between the size read and the hash records a sha256 taken over
+    // MORE bytes than the recorded size. That is silent corruption of the integrity
+    // fields a client verifies a download against, and it is the hazard this lock
+    // exists for.
+    //
+    // A frame arriving after the RENAME is NOT part of it: staging and message paths
+    // are `gram-files/.staging/<upload_id>` and `gram-files/<message_id>/<name>`, and
+    // the second is not derivable from an upload_id, so a late append creates a fresh
+    // orphaned staging file rather than writing into the attachment. Do not widen or
+    // narrow this lock on the strength of that; the size/hash window is the reason.
+    //
+    // The claim is HELD ACROSS the whole sequence, not merely consulted before it: a
+    // check that releases the lock and then finalizes still admits a stream that
+    // opens in between, which is the same corruption with a narrower window.
+    let Some(_claim) = crate::api::UploadClaim::acquire(&upload.upload_id) else {
+        return Err(encode_error(
+            request_id.to_string(),
+            "upload_in_progress",
+            // Names the actual wait condition. A client that merely closed its write
+            // half has NOT waited: the claim lives until the daemon's serve thread
+            // observes that EOF, and it is released before the socket, so reading the
+            // upload connection to EOF is the synchronization point.
+            "another writer owns this upload_id; read the upload connection to EOF before attaching",
+        ));
+    };
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
         Ok(finalized) => Ok(Some(GramFile {
             name: finalized.name,
