@@ -403,6 +403,18 @@ impl App {
         if self.no_session {
             return gram_unavailable(id);
         }
+        // Single writer per upload_id. A live `gram.upload.stream` channel appends
+        // on the server thread with no lock, and an `offset: 0` chunk here would
+        // TRUNCATE the staging file, discarding bytes that channel already acked.
+        // The offset rule would make the result loud rather than silent, but a
+        // second writer on one upload is always a client bug: refuse it.
+        if crate::api::upload_id_is_streaming(&params.upload_id) {
+            return encode_error(
+                id,
+                "upload_in_progress",
+                "another stream is already uploading this upload_id",
+            );
+        }
         let bytes = match base64::engine::general_purpose::STANDARD
             .decode(params.data_base64.as_bytes())
         {

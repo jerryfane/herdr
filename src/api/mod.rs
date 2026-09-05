@@ -6,6 +6,7 @@ pub mod federation_store;
 pub(crate) mod output_registry;
 pub mod schema;
 mod server;
+pub(crate) use server::upload_id_is_streaming;
 mod ssh_transport;
 mod status;
 mod subscriptions;

@@ -49,6 +49,14 @@ mod pane_input_stream;
 mod pane_output_stream;
 mod stream_read;
 
+/// Whether a `gram.upload.stream` channel currently owns this `upload_id`. The
+/// per-chunk `gram.upload_chunk` handler consults this to refuse a second writer:
+/// an `offset: 0` chunk truncates the staging file, which would discard bytes a
+/// live stream has already acked.
+pub(crate) fn upload_id_is_streaming(upload_id: &str) -> bool {
+    gram_upload_stream::upload_is_streaming(upload_id)
+}
+
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);

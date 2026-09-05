@@ -57,9 +57,21 @@ const UPLOAD_FRAME_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upload ids with a live streaming channel. `append_chunk` is read-then-write
 /// with no lock, and the app loop no longer serializes chunks, so two writers on
 /// one `upload_id` could interleave. The offset rule makes that LOUD rather than
-/// silent, but a second stream is always a client bug — refuse it at open.
+/// silent, but a second writer is always a client bug — refuse it. Consulted by
+/// BOTH writers: a second stream is refused at open here, and a concurrent
+/// per-chunk `gram.upload_chunk` is refused by the app handler through
+/// [`upload_is_streaming`] (an `offset: 0` chunk would otherwise TRUNCATE bytes
+/// this channel has already acked).
 static STREAMING_UPLOADS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether a streaming channel currently owns this `upload_id`.
+pub(super) fn upload_is_streaming(upload_id: &str) -> bool {
+    STREAMING_UPLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(upload_id)
+}
 
 /// Holds the single-writer claim on one `upload_id` for the channel's lifetime.
 /// `Drop` releases it, so every exit path — EOF, frame error, timeout, server
@@ -499,6 +511,53 @@ mod tests {
         assert!(api_rx.try_recv().is_err(), "no frame reached the app loop");
     }
 
+    /// Frames PIPELINED into one write: nothing in the protocol makes a client wait
+    /// for ack N before writing frame N+1, so one `read` can carry several frames.
+    /// This is the property the buffered reader exists for — it must keep the
+    /// over-read remainder, not discard it. Without that, frames after the first in
+    /// a read are silently dropped: no ack, no error, and the client blocks forever
+    /// (measured: this test hangs under that mutation and passes in ~10ms without).
+    #[cfg(unix)]
+    #[test]
+    fn assembles_frames_pipelined_into_one_write() {
+        let _config = isolate_config_dir("pipelined");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-pipelined");
+
+        // Three frames, ONE write_all, no waiting for acks in between.
+        let batch = format!(
+            "{}\n{}\n{}\n",
+            frame(1, 0, b"one "),
+            frame(2, 4, b"two "),
+            frame(3, 8, b"three")
+        );
+        client.write_all(batch.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(&mut client);
+        for expected in 1..=3_u64 {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let ack: UploadAck = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                (ack.seq, ack.ok),
+                (expected, true),
+                "missing ack {expected}"
+            );
+        }
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        assert!(server_thread.join().unwrap().is_ok());
+
+        assert_eq!(staged_bytes("up-pipelined"), b"one two three");
+        assert!(api_rx.try_recv().is_err(), "no frame reached the app loop");
+    }
+
     /// The round-trip claim, measured: 8 MiB uploads as 16 frames of 512 KiB over
     /// a SINGLE `handle_connection` call. A per-chunk implementation cannot
     /// satisfy this — each chunk would need its own connection and its own app
@@ -676,6 +735,60 @@ mod tests {
         drop(third);
         running.store(false, Ordering::Relaxed);
         assert!(third_thread.join().unwrap().is_ok());
+    }
+
+    /// A concurrent per-chunk `gram.upload_chunk` on a STREAMING upload_id is
+    /// refused by the real app handler, through the real request dispatch — an
+    /// `offset: 0` chunk truncates the staging file, which would discard bytes this
+    /// channel already acked. A different upload_id is unaffected, so the guard
+    /// cannot be a blanket refusal.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_per_chunk_write_while_a_stream_owns_the_upload_id() {
+        let _config = isolate_config_dir("mixedwriters");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_thread = spawn_server(server, api_tx, Arc::clone(&running));
+
+        open_ok(&mut client, &mut api_rx, "up-mixed");
+        write_line(&mut client, &frame(1, 0, b"streamed"));
+        let ack: UploadAck = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert!(ack.ok);
+
+        // A REAL app, answering a REAL `gram.upload_chunk` request through the
+        // production dispatch — not the claim predicate in isolation.
+        let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            false,
+            None,
+            app_rx,
+            crate::api::EventHub::default(),
+        );
+        let chunk_request = |upload_id: &str| crate::api::schema::Request {
+            id: "chunk".into(),
+            method: Method::GramUploadChunk(crate::api::schema::GramUploadChunkParams {
+                upload_id: upload_id.to_string(),
+                offset: 0,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"clobber"),
+            }),
+        };
+
+        let refused: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(chunk_request("up-mixed"))).unwrap();
+        assert_eq!(refused["error"]["code"], "upload_in_progress");
+
+        // An unrelated upload_id still uploads per-chunk.
+        let allowed: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(chunk_request("up-unrelated"))).unwrap();
+        assert_eq!(allowed["result"]["type"], "ok");
+
+        // The streamed bytes survived the attempted clobber.
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        assert!(server_thread.join().unwrap().is_ok());
+        assert_eq!(staged_bytes("up-mixed"), b"streamed");
     }
 
     #[cfg(unix)]

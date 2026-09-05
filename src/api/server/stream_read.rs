@@ -59,6 +59,9 @@ pub(super) fn read_line(
     total_timeout: Duration,
     label: &str,
 ) -> std::io::Result<Option<String>> {
+    // Built ONCE: this loop reads a single byte per iteration, so formatting inside
+    // it would cost a heap allocation per byte on the keystroke path.
+    let timeout_message = format!("timed out reading {label}");
     with_timed_reads(stream, |stream, mut wait| {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
@@ -69,11 +72,7 @@ pub(super) fn read_line(
             if !stream_is_running(running, stream_active) {
                 return Ok(None);
             }
-            ensure_before_deadlines(
-                idle_deadline,
-                total_deadline,
-                &format!("timed out reading {label}"),
-            )?;
+            ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
             match stream.read(&mut byte) {
                 Ok(0) => return Ok(None),
                 Ok(_) => {
@@ -146,10 +145,14 @@ impl LineReader {
         total_timeout: Duration,
         label: &str,
     ) -> std::io::Result<Option<String>> {
+        // A line already buffered from a previous over-read still owes the cap check:
+        // the loop below can only test the UNTERMINATED remainder, so without this a
+        // frame whose newline arrived in the same read as its overflow would slip past.
         if let Some(line) = take_line(&mut self.pending)? {
-            return Ok(Some(line));
+            return oversize_or_line(line, max_bytes, label);
         }
 
+        let timeout_message = format!("timed out reading {label}");
         let pending = &mut self.pending;
         let scratch = &mut self.scratch;
         with_timed_reads(stream, |stream, mut wait| {
@@ -161,11 +164,7 @@ impl LineReader {
                 if !stream_is_running(running, stream_active) {
                     return Ok(None);
                 }
-                ensure_before_deadlines(
-                    idle_deadline,
-                    total_deadline,
-                    &format!("timed out reading {label}"),
-                )?;
+                ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
                 match stream.read(scratch) {
                     Ok(0) => return Ok(None),
                     Ok(read) => {
@@ -177,12 +176,12 @@ impl LineReader {
                         if now >= total_deadline_at {
                             return Err(io::Error::new(
                                 io::ErrorKind::TimedOut,
-                                format!("timed out reading {label}"),
+                                timeout_message.clone(),
                             ));
                         }
                         pending.extend_from_slice(&scratch[..read]);
                         if let Some(line) = take_line(pending)? {
-                            return Ok(Some(line));
+                            return oversize_or_line(line, max_bytes, label);
                         }
                         if pending.len() > max_bytes {
                             return Err(io::Error::new(
@@ -213,6 +212,24 @@ fn take_line(pending: &mut Vec<u8>) -> std::io::Result<Option<String>> {
     String::from_utf8(line)
         .map(Some)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// A complete line, or the oversize error. The cap has to be re-tested on a line
+/// the buffered reader RETURNS, not only on the unterminated remainder: a frame
+/// whose newline lands in the same read that pushes it past `max_bytes` never
+/// leaves an over-cap remainder behind to catch.
+fn oversize_or_line(
+    line: String,
+    max_bytes: usize,
+    label: &str,
+) -> std::io::Result<Option<String>> {
+    if line.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} is too large"),
+        ));
+    }
+    Ok(Some(line))
 }
 
 /// Read exactly `len` bytes of a length-prefixed frame body. `None` means the
