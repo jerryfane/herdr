@@ -344,15 +344,43 @@ enum PromptObservationVerdict {
     WrittenToPty,
     Unsubmitted,
     Stalled,
+    Unverifiable,
     TimedOut,
 }
 
+/// Classifies what the daemon can PROVE about a prompt it has already written.
+///
+/// `composer_observable` is what separates the two negative verdicts, and the
+/// distinction is the whole point of this function. `Stalled` means the daemon
+/// LOCATED and READ the composer region and saw no evidence either way.
+/// `Unverifiable` means it had no composer to look at — no loadable manifest for
+/// this agent, or a manifest with no `[composer]` section — so it never had the
+/// instrument that `Unsubmitted` requires.
+///
+/// Deliberately NOT claimed here: that a pane whose SCREEN DETECTION is skipped
+/// reports `Unverifiable`. It does not. `screen_detection_skipped` gates STATE
+/// detection only; the composer is built unconditionally, so a hook-authority pane
+/// still yields a readable region and still reports `Stalled`.
+///
+/// One residual class, named rather than hidden: `ComposerRegionEvidence::Missing`
+/// — a manifest that DOES declare `[composer]` whose region cannot be located on
+/// screen (alternate screen buffer, a transcript view, manifest drift) — counts as
+/// observable and reports `Stalled`. That is a narrower instance of the same
+/// conflation this function fixes. It is left as-is deliberately: folding it into
+/// the unobservable set would report `Unverifiable` for a pane the daemon can
+/// normally read, which would hide a real stall behind a drifted region.
+///
+/// Collapsing the two is how a supervisor ends up escalating on the absence of an
+/// instrument: `agent_prompt_stalled` is honest about a pane whose disposition is
+/// unknown, and dishonest as a report that nothing was observed when nothing COULD
+/// be observed. Neither verdict is proof that the prompt was not delivered.
 fn classify_prompt_observation(
     initially_working: bool,
     baseline: u64,
     current_sequence: u64,
     composer_clear_observed: bool,
     composer_matches: bool,
+    composer_observable: bool,
     timed_out: bool,
     caller_timeout_is_effect_deadline: bool,
 ) -> Option<PromptObservationVerdict> {
@@ -373,6 +401,9 @@ fn classify_prompt_observation(
     }
     if initially_working {
         return Some(PromptObservationVerdict::WrittenToPty);
+    }
+    if !composer_observable {
+        return Some(PromptObservationVerdict::Unverifiable);
     }
     Some(PromptObservationVerdict::Stalled)
 }
@@ -397,6 +428,9 @@ fn observe_prompt_effect(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
+    // Latched across polls: once the daemon has had a composer to look at, a later
+    // sample that momentarily reports none must not downgrade the verdict.
+    let mut composer_ever_observable = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -431,6 +465,24 @@ fn observe_prompt_effect(
         if same_attempt && stable_empty_region && composer_observed {
             composer_clear_observed = true;
         }
+        // Whether the daemon has a composer to look at AT ALL for this pane. Its
+        // absence is structural — no loadable manifest for the agent, or a manifest
+        // with no `[composer]` section — not a negative observation, and it must not
+        // be reported as one.
+        //
+        // LATCHED, mirroring `composer_observed` above. Recomputing it from the final
+        // sample alone meant a pane that was observable for the whole window reported
+        // `unverifiable` if its LAST `agent_get` happened to return a default composer
+        // (momentarily unresolved agent label, or a failed runtime lookup reaching
+        // `unwrap_or_default()`). That loses the stronger "we looked and saw nothing"
+        // signal in the one direction that makes the answer look more benign, which is
+        // the failure this whole distinction exists to prevent.
+        if current.composer.evidence.region
+            != crate::api::schema::ComposerRegionEvidence::Unavailable
+        {
+            composer_ever_observable = true;
+        }
+        let composer_observable = composer_ever_observable;
 
         match classify_prompt_observation(
             initially_working,
@@ -438,6 +490,7 @@ fn observe_prompt_effect(
             current.state_change_seq,
             composer_clear_observed,
             composer_matches,
+            composer_observable,
             std::time::Instant::now() >= deadline,
             caller_timeout_is_effect_deadline,
         ) {
@@ -461,6 +514,17 @@ fn observe_prompt_effect(
                     request_id,
                     "agent_prompt_stalled",
                     "agent prompt was written to the PTY, but submission could not be observed",
+                )
+                .map(PromptEffectOutcome::Response)
+                .map(Some);
+            }
+            Some(PromptObservationVerdict::Unverifiable) => {
+                return agent_prompt_observation_error(
+                    request_id,
+                    "agent_prompt_unverifiable",
+                    "agent prompt was written to the PTY; this pane exposes no composer \
+                     observation, so submission can be neither confirmed nor denied \
+                     — do not treat this as non-delivery",
                 )
                 .map(PromptEffectOutcome::Response)
                 .map(Some);
@@ -1166,38 +1230,51 @@ mod tests {
 
     #[test]
     fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
+        // Argument order: initially_working, baseline, current_sequence,
+        // composer_clear_observed, composer_matches, composer_observable, timed_out,
+        // caller_timeout_is_effect_deadline.
         assert_eq!(
-            classify_prompt_observation(false, 10, 11, false, false, false, false),
+            classify_prompt_observation(false, 10, 11, false, false, true, false, false),
             Some(PromptObservationVerdict::Submitted),
             "settled lifecycle advance is attributable submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, false, false, false),
+            classify_prompt_observation(false, 10, 10, true, false, true, false, false),
             Some(PromptObservationVerdict::Submitted),
             "composer observed then cleared is stronger submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, true, true, false),
+            classify_prompt_observation(false, 10, 10, false, true, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
             "persistent same-attempt composer evidence proves non-submission"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, false, true, false),
+            classify_prompt_observation(false, 10, 10, false, false, true, true, false),
             Some(PromptObservationVerdict::Stalled),
-            "settled unobservable disposition remains the residual stalled case"
+            "an OBSERVABLE composer showing nothing is the residual stalled case"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 11, false, false, true, false),
+            classify_prompt_observation(false, 10, 10, false, false, false, true, false),
+            Some(PromptObservationVerdict::Unverifiable),
+            "with no composer to observe the verdict must say so, not report stalled"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 11, false, false, true, true, false),
             Some(PromptObservationVerdict::WrittenToPty),
             "an already-working completion is not attributable to the new prompt"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 11, true, false, false, false),
+            classify_prompt_observation(true, 10, 11, false, false, false, true, false),
+            Some(PromptObservationVerdict::WrittenToPty),
+            "an already-working pane keeps its own verdict regardless of observability"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 11, true, false, true, false, false),
             Some(PromptObservationVerdict::Submitted),
             "already-working prompts still use composer-cleared evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, true, true, true),
+            classify_prompt_observation(false, 10, 10, false, true, true, true, true),
             Some(PromptObservationVerdict::TimedOut),
             "caller deadlines at the observation boundary preserve ordinary timeout"
         );
@@ -1311,10 +1388,15 @@ mod tests {
 
     #[test]
     fn prompt_agent_does_not_use_another_attempts_draft_to_clear_ours() {
-        let prompted = with_composer(
+        // Region `Empty` (not `Unavailable`): this test is about attribution, not
+        // observability, so the composer must be OBSERVABLE for the residual verdict
+        // to be `stalled`. With no composer to observe the honest verdict is
+        // `unverifiable`, which is pinned separately.
+        let prompted = with_composer_region(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
             crate::api::schema::ComposerState::Unknown,
             Some("attempt-ours"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
         );
         let other = with_composer(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
@@ -1372,21 +1454,126 @@ mod tests {
         );
     }
 
+    /// A pane the daemon COULD observe, where it saw no evidence either way. The
+    /// composer is empty and observable, so the honest verdict is `stalled`.
     #[test]
-    fn prompt_agent_reports_stalled_without_composer_or_lifecycle_evidence() {
+    fn prompt_agent_reports_stalled_when_an_observable_composer_shows_nothing() {
+        let observable = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Empty,
+            None,
+        );
         let response = run_prompt_harness(
             "stalled",
             "review the diff",
             crate::api::schema::AgentStatus::Idle,
             0,
             PromptHarness {
-                agents: VecDeque::from([test_agent(crate::api::schema::AgentStatus::Idle, 10)]),
-                prompted: test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                agents: VecDeque::from([observable.clone()]),
+                prompted: observable,
                 prompt_error: None,
             },
         );
 
         assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+    }
+
+    /// The same absence of evidence on a pane the daemon CANNOT observe — no loadable
+    /// manifest for the agent, or a manifest with no `[composer]` section — which is
+    /// every live pane on the fleet that reported this incident (31 of 31 measured
+    /// `region = unavailable`). It must NOT read as `stalled`: a supervisor that
+    /// escalates on `stalled` would be escalating on a missing instrument, which is
+    /// what made the wake failure silent.
+    #[test]
+    fn prompt_agent_reports_unverifiable_when_no_composer_can_be_observed() {
+        let unobservable = test_agent(crate::api::schema::AgentStatus::Idle, 10);
+        assert_eq!(
+            unobservable.composer.evidence.region,
+            crate::api::schema::ComposerRegionEvidence::Unavailable,
+            "fixture must have no composer to observe, or this pins nothing"
+        );
+        let response = run_prompt_harness(
+            "unverifiable",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            0,
+            PromptHarness {
+                agents: VecDeque::from([unobservable.clone()]),
+                prompted: unobservable,
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(response["error"]["code"], "agent_prompt_unverifiable");
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("do not treat this as non-delivery"),
+            "the verdict must tell the caller what it may not conclude: {message}"
+        );
+    }
+
+    /// Observability is LATCHED: a pane the daemon could read for most of the window
+    /// must not be downgraded to `unverifiable` because the FINAL sample happened to
+    /// report no composer (an unresolved agent label or a failed runtime lookup both
+    /// reach `unwrap_or_default()`). Without the latch the verdict flips on the last
+    /// poll alone, and it flips toward the more benign answer — losing the stronger
+    /// "we looked and saw nothing" signal in exactly the direction that hides a real
+    /// stall.
+    #[test]
+    fn prompt_agent_keeps_stalled_when_only_the_last_sample_is_unobservable() {
+        let observable = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Empty,
+            None,
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let blind = test_agent(crate::api::schema::AgentStatus::Idle, 10);
+        assert_eq!(
+            observable.composer.evidence.region,
+            crate::api::schema::ComposerRegionEvidence::Empty,
+            "first sample must be observable, or this pins nothing"
+        );
+        assert_eq!(
+            blind.composer.evidence.region,
+            crate::api::schema::ComposerRegionEvidence::Unavailable,
+            "last sample must be unobservable, or this pins nothing"
+        );
+
+        // The window must span SEVERAL polls, with the DECIDING sample blind. The
+        // verdict is taken on whichever sample is in hand once the deadline passes, so
+        // a cap of 0 (what the other negative-verdict tests use) would decide on the
+        // very first in-loop sample and could not exercise a latch at all.
+        //
+        // DERIVED from `CONNECTION_POLL_INTERVAL` rather than hardcoded: the window is
+        // only valid relative to the poll rate. Pinned to a literal, raising that
+        // constant past the window would make the observable sample itself the
+        // timed-out one, `composer_observable` would be true with or without the
+        // latch, and this test would silently pass either way — rejoining the vacuous
+        // state its first version was in, with no signal that it had.
+        //
+        // The queue feeds `AgentGet`s in order and then repeats `prompted` forever
+        // (`pop_front().unwrap_or_else(|| prompted.clone())`). The FIRST `AgentGet` is
+        // the pre-prompt snapshot, so two observable entries are needed to put one
+        // observable sample inside the loop; every later poll — including the one that
+        // decides — is blind.
+        let window_ms = 12 * CONNECTION_POLL_INTERVAL.as_millis() as u64;
+        let response = run_prompt_harness(
+            "latched",
+            "review the diff",
+            crate::api::schema::AgentStatus::Idle,
+            window_ms,
+            PromptHarness {
+                agents: VecDeque::from([observable.clone(), observable]),
+                prompted: blind,
+                prompt_error: None,
+            },
+        );
+
+        assert_eq!(
+            response["error"]["code"], "agent_prompt_stalled",
+            "the daemon DID have an instrument during the window; \
+             a blind final sample must not rewrite that into 'never had one'"
+        );
     }
 
     #[test]

@@ -411,10 +411,15 @@ fn agent_start_command_works() {
     );
     assert_eq!(stalled.status.code(), Some(1));
     let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
-    assert_eq!(stalled["error"]["code"], "agent_prompt_stalled");
+    // `unverifiable`, not `stalled`: this harness runs a test pane whose agent
+    // declares no `[composer]` region, so the daemon has nothing to observe and must
+    // say so. `stalled` is reserved for a composer it COULD read that showed nothing
+    // either way — the distinction this verdict exists to make, and one this fixture
+    // cannot exercise precisely because it has no composer.
+    assert_eq!(stalled["error"]["code"], "agent_prompt_unverifiable");
     assert!(stalled["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("submission could not be observed")));
+        .is_some_and(|message| message.contains("do not treat this as non-delivery")));
 
     let prompted = run_cli(
         &socket_path,
