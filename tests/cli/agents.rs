@@ -146,7 +146,16 @@ fn agent_start_stops_retrying_when_the_pane_shell_stays_busy() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("herdr.sock");
-    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "2.3");
+    // 3.0s, not 2.3s. The CLI retries `agent_pane_busy` for exactly
+    // PANE_SHELL_READINESS_RETRY_TIMEOUT (2s, src/cli/agent.rs:12), polling every
+    // 100ms and making two extra API round-trips per iteration. A 2.3s shell left
+    // only 300ms of slack, so under full-suite load one slow iteration carried the
+    // loop past the shell becoming ready, `pane_shell_is_initializing` went false,
+    // and the start SUCCEEDED — exit 0 where the test requires 1. 3.0s keeps the
+    // shell busy for the whole 2s budget (0.9s slack) while still becoming ready
+    // well inside the retried call's own 2s budget (1.1s slack); both assertions
+    // below are unchanged.
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "3.0");
     let config = format!(
         "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
         delayed_shell.to_str().unwrap()
@@ -440,10 +449,15 @@ fn agent_start_command_works() {
     let stalled = prompt_wait("do not transition", "6000");
     assert_eq!(stalled.status.code(), Some(1));
     let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
-    assert_eq!(stalled["error"]["code"], "agent_prompt_stalled");
+    // `unverifiable`, not `stalled`: this harness runs a test pane whose agent
+    // declares no `[composer]` region, so the daemon has nothing to observe and must
+    // say so. `stalled` is reserved for a composer it COULD read that showed nothing
+    // either way — the distinction this verdict exists to make, and one this fixture
+    // cannot exercise precisely because it has no composer.
+    assert_eq!(stalled["error"]["code"], "agent_prompt_unverifiable");
     assert!(stalled["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("no observed working or blocked state")));
+        .is_some_and(|message| message.contains("do not treat this as non-delivery")));
 
     for prompt in ["done churn", "session churn"] {
         let settled_only = prompt_wait(prompt, "500");
@@ -463,7 +477,11 @@ fn agent_start_command_works() {
     assert!(report_agent("idle"));
     assert!(report_agent("working"));
     let already_working = prompt_wait("finish active", "2000");
-    assert!(already_working.status.success());
+    assert!(
+        already_working.status.success(),
+        "prompt failed: {}",
+        String::from_utf8_lossy(&already_working.stderr)
+    );
 
     let prompted = prompt_wait("Review this diff", "2000");
     assert!(

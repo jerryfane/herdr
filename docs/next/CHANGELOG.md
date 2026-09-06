@@ -20,13 +20,12 @@
 - Experimental live handoff can now transfer more than 64 panes when the sending server includes this update. An older running server still has its old limit for the first upgrade; this does not change update installation order or make live handoff non-experimental. (#3393, #3411, thanks @kataokatsuki)
 - On Linux and macOS, terminal observers that stop accepting output are disconnected after 30 seconds without write progress. Their pane and other clients keep running; an interrupted stream may end without a final close record. (#3612)
 - Windows terminal cleanup now explicitly resets mouse-reporting modes. The remaining standalone Git Bash detach report in #3748 is still under investigation; do not treat this release as a confirmed fix for that report. (#4055, thanks @JJLiebig)
-
-### Changed
 - Live handoff is now refused when Herdr is the main process of a service-manager unit such as systemd, because that process exiting deactivates the unit and kills the replacement server and every pane with it. The refusal happens before anything is torn down, so running panes are unaffected. Update supervised installs by replacing the binary and restarting the service.
 - Direct preview binaries now follow the fork's preview update manifest by default on macOS and Linux as well as Windows, preventing a Herdrup-compatible install from being replaced by an upstream binary.
 
 ### Fixed
 - Managed Claude Code and Codex session resumes now bypass shell aliases and functions in common POSIX shells, Fish, PowerShell, cmd, and Git Bash while preserving shell-initialized PATH; transfer launch failures in those shells are detected immediately and restore the source instead of waiting for the launch deadline.
+- `agent prompt --wait` now distinguishes a prompt whose disposition could not be observed from one that could not be observed at all. A pane with no loadable manifest or no `[composer]` section returns `agent_prompt_unverifiable` instead of `agent_prompt_stalled`; neither verdict proves that delivery failed. (#5)
 - Remote typing, switching, and popup interaction no longer resend the entire pane screen for small changes. Busy SSH sessions use less bandwidth, and idle attached clients avoid unnecessary redraw work. (#3769, #3745, #3822)
 - A stalled SSH machine no longer traps the client away from Local. Clicking a local workspace or agent cancels the unfinished remote switch, and a recovered remote workspace refreshes without an away-and-back selection. Stale screens from before a reconnect are not reused. (#3903, #3842)
 - Idle SSH connections use less CPU without losing final output. Repeated connection failures back off instead of reconnecting rapidly, and supported idle bridges clean up without stopping remote panes. (#3728, #4083)
