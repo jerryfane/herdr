@@ -1478,8 +1478,8 @@ mod tests {
         assert_eq!(response["error"]["code"], "agent_prompt_stalled");
     }
 
-    /// The same absence of evidence on a pane the daemon CANNOT observe — no
-    /// `[composer]` region for the agent, or screen detection skipped — which is
+    /// The same absence of evidence on a pane the daemon CANNOT observe — no loadable
+    /// manifest for the agent, or a manifest with no `[composer]` section — which is
     /// every live pane on the fleet that reported this incident (31 of 31 measured
     /// `region = unavailable`). It must NOT read as `stalled`: a supervisor that
     /// escalates on `stalled` would be escalating on a missing instrument, which is
@@ -1539,23 +1539,29 @@ mod tests {
             "last sample must be unobservable, or this pins nothing"
         );
 
-        // The window must span SEVERAL polls, with the DECIDING sample blind:
-        // `CONNECTION_POLL_INTERVAL` is 100ms and the verdict is taken on whichever
-        // sample is in hand once the deadline passes, so a cap of 0 (what the other
-        // negative-verdict tests use) would decide on the very first in-loop sample
-        // and could not exercise a latch at all. 1200ms leaves room for several polls
-        // even on a loaded box.
+        // The window must span SEVERAL polls, with the DECIDING sample blind. The
+        // verdict is taken on whichever sample is in hand once the deadline passes, so
+        // a cap of 0 (what the other negative-verdict tests use) would decide on the
+        // very first in-loop sample and could not exercise a latch at all.
+        //
+        // DERIVED from `CONNECTION_POLL_INTERVAL` rather than hardcoded: the window is
+        // only valid relative to the poll rate. Pinned to a literal, raising that
+        // constant past the window would make the observable sample itself the
+        // timed-out one, `composer_observable` would be true with or without the
+        // latch, and this test would silently pass either way — rejoining the vacuous
+        // state its first version was in, with no signal that it had.
         //
         // The queue feeds `AgentGet`s in order and then repeats `prompted` forever
         // (`pop_front().unwrap_or_else(|| prompted.clone())`). The FIRST `AgentGet` is
         // the pre-prompt snapshot, so two observable entries are needed to put one
         // observable sample inside the loop; every later poll — including the one that
         // decides — is blind.
+        let window_ms = 12 * CONNECTION_POLL_INTERVAL.as_millis() as u64;
         let response = run_prompt_harness(
             "latched",
             "review the diff",
             crate::api::schema::AgentStatus::Idle,
-            1200,
+            window_ms,
             PromptHarness {
                 agents: VecDeque::from([observable.clone(), observable]),
                 prompted: blind,
