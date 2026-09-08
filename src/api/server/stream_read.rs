@@ -62,17 +62,51 @@ pub(super) fn read_line(
     // Built ONCE: this loop reads a single byte per iteration, so formatting inside
     // it would cost a heap allocation per byte on the keystroke path.
     let timeout_message = format!("timed out reading {label}");
-    with_timed_reads(stream, |stream, mut wait| {
+    with_timed_reads(stream, |stream, wait| {
+        read_line_polling(
+            stream,
+            wait,
+            running,
+            stream_active,
+            max_bytes,
+            idle_timeout,
+            total_timeout,
+            &timeout_message,
+        )
+    })
+}
+
+/// The `read_line` loop, with its wait mode supplied rather than negotiated.
+///
+/// Split out so the POLL path is testable on a platform whose sockets accept a
+/// recv timeout and would therefore never choose it.
+#[allow(clippy::too_many_arguments)]
+fn read_line_polling(
+    stream: &mut ApiStream,
+    mut wait: ReadWait,
+    running: &Arc<AtomicBool>,
+    stream_active: &Arc<AtomicBool>,
+    max_bytes: usize,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    timeout_message: &str,
+) -> std::io::Result<Option<String>> {
+    {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         let mut total_deadline = None;
         let mut idle_deadline = None;
+        if wait.arms_deadlines_before_first_byte() {
+            let now = Instant::now();
+            total_deadline = Some(now + total_timeout);
+            idle_deadline = Some(now + idle_timeout);
+        }
 
         loop {
             if !stream_is_running(running, stream_active) {
                 return Ok(None);
             }
-            ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
+            ensure_before_deadlines(idle_deadline, total_deadline, timeout_message)?;
             match stream.read(&mut byte) {
                 Ok(0) if wait.zero_read_is_eof() => return Ok(None),
                 // Non-blocking named pipe with nothing buffered: retry under the
@@ -90,7 +124,7 @@ pub(super) fn read_line(
                     if now >= total_deadline_at {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!("timed out reading {label}"),
+                            timeout_message.to_string(),
                         ));
                     }
                     bytes.push(byte[0]);
@@ -102,7 +136,7 @@ pub(super) fn read_line(
                     if bytes.len() > max_bytes {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("{label} is too large"),
+                            format!("{timeout_message} exceeded its size limit"),
                         ));
                     }
                 }
@@ -113,7 +147,7 @@ pub(super) fn read_line(
                 Err(err) => return Err(err),
             }
         }
-    })
+    }
 }
 
 /// Buffered line framing for a channel whose frames are ALL newline-delimited
@@ -348,15 +382,32 @@ impl ReadWait {
 
     /// Whether a zero-length read means the peer hung up.
     ///
-    /// Only under a socket timeout. In the POLL fallback the stream is
-    /// non-blocking, and a Windows named pipe reports "no data available yet" as
-    /// `Ok(0)` where a unix socket reports `WouldBlock` - so treating `Ok(0)` as
-    /// EOF there ends a live stream the moment it pauses. That is exactly how the
-    /// graphics header timeout tests failed on Windows: the reader answered
-    /// `Ok(None)` (peer gone) instead of timing out, after the byte it had
-    /// already received.
+    /// Always, under a socket timeout. In the POLL fallback the stream is
+    /// non-blocking and a Windows named pipe reports "no data available yet" as
+    /// `Ok(0)` where a unix socket reports `WouldBlock`, so a live stream that
+    /// merely pauses must NOT be called a hangup - that is how the graphics
+    /// header timeout tests failed there.
+    ///
+    /// But only once the read has made progress. The idle and total deadlines are
+    /// armed by the first byte, so retrying before any byte arrives is retrying
+    /// with NO deadline: a stream that never sends spins forever, which hung the
+    /// whole Windows suite. Before the first byte, `Ok(0)` keeps its EOF meaning -
+    /// a peer that closed without sending - and after it, the retry is bounded by
+    /// the deadlines that byte established.
     fn zero_read_is_eof(&self) -> bool {
         matches!(self, Self::SocketTimeout)
+    }
+
+    /// Whether this wait mode needs its deadlines armed before the first byte.
+    ///
+    /// The blocking path lets the socket timeout bound each read, so it arms
+    /// deadlines from the first byte. The poll path cannot: with `Ok(0)` meaning
+    /// "not yet" it would retry against NO deadline and spin forever on a stream
+    /// that never sends, which hung the entire Windows suite. Arming at entry
+    /// keeps a pre-first-byte pause bounded by the same idle/total timeouts the
+    /// caller already chose.
+    fn arms_deadlines_before_first_byte(&self) -> bool {
+        matches!(self, Self::Poll(_))
     }
 }
 
@@ -500,18 +551,80 @@ mod tests {
 
 #[cfg(test)]
 mod zero_read_tests {
-    use super::{PollBackoff, ReadWait};
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
-    /// A zero-length read means EOF only when the stream is blocking with a
-    /// socket timeout. Under the poll fallback the stream is non-blocking, and a
-    /// Windows named pipe returns `Ok(0)` for "nothing buffered yet" where a unix
-    /// socket returns `WouldBlock`; treating that as EOF ended live streams on
-    /// Windows the moment they paused, which is what broke the pane-graphics
-    /// header timeout tests there. Linux cannot exercise the poll path (its
-    /// sockets accept a recv timeout), so this pins the rule directly.
+    fn poll_pair(name: &str) -> (crate::ipc::LocalStream, ApiStream) {
+        let path = std::env::temp_dir().join(format!("srp-{}-{}.sock", std::process::id(), name));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        let mut server = ApiStream::Local(server);
+        server.set_nonblocking(true).unwrap();
+        (client, server)
+    }
+
+    fn poll_read_line(server: &mut ApiStream) -> (std::io::Result<Option<String>>, Duration) {
+        let running = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let result = read_line_polling(
+            server,
+            ReadWait::Poll(PollBackoff::new()),
+            &running,
+            &active,
+            4096,
+            Duration::from_millis(40),
+            Duration::from_millis(200),
+            "test frame",
+        );
+        (result, started.elapsed())
+    }
+
+    /// A zero-length read means EOF only under a socket timeout. The poll path runs
+    /// non-blocking, where a Windows named pipe reports "nothing buffered yet" as
+    /// `Ok(0)` and a unix socket reports `WouldBlock`.
     #[test]
     fn only_a_socket_timeout_read_treats_zero_bytes_as_a_hangup() {
         assert!(ReadWait::SocketTimeout.zero_read_is_eof());
         assert!(!ReadWait::Poll(PollBackoff::new()).zero_read_is_eof());
+        assert!(ReadWait::Poll(PollBackoff::new()).arms_deadlines_before_first_byte());
+        assert!(!ReadWait::SocketTimeout.arms_deadlines_before_first_byte());
+    }
+
+    /// THE regression: the poll path must terminate when no byte ever arrives.
+    ///
+    /// Deadlines used to be armed by the first byte, so a poll-mode read that never
+    /// received one retried against no deadline at all. On Windows, where `Ok(0)`
+    /// means "not yet" rather than EOF, that spun forever and hung the whole suite.
+    #[test]
+    fn a_poll_read_that_never_receives_a_byte_still_times_out() {
+        let (_client, mut server) = poll_pair("idle");
+        let (result, elapsed) = poll_read_line(&mut server);
+        let err = result.expect_err("an idle poll read must time out, not hang or report EOF");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the idle poll read was not bounded: {elapsed:?}"
+        );
+    }
+
+    /// A live stream that pauses mid-line is not a hangup: it times out, and the
+    /// byte it did deliver does not turn the pause into `Ok(None)`.
+    #[test]
+    fn a_poll_read_that_pauses_mid_line_times_out_rather_than_reporting_eof() {
+        let (mut client, mut server) = poll_pair("partial");
+        std::io::Write::write_all(&mut client, b"{").unwrap();
+        std::io::Write::flush(&mut client).unwrap();
+        let (result, elapsed) = poll_read_line(&mut server);
+        let err = result.expect_err("a paused stream must time out, not report a hangup");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the paused poll read was not bounded: {elapsed:?}"
+        );
     }
 }
