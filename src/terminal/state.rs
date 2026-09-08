@@ -2761,6 +2761,15 @@ pub(crate) fn stabilize_agent_detection(detection: crate::detect::AgentDetection
 
 #[cfg(test)]
 mod tests {
+
+    /// A platform-absolute session path.
+    ///
+    /// `AgentSessionRef::path` requires `Path::is_absolute`, and "/tmp/x.jsonl" is
+    /// NOT absolute on Windows (no drive), so the literal returned `None` there and
+    /// the fixture's `unwrap` panicked in CI while passing on unix.
+    fn absolute_session_path(name: &str) -> String {
+        std::env::temp_dir().join(name).display().to_string()
+    }
     use super::*;
     use crate::detect::AgentDetection;
 
@@ -5967,7 +5976,7 @@ mod tests {
             "pi".into(),
             AgentState::Working,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/pi-session.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(absolute_session_path("pi-session.jsonl")),
             Some(21),
         );
 
@@ -7052,7 +7061,10 @@ mod tests {
             message: Some(format!("{}é", "x".repeat(TURN_MESSAGE_MAX_BYTES - 1))),
             reported_at: Instant::now(),
             session_ref: Some(
-                crate::agent_resume::AgentSessionRef::path("/tmp/pi-session.jsonl").unwrap(),
+                crate::agent_resume::AgentSessionRef::path(absolute_session_path(
+                    "pi-session.jsonl",
+                ))
+                .unwrap(),
             ),
         });
 
@@ -7064,8 +7076,8 @@ mod tests {
             .as_ref()
             .is_some_and(|message| message.len() <= TURN_MESSAGE_MAX_BYTES));
         assert_eq!(
-            record.agent_session_path.as_deref(),
-            Some("/tmp/pi-session.jsonl")
+            record.agent_session_path,
+            Some(absolute_session_path("pi-session.jsonl"))
         );
     }
 
