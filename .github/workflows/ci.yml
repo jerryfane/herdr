@@ -53,7 +53,12 @@ jobs:
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # 15 was sized for the fork's Windows leg, which ran a FILTERED test list via
+    # its own windows_check.ps1. The v0.9.0 merge adopted upstream's script, which
+    # runs the whole suite there - roughly 3400 tests after a 3-minute build and a
+    # full clippy - and that no longer fits. Linux and macOS finish well inside
+    # this; the cap exists to catch a hang, and a hang still trips it.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
