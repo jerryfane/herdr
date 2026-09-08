@@ -4024,6 +4024,7 @@ mod tests {
         assert_eq!(app.state.archived_agents.len(), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_resumes_the_session_and_removes_record() {
         let mut app = app_with_agent();
@@ -4102,6 +4103,7 @@ mod tests {
     ///
     /// Asserting through the registry rather than a state field is the point: it is the
     /// thing every runtime-requiring API path actually consults.
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_leaves_the_pane_with_a_live_runtime() {
         let mut app = app_with_agent();
@@ -4218,6 +4220,7 @@ mod tests {
         terminal_id.to_string()
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_restores_the_original_workspace_tab_and_label() {
         let mut app = app_with_agent();
@@ -4369,6 +4372,7 @@ mod tests {
     /// started on the SAME session as a workaround, and then the original is unarchived.
     /// Without the guard that yields two harness processes appending to one transcript,
     /// and org actions that cannot be attributed to either.
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_refuses_a_session_a_live_agent_already_holds() {
         let mut app = app_with_agent();
@@ -4448,6 +4452,7 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_unarchive_missing_record_errors() {
         let mut app = app_with_agent();
@@ -4556,6 +4561,7 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_path_kind_missing_session_errors_then_fresh_succeeds() {
         let mut app = app_with_agent();
@@ -4609,6 +4615,7 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_unarchive_id_kind_ignores_existence_probe_and_resumes() {
         // Regression guard: the existence probe is PATH-kind only. An ID-kind
