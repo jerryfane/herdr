@@ -950,7 +950,17 @@ mod tests {
         app.usage_cache.insert(
             "work".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: instant_at_least_ago(std::time::Duration::from_secs(600)),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "SKIPPED {}: host clock is younger than the usage TTL, so a stale \
+                             reading cannot be constructed here",
+                            module_path!()
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
@@ -966,23 +976,24 @@ mod tests {
         assert!(app.usage_refresh_inflight.contains("work"));
     }
 
-    /// An `Instant` at least `min_age` in the past.
+    /// An `Instant` at least `min_age` in the past, or `None` when this host's
+    /// clock cannot represent one.
     ///
-    /// `Instant::now() - age` PANICS on Windows, where the clock is boot-relative.
-    /// This walks down to the oldest age the host can represent and PANICS with a
-    /// clear message if even the cache TTL is out of reach - it never returns a
-    /// too-recent instant, because a silent fallback would leave the test asserting
-    /// on a FRESH reading while claiming to test a stale one.
-    fn instant_at_least_ago(min_age: std::time::Duration) -> std::time::Instant {
+    /// `Instant::now() - age` PANICS on Windows, where the clock counts from boot:
+    /// a CI runner minutes old cannot go 600 s back, and a runner younger than the
+    /// TTL cannot express staleness at all. `None` is that case, and the caller
+    /// SKIPS LOUDLY - it never silently substitutes a fresher instant, which would
+    /// leave the test asserting on a fresh reading while claiming to test a stale
+    /// one.
+    fn instant_at_least_ago(min_age: std::time::Duration) -> Option<std::time::Instant> {
         let now = std::time::Instant::now();
         let mut age = min_age;
         loop {
             if let Some(instant) = now.checked_sub(age) {
-                assert!(
-                    age > crate::app::api::usage_fetch::USAGE_CLAUDE_TTL,
-                    "host clock is younger than the usage TTL, so staleness cannot be built"
-                );
-                return instant;
+                return (age > crate::app::api::usage_fetch::USAGE_CLAUDE_TTL).then_some(instant);
+            }
+            if age <= crate::app::api::usage_fetch::USAGE_CLAUDE_TTL {
+                return None;
             }
             age /= 2;
         }
@@ -1022,7 +1033,17 @@ mod tests {
         app.usage_cache.insert(
             "primary".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: instant_at_least_ago(std::time::Duration::from_secs(600)),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "SKIPPED {}: host clock is younger than the usage TTL, so a stale \
+                             reading cannot be constructed here",
+                            module_path!()
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
