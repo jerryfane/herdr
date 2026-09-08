@@ -193,7 +193,7 @@ impl App {
             self.mark_git_status_refresh_due(Instant::now());
             self.git_refresh_due_after_in_flight = false;
         } else {
-            self.last_git_remote_status_refresh = Instant::now();
+            self.last_git_remote_status_refresh = Some(Instant::now());
         }
         let changed = self
             .state

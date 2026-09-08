@@ -153,7 +153,12 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
-    pub(crate) last_git_remote_status_refresh: Instant,
+    /// When the remote-status refresh last ran. `None` means it never has, which
+    /// is DUE NOW - the state `App::new` starts in. Representing it as `None`
+    /// rather than a backdated `Instant` is what makes this correct on Windows,
+    /// where `Instant` is boot-relative and `now - interval` underflows on a
+    /// freshly booted host.
+    pub(crate) last_git_remote_status_refresh: Option<Instant>,
     pub(crate) last_git_repo_discovery_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
@@ -646,14 +651,8 @@ impl App {
             expected_pane_exit_epochs: HashMap::new(),
             event_tx,
             event_rx,
-            // Backdated so the first remote-status refresh is due immediately.
-            // `checked_sub`, not `-`: `Instant` is boot-relative on Windows, so a
-            // machine up for less than the interval underflows and `-` PANICS at
-            // startup. Falling back to `now` only delays the first refresh by one
-            // interval on a freshly booted host.
-            last_git_remote_status_refresh: Instant::now()
-                .checked_sub(GIT_REMOTE_STATUS_REFRESH_INTERVAL)
-                .unwrap_or_else(Instant::now),
+            // Never refreshed, so the first remote-status refresh is due at once.
+            last_git_remote_status_refresh: None,
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
@@ -1162,7 +1161,7 @@ mod tests {
         app.state.workspaces.push(Workspace::test_new("one"));
         app.git_refresh_in_flight = true;
 
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(app.git_refresh_deadline(Instant::now()), None);
     }
 
     #[test]
@@ -1214,10 +1213,9 @@ mod tests {
     fn git_status_event_clears_in_flight_refresh() {
         let mut app = test_app();
         app.git_refresh_in_flight = true;
-        let previous_refresh = Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .expect("host uptime exceeds the refresh window this test backdates");
-        app.last_git_remote_status_refresh = previous_refresh;
+        // "Never refreshed" is the state under test here - a completed refresh must
+        // move it forward - and it needs no clock arithmetic to express.
+        app.last_git_remote_status_refresh = None;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
             results: Vec::new(),
@@ -1225,7 +1223,7 @@ mod tests {
         });
 
         assert!(!app.git_refresh_in_flight);
-        assert!(app.last_git_remote_status_refresh > previous_refresh);
+        assert!(app.last_git_remote_status_refresh.is_some());
     }
 
     #[test]

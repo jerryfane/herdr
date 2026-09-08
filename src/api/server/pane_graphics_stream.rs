@@ -377,13 +377,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    #[cfg(unix)]
     use tokio::sync::mpsc;
 
-    #[cfg(unix)]
     static NEXT_LOCAL_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-    #[cfg(unix)]
     fn local_stream_pair(_name: &str) -> (LocalStream, LocalStream, PathBuf) {
         let unique = format!(
             "hpg-{}-{}.sock",
@@ -397,7 +394,6 @@ mod tests {
         (client, server, path)
     }
 
-    #[cfg(unix)]
     fn read_response_line(stream: &mut LocalStream) -> String {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -654,15 +650,6 @@ mod tests {
         assert!(server_thread.join().unwrap().is_ok());
     }
 
-    // Unix-only, matching the sibling streaming modules (pane_input_stream and
-    // gram_upload_stream gate their socket tests the same way). These drive a real
-    // ApiStream over a local socket and assert on read TIMING and EOF, and a
-    // Windows named pipe answers "nothing buffered yet" with the same `Ok(0)` it
-    // uses for a closed pipe, with no API to tell them apart. Until there is a real
-    // closed-pipe signal, asserting these on Windows tests the ambiguity, not the
-    // server. They ran here for the first time only because the merge adopted
-    // upstream's windows_check.ps1, which runs the whole suite where the fork's ran
-    // a filtered list. Tracked for real Windows coverage.
     #[cfg(unix)]
     #[test]
     fn idle_graphics_stream_waits_for_header_without_timing_out() {

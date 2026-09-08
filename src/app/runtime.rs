@@ -322,7 +322,7 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             include_git_refresh
-                .then(|| self.git_refresh_deadline())
+                .then(|| self.git_refresh_deadline(now))
                 .flatten(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
