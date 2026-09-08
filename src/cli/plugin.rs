@@ -1807,6 +1807,10 @@ mod tests {
 
     #[test]
     fn cli_user_dir_creation_seeds_legacy_config_before_printing_config_dir() {
+        // Every path here is derived from `config_dir()`, and the command under
+        // test derives it again: hold the one env lock so a concurrent
+        // `XDG_CONFIG_HOME` override cannot split the fixture from the run.
+        let _env_guard = crate::config::test_config_env_lock().lock();
         let plugin_id = unique_plugin_id("legacy-config");
         let config_dir = crate::plugin_paths::plugin_config_dir(&plugin_id);
         let state_dir = crate::plugin_paths::plugin_state_dir(&plugin_id);

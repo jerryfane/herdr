@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::RwLockWriteGuard;
 
 use portable_pty::CommandBuilder;
 
@@ -65,6 +65,11 @@ pub(crate) fn copilot_dir() -> io::Result<PathBuf> {
 pub(crate) fn devin_dir() -> io::Result<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("devin"));
+    }
+
+    #[cfg(windows)]
+    if let Some(value) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value).join("devin"));
     }
 
     Ok(home_dir()?.join(".config").join("devin"))
@@ -180,33 +185,47 @@ pub(crate) fn grok_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(GROK_HOME_ENV_VAR, &[".grok"])
 }
 
+/// The installer's view of the home directory. `crate::config::home_dir` owns
+/// the resolution order (`HOME`, then `USERPROFILE` and `HOMEDRIVE`+`HOMEPATH`
+/// on Windows) so an installed integration and a registered account never
+/// disagree about a harness's config home.
 pub(crate) fn home_dir() -> io::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(home));
-    }
-
-    #[cfg(windows)]
-    {
-        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(profile));
-        }
-        if let (Some(drive), Some(path)) = (
-            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
-            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
-        ) {
-            let mut home = PathBuf::from(drive);
-            home.push(path);
-            return Ok(home);
-        }
-    }
-
-    Err(io::Error::other(
-        "home directory is not set; cannot locate home directory",
-    ))
+    crate::config::home_dir().ok_or_else(|| {
+        io::Error::other("home directory is not set; cannot locate home directory")
+    })
 }
 
 #[cfg(test)]
-pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+pub(crate) struct IntegrationEnvLock {
+    _guard: RwLockWriteGuard<'static, ()>,
+    #[cfg(windows)]
+    appdata: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for IntegrationEnvLock {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(appdata) = self.appdata.take() {
+            std::env::set_var("APPDATA", appdata);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+    }
+}
+
+/// Integration tests move `HOME`, `PATH`, and the per-harness config-home
+/// overrides, which are the same process-global table
+/// [`crate::config::test_config_env_lock`] guards. Holding a second mutex
+/// would let a config test read `XDG_CONFIG_HOME` in the middle of an
+/// integration test's write, so this borrows the one lock instead of owning
+/// another.
+#[cfg(test)]
+pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
+    let guard = crate::config::test_config_env_lock().lock();
+    IntegrationEnvLock {
+        _guard: guard,
+        #[cfg(windows)]
+        appdata: std::env::var_os("APPDATA"),
+    }
 }

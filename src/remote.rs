@@ -1,12 +1,18 @@
+mod args;
 mod attach;
 #[cfg(unix)]
 mod host_unix;
+mod process;
+mod restart_policy;
+mod saved;
 
+pub(crate) use args::*;
 pub(crate) use attach::*;
 #[cfg(unix)]
 pub(crate) use host_unix::{
     run_api_client_bridge, run_api_client_bridge_duplex, run_remote_client_bridge,
 };
+pub(crate) use saved::*;
 
 #[cfg(windows)]
 pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
@@ -31,6 +37,16 @@ pub(crate) fn run_api_client_bridge_duplex() -> std::io::Result<()> {
     ))
 }
 
+pub(crate) fn print_saved_ssh_error_hint(err: &std::io::Error, target: &str) {
+    if is_remote_host_key_error(err) {
+        eprintln!(
+            "hint: saved machines use strict host-key checking; add the host key to the configured known_hosts file, then retry."
+        );
+    } else {
+        print_remote_error_hint(err, target);
+    }
+}
+
 pub(crate) fn print_remote_error_hint(err: &std::io::Error, target: &str) {
     if is_remote_auth_error(err) {
         eprintln!(
@@ -41,6 +57,12 @@ pub(crate) fn print_remote_error_hint(err: &std::io::Error, target: &str) {
             "hint: if your SSH key has a passphrase, load it into ssh-agent with `ssh-add` before running `herdr --remote`."
         );
     }
+}
+
+fn is_remote_host_key_error(err: &std::io::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("host key verification failed")
+        || message.contains("remote host identification has changed")
 }
 
 fn is_remote_auth_error(err: &std::io::Error) -> bool {
@@ -74,6 +96,19 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_host_key_error_matches_ssh_diagnostics() {
+        for message in [
+            "Host key verification failed.",
+            "REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        ] {
+            assert!(is_remote_host_key_error(&std::io::Error::other(message)));
+        }
+        assert!(!is_remote_host_key_error(&std::io::Error::other(
+            "server closed connection"
+        )));
+    }
 
     #[test]
     fn remote_auth_error_matches_ssh_auth_denied() {

@@ -17,8 +17,11 @@ pub(crate) use super::unix_common::{
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
     remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
-    StatusCommandGuard,
+    wait_client_stream_readable, StatusCommandGuard,
 };
+
+#[cfg(test)]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;

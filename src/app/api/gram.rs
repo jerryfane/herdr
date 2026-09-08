@@ -1103,7 +1103,7 @@ mod tests {
         // store (never the real ~/.config/herdr/gram.json) and machine::get_or_create
         // mints a temp id. nextest runs each test in its own process, so the
         // machine-id OnceLock and this env var stay isolated to this test.
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let tmp = std::env::temp_dir().join(format!(
             "herdr-gram-origin-{}-{}",
@@ -1119,7 +1119,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1213,7 +1213,7 @@ mod tests {
     /// would save nothing.
     #[test]
     fn conditional_list_answers_unchanged_only_while_the_digest_matches() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let tmp = std::env::temp_dir().join(format!(
             "herdr-gram-digest-{}-{}",
@@ -1229,7 +1229,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),

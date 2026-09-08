@@ -5835,6 +5835,11 @@ mod tests {
     /// because the assertion is about what was SENT, not about the outcome.
     #[tokio::test]
     async fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
+        // This test prepends a shim directory to the process-global `PATH`, so
+        // it takes the one env lock rather than trusting a per-test process:
+        // `cargo test` runs the whole binary in one process, and a stray `PATH`
+        // during another test's `Command::spawn` resolves the wrong program.
+        let _env_guard = crate::config::test_config_env_lock().lock();
         let root = temp_root("prepare-import-source");
         let bin = root.join("bin");
         let sessions = root.join("claude");
@@ -5885,7 +5890,8 @@ mod tests {
         }
 
         let previous = std::env::var_os("PATH");
-        // SAFETY: nextest gives each test its own process.
+        // SAFETY: `_env_guard` above holds the one process-wide test env lock,
+        // so no other test reads or writes `PATH` for the duration.
         unsafe {
             std::env::set_var(
                 "PATH",

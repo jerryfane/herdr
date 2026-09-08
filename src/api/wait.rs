@@ -9,8 +9,8 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_timeout, should_stop_connection, APP_RESPONSE_TIMEOUT,
-    CONNECTION_POLL_INTERVAL,
+    dispatch_to_app_with_caller_timeout, dispatch_to_app_with_timeout, should_stop_connection,
+    APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
@@ -175,7 +175,7 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    params: crate::api::schema::AgentPromptParams,
+    mut params: crate::api::schema::AgentPromptParams,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -194,7 +194,7 @@ pub(super) fn prompt_agent(
 
 fn prompt_agent_with_effect_timeout(
     request_id: String,
-    params: crate::api::schema::AgentPromptParams,
+    mut params: crate::api::schema::AgentPromptParams,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -212,8 +212,14 @@ fn prompt_agent_with_effect_timeout(
         )));
     };
 
-    let last_event_sequence = event_hub.current_sequence();
-    let before_prompt = match agent_get(&request_id, &params.target, api_tx) {
+    let wait_started = std::time::Instant::now();
+    let before_prompt = match agent_get_for_prompt(
+        &request_id,
+        &params.target,
+        api_tx,
+        wait.timeout_ms,
+        wait_started,
+    ) {
         Ok(agent) => agent,
         Err(response) => {
             return serde_json::to_string(&response)
@@ -221,16 +227,27 @@ fn prompt_agent_with_effect_timeout(
                 .map_err(std::io::Error::other);
         }
     };
+    let prompt_started_working =
+        before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
     let target = params.target.clone();
-    let initially_working = before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
-    let prompt_response = dispatch_to_app_with_timeout(
-        Request {
-            id: request_id.clone(),
-            method: Method::AgentPrompt(params),
-        },
+    if let Some(prompt_wait) = params.wait.as_mut() {
+        prompt_wait.submission_deadline = wait
+            .timeout_ms
+            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
+    }
+    let last_event_sequence = event_hub.current_sequence();
+    let prompt_request = Request {
+        id: request_id.clone(),
+        method: Method::AgentPrompt(params),
+    };
+    #[cfg(windows)]
+    let prompt_response = dispatch_to_app_with_caller_timeout(
+        prompt_request,
         api_tx,
-        None,
+        remaining_timeout_ms(wait.timeout_ms, wait_started).map(std::time::Duration::from_millis),
     );
+    #[cfg(not(windows))]
+    let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
@@ -243,8 +260,6 @@ fn prompt_agent_with_effect_timeout(
         return agent_wait_not_running(request_id).map(Some);
     }
     let composer_attempt_id = prompted.composer.attempt_id.clone();
-
-    let wait_started = std::time::Instant::now();
     let prompt_state_change_seq = prompted.state_change_seq;
     let until = agent_wait_statuses(wait.until);
     let effect_timeout_ms = wait.timeout_ms.map_or(effect_timeout_cap_ms, |timeout_ms| {
@@ -259,7 +274,7 @@ fn prompt_agent_with_effect_timeout(
         &before_prompt,
         prompted,
         prompt_state_change_seq,
-        initially_working,
+        prompt_started_working,
         composer_attempt_id.as_deref(),
         effect_timeout_ms,
         caller_timeout_is_effect_deadline,
@@ -270,7 +285,7 @@ fn prompt_agent_with_effect_timeout(
     else {
         return Ok(None);
     };
-    let (initial, delivery) = match effect {
+    let (mut initial, delivery) = match effect {
         PromptEffectOutcome::Submitted(agent) => {
             (agent, crate::api::schema::AgentPromptDelivery::Submitted)
         }
@@ -279,6 +294,54 @@ fn prompt_agent_with_effect_timeout(
         }
         PromptEffectOutcome::Response(response) => return Ok(Some(response)),
     };
+    // The fork's composer-observation verdict (#164) has already decided delivery and
+    // takes precedence: a pane that exposes no composer has nothing to observe, so
+    // `agent_prompt_unverifiable` must win there rather than a stall claim. Upstream's
+    // stall detection is the narrower, later signal, so it runs only after delivery is
+    // established and the agent still shows no working/blocked activity of its own.
+    let prompt_activity_observed = prompt_started_working
+        || matches!(
+            initial.agent_status,
+            crate::api::schema::AgentStatus::Working | crate::api::schema::AgentStatus::Blocked
+        );
+    if !prompt_activity_observed {
+        let remaining_timeout_ms = remaining_timeout_ms(wait.timeout_ms, wait_started);
+        let (stall_timeout_ms, timeout_kind) = match remaining_timeout_ms {
+            Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
+                (timeout_ms, AgentWaitTimeoutKind::Status)
+            }
+            _ => (
+                AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                AgentWaitTimeoutKind::PromptStalled {
+                    timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                },
+            ),
+        };
+        let Some(outcome) = wait_for_resolved_agent(
+            request_id.clone(),
+            ResolvedAgentWait {
+                target: target.clone(),
+                until: prompt_activity_statuses(),
+                timeout_ms: Some(stall_timeout_ms),
+                initial,
+                last_event_sequence,
+                after_state_change_seq: Some(prompt_state_change_seq),
+                accept_transient_status: true,
+                timeout_kind,
+            },
+            stream,
+            api_tx,
+            event_hub,
+            running,
+        )?
+        else {
+            return Ok(None);
+        };
+        initial = match outcome {
+            AgentWaitOutcome::Matched(agent) => *agent,
+            AgentWaitOutcome::Response(response) => return Ok(Some(response)),
+        };
+    }
     if agent_wait_matches(&initial, &until, None) {
         return agent_prompt_success(request_id, initial, delivery).map(Some);
     }
@@ -393,7 +456,17 @@ fn classify_prompt_observation(
     if !timed_out {
         return None;
     }
-    if caller_timeout_is_effect_deadline {
+    // The caller-deadline short-circuit does NOT apply when the pane was already
+    // working at submit time. `TimedOut` means "time ran out
+    // before we could observe the effect". For a pane that was ALREADY working when
+    // the prompt was submitted, no amount of extra time would have helped: there is no
+    // turn boundary to see, and this fixture's pane has no composer either. Reporting
+    // a timeout there tells the caller to retry something that in fact landed, which is
+    // how `agent prompt --wait` into a busy agent started failing after the v0.9.0
+    // merge (tests/cli/agents.rs `agent_start_command_works`, fork commit 8633a398).
+    // `WrittenToPty` is the honest answer and it is a SUCCESS outcome. Evidence still
+    // outranks it: a draft still visible below reports `Unsubmitted` either way.
+    if caller_timeout_is_effect_deadline && !initially_working {
         return Some(PromptObservationVerdict::TimedOut);
     }
     if composer_matches {
@@ -582,6 +655,7 @@ struct ResolvedAgentWait {
 #[derive(Clone, Copy)]
 enum AgentWaitTimeoutKind {
     Status,
+    PromptStalled { timeout_ms: u64 },
 }
 
 enum AgentWaitOutcome {
@@ -741,6 +815,17 @@ fn wait_for_resolved_agent(
     }
 }
 
+/// Statuses that count as the agent visibly acting on a prompt. Used by the
+/// post-delivery stall check, which is narrower than the composer-observation
+/// verdict: it only reports `agent_prompt_stalled` for a prompt whose delivery
+/// was already established.
+fn prompt_activity_statuses() -> Vec<crate::api::schema::AgentStatus> {
+    vec![
+        crate::api::schema::AgentStatus::Working,
+        crate::api::schema::AgentStatus::Blocked,
+    ]
+}
+
 fn agent_wait_statuses(
     until: Vec<crate::api::schema::AgentStatus>,
 ) -> Vec<crate::api::schema::AgentStatus> {
@@ -797,6 +882,33 @@ fn agent_get(
     agent_from_response(request_id, &response)
 }
 
+fn agent_get_for_prompt(
+    request_id: &str,
+    target: &str,
+    api_tx: &ApiRequestSender,
+    total_timeout_ms: Option<u64>,
+    started: std::time::Instant,
+) -> Result<crate::api::schema::AgentInfo, ErrorResponse> {
+    let request = Request {
+        id: format!("{request_id}:agent"),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: target.to_string(),
+        }),
+    };
+    let remaining_ms = remaining_timeout_ms(total_timeout_ms, started);
+    let response = match remaining_ms {
+        Some(timeout_ms) if timeout_ms <= APP_RESPONSE_TIMEOUT.as_millis() as u64 => {
+            dispatch_to_app_with_caller_timeout(
+                request,
+                api_tx,
+                Some(std::time::Duration::from_millis(timeout_ms)),
+            )
+        }
+        _ => dispatch_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT)),
+    };
+    agent_from_response(request_id, &response)
+}
+
 fn agent_from_response(
     request_id: &str,
     response: &str,
@@ -844,11 +956,20 @@ fn agent_wait_success(
 fn agent_wait_timeout(
     request_id: String,
     kind: AgentWaitTimeoutKind,
-    _current: &crate::api::schema::AgentInfo,
+    current: &crate::api::schema::AgentInfo,
 ) -> std::io::Result<String> {
     let (code, message) = match kind {
         AgentWaitTimeoutKind::Status => {
             ("timeout", "timed out waiting for agent status".to_string())
+        }
+        AgentWaitTimeoutKind::PromptStalled { timeout_ms } => {
+            let status = format!("{:?}", current.agent_status).to_ascii_lowercase();
+            (
+                "agent_prompt_stalled",
+                format!(
+                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; current status is {status}"
+                ),
+            )
         }
     };
     serde_json::to_string(&ErrorResponse {
@@ -1211,6 +1332,7 @@ mod tests {
                 wait: Some(crate::api::schema::AgentPromptWaitOptions {
                     until: vec![until],
                     timeout_ms: Some(10_000),
+                    submission_deadline: None,
                 }),
             },
             &mut client,
@@ -1247,6 +1369,22 @@ mod tests {
             classify_prompt_observation(false, 10, 10, false, true, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
             "persistent same-attempt composer evidence proves non-submission"
+        );
+        // Regression, v0.9.0 merge: a pane ALREADY working at submit time has no turn
+        // boundary to observe, so a caller-bounded deadline must not convert that into
+        // a timeout - it told callers to resend a prompt that had in fact landed, and
+        // broke `agent prompt --wait` into a busy agent.
+        assert_eq!(
+            classify_prompt_observation(true, 10, 10, false, false, false, true, true),
+            Some(PromptObservationVerdict::WrittenToPty),
+            "an already-working pane reports what it can prove, not a timeout"
+        );
+        // Evidence still outranks it: a draft still on screen is non-submission even
+        // for a busy pane at the caller's deadline.
+        assert_eq!(
+            classify_prompt_observation(true, 10, 10, false, true, true, true, true),
+            Some(PromptObservationVerdict::Unsubmitted),
+            "a visible same-attempt draft outranks the already-working shortcut"
         );
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, false, true, true, false),

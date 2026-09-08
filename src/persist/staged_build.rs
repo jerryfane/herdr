@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn clear_removes_the_manifest_and_is_a_noop_when_absent() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         let home = temp_dir("clear");
         std::env::set_var("XDG_CONFIG_HOME", &home);

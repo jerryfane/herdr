@@ -1,6 +1,93 @@
 use std::path::{Path, PathBuf};
 
+pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
+    if status.signal().is_some() {
+        super::ChildExitReason::Interrupted
+    } else {
+        super::ChildExitReason::Exited
+    }
+}
+
+pub(crate) fn wait_client_stream_readable(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Bound cancellation latency without polling idle connections hundreds of times per second.
+    let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct RemoteBridgeWake {
+    reader: std::os::unix::net::UnixStream,
+    writer: std::os::unix::net::UnixStream,
+}
+
+impl RemoteBridgeWake {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        Ok(Self { reader, writer })
+    }
+
+    pub(crate) fn cancel(&self) -> std::io::Result<()> {
+        // EOF stays readable, including when cancellation precedes the wait.
+        self.writer.shutdown(std::net::Shutdown::Write)
+    }
+
+    pub(crate) fn wait(&self, stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let crate::ipc::LocalStream::UdSocket(stream) = stream;
+        let mut descriptors = [
+            libc::pollfd {
+                fd: stream.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // SAFETY: both descriptors remain borrowed and the array has two entries.
+            if unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) } >= 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
+}
+
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
+    // SIGPIPE disposition is process-wide, and under `cargo test` the process is
+    // the whole harness: one `cli` test using this module's `print!` would flip
+    // every other test onto SIG_DFL, so an unrelated test writing to a closed pipe
+    // kills the run with a signal and no failing test to point at. Production
+    // behaviour (quiet exit under `herdr ... | head`) is unchanged.
+    #[cfg(test)]
+    {
+        let _ = handler;
+        return;
+    }
+    #[cfg(not(test))]
+    {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
     unsafe {
@@ -8,6 +95,7 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
         // Rust starts with SIGPIPE ignored. If this best-effort transition
         // fails, stdout retains the existing Rust behavior.
         libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+    }
     }
 }
 
@@ -97,7 +185,17 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
 }
 
 pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
+    remote_bridge_endpoint_path_in(&std::env::temp_dir(), readable_name, short_name)
+}
+
+/// The naming rule with the temporary base passed in, so a test can exercise
+/// the `/tmp` fallback for an over-long base without moving the process-global
+/// `TMPDIR` out from under every other test's `std::env::temp_dir()`.
+pub(crate) fn remote_bridge_endpoint_path_in(
+    tmp: &Path,
+    readable_name: &str,
+    short_name: &str,
+) -> PathBuf {
     let readable = tmp.join(readable_name);
     if fits_unix_socket_path(&readable) {
         return readable;

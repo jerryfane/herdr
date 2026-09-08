@@ -749,7 +749,13 @@ mod tests {
             ..Default::default()
         };
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+        App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
     }
 
     fn account(id: &str, kind: &str, config_dir: &str) -> AccountConfig {
@@ -1307,7 +1313,7 @@ mod tests {
         // Default install layout: config-home ~/.claude has NO inner .claude.json;
         // the real config file is the sibling ~/.claude.json. The primary account's
         // email must resolve from that sibling (issue #94), not read as null.
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev = std::env::var_os("HOME");
         let home = std::env::temp_dir().join(format!("herdr-claude-home-{}", std::process::id()));
         let claude_dir = home.join(".claude");

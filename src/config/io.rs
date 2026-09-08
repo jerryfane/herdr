@@ -181,11 +181,19 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
         return None;
     }
 
-    let target = config_path()
+    let target = config_path();
+    let target = target
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("config.toml")
-        .to_string();
+        .unwrap_or("config.toml");
+    Some(config_diagnostic_banner(target, diagnostics))
+}
+
+/// The banner wording for a non-empty diagnostic set, with the config file
+/// name passed in. Keeping the wording independent of `config_path()` lets it
+/// be asserted without the ambient `HERDR_CONFIG_PATH` a concurrent loader
+/// test may be pointing at a temporary file.
+fn config_diagnostic_banner(target: &str, diagnostics: &[String]) -> String {
     let read_error = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.starts_with("config read error:"));
@@ -216,7 +224,7 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
         ""
     };
 
-    Some(format!("{target}{impact}; herdr config check"))
+    format!("{target}{impact}; herdr config check")
 }
 
 pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
@@ -929,8 +937,8 @@ mod tests {
         ];
 
         assert_eq!(
-            config_diagnostic_summary(&diagnostics).as_deref(),
-            Some("config.toml; herdr config check")
+            config_diagnostic_banner("config.toml", &diagnostics),
+            "config.toml; herdr config check"
         );
     }
 
@@ -942,8 +950,8 @@ mod tests {
         ];
 
         assert_eq!(
-            config_diagnostic_summary(&diagnostics).as_deref(),
-            Some("config.toml has unknown keys; herdr config check")
+            config_diagnostic_banner("config.toml", &diagnostics),
+            "config.toml has unknown keys; herdr config check"
         );
     }
 
@@ -955,8 +963,8 @@ mod tests {
         ];
 
         assert_eq!(
-            config_diagnostic_summary(&diagnostics).as_deref(),
-            Some("config.toml; herdr config check")
+            config_diagnostic_banner("config.toml", &diagnostics),
+            "config.toml; herdr config check"
         );
     }
 
@@ -968,8 +976,8 @@ mod tests {
         ];
 
         assert_eq!(
-            config_diagnostic_summary(&diagnostics).as_deref(),
-            Some("config.toml invalid; using defaults; herdr config check")
+            config_diagnostic_banner("config.toml", &diagnostics),
+            "config.toml invalid; using defaults; herdr config check"
         );
     }
 
@@ -977,15 +985,15 @@ mod tests {
     fn config_diagnostic_summary_reports_unreadable_config_impact() {
         let startup = vec!["config read error: permission denied; using defaults".to_string()];
         assert_eq!(
-            config_diagnostic_summary(&startup).as_deref(),
-            Some("config.toml unreadable; using defaults; herdr config check")
+            config_diagnostic_banner("config.toml", &startup),
+            "config.toml unreadable; using defaults; herdr config check"
         );
 
         let reload =
             vec!["config read error: permission denied; keeping current config".to_string()];
         assert_eq!(
-            config_diagnostic_summary(&reload).as_deref(),
-            Some("config.toml unreadable; keeping current config; herdr config check")
+            config_diagnostic_banner("config.toml", &reload),
+            "config.toml unreadable; keeping current config; herdr config check"
         );
     }
 
@@ -997,14 +1005,14 @@ mod tests {
         ];
 
         assert_eq!(
-            config_diagnostic_summary(&diagnostics).as_deref(),
-            Some("config.toml invalid; keeping current config; herdr config check")
+            config_diagnostic_banner("config.toml", &diagnostics),
+            "config.toml invalid; keeping current config; herdr config check"
         );
     }
 
     #[test]
     fn config_loaders_report_unreadable_path() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path =
             std::env::temp_dir().join(format!("herdr-config-unreadable-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
@@ -1184,7 +1192,7 @@ mouse_captur = true
 
     #[test]
     fn startup_config_accepts_legacy_agent_panel_scope_without_warning() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-legacy-agent-panel-scope-{}.toml",
             std::process::id()
@@ -1202,7 +1210,7 @@ mouse_captur = true
 
     #[test]
     fn startup_config_load_warns_about_unknown_top_level_sections() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-unknown-section-{}.toml",
             std::process::id()

@@ -8,6 +8,7 @@ mod sound;
 mod tab_bar;
 mod theme;
 mod window_title;
+mod write;
 
 pub use self::{
     io::{
@@ -24,7 +25,8 @@ pub use self::{
         auth_env_vars_to_clear, default_config_dir, env_var_for_kind, is_default_config_dir,
         kind_for_config_env_var, validated_sidebar_bounds, AccountConfig, AccountLaunchEnv,
         AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport, ConfigReloadStatus,
-        FederationConfig, FederationPeer, HostCursorModeConfig, NewTerminalCwdConfig, PushConfig,
+        FederationConfig, FederationPeer, HostCursorModeConfig, NewTerminalCwdConfig,
+        PaneBordersConfig, PushConfig,
         ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
@@ -38,8 +40,10 @@ pub use self::{
     theme::{parse_color, CustomThemeColors, ModeThemeColors, ThemeConfig, THEME_NAMES},
     window_title::{WindowTitlePart, WindowTitleTemplate, WindowTitleToken},
 };
+pub(crate) use self::model::home_dir;
 
 pub(crate) use self::keybinds::parse_key_combo;
+pub(crate) use self::write::{update_file_at, write_edit, ConfigEdit};
 pub(crate) use self::{
     io::upsert_top_level_bool,
     model::omp_sessions_dir,
@@ -52,7 +56,28 @@ pub(crate) use self::{
     window_title::{sanitize_window_title_text, window_title_diagnostics},
 };
 
+pub(crate) use self::{keybinds::CommandKeybindType, model::KeysConfig};
+
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
+
+pub(crate) fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
+    if diagnostic.starts_with("config parse error:") || diagnostic.starts_with("config read error:")
+    {
+        return false;
+    }
+    diagnostic.contains("keybinding") || diagnostic.contains("keys.")
+}
+
+pub(crate) fn config_diagnostic_summary_without_keybindings(
+    diagnostics: &[String],
+) -> Option<String> {
+    let diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| !is_keybinding_config_diagnostic(diagnostic))
+        .cloned()
+        .collect::<Vec<_>>();
+    config_diagnostic_summary(&diagnostics)
+}
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
 pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
@@ -64,15 +89,64 @@ pub(crate) fn app_dir_name() -> &'static str {
     io::app_dir_name()
 }
 
+/// The one process-wide lock for test access to the environment.
+///
+/// `HOME`, `PATH`, `TMPDIR`, and every `XDG_*`/`HERDR_*` override live in a
+/// single process-global table, so a second lock guarding any of them is
+/// exactly as useful as no lock at all: two tests each holding their own lock
+/// still interleave a write with someone else's read. Everything that touches
+/// the environment under `cargo test` takes this lock and nothing else.
+///
+/// It is a reader-writer lock because the two kinds of dependency are not
+/// symmetric. A test that installs `XDG_CONFIG_HOME` or empties `PATH` needs
+/// exclusive access ([`TestEnvLock::lock`]); a test that merely *reads* the
+/// environment — most importantly one that spawns a program by bare name and
+/// therefore resolves it through `PATH` — only needs the writers held off
+/// ([`TestEnvLock::read`]), and those readers run concurrently with each other.
 #[cfg(test)]
-pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) struct TestEnvLock(std::sync::RwLock<()>);
+
+#[cfg(test)]
+impl TestEnvLock {
+    /// Exclusive access, for a test that MUTATES the environment.
+    ///
+    /// Hands back the guard directly and never reports poisoning: a test that
+    /// panics while holding this lock has already reported its own failure, and
+    /// propagating poison would turn that one failure into an unbounded cascade
+    /// of unrelated ones.
+    pub(crate) fn lock(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Shared access, for a test that only depends on the environment holding
+    /// still — typically because it spawns `sh`, `git`, or another program by
+    /// bare name and would get `ENOENT` from a `PATH` a mutating test replaced.
+    pub(crate) fn read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_config_env_lock() -> &'static TestEnvLock {
+    static LOCK: std::sync::LazyLock<TestEnvLock> =
+        std::sync::LazyLock::new(|| TestEnvLock(std::sync::RwLock::new(())));
+    &LOCK
 }
 
 impl Config {
     pub fn should_show_onboarding(&self) -> bool {
         self.onboarding.unwrap_or(true)
+    }
+
+    pub fn kitty_graphics_enabled(&self) -> bool {
+        self.terminal
+            .kitty_graphics
+            .or(self.experimental.kitty_graphics)
+            .unwrap_or(true)
     }
 
     pub fn prefix_key(&self) -> (KeyCode, KeyModifiers) {
@@ -137,12 +211,6 @@ impl Config {
         })
     }
 
-    #[cfg(test)]
-    pub fn live_keybinds(&self) -> Result<LiveKeybindConfig, Vec<String>> {
-        self.live_keybinds_with_diagnostics()
-            .map(|(live, _diagnostics)| live)
-    }
-
     pub(crate) fn live_keybinds_with_diagnostics(
         &self,
     ) -> Result<(LiveKeybindConfig, Vec<String>), Vec<String>> {
@@ -160,10 +228,19 @@ impl Config {
             keys: model::KeysConfigOverlay,
         }
 
-        toml::to_string_pretty(&KeysProfile {
-            keys: self.keys.local_profile(&self.keybinds()),
-        })
+        let mut keys = self.keys.local_profile(&self.keybinds());
+        keys.set_prefix(format_key_combo(self.prefix_key()));
+        toml::to_string_pretty(&KeysProfile { keys })
     }
+}
+
+pub(crate) fn keybindings_from_profile_toml(profile: &str) -> Result<LiveKeybindConfig, String> {
+    let config = toml::from_str::<Config>(profile)
+        .map_err(|err| format!("invalid keybinding profile: {err}"))?;
+    config
+        .live_keybinds_with_diagnostics()
+        .map(|(keybinds, _diagnostics)| keybinds)
+        .map_err(|diagnostics| diagnostics.join("; "))
 }
 
 #[cfg(test)]
@@ -193,6 +270,23 @@ command = "lazygit"
         assert!(!profile.contains("lazygit"));
         assert!(!profile.contains("command ="));
         assert!(!profile.contains("[[keys.command]]"));
+    }
+
+    #[test]
+    fn local_keybindings_profile_publishes_the_effective_prefix_fallback() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ctrl+"
+"#,
+        )
+        .unwrap();
+
+        let profile = config.local_keybindings_profile_toml().unwrap();
+        let keybinds = keybindings_from_profile_toml(&profile).unwrap();
+
+        assert!(profile.contains("prefix = \"ctrl+b\""));
+        assert_eq!(keybinds.prefix, config.prefix_key());
     }
 
     #[test]

@@ -36,4 +36,13 @@ pub struct ServerCapabilities {
     /// destinations. Empty means the older Claude/Codex-only capability shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_session_transfer_harnesses: Vec<super::AgentSessionTransferHarness>,
+    /// Stable client-owned endpoint generation supported by this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_protocol_generation: Option<u32>,
+    /// Whether this server supports explicit client-shell surface interest.
+    #[serde(default)]
+    pub surface_interest: bool,
+    /// Whether this server supports endpoint health probes.
+    #[serde(default)]
+    pub health_check: bool,
 }

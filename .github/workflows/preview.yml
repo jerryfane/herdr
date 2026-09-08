@@ -12,7 +12,7 @@ on:
     types: [closed]
     paths:
       - docs/preview/**
-      - website/preview.json
+      - distribution/preview.json
 
 permissions:
   contents: read
@@ -65,8 +65,8 @@ jobs:
           else
             commit="$(python3 scripts/preview.py select-commit --ref origin/master)"
           fi
-          current_preview="$(python3 scripts/preview.py current-commit --manifest website/preview.json || true)"
-          if [ "$current_preview" = "$commit" ] && node website/scripts/docs-preview.mjs check; then
+          current_preview="$(python3 scripts/preview.py current-commit --manifest distribution/preview.json || true)"
+          if [ "$current_preview" = "$commit" ] && node scripts/docs/preview.mjs check; then
             echo "Preview and documentation already point at $commit; skipping."
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -313,17 +313,12 @@ jobs:
         with:
           path: artifacts
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
-
       - name: Record previous preview commit
         id: previous-preview
         shell: bash
         run: |
           set -euo pipefail
-          previous="$(python3 scripts/preview.py current-commit --manifest website/preview.json || true)"
+          previous="$(python3 scripts/preview.py current-commit --manifest distribution/preview.json || true)"
           if [ -z "$previous" ]; then
             previous="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
           fi
@@ -400,10 +395,10 @@ jobs:
 
       - name: Update preview documentation and manifest
         run: |
-          node website/scripts/docs-preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
+          node scripts/docs/preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
           python3 scripts/preview.py manifest \
             --repo "$GITHUB_REPOSITORY" \
-            --output website/preview.json \
+            --output distribution/preview.json \
             --tag '${{ needs.preflight.outputs.tag }}' \
             --build-id '${{ needs.preflight.outputs.build_id }}' \
             --commit '${{ needs.preflight.outputs.commit }}' \
@@ -414,9 +409,8 @@ jobs:
             --sha-file preview-sha256.json \
             --retain 30
           python3 scripts/preview.py validate-manifest-repository \
-            --manifest website/preview.json \
+            --manifest distribution/preview.json \
             --repo "$GITHUB_REPOSITORY"
-          (cd website && bun install --frozen-lockfile)
 
       - name: Prepare preview publication pull request
         id: publication-pr
@@ -440,7 +434,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A docs/preview website/preview.json
+          git add -A docs/preview distribution/preview.json
           if git diff --cached --quiet; then
             echo "error: preview preflight requested publication but generated no changes" >&2
             exit 1
@@ -450,9 +444,8 @@ jobs:
           pushed=false
           for attempt in 1 2 3; do
             git pull --rebase "$remote" master
-            node website/scripts/docs-preview.mjs check
-            node website/scripts/docs-versions.mjs check
-            (cd website && bun run build)
+            node scripts/docs/preview.mjs check
+            node scripts/docs/versions.mjs check
             remote_head="$(git ls-remote "$remote" "refs/heads/${publication_branch}" | awk 'NR == 1 {print $1}')"
             if [ -n "$remote_head" ]; then
               if git push \
@@ -485,7 +478,7 @@ jobs:
             echo "Build: \`${PREVIEW_BUILD_ID}\`"
             echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
-            echo "This PR changes only generated preview documentation and \`website/preview.json\`."
+            echo "This PR changes only generated preview documentation and \`distribution/preview.json\`."
             echo "Merge it only after this workflow publishes the matching prerelease and marks the PR ready."
           } > "$body_file"
 
@@ -591,7 +584,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
             | python3 scripts/preview.py validate-publication-files
 
-          preview_commit="$(python3 scripts/preview.py current-commit --manifest website/preview.json)"
+          preview_commit="$(python3 scripts/preview.py current-commit --manifest distribution/preview.json)"
           expected_branch="$(python3 scripts/preview.py publication-branch --commit "$preview_commit")"
           if [ "$PUBLICATION_BRANCH" != "$expected_branch" ]; then
             echo "error: merged branch $PUBLICATION_BRANCH does not match $expected_branch" >&2
@@ -602,8 +595,8 @@ jobs:
             exit 1
           fi
 
-          build_id="$(jq -er '.build_id | select(type == "string" and length > 0)' website/preview.json)"
-          tag="$(jq -er --arg build "$build_id" '.builds[$build].tag | select(type == "string" and length > 0)' website/preview.json)"
+          build_id="$(jq -er '.build_id | select(type == "string" and length > 0)' distribution/preview.json)"
+          tag="$(jq -er --arg build "$build_id" '.builds[$build].tag | select(type == "string" and length > 0)' distribution/preview.json)"
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
           if [ "$(jq -r '.draft' <<<"$release")" != "false" ] || [ "$(jq -r '.prerelease' <<<"$release")" != "true" ]; then
             echo "error: $tag is not a published prerelease" >&2
@@ -615,13 +608,13 @@ jobs:
             "herdr-macos-x86_64": .assets["macos-x86_64"].sha256,
             "herdr-macos-aarch64": .assets["macos-aarch64"].sha256,
             "herdr-windows-x86_64.zip": .assets["windows-x86_64"].sha256
-          }' website/preview.json)"
+          }' distribution/preview.json)"
           actual_assets="$(jq -S '[
             .assets[] | select(.digest | type == "string") |
             {key: .name, value: (.digest | sub("^sha256:"; ""))}
           ] | from_entries' <<<"$release")"
           if [ "$actual_assets" != "$expected_assets" ]; then
-            echo "error: $tag assets do not match website/preview.json" >&2
+            echo "error: $tag assets do not match distribution/preview.json" >&2
             exit 1
           fi
           tag_commit="$(git ls-remote origin "refs/tags/${tag}" | awk 'NR == 1 {print $1}')"
@@ -630,7 +623,7 @@ jobs:
             exit 1
           fi
 
-          previous="$(git show "${BASE_SHA}:website/preview.json" | jq -r '.commit // empty' || true)"
+          previous="$(git show "${BASE_SHA}:distribution/preview.json" | jq -r '.commit // empty' || true)"
           if [ -z "$previous" ]; then
             previous="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "$preview_commit")"
           fi
@@ -663,7 +656,7 @@ jobs:
               echo
               echo "| what | state |"
               echo "| --- | --- |"
-              echo "| \`website/preview.json\` on \`master\` | \`${BUILD_ID}\` published |"
+              echo "| \`distribution/preview.json\` on \`master\` | \`${BUILD_ID}\` published |"
               echo "| <https://herdr.dev/preview.json> | **NOT updated — still serving an older build** |"
               echo "| daemon self-update over the preview channel | **unavailable** |"
               echo
@@ -684,7 +677,7 @@ jobs:
         if: steps.website-deploy.outputs.triggered == 'true'
         run: |
           python3 scripts/preview.py verify-deployment \
-            --manifest website/preview.json \
+            --manifest distribution/preview.json \
             --url https://herdr.dev/preview.json \
             --token "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 

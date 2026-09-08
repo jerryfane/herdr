@@ -378,7 +378,7 @@ mod tests {
     struct ConfigDirGuard {
         dir: PathBuf,
         previous: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: std::sync::RwLockWriteGuard<'static, ()>,
     }
 
     impl Drop for ConfigDirGuard {
@@ -392,9 +392,7 @@ mod tests {
     }
 
     fn isolate_config_dir(tag: &str) -> ConfigDirGuard {
-        let lock = crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = crate::config::test_config_env_lock().lock();
         let dir = std::env::temp_dir().join(format!(
             "hgu-cfg-{}-{}-{tag}",
             std::process::id(),
@@ -844,7 +842,7 @@ mod tests {
         let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             app_rx,
             crate::api::EventHub::default(),
@@ -897,7 +895,7 @@ mod tests {
         let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             app_rx,
             crate::api::EventHub::default(),

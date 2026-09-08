@@ -177,8 +177,13 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         // agent.transfer_session (account-home filesystem authority), pane.close,
         // popup.close, every workspace/worktree/tab/layout/pane mutation except
         // the Admin `pane.set_pty_size` width-lease call above, the
-        // pane.report_*/authority calls, and pane.graphics.set/clear/stream) is
-        // denied to federation regardless of tier.
+        // pane.report_*/authority calls, pane.graphics.set/clear/stream, and the
+        // client-shell-routed commands that only a locally attached shell can
+        // serve — command.invoke, client_shell.surface.set, pane.scroll,
+        // pane.edit_scrollback, pane.selection.read, pane.copy_motion,
+        // pane.copy_search, pane.link.activate, integration.list, and the
+        // product_announcement/release_notes dismissals) is denied to federation
+        // regardless of tier.
         _ => FederationAccess::Denied,
     }
 }
