@@ -55,11 +55,14 @@ def staged_manifest_dirs(root: Path) -> tuple[Path, Path, dict[str, tuple[str, s
     (bundled / "staged.toml").write_text(bundled_content)
     (published / "staged.toml").write_text(published_content)
     (published / "index.toml").write_text(catalog("staged", "staged.toml"))
+    # Digest the file AS WRITTEN, not the string: `write_text` translates "\n" to
+    # "\r\n" on Windows, so hashing the source string disagrees with what the
+    # checker reads back and the entry stops matching.
     staged = {
         "staged": (
             STAGED_BUNDLED_VERSION,
             STAGED_PUBLISHED_VERSION,
-            hashlib.sha256(published_content.encode()).hexdigest(),
+            hashlib.sha256((published / "staged.toml").read_bytes()).hexdigest(),
         )
     }
     return bundled, published, staged
