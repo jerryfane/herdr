@@ -650,7 +650,6 @@ mod tests {
         assert!(server_thread.join().unwrap().is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
     fn idle_graphics_stream_waits_for_header_without_timing_out() {
         let (_client, server, _path) = local_stream_pair("graphics-idle-header");
@@ -678,7 +677,6 @@ mod tests {
         stopper.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn partial_graphics_header_times_out_after_first_byte() {
         let (mut client, server, _path) = local_stream_pair("graphics-partial-header");
@@ -702,7 +700,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
-    #[cfg(unix)]
     #[test]
     fn trickled_graphics_body_obeys_absolute_deadline() {
         let (mut client, server, _path) = local_stream_pair("graphics-trickle-body");
@@ -741,7 +738,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
-    #[cfg(unix)]
     #[test]
     fn timed_out_header_dispatches_owner_scoped_stream_close() {
         let (mut client, server, _path) = local_stream_pair("graphics-timeout-close");
@@ -794,7 +790,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
-    #[cfg(unix)]
     #[test]
     fn oversized_stream_frame_is_rejected_before_body_or_app_dispatch() {
         let (mut client, server, _path) = local_stream_pair("graphics-oversized-frame");
