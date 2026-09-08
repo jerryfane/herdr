@@ -779,12 +779,26 @@ mod tests {
     fn create_committed_repo(name: &str) -> PathBuf {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
+        // Every `git` invocation is a process spawn, and a process spawn costs seconds -
+        // not milliseconds - on a cold Windows CI runner. Pass the commit identity as
+        // one-shot config on the commit itself instead of writing it with two extra
+        // `git config` spawns; nothing after this commits again in these fixtures.
+        run_git(&repo, &["init", "--quiet"]);
         run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.email=herdr@example.invalid",
+                "-c",
+                "user.name=Herdr Test",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        );
         repo
     }
 
@@ -826,15 +840,23 @@ mod tests {
         app
     }
 
+    /// Liveness guard for the app event that a detached worktree thread emits after its
+    /// `git` child exits. The budget has to cover real process spawns - `git show-ref`
+    /// plus a `git worktree add` that checks a tree out - which cost seconds each on a
+    /// cold Windows CI runner against milliseconds on a warm Linux box. A budget that
+    /// expires while the child is still running fails the test without observing
+    /// anything, so keep it generous: nothing here waits on it in the passing path.
+    const APP_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     fn wait_for_app_event(app: &mut App) -> AppEvent {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
         loop {
             if let Ok(event) = app.event_rx.try_recv() {
                 return event;
             }
             assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for app event"
+                started.elapsed() < APP_EVENT_WAIT,
+                "timed out waiting for app event after {APP_EVENT_WAIT:?}"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
