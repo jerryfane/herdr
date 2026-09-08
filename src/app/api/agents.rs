@@ -1169,6 +1169,7 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&source).ok();
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// THE ASSERTION THE INCIDENT LACKED: on a failed preflight the OLD SEAT KEEPS RUNNING.    /// THE ASSERTION THE INCIDENT LACKED: on a failed preflight the OLD SEAT KEEPS RUNNING.
@@ -1212,6 +1213,7 @@ mod tests {
             "a refused restart must not mark the pane for respawn"
         );
         std::fs::remove_dir_all(&home).ok();
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[test]
@@ -2215,6 +2217,7 @@ mod tests {
         );
         // The imminent PaneDied must respawn the pane (with resume), not close it.
         assert!(terminal.respawn_shell_on_exit);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// Characterize the identity/persistence boundary a same-pane replacement relies on.
@@ -2290,6 +2293,7 @@ mod tests {
         );
         assert!(terminal.pending_agent_resume_plan.is_some());
         assert!(terminal.respawn_shell_on_exit);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     fn arm_ready_session_transfer(
@@ -3686,6 +3690,7 @@ mod tests {
                 format!("--resume={}", absolute_session_path("omp-sess.jsonl"))
             ]
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3716,6 +3721,7 @@ mod tests {
         assert!(app.state.terminals[&terminal_id]
             .pending_agent_resume_plan
             .is_none());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     fn arm_codex_agent(app: &mut App, name: &str) -> crate::terminal::TerminalId {
@@ -3793,6 +3799,7 @@ mod tests {
             vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
             "a plain restart keeps the remembered account"
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// THE POINT OF THE WHOLE DIAGNOSTIC: an agent says which account it is on.
@@ -3891,6 +3898,7 @@ mod tests {
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "unknown_account");
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// Arm a live, resumable Claude agent named `name` on the root pane and return
@@ -4079,6 +4087,7 @@ mod tests {
             .flat_map(|ws| ws.tabs.iter())
             .flat_map(|tab| tab.panes.values())
             .any(|pane| pane.attached_terminal_id == tid));
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// An unarchived pane must come back with a LIVE RUNTIME, not just live state.
@@ -4128,6 +4137,7 @@ mod tests {
             "unarchive advertised a pane with no runtime: every read/stream call on it \
              answers pane_not_found and a client retries forever"
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// The `--fresh` escape hatch arms no resume plan, so the resume launcher declines —
@@ -4162,6 +4172,7 @@ mod tests {
             app.terminal_runtimes.get(&tid).is_some(),
             "a fresh unarchive left the pane with no runtime, so it cannot be opened"
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// AN UNARCHIVED AGENT MUST COME BACK WHERE IT LEFT, WITH ITS LABEL.
@@ -4298,6 +4309,7 @@ mod tests {
             Some("reviewer"),
             "the restored pane lost its label, so a role bound to it cannot resolve"
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// An archive can outlive its workspace. When the origin is gone the restore must
@@ -4335,6 +4347,7 @@ mod tests {
             "restored into a fresh workspace"
         );
         assert!(app.state.archived_agents.is_empty());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// TWO PROCESSES MUST NEVER SHARE ONE SESSION.
@@ -4382,6 +4395,7 @@ mod tests {
             1,
             "a refused unarchive must leave the archive intact"
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// The guard must not fire for `--fresh`, which resumes nothing and therefore cannot
@@ -4417,6 +4431,7 @@ mod tests {
             serde_json::from_str(&response).expect("--fresh must remain available");
         assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
         assert!(app.state.archived_agents.is_empty());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[test]
@@ -4431,6 +4446,7 @@ mod tests {
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "archived_agent_not_found");
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     /// Push an archived record directly into the store, bypassing the archive
@@ -4522,6 +4538,7 @@ mod tests {
             .flat_map(|ws| ws.tabs.iter())
             .flat_map(|tab| tab.panes.values())
             .any(|pane| pane.attached_terminal_id == tid));
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -4574,6 +4591,7 @@ mod tests {
             .get(&tid)
             .expect("fresh unarchive brings the terminal back");
         assert!(terminal.pending_agent_resume_plan.is_none());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -4622,6 +4640,7 @@ mod tests {
                 .map(|session| session.session_ref.value.as_str()),
             Some(path_shaped_id)
         );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[test]
