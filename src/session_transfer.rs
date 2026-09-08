@@ -5833,22 +5833,44 @@ mod tests {
     ///
     /// The shim records the import request and exits; the import failing is fine,
     /// because the assertion is about what was SENT, not about the outcome.
-    #[tokio::test]
-    async fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
-        let root = temp_root("prepare-import-source");
-        let bin = root.join("bin");
-        let sessions = root.join("claude");
-        let target_home = root.join("codex");
-        let project = sessions.join("projects/-tmp");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&target_home).unwrap();
-        let session_id = "aaaaaaaa-0000-0000-0000-000000000001";
-        let source = project.join(format!("{session_id}.jsonl"));
-        write_fixture(
-            &source,
-            &[
-                json!({"type":"user","cwd":"/tmp","sessionId":session_id,
+    // Unix-only by mechanism, not by convenience: the fixture stands in for the
+    // `codex` importer with a `#!/bin/sh` script made executable by a mode bit and
+    // found through a `:`-separated PATH. Windows resolves executability from
+    // PATHEXT and separates PATH with `;`, so none of that shim exists there. Same
+    // gate, same reason, as `path_validation_rejects_symlinks_below_account_home`
+    // above. The contract itself is cross-platform; only this harness is not.
+    #[cfg(unix)]
+    #[test]
+    fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
+        // This test prepends a shim directory to the process-global `PATH`, so
+        // it takes the one env lock rather than trusting a per-test process:
+        // `cargo test` runs the whole binary in one process, and a stray `PATH`
+        // during another test's `Command::spawn` resolves the wrong program.
+        //
+        // Deliberately NOT `#[tokio::test]`: the guard has to cover the whole
+        // async body, and holding a std lock across an await inside an async fn
+        // is how a current-thread runtime deadlocks. Owning the runtime here keeps
+        // the guard in synchronous scope while the async work runs under it.
+        let _env_guard = crate::config::test_config_env_lock().lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let root = temp_root("prepare-import-source");
+            let bin = root.join("bin");
+            let sessions = root.join("claude");
+            let target_home = root.join("codex");
+            let project = sessions.join("projects/-tmp");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&target_home).unwrap();
+            let session_id = "aaaaaaaa-0000-0000-0000-000000000001";
+            let source = project.join(format!("{session_id}.jsonl"));
+            write_fixture(
+                &source,
+                &[
+                    json!({"type":"user","cwd":"/tmp","sessionId":session_id,
                     "message":{"role":"user","content":"hello"}}),
                 json!({"type":"assistant","cwd":"/tmp","sessionId":session_id,
                     "message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}),
