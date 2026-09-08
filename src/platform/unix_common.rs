@@ -82,10 +82,7 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     // kills the run with a signal and no failing test to point at. Production
     // behaviour (quiet exit under `herdr ... | head`) is unchanged.
     #[cfg(test)]
-    {
-        let _ = handler;
-        return;
-    }
+    let _ = handler;
     #[cfg(not(test))]
     {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

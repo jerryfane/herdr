@@ -143,16 +143,6 @@ mod windows {
                 })
         }
 
-        pub(crate) fn queue_user_input_submission(
-            &self,
-            text: Bytes,
-            enter: Bytes,
-            delay: Duration,
-            deadline: Option<Instant>,
-        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-            self.queue_user_input_submission_guarded(text, enter, delay, deadline, None)
-        }
-
         /// As above, but the Enter is withheld if `guard` says the pane changed
         /// hands during the submit delay. See `SubmissionGuard`.
         pub(crate) fn queue_user_input_submission_guarded(
@@ -418,7 +408,7 @@ mod windows {
                                 return Err(pty_actor_closed());
                             }
                             if let Some(guard) = guard.as_ref() {
-                                if (guard.occupant_unchanged)() == false {
+                                if !(guard.occupant_unchanged)() {
                                     if let Some(watch) = guard.watch.as_ref() {
                                         watch
                                             .abandoned

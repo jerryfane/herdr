@@ -466,9 +466,6 @@ impl PaneTerminal {
         self.ghostty.leave_alternate_screen_if_active()
     }
 
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.ghostty.keyboard_report_all_requested()
-    }
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.ghostty.bracketed_paste_enabled()
     }
@@ -1917,16 +1914,6 @@ impl GhosttyPaneTerminal {
         core.kitty_keyboard.replay_ansi()
     }
 
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.core.lock().is_ok_and(|core| {
-            let protocol = crate::input::KeyboardProtocol::from_kitty_flags(
-                core.terminal.kitty_keyboard_flags().unwrap_or(0) as u16,
-            );
-            protocol.reports_all_keys()
-                || (protocol.reports_event_types()
-                    && core.terminal.modify_other_keys_enabled().unwrap_or(false))
-        })
-    }
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.mode_enabled(crate::ghostty::MODE_BRACKETED_PASTE)
     }

@@ -141,15 +141,6 @@ impl PtyIoActorHandle {
         }
     }
 
-    pub(crate) fn queue_user_input_submission(
-        &self,
-        text: Bytes,
-        enter: Bytes,
-        delay: Duration,
-    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-        self.queue_user_input_submission_guarded(text, enter, delay, None)
-    }
-
     /// As above, but the Enter is withheld if the pane changed hands during the
     /// submit delay. See `crate::pty::actor::SubmissionGuard`.
     pub(crate) fn queue_user_input_submission_guarded(
@@ -920,7 +911,7 @@ impl PtyIoActorRunner {
                 .active_submission
                 .as_ref()
                 .and_then(|submission| submission.guard.as_ref())
-                .is_some_and(|guard| (guard.occupant_unchanged)() == false);
+                .is_some_and(|guard| !(guard.occupant_unchanged)());
             if occupant_changed {
                 let submission = self.active_submission.take().unwrap();
                 if let Some(watch) = submission.guard.as_ref().and_then(|g| g.watch.as_ref()) {
@@ -1242,7 +1233,7 @@ mod tests {
         });
 
         let completion = handle
-            .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay)
+            .queue_user_input_submission_guarded(text, Bytes::from_static(b"\r"), delay, None)
             .expect("submission queues");
         handle
             .try_write_user_input(Bytes::from_static(b"user"))
@@ -1265,10 +1256,11 @@ mod tests {
         // hard failure if it never does.
         let deadline = Instant::now() + Duration::from_secs(5);
         let err = loop {
-            let attempt = match handle.queue_user_input_submission(
+            let attempt = match handle.queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             ) {
                 Ok(completion) => completion.recv().expect("actor reports submission"),
                 Err(err) => Err(err),
@@ -1360,7 +1352,12 @@ mod tests {
             .expect("peer timeout");
 
         let completion = handle
-            .queue_user_input_submission(Bytes::new(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission_guarded(
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("empty prompt submission queues");
         let mut enter = [0; 1];
         peer.read_exact(&mut enter)
@@ -1372,10 +1369,11 @@ mod tests {
             .expect("empty prompt submission completes");
 
         let completion = handle
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt"),
                 Bytes::new(),
                 Duration::from_millis(40),
+                None,
             )
             .expect("empty enter submission queues");
         let handoff_handle = handle.clone();
@@ -1400,10 +1398,11 @@ mod tests {
     fn actor_reports_peer_closure_during_submission_delay() {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let completion = handle
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("submission queues");
         let mut prompt = [0; 6];
@@ -1421,19 +1420,21 @@ mod tests {
     fn actor_fails_buffered_submissions_on_exit() {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let active = handle
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"first"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("first submission queues");
         let mut prompt = [0; 5];
         peer.read_exact(&mut prompt).expect("peer receives prompt");
         let buffered = handle
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"second"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             )
             .expect("second submission queues");
 
@@ -1474,10 +1475,11 @@ mod tests {
                         .as_ref()
                         .expect("actor handle installed")
                         .clone();
-                    let attempt = handle.queue_user_input_submission(
+                    let attempt = handle.queue_user_input_submission_guarded(
                         Bytes::from_static(b"prompt"),
                         Bytes::from_static(b"\r"),
                         Duration::ZERO,
+                        None,
                     );
                     attempt_tx.send(attempt).expect("attempt receiver alive");
                 }
@@ -1568,7 +1570,12 @@ mod tests {
 
         let marker = Bytes::from_static(b"queued-input");
         let completion = handle
-            .queue_user_input_submission(marker.clone(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission_guarded(
+                marker.clone(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("submission accepted");
 
         const OUTPUT_LEN: usize = 128 * 1024;
@@ -2004,10 +2011,11 @@ mod tests {
         };
 
         let err = handle
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             )
             .expect_err("a full command queue must reject a queued submission");
 

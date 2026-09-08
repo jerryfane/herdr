@@ -5833,43 +5833,53 @@ mod tests {
     ///
     /// The shim records the import request and exits; the import failing is fine,
     /// because the assertion is about what was SENT, not about the outcome.
-    #[tokio::test]
-    async fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
+    #[test]
+    fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
         // This test prepends a shim directory to the process-global `PATH`, so
         // it takes the one env lock rather than trusting a per-test process:
         // `cargo test` runs the whole binary in one process, and a stray `PATH`
         // during another test's `Command::spawn` resolves the wrong program.
+        //
+        // Deliberately NOT `#[tokio::test]`: the guard has to cover the whole
+        // async body, and holding a std lock across an await inside an async fn
+        // is how a current-thread runtime deadlocks. Owning the runtime here keeps
+        // the guard in synchronous scope while the async work runs under it.
         let _env_guard = crate::config::test_config_env_lock().lock();
-        let root = temp_root("prepare-import-source");
-        let bin = root.join("bin");
-        let sessions = root.join("claude");
-        let target_home = root.join("codex");
-        let project = sessions.join("projects/-tmp");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&target_home).unwrap();
-        let session_id = "aaaaaaaa-0000-0000-0000-000000000001";
-        let source = project.join(format!("{session_id}.jsonl"));
-        write_fixture(
-            &source,
-            &[
-                json!({"type":"user","cwd":"/tmp","sessionId":session_id,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let root = temp_root("prepare-import-source");
+            let bin = root.join("bin");
+            let sessions = root.join("claude");
+            let target_home = root.join("codex");
+            let project = sessions.join("projects/-tmp");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&target_home).unwrap();
+            let session_id = "aaaaaaaa-0000-0000-0000-000000000001";
+            let source = project.join(format!("{session_id}.jsonl"));
+            write_fixture(
+                &source,
+                &[
+                    json!({"type":"user","cwd":"/tmp","sessionId":session_id,
                     "message":{"role":"user","content":"hello"}}),
-                json!({"type":"assistant","cwd":"/tmp","sessionId":session_id,
+                    json!({"type":"assistant","cwd":"/tmp","sessionId":session_id,
                     "message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}),
-            ],
-        );
+                ],
+            );
 
-        let log = root.join("import-requests.log");
-        let shim = bin.join("codex");
-        std::fs::write(
-            &shim,
-            format!(
-                // ANSWERS THE HANDSHAKE FIRST. The client sends `initialize` and WAITS
-                // for its response before sending anything else, so a shim that only
-                // watches for the import line blocks the exchange and times out having
-                // recorded nothing. Same mistake as the delete-protocol shim earlier.
-                "#!/bin/sh\n\
+            let log = root.join("import-requests.log");
+            let shim = bin.join("codex");
+            std::fs::write(
+                &shim,
+                format!(
+                    // ANSWERS THE HANDSHAKE FIRST. The client sends `initialize` and WAITS
+                    // for its response before sending anything else, so a shim that only
+                    // watches for the import line blocks the exchange and times out having
+                    // recorded nothing. Same mistake as the delete-protocol shim earlier.
+                    "#!/bin/sh\n\
                  head -n 1 > /dev/null\n\
                  printf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\n\
                  while IFS= read -r line; do\n\
@@ -5879,78 +5889,79 @@ mod tests {
                  \x20     exit 0;;\n\
                  \x20 esac\n\
                  done\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let previous = std::env::var_os("PATH");
-        // SAFETY: `_env_guard` above holds the one process-wide test env lock,
-        // so no other test reads or writes `PATH` for the duration.
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin.display(),
-                    previous.as_ref().and_then(|p| p.to_str()).unwrap_or("")
+                    log.display()
                 ),
-            );
-        }
-        for _ in 0..2 {
-            let _ = prepare(PrepareRequest {
-                source_kind: HarnessKind::Claude,
-                source_sessions_root: sessions.clone(),
-                source_session_ref: crate::agent_resume::AgentSessionRef::id(
-                    session_id.to_string(),
-                )
-                .expect("valid session id"),
-                source_cursor: None,
-                source_transcript_path: Some(source.clone()),
-                target_kind: HarnessKind::Codex,
-                target_config_home: target_home.clone(),
-                target_sessions_root: target_home.clone(),
-                target_launch_env: crate::config::AccountLaunchEnv::default(),
-                cwd: std::path::PathBuf::from("/tmp"),
-                timeout: Duration::from_secs(10),
-            })
-            .await;
-        }
-        if let Some(previous) = previous {
-            unsafe { std::env::set_var("PATH", previous) };
-        }
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
 
-        let recorded = std::fs::read_to_string(&log).expect("the importer must be invoked");
-        let paths: Vec<String> = recorded
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|value| {
-                value["params"]["migrationItems"][0]["details"]["sessions"][0]["path"]
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .collect();
-        assert_eq!(
-            paths.len(),
-            2,
-            "both attempts must reach the importer: {recorded}"
-        );
-        assert!(
-            paths.iter().all(|path| path != &source.to_string_lossy()),
-            "the ORIGINAL transcript path must never be sent — Codex would look it up in \
+            let previous = std::env::var_os("PATH");
+            // SAFETY: `_env_guard` above holds the one process-wide test env lock,
+            // so no other test reads or writes `PATH` for the duration.
+            unsafe {
+                std::env::set_var(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        previous.as_ref().and_then(|p| p.to_str()).unwrap_or("")
+                    ),
+                );
+            }
+            for _ in 0..2 {
+                let _ = prepare(PrepareRequest {
+                    source_kind: HarnessKind::Claude,
+                    source_sessions_root: sessions.clone(),
+                    source_session_ref: crate::agent_resume::AgentSessionRef::id(
+                        session_id.to_string(),
+                    )
+                    .expect("valid session id"),
+                    source_cursor: None,
+                    source_transcript_path: Some(source.clone()),
+                    target_kind: HarnessKind::Codex,
+                    target_config_home: target_home.clone(),
+                    target_sessions_root: target_home.clone(),
+                    target_launch_env: crate::config::AccountLaunchEnv::default(),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    timeout: Duration::from_secs(10),
+                })
+                .await;
+            }
+            if let Some(previous) = previous {
+                unsafe { std::env::set_var("PATH", previous) };
+            }
+
+            let recorded = std::fs::read_to_string(&log).expect("the importer must be invoked");
+            let paths: Vec<String> = recorded
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|value| {
+                    value["params"]["migrationItems"][0]["details"]["sessions"][0]["path"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect();
+            assert_eq!(
+                paths.len(),
+                2,
+                "both attempts must reach the importer: {recorded}"
+            );
+            assert!(
+                paths.iter().all(|path| path != &source.to_string_lossy()),
+                "the ORIGINAL transcript path must never be sent — Codex would look it up in \
              its import ledger and skip or reuse: {paths:?}"
-        );
-        assert_ne!(
-            paths[0], paths[1],
-            "two attempts must present DIFFERENT staged paths, or the second is skipped \
+            );
+            assert_ne!(
+                paths[0], paths[1],
+                "two attempts must present DIFFERENT staged paths, or the second is skipped \
              or answered with the first attempt's thread"
-        );
-        let _ = fs::remove_dir_all(&root);
+            );
+            let _ = fs::remove_dir_all(&root);
+        });
     }
 
     #[test]

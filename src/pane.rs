@@ -1567,7 +1567,7 @@ impl PaneRuntimeIo {
                         // The guard is honoured here too, so the occupant-change
                         // regression is provable without a real PTY.
                         if let Some(guard) = guard.as_ref() {
-                            if (guard.occupant_unchanged)() == false {
+                            if !(guard.occupant_unchanged)() {
                                 if let Some(watch) = guard.watch.as_ref() {
                                     watch
                                         .abandoned
@@ -3249,9 +3249,6 @@ impl PaneRuntime {
         self.terminal.normalize_alternate_screen_on_exit()
     }
 
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.terminal.keyboard_report_all_requested()
-    }
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.terminal.bracketed_paste_enabled()
     }

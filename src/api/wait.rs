@@ -175,7 +175,7 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    mut params: crate::api::schema::AgentPromptParams,
+    params: crate::api::schema::AgentPromptParams,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,

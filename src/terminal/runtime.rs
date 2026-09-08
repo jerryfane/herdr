@@ -318,15 +318,6 @@ impl TerminalRuntime {
         self.0.word_motion_target(row, col, motion)
     }
 
-    /// Collects the complete terminal input-mode snapshot.
-    ///
-    /// This performs multiple terminal queries. Keep it out of render/layout
-    /// and pane-scaled loops; add a narrow accessor when one fact is needed.
-    #[cfg(test)]
-    pub fn input_state(&self) -> Option<crate::pane::InputState> {
-        self.0.input_state()
-    }
-
     pub(crate) fn terminal_dimensions(&self) -> Option<(u16, u16)> {
         self.0.terminal_dimensions()
     }
@@ -345,10 +336,6 @@ impl TerminalRuntime {
 
     pub fn normalize_alternate_screen_on_exit(&self) -> bool {
         self.0.normalize_alternate_screen_on_exit()
-    }
-
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.0.keyboard_report_all_requested()
     }
 
     pub fn bracketed_paste_enabled(&self) -> bool {

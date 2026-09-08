@@ -121,6 +121,46 @@ manage_ssh_config = true
 
 启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含用户和系统 SSH 配置，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Linux 和 macOS 客户端还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接；Windows OpenSSH 不使用此复用方式。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
 
+## 联邦
+
+联邦让一个 Herdr 守护进程可以访问另一个守护进程的运行时。它默认关闭。只有在你启用它并且至少提供一个用于认证的对端令牌时，入站 TCP 监听器才会绑定；否则它会拒绝启动，而不是暴露一个未经认证的端口。
+
+```toml
+[federation]
+listen = true
+listen_addr = "127.0.0.1:7020"
+
+[[federation.peers]]
+alias = "laptop"
+token_file = "/etc/herdr/peers/laptop.token"
+capability = "observe"
+
+[[federation.peers]]
+alias = "ops"
+token_file = "/etc/herdr/peers/ops.token"
+capability = "interact"
+```
+
+每个 `[[federation.peers]]` 表声明一个对端：
+
+- `alias` — 该对端的本地名称，用于日志和诊断。
+- `token_file` — 共享密钥的路径。文件内容去除首尾空白后即为该对端出示的令牌；文件字节永远不会写入日志。没有可读且非空令牌文件的对端会被跳过。
+- `endpoint` — 出站连接时访问该对端的地址（供后续联邦功能使用）。
+- `expected_node_id` — 连接时要校验的节点标识（供后续联邦功能使用）。
+- `capability` — 该对端的令牌在入站 TCP 联邦中获得的能力等级。取值为 `observe`、`interact` 或 `admin`。默认值：`observe`。
+
+能力等级是有序的，每一级都包含它下面的一级：
+
+- `observe` — 只读：列出、读取和查看窗格、智能体、事件与布局。
+- `interact` — 包含 `observe` 的全部能力，另外可以驱动智能体和窗格（`agent.prompt`、`agent.send_keys`、`pane.send_text`、`pane.send_keys`）。
+- `admin` — 包含 `interact` 的全部能力，另外可以进行聚焦、重命名以及输入与权限变更（`agent.focus`、`agent.rename`、`pane.rename`、`pane.input.set`、`pane.send_input`、`agent.view.set`、`agent.view.clear`）。
+
+联邦只公开一个刻意挑选的、仅供读取与驱动的 API 子集。任何不属于某个能力等级的操作，包括服务器生命周期、插件、集成、gram、通知、窗口标题，以及对智能体 / 窗格 / 工作区 / 标签页 / worktree / 布局的修改和图形，都会对所有联邦对端拒绝，与其等级无关。入站连接的数量也有上限，因此对端无法耗尽守护进程的线程或文件描述符。
+
+:::caution[安全]
+TCP 联邦令牌授予的权限恰好是该对端的能力等级，不会更多。请把每个令牌文件视为限定在该等级上的密钥：只需要观察的对端给 `observe` 令牌，`admin` 留给你完全信任的对端。这与 SSH 路径（`herdr --remote` / `herdr api-bridge`）不同：SSH 路径针对本地 unix socket 运行，因此授予完整、不经过滤的控制平面访问权限；联邦的能力等级对它不适用。本地 unix socket 本身既不检查令牌，也不做等级过滤。
+:::
+
 ## 按键绑定
 
 有关前缀键的引导式介绍和经过验证的免前缀配置，请参阅[键盘](/docs/keyboard/)。

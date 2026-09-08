@@ -56,6 +56,18 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+`agent get` と `agent list` は、モーダル入力をライフサイクル状態とは別に公開します:
+
+```json
+{
+  "agent_status": "working",
+  "input_pending": true,
+  "input_prompt_kind": "select"
+}
+```
+
+`input_prompt_kind` は `confirm`、`select`、`free_text`、`unknown` のいずれかです。入力待ちがないときは両方のフィールドが省略され、`agent_status` は変わりません。
+
 ## 操作面を選ぶ
 
 | 目的 | コマンド |
