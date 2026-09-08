@@ -30,6 +30,7 @@ REQUIRED_COMMANDS = (
 )
 
 
+@unittest.skipUnless(os.name == "posix", "the fork installer is a POSIX shell script")
 class ForkInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="herdr-fork-installer-test-")
