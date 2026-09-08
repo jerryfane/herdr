@@ -646,7 +646,14 @@ impl App {
             expected_pane_exit_epochs: HashMap::new(),
             event_tx,
             event_rx,
-            last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            // Backdated so the first remote-status refresh is due immediately.
+            // `checked_sub`, not `-`: `Instant` is boot-relative on Windows, so a
+            // machine up for less than the interval underflows and `-` PANICS at
+            // startup. Falling back to `now` only delays the first refresh by one
+            // interval on a freshly booted host.
+            last_git_remote_status_refresh: Instant::now()
+                .checked_sub(GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+                .unwrap_or_else(Instant::now),
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,

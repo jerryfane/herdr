@@ -950,7 +950,15 @@ mod tests {
         app.usage_cache.insert(
             "work".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(600),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "skipping: host clock is younger than the staleness this test needs"
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
@@ -966,9 +974,32 @@ mod tests {
         assert!(app.usage_refresh_inflight.contains("work"));
     }
 
+    /// An `Instant` at least `min_age` in the past, or `None` when the host cannot
+    /// represent one.
+    ///
+    /// `Instant::now() - age` PANICS on Windows, where the clock is boot-relative:
+    /// a CI runner up for twenty minutes cannot go an hour back, which is exactly
+    /// how `a_stale_claude_reading_does_not_blank_the_meter` failed there while
+    /// passing on Linux. Returning `None` lets the caller skip loudly rather than
+    /// silently testing a FRESH reading while claiming to test a stale one.
+    fn instant_at_least_ago(min_age: std::time::Duration) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let mut age = min_age * 2;
+        loop {
+            if let Some(instant) = now.checked_sub(age) {
+                return Some(instant);
+            }
+            if age <= min_age {
+                return None;
+            }
+            age = (age / 2).max(min_age);
+        }
+    }
+
     /// The claude shape specifically: no local usage source, so discarding a stale cache
     /// leaves NOTHING. This is the exact case the owner hit — a meter that emptied itself —
     /// and it is why serving stale matters more for claude than for codex.
+
     #[test]
     fn a_stale_claude_reading_does_not_blank_the_meter() {
         let mut app = test_app_with_accounts(vec![account(
@@ -999,7 +1030,15 @@ mod tests {
         app.usage_cache.insert(
             "primary".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(3_600),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(3_600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "skipping: host clock is younger than the staleness this test needs"
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
