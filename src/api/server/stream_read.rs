@@ -96,11 +96,6 @@ fn read_line_polling(
         let mut byte = [0_u8; 1];
         let mut total_deadline = None;
         let mut idle_deadline = None;
-        if wait.arms_deadlines_before_first_byte() {
-            let now = Instant::now();
-            total_deadline = Some(now + total_timeout);
-            idle_deadline = Some(now + idle_timeout);
-        }
 
         loop {
             if !stream_is_running(running, stream_active) {
@@ -108,7 +103,7 @@ fn read_line_polling(
             }
             ensure_before_deadlines(idle_deadline, total_deadline, timeout_message)?;
             match stream.read(&mut byte) {
-                Ok(0) if wait.zero_read_is_eof() => return Ok(None),
+                Ok(0) if wait.zero_read_is_eof(!bytes.is_empty()) => return Ok(None),
                 // Non-blocking named pipe with nothing buffered: retry under the
                 // same deadlines rather than calling it a hangup.
                 Ok(0) => {
@@ -219,7 +214,7 @@ impl LineReader {
                 }
                 ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
                 match stream.read(scratch) {
-                    Ok(0) if wait.zero_read_is_eof() => return Ok(None),
+                    Ok(0) if wait.zero_read_is_eof(total_deadline.is_some()) => return Ok(None),
                     Ok(0) => {
                         wait.after_retry(idle_deadline, total_deadline);
                         continue;
@@ -325,7 +320,7 @@ pub(super) fn read_exact(
             let remaining = len - data.len();
             let read_len = remaining.min(chunk.len());
             match stream.read(&mut chunk[..read_len]) {
-                Ok(0) if !wait.zero_read_is_eof() => {
+                Ok(0) if !wait.zero_read_is_eof(!data.is_empty()) => {
                     wait.after_retry(Some(idle_deadline), Some(total_deadline));
                     continue;
                 }
@@ -382,6 +377,21 @@ impl ReadWait {
 
     /// Whether a zero-length read means the peer hung up.
     ///
+    /// TRADEOFF, stated plainly. On a non-blocking Windows named pipe `Ok(0)` is
+    /// ambiguous: it means both "closed" and "nothing buffered yet", and the API
+    /// offers no way to tell them apart. Unix does not share the ambiguity, since
+    /// a blocking read returns 0 only at EOF and `WouldBlock` otherwise.
+    ///
+    /// So the rule keys on progress. After a byte, `Ok(0)` is a pause and the
+    /// deadlines that byte armed bound the retry - this is the fix for a live
+    /// stream being dropped mid-frame. Before any byte, `Ok(0)` keeps its EOF
+    /// meaning, because retrying there would retry against no deadline at all and
+    /// spin forever, and because `idle_graphics_stream_waits_for_header_without_
+    /// timing_out` pins that a header-less stream must NOT time out - it exits on
+    /// its running flag. A live pipe idle before its first byte can therefore
+    /// still be read as closed on Windows; that is the pre-existing behaviour,
+    /// unchanged, and narrowing it further needs a real closed-pipe signal.
+    ///
     /// Always, under a socket timeout. In the POLL fallback the stream is
     /// non-blocking and a Windows named pipe reports "no data available yet" as
     /// `Ok(0)` where a unix socket reports `WouldBlock`, so a live stream that
@@ -394,20 +404,8 @@ impl ReadWait {
     /// whole Windows suite. Before the first byte, `Ok(0)` keeps its EOF meaning -
     /// a peer that closed without sending - and after it, the retry is bounded by
     /// the deadlines that byte established.
-    fn zero_read_is_eof(&self) -> bool {
-        matches!(self, Self::SocketTimeout)
-    }
-
-    /// Whether this wait mode needs its deadlines armed before the first byte.
-    ///
-    /// The blocking path lets the socket timeout bound each read, so it arms
-    /// deadlines from the first byte. The poll path cannot: with `Ok(0)` meaning
-    /// "not yet" it would retry against NO deadline and spin forever on a stream
-    /// that never sends, which hung the entire Windows suite. Arming at entry
-    /// keeps a pre-first-byte pause bounded by the same idle/total timeouts the
-    /// caller already chose.
-    fn arms_deadlines_before_first_byte(&self) -> bool {
-        matches!(self, Self::Poll(_))
+    fn zero_read_is_eof(&self, made_progress: bool) -> bool {
+        matches!(self, Self::SocketTimeout) || !made_progress
     }
 }
 
@@ -557,7 +555,15 @@ mod zero_read_tests {
     use std::sync::Arc;
 
     fn poll_pair(name: &str) -> (crate::ipc::LocalStream, ApiStream) {
-        let path = std::env::temp_dir().join(format!("srp-{}-{}.sock", std::process::id(), name));
+        // Counter as well as pid: a leftover path from an earlier run makes bind
+        // fail rather than reusing a fresh socket.
+        static NEXT_POLL_PAIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "srp-{}-{}-{}.sock",
+            std::process::id(),
+            name,
+            NEXT_POLL_PAIR.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&path);
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
         let client = crate::ipc::connect_local_stream(&path).unwrap();
@@ -588,34 +594,23 @@ mod zero_read_tests {
     /// non-blocking, where a Windows named pipe reports "nothing buffered yet" as
     /// `Ok(0)` and a unix socket reports `WouldBlock`.
     #[test]
-    fn only_a_socket_timeout_read_treats_zero_bytes_as_a_hangup() {
-        assert!(ReadWait::SocketTimeout.zero_read_is_eof());
-        assert!(!ReadWait::Poll(PollBackoff::new()).zero_read_is_eof());
-        assert!(ReadWait::Poll(PollBackoff::new()).arms_deadlines_before_first_byte());
-        assert!(!ReadWait::SocketTimeout.arms_deadlines_before_first_byte());
+    fn zero_length_reads_are_classified_by_progress_not_by_platform_luck() {
+        assert!(ReadWait::SocketTimeout.zero_read_is_eof(true));
+        assert!(ReadWait::SocketTimeout.zero_read_is_eof(false));
+        // Mid-read pause on a non-blocking pipe: NOT a hangup. This is the fix -
+        // a live stream that pauses used to be reported as a closed one.
+        assert!(!ReadWait::Poll(PollBackoff::new()).zero_read_is_eof(true));
+        // Before the first byte there is no deadline to bound a retry, so this
+        // keeps its EOF meaning rather than spinning forever.
+        assert!(ReadWait::Poll(PollBackoff::new()).zero_read_is_eof(false));
     }
 
-    /// THE regression: the poll path must terminate when no byte ever arrives.
-    ///
-    /// Deadlines used to be armed by the first byte, so a poll-mode read that never
-    /// received one retried against no deadline at all. On Windows, where `Ok(0)`
-    /// means "not yet" rather than EOF, that spun forever and hung the whole suite.
+    /// THE regression, and the reason the rule keys on progress: a poll read that
+    /// has received a byte and then stalls must end on its own deadline. Retrying
+    /// with no deadline spun forever and hung the entire Windows suite; calling the
+    /// stall EOF dropped a live stream mid-frame.
     #[test]
-    fn a_poll_read_that_never_receives_a_byte_still_times_out() {
-        let (_client, mut server) = poll_pair("idle");
-        let (result, elapsed) = poll_read_line(&mut server);
-        let err = result.expect_err("an idle poll read must time out, not hang or report EOF");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the idle poll read was not bounded: {elapsed:?}"
-        );
-    }
-
-    /// A live stream that pauses mid-line is not a hangup: it times out, and the
-    /// byte it did deliver does not turn the pause into `Ok(None)`.
-    #[test]
-    fn a_poll_read_that_pauses_mid_line_times_out_rather_than_reporting_eof() {
+    fn a_poll_read_that_pauses_mid_line_times_out_and_stays_bounded() {
         let (mut client, mut server) = poll_pair("partial");
         std::io::Write::write_all(&mut client, b"{").unwrap();
         std::io::Write::flush(&mut client).unwrap();
