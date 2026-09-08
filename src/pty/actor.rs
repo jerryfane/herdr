@@ -531,6 +531,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -621,6 +622,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
@@ -630,6 +632,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();
@@ -733,19 +736,21 @@ mod windows {
             let accepting = Arc::new(Mutex::new(true));
             let handle = test_handle(data_tx, Arc::clone(&accepting));
             handle
-                .queue_user_input_submission(
+                .queue_user_input_submission_guarded(
                     Bytes::from_static(b"first"),
                     Bytes::from_static(b"\r"),
                     Duration::ZERO,
+                    None,
                     None,
                 )
                 .expect("the first submission is queued");
 
             let full = handle
-                .queue_user_input_submission(
+                .queue_user_input_submission_guarded(
                     Bytes::from_static(b"second"),
                     Bytes::from_static(b"\r"),
                     Duration::ZERO,
+                    None,
                     None,
                 )
                 .expect_err("a full input queue must not silently drop a submission");
@@ -754,10 +759,11 @@ mod windows {
             let (closed_tx, closed_rx) = mpsc::channel(1);
             drop(closed_rx);
             let closed = test_handle(closed_tx, accepting)
-                .queue_user_input_submission(
+                .queue_user_input_submission_guarded(
                     Bytes::from_static(b"prompt"),
                     Bytes::from_static(b"\r"),
                     Duration::ZERO,
+                    None,
                     None,
                 )
                 .expect_err("an exited actor must reject a queued submission");

@@ -340,6 +340,11 @@ fi
         self.assertEqual(self._installed_binary().read_bytes(), self.binary_content)
 
     def test_darwin_uses_the_portable_stat_path(self) -> None:
+        # The shim REFUSES `-c` - that is the point, it stands in for BSD stat and
+        # proves the installer falls back to `-f`. Its delegation to the host's real
+        # stat must not assume GNU syntax: on a macOS runner the real stat is itself
+        # BSD, so `-c` fails there too and this test passed on Linux while failing on
+        # macOS with "illegal option -- c".
         real_stat = shutil.which("stat")
         if real_stat is None:
             self.fail("test host is missing stat")
@@ -351,8 +356,8 @@ if [ "$1" = "-c" ]; then
 fi
 [ "$1" = "-f" ] || exit 2
 case "$2" in
-    %u) exec {real_stat} -c %u "$3" ;;
-    %Lp) exec {real_stat} -c %a "$3" ;;
+    %u) {real_stat} -c %u "$3" 2>/dev/null || {real_stat} -f %u "$3" ;;
+    %Lp) {real_stat} -c %a "$3" 2>/dev/null || {real_stat} -f %Lp "$3" ;;
     *) exit 3 ;;
 esac
 """,
