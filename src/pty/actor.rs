@@ -471,6 +471,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -561,6 +562,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
@@ -570,6 +572,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();
@@ -598,6 +601,113 @@ mod windows {
                     .collect::<Vec<_>>(),
                 vec![b"first".as_slice(), b"\r".as_slice()]
             );
+        }
+
+        struct ChunkedWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+            max_chunk: usize,
+        }
+
+        impl Write for ChunkedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = bytes.len().min(self.max_chunk);
+                self.bytes.extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        fn test_handle(
+            data_tx: mpsc::Sender<PtyIoDataCommand>,
+            accepting: Arc<Mutex<bool>>,
+        ) -> PtyIoActorHandle {
+            let (control_tx, _control_rx) = std_mpsc::channel();
+            let (write_tx, _write_rx) = std_mpsc::channel();
+            PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                write_tx,
+                response_order: Arc::new(Mutex::new(())),
+                accepting,
+            }
+        }
+
+        /// A ConPTY writer may accept fewer bytes than offered. Acknowledging before
+        /// the tail is written would report a prompt as delivered while part of it
+        /// never reached the child.
+        #[test]
+        fn submission_part_completes_partial_writes_before_acknowledging() {
+            let mut writer = ChunkedWriter {
+                bytes: Vec::new(),
+                flushes: 0,
+                max_chunk: 3,
+            };
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply, completion) = std_mpsc::channel();
+            write_tx
+                .send(PtyIoWriteCommand::SubmissionPart {
+                    bytes: Bytes::from_static(b"complete partial batch"),
+                    deadline: None,
+                    reply,
+                })
+                .unwrap();
+            drop(write_tx);
+
+            run_writer(&mut writer, write_rx);
+
+            completion
+                .recv()
+                .expect("the writer reports the submission part")
+                .expect("partial writes complete before acknowledgement");
+            assert_eq!(writer.bytes, b"complete partial batch");
+            assert_eq!(writer.flushes, 1);
+        }
+
+        /// Refusing a submission must be observable: a dropped submission would leave
+        /// text stranded in a composer after the caller was told it was accepted.
+        #[test]
+        fn queued_submission_reports_backpressure_and_a_closed_actor() {
+            let (data_tx, _data_rx) = mpsc::channel(1);
+            let accepting = Arc::new(Mutex::new(true));
+            let handle = test_handle(data_tx, Arc::clone(&accepting));
+            handle
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"first"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect("the first submission is queued");
+
+            let full = handle
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"second"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect_err("a full input queue must not silently drop a submission");
+            assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
+
+            let (closed_tx, closed_rx) = mpsc::channel(1);
+            drop(closed_rx);
+            let closed = test_handle(closed_tx, accepting)
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"prompt"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect_err("an exited actor must reject a queued submission");
+            assert_eq!(closed.kind(), std::io::ErrorKind::BrokenPipe);
         }
     }
 }
