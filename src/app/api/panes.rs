@@ -14,8 +14,8 @@ use crate::api::schema::{
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
     PaneSendTextParams, PaneSetPtySizeParams, PaneSplitParams, PaneStreamParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneTurnRecord,
-    PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult,
+    ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;

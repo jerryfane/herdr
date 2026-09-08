@@ -4934,11 +4934,13 @@ async fn client_shell_text_input_opens_human_composer_attempt() {
         panes.remove(0).composer
     };
 
-    assert!(server.handle_server_event(ServerEvent::ClientShellPaneInput {
-        client_id: 1,
-        pane_id: pane_id.clone(),
-        events: vec![key(crate::protocol::ClientKeyCode::Left, None)],
-    }));
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id: pane_id.clone(),
+            events: vec![key(crate::protocol::ClientKeyCode::Left, None)],
+        })
+    );
     assert!(!input_rx.recv().await.expect("encoded arrow").is_empty());
     let navigation_only = composer(&mut server);
     assert_eq!(
@@ -4968,7 +4970,11 @@ async fn client_shell_text_input_opens_human_composer_attempt() {
         pane_id,
         events: vec![key(crate::protocol::ClientKeyCode::Char('i'), Some("i"))],
     });
-    assert!(!input_rx.recv().await.expect("encoded second key").is_empty());
+    assert!(!input_rx
+        .recv()
+        .await
+        .expect("encoded second key")
+        .is_empty());
     let continued = composer(&mut server);
     assert_eq!(
         continued.author,

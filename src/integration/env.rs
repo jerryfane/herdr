@@ -190,9 +190,8 @@ pub(crate) fn grok_dir() -> io::Result<PathBuf> {
 /// on Windows) so an installed integration and a registered account never
 /// disagree about a harness's config home.
 pub(crate) fn home_dir() -> io::Result<PathBuf> {
-    crate::config::home_dir().ok_or_else(|| {
-        io::Error::other("home directory is not set; cannot locate home directory")
-    })
+    crate::config::home_dir()
+        .ok_or_else(|| io::Error::other("home directory is not set; cannot locate home directory"))
 }
 
 #[cfg(test)]

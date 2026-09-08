@@ -49,9 +49,9 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalComposerFrame, TerminalCompressionStep, TerminalDirtyPatch,
-    TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalSearchDirection,
-    TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    TerminalComposerFrame, TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -1513,7 +1513,6 @@ impl PaneRuntimeIo {
         }
     }
 
-
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_terminal_response(response),
@@ -1525,7 +1524,6 @@ impl PaneRuntimeIo {
             }
         }
     }
-
 
     fn queue_user_input_submission_guarded(
         &self,
@@ -1559,42 +1557,40 @@ impl PaneRuntimeIo {
                         Ok(())
                     } else {
                         sender.try_send(text).map_err(|err| {
-                            crate::pty::actor::submission_text_unwritten(
-                                &std::io::Error::other(err),
-                            )
+                            crate::pty::actor::submission_text_unwritten(&std::io::Error::other(
+                                err,
+                            ))
                         })
                     }
                     .and_then(|()| {
-                            std::thread::sleep(delay);
-                            // The guard is honoured here too, so the occupant-change
-                            // regression is provable without a real PTY.
-                            if let Some(guard) = guard.as_ref() {
-                                if (guard.occupant_unchanged)() == false {
-                                    if let Some(watch) = guard.watch.as_ref() {
-                                        watch
-                                            .abandoned
-                                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                            if let Err(err) = sender.try_send(enter) {
-                                if let Some(watch) =
-                                    guard.as_ref().and_then(|g| g.watch.as_ref())
-                                {
+                        std::thread::sleep(delay);
+                        // The guard is honoured here too, so the occupant-change
+                        // regression is provable without a real PTY.
+                        if let Some(guard) = guard.as_ref() {
+                            if (guard.occupant_unchanged)() == false {
+                                if let Some(watch) = guard.watch.as_ref() {
                                     watch
                                         .abandoned
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
-                                return Err(std::io::Error::other(err));
+                                return Ok(());
                             }
+                        }
+                        if let Err(err) = sender.try_send(enter) {
                             if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
                                 watch
-                                    .submitted
+                                    .abandoned
                                     .store(true, std::sync::atomic::Ordering::SeqCst);
                             }
-                            Ok(())
-                        });
+                            return Err(std::io::Error::other(err));
+                        }
+                        if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
+                            watch
+                                .submitted
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(())
+                    });
                     let _ = reply_tx.send(result);
                 });
                 Ok(reply_rx)
@@ -3427,8 +3423,6 @@ impl PaneRuntime {
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
     }
-
-
 
     /// Submission whose Enter is withheld when the pane changed hands during
     /// the delay. Used by the API prompt path; see `SubmissionGuard`.

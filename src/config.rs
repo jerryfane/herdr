@@ -10,6 +10,7 @@ mod theme;
 mod window_title;
 mod write;
 
+pub(crate) use self::model::home_dir;
 pub use self::{
     io::{
         append_accounts_block, config_diagnostic_summary, config_dir, config_path,
@@ -26,10 +27,9 @@ pub use self::{
         kind_for_config_env_var, validated_sidebar_bounds, AccountConfig, AccountLaunchEnv,
         AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport, ConfigReloadStatus,
         FederationConfig, FederationPeer, HostCursorModeConfig, NewTerminalCwdConfig,
-        PaneBordersConfig, PushConfig,
-        ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
-        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        PaneBordersConfig, PushConfig, ShellModeConfig, SidebarCollapsedModeConfig,
+        StatusIndicatorStyle, TabBarPositionConfig, ToastClipboardPosition, ToastConfig,
+        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -40,7 +40,6 @@ pub use self::{
     theme::{parse_color, CustomThemeColors, ModeThemeColors, ThemeConfig, THEME_NAMES},
     window_title::{WindowTitlePart, WindowTitleTemplate, WindowTitleToken},
 };
-pub(crate) use self::model::home_dir;
 
 pub(crate) use self::keybinds::parse_key_combo;
 pub(crate) use self::write::{update_file_at, write_edit, ConfigEdit};

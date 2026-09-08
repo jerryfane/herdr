@@ -497,8 +497,6 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-
-
     /// Submission whose Enter is withheld when the pane changed hands during
     /// the delay. Used by the API prompt path; see `SubmissionGuard`.
     pub fn queue_user_input_submission_guarded(

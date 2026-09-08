@@ -88,14 +88,14 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     }
     #[cfg(not(test))]
     {
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = handler;
-    unsafe {
-        libc::sigemptyset(&mut action.sa_mask);
-        // Rust starts with SIGPIPE ignored. If this best-effort transition
-        // fails, stdout retains the existing Rust behavior.
-        libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
-    }
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            // Rust starts with SIGPIPE ignored. If this best-effort transition
+            // fails, stdout retains the existing Rust behavior.
+            libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+        }
     }
 }
 

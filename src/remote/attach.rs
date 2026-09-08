@@ -3889,11 +3889,8 @@ mod tests {
         let long_dir = Path::new("/tmp").join("a".repeat(80));
         let (readable_name, short_name) =
             local_forward_socket_names("longish-host.example.com", "default");
-        let path = crate::platform::remote_bridge_endpoint_path_in(
-            &long_dir,
-            &readable_name,
-            &short_name,
-        );
+        let path =
+            crate::platform::remote_bridge_endpoint_path_in(&long_dir, &readable_name, &short_name);
 
         assert!(
             fits_unix_socket_path(&path),
