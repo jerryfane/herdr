@@ -103,7 +103,9 @@ fn read_line_polling(
             }
             ensure_before_deadlines(idle_deadline, total_deadline, timeout_message)?;
             match stream.read(&mut byte) {
-                Ok(0) if wait.zero_read_is_eof(!bytes.is_empty()) => return Ok(None),
+                Ok(0) if !wait.zero_read_needs_a_close_probe() || stream.peer_closed()? => {
+                    return Ok(None)
+                }
                 // Non-blocking named pipe with nothing buffered: retry under the
                 // same deadlines rather than calling it a hangup.
                 Ok(0) => {
@@ -214,7 +216,9 @@ impl LineReader {
                 }
                 ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
                 match stream.read(scratch) {
-                    Ok(0) if wait.zero_read_is_eof(total_deadline.is_some()) => return Ok(None),
+                    Ok(0) if !wait.zero_read_needs_a_close_probe() || stream.peer_closed()? => {
+                        return Ok(None)
+                    }
                     Ok(0) => {
                         wait.after_retry(idle_deadline, total_deadline);
                         continue;
@@ -320,7 +324,7 @@ pub(super) fn read_exact(
             let remaining = len - data.len();
             let read_len = remaining.min(chunk.len());
             match stream.read(&mut chunk[..read_len]) {
-                Ok(0) if !wait.zero_read_is_eof(!data.is_empty()) => {
+                Ok(0) if wait.zero_read_needs_a_close_probe() && !stream.peer_closed()? => {
                     wait.after_retry(Some(idle_deadline), Some(total_deadline));
                     continue;
                 }
@@ -377,35 +381,14 @@ impl ReadWait {
 
     /// Whether a zero-length read means the peer hung up.
     ///
-    /// TRADEOFF, stated plainly. On a non-blocking Windows named pipe `Ok(0)` is
-    /// ambiguous: it means both "closed" and "nothing buffered yet", and the API
-    /// offers no way to tell them apart. Unix does not share the ambiguity, since
-    /// a blocking read returns 0 only at EOF and `WouldBlock` otherwise.
-    ///
-    /// So the rule keys on progress. After a byte, `Ok(0)` is a pause and the
-    /// deadlines that byte armed bound the retry - this is the fix for a live
-    /// stream being dropped mid-frame. Before any byte, `Ok(0)` keeps its EOF
-    /// meaning, because retrying there would retry against no deadline at all and
-    /// spin forever, and because `idle_graphics_stream_waits_for_header_without_
-    /// timing_out` pins that a header-less stream must NOT time out - it exits on
-    /// its running flag. A live pipe idle before its first byte can therefore
-    /// still be read as closed on Windows; that is the pre-existing behaviour,
-    /// unchanged, and narrowing it further needs a real closed-pipe signal.
-    ///
-    /// Always, under a socket timeout. In the POLL fallback the stream is
-    /// non-blocking and a Windows named pipe reports "no data available yet" as
-    /// `Ok(0)` where a unix socket reports `WouldBlock`, so a live stream that
-    /// merely pauses must NOT be called a hangup - that is how the graphics
-    /// header timeout tests failed there.
-    ///
-    /// But only once the read has made progress. The idle and total deadlines are
-    /// armed by the first byte, so retrying before any byte arrives is retrying
-    /// with NO deadline: a stream that never sends spins forever, which hung the
-    /// whole Windows suite. Before the first byte, `Ok(0)` keeps its EOF meaning -
-    /// a peer that closed without sending - and after it, the retry is bounded by
-    /// the deadlines that byte established.
-    fn zero_read_is_eof(&self, made_progress: bool) -> bool {
-        matches!(self, Self::SocketTimeout) || !made_progress
+    /// Under a socket timeout, always: a blocking read returns 0 only at EOF.
+    /// Under the poll fallback the stream is non-blocking, and a Windows named
+    /// pipe answers "nothing buffered yet" with the same `Ok(0)` it uses for a
+    /// closed pipe - so the answer cannot come from the read alone, and the
+    /// caller must ASK, via `ApiStream::peer_closed` (a non-destructive
+    /// `PeekNamedPipe`, src/ipc.rs `probe_stream_closed`).
+    fn zero_read_needs_a_close_probe(&self) -> bool {
+        matches!(self, Self::Poll(_))
     }
 }
 
@@ -594,15 +577,31 @@ mod zero_read_tests {
     /// non-blocking, where a Windows named pipe reports "nothing buffered yet" as
     /// `Ok(0)` and a unix socket reports `WouldBlock`.
     #[test]
-    fn zero_length_reads_are_classified_by_progress_not_by_platform_luck() {
-        assert!(ReadWait::SocketTimeout.zero_read_is_eof(true));
-        assert!(ReadWait::SocketTimeout.zero_read_is_eof(false));
-        // Mid-read pause on a non-blocking pipe: NOT a hangup. This is the fix -
-        // a live stream that pauses used to be reported as a closed one.
-        assert!(!ReadWait::Poll(PollBackoff::new()).zero_read_is_eof(true));
-        // Before the first byte there is no deadline to bound a retry, so this
-        // keeps its EOF meaning rather than spinning forever.
-        assert!(ReadWait::Poll(PollBackoff::new()).zero_read_is_eof(false));
+    fn only_the_poll_path_has_to_ask_whether_the_peer_closed() {
+        // Blocking read: Ok(0) is EOF by definition, no probe needed.
+        assert!(!ReadWait::SocketTimeout.zero_read_needs_a_close_probe());
+        // Non-blocking: Ok(0) is ambiguous on a Windows named pipe, so the reader
+        // asks ApiStream::peer_closed (PeekNamedPipe) rather than guessing.
+        assert!(ReadWait::Poll(PollBackoff::new()).zero_read_needs_a_close_probe());
+    }
+
+    /// Closed versus idle, the distinction the whole rule exists for: with the peer
+    /// GONE the poll path must answer `Ok(None)` promptly rather than burning the
+    /// caller's deadline. The reader asks `ApiStream::peer_closed` rather than
+    /// inferring it from `Ok(0)`, which on a Windows named pipe means both things.
+    #[test]
+    fn a_poll_read_reports_a_closed_peer_without_waiting_for_the_deadline() {
+        let (client, mut server) = poll_pair("closed");
+        drop(client);
+        let (result, elapsed) = poll_read_line(&mut server);
+        assert!(
+            matches!(result, Ok(None)),
+            "a closed peer must read as EOF, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a closed peer must not wait out the idle deadline: {elapsed:?}"
+        );
     }
 
     /// THE regression, and the reason the rule keys on progress: a poll read that

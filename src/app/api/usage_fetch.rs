@@ -22,7 +22,7 @@ use crate::api::schema::{AccountUsage, UsageWindow};
 /// Codex quota moves fast (5h window); refresh the cache often.
 const USAGE_CODEX_TTL: Duration = Duration::from_secs(60);
 /// Claude's endpoint 429s more readily, so cache its result longer.
-const USAGE_CLAUDE_TTL: Duration = Duration::from_secs(300);
+pub(crate) const USAGE_CLAUDE_TTL: Duration = Duration::from_secs(300);
 /// Hard per-request bound so a hung network never strands the fetch thread.
 const CURL_MAX_TIME_SECS: u64 = 4;
 
