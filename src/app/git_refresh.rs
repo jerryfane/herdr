@@ -382,7 +382,9 @@ mod tests {
         let mut app = test_app(&config);
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
-        app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        app.last_git_remote_status_refresh = now
+            .checked_sub(GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+            .expect("test host clock is younger than the refresh interval");
 
         app.start_git_status_refresh_if_due(now);
 
@@ -470,7 +472,9 @@ mod tests {
         let mut app = test_app(&crate::config::Config::default());
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
-        app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        app.last_git_remote_status_refresh = now
+            .checked_sub(GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+            .expect("test host clock is younger than the refresh interval");
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, false),
