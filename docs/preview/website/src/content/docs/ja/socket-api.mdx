@@ -153,9 +153,9 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 
 クライアントは `offset_from_bottom == 0` を最下部にいる状態として扱えます。
 
-### ペイングラフィックス
+### 実験的なペイングラフィックス
 
-ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。デフォルトで利用でき、サーバーで `[terminal].kitty_graphics = false` が設定されている場合は、すべてのペイングラフィックスメソッドが `feature_disabled` を返します。この設定の変更にはサーバーの再起動が必要です。`pane.graphics.info` はグラフィックスレイヤーを作成せず、接続中クライアントのセルの幅と高さをピクセル単位で返します。`pane.graphics.set` は `data_base64` の `png`、`rgb`、`rgba` データを受け取り、`pane.graphics.clear` はレイヤーを削除します。
+ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。`[experimental].kitty_graphics = true` の場合にのみ利用でき、それ以外ではすべてのペイングラフィックスメソッドが `feature_disabled` を返します。`pane.graphics.info` はグラフィックスレイヤーを作成せず、接続中クライアントのセルの幅と高さをピクセル単位で返します。`pane.graphics.set` は `data_base64` の `png`、`rgb`、`rgba` データを受け取り、`pane.graphics.clear` はレイヤーを削除します。
 
 ```json
 {"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
@@ -306,8 +306,6 @@ Worktree メソッドは Git チェックアウトを Herdr ワークスペー�
 `worktree.list`、`worktree.create`、`worktree.open` では `workspace_id` と `cwd` は最大どちらか一方だけを使い、両方省略するとアクティブなワークスペースを使います。`worktree.open` では `path` と `branch` のちょうど一方を使います。生のソケットの `cwd` と `path` の値は絶対パスでなければなりません。CLI は相対の `--cwd` と `--path` の値をリクエスト送信前に展開します。ワークスペースが Herdr の worktree グループに属している場合、ワークスペースのレスポンスには任意の `worktree` 出自情報が含まれます。既存のワークスペースが worktree の出自情報を獲得または変更したとき、worktree コマンドは `workspace.updated` を発行することがあります。
 
 worktree コマンドはライフサイクルイベントも発行します。`worktree.create` は `workspace.created`、`tab.created`、`pane.created`、`worktree.created` を発行します。`worktree.open` は `worktree.opened` を発行し、新しい Herdr ワークスペースを開いた場合はワークスペース/タブ/ペインの作成イベントも発行します。`worktree.remove` は `worktree.removed` を発行し、リンクされたワークスペースがまだ開いている場合は `workspace.closed` も発行します。
-
-リンクされた worktree ワークスペースが開いている親ワークスペースを `workspace.close` で閉じるには、params に `"close_group": true` が必要です。明示的なグループクローズ指定がない場合は `workspace_group_close_required` を返します。明示的なグループクローズは、閉じた各ワークスペースについて `workspace.closed` イベントを 1 件ずつ発行します。
 
 ## エージェントビューのクエリ
 
@@ -757,6 +755,6 @@ herdr agent wait w1:p1 --until blocked
 
 ## プロトコルの安定性
 
-クライアント描画の Herdr UI は、ローカルサーバーと SSH サーバーに安定したエンドポイント世代を使います。クライアントとサーバーのビルドが一致する必要はありません。接続時にコアのスナップショット、画面、入力、blob コーデックを合意し、サーバーが対応 API メソッドと任意の能力を通知します。保存済み SSH マシンには、選択中のマシンだけがペイン画面を送信するための `surface_interest` と、通信のない接続の障害を検知する `health_check` が必要です。未対応のサーバーは明示的に更新するまで Attention になります。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。メソッドがない場合は、そのサーバー上の該当アクションだけを無効にしてクライアント側通知を表示します。拒否やタイムアウトも接続を終了せず通知します。エンドポイント世代 1 より前のサーバーだけは最後の 1 回の更新が必要です。
+Herdr にはクライアント/サーバー互換性のためのプロトコルバージョンがあります。プロトコルの変更は、リリースの互換性を念頭にレビューされます。
 
-番号付きバイナリプロトコルは、直接ターミナル接続やライブハンドオフなど、同一インストール内の内部操作に残ります。異なるビルド間でそれらを使う前に `ping` または `herdr status` を確認してください。JSON API クライアントは未知のフィールドを無視し、未対応メソッドを通常のエラーとして扱う必要があります。
+新しい挙動に依存する前に、`ping` または `herdr status` でサーバーのプロトコルを確認してください。未知のフィールドは寛容に扱ってください。

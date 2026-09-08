@@ -119,6 +119,24 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 
 `notification show` は設定済みの `[ui.toast]` 配信を使います。`--position` はアプリ内の Herdr トーストにのみ影響します。`--sound` のデフォルトは `none` で、`done` と `request` は通知が表示されたときにのみ、既存の完了音と要注意音を再生します。
 
+## Gram
+
+Gram は Herdr アプリに表示される、オーナーとエージェント間のメッセージチャネルです。
+
+```bash
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # オーナーにメッセージを送る(プッシュ通知)
+herdr gram list [--queue] [--unread] [--owner]  # --owner はオーナーとして読む
+herdr gram grab <id> [--as LABEL]               # 共有キューの項目を取得する(先着順)
+herdr gram get-file <id> -o PATH                # メッセージの添付ファイルをダウンロードする
+herdr gram post "<text>" [--to AGENT]           # オーナー:共有キュー、または特定のエージェント宛
+herdr gram mark-read <id>                       # オーナー:メッセージを既読にする
+herdr gram delete <id> [--owner]                # メッセージ(と添付ファイル)を完全に削除する
+```
+
+エージェントの識別子は `HERDR_PANE_ID` から解決され、エージェント名(名前がなければペイン id)になります。この名前は再起動やデプロイのハンドオフをまたいでも保持されますが、あくまで「名前」です。名前の変更・クリア・再利用により、`gram list` で「自分のもの」として表示される項目が変わります。取得(grab)自体は識別子に関わらず常に先着順でアトミックであり、2 つのエージェントが同じ項目を取得することはありません。属性表示(`from` やオーナー投稿のメッセージ)は参考情報であり、認証されたものではありません。
+
+`send --file` はファイルを添付し(キャプションは任意)、リクエストサイズの上限に収まるようチャンク単位でアップロードします。`get-file` はダウンロードします。`delete` はメッセージと添付データを完全に削除します。使い捨ての機密情報(一時的な API キーなど)を一度だけ送って破棄する用途に便利です。削除できるのは自分が送った・取得した・自分宛てのメッセージで、`--owner` は任意のメッセージを削除します。
+
 ## セッション
 
 ```bash
@@ -249,6 +267,8 @@ herdr pane report-agent-session <pane_id> \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH] \
+  [--agent-session-cursor ID] \
+  [--agent-process-pid PID] \
   [--session-start-source SOURCE]
 
 herdr pane release-agent <pane_id> \
@@ -257,9 +277,11 @@ herdr pane release-agent <pane_id> \
   [--seq N]
 ```
 
-`report-agent-session` はライフサイクル状態を報告せずにネイティブセッション識別子を更新します。`release-agent` は、そのエージェントプロセスが終了したときに、そのソースのライフサイクル権限を終了します。
+`report-agent-session` はライフサイクル状態を報告せずにネイティブセッション識別子を更新します。ツリー形式のセッションログを使うインテグレーションは、`--agent-session-cursor` で選択中のリーフを、`--agent-process-pid` でその報告に対応する正確なハーネスプロセスを指定できます。`release-agent` は、そのエージェントプロセスが終了したときに、そのソースのライフサイクル権限を終了します。
 
 公式インテグレーションがネイティブセッション参照を報告している場合、`pane get`、`pane list`、`agent get`、`agent list` は読み取り専用の `agent_session` オブジェクトを含みます。ネイティブセッション参照が保存されていない場合、このフィールドは省略されます。
+
+これらのコマンドは、ライフサイクル状態とは独立して、進行中のモーダル入力要求も公開します。モーダルが表示されている間は `"input_pending": true` と、`confirm`、`select`、`free_text`、`unknown` のいずれかの `input_prompt_kind` を含みます。それ以外の場合、両方のフィールドは省略されます。このシグナルによって `agent_status` が変わることはありません。
 
 これらのコマンドは、ペインを制御しているフォアグラウンドプロセスの cwd を解決できる場合に `foreground_cwd` を含みます。既存の `cwd` フィールドは、ラベルと follow-cwd 挙動に使われるペイン/ワークスペースの cwd のままです。
 

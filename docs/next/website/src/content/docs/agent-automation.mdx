@@ -56,6 +56,18 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+`agent get` and `agent list` expose modal input separately from lifecycle status:
+
+```json
+{
+  "agent_status": "working",
+  "input_pending": true,
+  "input_prompt_kind": "select"
+}
+```
+
+`input_prompt_kind` is `confirm`, `select`, `free_text`, or `unknown`. The fields are omitted when no input is pending, and `agent_status` remains unchanged.
+
 ## Choose the control surface
 
 | Goal | Command |

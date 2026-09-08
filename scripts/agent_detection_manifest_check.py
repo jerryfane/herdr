@@ -16,7 +16,36 @@ DEFAULT_BUNDLED_DIR = PROJECT_ROOT / "src" / "detect" / "manifests"
 DEFAULT_PUBLISHED_DIR = PROJECT_ROOT / "distribution" / "agent-detection"
 ENGINE_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest_update.rs"
 
-MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
+# `composer` and `input_rules` are fork-only manifest sections (composer
+# observation and input-prompt classification). Upstream's copy of this script
+# does not know them, and taking upstream's copy in the v0.9.0 merge made CI
+# reject every bundled fork manifest. Mirrored from the Rust deserializers in
+# src/detect/manifest.rs (`ComposerManifest`, `InputManifestRule`), both of which
+# are `deny_unknown_fields`, so this list must stay in step with them.
+MANIFEST_KEYS = {
+    "id",
+    "version",
+    "min_engine_version",
+    "updated_at",
+    "aliases",
+    "rules",
+    "composer",
+    "input_rules",
+}
+COMPOSER_KEYS = {"region"}
+INPUT_RULE_KEYS = {
+    "id",
+    "kind",
+    "priority",
+    "region",
+    "all",
+    "any",
+    "not",
+    "contains",
+    "regex",
+    "line_regex",
+}
+INPUT_PROMPT_KINDS = {"confirm", "select", "free_text", "unknown"}
 RULE_KEYS = {
     "id",
     "state",
@@ -56,15 +85,25 @@ MAX_MATCHER_CHARS = 512
 # Keep engine-2 clients on the OSC-capable manifest until an engine-3 release
 # can consume top_non_empty_lines. Remove this entry when the distribution
 # publishes the bundled Grok manifest.
-STAGED_PUBLISHED_MANIFESTS = {
-    "grok": (
-        "2026.07.16.2",
-        "2026.07.16.1",
-        "1f35b3271a96cf830c64bed78751619bfd8013c277c0d7c0f999b7a433895f28",
-    ),
-}
+# Bundled manifests deliberately held back from the published catalog, keyed by
+# agent id -> (bundled version, published version, published digest). Empty: the
+# v0.9.0 merge publishes claude (engine 4) and grok (engine 3), both consumable
+# now that MANIFEST_ENGINE_VERSION is 5. A client on an older engine rejects a
+# manifest that needs a newer one (src/detect/manifest.rs `min_engine_version`
+# gate) and keeps its bundled rules, so publishing ahead of a client is a no-op
+# for that client rather than a break.
+STAGED_PUBLISHED_MANIFESTS: dict[str, tuple[str, str, str]] = {}
+
 
 UNPUBLISHED_BUNDLED_MANIFESTS: dict[str, tuple[str, str]] = {}
+
+# Bundled SHARED rule sets, not agent manifests: compiled into the binary with
+# `include_str!` (src/detect/manifest.rs `SHARED_INPUT_MANIFEST`), applied to every
+# agent, and never published, so they carry no `version` and belong to no catalog
+# entry. `AgentManifest::version` is `Option` on the Rust side for exactly this
+# reason. Their input rules are still validated, by `validate_shared_rule_manifest`.
+SHARED_RULE_MANIFESTS = {"shared-input.toml"}
+SHARED_RULE_MANIFEST_KEYS = {"id", "min_engine_version", "input_rules"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,11 +164,77 @@ def compare_versions(left: str, right: str, path: Path) -> int:
     return (left_parts > right_parts) - (left_parts < right_parts)
 
 
+def validate_input_sections(path: Path, manifest: dict) -> None:
+    """Validates the fork-only `composer` and `input_rules` sections."""
+    composer = manifest.get("composer")
+    if composer is not None:
+        if not isinstance(composer, dict):
+            raise CheckError(f"{path}: composer must be a table")
+        unknown_composer = sorted(set(composer) - COMPOSER_KEYS)
+        if unknown_composer:
+            raise CheckError(
+                f"{path}: unknown composer field(s): {', '.join(unknown_composer)}"
+            )
+        region = composer.get("region")
+        if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+            raise CheckError(f"{path}: composer.region must be a known region")
+
+    input_rules = manifest.get("input_rules")
+    if input_rules is not None:
+        if not isinstance(input_rules, list):
+            raise CheckError(f"{path}: input_rules must be an array of tables")
+        for index, rule in enumerate(input_rules):
+            if not isinstance(rule, dict):
+                raise CheckError(f"{path}: input_rules[{index}] must be a table")
+            unknown_rule = sorted(set(rule) - INPUT_RULE_KEYS)
+            if unknown_rule:
+                raise CheckError(
+                    f"{path}: input_rules[{index}] unknown field(s): "
+                    f"{', '.join(unknown_rule)}"
+                )
+            rule_id = rule.get("id")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                raise CheckError(f"{path}: input_rules[{index}].id must be a non-empty string")
+            kind = rule.get("kind")
+            if kind not in INPUT_PROMPT_KINDS:
+                raise CheckError(
+                    f"{path}: input_rules[{index}].kind must be one of "
+                    f"{', '.join(sorted(INPUT_PROMPT_KINDS))}"
+                )
+            rule_region = rule.get("region")
+            if rule_region is not None and (
+                not isinstance(rule_region, str) or not REGION_RE.fullmatch(rule_region)
+            ):
+                raise CheckError(f"{path}: input_rules[{index}].region must be a known region")
+
+
+def validate_shared_rule_manifest(path: Path, engine_version: int) -> None:
+    """A bundled shared rule set: input rules only, no version, no catalog entry."""
+    manifest = load_toml(path)
+    unknown = sorted(set(manifest) - SHARED_RULE_MANIFEST_KEYS)
+    if unknown:
+        raise CheckError(
+            f"{path}: unknown shared rule manifest field(s): {', '.join(unknown)}"
+        )
+    min_engine = manifest.get("min_engine_version")
+    if not isinstance(min_engine, int):
+        raise CheckError(f"{path}: min_engine_version must be an integer")
+    if min_engine > engine_version:
+        raise CheckError(
+            f"{path}: min_engine_version {min_engine} exceeds engine version {engine_version}"
+        )
+    if not manifest.get("input_rules"):
+        raise CheckError(f"{path}: a shared rule manifest must declare input_rules")
+    validate_input_sections(path, manifest)
+
+
 def validate_manifest(path: Path, engine_version: int) -> dict:
     manifest = load_toml(path)
     unknown = sorted(set(manifest) - MANIFEST_KEYS)
     if unknown:
         raise CheckError(f"{path}: unknown manifest field(s): {', '.join(unknown)}")
+
+    validate_input_sections(path, manifest)
 
     agent_id = manifest.get("id")
     if not isinstance(agent_id, str) or not agent_id.strip():
@@ -279,6 +384,9 @@ def load_manifest_dir(path: Path, engine_version: int) -> dict[str, tuple[Path, 
     manifests: dict[str, tuple[Path, dict]] = {}
     for manifest_path in sorted(path.glob("*.toml")):
         if manifest_path.name == "index.toml":
+            continue
+        if manifest_path.name in SHARED_RULE_MANIFESTS:
+            validate_shared_rule_manifest(manifest_path, engine_version)
             continue
         manifest = validate_manifest(manifest_path, engine_version)
         agent_id = manifest["id"]

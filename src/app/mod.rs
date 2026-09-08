@@ -125,8 +125,16 @@ pub struct App {
     /// ("gram requires the shared herdr server"). Upstream's `AppPolicy` does not
     /// model this: deriving it from `persist_session` would make every
     /// `AppPolicy::TEST` app report gram unavailable and silently change what the
-    /// fork's gram tests exercise. Kept explicit, and false everywhere except the
-    /// monolithic entry point.
+    /// fork's gram tests exercise. Kept explicit rather than derived from
+    /// `AppPolicy`, because deriving it would make every test app report gram as
+    /// unavailable and silently change what those tests exercise.
+    ///
+    /// Currently always false: the v0.9.0 merge left no writer for it. Upstream
+    /// deleted the fork's monolithic entry point (`herdr --no-session`), which was
+    /// the only caller that set it true, and restoring that flag means rebuilding
+    /// an in-process TUI loop the merged architecture no longer has - see the
+    /// filed gap. The field and gram's gate stay so that restoring the entry point
+    /// is a one-line change rather than an archaeology exercise.
     pub(crate) no_session: bool,
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
@@ -629,7 +637,7 @@ impl App {
             // Shared in on production startup via `set_federation_manager`; the
             // no-federation path and every test keep this `None`.
             federation_manager: None,
-            // Monolithic mode sets this at its entry point; every other path
+            // No writer sets this true today: monolithic mode is gone. Every path
             // (server, tests) runs with a shared server available.
             no_session: false,
             direct_graphics_available: false,

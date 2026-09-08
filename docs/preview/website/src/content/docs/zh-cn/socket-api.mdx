@@ -153,9 +153,9 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 客户端可以把 `offset_from_bottom == 0` 视为位于底部。
 
-### 窗格图形
+### 实验性窗格图形
 
-窗格图形允许插件在窗格上放置图像数据。该功能默认可用；当服务器设置 `[terminal].kitty_graphics = false` 时，所有窗格图形方法都返回 `feature_disabled`。更改此设置需要重启服务器。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。
+窗格图形允许插件在窗格上放置图像数据。它们只在 `[experimental].kitty_graphics = true` 时可用;否则所有窗格图形方法都返回 `feature_disabled`。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。
 
 ```json
 {"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
@@ -306,8 +306,6 @@ Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` �
 `worktree.list`、`worktree.create` 和 `worktree.open` 中,`workspace_id` 和 `cwd` 最多用一个;两个都省略则使用活动工作区。`worktree.open` 中,`path` 和 `branch` 恰好用一个。原始 socket 的 `cwd` 和 `path` 值必须是绝对路径;CLI 在发送请求前会展开相对的 `--cwd` 和 `--path` 值。当工作区属于某个 Herdr worktree 组时,工作区响应包含可选的 `worktree` 来源信息。当已有工作区获得或改变 worktree 来源信息时,worktree 命令可能发出 `workspace.updated`。
 
 Worktree 命令也发出生命周期事件。`worktree.create` 发出 `workspace.created`、`tab.created`、`pane.created` 和 `worktree.created`。`worktree.open` 发出 `worktree.opened`,并在打开新的 Herdr 工作区时同时发出工作区/标签页/窗格创建事件。`worktree.remove` 发出 `worktree.removed`;如果关联的工作区仍然打开,还会发出 `workspace.closed`。
-
-当关联的 worktree 工作区仍然打开时，父工作区只有在 `workspace.close` 的 params 中包含 `"close_group": true` 时才会被关闭；缺少显式关闭组意图时会返回 `workspace_group_close_required`。显式关闭组时，每个被关闭的工作区都会发出一个 `workspace.closed` 事件。
 
 ## 智能体视图查询
 
@@ -753,6 +751,6 @@ herdr agent wait w1:p1 --until blocked
 
 ## 协议稳定性
 
-由客户端渲染的 Herdr UI 对本地和 SSH 服务器使用稳定的端点代数。客户端和服务器构建不必一致。连接时，双方会协商核心快照、屏幕、输入和 blob 编解码器，服务器则公布支持的 API 方法和可选能力。已保存的 SSH 机器需要 `surface_interest` 来确保只有选中的机器传输窗格画面，并需要 `health_check` 来发现空闲连接的故障。缺少这些能力的服务器会显示 Attention，直到明确更新。详见[连接机器](/zh-cn/docs/connecting-machines/)。缺少方法时,只禁用该服务器上的对应操作并显示客户端本地通知;操作被拒绝或超时也不会断开连接。只有早于端点第 1 代的服务器需要最后更新一次。
+Herdr 有一个用于客户端/服务器兼容性的协议版本。协议变更会在考虑发布兼容性的前提下进行评审。
 
-带编号的二进制协议仍用于同一安装内的内部操作,包括直接终端连接和实时交接。跨不同构建使用这些操作前,请检查 `ping` 或 `herdr status`。JSON API 客户端应忽略未知字段,并把不支持的方法当作普通错误处理。
+在依赖新行为之前,用 `ping` 或 `herdr status` 检查服务器协议。对未知字段做宽容处理。

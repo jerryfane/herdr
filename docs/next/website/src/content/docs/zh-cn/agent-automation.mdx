@@ -56,6 +56,18 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+`agent get` 和 `agent list` 会把模态输入与生命周期状态分开公开:
+
+```json
+{
+  "agent_status": "working",
+  "input_pending": true,
+  "input_prompt_kind": "select"
+}
+```
+
+`input_prompt_kind` 取值为 `confirm`、`select`、`free_text` 或 `unknown`。没有待处理输入时这两个字段都被省略,而 `agent_status` 保持不变。
+
 ## 选择控制界面
 
 | 目标 | 命令 |

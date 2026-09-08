@@ -29,19 +29,40 @@ path = "{path}"
 '''
 
 
-def staged_grok_dirs(root: Path) -> tuple[Path, Path]:
+# The staged-manifest fixture is SYNTHETIC on purpose. It used to copy the live
+# grok manifests out of the repo and lean on the live STAGED_PUBLISHED_MANIFESTS
+# entry, so the moment grok was actually published (v0.9.0 merge: engine 5 makes
+# the engine-3 manifest publishable) these tests stopped exercising staging at
+# all and started failing on unrelated content drift. The mechanism must be
+# testable without depending on what today's catalog happens to hold.
+STAGED_BUNDLED_VERSION = "2026.06.10.2"
+STAGED_PUBLISHED_VERSION = "2026.06.10.1"
+STAGED_ENGINE_VERSION = 3
+
+
+def staged_manifest_dirs(root: Path) -> tuple[Path, Path, dict[str, tuple[str, str, str]]]:
+    """A bundled manifest that needs the CURRENT engine, published one behind."""
     bundled = root / "bundled"
     published = root / "published"
     bundled.mkdir()
     published.mkdir()
-    (bundled / "grok.toml").write_bytes(
-        (check.DEFAULT_BUNDLED_DIR / "grok.toml").read_bytes()
+    bundled_content = manifest("staged", STAGED_BUNDLED_VERSION).replace(
+        "min_engine_version = 1", f"min_engine_version = {STAGED_ENGINE_VERSION}"
     )
-    (published / "grok.toml").write_bytes(
-        (check.DEFAULT_PUBLISHED_DIR / "grok.toml").read_bytes()
+    published_content = manifest("staged", STAGED_PUBLISHED_VERSION).replace(
+        "min_engine_version = 1", f"min_engine_version = {STAGED_ENGINE_VERSION - 1}"
     )
-    (published / "index.toml").write_text(catalog("grok", "grok.toml"))
-    return bundled, published
+    (bundled / "staged.toml").write_text(bundled_content)
+    (published / "staged.toml").write_text(published_content)
+    (published / "index.toml").write_text(catalog("staged", "staged.toml"))
+    staged = {
+        "staged": (
+            STAGED_BUNDLED_VERSION,
+            STAGED_PUBLISHED_VERSION,
+            hashlib.sha256(published_content.encode()).hexdigest(),
+        )
+    }
+    return bundled, published, staged
 
 
 UNPUBLISHED_TEST_MANIFEST = manifest("testagent", "2026.06.10.1")
@@ -96,20 +117,30 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
 
     def test_allows_explicitly_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
+            bundled, published, staged = staged_manifest_dirs(Path(tmp))
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
-            check.validate_catalog(website, bundled_manifests, engine_version=3)
+            bundled_manifests = check.load_manifest_dir(
+                bundled, engine_version=STAGED_ENGINE_VERSION
+            )
+            with patch.object(check, "STAGED_PUBLISHED_MANIFESTS", staged):
+                check.validate_catalog(
+                    published, bundled_manifests, engine_version=STAGED_ENGINE_VERSION
+                )
 
     def test_rejects_mutated_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
-            with (website / "grok.toml").open("a") as manifest_file:
+            bundled, published, staged = staged_manifest_dirs(Path(tmp))
+            with (published / "staged.toml").open("a") as manifest_file:
                 manifest_file.write("\n# unexpected mutation\n")
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
-            with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                check.validate_catalog(website, bundled_manifests, engine_version=3)
+            bundled_manifests = check.load_manifest_dir(
+                bundled, engine_version=STAGED_ENGINE_VERSION
+            )
+            with patch.object(check, "STAGED_PUBLISHED_MANIFESTS", staged):
+                with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
+                    check.validate_catalog(
+                        published, bundled_manifests, engine_version=STAGED_ENGINE_VERSION
+                    )
 
     def test_rejects_unlisted_published_manifest_lag_for_new_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,6 +274,86 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
                     check.validate_rule(
                         Path("test.toml"), 0, rule, {"gates": 0, "matchers": 0}
                     )
+
+
+class ForkManifestSectionTests(unittest.TestCase):
+    """The `composer` / `input_rules` sections are fork-only.
+
+    Upstream's copy of the checker does not know them, so a future upstream sync
+    that overwrites this script silently rejects every bundled fork manifest.
+    These tests fail loudly if that happens again.
+    """
+
+    def _manifest_with_sections(self, *, composer_region="prompt_box_body", kind="confirm"):
+        return manifest("claudeish", "2026.06.10.1") + f'''
+[composer]
+region = "{composer_region}"
+
+[[input_rules]]
+id = "confirm_prompt"
+priority = 100
+region = "bottom_non_empty_lines(4)"
+kind = "{kind}"
+contains = ["(y/n)"]
+'''
+
+    def _validate(self, content: str) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claudeish.toml"
+            path.write_text(content)
+            check.validate_manifest(path, engine_version=1)
+
+    def test_accepts_composer_and_input_rules(self):
+        self._validate(self._manifest_with_sections())
+
+    def test_rejects_unknown_composer_field(self):
+        content = self._manifest_with_sections().replace(
+            '[composer]', '[composer]\nunexpected = true'
+        )
+        with self.assertRaisesRegex(check.CheckError, "unknown composer field"):
+            self._validate(content)
+
+    def test_rejects_unknown_input_prompt_kind(self):
+        with self.assertRaisesRegex(check.CheckError, "kind must be one of"):
+            self._validate(self._manifest_with_sections(kind="interpretive_dance"))
+
+    def test_rejects_unknown_composer_region(self):
+        with self.assertRaisesRegex(check.CheckError, "composer.region must be a known region"):
+            self._validate(self._manifest_with_sections(composer_region="somewhere_else"))
+
+    def test_shared_rule_manifest_needs_no_version(self):
+        """`shared-input.toml` is bundled-only and versionless by design."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared-input.toml"
+            path.write_text(
+                '''id = "shared"
+min_engine_version = 1
+
+[[input_rules]]
+id = "shared_confirm"
+kind = "confirm"
+region = "bottom_non_empty_lines(4)"
+contains = ["(y/n)"]
+'''
+            )
+            check.validate_shared_rule_manifest(path, engine_version=1)
+
+    def test_shared_rule_manifest_rejects_agent_only_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared-input.toml"
+            path.write_text(
+                '''id = "shared"
+version = "2026.06.10.1"
+min_engine_version = 1
+
+[[input_rules]]
+id = "shared_confirm"
+kind = "confirm"
+contains = ["(y/n)"]
+'''
+            )
+            with self.assertRaisesRegex(check.CheckError, "unknown shared rule manifest field"):
+                check.validate_shared_rule_manifest(path, engine_version=1)
 
 
 if __name__ == "__main__":
