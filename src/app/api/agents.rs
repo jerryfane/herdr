@@ -915,6 +915,15 @@ fn migrate_session_for_account_swap(
 
 #[cfg(test)]
 mod tests {
+
+    /// A platform-absolute session path.
+    ///
+    /// `AgentSessionRef::path` requires `Path::is_absolute`, and "/tmp/x.jsonl" is
+    /// NOT absolute on Windows (no drive), so the literal returned `None` there and
+    /// the fixture's `unwrap` panicked in CI while passing on unix.
+    fn absolute_session_path(name: &str) -> String {
+        std::env::temp_dir().join(name).display().to_string()
+    }
     use super::*;
     use crate::{
         api::schema::{
@@ -3752,8 +3761,10 @@ mod tests {
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "herdr:omp".into(),
                 agent: "omp".into(),
-                session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/omp/sess.jsonl")
-                    .unwrap(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(absolute_session_path(
+                    "omp-sess.jsonl",
+                ))
+                .unwrap(),
             });
         }
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -3776,7 +3787,7 @@ mod tests {
             plan.argv,
             vec![
                 "omp".to_string(),
-                "--resume=/tmp/omp/sess.jsonl".to_string()
+                format!("--resume={}", absolute_session_path("omp-sess.jsonl"))
             ]
         );
     }
