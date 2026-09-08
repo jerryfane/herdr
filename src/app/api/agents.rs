@@ -1485,7 +1485,10 @@ mod tests {
                 wait: None,
             },
         );
-        assert!(response_rx.try_recv().is_err());
+        // No "has it answered yet?" poll here: that is a timing window, and a loaded
+        // runner loses it (this line failed on CI while passing locally every time).
+        // The contract is CAUSAL - the response follows the delayed Enter - and the
+        // elapsed assertion below proves it against the same clock the delay uses.
         let response = response_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission");
