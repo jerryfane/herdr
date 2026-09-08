@@ -3077,7 +3077,12 @@ mod tests {
             super::managed_resume_shell_command(&argv, r"C:\Program Files\Git\bin\bash.exe", true)
                 .expect("Git Bash transfer managed resume command");
 
-        assert!(command.starts_with("\\builtin command powershell.exe -NoProfile -EncodedCommand "));
+        // `-NoLogo -NoProfile`, matching cmd_encoded_powershell_command. The old
+        // expectation omitted -NoLogo and had never run: this is a fork test, and
+        // the fork's windows_check.ps1 ran a filtered list, so it first executed
+        // when this merge adopted upstream's full-suite script.
+        assert!(command
+            .starts_with("\\builtin command powershell.exe -NoLogo -NoProfile -EncodedCommand "));
         assert!(command.ends_with(r"; \command exit $?"));
         assert!(!command.contains(" & exit /b"));
     }
