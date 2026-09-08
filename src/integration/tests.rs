@@ -2871,25 +2871,76 @@ fn bundled_integration_assets_report_session_refs() {
     );
     assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
     assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
-    assert!(KIMI_HOOK_ASSET.contains("source\": \"herdr:kimi"));
-    assert!(KIMI_HOOK_ASSET.contains("agent_session_id"));
-    assert!(KIMI_HOOK_ASSET.contains("method = \"pane.report_agent_session\""));
-    assert!(KIMI_HOOK_ASSET.contains("params[\"session_start_source\"] = \"startup\""));
-    assert!(KIMI_HOOK_ASSET.contains("method = \"pane.report_agent\""));
-    assert!(KIMI_HOOK_ASSET.contains("params[\"state\"] = action"));
+    // The Windows assets speak the same protocol through the `herdr pane …` CLI
+    // instead of a JSON-RPC write over the unix socket, so the substring that proves
+    // a session ref is reported is spelled differently per platform. These are the
+    // same platform alternatives CLAUDE_HOOK_ASSET and CODEX_HOOK_ASSET above already
+    // carry; the harnesses below were simply missed, and the whole test failed fast
+    // (0.028 s) the first time Windows ran it (#174). Each pair is mutually
+    // exclusive — the unix spelling is absent from the .ps1 and vice versa — so
+    // neither platform's assertion is weakened into one the other could satisfy.
+    assert!(
+        KIMI_HOOK_ASSET.contains("source\": \"herdr:kimi")
+            || KIMI_HOOK_ASSET.contains("--source herdr:kimi")
+    );
+    assert!(
+        KIMI_HOOK_ASSET.contains("agent_session_id")
+            || KIMI_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        KIMI_HOOK_ASSET.contains("method = \"pane.report_agent_session\"")
+            || KIMI_HOOK_ASSET.contains("pane report-agent-session")
+    );
+    assert!(
+        KIMI_HOOK_ASSET.contains("params[\"session_start_source\"] = \"startup\"")
+            || KIMI_HOOK_ASSET.contains("--session-start-source startup")
+    );
+    assert!(
+        KIMI_HOOK_ASSET.contains("method = \"pane.report_agent\"")
+            || KIMI_HOOK_ASSET.contains("pane report-agent $env:HERDR_PANE_ID")
+    );
+    assert!(
+        KIMI_HOOK_ASSET.contains("params[\"state\"] = action")
+            || KIMI_HOOK_ASSET.contains("--state $Action")
+    );
     assert!(!KIMI_HOOK_ASSET.contains("pane.release_agent"));
-    assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
-    assert!(COPILOT_HOOK_ASSET.contains("pane.report_agent_session"));
+    assert!(
+        COPILOT_HOOK_ASSET.contains("agent_session_id")
+            || COPILOT_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        COPILOT_HOOK_ASSET.contains("pane.report_agent_session")
+            || COPILOT_HOOK_ASSET.contains("pane report-agent-session")
+    );
     assert!(!COPILOT_HOOK_ASSET.contains("\"state\":"));
     assert!(!COPILOT_HOOK_ASSET.contains("pane.release_agent"));
-    assert!(DEVIN_HOOK_ASSET.contains("HERDR_DEVIN_LIST_JSON"));
-    assert!(DEVIN_HOOK_ASSET.contains("\"method\": \"pane.report_agent_session\""));
+    // The unix asset takes its session list through the HERDR_DEVIN_LIST_JSON
+    // injection hook; the Windows asset has no injection point and invokes
+    // `devin list --format json` directly. Both spellings prove the same
+    // session-list fallback exists.
+    assert!(
+        DEVIN_HOOK_ASSET.contains("HERDR_DEVIN_LIST_JSON")
+            || DEVIN_HOOK_ASSET.contains("devin list --format json")
+    );
+    assert!(
+        DEVIN_HOOK_ASSET.contains("\"method\": \"pane.report_agent_session\"")
+            || DEVIN_HOOK_ASSET.contains("pane report-agent-session")
+    );
     assert!(!DEVIN_HOOK_ASSET.contains("\"method\": \"pane.report_agent\""));
     assert!(!DEVIN_HOOK_ASSET.contains("\"state\":"));
     assert!(!DEVIN_HOOK_ASSET.contains("pane.release_agent"));
-    assert!(DEVIN_HOOK_ASSET.contains("agent_session_id"));
-    assert!(DROID_HOOK_ASSET.contains("agent_session_id"));
-    assert!(DROID_HOOK_ASSET.contains("pane.report_agent_session"));
+    assert!(
+        DEVIN_HOOK_ASSET.contains("agent_session_id")
+            || DEVIN_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        DROID_HOOK_ASSET.contains("agent_session_id")
+            || DROID_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        DROID_HOOK_ASSET.contains("pane.report_agent_session")
+            || DROID_HOOK_ASSET.contains("pane report-agent-session")
+    );
     assert!(!DROID_HOOK_ASSET.contains("\"state\": action"));
     assert!(!DROID_HOOK_ASSET.contains("pane.release_agent"));
     assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
@@ -2913,8 +2964,14 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(CURSOR_HOOK_ASSET.contains("conversation_id"));
     assert!(CURSOR_HOOK_ASSET.contains("conversationId"));
     assert!(CURSOR_HOOK_ASSET.contains("sessionId"));
-    assert!(CURSOR_HOOK_ASSET.contains("agent_session_id"));
-    assert!(CURSOR_HOOK_ASSET.contains("pane.report_agent_session"));
+    assert!(
+        CURSOR_HOOK_ASSET.contains("agent_session_id")
+            || CURSOR_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        CURSOR_HOOK_ASSET.contains("pane.report_agent_session")
+            || CURSOR_HOOK_ASSET.contains("pane report-agent-session")
+    );
     assert!(CURSOR_HOOK_ASSET.contains("hook_event_name"));
     assert!(CURSOR_HOOK_ASSET.contains("sessionStart"));
     assert!(!CURSOR_HOOK_ASSET.contains("\"state\":"));
@@ -2923,15 +2980,33 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(MASTRACODE_HOOK_ASSET.contains("HERDR_INTEGRATION_VERSION=2"));
     assert!(MASTRACODE_HOOK_ASSET.contains("session_id"));
     assert!(!MASTRACODE_HOOK_ASSET.contains("run_id"));
-    assert!(MASTRACODE_HOOK_ASSET.contains("agent_session_id"));
-    assert!(MASTRACODE_HOOK_ASSET.contains("pane.report_agent_session"));
-    assert!(MASTRACODE_HOOK_ASSET.contains("session_start_source"));
-    assert!(MASTRACODE_HOOK_ASSET.contains("pane.report_agent"));
+    assert!(
+        MASTRACODE_HOOK_ASSET.contains("agent_session_id")
+            || MASTRACODE_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        MASTRACODE_HOOK_ASSET.contains("pane.report_agent_session")
+            || MASTRACODE_HOOK_ASSET.contains("report-agent-session")
+    );
+    assert!(
+        MASTRACODE_HOOK_ASSET.contains("session_start_source")
+            || MASTRACODE_HOOK_ASSET.contains("--session-start-source")
+    );
+    assert!(
+        MASTRACODE_HOOK_ASSET.contains("pane.report_agent")
+            || MASTRACODE_HOOK_ASSET.contains("\"report-agent\"")
+    );
     assert!(GROK_HOOK_ASSET.contains("HERDR_INTEGRATION_ID=grok"));
     assert!(GROK_HOOK_ASSET.contains("GROK_SESSION_ID"));
     assert!(GROK_HOOK_ASSET.contains("sessionId"));
-    assert!(GROK_HOOK_ASSET.contains("agent_session_id"));
-    assert!(GROK_HOOK_ASSET.contains("pane.report_agent_session"));
+    assert!(
+        GROK_HOOK_ASSET.contains("agent_session_id")
+            || GROK_HOOK_ASSET.contains("--agent-session-id")
+    );
+    assert!(
+        GROK_HOOK_ASSET.contains("pane.report_agent_session")
+            || GROK_HOOK_ASSET.contains("pane report-agent-session")
+    );
     assert!(GROK_HOOK_ASSET.contains("herdr:grok"));
     assert!(!GROK_HOOK_ASSET.contains("\"state\":"));
     assert!(!GROK_HOOK_ASSET.contains("pane.release_agent"));

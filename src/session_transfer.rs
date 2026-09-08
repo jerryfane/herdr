@@ -4086,6 +4086,26 @@ mod tests {
         path
     }
 
+    /// A short, constant, ABSOLUTE fixture cwd for the writers.
+    ///
+    /// `omp::write` (and `write_claude_session`) reject a non-absolute cwd, and
+    /// `Path::new("/tmp")` is NOT absolute on Windows — a rooted path with no drive
+    /// prefix — so the bare unix literal made every caller return
+    /// `TransferError::InvalidPath` and the tests failed fast the first time Windows
+    /// ran them (#174). The cwd is only recorded in the session header (it selects
+    /// `cwd_bucket`), so the value itself is arbitrary; it is kept short and constant
+    /// so the byte accounting these tests assert stays deterministic.
+    fn fixture_cwd() -> &'static Path {
+        #[cfg(windows)]
+        {
+            Path::new(r"C:\tmp")
+        }
+        #[cfg(not(windows))]
+        {
+            Path::new("/tmp")
+        }
+    }
+
     fn write_fixture(path: &Path, lines: &[Value]) {
         let mut file = fs::File::create(path).unwrap();
         for line in lines {
@@ -5197,8 +5217,7 @@ mod tests {
             role: VisibleRole::User,
             text: "x".repeat(64 * 1024),
         }];
-        let (_id, path, leaf) =
-            omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+        let (_id, path, leaf) = omp::write(&sessions, fixture_cwd(), &messages).unwrap();
         let written = std::fs::metadata(&path).unwrap().len();
         let ceiling = written / 2;
 
@@ -5291,8 +5310,7 @@ mod tests {
                         text: "a".to_string(),
                     })
                     .collect();
-                let (_id, path, _leaf) =
-                    omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+                let (_id, path, _leaf) = omp::write(&sessions, fixture_cwd(), &messages).unwrap();
                 std::fs::metadata(&path).unwrap().len()
             };
             (at(200) - at(100)) / 100
@@ -5380,7 +5398,7 @@ mod tests {
             std::fs::create_dir_all(&seeds).unwrap();
             let (_id, seed, _leaf) = omp::write(
                 &seeds,
-                std::path::Path::new("/tmp"),
+                fixture_cwd(),
                 &[VisibleMessage {
                     role: VisibleRole::Assistant,
                     text: "a".to_string(),
@@ -5539,8 +5557,7 @@ mod tests {
                     text: "a".to_string(),
                 })
                 .collect();
-            let (_id, path, _leaf) =
-                omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+            let (_id, path, _leaf) = omp::write(&sessions, fixture_cwd(), &messages).unwrap();
             std::fs::metadata(&path).unwrap().len()
         };
         // Differencing cancels the header, so this is the marginal entry cost.
@@ -5594,8 +5611,7 @@ mod tests {
                 text: "a".to_string(),
             });
         }
-        let (_id, path, _leaf) =
-            omp::write(&sessions, std::path::Path::new("/tmp"), &messages).unwrap();
+        let (_id, path, _leaf) = omp::write(&sessions, fixture_cwd(), &messages).unwrap();
         let destination_bytes = std::fs::metadata(&path).unwrap().len();
 
         let ratio = destination_bytes as f64 / source_bytes as f64;
