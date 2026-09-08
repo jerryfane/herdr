@@ -5833,6 +5833,13 @@ mod tests {
     ///
     /// The shim records the import request and exits; the import failing is fine,
     /// because the assertion is about what was SENT, not about the outcome.
+    // Unix-only by mechanism, not by convenience: the fixture stands in for the
+    // `codex` importer with a `#!/bin/sh` script made executable by a mode bit and
+    // found through a `:`-separated PATH. Windows resolves executability from
+    // PATHEXT and separates PATH with `;`, so none of that shim exists there. Same
+    // gate, same reason, as `path_validation_rejects_symlinks_below_account_home`
+    // above. The contract itself is cross-platform; only this harness is not.
+    #[cfg(unix)]
     #[test]
     fn production_prepare_sends_the_importer_a_fresh_staged_path_each_time() {
         // This test prepends a shim directory to the process-global `PATH`, so

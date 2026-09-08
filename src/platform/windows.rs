@@ -3754,7 +3754,7 @@ mod tests {
         cache.remember_for_test(10, &snapshot, &job);
         cache.entries.get_mut(&10).unwrap().verified_at = Instant::now()
             .checked_sub(super::FOREGROUND_SELECTION_RECHECK + Duration::from_secs(1))
-            .unwrap();
+            .expect("host uptime exceeds the recheck interval this test backdates");
         assert_eq!(cache.get(10, &snapshot), None);
     }
 
@@ -3871,7 +3871,7 @@ mod tests {
         cache.remember_for_test(10, &first_snapshot, &first_job);
         cache.entries.get_mut(&10).unwrap().last_used = Instant::now()
             .checked_sub(super::FOREGROUND_SELECTION_CACHE_RETENTION + Duration::from_secs(1))
-            .unwrap();
+            .expect("host uptime exceeds the cache retention this test backdates");
 
         let second_snapshot = super::ProcessSnapshot::new(vec![
             test_entry(11, 1, "powershell.exe", &["powershell.exe"]),

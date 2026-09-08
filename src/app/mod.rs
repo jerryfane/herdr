@@ -1214,7 +1214,9 @@ mod tests {
     fn git_status_event_clears_in_flight_refresh() {
         let mut app = test_app();
         app.git_refresh_in_flight = true;
-        let previous_refresh = Instant::now() - Duration::from_secs(10);
+        let previous_refresh = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("host uptime exceeds the refresh window this test backdates");
         app.last_git_remote_status_refresh = previous_refresh;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
