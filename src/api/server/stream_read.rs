@@ -74,7 +74,13 @@ pub(super) fn read_line(
             }
             ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
             match stream.read(&mut byte) {
-                Ok(0) => return Ok(None),
+                Ok(0) if wait.zero_read_is_eof() => return Ok(None),
+                // Non-blocking named pipe with nothing buffered: retry under the
+                // same deadlines rather than calling it a hangup.
+                Ok(0) => {
+                    wait.after_retry(idle_deadline, total_deadline);
+                    continue;
+                }
                 Ok(_) => {
                     wait.on_progress();
                     let now = Instant::now();
@@ -179,7 +185,11 @@ impl LineReader {
                 }
                 ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
                 match stream.read(scratch) {
-                    Ok(0) => return Ok(None),
+                    Ok(0) if wait.zero_read_is_eof() => return Ok(None),
+                    Ok(0) => {
+                        wait.after_retry(idle_deadline, total_deadline);
+                        continue;
+                    }
                     Ok(read) => {
                         wait.on_progress();
                         let now = Instant::now();
@@ -281,6 +291,10 @@ pub(super) fn read_exact(
             let remaining = len - data.len();
             let read_len = remaining.min(chunk.len());
             match stream.read(&mut chunk[..read_len]) {
+                Ok(0) if !wait.zero_read_is_eof() => {
+                    wait.after_retry(Some(idle_deadline), Some(total_deadline));
+                    continue;
+                }
                 Ok(0) if data.is_empty() => return Ok(None),
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -330,6 +344,19 @@ impl ReadWait {
         if let Self::Poll(backoff) = self {
             backoff.reset();
         }
+    }
+
+    /// Whether a zero-length read means the peer hung up.
+    ///
+    /// Only under a socket timeout. In the POLL fallback the stream is
+    /// non-blocking, and a Windows named pipe reports "no data available yet" as
+    /// `Ok(0)` where a unix socket reports `WouldBlock` - so treating `Ok(0)` as
+    /// EOF there ends a live stream the moment it pauses. That is exactly how the
+    /// graphics header timeout tests failed on Windows: the reader answered
+    /// `Ok(None)` (peer gone) instead of timing out, after the byte it had
+    /// already received.
+    fn zero_read_is_eof(&self) -> bool {
+        matches!(self, Self::SocketTimeout)
     }
 }
 
@@ -468,5 +495,23 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.interval, FALLBACK_POLL_INTERVAL);
         assert_eq!(backoff.fast_polls_remaining, FALLBACK_FAST_POLLS);
+    }
+}
+
+#[cfg(test)]
+mod zero_read_tests {
+    use super::{PollBackoff, ReadWait};
+
+    /// A zero-length read means EOF only when the stream is blocking with a
+    /// socket timeout. Under the poll fallback the stream is non-blocking, and a
+    /// Windows named pipe returns `Ok(0)` for "nothing buffered yet" where a unix
+    /// socket returns `WouldBlock`; treating that as EOF ended live streams on
+    /// Windows the moment they paused, which is what broke the pane-graphics
+    /// header timeout tests there. Linux cannot exercise the poll path (its
+    /// sockets accept a recv timeout), so this pins the rule directly.
+    #[test]
+    fn only_a_socket_timeout_read_treats_zero_bytes_as_a_hangup() {
+        assert!(ReadWait::SocketTimeout.zero_read_is_eof());
+        assert!(!ReadWait::Poll(PollBackoff::new()).zero_read_is_eof());
     }
 }
