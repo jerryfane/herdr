@@ -1250,6 +1250,24 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
         Method::AgentRestart(params) => Some(&mut params.target),
+        // Admin methods that name a pane/agent. `federation.rs` classifies all of these
+        // as AllowedAt(Admin) - remote admin is INTENDED - but without an arm here they
+        // fall through to `_ => None`, dispatch locally, and fail to resolve an
+        // `<alias>/pane` id that only exists on the peer. That produced `agent_not_found`
+        // for `agent.rename`/`agent.focus` against a healthy peer whose `agent.read` on
+        // the SAME target string worked (#181), because the read methods above are routed
+        // and these were not. The tier table and this table must agree; they did not.
+        Method::AgentRename(params) => Some(&mut params.target),
+        Method::AgentFocus(params) => Some(&mut params.target),
+        Method::PaneRename(params) => Some(&mut params.pane_id),
+        Method::PaneInputSet(params) => Some(&mut params.pane_id),
+        // `pane.send_keys` is Interact tier, beside the already-routed
+        // `pane.send_text`; sending text remotely while keys silently went local was
+        // the same asymmetry in a different pair.
+        Method::PaneSendKeys(params) => Some(&mut params.pane_id),
+        // NOT routed, deliberately: `agent.view.set`/`agent.view.clear` are Admin tier
+        // but their `source` is a view definition, not a pane or agent id, so there is
+        // no peer to resolve it against.
         // Session transfer is deliberately local-only. It reads account-home
         // transcripts and changes harness identity, so an alias-shaped target
         // must not silently gain federation filesystem authority.
@@ -4522,6 +4540,70 @@ mod federation_tests {
 
         // With no configured peers nothing routes.
         assert_eq!(federated_split("w1/builder", &HashMap::new()), None);
+    }
+
+    /// The tier table and the routing table MUST agree.
+    ///
+    /// `federation.rs` says which methods a peer may invoke; `routable_target_mut` says
+    /// which ones actually get sent there. #181: `agent.rename` and `agent.focus` were
+    /// AllowedAt(Admin) but had no routing arm, so they dispatched LOCALLY and answered
+    /// `agent_not_found` for an `<alias>/pane` id that only exists on the peer - while
+    /// `agent.read` on the same string worked, because reads were routed.
+    ///
+    /// This asserts the property rather than the two reported methods, so the next
+    /// method added to one table and forgotten in the other fails here.
+    #[test]
+    fn every_federation_allowed_target_method_is_routable() {
+        // (wire name, a params object carrying a federated target)
+        let cases: &[(&str, serde_json::Value)] = &[
+            (
+                "agent.rename",
+                serde_json::json!({ "target": "remote/w1:p1", "name": "x" }),
+            ),
+            (
+                "agent.focus",
+                serde_json::json!({ "target": "remote/w1:p1" }),
+            ),
+            (
+                "agent.restart",
+                serde_json::json!({ "target": "remote/w1:p1" }),
+            ),
+            (
+                "pane.rename",
+                serde_json::json!({ "pane_id": "remote/w1:p1", "label": "x" }),
+            ),
+            (
+                "pane.input.set",
+                serde_json::json!({ "pane_id": "remote/w1:p1", "right_click": "pane" }),
+            ),
+            (
+                "pane.send_keys",
+                serde_json::json!({ "pane_id": "remote/w1:p1", "keys": ["enter"] }),
+            ),
+            (
+                "pane.send_text",
+                serde_json::json!({ "pane_id": "remote/w1:p1", "text": "hi" }),
+            ),
+        ];
+
+        for (name, params) in cases {
+            // Only assert routing for methods federation actually exposes to a peer.
+            let access = crate::api::federation::federation_access(name);
+            assert!(
+                !matches!(access, crate::api::federation::FederationAccess::Denied),
+                "{name} is Denied by federation; this case is stale"
+            );
+
+            let mut method: Method =
+                serde_json::from_value(serde_json::json!({ "method": name, "params": params }))
+                    .unwrap_or_else(|err| panic!("{name} params do not parse: {err}"));
+            assert_eq!(
+                routable_target_mut(&mut method).map(|t| t.as_str()),
+                Some("remote/w1:p1"),
+                "{name} is federation-allowed but is not routed to the peer, so an \
+                 <alias>/pane target resolves locally and fails (#181)"
+            );
+        }
     }
 
     #[test]
