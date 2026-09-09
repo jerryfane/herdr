@@ -787,6 +787,12 @@ mod tests {
         assert_close_and_respond(close, "pane_1", &owner);
 
         let error = server_thread.join().unwrap().unwrap_err();
+        eprintln!(
+            "GFXPROBE kind={:?} raw={:?} msg={}",
+            error.kind(),
+            error.raw_os_error(),
+            error
+        );
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
