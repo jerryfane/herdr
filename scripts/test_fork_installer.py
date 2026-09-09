@@ -194,7 +194,7 @@ fi
     def test_installer_and_preview_updaters_share_the_fork_manifest(self) -> None:
         manifest_url = (
             "https://raw.githubusercontent.com/jerryfane/herdr/master/"
-            "website/preview.json"
+            "distribution/preview.json"
         )
         installer = INSTALLER.read_text(encoding="utf-8")
         updater = (REPO_ROOT / "src" / "update.rs").read_text(encoding="utf-8")
