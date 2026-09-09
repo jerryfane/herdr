@@ -2687,8 +2687,11 @@ mod tests {
             .unwrap();
         };
 
-        // Abbreviated form of the RUNNING commit: nothing to update to.
-        stage(&running[..8]);
+        // Abbreviated form of the RUNNING commit: nothing to update to. The embedded sha
+        // is NOT always 40 characters - CI builds carry a 7-character short sha - so the
+        // abbreviation is taken from whatever this binary actually has.
+        let abbrev = &running[..running.len().min(8)];
+        stage(abbrev);
         let v: serde_json::Value =
             serde_json::from_str(&app.handle_api_request(request())).unwrap();
         assert!(
@@ -2697,7 +2700,7 @@ mod tests {
         );
 
         // Same, upper-cased: git shas are hex and case-insensitive.
-        stage(&running[..8].to_ascii_uppercase());
+        stage(&abbrev.to_ascii_uppercase());
         let v: serde_json::Value =
             serde_json::from_str(&app.handle_api_request(request())).unwrap();
         assert!(
