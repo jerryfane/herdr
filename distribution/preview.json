@@ -1,36 +1,68 @@
 {
   "schema_version": 1,
   "channel": "preview",
-  "base_version": "0.8.2",
-  "build_id": "2026-08-30-dcc68be017d7",
-  "commit": "dcc68be017d723eaf8544e9fddd004f67ca70363",
-  "built_at": "2026-08-30T08:34:29Z",
-  "protocol": 20,
-  "notes": "Preview build 2026-08-30-dcc68be017d7\n\nBuilt from `dcc68be017d7` on `master`.\nBase stable: v0.8.2\nCompare: https://github.com/jerryfane/herdr/compare/15e730b8163308848a3d5195c519d882e1cec7c0...dcc68be017d723eaf8544e9fddd004f67ca70363\n\n### Added\n- Report account readiness and add `accounts prepare` (#147)\n\n### Fixed\n- Make pairing setup reliable on macos (#148)",
+  "base_version": "0.9.0",
+  "build_id": "2026-09-09-5a244caa60b0",
+  "commit": "5a244caa60b0c3a5742315c59d20ed81c05bc23e",
+  "built_at": "2026-09-09T04:46:18Z",
+  "protocol": 22,
+  "endpoint_generation": 1,
+  "notes": "Preview build 2026-09-09-5a244caa60b0\n\nBuilt from `5a244caa60b0` on `master`.\nBase stable: v0.9.0\nCompare: https://github.com/jerryfane/herdr/compare/v0.9.0...5a244caa60b0c3a5742315c59d20ed81c05bc23e\n\n### Fixed\n- Ask the pipe whether the peer closed, instead of guessing\n- Finish the Windows sweep with a measured predicate\n- Classify a zero-length read by progress, not by platform luck\n- Bound the poll read before its first byte\n- Close the remaining Windows-only hazards\n- Session-path fixtures must be absolute on every platform\n- Instant is boot-relative, so backdating must be checked\n- A non-blocking zero-length read is not a hangup\n- Repair the macOS and Windows checks the merge broke\n\n### Maintenance\n- Skip loudly when the host clock predates the TTL\n- Actually un-gate the socket-timing tests\n- Digest the staged fixture as written, not as a string\n- Budget the app-event wait for slow process spawns\n- Skip the fork installer suite off POSIX\n- Fix a stale git-bash resume expectation\n- Unix-gate the whole unarchive family\n- Unix-gate the unarchive tests that block on a Windows spawn\n- Shut down the PTY runtimes these tests spawn\n- Give the check job 30 minutes for the fuller Windows suite\n- Unix-gate the socket-timing graphics stream tests\n- Clear the lint gate after the merge\n\n### Other\n- Merge pull request #169 from jerryfane/chore/merge-upstream-v0.9.0",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-30-dcc68be017d7/herdr-linux-x86_64",
-      "sha256": "fa014e580c8ab77ff30c5810f3a2ed2a2fa2df644f23059af1befea31c40bea0"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-linux-x86_64",
+      "sha256": "e15c6306556bf076b831e90645d6dffb699f99eba8f75ba851854e59256a0386"
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-30-dcc68be017d7/herdr-linux-aarch64",
-      "sha256": "f095c50ab21cde56e32873976a64ad7949513562aeb011b083737959d74ad15f"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-linux-aarch64",
+      "sha256": "265f2bbe5585948affdb2ec27a52d83b0dc28082481a6c67f79477dfb6ae095f"
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-30-dcc68be017d7/herdr-macos-x86_64",
-      "sha256": "6819471050ba1e45edaf32fd119be4637ff4b5c58c81843e61902f9b79d0389e"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-macos-x86_64",
+      "sha256": "106eb6d09976d788a8e81ffb341943d3cd75d2498aa3a3f81fa2816a1ed45c32"
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-30-dcc68be017d7/herdr-macos-aarch64",
-      "sha256": "dce36d599218f1445894d2b03f02a433672fee1eae11dc9faf2c5e1a3df31827"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-macos-aarch64",
+      "sha256": "5a4629256918cabaab98e604af5d1205b20e7d42af2a37c62a3fa49c0ab9bd2b"
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-08-30-dcc68be017d7/herdr-windows-x86_64.zip",
-      "sha256": "ffaf6632bf405e2e84206c9c92778a68a544f0f4537822f5785292fa2dcdd163",
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-windows-x86_64.zip",
+      "sha256": "80d3d70c30b5aeb160c94142ba4b1b6d0b7176b9b04d5265b56dbed9f4a3cc42",
       "format": "zip"
     }
   },
   "builds": {
+    "2026-09-09-5a244caa60b0": {
+      "base_version": "0.9.0",
+      "commit": "5a244caa60b0c3a5742315c59d20ed81c05bc23e",
+      "built_at": "2026-09-09T04:46:18Z",
+      "protocol": 22,
+      "endpoint_generation": 1,
+      "tag": "preview-2026-09-09-5a244caa60b0",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-linux-x86_64",
+          "sha256": "e15c6306556bf076b831e90645d6dffb699f99eba8f75ba851854e59256a0386"
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-linux-aarch64",
+          "sha256": "265f2bbe5585948affdb2ec27a52d83b0dc28082481a6c67f79477dfb6ae095f"
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-macos-x86_64",
+          "sha256": "106eb6d09976d788a8e81ffb341943d3cd75d2498aa3a3f81fa2816a1ed45c32"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-macos-aarch64",
+          "sha256": "5a4629256918cabaab98e604af5d1205b20e7d42af2a37c62a3fa49c0ab9bd2b"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-09-5a244caa60b0/herdr-windows-x86_64.zip",
+          "sha256": "80d3d70c30b5aeb160c94142ba4b1b6d0b7176b9b04d5265b56dbed9f4a3cc42",
+          "format": "zip"
+        }
+      }
+    },
     "2026-08-30-dcc68be017d7": {
       "base_version": "0.8.2",
       "commit": "dcc68be017d723eaf8544e9fddd004f67ca70363",
@@ -857,31 +889,6 @@
         "macos-aarch64": {
           "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-03-fc82cbad2179/herdr-macos-aarch64",
           "sha256": "c8bcd63323c6daf671022a6872134c6178c153ddd89c4260fbb9b28fe162c18a"
-        }
-      }
-    },
-    "2026-06-02-cce3eacc49d2": {
-      "base_version": "0.6.6",
-      "commit": "cce3eacc49d281fd087ebf0d43eea3e08038033f",
-      "built_at": "2026-06-02T20:59:19Z",
-      "protocol": 12,
-      "tag": "preview-2026-06-02-cce3eacc49d2",
-      "assets": {
-        "linux-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-02-cce3eacc49d2/herdr-linux-x86_64",
-          "sha256": "c22aa4b2e5fadd6e04910f92bbc125aa749c6a9a9edd281082f07a839e37cbff"
-        },
-        "linux-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-02-cce3eacc49d2/herdr-linux-aarch64",
-          "sha256": "26a15f394fd27425ab252424fd090913c1ae5cf644f4f3aac0f06c086bdaabb7"
-        },
-        "macos-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-02-cce3eacc49d2/herdr-macos-x86_64",
-          "sha256": "c89a97b730e7e3b132a2eca53d49448ec2fb969362e903ce99b5b7b0fbd4d5b1"
-        },
-        "macos-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-02-cce3eacc49d2/herdr-macos-aarch64",
-          "sha256": "0f6c260d9cc65d01c1a58baca5f3ae8150b91f0a16a2ae223b71e76c9dda444f"
         }
       }
     }
