@@ -1421,19 +1421,29 @@ impl App {
                 // Report the running version/protocol plus the staged (built, not-yet-running)
                 // build, if the fleet build step recorded one. A staged build with a different
                 // version/sha means an update is ready to activate (server.apply_staged_update).
-                let staged = crate::persist::staged_build::load().map(|staged| {
-                    crate::api::schema::StagedBuildInfo {
+                //
+                // A staged build of the COMMIT ALREADY RUNNING is not an update, and must not be
+                // reported as one. The two shas are written by different producers at different
+                // lengths - `staged.sha` is the short form the fleet build step records, while
+                // `running_sha` is `build_info::commit()`, the full 40 characters - so a client
+                // comparing them with `!=` sees a permanent phantom update. Observed live:
+                // staged `5a244caa` against running `5a244caa60b0c3a5742315c59d20ed81c05bc23e`.
+                // Deciding it HERE fixes every client, including ones already shipped, instead of
+                // relying on each to normalise lengths it never agreed on.
+                let running_sha = crate::build_info::commit();
+                let staged = crate::persist::staged_build::load()
+                    .filter(|staged| !same_commit(&staged.sha, running_sha))
+                    .map(|staged| crate::api::schema::StagedBuildInfo {
                         version: staged.version,
                         sha: staged.sha,
                         built_at: staged.built_at,
-                    }
-                });
+                    });
                 SuccessResponse {
                     id: request.id,
                     result: ResponseResult::StagedUpdate {
                         running_version: crate::build_info::version(),
                         running_protocol: crate::protocol::PROTOCOL_VERSION,
-                        running_sha: crate::build_info::commit().map(str::to_string),
+                        running_sha: running_sha.map(str::to_string),
                         staged,
                     },
                 }
@@ -2065,6 +2075,33 @@ impl App {
     }
 }
 
+/// Is `staged_sha` an abbreviation of - or equal to - the running commit?
+///
+/// The two are written by different producers and are NOT the same length: the
+/// fleet build step records a short sha into `staged-build.json`, the binary
+/// embeds the full 40. So this is a prefix match, not equality.
+///
+/// Deliberately ONE-DIRECTIONAL: `staged` may abbreviate `running`, never the
+/// reverse. A staged value LONGER than the running sha that merely starts with it
+/// is a different (or malformed) identifier, and suppressing it would hide a real
+/// update. Empty or absent shas never match either, so an unidentifiable staged
+/// build is reported rather than swallowed.
+///
+/// Compares BYTES, not `str` slices: `staged` is attacker-adjacent JSON off disk
+/// and slicing it at a `min(len)` offset panics when that offset lands inside a
+/// multi-byte scalar (`"aé"` against `"ab"` did). Git shas are ASCII hex, so a
+/// non-ASCII value simply fails to match.
+fn same_commit(staged_sha: &str, running_sha: Option<&str>) -> bool {
+    let Some(running) = running_sha else {
+        return false;
+    };
+    let (staged, running) = (staged_sha.as_bytes(), running.as_bytes());
+    if staged.is_empty() || running.is_empty() || staged.len() > running.len() {
+        return false;
+    }
+    running[..staged.len()].eq_ignore_ascii_case(staged)
+}
+
 fn unix_millis_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2591,6 +2628,115 @@ mod tests {
             v2["result"]["staged"]["path"].is_null(),
             "the staged binary path must not be exposed on the wire"
         );
+
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn staged_build_of_the_running_commit_is_not_an_update() {
+        // The two shas come from different producers at different lengths: the fleet
+        // build step records a SHORT sha, the binary embeds the full 40. Observed live
+        // on 2026-09-09: staged `5a244caa` vs running
+        // `5a244caa60b0c3a5742315c59d20ed81c05bc23e`, which a client comparing with
+        // `!=` shows as a permanent "update available" for a build already running.
+        let Some(running) = crate::build_info::commit() else {
+            // Not a git build: there is no running sha to abbreviate, and the
+            // reporting path is exercised by the sibling test above.
+            return;
+        };
+
+        let _guard = crate::config::test_config_env_lock().lock();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-staged-same-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let request = || crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::ServerStagedUpdate(
+                crate::api::schema::EmptyParams {},
+            ),
+        };
+        let stage = |sha: &str| {
+            std::fs::write(
+                crate::config::config_dir().join("staged-build.json"),
+                format!(
+                    r#"{{"version":"9.9.9","sha":"{sha}","built_at":"2026-09-09T06:11:26Z","path":"/x"}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        // Abbreviated form of the RUNNING commit: nothing to update to. The embedded sha
+        // is NOT always 40 characters - CI builds carry a 7-character short sha - so the
+        // abbreviation is taken from whatever this binary actually has.
+        let abbrev = &running[..running.len().min(8)];
+        stage(abbrev);
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert!(
+            v["result"]["staged"].is_null(),
+            "a staged build of the running commit must not be reported as an update"
+        );
+
+        // Same, upper-cased: git shas are hex and case-insensitive.
+        stage(&abbrev.to_ascii_uppercase());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert!(
+            v["result"]["staged"].is_null(),
+            "sha match is case-insensitive"
+        );
+
+        // A DIFFERENT commit is still reported - the filter must not swallow real updates.
+        stage("deadbee");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(v["result"]["staged"]["sha"], "deadbee");
+
+        // A staged sha LONGER than the running one, sharing its prefix, is a different
+        // (or malformed) identifier - suppressing it would hide a real update.
+        stage(&format!("{running}0000"));
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(
+            v["result"]["staged"]["sha"],
+            format!("{running}0000"),
+            "a staged sha longer than the running commit is not an abbreviation of it"
+        );
+
+        // Non-ASCII cannot be a git sha. It must not match, and MUST NOT PANIC: slicing
+        // `str` at a byte offset inside a multi-byte scalar aborts the request thread.
+        stage("a\u{e9}");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(v["result"]["staged"]["version"], "9.9.9");
+
+        // An empty sha is unidentifiable, so it is reported rather than hidden.
+        stage("");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(v["result"]["staged"]["version"], "9.9.9");
 
         match prev_xdg {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
