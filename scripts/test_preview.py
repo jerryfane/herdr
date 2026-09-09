@@ -82,6 +82,7 @@ class PreviewNotesTests(unittest.TestCase):
                     retain=1,
                 )
 
+
     def test_preview_range_base_advances_to_stable_tag(self):
         with (
             mock.patch.object(preview, "latest_stable_tag", return_value="v0.7.0"),

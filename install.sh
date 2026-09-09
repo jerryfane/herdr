@@ -9,7 +9,7 @@ set -eu
 set -f
 umask 077
 
-DEFAULT_MANIFEST_URL="https://raw.githubusercontent.com/jerryfane/herdr/master/website/preview.json"
+DEFAULT_MANIFEST_URL="https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/preview.json"
 EXPECTED_RELEASE_ROOT="https://github.com/jerryfane/herdr/releases/download"
 
 MANIFEST_URL="${HERDR_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}"

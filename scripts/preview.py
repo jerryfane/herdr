@@ -19,6 +19,7 @@ EXPECTED_ASSET_NAMES = {
     **{target: f"herdr-{target}" for target in ASSET_TARGETS},
     "windows-x86_64": "herdr-windows-x86_64.zip",
 }
+
 ENDPOINT_PROTOCOL_SOURCE_PATH = Path("src/protocol/endpoint.rs")
 
 
@@ -252,6 +253,7 @@ def main() -> int:
     range_base.add_argument("--previous", required=True)
     range_base.add_argument("--commit", required=True)
     range_base.set_defaults(func=cmd_range_base)
+
 
     args = parser.parse_args()
     return args.func(args)

@@ -24,7 +24,17 @@ use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/jerryfane/herdr/master/website/preview.json";
+    "https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/preview.json";
+/// Every downloadable asset MUST come from this fork's own releases.
+///
+/// `install.sh:277` has enforced this since the fork existed; the in-process
+/// updater did not, and that gap is a real downgrade path: `herdr.dev/latest.json`
+/// is upstream-owned and advertises the SAME version number as a fork build
+/// (0.9.0 at the time of writing) while serving `herdrdev/herdr` binaries. With
+/// `stable_channel_should_install` short-circuiting on `installed_is_preview`, a
+/// fork preview build would install upstream's binary over itself and silently
+/// lose `api-bridge` - the transport the app speaks.
+const EXPECTED_RELEASE_ROOT: &str = "https://github.com/jerryfane/herdr/releases/download/";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
@@ -406,6 +416,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         .get(&asset_key)
         .ok_or_else(|| format!("no binary for {asset_key} in update manifest"))?;
     let download_url = asset.url.clone();
+    ensure_fork_release_asset(&download_url)?;
     let sha256 = asset
         .sha256
         .clone()
@@ -430,6 +441,18 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         package_format: asset.package_format()?,
         notes_body,
     }))
+}
+
+fn ensure_fork_release_asset(url: &str) -> Result<(), String> {
+    if url.starts_with(EXPECTED_RELEASE_ROOT) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing update: asset {url} is not published by jerryfane/herdr. \
+         A manifest advertising the same version from another repository would \
+         replace this build with a foreign one; re-point [update] manifest_url or \
+         install deliberately with install.sh."
+    ))
 }
 
 fn stable_channel_should_install(
@@ -503,6 +526,7 @@ fn release_info_from_preview_manifest(
         })
         .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
     let download_url = asset.url.clone();
+    ensure_fork_release_asset(&download_url)?;
 
     Ok(Some(ReleaseInfo {
         identity: preview_display_version(&manifest.base_version, build_id),
@@ -2477,7 +2501,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         }
@@ -2739,7 +2765,7 @@ mod tests {
                 "protocol": 10,
                 "notes": "### Fixed\n- Brew notes",
                 "assets": {
-                    "linux-x86_64": "https://example.com/herdr-linux-x86_64"
+                    "linux-x86_64": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
                 }
             }"####,
         )
@@ -3128,7 +3154,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         };
@@ -3312,7 +3340,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         };
@@ -3430,8 +3460,8 @@ mod tests {
                 \"body\": \"### Heads up\\n- Defaults changed\"\n\
             },\n\
             \"assets\": {\n\
-                \"linux-x86_64\": \"https://example.com/herdr-linux-x86_64\",\n\
-                \"macos-aarch64\": \"https://example.com/herdr-macos-aarch64\"\n\
+                \"linux-x86_64\": \"https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64\",\n\
+                \"macos-aarch64\": \"https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64-macos-aarch64\"\n\
             }\n\
         }";
         let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
@@ -3456,7 +3486,7 @@ mod tests {
         );
         assert_eq!(
             manifest.download_url_for("linux", "x86_64").as_deref(),
-            Some("https://example.com/herdr-linux-x86_64")
+            Some("https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64")
         );
     }
 
@@ -3563,7 +3593,7 @@ mod tests {
         let json = r#"{
             "version": "0.2.0",
             "assets": {
-                "linux-x86_64": "https://example.com/herdr-linux-x86_64"
+                "linux-x86_64": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
             }
         }"#;
 
@@ -3579,7 +3609,7 @@ mod tests {
                 "version": "99.99.99",
                 "notes": "### Changed\n- One",
                 "assets": {{
-                    "{asset_key}": "https://example.com/herdr"
+                    "{asset_key}": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
                 }}
             }}"####
         );
@@ -3606,7 +3636,7 @@ mod tests {
                 }},
                 "assets": {{
                     "{asset_key}": {{
-                        "url": "https://example.com/herdr",
+                        "url": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
                         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     }}
                 }}
@@ -3620,7 +3650,10 @@ mod tests {
             .expect("release info");
 
         assert_eq!(release.version, Version::parse("99.99.99").unwrap());
-        assert_eq!(release.download_url, "https://example.com/herdr");
+        assert_eq!(
+            release.download_url,
+            "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+        );
     }
 
     #[test]
@@ -3654,7 +3687,7 @@ mod tests {
                 "notes": "### Fixed\n- One",
                 "assets": {{
                     "{asset_key}": {{
-                        "url": "https://example.com/herdr-linux-x86_64",
+                        "url": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
                         "sha256": "deadbeef"
                     }}
                 }},
@@ -3666,7 +3699,7 @@ mod tests {
                         "protocol": 77,
                         "assets": {{
                             "{asset_key}": {{
-                                "url": "https://example.com/herdr-linux_x86_64",
+                                "url": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
                                 "sha256": "deadbeef"
                             }}
                         }}
@@ -3684,6 +3717,24 @@ mod tests {
         assert_eq!(release.identity, "9.9.9-preview.2026-06-02-abcdef123456");
         assert_eq!(release.target_protocol, Some(77));
         assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn foreign_repository_asset_is_refused() {
+        // herdr.dev/latest.json is upstream-owned and advertises the same version
+        // number this fork uses, so a version comparison alone cannot tell the two
+        // apart. The asset origin can.
+        let manifest: UpdateManifest = serde_json::from_str(
+            r#"{"version":"9.9.9","notes":"notes","assets":{"linux-x86_64":{"url":"https://github.com/herdrdev/herdr/releases/download/v9.9.9/herdr-linux-x86_64","sha256":"deadbeef"},"linux-aarch64":{"url":"https://github.com/herdrdev/herdr/releases/download/v9.9.9/herdr-linux-aarch64","sha256":"deadbeef"},"macos-x86_64":{"url":"https://github.com/herdrdev/herdr/releases/download/v9.9.9/herdr-macos-x86_64","sha256":"deadbeef"},"macos-aarch64":{"url":"https://github.com/herdrdev/herdr/releases/download/v9.9.9/herdr-macos-aarch64","sha256":"deadbeef"},"windows-x86_64":{"url":"https://github.com/herdrdev/herdr/releases/download/v9.9.9/herdr-windows-x86_64.zip","sha256":"deadbeef"}},"announcement":null}"#,
+        )
+        .unwrap();
+
+        let error = release_info_from_manifest(&manifest)
+            .expect_err("an upstream-hosted asset must not be installable over a fork build");
+        assert!(
+            error.contains("not published by jerryfane/herdr"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3709,7 +3760,7 @@ mod tests {
         ));
 
         let with_windows: UpdateManifest = serde_json::from_str(
-            r#"{"version":"9.9.9","notes":"notes","assets":{"windows-x86_64":"https://example.com/herdr-windows-x86_64.zip"},"announcement":null}"#,
+            r#"{"version":"9.9.9","notes":"notes","assets":{"windows-x86_64":"https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64-windows-x86_64.zip"},"announcement":null}"#,
         )
         .unwrap();
         assert!(!first_windows_stable_is_pending(&with_windows, true, true));
