@@ -13,10 +13,39 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLED_DIR = PROJECT_ROOT / "src" / "detect" / "manifests"
-DEFAULT_WEBSITE_DIR = PROJECT_ROOT / "website" / "agent-detection"
+DEFAULT_PUBLISHED_DIR = PROJECT_ROOT / "distribution" / "agent-detection"
 ENGINE_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest_update.rs"
 
-MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
+# `composer` and `input_rules` are fork-only manifest sections (composer
+# observation and input-prompt classification). Upstream's copy of this script
+# does not know them, and taking upstream's copy in the v0.9.0 merge made CI
+# reject every bundled fork manifest. Mirrored from the Rust deserializers in
+# src/detect/manifest.rs (`ComposerManifest`, `InputManifestRule`), both of which
+# are `deny_unknown_fields`, so this list must stay in step with them.
+MANIFEST_KEYS = {
+    "id",
+    "version",
+    "min_engine_version",
+    "updated_at",
+    "aliases",
+    "rules",
+    "composer",
+    "input_rules",
+}
+COMPOSER_KEYS = {"region"}
+INPUT_RULE_KEYS = {
+    "id",
+    "kind",
+    "priority",
+    "region",
+    "all",
+    "any",
+    "not",
+    "contains",
+    "regex",
+    "line_regex",
+}
+INPUT_PROMPT_KINDS = {"confirm", "select", "free_text", "unknown"}
 RULE_KEYS = {
     "id",
     "state",
@@ -54,26 +83,43 @@ MAX_TOTAL_MATCHERS = 1024
 MAX_MATCHER_CHARS = 512
 
 # Keep engine-2 clients on the OSC-capable manifest until an engine-3 release
-# can consume top_non_empty_lines. Remove this entry when the website publishes
-# the bundled Grok manifest.
-STAGED_WEBSITE_MANIFESTS = {
-    "grok": (
-        "2026.07.16.2",
-        "2026.07.16.1",
-        "1f35b3271a96cf830c64bed78751619bfd8013c277c0d7c0f999b7a433895f28",
-    ),
-}
+# can consume top_non_empty_lines. Remove this entry when the distribution
+# publishes the bundled Grok manifest.
+# Bundled manifests deliberately held back from the published catalog, keyed by
+# agent id -> (bundled version, published version, published digest). Empty: the
+# v0.9.0 merge publishes claude (engine 4) and grok (engine 3), both consumable
+# now that MANIFEST_ENGINE_VERSION is 5. A client on an older engine rejects a
+# manifest that needs a newer one (src/detect/manifest.rs `min_engine_version`
+# gate) and keeps its bundled rules, so publishing ahead of a client is a no-op
+# for that client rather than a break.
+STAGED_PUBLISHED_MANIFESTS: dict[str, tuple[str, str, str]] = {}
+
+
+UNPUBLISHED_BUNDLED_MANIFESTS: dict[str, tuple[str, str]] = {}
+
+# Bundled SHARED rule sets, not agent manifests: compiled into the binary with
+# `include_str!` (src/detect/manifest.rs `SHARED_INPUT_MANIFEST`), applied to every
+# agent, and never published, so they carry no `version` and belong to no catalog
+# entry. `AgentManifest::version` is `Option` on the Rust side for exactly this
+# reason. Their input rules are still validated, by `validate_shared_rule_manifest`.
+SHARED_RULE_MANIFESTS = {"shared-input.toml"}
+SHARED_RULE_MANIFEST_KEYS = {"id", "min_engine_version", "input_rules"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundled-dir", type=Path, default=DEFAULT_BUNDLED_DIR)
-    parser.add_argument("--website-dir", type=Path, default=DEFAULT_WEBSITE_DIR)
+    parser.add_argument("--published-dir", type=Path, default=DEFAULT_PUBLISHED_DIR)
     parser.add_argument("--engine-version", type=int)
     parser.add_argument(
-        "--require-website",
+        "--require-published",
         action="store_true",
-        help="fail if website agent-detection assets or catalog are missing",
+        help="fail if published agent-detection assets or catalog are missing",
+    )
+    parser.add_argument(
+        "--require-all-published",
+        action="store_true",
+        help="fail if any bundled manifest is intentionally held for a future stable release",
     )
     return parser.parse_args()
 
@@ -118,11 +164,77 @@ def compare_versions(left: str, right: str, path: Path) -> int:
     return (left_parts > right_parts) - (left_parts < right_parts)
 
 
+def validate_input_sections(path: Path, manifest: dict) -> None:
+    """Validates the fork-only `composer` and `input_rules` sections."""
+    composer = manifest.get("composer")
+    if composer is not None:
+        if not isinstance(composer, dict):
+            raise CheckError(f"{path}: composer must be a table")
+        unknown_composer = sorted(set(composer) - COMPOSER_KEYS)
+        if unknown_composer:
+            raise CheckError(
+                f"{path}: unknown composer field(s): {', '.join(unknown_composer)}"
+            )
+        region = composer.get("region")
+        if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+            raise CheckError(f"{path}: composer.region must be a known region")
+
+    input_rules = manifest.get("input_rules")
+    if input_rules is not None:
+        if not isinstance(input_rules, list):
+            raise CheckError(f"{path}: input_rules must be an array of tables")
+        for index, rule in enumerate(input_rules):
+            if not isinstance(rule, dict):
+                raise CheckError(f"{path}: input_rules[{index}] must be a table")
+            unknown_rule = sorted(set(rule) - INPUT_RULE_KEYS)
+            if unknown_rule:
+                raise CheckError(
+                    f"{path}: input_rules[{index}] unknown field(s): "
+                    f"{', '.join(unknown_rule)}"
+                )
+            rule_id = rule.get("id")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                raise CheckError(f"{path}: input_rules[{index}].id must be a non-empty string")
+            kind = rule.get("kind")
+            if kind not in INPUT_PROMPT_KINDS:
+                raise CheckError(
+                    f"{path}: input_rules[{index}].kind must be one of "
+                    f"{', '.join(sorted(INPUT_PROMPT_KINDS))}"
+                )
+            rule_region = rule.get("region")
+            if rule_region is not None and (
+                not isinstance(rule_region, str) or not REGION_RE.fullmatch(rule_region)
+            ):
+                raise CheckError(f"{path}: input_rules[{index}].region must be a known region")
+
+
+def validate_shared_rule_manifest(path: Path, engine_version: int) -> None:
+    """A bundled shared rule set: input rules only, no version, no catalog entry."""
+    manifest = load_toml(path)
+    unknown = sorted(set(manifest) - SHARED_RULE_MANIFEST_KEYS)
+    if unknown:
+        raise CheckError(
+            f"{path}: unknown shared rule manifest field(s): {', '.join(unknown)}"
+        )
+    min_engine = manifest.get("min_engine_version")
+    if not isinstance(min_engine, int):
+        raise CheckError(f"{path}: min_engine_version must be an integer")
+    if min_engine > engine_version:
+        raise CheckError(
+            f"{path}: min_engine_version {min_engine} exceeds engine version {engine_version}"
+        )
+    if not manifest.get("input_rules"):
+        raise CheckError(f"{path}: a shared rule manifest must declare input_rules")
+    validate_input_sections(path, manifest)
+
+
 def validate_manifest(path: Path, engine_version: int) -> dict:
     manifest = load_toml(path)
     unknown = sorted(set(manifest) - MANIFEST_KEYS)
     if unknown:
         raise CheckError(f"{path}: unknown manifest field(s): {', '.join(unknown)}")
+
+    validate_input_sections(path, manifest)
 
     agent_id = manifest.get("id")
     if not isinstance(agent_id, str) or not agent_id.strip():
@@ -273,6 +385,9 @@ def load_manifest_dir(path: Path, engine_version: int) -> dict[str, tuple[Path, 
     for manifest_path in sorted(path.glob("*.toml")):
         if manifest_path.name == "index.toml":
             continue
+        if manifest_path.name in SHARED_RULE_MANIFESTS:
+            validate_shared_rule_manifest(manifest_path, engine_version)
+            continue
         manifest = validate_manifest(manifest_path, engine_version)
         agent_id = manifest["id"]
         if agent_id in manifests:
@@ -286,11 +401,13 @@ def load_manifest_dir(path: Path, engine_version: int) -> dict[str, tuple[Path, 
 
 
 def validate_catalog(
-    website_dir: Path,
+    published_dir: Path,
     bundled: dict[str, tuple[Path, dict]],
     engine_version: int,
+    *,
+    allow_unpublished: bool = False,
 ) -> None:
-    catalog_path = website_dir / "index.toml"
+    catalog_path = published_dir / "index.toml"
     catalog = load_toml(catalog_path)
     if set(catalog) != {"schema_version", "agents"}:
         raise CheckError(f"{catalog_path}: expected only schema_version and agents")
@@ -314,7 +431,7 @@ def validate_catalog(
             raise CheckError(f"{catalog_path}: unsafe path for {agent_id}: {rel_path}")
         if agent_id not in bundled:
             raise CheckError(f"{catalog_path}: unknown agent {agent_id}; binary cannot identify it")
-        manifest_path = website_dir / rel_path
+        manifest_path = published_dir / rel_path
         manifest = validate_manifest(manifest_path, engine_version)
         if manifest["id"] != agent_id:
             raise CheckError(f"{manifest_path}: id {manifest['id']} does not match catalog {agent_id}")
@@ -322,17 +439,17 @@ def validate_catalog(
 
         bundled_path, bundled_manifest = bundled[agent_id]
         cmp = compare_versions(manifest["version"], bundled_manifest["version"], manifest_path)
-        staged_manifest = STAGED_WEBSITE_MANIFESTS.get(agent_id)
-        website_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        staged_manifest = STAGED_PUBLISHED_MANIFESTS.get(agent_id)
+        published_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         stages_new_engine_manifest = (
             staged_manifest
-            == (bundled_manifest["version"], manifest["version"], website_digest)
+            == (bundled_manifest["version"], manifest["version"], published_digest)
             and bundled_manifest["min_engine_version"] == engine_version
             and manifest["min_engine_version"] < bundled_manifest["min_engine_version"]
         )
         if cmp < 0 and not stages_new_engine_manifest:
             raise CheckError(
-                f"{manifest_path}: website version {manifest['version']} is lower than bundled "
+                f"{manifest_path}: published version {manifest['version']} is lower than bundled "
                 f"{bundled_manifest['version']} in {bundled_path}"
             )
         if cmp == 0 and manifest_path.read_text(encoding="utf-8") != bundled_path.read_text(encoding="utf-8"):
@@ -341,13 +458,22 @@ def validate_catalog(
             )
 
     missing = sorted(set(bundled) - set(seen))
-    if missing:
-        raise CheckError(f"{catalog_path}: missing bundled agent(s): {', '.join(missing)}")
+    unexpected_missing = []
+    for agent_id in missing:
+        bundled_path, bundled_manifest = bundled[agent_id]
+        staged = UNPUBLISHED_BUNDLED_MANIFESTS.get(agent_id) if allow_unpublished else None
+        digest = hashlib.sha256(bundled_path.read_bytes()).hexdigest()
+        if staged != (bundled_manifest["version"], digest):
+            unexpected_missing.append(agent_id)
+    if unexpected_missing:
+        raise CheckError(
+            f"{catalog_path}: missing bundled agent(s): {', '.join(unexpected_missing)}"
+        )
 
     catalog_paths = set(seen.values()) | {"index.toml"}
-    extra = sorted(path.name for path in website_dir.glob("*.toml") if path.name not in catalog_paths)
+    extra = sorted(path.name for path in published_dir.glob("*.toml") if path.name not in catalog_paths)
     if extra:
-        raise CheckError(f"{website_dir}: TOML file(s) not listed in catalog: {', '.join(extra)}")
+        raise CheckError(f"{published_dir}: TOML file(s) not listed in catalog: {', '.join(extra)}")
 
 
 def main() -> int:
@@ -355,10 +481,15 @@ def main() -> int:
     try:
         engine_version = read_engine_version(args.engine_version)
         bundled = load_manifest_dir(args.bundled_dir, engine_version)
-        if args.require_website or args.website_dir.exists():
-            if not args.website_dir.is_dir():
-                raise CheckError(f"{args.website_dir}: website manifest directory is missing")
-            validate_catalog(args.website_dir, bundled, engine_version)
+        if args.require_published or args.require_all_published or args.published_dir.exists():
+            if not args.published_dir.is_dir():
+                raise CheckError(f"{args.published_dir}: published manifest directory is missing")
+            validate_catalog(
+                args.published_dir,
+                bundled,
+                engine_version,
+                allow_unpublished=not args.require_all_published,
+            )
     except CheckError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

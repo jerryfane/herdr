@@ -39,49 +39,110 @@ id = "codex"
     )
 }
 
+thread_local! {
+    /// Private temp base of the manifest sandbox active on this thread, set by
+    /// `with_manifest_dirs`. Fixture writers resolve their paths through it so a
+    /// racing env change can never redirect a write into the developer's real
+    /// config or state directory.
+    static MANIFEST_SANDBOX_BASE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Points `XDG_CONFIG_HOME`/`XDG_STATE_HOME` at a private temp base for the
+/// whole scope and restores the previous values in `Drop`, so a panicking test
+/// cannot leave the override installed. Those variables are process-global, so
+/// every manifest-loader test also serialises behind the shared config-env lock
+/// instead of trusting test ordering.
+struct ManifestDirsGuard {
+    _lock: std::sync::RwLockWriteGuard<'static, ()>,
+    base: PathBuf,
+    old_config: Option<std::ffi::OsString>,
+    old_state: Option<std::ffi::OsString>,
+}
+
+impl ManifestDirsGuard {
+    fn new(name: &str) -> Self {
+        let lock = crate::config::test_config_env_lock().lock();
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        let base = std::env::temp_dir().join(format!(
+            "herdr-manifest-loader-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
+        std::env::set_var("XDG_STATE_HOME", base.join("state"));
+        MANIFEST_SANDBOX_BASE.with(|active| *active.borrow_mut() = Some(base.clone()));
+        reload_manifests();
+        Self {
+            _lock: lock,
+            base,
+            old_config,
+            old_state,
+        }
+    }
+}
+
+impl Drop for ManifestDirsGuard {
+    fn drop(&mut self) {
+        MANIFEST_SANDBOX_BASE.with(|active| *active.borrow_mut() = None);
+        match self.old_config.take() {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match self.old_state.take() {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        reload_manifests();
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
 fn with_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
-    let old_config = std::env::var_os("XDG_CONFIG_HOME");
-    let old_state = std::env::var_os("XDG_STATE_HOME");
-    let base = std::env::temp_dir().join(format!(
-        "herdr-manifest-loader-{name}-{}",
-        std::process::id()
-    ));
-    let config_dir = base.join("config");
-    let state_dir = base.join("state");
-    let _ = std::fs::remove_dir_all(&base);
-    std::env::set_var("XDG_CONFIG_HOME", &config_dir);
-    std::env::set_var("XDG_STATE_HOME", &state_dir);
-    reload_manifests();
-    let result = f();
-    match old_config {
-        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    let guard = ManifestDirsGuard::new(name);
+    // Catch a failing body here so the sandbox is torn down and the shared
+    // config-env lock is released normally: unwinding through the lock would
+    // poison it and turn one failing test into `.lock().unwrap()` panics in
+    // every other module that guards the same environment.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    drop(guard);
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
-    match old_state {
-        Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-        None => std::env::remove_var("XDG_STATE_HOME"),
-    }
-    reload_manifests();
-    let _ = std::fs::remove_dir_all(&base);
-    result
+}
+
+/// Refuses any fixture path outside the active sandbox, so an env race turns
+/// into a failing assertion instead of a write into the real config dir.
+fn sandboxed_fixture_path(path: PathBuf) -> PathBuf {
+    let base = MANIFEST_SANDBOX_BASE
+        .with(|active| active.borrow().clone())
+        .expect("manifest fixtures must be written inside with_manifest_dirs");
+    assert!(
+        path.starts_with(&base),
+        "manifest fixture path {} escaped the sandbox {}",
+        path.display(),
+        base.display()
+    );
+    path
 }
 
 fn write_remote_codex(content: &str) {
-    let path = crate::detect::manifest_update::remote_manifest_path(Agent::Codex);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, content).unwrap();
+    write_remote_codex_without_reload(content);
     reload_manifests();
 }
 
 fn write_remote_codex_without_reload(content: &str) {
-    let path = crate::detect::manifest_update::remote_manifest_path(Agent::Codex);
+    let path = sandboxed_fixture_path(crate::detect::manifest_update::remote_manifest_path(
+        Agent::Codex,
+    ));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
 
 fn write_local_codex(content: &str) {
-    let path = override_path(Agent::Codex).unwrap();
+    let path = sandboxed_fixture_path(override_path(Agent::Codex).unwrap());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
     reload_manifests();
@@ -683,6 +744,52 @@ fn devin_manifest_detects_idle_working_and_blocked_states() {
 }
 
 #[test]
+fn muse_manifest_requires_complete_live_controls() {
+    let working = explain(
+        Agent::Muse,
+        "⟩ hello\n\n◆ Working (0s · esc to interrupt)\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(working.state, AgentState::Working);
+    assert!(working.visible_working);
+
+    let picker = explain(
+        Agent::Muse,
+        "Which option should I use?\n\n› 1. Alpha\n  2. Beta\n\nEnter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(picker.state, AgentState::Blocked);
+    assert!(picker.visible_blocker);
+
+    let command_approval = explain(
+        Agent::Muse,
+        "Would you like to run the following command?\n\n$ printf muse-safe-probe\n\n› 1. Allow this stage once (y)\n  2. Always allow in this workspace: printf muse-safe-probe ... (p)\n  3. Abort the entire command (esc)\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(command_approval.state, AgentState::Blocked);
+    assert!(command_approval.visible_blocker);
+
+    let network_approval = explain(
+        Agent::Muse,
+        "network: example.com:443 https\nrequested by:\n$ curl -fsS https://example.com\n\n› 1. Yes, proceed (y)\n  2. Yes, don't ask again this session (p)  example.com:443 (https)\n  3. No, and tell Muse Code what to do differently (esc)\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(network_approval.state, AgentState::Blocked);
+    assert!(network_approval.visible_blocker);
+
+    let menu = explain(
+        Agent::Muse,
+        "Theme\n\n⟩ Default (active)\n  Dynamic\n\n↑↓ move · enter save · esc go back",
+    );
+    assert_eq!(menu.state, AgentState::Unknown);
+    assert!(menu.skip_state_update);
+    assert!(!menu.visible_blocker);
+
+    let ordinary_reply = explain(
+        Agent::Muse,
+        "⟩ say the phrase\n\n◆ Yes, proceed\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(ordinary_reply.state, AgentState::Idle);
+    assert!(ordinary_reply.visible_idle);
+}
+
+#[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(
         r#"
@@ -937,6 +1044,187 @@ fn osc_explain(
 // --- Claude OSC rules ---
 
 #[test]
+fn claude_idle_prompt_with_background_shell_is_idle() {
+    // Captured from Claude Code 2.1.251 after its foreground turn ended while
+    // a long-lived background shell remained active (issue #3414).
+    let screen = concat!(
+        "✻ Sautéed for 10s · 1 shell still running\n\n",
+        "──────────────────────────────────────────────────────── WINDOWS ─\n",
+        "❯\n",
+        "────────────────────────────────────────────────────────────────\n",
+        "  ⏵⏵ auto mode on · 1 shell · ← for agents                     /rc\n",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("live_prompt_box")
+    );
+    assert!(result.visible_idle);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn claude_background_shell_without_foreground_evidence_is_idle_fallback() {
+    let result = osc_explain(
+        Agent::Claude,
+        "  ⏵⏵ auto mode on · 1 shell · ← for agents\n",
+        "",
+        "",
+    );
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(result.matched_rule, None);
+    assert_eq!(
+        result.fallback_reason.as_deref(),
+        Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
+    );
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn claude_live_turn_with_background_shell_remains_working() {
+    let screen = concat!(
+        "────────────────────────────────────────────────────────────────\n",
+        "❯\n",
+        "────────────────────────────────────────────────────────────────\n",
+        "  ⏵⏵ auto mode on · 1 shell · esc to interrupt\n",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("live_turn_working")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn claude_blocker_with_background_shell_remains_blocked() {
+    let screen = concat!(
+        "do you want to proceed?\n",
+        "bash command: rm -rf /tmp/test\n",
+        "❯ 1. Yes\n",
+        "  2. No\n\n",
+        "Esc to cancel · Tab to amend · ctrl+e to explain\n",
+        "  ⏵⏵ auto mode on · 1 shell · ← for agents\n",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("bash_permission_prompt")
+    );
+    assert!(result.visible_blocker);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn claude_bash_prompt_with_dont_ask_again_option_matches_bash_rule() {
+    // Captured from a Bash approval prompt at its resting cursor position. The
+    // "don't ask again" choice pushes No to option 3, so the only cursor-free
+    // option line is one bash_permission_prompt used not to cover, which let
+    // the narrower generic_permission_prompt claim the prompt instead (#2650).
+    let screen = concat!(
+        "────────────────────────────────────────────────────────────────
+",
+        " Bash command
+
+",
+        "   curl -sS -o /tmp/probe.html https://example.com
+",
+        "   Download example.com to /tmp/probe.html
+
+",
+        " This command requires approval
+
+",
+        " Do you want to proceed?
+",
+        " ❯ 1. Yes
+",
+        "   2. Yes, and don't ask again for: curl *
+",
+        "   3. No
+
+",
+        " Esc to cancel · Tab to amend · ctrl+e to explain
+",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("bash_permission_prompt")
+    );
+    assert!(result.visible_blocker);
+}
+
+#[test]
+fn claude_permission_prompt_matches_at_every_cursor_position() {
+    // The selected option carries "❯", so no option branch may assume its line
+    // is cursor-free. Walk the cursor across both option layouts.
+    let layouts: [&[&str]; 2] = [
+        &[" ❯ 1. Yes", "   2. No"],
+        &[
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again for: curl *",
+            "   3. No",
+        ],
+    ];
+
+    for layout in layouts {
+        for selected in 0..layout.len() {
+            let options: Vec<String> = layout
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let bare = line.trim_start().trim_start_matches('❯').trim_start();
+                    if index == selected {
+                        format!(" ❯ {bare}")
+                    } else {
+                        format!("   {bare}")
+                    }
+                })
+                .collect();
+            let screen = format!(
+                concat!(
+                    "────────────────────────────────────────────────────────────────
+",
+                    " Bash command
+
+",
+                    "   curl -sS https://example.com
+
+",
+                    " Do you want to proceed?
+",
+                    "{}
+
+",
+                    " Esc to cancel · Tab to amend · ctrl+e to explain
+",
+                ),
+                options.join("\n"),
+            );
+            let result = osc_explain(Agent::Claude, &screen, "", "");
+
+            assert_eq!(
+                result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+                Some("bash_permission_prompt"),
+                "{options:?} selected={selected}"
+            );
+            assert_eq!(result.state, AgentState::Blocked, "selected={selected}");
+            assert!(result.visible_blocker, "selected={selected}");
+        }
+    }
+}
+
+#[test]
 fn claude_osc_title_braille_prefix_is_working() {
     // "⠂" is U+2802, in the braille block U+2800-U+28FF
     let result = osc_explain(Agent::Claude, "", "⠂ project", "");
@@ -1024,6 +1312,30 @@ fn claude_blocker_screen_outranks_osc_idle_title() {
 }
 
 #[test]
+fn claude_mcp_elicitation_is_blocked() {
+    // Regression for issue #3283: an MCP elicitation dialog has Accept/Decline
+    // controls and an "Esc to cancel" footer but no Enter hint, so no blocked
+    // rule matched and the static OSC title reported idle.
+    // Live capture uses curly quotes around the server name; the issue report
+    // transcribed straight quotes. Both must classify as blocked.
+    for screen in [
+        "MCP server \u{201c}my-server\u{201d} requests your input\n\nGrant temporary access to the demo gateway for 15 minutes?\n\n\u{276f} Accept    Decline\n\nEsc to cancel \u{b7} \u{2191}/\u{2193} to navigate\n",
+        "MCP server \"my-server\" requests your input\n\nserver-supplied message\n\n\u{276f} Accept    Decline\n\nEsc to cancel \u{b7} \u{2191}/\u{2193} to navigate\n",
+    ] {
+        let result = with_manifest_dirs("claude-mcp-elicitation", || {
+            osc_explain(Agent::Claude, screen, "\u{2733} Claude Code", "")
+        });
+        assert_eq!(result.state, AgentState::Blocked, "{result:#?}");
+        assert!(result.visible_blocker, "{result:#?}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|r| r.id.as_str()),
+            Some("mcp_elicitation_prompt"),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
 fn claude_empty_osc_empty_screen_is_idle_fallback() {
     // No OSC data, no matching screen rule → fallback idle (unchanged V3 behavior)
     let result = osc_explain(Agent::Claude, "", "", "");
@@ -1106,6 +1418,47 @@ fn codex_trust_directory_requires_live_top_region() {
 }
 
 #[test]
+fn codex_startup_update_requires_complete_live_chooser() {
+    let chooser = "Update available! 0.153.0 -> 9.8.7\n\
+        Run bun add -g @openai/codex to update.\n\n\
+        › 1. Update now\n\
+          2. Skip until next version\n\n\
+        Press enter to continue   \n";
+    let wrapped = "✨ Update available! 0.153.0\n\n\
+        Release notes: https://example\n\n\
+        › 1. Update now (runs `npm\n\
+             install -g\n\
+             @openai/codex`)\n\
+          2. Skip\n\
+          3. Skip until next\n\
+             version\n\n\
+        Press enter to continue\n";
+
+    for screen in [chooser, wrapped] {
+        let result = osc_explain(Agent::Codex, screen, "project", "");
+        assert_eq!(result.state, AgentState::Blocked);
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("startup_update")
+        );
+        assert!(result.visible_blocker);
+    }
+
+    for screen in [
+        chooser.replace("Update now", "Install"),
+        format!("{wrapped}\n› Ask Codex to do anything\n"),
+    ] {
+        let result = osc_explain(Agent::Codex, &screen, "project", "");
+        assert_eq!(result.state, AgentState::Idle);
+        assert_ne!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("startup_update")
+        );
+        assert!(!result.visible_blocker);
+    }
+}
+
+#[test]
 fn codex_background_terminal_screen_does_not_override_osc_idle() {
     // Background terminal tasks can be long-lived helpers such as dev servers.
     // They should not make Codex look busy once the foreground turn is idle.
@@ -1167,18 +1520,62 @@ fn codex_screen_blocker_outranks_working_fallback() {
 }
 
 #[test]
-fn codex_weak_blocker_outranks_working_fallback() {
-    let screen = "• Working (4s • esc to interrupt)\n\
-        do you want to continue? [y/n]\n\
-        › Use /skills to list available skills\n";
-    let result = osc_explain(Agent::Codex, screen, "project", "");
+fn codex_weak_blocker_without_current_prompt_is_blocked() {
+    let result = osc_explain(
+        Agent::Codex,
+        "do you want to continue? [y/n]\n",
+        "project",
+        "",
+    );
 
     assert_eq!(result.state, AgentState::Blocked);
     assert_eq!(
         result.matched_rule.as_ref().map(|r| r.id.as_str()),
         Some("weak_blocker")
     );
-    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_current_prompt_keeps_weak_text_from_overriding_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        do you want to continue? [y/n]\n\
+        › Use /skills to list available skills\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("screen_working_fallback")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_weak_blocker_ignores_finished_response_above_current_prompt() {
+    let screen = "• The `wt rm` transcript now shows [y/N] / esc, matching the real prompt.\n\n\
+        ─ Worked for 4m 59s ─\n\n\
+        › Ask Codex to do anything\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
+}
+
+#[test]
+fn codex_weak_blocker_ignores_wrapped_current_prompt_text() {
+    let screen = "› Explain why this prompt wraps before quoting the confirmation text\n\
+          [y/N] / esc and whether the docs should include it\n\n\
+          gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
 }
 
 #[test]
@@ -1250,4 +1647,35 @@ fn codex_osc_working_beats_weak_blocker_screen() {
         result.matched_rule.as_ref().map(|r| r.id.as_str()),
         Some("osc_title_working")
     );
+}
+
+#[test]
+fn manifest_fixture_writes_stay_inside_the_sandbox_even_when_a_test_panics() {
+    // A leaked override in the developer's real config dir shadowed the bundled
+    // codex manifest process-wide and failed unrelated modules hours later, so
+    // the sandbox must contain every fixture write and must be torn down even
+    // when the test body unwinds. Ambient XDG values belong to whichever
+    // sandboxed test currently holds the env lock, so assert only against this
+    // scope's own base rather than comparing the ambient value.
+    let sandbox_base = std::env::temp_dir().join(format!(
+        "herdr-manifest-loader-sandbox-unwind-{}",
+        std::process::id()
+    ));
+    let mut fixture_inside_sandbox = false;
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_manifest_dirs("sandbox-unwind", || {
+            write_local_codex(&local_manifest("blocked", "sandboxed-fixture"));
+            let written = override_path(Agent::Codex).unwrap();
+            fixture_inside_sandbox = written.starts_with(&sandbox_base) && written.exists();
+            panic!("fixture body failed");
+        })
+    }));
+
+    assert!(outcome.is_err());
+    assert!(fixture_inside_sandbox);
+    assert!(!sandbox_base.exists());
+    let still_installed = std::env::var_os("XDG_CONFIG_HOME")
+        .is_some_and(|value| PathBuf::from(value).starts_with(&sandbox_base));
+    assert!(!still_installed);
 }

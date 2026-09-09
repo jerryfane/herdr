@@ -62,7 +62,36 @@ pub(super) fn read_line(
     // Built ONCE: this loop reads a single byte per iteration, so formatting inside
     // it would cost a heap allocation per byte on the keystroke path.
     let timeout_message = format!("timed out reading {label}");
-    with_timed_reads(stream, |stream, mut wait| {
+    with_timed_reads(stream, |stream, wait| {
+        read_line_polling(
+            stream,
+            wait,
+            running,
+            stream_active,
+            max_bytes,
+            idle_timeout,
+            total_timeout,
+            &timeout_message,
+        )
+    })
+}
+
+/// The `read_line` loop, with its wait mode supplied rather than negotiated.
+///
+/// Split out so the POLL path is testable on a platform whose sockets accept a
+/// recv timeout and would therefore never choose it.
+#[allow(clippy::too_many_arguments)]
+fn read_line_polling(
+    stream: &mut ApiStream,
+    mut wait: ReadWait,
+    running: &Arc<AtomicBool>,
+    stream_active: &Arc<AtomicBool>,
+    max_bytes: usize,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    timeout_message: &str,
+) -> std::io::Result<Option<String>> {
+    {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         let mut total_deadline = None;
@@ -72,9 +101,17 @@ pub(super) fn read_line(
             if !stream_is_running(running, stream_active) {
                 return Ok(None);
             }
-            ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
+            ensure_before_deadlines(idle_deadline, total_deadline, timeout_message)?;
             match stream.read(&mut byte) {
-                Ok(0) => return Ok(None),
+                Ok(0) if !wait.zero_read_needs_a_close_probe() || stream.peer_closed()? => {
+                    return Ok(None)
+                }
+                // Non-blocking named pipe with nothing buffered: retry under the
+                // same deadlines rather than calling it a hangup.
+                Ok(0) => {
+                    wait.after_retry(idle_deadline, total_deadline);
+                    continue;
+                }
                 Ok(_) => {
                     wait.on_progress();
                     let now = Instant::now();
@@ -84,7 +121,7 @@ pub(super) fn read_line(
                     if now >= total_deadline_at {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!("timed out reading {label}"),
+                            timeout_message.to_string(),
                         ));
                     }
                     bytes.push(byte[0]);
@@ -96,7 +133,7 @@ pub(super) fn read_line(
                     if bytes.len() > max_bytes {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("{label} is too large"),
+                            format!("{timeout_message} exceeded its size limit"),
                         ));
                     }
                 }
@@ -107,7 +144,7 @@ pub(super) fn read_line(
                 Err(err) => return Err(err),
             }
         }
-    })
+    }
 }
 
 /// Buffered line framing for a channel whose frames are ALL newline-delimited
@@ -179,7 +216,13 @@ impl LineReader {
                 }
                 ensure_before_deadlines(idle_deadline, total_deadline, &timeout_message)?;
                 match stream.read(scratch) {
-                    Ok(0) => return Ok(None),
+                    Ok(0) if !wait.zero_read_needs_a_close_probe() || stream.peer_closed()? => {
+                        return Ok(None)
+                    }
+                    Ok(0) => {
+                        wait.after_retry(idle_deadline, total_deadline);
+                        continue;
+                    }
                     Ok(read) => {
                         wait.on_progress();
                         let now = Instant::now();
@@ -281,6 +324,10 @@ pub(super) fn read_exact(
             let remaining = len - data.len();
             let read_len = remaining.min(chunk.len());
             match stream.read(&mut chunk[..read_len]) {
+                Ok(0) if wait.zero_read_needs_a_close_probe() && !stream.peer_closed()? => {
+                    wait.after_retry(Some(idle_deadline), Some(total_deadline));
+                    continue;
+                }
                 Ok(0) if data.is_empty() => return Ok(None),
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -330,6 +377,18 @@ impl ReadWait {
         if let Self::Poll(backoff) = self {
             backoff.reset();
         }
+    }
+
+    /// Whether a zero-length read means the peer hung up.
+    ///
+    /// Under a socket timeout, always: a blocking read returns 0 only at EOF.
+    /// Under the poll fallback the stream is non-blocking, and a Windows named
+    /// pipe answers "nothing buffered yet" with the same `Ok(0)` it uses for a
+    /// closed pipe - so the answer cannot come from the read alone, and the
+    /// caller must ASK, via `ApiStream::peer_closed` (a non-destructive
+    /// `PeekNamedPipe`, src/ipc.rs `probe_stream_closed`).
+    fn zero_read_needs_a_close_probe(&self) -> bool {
+        matches!(self, Self::Poll(_))
     }
 }
 
@@ -468,5 +527,98 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.interval, FALLBACK_POLL_INTERVAL);
         assert_eq!(backoff.fast_polls_remaining, FALLBACK_FAST_POLLS);
+    }
+}
+
+#[cfg(test)]
+mod zero_read_tests {
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn poll_pair(name: &str) -> (crate::ipc::LocalStream, ApiStream) {
+        // Counter as well as pid: a leftover path from an earlier run makes bind
+        // fail rather than reusing a fresh socket.
+        static NEXT_POLL_PAIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "srp-{}-{}-{}.sock",
+            std::process::id(),
+            name,
+            NEXT_POLL_PAIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        let mut server = ApiStream::Local(server);
+        server.set_nonblocking(true).unwrap();
+        (client, server)
+    }
+
+    fn poll_read_line(server: &mut ApiStream) -> (std::io::Result<Option<String>>, Duration) {
+        let running = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let result = read_line_polling(
+            server,
+            ReadWait::Poll(PollBackoff::new()),
+            &running,
+            &active,
+            4096,
+            Duration::from_millis(40),
+            Duration::from_millis(200),
+            "test frame",
+        );
+        (result, started.elapsed())
+    }
+
+    /// A zero-length read means EOF only under a socket timeout. The poll path runs
+    /// non-blocking, where a Windows named pipe reports "nothing buffered yet" as
+    /// `Ok(0)` and a unix socket reports `WouldBlock`.
+    #[test]
+    fn only_the_poll_path_has_to_ask_whether_the_peer_closed() {
+        // Blocking read: Ok(0) is EOF by definition, no probe needed.
+        assert!(!ReadWait::SocketTimeout.zero_read_needs_a_close_probe());
+        // Non-blocking: Ok(0) is ambiguous on a Windows named pipe, so the reader
+        // asks ApiStream::peer_closed (PeekNamedPipe) rather than guessing.
+        assert!(ReadWait::Poll(PollBackoff::new()).zero_read_needs_a_close_probe());
+    }
+
+    /// Closed versus idle, the distinction the whole rule exists for: with the peer
+    /// GONE the poll path must answer `Ok(None)` promptly rather than burning the
+    /// caller's deadline. The reader asks `ApiStream::peer_closed` rather than
+    /// inferring it from `Ok(0)`, which on a Windows named pipe means both things.
+    #[test]
+    fn a_poll_read_reports_a_closed_peer_without_waiting_for_the_deadline() {
+        let (client, mut server) = poll_pair("closed");
+        drop(client);
+        let (result, elapsed) = poll_read_line(&mut server);
+        assert!(
+            matches!(result, Ok(None)),
+            "a closed peer must read as EOF, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a closed peer must not wait out the idle deadline: {elapsed:?}"
+        );
+    }
+
+    /// THE regression, and the reason the rule keys on progress: a poll read that
+    /// has received a byte and then stalls must end on its own deadline. Retrying
+    /// with no deadline spun forever and hung the entire Windows suite; calling the
+    /// stall EOF dropped a live stream mid-frame.
+    #[test]
+    fn a_poll_read_that_pauses_mid_line_times_out_and_stays_bounded() {
+        let (mut client, mut server) = poll_pair("partial");
+        std::io::Write::write_all(&mut client, b"{").unwrap();
+        std::io::Write::flush(&mut client).unwrap();
+        let (result, elapsed) = poll_read_line(&mut server);
+        let err = result.expect_err("a paused stream must time out, not report a hangup");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the paused poll read was not bounded: {elapsed:?}"
+        );
     }
 }

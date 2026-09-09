@@ -3,10 +3,7 @@
 //! When the user runs `herdr` with no subcommand:
 //! 1. Check if a server is already listening on the client socket
 //! 2. If no server → spawn one as a background daemon → wait for socket readiness (up to 15s)
-//! 3. Attach as a thin client to the server
-//!
-//! The `--no-session` flag bypasses server/client entirely and runs monolithically
-//! (escape hatch for users who want the traditional single-process behavior).
+//! 3. Attach as a client to the server
 
 use std::io;
 use std::path::Path;
@@ -66,7 +63,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
             Ok(_) => {
                 // Server is listening. Close the test connection immediately.
                 // The server's handshake handler will time out on this connection
-                // since we don't send Hello, which is fine.
+                // since we don't send a handshake, which is fine.
                 true
             }
             Err(err)
@@ -117,15 +114,13 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         Err(err) => return Err(err),
     };
 
-    let hello = crate::protocol::ClientMessage::Hello {
+    let hello = crate::protocol::ClientMessage::TerminalHello {
         version: crate::protocol::PROTOCOL_VERSION,
         cols: 80,
         rows: 24,
         cell_width_px: 0,
         cell_height_px: 0,
-        requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
-        keybindings: crate::protocol::ClientKeybindings::Server,
-        launch_mode: crate::protocol::ClientLaunchMode::App,
+        pixel_mouse: false,
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {
@@ -147,7 +142,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
-fn validate_running_server_compatibility() -> io::Result<()> {
+fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<()> {
     let Some(status) = read_server_status()? else {
         return Err(io::Error::other(format!(
             "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
@@ -155,19 +150,29 @@ fn validate_running_server_compatibility() -> io::Result<()> {
         )));
     };
 
-    if status.protocol == Some(crate::protocol::PROTOCOL_VERSION) {
+    let capabilities = status.capabilities.as_ref();
+    let endpoint_generation =
+        capabilities.and_then(|capabilities| capabilities.endpoint_protocol_generation);
+    let surface_interest = capabilities.is_some_and(|capabilities| capabilities.surface_interest);
+    if endpoint_generation == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION)
+        && (!saved_federation || surface_interest)
+    {
         return Ok(());
     }
 
+    let requirement = if saved_federation && !surface_interest {
+        "saved SSH machines require surface lifecycle support"
+    } else {
+        "the stable endpoint generation is incompatible"
+    };
     Err(io::Error::other(format!(
-        "Herdr was updated, but this session is still running the old server.\n\nserver: v{} protocol {}\nclient: v{} protocol {}\n\n{}",
+        "This session needs one final server update before Herdr can attach ({requirement}).\n\nserver: v{} endpoint generation {}\nclient: v{} endpoint generation {}\n\n{}",
         status.version.as_deref().unwrap_or("unknown"),
-        status
-            .protocol
+        endpoint_generation
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+            .unwrap_or_else(|| "unavailable".to_string()),
         crate::build_info::version(),
-        crate::protocol::PROTOCOL_VERSION,
+        crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
         crate::session::active_restart_after_update_guidance()
     )))
 }
@@ -281,24 +286,33 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// attach as a thin client.
 ///
 /// This is the entry point called from `main.rs` when the user runs `herdr`
-/// without `--no-session` and without a subcommand.
+/// without a subcommand.
 ///
 /// Flow:
 /// 1. Check if a server is listening on the client socket
 /// 2. If no server → spawn server daemon → wait for socket readiness
 /// 3. Run the thin client (which connects to the server)
-pub fn auto_detect_launch() -> io::Result<()> {
+pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
     let socket_path = client_socket_path();
     info!(path = %socket_path.display(), "auto-detect launch starting");
 
-    if is_server_listening_at(&socket_path) {
-        validate_running_server_compatibility()?;
+    let startup = if is_server_listening_at(&socket_path) {
         info!("server already running, attaching as client");
+        if saved_federation {
+            Ok(())
+        } else {
+            validate_running_server_compatibility(false)
+        }
     } else {
         info!("no server running, spawning server daemon");
-        spawn_server_daemon()?;
-        wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT)?;
-        info!("server ready, attaching as client");
+        spawn_server_daemon()
+            .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
+    };
+    if let Err(error) = startup {
+        if !saved_federation {
+            return Err(error);
+        }
+        tracing::warn!(%error, "Local startup failed; keeping saved machines available");
     }
 
     // Now attach as a thin client.
@@ -315,11 +329,9 @@ mod tests {
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static crate::config::TestEnvLock {
+        crate::config::test_config_env_lock()
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
@@ -339,7 +351,7 @@ mod tests {
 
     #[test]
     fn server_daemon_command_clears_socket_overrides_for_explicit_session() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/inherited.sock");
         std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/tmp/inherited-client.sock");
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
@@ -380,6 +392,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn server_daemon_detach_creates_new_session() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let mut command = Command::new("sh");
         command.arg("-c").arg(
             r#"sid=$(ps -o sid= -p $$ | tr -d ' ')
@@ -518,13 +535,13 @@ test "$sid" = "$$"
 
     #[test]
     fn validate_running_server_compatibility_fails_when_status_api_missing() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let dir = unique_test_dir("missing-api");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
 
-        let err = validate_running_server_compatibility().unwrap_err();
+        let err = validate_running_server_compatibility(false).unwrap_err();
 
         assert!(
             err.to_string().contains("status API is unavailable"),
@@ -536,7 +553,7 @@ test "$sid" = "$$"
 
     #[test]
     fn validate_running_server_compatibility_names_session_commands_for_protocol_mismatch() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let dir = unique_test_dir("named-protocol");
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
@@ -560,7 +577,7 @@ test "$sid" = "$$"
             stream.flush().unwrap();
         });
 
-        let err = validate_running_server_compatibility().unwrap_err();
+        let err = validate_running_server_compatibility(false).unwrap_err();
         let message = err.to_string();
 
         let _ = handle.join();

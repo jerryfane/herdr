@@ -749,7 +749,13 @@ mod tests {
             ..Default::default()
         };
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+        App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
     }
 
     fn account(id: &str, kind: &str, config_dir: &str) -> AccountConfig {
@@ -944,7 +950,17 @@ mod tests {
         app.usage_cache.insert(
             "work".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(600),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "SKIPPED {}: host clock is younger than the usage TTL, so a stale \
+                             reading cannot be constructed here",
+                            module_path!()
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
@@ -960,9 +976,33 @@ mod tests {
         assert!(app.usage_refresh_inflight.contains("work"));
     }
 
+    /// An `Instant` at least `min_age` in the past, or `None` when this host's
+    /// clock cannot represent one.
+    ///
+    /// `Instant::now() - age` PANICS on Windows, where the clock counts from boot:
+    /// a CI runner minutes old cannot go 600 s back, and a runner younger than the
+    /// TTL cannot express staleness at all. `None` is that case, and the caller
+    /// SKIPS LOUDLY - it never silently substitutes a fresher instant, which would
+    /// leave the test asserting on a fresh reading while claiming to test a stale
+    /// one.
+    fn instant_at_least_ago(min_age: std::time::Duration) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let mut age = min_age;
+        loop {
+            if let Some(instant) = now.checked_sub(age) {
+                return (age > crate::app::api::usage_fetch::USAGE_CLAUDE_TTL).then_some(instant);
+            }
+            if age <= crate::app::api::usage_fetch::USAGE_CLAUDE_TTL {
+                return None;
+            }
+            age /= 2;
+        }
+    }
+
     /// The claude shape specifically: no local usage source, so discarding a stale cache
     /// leaves NOTHING. This is the exact case the owner hit — a meter that emptied itself —
     /// and it is why serving stale matters more for claude than for codex.
+
     #[test]
     fn a_stale_claude_reading_does_not_blank_the_meter() {
         let mut app = test_app_with_accounts(vec![account(
@@ -993,7 +1033,17 @@ mod tests {
         app.usage_cache.insert(
             "primary".to_string(),
             crate::app::api::usage_fetch::CachedUsage {
-                fetched_at: std::time::Instant::now() - std::time::Duration::from_secs(3_600),
+                fetched_at: match instant_at_least_ago(std::time::Duration::from_secs(600)) {
+                    Some(instant) => instant,
+                    None => {
+                        eprintln!(
+                            "SKIPPED {}: host clock is younger than the usage TTL, so a stale \
+                             reading cannot be constructed here",
+                            module_path!()
+                        );
+                        return;
+                    }
+                },
                 usage,
                 active: true,
             },
@@ -1307,7 +1357,7 @@ mod tests {
         // Default install layout: config-home ~/.claude has NO inner .claude.json;
         // the real config file is the sibling ~/.claude.json. The primary account's
         // email must resolve from that sibling (issue #94), not read as null.
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev = std::env::var_os("HOME");
         let home = std::env::temp_dir().join(format!("herdr-claude-home-{}", std::process::id()));
         let claude_dir = home.join(".claude");

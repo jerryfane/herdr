@@ -28,6 +28,7 @@ mod api;
 mod completion;
 mod gram;
 mod integration;
+mod machine;
 mod notification;
 mod pair;
 mod pair_qr;
@@ -118,6 +119,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
+        "machine" => machine::run_machine_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
@@ -1112,6 +1114,11 @@ mod tests {
     fn maps_dead_server_connect_failure_to_friendly_error() {
         use crate::api::client::{ApiClient, ApiClientError};
 
+        // The message the mapper builds resolves the socket path again, from
+        // `HERDR_SOCKET_PATH`/`XDG_CONFIG_HOME`. Hold the one env lock so this
+        // snapshot and that later resolution cannot straddle another test's
+        // override.
+        let _env_guard = crate::config::test_config_env_lock().lock();
         let client = ApiClient::local();
         let socket = client.socket_path().display().to_string();
 

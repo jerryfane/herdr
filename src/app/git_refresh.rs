@@ -34,7 +34,7 @@ struct WorkspaceGitRefreshOutput {
 
 impl App {
     pub(crate) fn start_git_status_refresh_if_due(&mut self, now: Instant) {
-        let Some(deadline) = self.git_refresh_deadline() else {
+        let Some(deadline) = self.git_refresh_deadline(now) else {
             return;
         };
 
@@ -48,7 +48,7 @@ impl App {
         let workspaces = self.workspace_git_refresh_items(refresh_repo_discovery);
 
         if workspaces.is_empty() {
-            self.last_git_remote_status_refresh = now;
+            self.last_git_remote_status_refresh = Some(now);
             self.git_identity_refresh_requested = false;
             return;
         }
@@ -79,24 +79,30 @@ impl App {
         self.mark_git_status_refresh_due(now);
     }
 
-    pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
+    pub(crate) fn mark_git_status_refresh_due(&mut self, _now: Instant) {
         self.git_status_cache
             .retain(|_, entry| entry.fingerprint.is_some());
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
             return;
         }
-        self.last_git_remote_status_refresh = now
-            .checked_sub(GIT_REMOTE_STATUS_REFRESH_INTERVAL)
-            .unwrap_or(now);
+        // Force the next refresh due: "never refreshed" is exactly that state, and
+        // unlike a backdated instant it cannot underflow a boot-relative clock.
+        self.last_git_remote_status_refresh = None;
         self.git_refresh_due_after_in_flight = false;
     }
 
-    pub(crate) fn git_refresh_deadline(&self) -> Option<Instant> {
+    /// `now` is the caller's clock read, not a fresh one: a never-refreshed app is
+    /// due AT `now`, and reading the clock again here would return a deadline
+    ///slightly in the future and make the answer non-deterministic.
+    pub(crate) fn git_refresh_deadline(&self, now: Instant) -> Option<Instant> {
         (!self.git_refresh_in_flight
             && !self.state.workspaces.is_empty()
             && (self.git_identity_refresh_requested || !self.git_refresh_demand().is_empty()))
-        .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+        .then(|| {
+            self.last_git_remote_status_refresh
+                .map_or(now, |last| last + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+        })
     }
 
     fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
@@ -369,7 +375,7 @@ mod tests {
 
         app.request_git_identity_refresh(now);
 
-        assert!(app.git_refresh_deadline().is_some());
+        assert!(app.git_refresh_deadline(now).is_some());
         app.start_git_status_refresh_if_due(now);
         assert!(app.git_refresh_in_flight);
         assert!(!app.git_identity_refresh_requested);
@@ -382,7 +388,7 @@ mod tests {
         let mut app = test_app(&config);
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
-        app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        app.last_git_remote_status_refresh = None;
 
         app.start_git_status_refresh_if_due(now);
 
@@ -419,9 +425,10 @@ mod tests {
             let mut app = test_app(&config);
             app.state.workspaces.push(Workspace::test_new("test"));
 
+            let now = Instant::now();
             assert_eq!(app.git_refresh_demand(), expected, "token: {token:?}");
             assert_eq!(
-                app.git_refresh_deadline().is_some(),
+                app.git_refresh_deadline(now).is_some(),
                 !expected.is_empty(),
                 "token: {token:?}"
             );
@@ -444,7 +451,7 @@ mod tests {
         });
         app.state.workspaces.push(child);
 
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(app.git_refresh_deadline(Instant::now()), None);
     }
 
     #[test]
@@ -462,7 +469,7 @@ mod tests {
         });
         app.state.workspaces.push(child);
 
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(app.git_refresh_deadline(Instant::now()), None);
     }
 
     #[test]
@@ -470,7 +477,7 @@ mod tests {
         let mut app = test_app(&crate::config::Config::default());
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
-        app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        app.last_git_remote_status_refresh = None;
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, false),
@@ -517,11 +524,11 @@ mod tests {
 
         assert!(!app.git_refresh_in_flight);
         assert!(!app.git_refresh_due_after_in_flight);
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(app.git_refresh_deadline(now), None);
 
         app.state.workspaces.push(Workspace::test_new("test"));
         let deadline = app
-            .git_refresh_deadline()
+            .git_refresh_deadline(Instant::now())
             .expect("refresh should be due once a workspace exists");
         assert!(deadline <= Instant::now());
     }
@@ -529,7 +536,7 @@ mod tests {
     fn test_app(config: &crate::config::Config) -> super::super::App {
         super::super::App::new(
             config,
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),

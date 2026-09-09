@@ -16,6 +16,12 @@ pub fn encode_key(key: KeyEvent, protocol: KeyboardProtocol) -> Vec<u8> {
 }
 
 pub fn encode_terminal_key(key: TerminalKey, protocol: KeyboardProtocol) -> Vec<u8> {
+    // A zero Unicode value on this Windows character event means the host layout is
+    // still composing a dead key. Kitty panes must not receive its physical fallback.
+    // Legacy Windows panes take the native ConPTY fallback before reaching this encoder.
+    if matches!(protocol, KeyboardProtocol::Kitty { .. }) && key.is_windows_shift_dead_key() {
+        return Vec::new();
+    }
     // REPORT_ALL_KEYS must retain physical press/repeat/release semantics instead of
     // reducing a native key to its layout-generated text.
     let preserve_physical_key = key.has_physical_identity() && protocol.reports_all_keys();
@@ -494,7 +500,7 @@ fn encode_legacy_inner(key: TerminalKey) -> Vec<u8> {
                     ']' | '5' => vec![29],
                     '^' | '6' => vec![30],
                     '_' | '/' | '7' | '-' => vec![31],
-                    _ => vec![ch as u8],
+                    _ => ch.to_string().into_bytes(),
                 }
             } else {
                 let ch = if key.modifiers == KeyModifiers::SHIFT {
@@ -580,6 +586,12 @@ mod tests {
     fn legacy_ctrl_slash_aliases_ctrl_underscore() {
         let key = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
         assert_eq!(encode_key(key, KeyboardProtocol::Legacy), vec![31]);
+    }
+
+    #[test]
+    fn legacy_ctrl_non_ascii_char_uses_utf8() {
+        let key = KeyEvent::new(KeyCode::Char('ß'), KeyModifiers::CONTROL);
+        assert_eq!(encode_key(key, KeyboardProtocol::Legacy), "ß".as_bytes());
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl App {
         self.state
             .focus_pane_in_workspace(resolved.ws_idx, resolved.pane_id);
         self.state.mark_active_tab_seen();
-        self.state.settle_terminal_mode_after_focus();
+        self.state.mode = crate::app::Mode::Terminal;
         self.agent_info(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(|| TerminalTargetError::NotFound {
                 target: target.to_string(),
@@ -737,6 +737,8 @@ impl App {
         {
             return Err(AgentStartError::InvalidArgument);
         }
+        let persisted_agent_session =
+            crate::agent_resume::persisted_session_from_launch_args(kind, &params.args);
         let conflicts = self.agent_name_conflicts(&name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -813,6 +815,9 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
+        }
+        if let Some(session) = persisted_agent_session {
+            terminal.set_managed_agent_launch_session(session);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
@@ -1159,25 +1164,6 @@ pub(super) fn occupant_unchanged(
 /// distinguishes instances: a restarted agent gets a new one.
 pub(super) fn capture_occupant_group(runtime: &crate::terminal::TerminalRuntime) -> Option<u32> {
     crate::detect::foreground_job(runtime.child_pid()?).map(|job| job.process_group_id)
-}
-
-/// Re-answers the occupancy question for an ALREADY CAPTURED baseline.
-///
-/// Used for the post-write revalidation so that check compares instance, not
-/// merely kind, against the same baseline the delayed guard will use.
-pub(super) fn runtime_hosts_same_occupant(
-    runtime: &crate::terminal::TerminalRuntime,
-    expected: crate::detect::Agent,
-    expected_group: Option<u32>,
-) -> bool {
-    match runtime.child_pid() {
-        Some(pid) => occupant_unchanged(
-            expected_group,
-            expected,
-            crate::detect::foreground_job(pid).as_ref(),
-        ),
-        None => cfg!(test),
-    }
 }
 
 pub(super) fn runtime_agent_guard(

@@ -108,15 +108,6 @@ pub enum AgentPanelSortConfig {
     Priority,
 }
 
-impl AgentPanelSortConfig {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spaces => "spaces",
-            Self::Priority => "priority",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum LegacyAgentPanelScopeConfig {
@@ -274,6 +265,8 @@ pub struct TerminalConfig {
     pub shell_mode: ShellModeConfig,
     /// CWD policy for new interactive panes, tabs, and workspaces.
     pub new_cwd: NewTerminalCwdConfig,
+    /// Render Kitty graphics in compatible outer terminals. Default: true.
+    pub kitty_graphics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,21 +393,51 @@ pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
     }
 }
 
+/// The user's home directory: `HOME` first and, on Windows, `USERPROFILE`
+/// then `HOMEDRIVE` + `HOMEPATH`. This is the single definition of that
+/// chain; `crate::integration::env::home_dir` delegates here so the
+/// installer, the transcript verifier, and account registration cannot
+/// disagree about where a harness keeps its config. `None` when no home is
+/// set at all.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(profile));
+        }
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
+        ) {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            return Some(home);
+        }
+    }
+
+    None
+}
+
 /// The default config-home directory a harness uses with no override
 /// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.omp/agent`,
 /// `$HOME/.kimi-code`). OMP honors its two native directory overrides so the
 /// integration installer, transcript verifier, and launched runtime all resolve
-/// one authoritative account home. `None` when `HOME` is unset or the kind has
-/// no config-home lever.
+/// one authoritative account home. The home directory is resolved only when the
+/// requested value actually needs it: a complete `PI_CODING_AGENT_DIR` resolves
+/// with no home lookup at all. `None` when the kind has no config-home lever,
+/// or when a home is required and none is set.
 pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
     if kind == "omp" {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
         if let Some(agent_dir) =
             std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
         {
             let agent_dir = PathBuf::from(agent_dir);
             return Some(if let Ok(relative) = agent_dir.strip_prefix("~") {
-                home.join(relative)
+                home_dir()?.join(relative)
             } else {
                 agent_dir
             });
@@ -423,7 +446,7 @@ pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".omp"));
-        return Some(home.join(config_dir).join("agent"));
+        return Some(home_dir()?.join(config_dir).join("agent"));
     }
     let sub = match kind {
         "claude" => ".claude",
@@ -431,8 +454,7 @@ pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
         "kimi" => ".kimi-code",
         _ => return None,
     };
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(sub))
+    Some(home_dir()?.join(sub))
 }
 
 /// Resolve OMP's transcript trust root from its complete agent directory.
@@ -583,7 +605,7 @@ pub struct KeysConfig {
     pub navigate_pane_up: BindingConfig,
     /// Focus the pane to the right in navigate mode. Default: "l". Right arrow is always an alias.
     pub navigate_pane_right: BindingConfig,
-    /// Detach from server/client mode, or exit --no-session mode. Default: "prefix+q".
+    /// Detach the current client from its Herdr server. Default: "prefix+q".
     pub detach: BindingConfig,
     /// Reload config.toml in the running app/server. Default: "prefix+shift+r".
     pub reload_config: BindingConfig,
@@ -802,6 +824,12 @@ pub(crate) struct KeysConfigOverlay {
     indexed: Option<IndexedKeysConfig>,
     #[serde(skip_serializing)]
     command: Option<Vec<CommandKeybindConfig>>,
+}
+
+impl KeysConfigOverlay {
+    pub(crate) fn set_prefix(&mut self, prefix: String) {
+        self.prefix = Some(prefix);
+    }
 }
 
 impl<'de> Deserialize<'de> for KeysConfig {
@@ -1056,6 +1084,60 @@ pub enum TabBarPositionConfig {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneBordersConfig {
+    #[default]
+    Auto,
+    Always,
+    Off,
+}
+
+impl PaneBordersConfig {
+    pub fn draws_borders(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn shows_borders(self, multi_pane: bool) -> bool {
+        self.draws_borders() && (multi_pane || matches!(self, Self::Always))
+    }
+}
+
+impl<'de> Deserialize<'de> for PaneBordersConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PaneBordersVisitor;
+
+        impl<'de> de::Visitor<'de> for PaneBordersVisitor {
+            type Value = PaneBordersConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("\"auto\", \"always\", \"off\", or a legacy boolean")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    PaneBordersConfig::Auto
+                } else {
+                    PaneBordersConfig::Off
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "auto" => Ok(PaneBordersConfig::Auto),
+                    "always" => Ok(PaneBordersConfig::Always),
+                    "off" => Ok(PaneBordersConfig::Off),
+                    other => Err(E::invalid_value(de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(PaneBordersVisitor)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -1088,8 +1170,12 @@ pub struct UiConfig {
     pub prompt_new_tab_name: bool,
     /// Ask for a workspace name before interactive creation. Default: false.
     pub prompt_new_workspace_name: bool,
-    /// Draw borders around split panes. Default: true.
-    pub pane_borders: bool,
+    /// Draw borders around split panes. auto draws them only for split panes,
+    /// always also frames a lone pane (only while pane_outer_borders is
+    /// enabled, since every edge of a lone pane is an outer edge), off
+    /// disables them. Legacy booleans map true to auto and false to off.
+    /// Default: auto.
+    pub pane_borders: PaneBordersConfig,
     /// Draw borders along the outside edge of the pane area. Default: true.
     pub pane_outer_borders: bool,
     /// Draw interactive scrollbars beside terminal panes. Default: true.
@@ -1277,8 +1363,8 @@ pub struct FederationPeer {
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
     pub allow_nested: bool,
-    /// Experimental local Kitty graphics rendering for attached clients. Default: false.
-    pub kitty_graphics: bool,
+    /// Deprecated compatibility key for `terminal.kitty_graphics`.
+    pub kitty_graphics: Option<bool>,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
@@ -1412,7 +1498,7 @@ impl Default for UiConfig {
             confirm_close: true,
             prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
-            pane_borders: true,
+            pane_borders: PaneBordersConfig::Auto,
             pane_outer_borders: true,
             pane_scrollbars: true,
             pane_gaps: true,
@@ -1619,7 +1705,7 @@ mod tests {
 
     #[test]
     fn default_config_dir_is_home_relative_per_kind() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
             .map(|key| (key, std::env::var_os(key)));
         std::env::set_var("HOME", "/home/tester");
@@ -1652,7 +1738,7 @@ mod tests {
 
     #[test]
     fn omp_default_config_dir_honors_native_overrides() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
             .map(|key| (key, std::env::var_os(key)));
         std::env::set_var("HOME", "/home/tester");
@@ -1679,6 +1765,48 @@ mod tests {
     }
 
     #[test]
+    fn omp_complete_agent_dir_resolves_without_a_home() {
+        let _guard = crate::config::test_config_env_lock().lock();
+        let previous = [
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "PI_CODING_AGENT_DIR",
+            "PI_CONFIG_DIR",
+        ]
+        .map(|key| (key, std::env::var_os(key)));
+        for key in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("PI_CODING_AGENT_DIR", "/srv/omp/agent");
+        std::env::set_var("PI_CONFIG_DIR", "ignored-when-the-agent-dir-is-complete");
+
+        // A complete agent directory needs no home at all, so the OMP
+        // installer still resolves it - and still notices a shared Pi/OMP
+        // extensions directory - where no home is set.
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/srv/omp/agent"))
+        );
+
+        // The home-relative forms report the missing home instead of
+        // inventing a path.
+        std::env::set_var("PI_CODING_AGENT_DIR", "~/omp-work");
+        assert_eq!(default_config_dir("omp"), None);
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        assert_eq!(default_config_dir("omp"), None);
+        assert_eq!(default_config_dir("claude"), None);
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
     fn omp_session_root_is_below_the_complete_agent_directory() {
         let agent_dir = PathBuf::from("/home/tester/.omp/agent");
         assert_eq!(omp_sessions_dir(&agent_dir), agent_dir.join("sessions"));
@@ -1686,7 +1814,7 @@ mod tests {
 
     #[test]
     fn primary_default_dir_account_injects_no_env_but_secondary_does() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", "/home/tester");
 
@@ -1956,9 +2084,34 @@ status_indicators = "symbols"
     }
 
     #[test]
+    fn pane_borders_legacy_booleans_map_to_modes() {
+        let enabled: Config = toml::from_str("[ui]\npane_borders = true").unwrap();
+        assert_eq!(enabled.ui.pane_borders, PaneBordersConfig::Auto);
+
+        let disabled: Config = toml::from_str("[ui]\npane_borders = false").unwrap();
+        assert_eq!(disabled.ui.pane_borders, PaneBordersConfig::Off);
+
+        let auto: Config = toml::from_str("[ui]\npane_borders = \"auto\"").unwrap();
+        assert_eq!(auto.ui.pane_borders, PaneBordersConfig::Auto);
+
+        let off: Config = toml::from_str("[ui]\npane_borders = \"off\"").unwrap();
+        assert_eq!(off.ui.pane_borders, PaneBordersConfig::Off);
+
+        let unknown = toml::from_str::<Config>("[ui]\npane_borders = \"framed\"")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("\"auto\", \"always\", \"off\", or a legacy boolean"));
+
+        let wrong_type = toml::from_str::<Config>("[ui]\npane_borders = 3")
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("\"auto\", \"always\", \"off\", or a legacy boolean"));
+    }
+
+    #[test]
     fn pane_appearance_defaults_and_parse() {
         let default_config = Config::default();
-        assert!(default_config.ui.pane_borders);
+        assert_eq!(default_config.ui.pane_borders, PaneBordersConfig::Auto);
         assert!(default_config.ui.pane_outer_borders);
         assert!(default_config.ui.pane_scrollbars);
         assert!(default_config.ui.pane_gaps);
@@ -1973,7 +2126,7 @@ status_indicators = "symbols"
 
         let toml = r#"
 [ui]
-pane_borders = false
+pane_borders = "always"
 pane_outer_borders = false
 pane_scrollbars = false
 pane_gaps = true
@@ -1990,7 +2143,7 @@ tab_bar_right = [
 tab_bar_right_separator = " · "
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.pane_borders);
+        assert_eq!(config.ui.pane_borders, PaneBordersConfig::Always);
         assert!(!config.ui.pane_outer_borders);
         assert!(!config.ui.pane_scrollbars);
         assert!(config.ui.pane_gaps);
@@ -2479,16 +2632,41 @@ pane_history = true
     }
 
     #[test]
-    fn kitty_graphics_default_off_and_parse() {
-        let config = Config::default();
-        assert!(!config.experimental.kitty_graphics);
+    fn kitty_graphics_default_on_with_stable_opt_out() {
+        assert!(Config::default().kitty_graphics_enabled());
 
-        let toml = r#"
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.kitty_graphics_enabled());
+    }
+
+    #[test]
+    fn legacy_experimental_kitty_graphics_setting_remains_compatible() {
+        let disabled: Config = toml::from_str(
+            r#"
+[experimental]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.kitty_graphics_enabled());
+
+        let stable_setting_wins: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+
 [experimental]
 kitty_graphics = true
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.experimental.kitty_graphics);
+"#,
+        )
+        .unwrap();
+        assert!(!stable_setting_wins.kitty_graphics_enabled());
     }
 
     #[test]
@@ -2502,7 +2680,8 @@ switch_ascii_input_source_in_prefix = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.allow_nested);
-        assert!(config.experimental.kitty_graphics);
+        assert_eq!(config.experimental.kitty_graphics, Some(true));
+        assert!(config.kitty_graphics_enabled());
         assert!(config.experimental.pane_history);
         assert!(config.experimental.switch_ascii_input_source_in_prefix);
     }

@@ -172,23 +172,6 @@ pub(crate) fn start_server_with_stop_control(
     )
 }
 
-pub fn start_server_with_capabilities(
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
-    federation: &FederationConfig,
-    federation_store: Arc<Mutex<FederationStore>>,
-) -> std::io::Result<ServerHandle> {
-    start_server_inner(
-        api_tx,
-        event_hub,
-        capabilities,
-        None,
-        federation,
-        federation_store,
-    )
-}
-
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
@@ -201,6 +184,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
             crate::api::schema::AgentSessionTransferHarness::Codex,
             crate::api::schema::AgentSessionTransferHarness::Omp,
         ],
+        endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        surface_interest: true,
+        health_check: true,
     })
 }
 
@@ -1610,6 +1596,14 @@ fn handle_request(
         });
     }
 
+    if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
+        return error_response_json(
+            request.id,
+            "connection_local_only",
+            "client_shell.surface.set is only available through a client shell endpoint".into(),
+        );
+    }
+
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
             server_stop.store(true, Ordering::Release);
@@ -1627,10 +1621,10 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
 }
 
-fn api_method_name(method: &Method) -> &'static str {
+pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
@@ -1652,8 +1646,12 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::GramDelete(_) => "gram.delete",
         Method::GramUploadChunk(_) => "gram.upload_chunk",
         Method::GramGetFile(_) => "gram.get_file",
+        Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
+        Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
+        Method::CommandInvoke(_) => "command.invoke",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
+        Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
@@ -1710,12 +1708,18 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
         Method::PaneSetPtySize(_) => "pane.set_pty_size",
+        Method::PaneScroll(_) => "pane.scroll",
+        Method::PaneEditScrollback(_) => "pane.edit_scrollback",
+        Method::PaneSelectionRead(_) => "pane.selection.read",
+        Method::PaneCopyMotion(_) => "pane.copy_motion",
+        Method::PaneCopySearch(_) => "pane.copy_search",
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
         Method::PaneTurns(_) => "pane.turns",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
+        Method::PaneLinkActivate(_) => "pane.link.activate",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
@@ -1746,6 +1750,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
+        Method::IntegrationList(_) => "integration.list",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
         Method::PluginLink(_) => "plugin.link",
@@ -2077,7 +2082,22 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None, None)
+}
+
+pub(super) fn dispatch_to_app_with_caller_timeout(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+) -> String {
+    dispatch_to_app(
+        request,
+        api_tx,
+        timeout,
+        None,
+        None,
+        Some(("timeout", "timed out waiting for agent status")),
+    )
 }
 
 pub(super) fn dispatch_stream_open(
@@ -2086,7 +2106,7 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active))
+    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), None)
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -2100,6 +2120,7 @@ pub(super) fn dispatch_stream_frame(
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
         None,
         Some(active),
+        None,
     )
 }
 
@@ -2109,6 +2130,7 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
+    timeout_response: Option<(&str, &str)>,
 ) -> String {
     let request_id = request.id.clone();
     let request_active = stream_active.clone();
@@ -2154,6 +2176,11 @@ fn dispatch_to_app(
             if let Some(active) = request_active {
                 active.store(false, Ordering::Release);
             }
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                if let Some((code, message)) = timeout_response {
+                    return error_response_json(request_id, code, message.into());
+                }
+            }
             error_response_json(
                 request_id,
                 "server_unavailable",
@@ -2161,6 +2188,26 @@ fn dispatch_to_app(
             )
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn caller_timeout_dispatch_uses_timeout_error() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = dispatch_to_app_with_caller_timeout(
+        Request {
+            id: "prompt-timeout".into(),
+            method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                target: "reviewer".into(),
+                text: "review this".into(),
+                wait: None,
+            }),
+        },
+        &tx,
+        Some(Duration::ZERO),
+    );
+    let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(error.error.code, "timeout");
 }
 
 fn error_response_json(id: String, code: &str, message: String) -> String {
@@ -2185,12 +2232,10 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static crate::config::TestEnvLock {
+        crate::config::test_config_env_lock()
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
@@ -2286,7 +2331,7 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_explicit_env_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let unique = format!("/tmp/herdr-test-{}.sock", std::process::id());
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -2297,7 +2342,7 @@ mod tests {
 
     #[test]
     fn socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = unique_test_path("socket-default-config-home");
         let runtime_dir = unique_test_path("socket-default-runtime");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
@@ -2317,7 +2362,7 @@ mod tests {
 
     #[test]
     fn socket_path_uses_named_session_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = unique_test_path("socket-named-config-home");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -2385,6 +2430,11 @@ mod tests {
                     crate::api::schema::AgentSessionTransferHarness::Codex,
                     crate::api::schema::AgentSessionTransferHarness::Omp,
                 ],
+                endpoint_protocol_generation: Some(
+                    crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
+                ),
+                surface_interest: true,
+                health_check: true,
             }),
             None,
             None,
@@ -3211,8 +3261,12 @@ mod federation_tests {
             ("gram.delete", Denied),
             ("gram.upload_chunk", Denied),
             ("gram.get_file", Denied),
+            ("product_announcement.dismiss", Denied),
+            ("release_notes.dismiss", Denied),
+            ("command.invoke", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
+            ("client_shell.surface.set", Denied),
             ("session.snapshot", AllowedAt(Observe)),
             ("workspace.create", Denied),
             ("workspace.list", AllowedAt(Observe)),
@@ -3269,12 +3323,18 @@ mod federation_tests {
             ("pane.focus_direction", Denied),
             ("pane.resize", Denied),
             ("pane.set_pty_size", AllowedAt(Admin)),
+            ("pane.scroll", Denied),
+            ("pane.edit_scrollback", Denied),
+            ("pane.selection.read", Denied),
+            ("pane.copy_motion", Denied),
+            ("pane.copy_search", Denied),
             ("pane.list", AllowedAt(Observe)),
             ("pane.current", AllowedAt(Observe)),
             ("pane.get", AllowedAt(Observe)),
             ("pane.turns", AllowedAt(Observe)),
             ("pane.focus", Denied),
             ("pane.input.set", AllowedAt(Admin)),
+            ("pane.link.activate", Denied),
             ("pane.rename", AllowedAt(Admin)),
             ("pane.send_text", AllowedAt(Interact)),
             ("pane.send_keys", AllowedAt(Interact)),
@@ -3305,6 +3365,7 @@ mod federation_tests {
             ("events.subscribe", AllowedAt(Observe)),
             ("events.wait", AllowedAt(Observe)),
             ("pane.wait_for_output", AllowedAt(Observe)),
+            ("integration.list", Denied),
             ("integration.install", Denied),
             ("integration.uninstall", Denied),
             ("plugin.link", Denied),

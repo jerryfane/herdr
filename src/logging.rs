@@ -255,19 +255,6 @@ pub(crate) fn workspace_renamed(workspace_id: &str) {
     );
 }
 
-#[cfg(test)]
-pub(crate) fn tab_created(workspace_id: &str, tab_id: &str, root_pane_id: u32) {
-    tracing::info!(
-        event = "tab.create",
-        subsystem = "tab",
-        outcome = "ok",
-        workspace_id,
-        tab_id,
-        pane_id = root_pane_id,
-        "tab created"
-    );
-}
-
 pub(crate) fn tab_focused(workspace_id: &str, tab_id: &str) {
     tracing::info!(
         event = "tab.focus",
@@ -395,6 +382,21 @@ pub(crate) fn update_check_started() {
     );
 }
 
+/// Fork-only: `herdr accounts` and the config writer report a failed write here.
+/// Lost to auto-merge when upstream rewrote the surrounding region; no conflict
+/// was raised, so nothing flagged it until `config_io.rs` failed to compile.
+pub(crate) fn config_write_failed(path: &Path, context: &str, err: &str) {
+    tracing::warn!(
+        event = "config.write",
+        subsystem = "config",
+        outcome = "error",
+        path = %path.display(),
+        context,
+        err,
+        "failed to write config"
+    );
+}
+
 pub(crate) fn update_check_failed(err: &str) {
     tracing::warn!(
         event = "update.check.complete",
@@ -412,18 +414,6 @@ pub(crate) fn update_available(version: &str) {
         outcome = "ok",
         version,
         "update available"
-    );
-}
-
-pub(crate) fn config_write_failed(path: &Path, context: &str, err: &str) {
-    tracing::warn!(
-        event = "config.write",
-        subsystem = "config",
-        outcome = "error",
-        path = %path.display(),
-        context,
-        err,
-        "failed to write config"
     );
 }
 

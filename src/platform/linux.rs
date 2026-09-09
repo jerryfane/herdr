@@ -17,8 +17,11 @@ pub(crate) use super::unix_common::{
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
     remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
-    StatusCommandGuard,
+    wait_client_stream_readable, StatusCommandGuard,
 };
+
+#[cfg(test)]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
@@ -519,6 +522,13 @@ pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    if running_inside_wsl() {
+        if let Some(image) = read_wsl_clipboard_image_with_command(|program| Command::new(program))
+        {
+            return Some(image);
+        }
+    }
+
     for (mime, extension) in [
         ("image/png", "png"),
         ("image/jpeg", "jpg"),
@@ -547,6 +557,24 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     }
 
     None
+}
+
+fn read_wsl_clipboard_image_with_command(
+    mut command: impl FnMut(&str) -> Command,
+) -> Option<ClipboardImage> {
+    let mut command = command("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $image=[System.Windows.Forms.Clipboard]::GetImage(); if ($null -eq $image) { exit 1 }; $stream=[System.IO.MemoryStream]::new(); try { $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png); [Console]::OpenStandardOutput().Write($stream.GetBuffer(), 0, [int]$stream.Length) } finally { $stream.Dispose(); $image.Dispose() }",
+    ]);
+    let bytes = read_clipboard_image_with_spawned_command(command)?;
+    bytes_match_image_signature("png", &bytes).then_some(ClipboardImage {
+        bytes,
+        extension: "png",
+    })
 }
 
 fn read_validated_clipboard_image(
@@ -781,7 +809,62 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     }
     drop(stdin);
 
+    if command.program == "wl-copy" {
+        return wait_for_wl_copy_startup(child);
+    }
+
     child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+fn wait_for_wl_copy_startup(mut child: std::process::Child) -> bool {
+    const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    let deadline = std::time::Instant::now() + STARTUP_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Ok(None) => return detach_clipboard_owner(child),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn detach_clipboard_owner(child: std::process::Child) -> bool {
+    let pid = child.id();
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let reaper_child = std::sync::Arc::clone(&child);
+    let reaper = std::thread::Builder::new()
+        .name("herdr-wl-copy-reaper".to_string())
+        .spawn(move || {
+            let wait_result = match reaper_child.lock() {
+                Ok(mut child) => child.wait(),
+                Err(poisoned) => poisoned.into_inner().wait(),
+            };
+            if let Err(err) = wait_result {
+                tracing::warn!(pid, %err, "failed to reap wl-copy clipboard owner");
+            }
+        });
+
+    if let Err(err) = reaper {
+        tracing::warn!(pid, %err, "failed to start wl-copy clipboard owner reaper");
+        let mut child = match child.lock() {
+            Ok(child) => child,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+
+    true
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -794,12 +877,10 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static crate::config::TestEnvLock {
+        crate::config::test_config_env_lock()
     }
 
     #[test]
@@ -1044,7 +1125,7 @@ mod tests {
 
     #[test]
     fn clipboard_commands_prefer_wayland_when_available() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::remove_var("DISPLAY");
@@ -1055,8 +1136,245 @@ mod tests {
     }
 
     #[test]
+    fn wl_copy_owner_does_not_block_clipboard_write() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime};
+
+        struct Cleanup {
+            old_path: Option<OsString>,
+            temp_dir: PathBuf,
+            owner_pid: Option<i32>,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(pid) = self.owner_pid {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+                unsafe {
+                    match self.old_path.take() {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                    std::env::remove_var("HERDR_TEST_WL_COPY_MARKER");
+                    std::env::remove_var("HERDR_TEST_WL_COPY_PAYLOAD");
+                    std::env::remove_var("HERDR_TEST_WL_COPY_ARGS");
+                }
+                let _ = std::fs::remove_dir_all(&self.temp_dir);
+            }
+        }
+
+        let _guard = env_lock().lock();
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time should follow unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "herdr-fake-wl-copy-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let mut cleanup = Cleanup {
+            old_path: std::env::var_os("PATH"),
+            temp_dir: temp_dir.clone(),
+            owner_pid: None,
+        };
+        let fake_wl_copy = temp_dir.join("wl-copy");
+        let marker = temp_dir.join("owner-pid");
+        let payload = temp_dir.join("payload");
+        let args = temp_dir.join("args");
+        std::fs::write(
+            &fake_wl_copy,
+            "#!/bin/sh\ncat > \"$HERDR_TEST_WL_COPY_PAYLOAD\"\nprintf '%s\\n' \"$@\" > \"$HERDR_TEST_WL_COPY_ARGS\"\nprintf '%s' \"$$\" > \"$HERDR_TEST_WL_COPY_MARKER\"\nexec sleep 30\n",
+        )
+        .expect("fake wl-copy should be written");
+        let mut permissions = std::fs::metadata(&fake_wl_copy)
+            .expect("fake wl-copy metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_wl_copy, permissions)
+            .expect("fake wl-copy should be executable");
+
+        let test_path = match cleanup.old_path.as_ref() {
+            Some(path) => {
+                let mut paths = vec![temp_dir.clone()];
+                paths.extend(std::env::split_paths(path));
+                std::env::join_paths(paths).expect("test path should be valid")
+            }
+            None => temp_dir.clone().into_os_string(),
+        };
+        unsafe {
+            std::env::set_var("PATH", test_path);
+            std::env::set_var("HERDR_TEST_WL_COPY_MARKER", &marker);
+            std::env::set_var("HERDR_TEST_WL_COPY_PAYLOAD", &payload);
+            std::env::set_var("HERDR_TEST_WL_COPY_ARGS", &args);
+        }
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let command = ClipboardCommand {
+                program: "wl-copy",
+                args: &["--type", "text/plain;charset=utf-8"],
+            };
+            let _ = result_tx.send(run_clipboard_command(&command, b"clipboard text"));
+        });
+
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < marker_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let owner_pid: i32 = std::fs::read_to_string(&marker)
+            .expect("fake wl-copy should enter its clipboard-owner phase")
+            .parse()
+            .expect("owner pid should be numeric");
+        cleanup.owner_pid = Some(owner_pid);
+        let returned_while_owner_running = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_ok_and(|result| result);
+        let actual_payload = std::fs::read(&payload).expect("fake wl-copy should record stdin");
+        let actual_args = std::fs::read_to_string(&args).expect("fake wl-copy should record args");
+
+        unsafe {
+            libc::kill(owner_pid, libc::SIGTERM);
+        }
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(owner_pid as u32) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let owner_was_reaped = !process_exists(owner_pid as u32);
+        cleanup.owner_pid = None;
+        writer.join().expect("clipboard writer thread should join");
+        drop(cleanup);
+
+        assert!(
+            returned_while_owner_running,
+            "clipboard writes must return while wl-copy remains alive to own the selection"
+        );
+        assert_eq!(actual_payload, b"clipboard text");
+        assert_eq!(actual_args, "--type\ntext/plain;charset=utf-8\n");
+        assert!(
+            owner_was_reaped,
+            "wl-copy owner should be reaped after exit"
+        );
+    }
+
+    #[test]
+    fn failed_wl_copy_uses_x11_fallback() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Cleanup {
+            old_path: Option<OsString>,
+            old_wayland_display: Option<OsString>,
+            old_display: Option<OsString>,
+            temp_dir: PathBuf,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.old_path.take() {
+                        Some(value) => std::env::set_var("PATH", value),
+                        None => std::env::remove_var("PATH"),
+                    }
+                    match self.old_wayland_display.take() {
+                        Some(value) => std::env::set_var("WAYLAND_DISPLAY", value),
+                        None => std::env::remove_var("WAYLAND_DISPLAY"),
+                    }
+                    match self.old_display.take() {
+                        Some(value) => std::env::set_var("DISPLAY", value),
+                        None => std::env::remove_var("DISPLAY"),
+                    }
+                    std::env::remove_var("HERDR_TEST_XCLIP_PAYLOAD");
+                }
+                let _ = std::fs::remove_dir_all(&self.temp_dir);
+            }
+        }
+
+        let _guard = env_lock().lock();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should follow unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "herdr-failed-wl-copy-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let cleanup = Cleanup {
+            old_path: std::env::var_os("PATH"),
+            old_wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
+            old_display: std::env::var_os("DISPLAY"),
+            temp_dir: temp_dir.clone(),
+        };
+        let payload = temp_dir.join("xclip-payload");
+        let fake_wl_copy = temp_dir.join("wl-copy");
+        let fake_xclip = temp_dir.join("xclip");
+        std::fs::write(&fake_wl_copy, "#!/bin/sh\n/bin/cat >/dev/null\nexit 7\n")
+            .expect("fake wl-copy should be written");
+        std::fs::write(
+            &fake_xclip,
+            "#!/bin/sh\n/bin/cat > \"$HERDR_TEST_XCLIP_PAYLOAD\"\n",
+        )
+        .expect("fake xclip should be written");
+        for command in [&fake_wl_copy, &fake_xclip] {
+            let mut permissions = std::fs::metadata(command)
+                .expect("fake clipboard command metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(command, permissions)
+                .expect("fake clipboard command should be executable");
+        }
+
+        unsafe {
+            std::env::set_var("PATH", &temp_dir);
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+            std::env::set_var("HERDR_TEST_XCLIP_PAYLOAD", &payload);
+        }
+
+        assert!(write_clipboard(b"clipboard fallback"));
+        assert_eq!(
+            std::fs::read(&payload).expect("xclip should record stdin"),
+            b"clipboard fallback"
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn finite_clipboard_commands_report_exit_status() {
+        // Absolute interpreter on purpose: this test is about reporting a child's
+        // exit status, not about PATH resolution, and other modules' tests mutate
+        // PATH. Resolving "sh" through PATH made this fail only in a full-suite
+        // run, which is the worst kind of failure to debug.
+        // Shell BUILTINS only, and an absolute interpreter: this test is about
+        // reporting a child's exit status, and other modules' tests mutate PATH.
+        // `cat` resolved through a mutated PATH returned 127 and made this fail
+        // only in a full-suite run. The read loop drains stdin so the parent's
+        // write never sees EPIPE.
+        let success = ClipboardCommand {
+            program: "/bin/sh",
+            args: &["-c", "while read -r _; do :; done; exit 0"],
+        };
+        let failure = ClipboardCommand {
+            program: "/bin/sh",
+            args: &["-c", "while read -r _; do :; done; exit 7"],
+        };
+
+        assert!(run_clipboard_command(&success, b"clipboard text"));
+        assert!(!run_clipboard_command(&failure, b"clipboard text"));
+    }
+
+    #[test]
     fn clipboard_commands_include_x11_fallbacks() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
@@ -1069,7 +1387,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_commands_include_session_backends() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::set_var("DISPLAY", ":0");
@@ -1084,6 +1402,11 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_reads_utf8() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let command = ClipboardCommand {
             program: "printf",
             args: &["feature/linear-302"],
@@ -1097,6 +1420,11 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_rejects_oversized_output() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let command = ClipboardCommand {
             program: "sh",
             args: &["-c", "yes x | head -c 1048578"],
@@ -1107,6 +1435,11 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_reads_under_limit() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf image");
 
@@ -1118,6 +1451,11 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_rejects_over_limit() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf oversized");
 
@@ -1129,7 +1467,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_xclip_text_served_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -1181,7 +1519,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_wayland_xclip_fallback_text_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-wayland-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -1239,12 +1577,35 @@ mod tests {
 
     #[test]
     fn read_validated_clipboard_image_accepts_real_png_payload() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         assert_eq!(
             read_validated_clipboard_image(
                 "sh",
                 &["-c", "printf '\\211PNG\\r\\n\\032\\nrest-of-image'"],
                 "png"
             ),
+            Some(ClipboardImage {
+                bytes: b"\x89PNG\r\n\x1a\nrest-of-image".to_vec(),
+                extension: "png",
+            })
+        );
+    }
+
+    #[test]
+    fn read_wsl_clipboard_image_accepts_png_from_windows_command() {
+        assert_eq!(
+            read_wsl_clipboard_image_with_command(|program| {
+                assert_eq!(program, "powershell.exe");
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("printf '\\211PNG\\r\\n\\032\\nrest-of-image'");
+                command
+            }),
             Some(ClipboardImage {
                 bytes: b"\x89PNG\r\n\x1a\nrest-of-image".to_vec(),
                 extension: "png",
@@ -1285,7 +1646,7 @@ mod tests {
 
     #[test]
     fn desktop_notification_separates_option_like_titles() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");

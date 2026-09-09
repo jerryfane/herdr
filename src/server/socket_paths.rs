@@ -104,10 +104,16 @@ mod tests {
 
     #[test]
     fn client_socket_path_defaults_to_config_dir() {
+        // `HERDR_SESSION` and the whole `XDG_*` group are process-global, and
+        // the expectation is derived from the same `config_dir()` the call
+        // under test reads: hold the one env lock and snapshot the directory so
+        // a concurrent config test cannot move it between the two reads.
+        let _guard = crate::config::test_config_env_lock().lock();
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
+        let expected = crate::config::config_dir().join("herdr-client.sock");
         let path = client_socket_path_from_overrides(None, None);
-        assert_eq!(path, crate::config::config_dir().join("herdr-client.sock"));
+        assert_eq!(path, expected);
     }
 
     #[test]

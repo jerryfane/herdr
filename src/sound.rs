@@ -376,6 +376,11 @@ mod tests {
     #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn linux_audio_player_does_not_wait_forever() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let pid_path = temp_sound_path().with_extension("pid");
         let player = AudioPlayer {
             program: "sh",
@@ -406,6 +411,11 @@ mod tests {
     #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn linux_audio_player_preserves_completed_output() {
+        // Resolves its interpreter through `PATH`, which other tests replace
+        // wholesale (an agent-availability fixture even empties it). Take the
+        // shared read side of the one env lock: readers run concurrently, and
+        // only a mutating test is held off.
+        let _env = crate::config::test_config_env_lock().read();
         let player = AudioPlayer {
             program: "sh",
             args: &[

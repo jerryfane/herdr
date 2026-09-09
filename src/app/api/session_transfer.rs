@@ -2163,7 +2163,7 @@ mod tests {
             let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut app = App::new(
                 &crate::config::Config::default(),
-                true,
+                crate::app::AppPolicy::TEST,
                 None,
                 api_rx,
                 crate::api::EventHub::default(),
@@ -2266,7 +2266,7 @@ mod tests {
 
     #[test]
     fn default_omp_transfer_route_uses_native_profile_precedence() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let keys = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"];
         let previous = keys.map(|key| (key, std::env::var_os(key)));
         std::env::set_var("HOME", "/tmp/herdr-omp-profile-home");
@@ -2276,7 +2276,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
