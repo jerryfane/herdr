@@ -2075,24 +2075,31 @@ impl App {
     }
 }
 
-/// Do two git shas name the same commit, allowing for different abbreviations?
+/// Is `staged_sha` an abbreviation of - or equal to - the running commit?
 ///
-/// The staged record and `build_info::commit()` are written by different producers
-/// and are NOT the same length: the fleet build step records a short sha, the
-/// binary embeds the full 40 characters. So this is a case-insensitive prefix
-/// match on the shorter of the two, not equality.
+/// The two are written by different producers and are NOT the same length: the
+/// fleet build step records a short sha into `staged-build.json`, the binary
+/// embeds the full 40. So this is a prefix match, not equality.
 ///
-/// An empty or absent sha never matches: an unidentifiable staged build is
-/// reported, so a real update is never hidden by a missing field.
+/// Deliberately ONE-DIRECTIONAL: `staged` may abbreviate `running`, never the
+/// reverse. A staged value LONGER than the running sha that merely starts with it
+/// is a different (or malformed) identifier, and suppressing it would hide a real
+/// update. Empty or absent shas never match either, so an unidentifiable staged
+/// build is reported rather than swallowed.
+///
+/// Compares BYTES, not `str` slices: `staged` is attacker-adjacent JSON off disk
+/// and slicing it at a `min(len)` offset panics when that offset lands inside a
+/// multi-byte scalar (`"aé"` against `"ab"` did). Git shas are ASCII hex, so a
+/// non-ASCII value simply fails to match.
 fn same_commit(staged_sha: &str, running_sha: Option<&str>) -> bool {
-    let (Some(running), staged) = (running_sha, staged_sha) else {
+    let Some(running) = running_sha else {
         return false;
     };
-    if staged.is_empty() || running.is_empty() {
+    let (staged, running) = (staged_sha.as_bytes(), running.as_bytes());
+    if staged.is_empty() || running.is_empty() || staged.len() > running.len() {
         return false;
     }
-    let shorter = staged.len().min(running.len());
-    staged[..shorter].eq_ignore_ascii_case(&running[..shorter])
+    running[..staged.len()].eq_ignore_ascii_case(staged)
 }
 
 fn unix_millis_now() -> u64 {
@@ -2703,6 +2710,24 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&app.handle_api_request(request())).unwrap();
         assert_eq!(v["result"]["staged"]["sha"], "deadbee");
+
+        // A staged sha LONGER than the running one, sharing its prefix, is a different
+        // (or malformed) identifier - suppressing it would hide a real update.
+        stage(&format!("{running}0000"));
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(
+            v["result"]["staged"]["sha"],
+            format!("{running}0000"),
+            "a staged sha longer than the running commit is not an abbreviation of it"
+        );
+
+        // Non-ASCII cannot be a git sha. It must not match, and MUST NOT PANIC: slicing
+        // `str` at a byte offset inside a multi-byte scalar aborts the request thread.
+        stage("a\u{e9}");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request())).unwrap();
+        assert_eq!(v["result"]["staged"]["version"], "9.9.9");
 
         // An empty sha is unidentifiable, so it is reported rather than hidden.
         stage("");
