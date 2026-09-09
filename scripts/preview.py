@@ -45,6 +45,10 @@ TYPE_HEADINGS = {
 TYPE_ORDER = ("Added", "Fixed", "Performance", "Maintenance", "Other")
 COMMIT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+(?P<body>.+)$")
 PUBLICATION_BRANCH_PREFIX = "automation/preview-"
+# The runtime manifest the daemon fetches. `refactor: separate website
+# presentation from runtime` (8a6d6973) moved it here from website/preview.json;
+# src/update.rs, src/remote/attach.rs and install.sh point at this same path.
+RUNTIME_MANIFEST_PATH = "distribution/preview.json"
 ENDPOINT_PROTOCOL_SOURCE_PATH = Path("src/protocol/endpoint.rs")
 
 
@@ -146,12 +150,12 @@ def publication_branch(commit: str) -> str:
 
 def validate_publication_paths(paths: list[str]) -> None:
     normalized = {path.strip() for path in paths if path.strip()}
-    if "website/preview.json" not in normalized:
-        raise ValueError("preview publication must update website/preview.json")
+    if RUNTIME_MANIFEST_PATH not in normalized:
+        raise ValueError(f"preview publication must update {RUNTIME_MANIFEST_PATH}")
     invalid = sorted(
         path
         for path in normalized
-        if path != "website/preview.json" and not path.startswith("docs/preview/")
+        if path != RUNTIME_MANIFEST_PATH and not path.startswith("docs/preview/")
     )
     if invalid:
         raise ValueError(
@@ -655,12 +659,12 @@ def main() -> int:
     publication_files.set_defaults(func=cmd_validate_publication_files)
 
     manifest_repository = sub.add_parser("validate-manifest-repository")
-    manifest_repository.add_argument("--manifest", default="website/preview.json")
+    manifest_repository.add_argument("--manifest", default=RUNTIME_MANIFEST_PATH)
     manifest_repository.add_argument("--repo", required=True)
     manifest_repository.set_defaults(func=cmd_validate_manifest_repository)
 
     verify_deployment = sub.add_parser("verify-deployment")
-    verify_deployment.add_argument("--manifest", default="website/preview.json")
+    verify_deployment.add_argument("--manifest", default=RUNTIME_MANIFEST_PATH)
     verify_deployment.add_argument("--url", required=True)
     verify_deployment.add_argument("--token", required=True)
     verify_deployment.add_argument("--attempts", type=int, default=60)

@@ -301,7 +301,7 @@ class PreviewNotesTests(unittest.TestCase):
 
     def test_verify_deployment_rejects_invalid_polling_options(self):
         base = {
-            "manifest": "website/preview.json",
+            "manifest": preview.RUNTIME_MANIFEST_PATH,
             "url": "https://herdr.dev/preview.json",
             "token": "test-run",
             "attempts": 1,
@@ -343,14 +343,16 @@ class PreviewNotesTests(unittest.TestCase):
             [
                 "docs/preview/website/astro.config.mjs\n",
                 "docs/preview/website/src/content/docs/index.mdx\n",
-                "website/preview.json\n",
+                f"{preview.RUNTIME_MANIFEST_PATH}\n",
             ]
         )
-        with self.assertRaisesRegex(ValueError, "must update website/preview.json"):
+        with self.assertRaisesRegex(
+            ValueError, f"must update {preview.RUNTIME_MANIFEST_PATH}"
+        ):
             preview.validate_publication_paths(["docs/preview/website/astro.config.mjs"])
         with self.assertRaisesRegex(ValueError, "unexpected path"):
             preview.validate_publication_paths(
-                ["website/preview.json", ".github/workflows/preview.yml"]
+                [preview.RUNTIME_MANIFEST_PATH, ".github/workflows/preview.yml"]
             )
 
     def test_publication_files_reject_renamed_source_outside_allowlist(self):
@@ -363,7 +365,7 @@ class PreviewNotesTests(unittest.TestCase):
                             "previous_filename": ".github/workflows/preview.yml",
                             "status": "renamed",
                         },
-                        {"filename": "website/preview.json", "status": "modified"},
+                        {"filename": preview.RUNTIME_MANIFEST_PATH, "status": "modified"},
                     ]
                 ]
             )
@@ -372,7 +374,7 @@ class PreviewNotesTests(unittest.TestCase):
         preview.validate_publication_files(
             [
                 [{"filename": "docs/preview/website/astro.config.mjs"}],
-                [{"filename": "website/preview.json"}],
+                [{"filename": preview.RUNTIME_MANIFEST_PATH}],
             ]
         )
 
