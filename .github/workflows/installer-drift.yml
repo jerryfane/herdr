@@ -1,0 +1,113 @@
+# Does the PUBLISHED installer still match this repository?
+#
+# `https://herdrup.themartian.app/install.sh` is what the README and the app's
+# first-run card tell people to pipe into `sh`. It is served by a Cloudflare
+# Worker that fetches `install.sh` from master at request time, so the two should
+# be byte-identical.
+#
+# They were not, once. `8a6d6973 refactor: separate website presentation from
+# runtime` moved the runtime manifest to `distribution/preview.json` on
+# 2026-09-01, while the then-hosted COPY kept pointing at `website/preview.json`.
+# Every new install died on a 404 for eight days and nothing noticed, because the
+# failure was outside CI: the repo was fine, the website was not. This job is the
+# missing comparison (see #177).
+#
+# It checks the SERVED BYTES, not the Worker's configuration - a broken deploy, a
+# stale edge cache, a reverted asset and a bad DNS change all surface the same way.
+
+name: Installer drift
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily. Drift is silent, so time-to-detection matters more than immediacy;
+    # a push-triggered run would miss the failure mode where the repo is correct
+    # and the website is not.
+    - cron: "17 6 * * *"
+  push:
+    branches: [master]
+    paths:
+      - "install.sh"
+      - ".github/workflows/installer-drift.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-drift
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Compare the served installer against this commit
+        env:
+          INSTALLER_URL: https://herdrup.themartian.app/install.sh
+        run: |
+          set -euo pipefail
+
+          # --fail so an HTTP error is an error, not an error page saved to disk
+          # and then diffed as if it were a script.
+          if ! curl -fsSL --max-time 30 "$INSTALLER_URL" -o /tmp/served.sh; then
+            echo "::error::could not fetch $INSTALLER_URL - the published installer is unreachable"
+            exit 1
+          fi
+
+          if ! head -n 1 /tmp/served.sh | grep -qE '^#!/(bin/sh|usr/bin/env sh)'; then
+            echo "::error::$INSTALLER_URL did not return a shell script (first line: $(head -n 1 /tmp/served.sh))"
+            exit 1
+          fi
+
+          if diff -u install.sh /tmp/served.sh > /tmp/installer.diff; then
+            echo "published installer matches install.sh at $GITHUB_SHA"
+            exit 0
+          fi
+
+          echo "::error::the published installer differs from install.sh at this commit"
+          {
+            echo "### Installer drift detected"
+            echo
+            echo "\`$INSTALLER_URL\` does not match \`install.sh\` at \`$GITHUB_SHA\`."
+            echo
+            echo "Users piping that URL into \`sh\` are running the served version, not this one."
+            echo
+            echo '```diff'
+            cat /tmp/installer.diff
+            echo '```'
+            echo
+            echo "The site is a Cloudflare **Worker** named \`herdrup\` (not Pages) that proxies"
+            echo "this file from master. Redeploy from its checkout with \`wrangler deploy\`, or"
+            echo "investigate why the proxy is serving something else."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Verify the served installer resolves its manifest
+        # A byte-identical script can still be useless if the manifest URL it
+        # points at is gone - that is exactly what #177 was. Follow the script's
+        # own default URL and require a real manifest.
+        run: |
+          set -euo pipefail
+          url=$(sed -n 's/^DEFAULT_MANIFEST_URL="\(.*\)"$/\1/p' install.sh | head -n 1)
+          if [ -z "$url" ]; then
+            echo "::error::could not read DEFAULT_MANIFEST_URL out of install.sh"
+            exit 1
+          fi
+          echo "manifest: $url"
+          if ! curl -fsSL --max-time 30 "$url" -o /tmp/manifest.json; then
+            echo "::error::the installer's manifest URL is unreachable: $url"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("/tmp/manifest.json"))
+          missing = [k for k in ("build_id", "assets") if k not in m]
+          if missing:
+              sys.exit(f"manifest is missing {missing}")
+          print("manifest build_id:", m["build_id"])
+          PY
