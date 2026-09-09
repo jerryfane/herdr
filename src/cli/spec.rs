@@ -413,7 +413,7 @@ fn agent_command() -> Command {
             Command::new("read")
                 .about("Read agent terminal output")
                 .override_usage("herdr agent read <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(read_source_option(true))
                 .arg(option("lines", "N"))
                 .arg(text_ansi_format_option())
@@ -422,7 +422,7 @@ fn agent_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to an agent")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(required("key", "KEY").num_args(1..))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
         )
@@ -430,7 +430,7 @@ fn agent_command() -> Command {
             Command::new("prompt")
                 .about("Submit a prompt to an agent")
                 .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(required("text", "TEXT"))
                 .arg(
                     flag("wait")
@@ -456,7 +456,7 @@ fn agent_command() -> Command {
             Command::new("rename")
                 .about("Rename an agent")
                 .override_usage("herdr agent rename <TARGET> <NAME>|--clear")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(Arg::new("name").value_name("NAME"))
                 .arg(flag("clear"))
                 .group(
@@ -477,7 +477,7 @@ fn agent_command() -> Command {
                 .override_usage(
                     "herdr agent transfer-session <TARGET> --to claude|codex|omp [OPTIONS]",
                 )
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(
                     option("to", "HARNESS")
                         .required(true)
@@ -498,7 +498,7 @@ fn agent_command() -> Command {
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")
                 .override_usage("herdr agent wait <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(
                     option("until", "STATUS")
                         .action(ArgAction::Append)
@@ -514,7 +514,7 @@ fn agent_command() -> Command {
             Command::new("attach")
                 .about("Attach directly to an agent terminal")
                 .override_usage("herdr agent attach <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(flag("takeover")),
         )
         .subcommand(
@@ -821,7 +821,7 @@ fn terminal_command() -> Command {
                 .subcommand(
                     Command::new("control")
                         .about("Control a terminal stream")
-                        .arg(required("target", "TARGET"))
+                        .arg(agent_target())
                         .arg(flag("takeover"))
                         .arg(option("cols", "N"))
                         .arg(option("rows", "N")),
@@ -829,7 +829,7 @@ fn terminal_command() -> Command {
                 .subcommand(
                     Command::new("observe")
                         .about("Observe a terminal stream")
-                        .arg(required("target", "TARGET"))
+                        .arg(agent_target())
                         .arg(option("cols", "N"))
                         .arg(option("rows", "N")),
                 ),
@@ -1097,6 +1097,18 @@ fn repeatable_option(name: &'static str, value_name: &'static str) -> Arg {
 
 fn path_option(name: &'static str, value_name: &'static str) -> Arg {
     option(name, value_name).value_hint(ValueHint::AnyPath)
+}
+
+/// The `<TARGET>` every agent subcommand takes.
+///
+/// Spelled out because it was not: `herdr agent rename --help` printed a bare
+/// `<TARGET>` with no accepted forms, so a caller hitting a resolution failure had no
+/// documented form to try instead (#181).
+fn agent_target() -> Arg {
+    required("target", "TARGET").help(
+        "Agent name, pane id (w1:p1), terminal id, tab id, or <machine>/<id> for an \
+         agent on a configured peer",
+    )
 }
 
 fn required(name: &'static str, value_name: &'static str) -> Arg {
