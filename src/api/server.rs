@@ -5155,6 +5155,69 @@ mod federation_tests {
     }
 
     #[test]
+    fn proxy_returns_the_target_hosts_gram_path_without_local_dispatch() {
+        let expected = serde_json::json!({
+            "id": "g1",
+            "result": {
+                "type": "gram_sent",
+                "store_id": "peer-machine",
+                "local_file_path": "/peer/gram-files/message/attachment.txt"
+            }
+        })
+        .to_string();
+        let peer_line = expected.clone();
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            assert_eq!(parsed["method"], "gram.post");
+            assert_eq!(parsed["params"]["target_pane_id"], "w1:p1");
+            assert_eq!(parsed["id"], "g1");
+            writeln!(sock, "{peer_line}").expect("peer writes response");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "g1",
+                "method": "gram.post",
+                "params": {
+                    "text": "",
+                    "target_pane_id": "remote/w1:p1",
+                    "file": {
+                        "upload_id": "up-1",
+                        "name": "attachment.txt",
+                        "mime": "text/plain"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            response, expected,
+            "the target host's finalized path must pass through verbatim"
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["local_file_path"],
+            "/peer/gram-files/message/attachment.txt"
+        );
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "a federated gram post reached the home app dispatch path"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
     fn proxy_returns_the_peers_read_snapshot_verbatim() {
         // agent.read (an Observe-tier read) to `<alias>/…` returns the peer's
         // snapshot unchanged. The response body shape is opaque to the home — it
