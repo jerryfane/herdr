@@ -853,6 +853,7 @@ mod tests {
                 upload_id: upload_id.to_string(),
                 offset: 0,
                 data_base64: base64::engine::general_purpose::STANDARD.encode(b"clobber"),
+                target_pane_id: None,
             }),
         };
 
@@ -905,6 +906,7 @@ mod tests {
             method: Method::GramPost(crate::api::schema::GramPostParams {
                 text: String::new(),
                 to: None,
+                target_pane_id: None,
                 file: Some(crate::api::schema::GramFileUpload {
                     upload_id: upload_id.to_string(),
                     name: "half.bin".into(),
@@ -1001,6 +1003,7 @@ mod tests {
                 "up_silent".to_string(),
                 GramUploadStreamParams {
                     upload_id: "up-silent".into(),
+                    target_pane_id: None,
                 },
                 &api_tx,
                 &server_running,

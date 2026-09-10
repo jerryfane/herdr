@@ -332,6 +332,11 @@ pub enum ResponseResult {
         /// written to, so a send that lands where the owner never reads becomes
         /// visible instead of silent. See issue #98.
         store_id: String,
+        /// Exact absolute path of the finalized attachment on the responding
+        /// daemon, or absent for a text-only send. Response-only: paths are host
+        /// facts and are not persisted in gram.json.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_file_path: Option<String>,
     },
     GramList {
         messages: Vec<GramMessageInfo>,

@@ -198,9 +198,11 @@ fn append_chunk_in(dir: &Path, upload_id: &str, offset: u64, bytes: &[u8]) -> io
     Ok(())
 }
 
-/// Metadata for an assembled attachment: the stored (sanitized) name, byte size,
-/// and hex SHA-256 so a client can verify the assembled bytes match its upload.
+/// Metadata for an assembled attachment: the exact host-local path, stored
+/// (sanitized) name, byte size, and hex SHA-256 so a client can reference the
+/// bytes without guessing the server-created message id.
 pub struct FinalizedFile {
+    pub path: PathBuf,
     pub name: String,
     pub size: u64,
     pub sha256: String,
@@ -260,6 +262,7 @@ fn finalize_in(
     fs::rename(&staging, &target)?;
 
     Ok(FinalizedFile {
+        path: target,
         name: safe_name,
         size,
         sha256,

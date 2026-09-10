@@ -163,27 +163,15 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         | "tab.list"
         | "tab.get"
         | "layout.export" => AllowedAt(Observe),
-        // Interact: drive agents and panes.
-        "agent.prompt" | "agent.send_keys" | "pane.send_text" | "pane.send_keys" => {
-            AllowedAt(Interact)
-        }
+        // Interact: drive agents and panes, including target-host attachment writes.
+        "agent.prompt" | "agent.send_keys" | "pane.send_text" | "pane.send_keys" | "gram.post"
+        | "gram.upload_chunk" | "gram.upload.stream" => AllowedAt(Interact),
         // Admin: focus, rename, and input/authority mutations.
         "agent.focus" | "agent.rename" | "agent.restart" | "pane.send_input" | "pane.input.set"
         | "pane.rename" | "pane.set_pty_size" | "agent.view.set" | "agent.view.clear" => {
             AllowedAt(Admin)
         }
-        // Everything else (all server.*, plugin.*, integration.*, gram.*,
-        // notification(s).*, client.window_title.*, agent.start,
-        // agent.transfer_session (account-home filesystem authority), pane.close,
-        // popup.close, every workspace/worktree/tab/layout/pane mutation except
-        // the Admin `pane.set_pty_size` width-lease call above, the
-        // pane.report_*/authority calls, pane.graphics.set/clear/stream, and the
-        // client-shell-routed commands that only a locally attached shell can
-        // serve — command.invoke, client_shell.surface.set, pane.scroll,
-        // pane.edit_scrollback, pane.selection.read, pane.copy_motion,
-        // pane.copy_search, pane.link.activate, integration.list, and the
-        // product_announcement/release_notes dismissals) is denied to federation
-        // regardless of tier.
+        // Everything else is denied to federation regardless of tier.
         _ => FederationAccess::Denied,
     }
 }

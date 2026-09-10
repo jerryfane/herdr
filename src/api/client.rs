@@ -398,11 +398,18 @@ pub struct FederatedStream {
 }
 
 impl FederatedStream {
-    fn over(stream: ApiStream) -> Self {
+    pub(crate) fn over(stream: ApiStream) -> Self {
         Self {
             stream,
             buf: Vec::new(),
         }
+    }
+
+    /// Write one newline-delimited frame to the same duplex transport.
+    pub(crate) fn write_frame(&mut self, frame: &str) -> io::Result<()> {
+        self.stream.write_all(frame.as_bytes())?;
+        self.stream.write_all(b"\n")?;
+        self.stream.flush()
     }
 
     /// Read the next newline-delimited frame, or `Ok(None)` when the peer closed

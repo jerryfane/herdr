@@ -313,6 +313,19 @@ fn gram_file_round_trip_upload_download_delete() {
         .as_str()
         .expect("message id")
         .to_string();
+    let local_file_path = post["result"]["local_file_path"]
+        .as_str()
+        .expect("attachment post must return its finalized host-local path");
+    assert_eq!(
+        Path::new(local_file_path)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("greeting.txt")
+    );
+    assert_eq!(
+        fs::read(local_file_path).expect("returned attachment path must be readable"),
+        b"hello world"
+    );
 
     // Download the bytes (owner view: no caller pane) and verify they reassemble.
     let got = api_request(
