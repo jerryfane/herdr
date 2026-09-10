@@ -2772,6 +2772,13 @@
               ],
               "description": "An optional file to attach, previously uploaded in chunks via\n`gram.upload_chunk` under `file.upload_id`."
             },
+            "target_pane_id": {
+              "description": "Target pane whose owning daemon must store the attachment. When present,\nthe daemon resolves the pane's current Gram identity; mutually exclusive\nwith `to`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -2832,6 +2839,13 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "target_pane_id": {
+              "description": "Pane whose owning daemon must receive this upload. Used only for federation\nrouting; the destination handler still keys staging by `upload_id`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "upload_id": {
               "type": "string"
@@ -13386,6 +13400,13 @@
             },
             {
               "properties": {
+                "local_file_path": {
+                  "description": "Exact absolute path of the finalized attachment on the responding\ndaemon, or absent for a text-only send. Response-only: paths are host\nfacts and are not persisted in gram.json.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "message": {
                   "$ref": "#/schemas/success_response/$defs/GramMessageInfo"
                 },

@@ -69,6 +69,14 @@ enum DeleteOutcome {
     Forbidden,
 }
 
+/// A finalized attachment split into persisted metadata and response-only
+/// host-local location. The path is deliberately not written to gram.json: it
+/// belongs to the daemon installation that finalized the bytes.
+struct AttachedFile {
+    metadata: GramFile,
+    local_path: String,
+}
+
 impl App {
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
         let text = params.text.trim();
@@ -87,9 +95,13 @@ impl App {
         let from = self.resolve_sender(params.from.as_deref(), params.caller_pane_id.as_deref());
         let message_id = new_id();
         let store_id = crate::persist::machine::get_or_create();
-        let file = match attach_file(&id, &message_id, params.file) {
-            Ok(file) => file,
+        let attached = match attach_file(&id, &message_id, params.file) {
+            Ok(attached) => attached,
             Err(err) => return err,
+        };
+        let (file, local_file_path) = match attached {
+            Some(attached) => (Some(attached.metadata), Some(attached.local_path)),
+            None => (None, None),
         };
         let item = GramItem {
             id: message_id,
@@ -113,6 +125,7 @@ impl App {
                     ResponseResult::GramSent {
                         message: gram_item_to_info(item),
                         store_id,
+                        local_file_path,
                     },
                 )
             }
@@ -132,36 +145,63 @@ impl App {
         if let Some(err) = validate_label(&id, "to", params.to.as_deref()) {
             return err;
         }
+        if let Some(err) = validate_label(&id, "target_pane_id", params.target_pane_id.as_deref()) {
+            return err;
+        }
+        if params.to.is_some() && params.target_pane_id.is_some() {
+            return encode_error(
+                id,
+                "invalid_params",
+                "to and target_pane_id are mutually exclusive",
+            );
+        }
         if self.no_session {
             return gram_unavailable(id);
         }
 
-        let to = params
-            .to
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        // A direct message must name a live agent, else it would be visible to no
-        // one and never expire — a silent black hole. Omit `to` for the shared
-        // queue instead.
-        if let Some(target) = &to {
-            if !self.is_live_agent_name(target) {
-                return encode_error(
-                    id,
-                    "invalid_params",
-                    format!(
-                        "no live agent named '{target}'; omit --to to post to the shared queue"
-                    ),
-                );
+        let to = if let Some(target_pane) = params.target_pane_id.as_deref() {
+            match self.caller_identity(target_pane) {
+                Some(identity) => Some(identity),
+                None => {
+                    return encode_error(
+                        id,
+                        "agent_not_found",
+                        format!("no live agent in pane '{target_pane}'"),
+                    )
+                }
             }
-        }
+        } else {
+            let named = params
+                .to
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            // A direct message must name a live agent, else it would be visible to
+            // no one and never expire — a silent black hole.
+            if let Some(target) = &named {
+                if !self.is_live_agent_name(target) {
+                    return encode_error(
+                        id,
+                        "invalid_params",
+                        format!(
+                            "no live agent named '{target}'; omit --to to post to the shared queue"
+                        ),
+                    );
+                }
+            }
+            named
+        };
 
         let message_id = new_id();
         let store_id = crate::persist::machine::get_or_create();
-        let file = match attach_file(&id, &message_id, params.file) {
-            Ok(file) => file,
+        let attached = match attach_file(&id, &message_id, params.file) {
+            Ok(attached) => attached,
             Err(err) => return err,
+        };
+        let (file, local_file_path) = match attached {
+            Some(attached) => (Some(attached.metadata), Some(attached.local_path)),
+            None => (None, None),
         };
         let item = GramItem {
             id: message_id,
@@ -184,6 +224,7 @@ impl App {
                 ResponseResult::GramSent {
                     message: gram_item_to_info(item),
                     store_id,
+                    local_file_path,
                 },
             ),
             Err(err) => {
@@ -412,6 +453,15 @@ impl App {
         if self.no_session {
             return gram_unavailable(id);
         }
+        if let Some(target) = params.target_pane_id.as_deref() {
+            if self.caller_identity(target).is_none() {
+                return encode_error(
+                    id,
+                    "agent_not_found",
+                    format!("no live agent in pane '{target}'"),
+                );
+            }
+        }
         // Single writer per upload_id, and the CLAIM is the check: a predicate read
         // before appending would leave the window open, since a stream can open
         // between the read and the write. A live `gram.upload.stream` channel appends
@@ -442,16 +492,24 @@ impl App {
     }
 
     /// Validates a streaming upload before the server thread starts reading frames.
-    /// `no_session` is the ONLY app-owned state the per-chunk handler consults; every
-    /// other step (base64 decode, `append_chunk`) is pure filesystem and runs on the
-    /// server thread, so this is the whole app-side cost of a streamed upload.
+    /// The target pane is checked before the first byte is accepted, so a stale
+    /// federated pane cannot leave bytes on the wrong daemon.
     pub(super) fn handle_gram_upload_stream_open(
         &mut self,
         id: String,
-        _params: GramUploadStreamParams,
+        params: GramUploadStreamParams,
     ) -> String {
         if self.no_session {
             return gram_unavailable(id);
+        }
+        if let Some(target) = params.target_pane_id.as_deref() {
+            if self.caller_identity(target).is_none() {
+                return encode_error(
+                    id,
+                    "agent_not_found",
+                    format!("no live agent in pane '{target}'"),
+                );
+            }
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -606,14 +664,15 @@ fn validate_text(id: &str, text: &str, allow_empty: bool) -> Option<String> {
     None
 }
 
-/// Assemble a staged upload onto `message_id`, returning its metadata for the
-/// record. No file → `Ok(None)`. A bad upload (missing/oversized/invalid id or
-/// name) returns an encoded error response so the caller can return it directly.
+/// Assemble a staged upload onto `message_id`, returning persisted metadata plus
+/// the response-only host-local path. No file → `Ok(None)`. A bad upload
+/// (missing/oversized/invalid id or name) returns an encoded error response so
+/// the caller can return it directly.
 fn attach_file(
     request_id: &str,
     message_id: &str,
     upload: Option<GramFileUpload>,
-) -> Result<Option<GramFile>, String> {
+) -> Result<Option<AttachedFile>, String> {
     let Some(upload) = upload else {
         return Ok(None);
     };
@@ -660,11 +719,14 @@ fn attach_file(
         ));
     };
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
-        Ok(finalized) => Ok(Some(GramFile {
-            name: finalized.name,
-            size: finalized.size,
-            mime: upload.mime,
-            sha256: finalized.sha256,
+        Ok(finalized) => Ok(Some(AttachedFile {
+            local_path: finalized.path.to_string_lossy().into_owned(),
+            metadata: GramFile {
+                name: finalized.name,
+                size: finalized.size,
+                mime: upload.mime,
+                sha256: finalized.sha256,
+            },
         })),
         // A malformed upload (unknown id, empty or oversized staging, bad name) is
         // the caller's mistake; anything else is a real I/O failure.
@@ -1302,5 +1364,38 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn targeted_upload_rejects_a_stale_pane_before_accepting_bytes() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let chunk: serde_json::Value = serde_json::from_str(&app.handle_gram_upload_chunk(
+            "chunk".into(),
+            GramUploadChunkParams {
+                upload_id: "stale-target".into(),
+                offset: 0,
+                data_base64: "eA==".into(),
+                target_pane_id: Some("missing/w1:p1".into()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(chunk["error"]["code"], "agent_not_found");
+
+        let stream: serde_json::Value = serde_json::from_str(&app.handle_gram_upload_stream_open(
+            "stream".into(),
+            GramUploadStreamParams {
+                upload_id: "stale-target".into(),
+                target_pane_id: Some("missing/w1:p1".into()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(stream["error"]["code"], "agent_not_found");
     }
 }

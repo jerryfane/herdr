@@ -57,6 +57,11 @@ pub struct GramPostParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Target pane whose owning daemon must store the attachment. When present,
+    /// the daemon resolves the pane's current Gram identity; mutually exclusive
+    /// with `to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<String>,
     /// An optional file to attach, previously uploaded in chunks via
     /// `gram.upload_chunk` under `file.upload_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +151,10 @@ pub struct GramUploadChunkParams {
     pub upload_id: String,
     pub offset: u64,
     pub data_base64: String,
+    /// Pane whose owning daemon must receive this upload. Used only for federation
+    /// routing; the destination handler still keys staging by `upload_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<String>,
 }
 
 /// `gram.upload.stream` — open a streaming upload channel for one file.
@@ -159,6 +168,9 @@ pub struct GramUploadChunkParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramUploadStreamParams {
     pub upload_id: String,
+    /// Pane whose owning daemon must receive this stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<String>,
 }
 
 /// `gram.get_file` — download the file attached to a message. The bytes come back

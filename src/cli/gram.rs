@@ -98,6 +98,7 @@ fn gram_post(args: &[String]) -> std::io::Result<i32> {
         method: Method::GramPost(GramPostParams {
             text,
             to,
+            target_pane_id: None,
             file: None,
         }),
     })?)
@@ -140,6 +141,7 @@ fn upload_file(path: &str) -> std::io::Result<Result<GramFileUpload, serde_json:
                 upload_id: upload_id.clone(),
                 offset,
                 data_base64,
+                target_pane_id: None,
             }),
         })?;
         if response.get("error").is_some() {

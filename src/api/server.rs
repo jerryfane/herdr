@@ -15,7 +15,7 @@ use std::fs;
 
 use crate::api::client::{
     endpoint_to_target, parse_response_value, ApiClient, ApiClientError, ConnectionTarget,
-    ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
+    FederatedStream, ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
 use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
@@ -26,8 +26,8 @@ use crate::api::federation_store::{
     FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
 };
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, Method, PaneStreamParams, Request, ResponseResult,
-    ServerCapabilities, SuccessResponse,
+    ErrorBody, ErrorResponse, GramUploadStreamParams, Method, PaneStreamParams, Request,
+    ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
@@ -1096,9 +1096,24 @@ fn handle_connection_with_stop(
             }
             result
         }
-        Method::GramUploadStream(params) => {
-            let result =
-                gram_upload_stream::serve(stream, request_id.clone(), params, api_tx, running);
+        Method::GramUploadStream(mut params) => {
+            let result = if let Some((alias, rest, peer_target)) = params
+                .target_pane_id
+                .as_deref()
+                .and_then(|target| federated_stream_target(target, federation_peers))
+            {
+                params.target_pane_id = Some(rest);
+                proxy_federated_gram_upload_stream(
+                    stream,
+                    request_id.clone(),
+                    &alias,
+                    params,
+                    peer_target,
+                    running,
+                )
+            } else {
+                gram_upload_stream::serve(stream, request_id.clone(), params, api_tx, running)
+            };
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -1265,6 +1280,8 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // `pane.send_text`; sending text remotely while keys silently went local was
         // the same asymmetry in a different pair.
         Method::PaneSendKeys(params) => Some(&mut params.pane_id),
+        Method::GramPost(params) => params.target_pane_id.as_mut(),
+        Method::GramUploadChunk(params) => params.target_pane_id.as_mut(),
         // NOT routed, deliberately: `agent.view.set`/`agent.view.clear` are Admin tier
         // but their `source` is a view definition, not a pane or agent id, so there is
         // no peer to resolve it against.
@@ -1543,6 +1560,119 @@ fn proxy_federated_pane_stream(
     // Every exit path reaches here: dropping the peer stream closes the peer
     // connection so no orphan stream is left running on the peer.
     drop(peer_stream);
+    Ok(())
+}
+
+/// Proxy one target-host Gram upload as a bounded duplex NDJSON stream. Each
+/// client frame is written to the peer before its one ack is read and returned,
+/// preserving the upload protocol's backpressure and single-writer ordering.
+fn proxy_federated_gram_upload_stream(
+    client_stream: ApiStream,
+    request_id: String,
+    alias: &str,
+    params: GramUploadStreamParams,
+    peer_target: ConnectionTarget,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let client = ApiClient::for_target(peer_target);
+    let request = Request {
+        id: request_id.clone(),
+        method: Method::GramUploadStream(params),
+    };
+    let mut client_stream = FederatedStream::over(client_stream);
+    let mut peer_stream = match client.open_frame_stream(&request) {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!(
+                id = %request_id,
+                alias,
+                err = %err,
+                "federated gram upload could not reach peer"
+            );
+            return client_stream.write_frame(&error_response_json(
+                request_id,
+                "peer_unreachable",
+                format!("could not reach federation peer: {err}"),
+            ));
+        }
+    };
+
+    let first = match peer_stream.next_frame(
+        FEDERATION_MAX_STREAM_FRAME_BYTES,
+        FEDERATION_STREAM_IDLE_TIMEOUT,
+        running,
+    ) {
+        Ok(Some(first)) => first,
+        Ok(None) => error_response_json(
+            request_id.clone(),
+            "delivery_unknown",
+            "federation peer closed the upload stream before it started".into(),
+        ),
+        Err(err) => error_response_json(
+            request_id.clone(),
+            "delivery_unknown",
+            format!("federation peer upload stream could not be read: {err}"),
+        ),
+    };
+    client_stream.write_frame(&first)?;
+    if api_response_outcome(&first) != "ok" {
+        return Ok(());
+    }
+
+    loop {
+        let frame = match client_stream.next_frame(
+            FEDERATION_MAX_STREAM_FRAME_BYTES,
+            FEDERATION_STREAM_IDLE_TIMEOUT,
+            running,
+        ) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => break,
+            Err(err) => {
+                warn!(
+                    id = %request_id,
+                    alias,
+                    err = %err,
+                    "federated gram upload client stream ended"
+                );
+                break;
+            }
+        };
+
+        if let Err(err) = peer_stream.write_frame(&frame) {
+            client_stream.write_frame(&error_response_json(
+                request_id.clone(),
+                "delivery_unknown",
+                format!("federation peer upload write outcome is unknown: {err}"),
+            ))?;
+            break;
+        }
+        let ack = match peer_stream.next_frame(
+            FEDERATION_MAX_STREAM_FRAME_BYTES,
+            FEDERATION_STREAM_IDLE_TIMEOUT,
+            running,
+        ) {
+            Ok(Some(ack)) => ack,
+            Ok(None) => error_response_json(
+                request_id.clone(),
+                "delivery_unknown",
+                "federation peer closed before acknowledging an upload frame".into(),
+            ),
+            Err(err) => error_response_json(
+                request_id.clone(),
+                "delivery_unknown",
+                format!("federation peer upload acknowledgement is unknown: {err}"),
+            ),
+        };
+        client_stream.write_frame(&ack)?;
+        let rejected = serde_json::from_str::<serde_json::Value>(&ack)
+            .ok()
+            .and_then(|value| value.get("ok").and_then(serde_json::Value::as_bool))
+            == Some(false);
+        if rejected || api_response_outcome(&ack) == "error" {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -3272,12 +3402,12 @@ mod federation_tests {
             ("notifications.register_activity", Denied),
             ("notifications.unregister_activity", Denied),
             ("gram.send", Denied),
-            ("gram.post", Denied),
+            ("gram.post", AllowedAt(Interact)),
             ("gram.list", Denied),
             ("gram.grab", Denied),
             ("gram.mark_read", Denied),
             ("gram.delete", Denied),
-            ("gram.upload_chunk", Denied),
+            ("gram.upload_chunk", AllowedAt(Interact)),
             ("gram.get_file", Denied),
             ("product_announcement.dismiss", Denied),
             ("release_notes.dismiss", Denied),
@@ -3371,7 +3501,7 @@ mod federation_tests {
             ("pane.stream.close", Denied),
             ("pane.input.stream", Denied),
             ("pane.input.stream.open", Denied),
-            ("gram.upload.stream", Denied),
+            ("gram.upload.stream", AllowedAt(Interact)),
             ("gram.upload.stream.open", Denied),
             ("pane.report_agent", Denied),
             ("pane.report_agent_session", Denied),
@@ -4584,6 +4714,23 @@ mod federation_tests {
                 "pane.send_text",
                 serde_json::json!({ "pane_id": "remote/w1:p1", "text": "hi" }),
             ),
+            (
+                "gram.post",
+                serde_json::json!({
+                    "text": "",
+                    "target_pane_id": "remote/w1:p1",
+                    "file": { "upload_id": "up-1", "name": "x.txt", "mime": "text/plain" }
+                }),
+            ),
+            (
+                "gram.upload_chunk",
+                serde_json::json!({
+                    "upload_id": "up-1",
+                    "offset": 0,
+                    "data_base64": "eA==",
+                    "target_pane_id": "remote/w1:p1"
+                }),
+            ),
         ];
 
         for (name, params) in cases {
@@ -4875,6 +5022,80 @@ mod federation_tests {
     }
 
     #[test]
+    fn proxy_routes_gram_upload_stream_frames_and_acks_to_target_peer() {
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+        let peer = start_proxy_peer(move |_request, mut socket| {
+            let started = serde_json::to_string(&SuccessResponse {
+                id: "upload".into(),
+                result: ResponseResult::Ok {},
+            })
+            .unwrap();
+            writeln!(socket, "{started}").unwrap();
+            socket.flush().unwrap();
+
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut frame = String::new();
+            reader.read_line(&mut frame).unwrap();
+            frame_tx.send(frame.trim().to_string()).unwrap();
+            writeln!(socket, r#"{{"seq":1,"ok":true}}"#).unwrap();
+            socket.flush().unwrap();
+
+            let mut eof = String::new();
+            let _ = reader.read_line(&mut eof);
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("token".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+        let request = serde_json::json!({
+            "id": "upload",
+            "method": "gram.upload.stream",
+            "params": {
+                "upload_id": "up-remote",
+                "target_pane_id": "remote/w1:p1"
+            }
+        });
+        writeln!(home.client, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        home.client.flush().unwrap();
+
+        let mut reader = BufReader::new(home.client.try_clone().unwrap());
+        let mut started = String::new();
+        reader.read_line(&mut started).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&started).unwrap()["result"]["type"],
+            "ok"
+        );
+
+        let frame = r#"{"seq":1,"offset":0,"data_base64":"aGVsbG8="}"#;
+        writeln!(home.client, "{frame}").unwrap();
+        home.client.flush().unwrap();
+        let mut ack = String::new();
+        reader.read_line(&mut ack).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ack).unwrap()["ok"],
+            true
+        );
+        assert_eq!(
+            frame_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            frame
+        );
+        home.client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let seen = peer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the stream must not reconnect or retry");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(forwarded["params"]["target_pane_id"], "w1:p1");
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "upload must not dispatch locally"
+        );
+    }
+
+    #[test]
     fn proxy_returns_the_peers_agent_prompted_verbatim() {
         // The peer answers agent.prompt for its LOCAL agent id (prefix stripped)
         // with a real AgentPrompted{delivery}. The exact line it sends is captured
@@ -4929,6 +5150,69 @@ mod federation_tests {
         assert!(
             home.api_rx.try_recv().is_err(),
             "a proxied prompt reached the local app dispatch path"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn proxy_returns_the_target_hosts_gram_path_without_local_dispatch() {
+        let expected = serde_json::json!({
+            "id": "g1",
+            "result": {
+                "type": "gram_sent",
+                "store_id": "peer-machine",
+                "local_file_path": "/peer/gram-files/message/attachment.txt"
+            }
+        })
+        .to_string();
+        let peer_line = expected.clone();
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            assert_eq!(parsed["method"], "gram.post");
+            assert_eq!(parsed["params"]["target_pane_id"], "w1:p1");
+            assert_eq!(parsed["id"], "g1");
+            writeln!(sock, "{peer_line}").expect("peer writes response");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "g1",
+                "method": "gram.post",
+                "params": {
+                    "text": "",
+                    "target_pane_id": "remote/w1:p1",
+                    "file": {
+                        "upload_id": "up-1",
+                        "name": "attachment.txt",
+                        "mime": "text/plain"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            response, expected,
+            "the target host's finalized path must pass through verbatim"
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["local_file_path"],
+            "/peer/gram-files/message/attachment.txt"
+        );
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "a federated gram post reached the home app dispatch path"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
