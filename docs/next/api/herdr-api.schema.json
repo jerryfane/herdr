@@ -2718,8 +2718,15 @@
           "type": "object"
         },
         "GramListParams": {
-          "description": "`gram.list` — read messages. The audience is chosen by `caller_pane_id`:\nomit it for the owner view (everything); supply it for that pane's agent view\n(its direct items, the shared ungrabbed queue, its own grabs, and its own sent\nitems). A `caller_pane_id` that names no live pane is an error, not a\nfall-through to the owner view. `unread_only` is an owner-view filter and is\nrejected when `caller_pane_id` is present.",
+          "description": "`gram.list` — read messages. The audience is chosen by `caller_pane_id`:\nomit it for the owner view (everything); supply it for that pane's agent view\n(its direct items, the shared ungrabbed queue, its own grabs, and its own sent\nitems). A `caller_pane_id` that names no live pane is an error, not a\nfall-through to the owner view. `unread_only` is an owner-view filter and is\nrejected when `caller_pane_id` is present.\n\n`limit`/`before_id` page the answer; omitting both returns the whole filtered\nlist, exactly as before they existed.",
           "properties": {
+            "before_id": {
+              "description": "Cursor: return only messages strictly OLDER than this id in the newest-first\norder. An id absent from the filtered list is rejected rather than treated as\n\"start at the head\" — a stale cursor that silently fell back would re-deliver\npage 1 forever while the reader scrolled.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "caller_pane_id": {
               "type": [
                 "string",
@@ -2727,9 +2734,18 @@
               ]
             },
             "if_unchanged_digest": {
-              "description": "Conditional fetch: the `digest` from a previous `gram.list` answer. When it\nstill matches, the reply is `gram_list_unchanged` — store id and digest only,\nno messages — so a polling client pays a few hundred bytes instead of the whole\nstore. The app polls every 6s over one SSH channel, where a full owner view is\n~900 KB for ~870 messages; re-sending that unchanged payload is what made the\ninbox slow to open and starved the channel everything else shares.\n\nDeliberately a DIGEST rather than a `limit`/cursor: truncating the window would\nsilently narrow search, Read-all and the unread badge, all of which read the\nfull list. Clients keep the complete list and skip only the transfer.",
+              "description": "Conditional fetch: the `digest` from a previous `gram.list` answer. When it\nstill matches, the reply is `gram_list_unchanged` — store id and digest only,\nno messages — so a polling client pays a few hundred bytes instead of the whole\nstore. The app polls every 6s over one SSH channel, where a full owner view is\n~900 KB for ~870 messages; re-sending that unchanged payload is what made the\ninbox slow to open and starved the channel everything else shares.\n\nThe digest answers a HEAD poll and is computed over the whole filtered list,\nso it stays cheap and meaningful for a paging client too. It is ignored when\n`before_id` is present: an older page is requested explicitly, so there is\nnothing the client could already hold.",
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "description": "Maximum messages to return, counted from the NEWEST end of the filtered\nnewest-first list. Absent means no limit. Clamped server-side to\n`GRAM_LIST_MAX_LIMIT`; `Some(0)` is rejected rather than answered with an\nempty page, because a client asking for nothing is a bug, not a request.\n\nPaging exists for the initial open: the owner view is ~900 KB for ~870\nmessages over the one SSH channel everything else shares, and the reader\nonly ever sees the newest screenful first. Search, Read-all and the unread\nbadge survive a windowed client because `unread_count` is reported over the\nfull filtered list, not the page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -13408,8 +13424,12 @@
             {
               "properties": {
                 "digest": {
-                  "description": "Fingerprint of THIS answer. Send it back as `if_unchanged_digest` to make\nthe next poll conditional. Computed over the serialized payload itself, so\nit changes exactly when the answer would differ — there is no field list to\nkeep in step as `GramMessageInfo` grows.",
+                  "description": "Fingerprint of the whole filtered list this answer was cut from — NOT of\nthe page. Send it back as `if_unchanged_digest` to make the next head poll\nconditional. Computed over the serialized messages themselves, so it\nchanges exactly when the answer would differ and there is no field list to\nkeep in step as `GramMessageInfo` grows.",
                   "type": "string"
+                },
+                "has_more": {
+                  "description": "Whether messages older than this page remain. Always `false` for an\nunpaged answer, which by definition already reaches the oldest message.",
+                  "type": "boolean"
                 },
                 "messages": {
                   "items": {
@@ -13424,13 +13444,21 @@
                 "type": {
                   "const": "gram_list",
                   "type": "string"
+                },
+                "unread_count": {
+                  "description": "Unread count over the WHOLE filtered list, never just the page: the app's\nbadge and its Read-all affordance must stay correct while the reader holds\nonly the newest window.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
                 }
               },
               "required": [
                 "type",
                 "messages",
                 "store_id",
-                "digest"
+                "digest",
+                "has_more",
+                "unread_count"
               ],
               "type": "object"
             },

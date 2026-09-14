@@ -129,7 +129,7 @@ Gram is the owner↔agent message channel surfaced in the Herdr app.
 
 ```bash
 herdr gram send "<text>" [--from LABEL] [--file PATH]  # message the owner (push-notified)
-herdr gram list [--queue] [--unread] [--owner]  # --owner reads as the owner
+herdr gram list [--queue] [--unread] [--owner] [--limit N]  # --owner reads as the owner; --limit: newest N only
 herdr gram grab <id> [--as LABEL]               # claim a shared queue item (first-wins)
 herdr gram get-file <id> -o PATH                # download a message's attached file
 herdr gram post "<text>" [--to AGENT]           # owner: shared queue, or one agent
