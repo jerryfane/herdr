@@ -140,7 +140,7 @@ Gram 是在 Herdr 应用中呈现的所有者↔智能体消息通道。
 
 ```bash
 herdr gram send "<text>" [--from LABEL] [--file PATH]  # 给所有者发消息(推送通知)
-herdr gram list [--queue] [--unread] [--owner]  # --owner 以所有者身份查看
+herdr gram list [--queue] [--unread] [--owner] [--limit N]  # --owner 以所有者身份查看;--limit 仅取最新 N 条
 herdr gram grab <id> [--as LABEL]               # 认领共享队列中的一项(先到先得)
 herdr gram get-file <id> -o PATH                # 下载消息附带的文件
 herdr gram post "<text>" [--to AGENT]           # 所有者:共享队列,或指定某个智能体

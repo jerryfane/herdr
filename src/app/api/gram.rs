@@ -48,6 +48,12 @@ use crate::persist::gram::{
     MAX_TEXT_BYTES,
 };
 
+/// Ceiling on a `gram.list` page. A page is meant to be one screenful plus the
+/// scroll ahead of it; 500 is far past that and still an order of magnitude under
+/// the ~870-message store that made the unpaged answer slow. Clamping (rather than
+/// rejecting) keeps a client that asks for too much working.
+const GRAM_LIST_MAX_LIMIT: usize = 500;
+
 /// Why a claim could not be completed.
 enum GrabError {
     NotFound,
@@ -197,6 +203,22 @@ impl App {
         if self.no_session {
             return gram_unavailable(id);
         }
+        let limit = match params.limit {
+            // An explicit zero would answer "nothing here" for a store that is not
+            // empty, which a scrolling reader cannot tell from the end of the list.
+            // A client asking for no messages is a bug worth surfacing.
+            Some(0) => {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    "limit must be greater than zero; omit it to read the whole list",
+                )
+            }
+            // Clamped rather than rejected: an over-eager client still gets a valid,
+            // bounded page instead of an error it cannot act on.
+            Some(requested) => Some(requested.min(GRAM_LIST_MAX_LIMIT)),
+            None => None,
+        };
 
         let items = crate::persist::gram::load();
         let filtered = match params.caller_pane_id.as_deref() {
@@ -227,16 +249,45 @@ impl App {
             // No caller pane: the owner (app) view.
             None => filter_owner_view(&items, params.only_queue, params.unread_only),
         };
+        // Counted over the whole filtered list, BEFORE paging: the badge and the
+        // Read-all affordance describe the inbox, not the window the client happens
+        // to be holding.
+        let unread_count = filtered.iter().filter(|item| is_unread(item)).count();
         // Store order is oldest-first; clients want newest-first.
-        let messages: Vec<GramMessageInfo> =
+        let mut messages: Vec<GramMessageInfo> =
             filtered.into_iter().rev().map(gram_item_to_info).collect();
         let store_id = crate::persist::machine::get_or_create();
+        // Over the FULL list, not the page, so a paging client can keep polling the
+        // head for a few hundred bytes.
         let digest = list_digest(&store_id, &messages);
         // Conditional fetch. The digest covers the store id as well as the messages, so
         // a client that has been pointed at a DIFFERENT store can never be told
         // "unchanged" while holding another store's list.
-        if params.if_unchanged_digest.as_deref() == Some(digest.as_str()) {
+        //
+        // Head-only: a request with `before_id` asks for an older page the client does
+        // not hold yet, so answering "unchanged" would starve its scroll.
+        if params.before_id.is_none()
+            && params.if_unchanged_digest.as_deref() == Some(digest.as_str())
+        {
             return encode_success(id, ResponseResult::GramListUnchanged { store_id, digest });
+        }
+        // Paging happens after the audience filter and after the reverse, so a cursor
+        // means the same thing — "the message after this one, going older" — in the
+        // owner view and the agent view alike.
+        if let Some(cursor) = params.before_id.as_deref() {
+            match messages.iter().position(|message| message.id == cursor) {
+                Some(index) => {
+                    messages.drain(..=index);
+                }
+                // Never fall back to the head: a client whose cursor aged out of the
+                // list (deleted message, switched filter) would otherwise be handed
+                // page 1 again on every scroll, forever.
+                None => return encode_error(id, "invalid_params", "before_id is not in this list"),
+            }
+        }
+        let has_more = limit.is_some_and(|limit| messages.len() > limit);
+        if let Some(limit) = limit {
+            messages.truncate(limit);
         }
         encode_success(
             id,
@@ -244,6 +295,8 @@ impl App {
                 messages,
                 store_id,
                 digest,
+                has_more,
+                unread_count,
             },
         )
     }
@@ -825,12 +878,19 @@ fn filter_owner_view(items: &[GramItem], only_queue: bool, unread_only: bool) ->
                 return is_open_shared_queue(item);
             }
             if unread_only {
-                return item.direction == StoredDirection::AgentToOwner && !item.read_by_owner;
+                return is_unread(item);
             }
             true
         })
         .cloned()
         .collect()
+}
+
+/// An agent->owner message the owner has not read yet — the thing the app's badge
+/// counts. Shared by the `unread_only` filter and the whole-list `unread_count`, so
+/// the count can never drift from the filter.
+fn is_unread(item: &GramItem) -> bool {
+    item.direction == StoredDirection::AgentToOwner && !item.read_by_owner
 }
 
 /// Fingerprint of a `gram.list` answer, for conditional polling.
@@ -1242,6 +1302,8 @@ mod tests {
                     only_queue: false,
                     unread_only: false,
                     if_unchanged_digest: digest.map(str::to_string),
+                    limit: None,
+                    before_id: None,
                 },
             );
             serde_json::from_str(&raw).unwrap()
@@ -1302,5 +1364,338 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Seed a private gram store, then read it through the real handler. Paging is
+    /// only observable end to end — the cut depends on the audience filter and the
+    /// newest-first reverse — so these tests go through `handle_gram_list` and its
+    /// encoded answer rather than a helper in isolation.
+    fn with_gram_store<T>(items: &[GramItem], body: impl FnOnce(&mut App) -> T) -> T {
+        let _guard = crate::config::test_config_env_lock().lock();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-gram-page-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        for item in items {
+            crate::persist::gram::append(item.clone()).unwrap();
+        }
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let outcome = body(&mut app);
+
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        outcome
+    }
+
+    fn list(app: &mut App, params: GramListParams) -> serde_json::Value {
+        serde_json::from_str(&app.handle_gram_list("req".to_string(), params)).unwrap()
+    }
+
+    fn page(app: &mut App, limit: Option<usize>, before_id: Option<&str>) -> serde_json::Value {
+        list(
+            app,
+            GramListParams {
+                limit,
+                before_id: before_id.map(str::to_string),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn page_ids(answer: &serde_json::Value) -> Vec<String> {
+        answer["result"]["messages"]
+            .as_array()
+            .expect("a gram_list answer carries messages")
+            .iter()
+            .map(|message| message["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Oldest-first, the order the store keeps.
+    fn seeded(count: usize) -> Vec<GramItem> {
+        (0..count)
+            .map(|index| {
+                let mut item = owner_shared(&format!("g{index}"));
+                item.created_unix_ms = index as u64 + 1;
+                item
+            })
+            .collect()
+    }
+
+    /// The compatibility floor: an old client that sends no paging parameters must
+    /// get exactly what it got before they existed — every message, newest first —
+    /// and `has_more` false, since an unpaged answer already reaches the oldest.
+    #[test]
+    fn list_without_paging_params_returns_the_whole_list_newest_first() {
+        let items = seeded(4);
+        let answer = with_gram_store(&items, |app| page(app, None, None));
+        assert_eq!(answer["result"]["type"], "gram_list");
+        assert_eq!(page_ids(&answer), vec!["g3", "g2", "g1", "g0"]);
+        assert_eq!(answer["result"]["has_more"], false);
+    }
+
+    #[test]
+    fn limit_cuts_the_newest_page_and_reports_more() {
+        let items = seeded(5);
+        let answer = with_gram_store(&items, |app| page(app, Some(2), None));
+        assert_eq!(page_ids(&answer), vec!["g4", "g3"]);
+        assert_eq!(answer["result"]["has_more"], true);
+    }
+
+    /// A limit past the end is not an edge case for the client to special-case: it
+    /// gets the whole list and is told there is nothing older.
+    #[test]
+    fn limit_larger_than_the_list_returns_everything_with_no_more() {
+        let items = seeded(3);
+        let answer = with_gram_store(&items, |app| page(app, Some(50), None));
+        assert_eq!(page_ids(&answer), vec!["g2", "g1", "g0"]);
+        assert_eq!(answer["result"]["has_more"], false);
+    }
+
+    /// Walking the cursor is the actual scroll the app performs: every page strictly
+    /// older than the last id it holds, no id twice, and the walk terminates covering
+    /// the list exactly once. A cursor that were inclusive, or an off-by-one on the
+    /// reverse, shows up here as a duplicate or a hole.
+    #[test]
+    fn walking_before_id_covers_the_list_exactly_once() {
+        let items = seeded(7);
+        let walked = with_gram_store(&items, |app| {
+            let mut seen: Vec<String> = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let answer = page(app, Some(3), cursor.as_deref());
+                let ids = page_ids(&answer);
+                assert!(!ids.is_empty(), "a page with has_more must not be empty");
+                for id in &ids {
+                    assert!(!seen.contains(id), "page repeated {id}");
+                }
+                seen.extend(ids.iter().cloned());
+                if answer["result"]["has_more"] == false {
+                    break;
+                }
+                cursor = ids.last().cloned();
+            }
+            seen
+        });
+        assert_eq!(walked, vec!["g6", "g5", "g4", "g3", "g2", "g1", "g0"]);
+    }
+
+    /// A cursor that is not in the list is an error, never a silent page 1: falling
+    /// back to the head would re-deliver the newest page on every scroll, so the
+    /// reader could never reach older messages.
+    #[test]
+    fn unknown_before_id_is_rejected() {
+        let items = seeded(3);
+        let answer = with_gram_store(&items, |app| page(app, Some(2), Some("g-nope")));
+        assert_eq!(answer["error"]["code"], "invalid_params");
+        assert_eq!(
+            answer["error"]["message"], "before_id is not in this list",
+            "the client needs to know its cursor aged out, not get page 1 back"
+        );
+    }
+
+    /// A `before_id` that exists but was filtered OUT of this audience is just as
+    /// unusable as one that never existed — it must not silently anchor at the head.
+    #[test]
+    fn before_id_outside_the_filtered_list_is_rejected() {
+        let mut items = seeded(3);
+        let mut unread = owner_shared("only-unread");
+        unread.direction = StoredDirection::AgentToOwner;
+        unread.read_by_owner = false;
+        items.push(unread);
+
+        let answer = with_gram_store(&items, |app| {
+            list(
+                app,
+                GramListParams {
+                    unread_only: true,
+                    before_id: Some("g1".to_string()),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(answer["error"]["code"], "invalid_params");
+    }
+
+    /// Zero is rejected rather than answered with an empty page: a reader cannot tell
+    /// an empty page from the end of the list, so it would simply stop scrolling.
+    #[test]
+    fn zero_limit_is_rejected() {
+        let items = seeded(2);
+        let answer = with_gram_store(&items, |app| page(app, Some(0), None));
+        assert_eq!(answer["error"]["code"], "invalid_params");
+        assert!(answer["result"].is_null());
+    }
+
+    /// ...but an over-large limit is CLAMPED, not rejected: an over-eager client
+    /// still gets a valid bounded page it can page onward from.
+    #[test]
+    fn limit_above_the_cap_is_clamped_not_rejected() {
+        let items = seeded(GRAM_LIST_MAX_LIMIT + 3);
+        let answer = with_gram_store(&items, |app| page(app, Some(GRAM_LIST_MAX_LIMIT * 4), None));
+        assert_eq!(answer["result"]["type"], "gram_list");
+        assert_eq!(
+            answer["result"]["messages"].as_array().unwrap().len(),
+            GRAM_LIST_MAX_LIMIT
+        );
+        assert_eq!(
+            answer["result"]["has_more"], true,
+            "a clamped page must still admit that older messages remain"
+        );
+    }
+
+    /// The badge and Read-all read the inbox, not the window: unread messages that
+    /// fall entirely outside page 1 must still be counted. Here every unread message
+    /// is older than the page, so a count taken over the page would report zero.
+    #[test]
+    fn unread_count_covers_the_whole_filtered_list_not_the_page() {
+        let mut items: Vec<GramItem> = (0..3)
+            .map(|index| {
+                let mut unread = owner_shared(&format!("old-unread-{index}"));
+                unread.direction = StoredDirection::AgentToOwner;
+                unread.read_by_owner = false;
+                unread.created_unix_ms = index as u64 + 1;
+                unread
+            })
+            .collect();
+        items.extend((0..4).map(|index| {
+            let mut item = owner_shared(&format!("new-read-{index}"));
+            item.created_unix_ms = index as u64 + 10;
+            item
+        }));
+
+        let answer = with_gram_store(&items, |app| page(app, Some(2), None));
+        assert_eq!(page_ids(&answer), vec!["new-read-3", "new-read-2"]);
+        assert_eq!(answer["result"]["unread_count"], 3);
+    }
+
+    /// Conditional fetch is HEAD-only. With a cursor the client is asking for a page
+    /// it does not hold, so a matching digest must not short-circuit it; without one,
+    /// the unchanged answer still works. The digest itself stays a fingerprint of the
+    /// full list, so the same value keeps working for the cheap head poll.
+    #[test]
+    fn digest_short_circuits_the_head_but_never_an_older_page() {
+        let items = seeded(5);
+        with_gram_store(&items, |app| {
+            let head = page(app, Some(2), None);
+            let digest = head["result"]["digest"].as_str().unwrap().to_string();
+
+            let unchanged = list(
+                app,
+                GramListParams {
+                    limit: Some(2),
+                    if_unchanged_digest: Some(digest.clone()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(unchanged["result"]["type"], "gram_list_unchanged");
+
+            let older = list(
+                app,
+                GramListParams {
+                    limit: Some(2),
+                    before_id: Some("g3".to_string()),
+                    if_unchanged_digest: Some(digest.clone()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                older["result"]["type"], "gram_list",
+                "an older page must be answered even while the head is unchanged"
+            );
+            assert_eq!(page_ids(&older), vec!["g2", "g1"]);
+
+            // The digest a paging client polls with is the FULL list's, so it does not
+            // move when the page size does.
+            let wider = page(app, Some(4), None);
+            assert_eq!(wider["result"]["digest"].as_str().unwrap(), digest);
+        });
+    }
+
+    /// The agent view pages on the same terms, over its own audience: the cursor
+    /// indexes the filtered list, so an item the agent cannot see is neither a page
+    /// entry nor a usable anchor.
+    #[test]
+    fn agent_view_pages_over_its_own_audience() {
+        let mut items = seeded(4);
+        let mut other = owner_shared("addressed-elsewhere");
+        other.to = Some("someone-else".to_string());
+        other.created_unix_ms = 99;
+        items.push(other);
+
+        let (first, second) = with_gram_store(&items, |app| {
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("gram-paging")];
+            app.state.ensure_test_terminals();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let caller = app.public_pane_id(0, pane_id).unwrap();
+
+            let first = list(
+                app,
+                GramListParams {
+                    caller_pane_id: Some(caller.clone()),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            );
+            let cursor = page_ids(&first).last().unwrap().clone();
+            let second = list(
+                app,
+                GramListParams {
+                    caller_pane_id: Some(caller),
+                    limit: Some(2),
+                    before_id: Some(cursor),
+                    ..Default::default()
+                },
+            );
+            (first, second)
+        });
+
+        // The direct message to another agent is invisible here, so it is not the
+        // newest entry the way it would be in the owner view.
+        assert_eq!(page_ids(&first), vec!["g3", "g2"]);
+        assert_eq!(first["result"]["has_more"], true);
+        assert_eq!(page_ids(&second), vec!["g1", "g0"]);
+        assert_eq!(second["result"]["has_more"], false);
+    }
+
+    /// Paging did not open a back door for the owner-only filter: `unread_only` with a
+    /// caller pane is still rejected rather than quietly ignored.
+    #[test]
+    fn unread_only_with_a_caller_pane_is_still_rejected() {
+        let items = seeded(2);
+        let answer = with_gram_store(&items, |app| {
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("gram-unread")];
+            app.state.ensure_test_terminals();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let caller = app.public_pane_id(0, pane_id).unwrap();
+            list(
+                app,
+                GramListParams {
+                    caller_pane_id: Some(caller),
+                    unread_only: true,
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(answer["error"]["code"], "invalid_params");
     }
 }

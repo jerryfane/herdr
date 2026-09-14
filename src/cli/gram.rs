@@ -290,6 +290,9 @@ fn gram_list(args: &[String]) -> std::io::Result<i32> {
             // The CLI holds no previous list, so it has nothing to validate a digest
             // against and always asks unconditionally.
             if_unchanged_digest: None,
+            limit: parsed.limit,
+            // One-shot read: nothing here scrolls, so there is no cursor to carry.
+            before_id: None,
         }),
     })?;
     // Redact credential-looking bodies before printing so a routine `gram list`
@@ -718,15 +721,43 @@ fn redact_pem_blocks(text: &str) -> String {
 
 fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
     let mut parsed = ListArgs::default();
-    for arg in args {
-        match arg.as_str() {
-            "--queue" => parsed.only_queue = true,
-            "--unread" => parsed.unread_only = true,
-            "--owner" => parsed.owner = true,
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--queue" => {
+                parsed.only_queue = true;
+                index += 1;
+            }
+            "--unread" => {
+                parsed.unread_only = true;
+                index += 1;
+            }
+            "--owner" => {
+                parsed.owner = true;
+                index += 1;
+            }
             // Print credential-looking bodies in the clear. Default is to redact them
             // (see `redact_credentials`) so a routine `gram list` can't drop a secret
             // into the reader's transcript.
-            "--reveal" | "--show-secrets" => parsed.reveal = true,
+            "--reveal" | "--show-secrets" => {
+                parsed.reveal = true;
+                index += 1;
+            }
+            // Newest N only. The CLI reads a terminal, where the tail of a ~870
+            // message store is noise; it never pages, so there is no `--before`.
+            "--limit" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --limit".into());
+                };
+                let limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--limit expects a positive number, got '{value}'"))?;
+                if limit == 0 {
+                    return Err("--limit expects a positive number, got '0'".into());
+                }
+                parsed.limit = Some(limit);
+                index += 2;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -742,6 +773,7 @@ struct ListArgs {
     unread_only: bool,
     owner: bool,
     reveal: bool,
+    limit: Option<usize>,
 }
 
 /// `grab <id> [--as LABEL]` -> (id, grabbed_by).
@@ -815,7 +847,7 @@ fn print_gram_help() {
     eprintln!(
         "  herdr gram send <text> [--from LABEL] [--file PATH]   message the owner (push-notified)"
     );
-    eprintln!("  herdr gram list [--queue] [--unread] [--owner] [--reveal]   list messages (--owner: read as the owner)");
+    eprintln!("  herdr gram list [--queue] [--unread] [--owner] [--reveal] [--limit N]   list messages (--owner: read as the owner; --limit: newest N only)");
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram get-file <id> -o PATH         download a message's attached file");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
@@ -917,6 +949,19 @@ mod tests {
         assert!(!none.only_queue && !none.unread_only && !none.owner && !none.reveal);
         assert!(parse_list_args(&args(&["--queue", "--unread"])).is_err());
         assert!(parse_list_args(&args(&["--nope"])).is_err());
+    }
+
+    /// `--limit` takes a value, so it must not swallow the flag after it or accept a
+    /// non-count: a silently misparsed limit would truncate the reader's list.
+    #[test]
+    fn list_limit_takes_a_positive_count() {
+        let parsed = parse_list_args(&args(&["--limit", "20", "--owner"])).unwrap();
+        assert_eq!(parsed.limit, Some(20));
+        assert!(parsed.owner);
+        assert_eq!(parse_list_args(&args(&[])).unwrap().limit, None);
+        assert!(parse_list_args(&args(&["--limit"])).is_err());
+        assert!(parse_list_args(&args(&["--limit", "0"])).is_err());
+        assert!(parse_list_args(&args(&["--limit", "many"])).is_err());
     }
 
     #[test]

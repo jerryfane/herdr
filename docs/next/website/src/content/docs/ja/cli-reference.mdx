@@ -140,7 +140,7 @@ Gram は Herdr アプリに表示される、オーナーとエージェント�
 
 ```bash
 herdr gram send "<text>" [--from LABEL] [--file PATH]  # オーナーにメッセージを送る(プッシュ通知)
-herdr gram list [--queue] [--unread] [--owner]  # --owner はオーナーとして読む
+herdr gram list [--queue] [--unread] [--owner] [--limit N]  # --owner はオーナーとして読む、--limit は最新 N 件のみ
 herdr gram grab <id> [--as LABEL]               # 共有キューの項目を取得する(先着順)
 herdr gram get-file <id> -o PATH                # メッセージの添付ファイルをダウンロードする
 herdr gram post "<text>" [--to AGENT]           # オーナー:共有キュー、または特定のエージェント宛

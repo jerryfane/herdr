@@ -348,11 +348,19 @@ pub enum ResponseResult {
         /// responding daemon's `machine` id). Present even when `messages` is empty,
         /// so a reader can tell which store it is looking at when it appears empty.
         store_id: String,
-        /// Fingerprint of THIS answer. Send it back as `if_unchanged_digest` to make
-        /// the next poll conditional. Computed over the serialized payload itself, so
-        /// it changes exactly when the answer would differ — there is no field list to
+        /// Fingerprint of the whole filtered list this answer was cut from — NOT of
+        /// the page. Send it back as `if_unchanged_digest` to make the next head poll
+        /// conditional. Computed over the serialized messages themselves, so it
+        /// changes exactly when the answer would differ and there is no field list to
         /// keep in step as `GramMessageInfo` grows.
         digest: String,
+        /// Whether messages older than this page remain. Always `false` for an
+        /// unpaged answer, which by definition already reaches the oldest message.
+        has_more: bool,
+        /// Unread count over the WHOLE filtered list, never just the page: the app's
+        /// badge and its Read-all affordance must stay correct while the reader holds
+        /// only the newest window.
+        unread_count: usize,
     },
     /// `gram.list` with an `if_unchanged_digest` that still matches: nothing has
     /// changed, so the messages are omitted entirely. A client holding that digest

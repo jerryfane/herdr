@@ -69,6 +69,9 @@ pub struct GramPostParams {
 /// items). A `caller_pane_id` that names no live pane is an error, not a
 /// fall-through to the owner view. `unread_only` is an owner-view filter and is
 /// rejected when `caller_pane_id` is present.
+///
+/// `limit`/`before_id` page the answer; omitting both returns the whole filtered
+/// list, exactly as before they existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct GramListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,11 +89,30 @@ pub struct GramListParams {
     /// ~900 KB for ~870 messages; re-sending that unchanged payload is what made the
     /// inbox slow to open and starved the channel everything else shares.
     ///
-    /// Deliberately a DIGEST rather than a `limit`/cursor: truncating the window would
-    /// silently narrow search, Read-all and the unread badge, all of which read the
-    /// full list. Clients keep the complete list and skip only the transfer.
+    /// The digest answers a HEAD poll and is computed over the whole filtered list,
+    /// so it stays cheap and meaningful for a paging client too. It is ignored when
+    /// `before_id` is present: an older page is requested explicitly, so there is
+    /// nothing the client could already hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_unchanged_digest: Option<String>,
+    /// Maximum messages to return, counted from the NEWEST end of the filtered
+    /// newest-first list. Absent means no limit. Clamped server-side to
+    /// `GRAM_LIST_MAX_LIMIT`; `Some(0)` is rejected rather than answered with an
+    /// empty page, because a client asking for nothing is a bug, not a request.
+    ///
+    /// Paging exists for the initial open: the owner view is ~900 KB for ~870
+    /// messages over the one SSH channel everything else shares, and the reader
+    /// only ever sees the newest screenful first. Search, Read-all and the unread
+    /// badge survive a windowed client because `unread_count` is reported over the
+    /// full filtered list, not the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Cursor: return only messages strictly OLDER than this id in the newest-first
+    /// order. An id absent from the filtered list is rejected rather than treated as
+    /// "start at the head" — a stale cursor that silently fell back would re-deliver
+    /// page 1 forever while the reader scrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_id: Option<String>,
 }
 
 /// `gram.grab` — an agent claims a shared-queue item. The claim is first-wins and
