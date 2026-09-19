@@ -9,11 +9,10 @@
 //! bookkeeping. (Routing text through `send_input` would bracketed-paste-wrap it
 //! and break control keys under DECSET 2004 — see the dispatch in `serve_frames`.)
 //!
-//! This removes the per-keystroke remote `api-bridge` fork/exec that dominates
-//! felt typing latency on the iPad hardware-keyboard path (issue #62): keystrokes
-//! become socket writes on one long-lived ordered channel instead of one exec
-//! per call, which also preserves order by construction (a single ordered
-//! channel, unlike today's per-call channels).
+//! This removes the per-keystroke remote process and connection setup that
+//! dominates felt typing latency on the iPad hardware-keyboard path (issue #62):
+//! keystrokes become socket writes on one long-lived ordered channel, which also
+//! preserves order by construction.
 //!
 //! The line-framing read machinery lives in `stream_read`, shared with
 //! `pane_graphics_stream.rs` and `gram_upload_stream.rs`; only this channel's

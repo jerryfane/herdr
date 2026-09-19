@@ -654,7 +654,7 @@ impl FederationPeerManager {
             }
         };
         let (route, ssh_bridge) = match parsed {
-            ConnectionTarget::Ssh(target) => {
+            crate::api::client::FederationEndpoint::Ssh { destination } => {
                 let Some(profile_id) = peer.profile_id.as_deref() else {
                     tracing::warn!(alias = %peer.alias, "SSH federation peer requires profile_id");
                     return None;
@@ -663,10 +663,7 @@ impl FederationPeerManager {
                     tracing::warn!(alias = %peer.alias, "SSH federation peer requires remote_session");
                     return None;
                 };
-                let target = match target.user {
-                    Some(user) => format!("{user}@{}", target.host),
-                    None => target.host,
-                };
+                let target = destination;
                 let (route, bridge) = match start_saved_peer_bridge(
                     profile_id,
                     &target,
@@ -687,7 +684,7 @@ impl FederationPeerManager {
                 };
                 (route, Some(bridge))
             }
-            target => (target, None),
+            crate::api::client::FederationEndpoint::Target(target) => (target, None),
         };
         let route = PeerRoute::new(
             route,

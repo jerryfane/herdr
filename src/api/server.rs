@@ -4770,7 +4770,6 @@ mod federation_tests {
         assert!(args.contains("remote-api-bridge"));
         assert!(args.contains("ControlMaster=auto"));
         assert!(args.contains("ControlPersist=yes"));
-        assert!(!args.contains(" api-bridge "));
 
         catalog.rename_ssh(&profile_id, "Build Farm").unwrap();
         catalog.store_profiles().unwrap();

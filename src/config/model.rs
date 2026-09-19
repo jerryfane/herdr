@@ -1303,13 +1303,36 @@ pub struct FederationConfig {
     pub coordinator: bool,
     /// Address the federation listener binds to when `listen` is enabled.
     pub listen_addr: Option<String>,
-    /// Federation peers configured directly by endpoint and alias.
+    /// Federation peers configured directly by endpoint and alias. SSH peers
+    /// must use `saved_machines`; this list accepts TCP and inbound-only peers.
+    #[serde(default, deserialize_with = "deserialize_explicit_federation_peers")]
     pub peers: Vec<FederationPeer>,
     /// Coordinator policy for saved SSH machines, keyed by the immutable
     /// upstream profile id. Connection details, labels, sessions, and enabled
     /// state remain owned by the endpoint catalog.
     #[serde(default, deserialize_with = "deserialize_saved_machine_policies")]
     pub saved_machines: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+}
+
+fn deserialize_explicit_federation_peers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<FederationPeer>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let peers = Vec::<FederationPeer>::deserialize(deserializer)?;
+    if peers.iter().any(|peer| {
+        peer.endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.starts_with("ssh://"))
+            || peer.profile_id.is_some()
+            || peer.remote_session.is_some()
+    }) {
+        return Err(de::Error::custom(
+            "SSH federation peers must use federation.saved_machines keyed by an existing saved profile ID; federation.peers accepts only TCP or inbound-only peers",
+        ));
+    }
+    Ok(peers)
 }
 
 /// Federation-only policy attached to one saved SSH profile.
@@ -1359,6 +1382,10 @@ fn validate_expected_machine_id(machine_id: &str) -> Result<(), String> {
 }
 
 /// A directly configured federation peer.
+///
+/// `profile_id` and `remote_session` are populated only by the coordinator's
+/// saved-profile adapter. Config deserialization rejects either field and every
+/// `ssh://` endpoint in `federation.peers`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FederationPeer {
@@ -1366,13 +1393,11 @@ pub struct FederationPeer {
     pub alias: String,
     /// Mutable display label. Routing continues to use `alias`.
     pub display_label: Option<String>,
-    /// Endpoint to reach the peer (e.g. an `ssh://` or `tcp://` target).
+    /// TCP endpoint to reach an explicitly configured peer.
     pub endpoint: Option<String>,
-    /// Immutable saved-machine profile id used for SSH metadata and bridge
-    /// lifetime. Required for `ssh://` endpoints.
+    /// Immutable saved-machine profile id synthesized by the coordinator.
     pub profile_id: Option<String>,
-    /// Named remote Herdr session reached by `remote-api-bridge`. Required for
-    /// `ssh://` endpoints.
+    /// Named remote session synthesized by the coordinator.
     pub remote_session: Option<String>,
     /// Filesystem path to the shared auth token for this peer.
     pub token_file: Option<String>,
@@ -1702,33 +1727,20 @@ mod tests {
     }
 
     #[test]
-    fn ssh_federation_peer_carries_saved_profile_and_named_session() {
-        let config: FederationConfig = toml::from_str(
+    fn explicit_ssh_federation_peer_requires_saved_machine_policy() {
+        let error = toml::from_str::<FederationConfig>(
             r#"
                 coordinator = true
                 [[peers]]
                 alias = "build"
-                display_label = "Build Machine"
                 endpoint = "ssh://dev@build.example"
                 profile_id = "0123456789abcdef0123456789abcdef"
                 remote_session = "agent-work"
             "#,
         )
-        .unwrap();
-        assert!(config.coordinator);
-        assert_eq!(
-            config.peers[0].display_label.as_deref(),
-            Some("Build Machine")
-        );
-
-        assert_eq!(
-            config.peers[0].profile_id.as_deref(),
-            Some("0123456789abcdef0123456789abcdef")
-        );
-        assert_eq!(
-            config.peers[0].remote_session.as_deref(),
-            Some("agent-work")
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must use federation.saved_machines"));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 # Install the prebuilt herdr fork used by the herdrup app.
 #
 # herdr.dev/install.sh installs upstream Herdr, which does not have this fork's
-# `api-bridge` subcommand. This installer selects the latest published preview
-# asset from the fork's checked-in manifest, verifies its SHA-256 digest, and
+# saved-machine coordination and federation features. This installer selects the
+# latest published preview asset, verifies its SHA-256 digest, and
 # installs only one binary under the invoking user's home directory.
 set -eu
 set -f

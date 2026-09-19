@@ -1,19 +1,7 @@
-//! Transport abstraction for the JSON API connection.
+//! Transport abstraction for local and federation TCP API connections.
 //!
-//! Today every API connection is a local unix-socket / named-pipe
-//! [`LocalStream`]. This enum lets the API server/handlers carry that concrete
-//! stream behind a single type so later federation parts can serve the same
-//! JSON protocol over a TCP socket or an SSH-tunneled child process without
-//! touching the request-handling code.
-//!
-//! [`ApiStream::Local`] is built by the local unix-socket server and client;
-//! [`ApiStream::Tcp`] by the federation TCP listener ([`crate::api::server`])
-//! and TCP client; [`ApiStream::Ssh`] by the outbound SSH client
-//! ([`crate::api::ssh_transport`]).
-//!
-//! The `Local` variant delegates every operation to the exact same `crate::ipc`
-//! functions and stream methods used before this abstraction existed, so the
-//! local path stays byte-identical.
+//! Saved-machine SSH routes terminate in a shared local `remote-api-bridge`, so
+//! this layer only carries local sockets and TCP streams.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -26,105 +14,16 @@ use crate::ipc::{
     set_local_stream_polling, LocalStream, LocalStreamReadCount,
 };
 
-/// A duplex pipe pair to an SSH child process running `herdr api-bridge`.
-///
-/// Built by [`crate::api::ssh_transport`], which spawns the child with the
-/// request already embedded (base64 argv or piped stdin) and hands the child's
-/// stdin/stdout here. Holding `child` keeps the process alive for the lifetime
-/// of the stream; dropping the pipe closes both fds so the remote bridge exits.
-pub(crate) struct SshPipe {
-    // Retained so the pipe write half stays open for the child's lifetime even
-    // when the request was delivered as an argv argument (nothing is written to
-    // stdin in that form; the bridge tears down on stdout hangup).
-    stdin: std::process::ChildStdin,
-    stdout: std::process::ChildStdout,
-    // Owned so the child is force-killed and reaped when the stream drops (see the
-    // `Drop` impl); also keeps it from being reaped while the stream is in use.
-    child: std::process::Child,
-}
-
-impl Drop for SshPipe {
-    /// Force-kill and reap the SSH child on drop.
-    ///
-    /// `std::process::Child` has NO killing Drop of its own — dropping it only
-    /// closes the handle. For a TCP peer, dropping the socket is a definitive
-    /// teardown; the SSH bridge instead relies on stdin/stdout pipe closure to
-    /// make the child exit, which a hung or wedged `herdr api-bridge` (or a stuck
-    /// `ssh`) could ignore and orphan. So kill the local child explicitly — which
-    /// also drops the SSH connection and so tears the remote bridge down — and
-    /// `wait` to reap the zombie. Both are best-effort: `kill` on an
-    /// already-exited child is a benign error, and `wait` then returns its status.
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl SshPipe {
-    pub(crate) fn new(
-        stdin: std::process::ChildStdin,
-        stdout: std::process::ChildStdout,
-        child: std::process::Child,
-    ) -> Self {
-        Self {
-            stdin,
-            stdout,
-            child,
-        }
-    }
-
-    /// Toggle non-blocking mode on the child's stdout pipe (the reply read half),
-    /// so a [`poll_read`](ApiStream::poll_read) can return `Pending` instead of
-    /// blocking. The federation bounded-response reader relies on this to enforce
-    /// its wall-clock deadline even when a peer stalls without sending a newline.
-    fn set_stdout_nonblocking(&mut self, enabled: bool) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd as _;
-            let fd = self.stdout.as_raw_fd();
-            // SAFETY: `fd` is the live, owned read end of the child's stdout pipe
-            // for the lifetime of `self`; F_GETFL/F_SETFL only read and replace
-            // its status flags and do not transfer ownership of the descriptor.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let updated = if enabled {
-                flags | libc::O_NONBLOCK
-            } else {
-                flags & !libc::O_NONBLOCK
-            };
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            // SSH federation is not a first-class non-Unix path. The byte cap and
-            // the trickle deadline still bound the read; a full stall is bounded
-            // by ssh's own ConnectTimeout/ServerAlive settings.
-            let _ = enabled;
-            Ok(())
-        }
-    }
-}
-
-/// One API connection, over any supported transport.
-///
-/// `Local` is the local unix-socket / named-pipe stream, `Tcp` a federation TCP
-/// connection, and `Ssh` an outbound `herdr api-bridge` child over SSH.
+/// One API connection over a local socket or federation TCP stream.
 pub(crate) enum ApiStream {
     Local(LocalStream),
     Tcp(TcpStream),
-    Ssh(SshPipe),
 }
 
 /// Result of a single non-blocking [`ApiStream::poll_read`].
 ///
-/// The `Data` byte count is consumed by the TCP/SSH read paths (and the unit
-/// test); the local initial-request reader only distinguishes the variants, so
-/// the field can read as unused in a local-only build.
+/// The `Data` byte count is consumed by the TCP read path (and the unit test);
+/// the local initial-request reader only distinguishes the variants.
 #[allow(dead_code)]
 pub(crate) enum ApiStreamRead {
     /// `n` bytes were read into the buffer.
@@ -140,7 +39,6 @@ impl Read for ApiStream {
         match self {
             ApiStream::Local(stream) => stream.read(buf),
             ApiStream::Tcp(stream) => stream.read(buf),
-            ApiStream::Ssh(pipe) => pipe.stdout.read(buf),
         }
     }
 }
@@ -150,7 +48,6 @@ impl Write for ApiStream {
         match self {
             ApiStream::Local(stream) => stream.write(buf),
             ApiStream::Tcp(stream) => stream.write(buf),
-            ApiStream::Ssh(pipe) => pipe.stdin.write(buf),
         }
     }
 
@@ -158,7 +55,6 @@ impl Write for ApiStream {
         match self {
             ApiStream::Local(stream) => stream.flush(),
             ApiStream::Tcp(stream) => stream.flush(),
-            ApiStream::Ssh(pipe) => pipe.stdin.flush(),
         }
     }
 }
@@ -170,8 +66,6 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => stream.set_send_timeout(dur),
             ApiStream::Tcp(stream) => stream.set_write_timeout(dur),
-            // SSH write timeouts are handled by the tunnel in a later part.
-            ApiStream::Ssh(_) => Ok(()),
         }
     }
 
@@ -181,8 +75,6 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => stream.set_recv_timeout(dur),
             ApiStream::Tcp(stream) => stream.set_read_timeout(dur),
-            // SSH read timeouts land with the SSH client in a later part.
-            ApiStream::Ssh(_) => Ok(()),
         }
     }
 
@@ -195,9 +87,6 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => set_local_stream_polling(stream, enabled),
             ApiStream::Tcp(stream) => stream.set_nonblocking(enabled),
-            // Non-blocking the child stdout pipe so the federation bounded reader's
-            // poll loop can enforce its deadline instead of blocking on a stall.
-            ApiStream::Ssh(pipe) => pipe.set_stdout_nonblocking(enabled),
         }
     }
 
@@ -208,8 +97,6 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => stream.set_nonblocking(enabled),
             ApiStream::Tcp(stream) => stream.set_nonblocking(enabled),
-            // SSH pipe non-blocking mode lands with the SSH client in a later part.
-            ApiStream::Ssh(_) => Ok(()),
         }
     }
 
@@ -223,7 +110,6 @@ impl ApiStream {
                 LocalStreamReadCount::Closed => Ok(ApiStreamRead::Closed),
             },
             ApiStream::Tcp(stream) => poll_read_generic(stream, buf),
-            ApiStream::Ssh(pipe) => poll_read_generic(&mut pipe.stdout, buf),
         }
     }
 
@@ -232,15 +118,12 @@ impl ApiStream {
         match self {
             ApiStream::Local(stream) => local_stream_peer_closed(stream),
             ApiStream::Tcp(stream) => tcp_peer_closed(stream),
-            // Peeking a pipe without consuming input is not reliable; treat SSH
-            // liveness as unknown-open until the SSH client wires this up.
-            ApiStream::Ssh(_) => Ok(false),
         }
     }
 }
 
-/// Map a single non-blocking `read` into an [`ApiStreamRead`]. Shared by the
-/// `Tcp` and `Ssh` variants; the stream must already be non-blocking.
+/// Map a single non-blocking `read` into an [`ApiStreamRead`]. The stream must
+/// already be non-blocking.
 fn poll_read_generic<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ApiStreamRead> {
     match reader.read(buf) {
         Ok(0) => Ok(ApiStreamRead::Closed),

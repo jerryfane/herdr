@@ -1,9 +1,8 @@
 //! Streaming file upload for gram attachments (`gram.upload.stream`).
 //!
-//! `gram.upload_chunk` costs one API connection per chunk, and over the app's SSH
-//! transport one `herdr api-bridge` process spawn per chunk — a 100 MB file is
-//! ~2100 of them, which is what makes a large attachment slow. That path is
-//! round-trip bound, not bandwidth bound.
+//! A chunk-per-connection upload is round-trip bound: a 100 MB file is about
+//! 2100 request/response cycles even when they share a saved-machine API bridge.
+//! This stream keeps the transfer on one ordered connection instead.
 //!
 //! This method opens ONE connection, acks it, then reads newline-delimited chunk
 //! frames on that same connection until EOF, acking each one. Every frame lands

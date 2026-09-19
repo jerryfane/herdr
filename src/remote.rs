@@ -1,5 +1,3 @@
-#[cfg(unix)]
-mod api_bridge_unix;
 mod args;
 mod attach;
 mod host;
@@ -7,20 +5,10 @@ mod process;
 mod restart_policy;
 mod saved;
 
-#[cfg(unix)]
-pub(crate) use api_bridge_unix::run_api_client_bridge;
 pub(crate) use args::*;
 pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
 pub(crate) use saved::*;
-
-#[cfg(windows)]
-pub(crate) fn run_api_client_bridge(_args: &[String]) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "api-bridge is only supported on Unix remote hosts",
-    ))
-}
 
 pub(crate) fn run_remote_api_bridge(args: &[String]) -> std::io::Result<()> {
     match args {

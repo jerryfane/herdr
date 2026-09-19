@@ -548,10 +548,6 @@ fn main() -> io::Result<()> {
 
     finish_cli(cli::maybe_run(&args))?;
 
-    if args.get(1).map(String::as_str) == Some("api-bridge") {
-        return remote::run_api_client_bridge(&args[2..]);
-    }
-
     if args.get(1).map(String::as_str) == Some("remote-api-bridge") {
         return remote::run_remote_api_bridge(&args[2..]);
     }
