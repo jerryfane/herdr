@@ -396,6 +396,44 @@ mod tests {
     }
 
     #[test]
+    fn local_control_messages_bypass_the_active_remote_endpoint() {
+        use crate::client::transport::ClientMessageSink as _;
+
+        let local_sent = Arc::new(Mutex::new(Vec::new()));
+        let remote_sent = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = EndpointRegistry::new(
+            FakeTransport {
+                sent: Arc::clone(&local_sent),
+                error: None,
+            },
+            1,
+            negotiation(),
+        );
+        let ssh_id = ClientEndpointId::Ssh(profile());
+        registry.insert(
+            ssh_id.clone(),
+            FakeTransport {
+                sent: Arc::clone(&remote_sent),
+                error: None,
+            },
+            2,
+            negotiation(),
+            true,
+        );
+        assert!(registry.set_active(&ssh_id));
+
+        registry
+            .send_local_client_message(&ClientMessage::EndpointControl {
+                kind: crate::protocol::endpoint::ENDPOINT_RUNTIME_STATUS_KIND.into(),
+                data: "{}".into(),
+            })
+            .unwrap();
+
+        assert_eq!(local_sent.lock().unwrap().len(), 1);
+        assert!(remote_sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn endpoint_failures_do_not_remove_other_connections() {
         let local_sent = Arc::new(Mutex::new(Vec::new()));
         let mut registry = EndpointRegistry::new(

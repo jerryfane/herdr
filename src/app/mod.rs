@@ -120,6 +120,8 @@ pub struct App {
     /// no-op.
     pub(crate) federation_manager:
         Option<Arc<crate::api::federation_manager::FederationPeerManager>>,
+    client_endpoint_statuses:
+        HashMap<u64, HashMap<String, crate::api::schema::MachineEndpointStatus>>,
     pub(crate) no_session: bool,
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
@@ -625,6 +627,7 @@ impl App {
             // Shared in on production startup via `set_federation_manager`; the
             // no-federation path and every test keep this `None`.
             federation_manager: None,
+            client_endpoint_statuses: HashMap::new(),
 
             no_session: false,
             direct_graphics_available: false,
@@ -708,6 +711,51 @@ impl App {
         manager: Arc<crate::api::federation_manager::FederationPeerManager>,
     ) {
         self.federation_manager = Some(manager);
+    }
+
+    pub(crate) fn record_client_endpoint_status(
+        &mut self,
+        client_id: u64,
+        profile_id: String,
+        status: crate::api::schema::MachineEndpointStatus,
+    ) {
+        self.client_endpoint_statuses
+            .entry(client_id)
+            .or_default()
+            .insert(profile_id, status);
+    }
+
+    pub(crate) fn remove_client_endpoint_statuses(&mut self, client_id: u64) {
+        self.client_endpoint_statuses.remove(&client_id);
+    }
+
+    pub(crate) fn endpoint_statuses(
+        &self,
+    ) -> HashMap<String, crate::api::schema::MachineEndpointStatus> {
+        fn rank(status: crate::api::schema::MachineEndpointStatus) -> u8 {
+            use crate::api::schema::MachineEndpointStatus::*;
+            match status {
+                Disabled => 0,
+                Attention => 1,
+                Reconnecting => 2,
+                Connecting => 3,
+                Online => 4,
+            }
+        }
+        let mut statuses = HashMap::new();
+        for client in self.client_endpoint_statuses.values() {
+            for (profile_id, status) in client {
+                statuses
+                    .entry(profile_id.clone())
+                    .and_modify(|current| {
+                        if rank(*status) > rank(*current) {
+                            *current = *status;
+                        }
+                    })
+                    .or_insert(*status);
+            }
+        }
+        statuses
     }
 
     #[cfg(unix)]

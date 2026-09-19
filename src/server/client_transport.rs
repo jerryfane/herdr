@@ -404,6 +404,11 @@ pub(crate) enum ServerEvent {
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    /// A thin client reported one saved endpoint supervisor's current state.
+    ClientEndpointStatus {
+        client_id: u64,
+        report: crate::protocol::endpoint::EndpointRuntimeStatusReport,
+    },
     /// A client reported the one armed Kitty regular-file response.
     GraphicsTransmissionResult {
         client_id: u64,
@@ -1315,6 +1320,18 @@ fn client_read_loop_with_endpoint_controls(
                         message,
                     },
                 }
+            }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == crate::protocol::endpoint::ENDPOINT_RUNTIME_STATUS_KIND =>
+            {
+                let report = match serde_json::from_str(&data) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        warn!(client_id, %error, "ignoring invalid endpoint runtime status");
+                        continue;
+                    }
+                };
+                ServerEvent::ClientEndpointStatus { client_id, report }
             }
             ClientMessage::EndpointControl { kind, data }
                 if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_SYNC_KIND =>

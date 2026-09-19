@@ -24,11 +24,11 @@ use crate::api::federation_manager::{
     FederationPeerManager, PeerPresentation, PeerRoute, PeerRouteStamp,
 };
 use crate::api::federation_store::{
-    FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
+    FederationStore, PeerCacheEntry, PeerObservation, Reachability, ReachabilityTracker,
 };
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, Method, PaneStreamParams, Request, ResponseResult,
-    ServerCapabilities, SuccessResponse,
+    ErrorBody, ErrorResponse, FederationPollErrorClass, Method, PaneStreamParams, Request,
+    ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
@@ -171,7 +171,7 @@ pub(crate) fn start_server_with_stop_control(
     )
 }
 
-fn default_capabilities() -> Option<ServerCapabilities> {
+pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
@@ -562,6 +562,30 @@ pub(crate) fn run_federation_peer_poll(
     debug!(alias = %peer.alias, "federation peer poll thread exiting");
 }
 
+struct PeerPollSnapshot {
+    agents: Vec<crate::api::schema::AgentInfo>,
+    remote_boot_id: Option<String>,
+    observation: PeerObservation,
+}
+
+fn federation_poll_error_class(error: &ApiClientError) -> FederationPollErrorClass {
+    match error {
+        ApiClientError::ErrorResponse(response) if response.error.code == "unauthorized" => {
+            FederationPollErrorClass::AuthenticationFailed
+        }
+        ApiClientError::UnexpectedResult(message)
+            if message.starts_with("peer machine identity mismatch:") =>
+        {
+            FederationPollErrorClass::IdentityMismatch
+        }
+        ApiClientError::Io(_) | ApiClientError::EmptyResponse => {
+            FederationPollErrorClass::Transport
+        }
+        ApiClientError::Json(_)
+        | ApiClientError::ErrorResponse(_)
+        | ApiClientError::UnexpectedResult(_) => FederationPollErrorClass::Protocol,
+    }
+}
 /// Run one poll of `client`'s `agent.list` and fold the result into `cache`:
 /// on success, alias-prefix the agents and store them `Reachable`; on failure,
 /// advance the miss tracker and degrade the peer (retaining last-known agents)
@@ -580,15 +604,16 @@ fn poll_once_into_cache(
     peer_stop: &Arc<AtomicBool>,
 ) -> Reachability {
     match poll_peer_agent_list(client, running, expected_machine_id) {
-        Ok((agents, remote_boot_id)) => {
+        Ok(snapshot) => {
             if let Some(route) = route {
-                route.observe_remote_boot(remote_boot_id.as_deref());
+                route.observe_remote_boot(snapshot.remote_boot_id.as_deref());
             }
             let mut rejected = 0usize;
             let presentation = presentation
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let prefixed = agents
+            let prefixed = snapshot
+                .agents
                 .into_iter()
                 .filter_map(|agent| {
                     let agent = prefix_remote_agent(alias, &presentation, agent);
@@ -623,7 +648,7 @@ fn poll_once_into_cache(
             }
             store.set_peer(
                 alias.to_string(),
-                PeerCacheEntry::reachable(prefixed, Instant::now()),
+                PeerCacheEntry::reachable_observed(prefixed, Instant::now(), snapshot.observation),
             );
             drop(presentation);
             reachability
@@ -633,7 +658,8 @@ fn poll_once_into_cache(
                 route.set_identity_validated(false);
             }
             let reachability = tracker.record_miss();
-            warn!(alias = %alias, err = %err, ?reachability, "federation peer poll failed");
+            let error_class = federation_poll_error_class(&err);
+            warn!(alias = %alias, ?error_class, ?reachability, "federation peer poll failed");
             let mut store = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -644,6 +670,7 @@ fn poll_once_into_cache(
                 return reachability;
             }
             store.degrade_peer(alias, reachability);
+            store.record_poll_error(alias, error_class);
             reachability
         }
     }
@@ -685,7 +712,7 @@ fn poll_peer_agent_list(
     client: &ApiClient,
     running: &Arc<AtomicBool>,
     expected_machine_id: Option<&str>,
-) -> Result<(Vec<crate::api::schema::AgentInfo>, Option<String>), ApiClientError> {
+) -> Result<PeerPollSnapshot, ApiClientError> {
     let request = Request {
         id: "federation:agent.list".into(),
         method: Method::AgentList(crate::api::schema::AgentListParams { local_only: true }),
@@ -702,6 +729,9 @@ fn poll_peer_agent_list(
             mut agents,
             origin_machine_id,
             origin_boot_id,
+            origin_version,
+            origin_protocol,
+            origin_capabilities,
         } => {
             if let Some(expected) = expected_machine_id {
                 if origin_machine_id.as_deref() != Some(expected) {
@@ -722,7 +752,17 @@ fn poll_peer_agent_list(
             for agent in &mut agents {
                 agent.origin_machine_id.clone_from(&origin_machine_id);
             }
-            Ok((agents, origin_boot_id))
+            Ok(PeerPollSnapshot {
+                agents,
+                remote_boot_id: origin_boot_id.clone(),
+                observation: PeerObservation {
+                    validated_machine_id: origin_machine_id,
+                    remote_boot_id: origin_boot_id,
+                    remote_version: origin_version,
+                    remote_protocol: origin_protocol,
+                    remote_capabilities: origin_capabilities,
+                },
+            })
         }
         other => Err(ApiClientError::UnexpectedResult(format!("{other:?}"))),
     }
@@ -1804,6 +1844,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
+        Method::MachineStatus(_) => "machine.status",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerStagedUpdate(_) => "server.staged_update",
         Method::ServerApplyStagedUpdate(_) => "server.apply_staged_update",
@@ -3524,6 +3565,7 @@ mod federation_tests {
             ("ping", AllowedAt(Observe)),
             ("server.stop", Denied),
             ("server.live_handoff", Denied),
+            ("machine.status", Denied),
             ("server.reload_config", Denied),
             ("server.staged_update", Denied),
             ("server.apply_staged_update", Denied),
@@ -4182,6 +4224,9 @@ mod federation_tests {
                                     ],
                                     origin_machine_id: Some("machine-peer".into()),
                                     origin_boot_id: Some("boot-peer".into()),
+                                    origin_version: Some("test".into()),
+                                    origin_protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                                    origin_capabilities: None,
                                 },
                             })
                             .expect("encode agent.list response")
@@ -4292,6 +4337,19 @@ mod federation_tests {
             assert_eq!(agent.machine_id.as_deref(), Some("home"));
             assert_eq!(agent.machine_label.as_deref(), Some("home"));
             assert_eq!(agent.origin_machine_id.as_deref(), Some("machine-peer"));
+            assert_eq!(
+                store
+                    .peer("home")
+                    .unwrap()
+                    .observation
+                    .validated_machine_id
+                    .as_deref(),
+                Some("machine-peer")
+            );
+            assert_eq!(
+                store.peer("home").unwrap().observation.remote_protocol,
+                Some(crate::protocol::PROTOCOL_VERSION)
+            );
         }
 
         // The read/merge helper stamps a reachable peer as-is with the status.
@@ -4399,6 +4457,15 @@ mod federation_tests {
         assert!(
             !route.identity_validated(),
             "identity mismatch must keep proxy routing disabled"
+        );
+        assert_eq!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .peer("home")
+                .unwrap()
+                .last_error_class,
+            Some(FederationPollErrorClass::IdentityMismatch)
         );
 
         running.store(false, Ordering::Relaxed);

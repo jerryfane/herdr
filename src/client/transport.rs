@@ -132,6 +132,10 @@ pub(in crate::client) fn write_to_local_server(
 
 pub(super) trait ClientMessageSink {
     fn send_client_message(&mut self, message: &ClientMessage) -> io::Result<()>;
+
+    fn send_local_client_message(&mut self, message: &ClientMessage) -> io::Result<()> {
+        self.send_client_message(message)
+    }
 }
 
 impl ClientMessageSink for LocalStream {
@@ -146,6 +150,16 @@ impl ClientMessageSink for endpoint::EndpointRegistry {
         // failure must not bypass that transition or tear down unrelated connections.
         self.send(message);
         Ok(())
+    }
+
+    fn send_local_client_message(&mut self, message: &ClientMessage) -> io::Result<()> {
+        match self.send_to(&endpoint::ClientEndpointId::Local, message) {
+            endpoint::EndpointSendOutcome::Sent => Ok(()),
+            endpoint::EndpointSendOutcome::NotSent => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "local endpoint is unavailable",
+            )),
+        }
     }
 }
 

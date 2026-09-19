@@ -2746,14 +2746,30 @@ impl HeadlessServer {
                 );
                 navigation_changed | geometry_changed
             }
+            ServerEvent::ClientEndpointStatus { client_id, report } => {
+                use crate::api::schema::MachineEndpointStatus;
+                use crate::protocol::endpoint::EndpointRuntimeStatus;
+                let status = match report.status {
+                    EndpointRuntimeStatus::Connecting => MachineEndpointStatus::Connecting,
+                    EndpointRuntimeStatus::Online => MachineEndpointStatus::Online,
+                    EndpointRuntimeStatus::Reconnecting => MachineEndpointStatus::Reconnecting,
+                    EndpointRuntimeStatus::Attention => MachineEndpointStatus::Attention,
+                    EndpointRuntimeStatus::Disabled => MachineEndpointStatus::Disabled,
+                };
+                self.app
+                    .record_client_endpoint_status(client_id, report.profile_id, status);
+                false
+            }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
+                self.app.remove_client_endpoint_statuses(client_id);
                 self.send_terminal_stream_detach_shutdown(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
+                self.app.remove_client_endpoint_statuses(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }

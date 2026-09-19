@@ -2,10 +2,13 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::api::client::ApiClient;
+use crate::api::schema::{EmptyParams, Method, Request, ResponseResult};
 use crate::client::endpoint::{EndpointCatalog, ProfileId};
 
 const HELP: &str = "Usage:
   herdr machine list [--json]
+  herdr machine status [--json]
   herdr machine add <ssh-target> --label <label> [--remote-session <name>]
   herdr machine rename <profile-id> --label <label>
   herdr machine remove <profile-id>
@@ -34,6 +37,7 @@ struct MachineListRow<'a> {
 pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
         Some("list") => list(&args[1..]),
+        Some("status") => status(&args[1..]),
         Some("add") => add(&args[1..]),
         Some("rename") => rename(&args[1..]),
         Some("remove") => remove(&args[1..]),
@@ -79,6 +83,87 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             "{}\t{}\t{}\t{}\t{}",
             row.id, row.label, row.target, row.session, state
         );
+    }
+    Ok(0)
+}
+
+fn status(args: &[String]) -> std::io::Result<i32> {
+    let json = match args {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => {
+            eprintln!("{HELP}");
+            return Ok(2);
+        }
+    };
+    let response = ApiClient::local()
+        .request(Request {
+            id: "machine-status".into(),
+            method: Method::MachineStatus(EmptyParams {}),
+        })
+        .map_err(std::io::Error::other)?;
+    let ResponseResult::MachineStatus { machines } = response.result else {
+        return Err(std::io::Error::other(
+            "local daemon returned an unexpected machine.status response",
+        ));
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&machines).map_err(std::io::Error::other)?
+        );
+        return Ok(0);
+    }
+    if machines.is_empty() {
+        println!("No saved machines.");
+        return Ok(0);
+    }
+    println!(
+        "{:<24} {:<20} {:<20} {:<14} {:<16} {}",
+        "LABEL", "PROFILE", "SAVED", "ENDPOINT", "FEDERATION", "MACHINE ID"
+    );
+    for machine in machines.values() {
+        let endpoint = machine
+            .endpoint_status
+            .map(|status| format!("{status:?}").to_lowercase())
+            .unwrap_or_else(|| "unavailable".into());
+        let federation = machine
+            .federation_reachability
+            .map(|status| format!("{status:?}").to_lowercase())
+            .unwrap_or_else(|| "not_started".into());
+        println!(
+            "{:<24} {:<20} {:<20} {:<14} {:<16} {}",
+            machine.display_label,
+            machine.profile_id,
+            format!("{:?}", machine.saved_state).to_lowercase(),
+            endpoint,
+            federation,
+            machine.validated_machine_id.as_deref().unwrap_or("-"),
+        );
+        if machine.remote_boot_id.is_some()
+            || machine.remote_version.is_some()
+            || machine.remote_protocol.is_some()
+            || machine.remote_capabilities.is_some()
+        {
+            println!(
+                "  remote: boot={} version={} protocol={} capabilities={}",
+                machine.remote_boot_id.as_deref().unwrap_or("-"),
+                machine.remote_version.as_deref().unwrap_or("-"),
+                machine
+                    .remote_protocol
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+                machine
+                    .remote_capabilities
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |value| format!("{value:?}").to_lowercase()),
+            );
+        }
+        if let Some(error) = machine.last_error_class {
+            println!("  last error: {}", format!("{error:?}").to_lowercase());
+        }
+        if machine.stale {
+            println!("  cached federation data is stale");
+        }
     }
     Ok(0)
 }

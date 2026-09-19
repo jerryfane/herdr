@@ -38,6 +38,7 @@ fn agent_list_response_preserves_legacy_shape_and_reports_origin_identity() {
         agents,
         origin_machine_id,
         origin_boot_id,
+        ..
     } = legacy.result
     else {
         panic!("expected agent_list");
@@ -52,11 +53,16 @@ fn agent_list_response_preserves_legacy_shape_and_reports_origin_identity() {
             agents: Vec::new(),
             origin_machine_id: Some("machine_current".into()),
             origin_boot_id: Some("boot_current".into()),
+            origin_version: Some("0.9.1".into()),
+            origin_protocol: Some(2),
+            origin_capabilities: None,
         },
     };
     let encoded = serde_json::to_value(&current).unwrap();
     assert_eq!(encoded["result"]["origin_machine_id"], "machine_current");
     assert_eq!(encoded["result"]["origin_boot_id"], "boot_current");
+    assert_eq!(encoded["result"]["origin_version"], "0.9.1");
+    assert_eq!(encoded["result"]["origin_protocol"], 2);
 }
 
 #[test]
