@@ -417,7 +417,10 @@ mod windows {
                                             subsystem = "pty",
                                             "delayed PTY input withheld: pane occupant changed during the submit delay"
                                         );
-                                        return Ok(());
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::Interrupted,
+                                            "pane occupant changed before prompt submission",
+                                        ));
                                     }
                                 }
                                 let written = write_submission_part(&write_tx, enter, None);
@@ -434,6 +437,13 @@ mod windows {
                                 written
                             })
                     };
+                    if result.is_err() {
+                        if let Some(watch) = guard.as_ref().and_then(|guard| guard.watch.as_ref()) {
+                            watch
+                                .abandoned
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
                     let failed = result
                         .as_ref()
                         .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);

@@ -3,9 +3,10 @@
 pub mod support;
 
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2822,4 +2823,44 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert!(expiry_event["data"]["title"].is_null());
 
     cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn api_bridge_round_trips_an_encoded_request() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("api.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let request = r#"{"id":"bridge-1","method":"ping","params":{}}"#;
+    let response = r#"{"id":"bridge-1","result":{"type":"pong"}}"#;
+    let expected_request = request.to_string();
+    let response_line = response.to_string();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), expected_request);
+        writeln!(reader.get_mut(), "{response_line}").unwrap();
+    });
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(request);
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("api-bridge")
+        .arg(encoded)
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "api-bridge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), response);
+    cleanup_test_base(&base);
 }

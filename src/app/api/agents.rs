@@ -1645,7 +1645,7 @@ mod tests {
         let guard_flag = Arc::clone(&still_hosting);
         let abandoned = Arc::new(crate::terminal::PromptSubmitWatch::default());
 
-        let _completion = runtime
+        let completion = runtime
             .queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt text"),
                 Bytes::from_static(b"\r"),
@@ -1681,6 +1681,11 @@ mod tests {
             abandoned.abandoned.load(Ordering::SeqCst),
             "withholding the Enter must be observable, not silent"
         );
+        let completion_error = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the withheld submission should answer")
+            .expect_err("a withheld Enter must not report prompt success");
+        assert_eq!(completion_error.kind(), std::io::ErrorKind::Interrupted);
     }
 
     /// The guard must not withhold the Enter when the occupant is unchanged —

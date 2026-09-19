@@ -1582,7 +1582,10 @@ impl PaneRuntimeIo {
                                         .abandoned
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
-                                return Ok(());
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "pane occupant changed before prompt submission",
+                                ));
                             }
                         }
                         if let Err(err) = sender.try_send(enter) {

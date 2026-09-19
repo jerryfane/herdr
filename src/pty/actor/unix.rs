@@ -941,7 +941,10 @@ impl PtyIoActorRunner {
                     subsystem = "pty",
                     "delayed PTY input withheld: pane occupant changed during the submit delay"
                 );
-                let _ = submission.reply.send(Ok(()));
+                let _ = submission.reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "pane occupant changed before prompt submission",
+                )));
                 return;
             }
             if enter.is_empty() {
