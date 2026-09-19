@@ -3,7 +3,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentArchiveParams, AgentPromptDelivery, AgentPromptParams, AgentRenameParams,
+    AgentArchiveParams, AgentListParams, AgentPromptDelivery, AgentPromptParams, AgentRenameParams,
     AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentUnarchiveParams,
     PaneReadResult, ResponseResult,
 };
@@ -42,19 +42,18 @@ fn append_codex_paste_boundary(runtime: &crate::terminal::TerminalRuntime, text:
 }
 
 impl App {
-    pub(super) fn handle_agent_list(&mut self, id: String) -> String {
-        // Local agents first, then remote federation peers' agents appended with
-        // honest reachability stamping. The remote agents are injected HERE (not
-        // in `collect_agent_infos`, which `agent_name_conflicts` reuses for local
-        // conflict checks). When no peer has an endpoint the store is empty and
-        // this is a no-op, keeping the local path byte-identical to today.
+    pub(super) fn handle_agent_list(&mut self, id: String, params: AgentListParams) -> String {
+        // Local agents first. Ordinary callers also receive the coordinator's
+        // cached remote directory, while federation pollers explicitly request
+        // local-only state so peers cannot recursively re-export aggregates.
         let mut agents = self.collect_agent_infos();
-        let store = self
-            .federation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        agents.extend(store.merged_agents());
-        drop(store);
+        if !params.local_only {
+            let store = self
+                .federation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            agents.extend(store.merged_agents());
+        }
         encode_success(id, ResponseResult::AgentList { agents })
     }
 
@@ -1401,6 +1400,55 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    #[test]
+    fn agent_list_local_only_excludes_federated_cache() {
+        let mut app = app_with_agent();
+        let remote = serde_json::from_value(serde_json::json!({
+            "terminal_id": "peer/remote-terminal",
+            "agent_status": "idle",
+            "workspace_id": "peer/remote-workspace",
+            "tab_id": "peer/remote-tab",
+            "pane_id": "peer/remote-pane",
+            "focused": false,
+            "revision": 1,
+            "machine_id": "peer"
+        }))
+        .expect("valid remote agent");
+        app.federation.lock().unwrap().set_peer(
+            "peer",
+            crate::api::federation_store::PeerCacheEntry::reachable(
+                vec![remote],
+                std::time::Instant::now(),
+            ),
+        );
+
+        let aggregate: SuccessResponse = serde_json::from_str(
+            &app.handle_agent_list("aggregate".into(), AgentListParams::default()),
+        )
+        .expect("aggregate agent.list response");
+        let local: SuccessResponse = serde_json::from_str(
+            &app.handle_agent_list("local".into(), AgentListParams { local_only: true }),
+        )
+        .expect("local-only agent.list response");
+        let ResponseResult::AgentList {
+            agents: aggregate_agents,
+        } = aggregate.result
+        else {
+            panic!("expected aggregate agent list");
+        };
+        let ResponseResult::AgentList {
+            agents: local_agents,
+        } = local.result
+        else {
+            panic!("expected local-only agent list");
+        };
+
+        assert!(aggregate_agents
+            .iter()
+            .any(|agent| agent.terminal_id == "peer/remote-terminal"));
+        assert!(!local_agents.iter().any(|agent| agent.machine_id.is_some()));
     }
 
     fn start_deferred_agent_prompt(

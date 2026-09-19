@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentArchiveParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
-    AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentSessionTransferHarness,
-    AgentStartParams, AgentTarget, AgentTransferSessionParams, AgentUnarchiveParams,
-    AgentWaitParams, EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams,
+    AgentArchiveParams, AgentListParams, AgentPromptParams, AgentPromptWaitOptions,
+    AgentReadParams, AgentRenameParams, AgentRestartParams, AgentSendKeysParams,
+    AgentSessionTransferHarness, AgentStartParams, AgentTarget, AgentTransferSessionParams,
+    AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams,
     PaneTarget, ReadFormat, ReadSource, Request,
 };
 
@@ -475,7 +475,7 @@ fn agent_list(args: &[String]) -> std::io::Result<i32> {
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:list".into(),
-        method: Method::AgentList(EmptyParams::default()),
+        method: Method::AgentList(AgentListParams::default()),
     })?)
 }
 

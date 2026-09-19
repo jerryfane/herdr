@@ -1617,6 +1617,15 @@
           ],
           "type": "object"
         },
+        "AgentListParams": {
+          "description": "Controls whether `agent.list` returns the coordinator's cached remote agents.\n\nOrdinary callers get the aggregate view. Federation pollers request the\nlocal-only view so peers never re-export an already aggregated directory.",
+          "properties": {
+            "local_only": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -6410,7 +6419,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/EmptyParams"
+              "$ref": "#/schemas/request/$defs/AgentListParams"
             }
           },
           "required": [
