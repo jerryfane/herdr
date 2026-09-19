@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,7 @@ use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
     FEDERATION_PROTOCOL_VERSION,
 };
-use crate::api::federation_manager::FederationPeerManager;
+use crate::api::federation_manager::{FederationPeerManager, PeerPresentation, PeerRoute};
 use crate::api::federation_store::{
     FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
 };
@@ -104,11 +104,10 @@ pub struct ServerHandle {
     /// Federation TCP accept thread, joined on drop. `None` when federation is
     /// not listening.
     federation_thread: Option<JoinHandle<()>>,
-    /// Manager for the outbound federation peer set — one poll thread per peer
-    /// with an `endpoint`, plus the outbound proxy registry. Shared with the
-    /// `App` so `reload-config` can add/remove/change peers live. Drives zero
-    /// threads and an empty registry when no peer has an endpoint (the
-    /// byte-identical no-federation path). Joined on drop via `join_all`.
+    /// Manager for outbound federation polls, proxy routes, and the inert-until-
+    /// enabled saved-profile watcher. Shared with the app so config and catalog
+    /// changes apply live. With no peer endpoint it drives zero poll threads and
+    /// an empty registry, preserving local API behavior. Joined on drop.
     federation_manager: Arc<FederationPeerManager>,
     path: PathBuf,
     identity: SocketFileIdentity,
@@ -127,10 +126,10 @@ impl Drop for ServerHandle {
             let _ = thread.join();
         }
 
-        // Outbound poll threads observe the cleared `running` between their short
-        // sleep increments; a mid-flight poll is bounded by the request timeout,
-        // so joining them here returns promptly. `join_all` also drains any
-        // threads still being retired by a concurrent reconcile.
+        // The catalog watcher is stopped first. Outbound poll threads observe
+        // the cleared `running` between short sleep increments; a mid-flight
+        // poll is bounded by the request timeout. `join_all` also drains threads
+        // still being retired by a concurrent reconcile.
         self.federation_manager.join_all();
 
         if let Err(err) = self.remove_socket_file_if_owned() {
@@ -215,7 +214,7 @@ fn start_server_inner(
     // add/remove/change peers live.
     let federation_manager =
         FederationPeerManager::new(Arc::clone(&federation_store), Arc::clone(&running));
-    federation_manager.reconcile(&federation.peers);
+    federation_manager.reconcile_config(federation);
 
     let listener_running = Arc::clone(&running);
     let listener_api_tx = api_tx.clone();
@@ -280,10 +279,10 @@ fn start_server_inner(
         &server_stop,
     );
 
-    // Outbound side is owned by `federation_manager`, boot-spawned above via
-    // `reconcile(&federation.peers)` from an empty set. When no peer has an
-    // `endpoint` this drove zero threads and an empty registry, so the local
-    // `agent.list` path is unchanged.
+    // Outbound side is owned by `federation_manager`, boot-reconciled above from
+    // explicit peers plus opt-in coordinator profiles. With neither source, it
+    // drives zero poll threads and an empty registry, so local `agent.list`
+    // behavior is unchanged.
 
     Ok(ServerHandle {
         _thread: thread,
@@ -531,12 +530,13 @@ fn classify_accept_error(err: &io::Error) -> AcceptBackoff {
 /// removed peer can be stopped without disturbing the others.
 pub(crate) fn run_federation_peer_poll(
     peer: FederationPeer,
-    target: ConnectionTarget,
+    route: PeerRoute,
+    presentation: Arc<RwLock<PeerPresentation>>,
     cache: Arc<Mutex<FederationStore>>,
     running: Arc<AtomicBool>,
     peer_stop: Arc<AtomicBool>,
 ) {
-    let client = ApiClient::for_target(target);
+    let client = ApiClient::for_target(route.target().clone());
     let mut tracker = ReachabilityTracker::default();
 
     while running.load(Ordering::Relaxed) && !peer_stop.load(Ordering::Relaxed) {
@@ -544,6 +544,8 @@ pub(crate) fn run_federation_peer_poll(
             &client,
             &peer.alias,
             peer.expected_node_id.as_deref(),
+            Some(&route),
+            &presentation,
             &cache,
             &mut tracker,
             &running,
@@ -569,6 +571,8 @@ fn poll_once_into_cache(
     client: &ApiClient,
     alias: &str,
     expected_machine_id: Option<&str>,
+    route: Option<&PeerRoute>,
+    presentation: &Arc<RwLock<PeerPresentation>>,
     cache: &Mutex<FederationStore>,
     tracker: &mut ReachabilityTracker,
     running: &Arc<AtomicBool>,
@@ -577,12 +581,15 @@ fn poll_once_into_cache(
     match poll_peer_agent_list(client, running, expected_machine_id) {
         Ok(agents) => {
             let mut rejected = 0usize;
+            let presentation = presentation
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let prefixed = agents
                 .into_iter()
                 .filter_map(|agent| {
-                    let prefixed = prefix_remote_agent(alias, agent);
-                    rejected += usize::from(prefixed.is_none());
-                    prefixed
+                    let agent = prefix_remote_agent(alias, &presentation, agent);
+                    rejected += usize::from(agent.is_none());
+                    agent
                 })
                 .collect();
             if rejected != 0 {
@@ -607,13 +614,20 @@ fn poll_once_into_cache(
             if peer_stop.load(Ordering::Relaxed) {
                 return reachability;
             }
+            if let Some(route) = route {
+                route.set_identity_validated(true);
+            }
             store.set_peer(
                 alias.to_string(),
                 PeerCacheEntry::reachable(prefixed, Instant::now()),
             );
+            drop(presentation);
             reachability
         }
         Err(err) => {
+            if let Some(route) = route {
+                route.set_identity_validated(false);
+            }
             let reachability = tracker.record_miss();
             warn!(alias = %alias, err = %err, ?reachability, "federation peer poll failed");
             let mut store = cache
@@ -722,6 +736,7 @@ fn poll_peer_agent_list(
 /// `reachability`/`last_known_status`, from the home's poll-outcome tracking.
 fn prefix_remote_agent(
     alias: &str,
+    presentation: &PeerPresentation,
     mut agent: crate::api::schema::AgentInfo,
 ) -> Option<crate::api::schema::AgentInfo> {
     fn qualify(alias: &str, value: String, allow_empty: bool) -> Option<String> {
@@ -744,8 +759,10 @@ fn prefix_remote_agent(
     // alias for wire compatibility. Explicit peers have no saved profile id;
     // `origin_machine_id` is the response-level identity validated by the poll.
     agent.machine_id = Some(alias.to_string());
-    agent.machine_profile_id = None;
-    agent.machine_label = Some(alias.to_string());
+    agent
+        .machine_profile_id
+        .clone_from(&presentation.profile_id);
+    agent.machine_label = Some(presentation.label.clone());
     agent.reachability = None;
     agent.last_known_status = None;
     Some(agent)
@@ -781,7 +798,6 @@ fn failure_backoff(base: Duration) -> Duration {
     let jitter = if cap == 0 { 0 } else { entropy % cap };
     base + Duration::from_nanos(jitter)
 }
-
 /// Enforce the federation handshake, then dispatch the connection normally.
 ///
 /// The first line MUST be a `federation.hello` whose `proto_version` this daemon
@@ -850,7 +866,7 @@ fn handle_federation_connection(
     // path and a `<alias>/…` target falls through to a local not-found. This
     // single choke point also keeps the pane.stream proxy inbound-safe, since it
     // reads the same registry.
-    let no_outbound_routing: HashMap<String, ConnectionTarget> = HashMap::new();
+    let no_outbound_routing: HashMap<String, PeerRoute> = HashMap::new();
     handle_connection_with_stop(
         stream,
         api_tx,
@@ -901,6 +917,16 @@ fn federation_forbidden_error(id: String, method: &str) -> ErrorResponse {
     }
 }
 
+fn federation_identity_unverified_error(id: String, alias: &str) -> ErrorResponse {
+    ErrorResponse {
+        id,
+        error: ErrorBody {
+            code: "federation_identity_unverified".into(),
+            message: format!("federation peer {alias:?} has not validated its machine identity"),
+        },
+    }
+}
+
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
@@ -943,7 +969,7 @@ fn handle_connection_with_stop(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     federation: Option<PeerContext>,
-    federation_peers: &HashMap<String, ConnectionTarget>,
+    federation_peers: &HashMap<String, PeerRoute>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -1077,17 +1103,25 @@ fn handle_connection_with_stop(
             let result = if let Some((alias, rest, peer_target)) =
                 federated_stream_target(&params.pane_id, federation_peers)
             {
-                // Strip the `<alias>/` prefix so the peer sees its own local pane id;
-                // every other client parameter is forwarded unchanged.
-                params.pane_id = rest;
-                proxy_federated_pane_stream(
-                    stream,
-                    request_id.clone(),
-                    &alias,
-                    params,
-                    peer_target,
-                    running,
-                )
+                if !peer_target.identity_validated() {
+                    let mut stream = stream;
+                    write_json_line_allow_disconnect(
+                        &mut stream,
+                        &federation_identity_unverified_error(request_id.clone(), &alias),
+                    )
+                } else {
+                    // Strip the `<alias>/` prefix so the peer sees its own local pane id;
+                    // every other client parameter is forwarded unchanged.
+                    params.pane_id = rest;
+                    proxy_federated_pane_stream(
+                        stream,
+                        request_id.clone(),
+                        &alias,
+                        params,
+                        peer_target.target().clone(),
+                        running,
+                    )
+                }
             } else {
                 pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running)
             };
@@ -1314,9 +1348,9 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
 /// never contain `/` and never equal a configured alias (W3), and a `w1:p1`-style
 /// local id has no `/` either — so neither routes. Returns `None` (fall through to
 /// local dispatch) for every non-federated target.
-fn federated_split<'a>(
+fn federated_split<'a, T>(
     target: &'a str,
-    peers: &HashMap<String, ConnectionTarget>,
+    peers: &HashMap<String, T>,
 ) -> Option<(&'a str, &'a str)> {
     let (alias, rest) = target.split_once('/')?;
     if peers.contains_key(alias) {
@@ -1339,7 +1373,7 @@ fn federated_split<'a>(
 fn maybe_route_to_peer(
     stream: &mut ApiStream,
     request: &mut Request,
-    peers: &HashMap<String, ConnectionTarget>,
+    peers: &HashMap<String, PeerRoute>,
     running: &Arc<AtomicBool>,
     request_id: &str,
     method: &'static str,
@@ -1355,7 +1389,22 @@ fn maybe_route_to_peer(
         let (alias, rest) = federated_split(target, peers)?;
         (alias.to_string(), rest.to_string())
     };
-    let peer_target = peers.get(&alias)?.clone();
+    let peer_route = peers.get(&alias)?.clone();
+    if !peer_route.identity_validated() {
+        let response = federation_identity_unverified_error(request_id.to_owned(), &alias);
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "identity_unverified",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
+    let peer_target = peer_route.target().clone();
     // Federated: strip the `<alias>/` prefix so the peer sees its own local id.
     *target = rest;
 
@@ -1431,8 +1480,8 @@ fn proxy_federated_response(
 /// `peers.get` cannot miss after a [`federated_split`] match, so this never panics.
 fn federated_stream_target(
     pane_id: &str,
-    peers: &HashMap<String, ConnectionTarget>,
-) -> Option<(String, String, ConnectionTarget)> {
+    peers: &HashMap<String, PeerRoute>,
+) -> Option<(String, String, PeerRoute)> {
     let (alias, rest) = federated_split(pane_id, peers)?;
     let target = peers.get(alias)?.clone();
     Some((alias.to_string(), rest.to_string(), target))
@@ -3041,6 +3090,17 @@ mod federation_tests {
     use std::net::{SocketAddr, TcpStream};
     use tokio::sync::mpsc;
 
+    fn presentation(alias: &str) -> PeerPresentation {
+        PeerPresentation {
+            profile_id: None,
+            label: alias.into(),
+        }
+    }
+
+    fn shared_presentation(alias: &str) -> Arc<RwLock<PeerPresentation>> {
+        Arc::new(RwLock::new(presentation(alias)))
+    }
+
     /// A running federation listener bound to a loopback ephemeral port, plus the
     /// app channel receiver so a test can assert whether any request reached the
     /// dispatch path. Dropping it stops and joins the accept thread.
@@ -4093,6 +4153,7 @@ mod federation_tests {
     ) -> FederationPeer {
         FederationPeer {
             alias: alias.into(),
+            display_label: None,
             endpoint: Some(format!("tcp://{addr}")),
             profile_id: None,
             remote_session: None,
@@ -4180,6 +4241,58 @@ mod federation_tests {
     }
 
     #[test]
+    fn peer_label_change_updates_presentation_without_reconnect() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let mut peer = reachable_peer_on(peer_srv.addr, "home", &peer_srv.token_path);
+        peer.display_label = Some("Before".into());
+        manager.reconcile(std::slice::from_ref(&peer));
+        assert!(wait_for_cached(&cache, "home", "home/builder"));
+        assert_eq!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .peer("home")
+                .unwrap()
+                .agents[0]
+                .machine_label
+                .as_deref(),
+            Some("Before")
+        );
+
+        peer.display_label = Some("After".into());
+        manager.reconcile(&[peer]);
+        assert_eq!(
+            manager.reap_and_count_pending(),
+            0,
+            "display-only rename must not retire the poll thread"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let updated = cache
+                .lock()
+                .expect("cache lock")
+                .peer("home")
+                .and_then(|entry| entry.agents.first())
+                .and_then(|agent| agent.machine_label.as_deref())
+                == Some("After");
+            if updated {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "renamed label did not reach cached agents"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        manager.join_all();
+        peer_srv.shutdown();
+    }
+
+    #[test]
     fn federation_client_rejects_changed_machine_identity() {
         let peer_srv = SeededPeer::spawn("builder");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
@@ -4190,12 +4303,18 @@ mod federation_tests {
         let running = Arc::new(AtomicBool::new(true));
         let peer_stop = Arc::new(AtomicBool::new(false));
         let mut tracker = ReachabilityTracker::default();
+        let route = PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+            addr: peer_srv.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
 
         assert_eq!(
             poll_once_into_cache(
                 &client,
                 "home",
                 Some("machine-before-reinstall"),
+                Some(&route),
+                &shared_presentation("home"),
                 &cache,
                 &mut tracker,
                 &running,
@@ -4206,6 +4325,10 @@ mod federation_tests {
         assert!(
             cache.lock().expect("cache lock").merged_agents().is_empty(),
             "an identity mismatch must not publish the peer's agents"
+        );
+        assert!(
+            !route.identity_validated(),
+            "identity mismatch must keep proxy routing disabled"
         );
 
         running.store(false, Ordering::Relaxed);
@@ -4226,10 +4349,12 @@ mod federation_tests {
             store.set_peer(
                 "home",
                 PeerCacheEntry::reachable(
-                    vec![
-                        prefix_remote_agent("home", seeded_agent(AgentStatus::Idle, "idler"))
-                            .expect("local agent identity can be qualified"),
-                    ],
+                    vec![prefix_remote_agent(
+                        "home",
+                        &presentation("home"),
+                        seeded_agent(AgentStatus::Idle, "idler"),
+                    )
+                    .expect("local agent identity can be qualified")],
                     Instant::now(),
                 ),
             );
@@ -4260,6 +4385,8 @@ mod federation_tests {
                 &client,
                 "home",
                 None,
+                None,
+                &shared_presentation("home"),
                 &cache,
                 &mut tracker,
                 &running,
@@ -4272,6 +4399,8 @@ mod federation_tests {
                 &client,
                 "home",
                 None,
+                None,
+                &shared_presentation("home"),
                 &cache,
                 &mut tracker,
                 &running,
@@ -4296,6 +4425,8 @@ mod federation_tests {
                 &client,
                 "home",
                 None,
+                None,
+                &shared_presentation("home"),
                 &cache,
                 &mut tracker,
                 &running,
@@ -4328,6 +4459,7 @@ mod federation_tests {
         let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
         manager.reconcile(&[FederationPeer {
             alias: "listen-only".into(),
+            display_label: None,
             endpoint: None,
             profile_id: None,
             remote_session: None,
@@ -4412,7 +4544,12 @@ mod federation_tests {
         std::env::set_var("HERDR_TEST_SSH_FAIL", &fail_bridge);
         std::env::set_var("HERDR_TEST_SSH_FAILED", &bridge_failed);
 
-        let profile_text = format!("{nonce:032x}");
+        let mut catalog = crate::client::endpoint::EndpointCatalog::default();
+        let profile_id = catalog
+            .add_ssh("Build", "dev@build.example", "agent-work")
+            .unwrap();
+        catalog.store_profiles().unwrap();
+        let profile_text = profile_id.to_string();
         crate::client::endpoint::SshMetadataCache::new(
             &profile_text,
             "dev@build.example",
@@ -4427,26 +4564,27 @@ mod federation_tests {
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
         let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
-        let peer = FederationPeer {
-            alias: "build".into(),
-            endpoint: Some("ssh://dev@build.example".into()),
-            profile_id: Some(profile_text.clone()),
-            remote_session: Some("agent-work".into()),
-            token_file: None,
-            expected_node_id: None,
-            capability: CapabilityTier::Observe,
+        let mut config = FederationConfig {
+            coordinator: true,
+            ..FederationConfig::default()
         };
-        manager.reconcile(std::slice::from_ref(&peer));
+        config.saved_machines.insert(
+            profile_id.clone(),
+            crate::config::FederationSavedMachinePolicy {
+                expected_machine_id: "machine-build".into(),
+            },
+        );
+        manager.reconcile_config(&config);
 
         let route = manager
             .registry_snapshot()
-            .get("build")
+            .get(&profile_text)
             .cloned()
             .expect("SSH peer is routable");
-        let ConnectionTarget::SocketPath(socket) = route else {
+        let ConnectionTarget::SocketPath(socket) = route.target() else {
             panic!("SSH federation must route through the local saved bridge");
         };
-        let stream = crate::ipc::connect_local_stream(&socket).expect("connect shared bridge");
+        let stream = crate::ipc::connect_local_stream(socket).expect("connect shared bridge");
         let mut stream = BufReader::new(stream);
         stream.get_mut().write_all(b"probe\n").unwrap();
         let mut line = String::new();
@@ -4456,7 +4594,7 @@ mod federation_tests {
 
         std::fs::write(&fail_bridge, b"fail").unwrap();
         let mut failing =
-            crate::ipc::connect_local_stream(&socket).expect("connect bridge before failure");
+            crate::ipc::connect_local_stream(socket).expect("connect bridge before failure");
         failing.write_all(b"trigger\n").unwrap();
         drop(failing);
         let failure_deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -4468,7 +4606,7 @@ mod federation_tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let recovered_line = loop {
-            if let Ok(stream) = crate::ipc::connect_local_stream(&socket) {
+            if let Ok(stream) = crate::ipc::connect_local_stream(socket) {
                 let mut recovered = BufReader::new(stream);
                 if recovered.get_mut().write_all(b"recovered\n").is_ok() {
                     let mut line = String::new();
@@ -4497,6 +4635,28 @@ mod federation_tests {
         assert!(args.contains("ControlPersist=yes"));
         assert!(!args.contains(" api-bridge "));
 
+        catalog.rename_ssh(&profile_id, "Build Farm").unwrap();
+        catalog.store_profiles().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager
+            .presentation_for(&profile_text)
+            .is_some_and(|presentation| presentation.label != "Build Farm")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            manager
+                .presentation_for(&profile_text)
+                .map(|presentation| presentation.label),
+            Some("Build Farm".into())
+        );
+        assert_eq!(
+            manager.reap_and_count_pending(),
+            0,
+            "catalog label rename must not reconnect federation"
+        );
+
         crate::client::endpoint::SshMetadataCache::new(
             &profile_text,
             "dev@build.example",
@@ -4507,24 +4667,28 @@ mod federation_tests {
             os: "linux".into(),
             executable: "/opt/Herdr Builds/herdr".into(),
         });
-        let mut changed = peer;
-        changed.remote_session = Some("agent-next".into());
-        let reconcile_started = std::time::Instant::now();
-        manager.reconcile(&[changed]);
-        assert!(
-            reconcile_started.elapsed() < Duration::from_millis(750),
-            "bridge retirement must not serialize one-second monitor waits"
+        catalog.ssh[0].session = "agent-next".into();
+        catalog.store_profiles().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.remote_session_for(&profile_text).as_deref() != Some("agent-next")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            manager.remote_session_for(&profile_text).as_deref(),
+            Some("agent-next")
         );
 
         let route = manager
             .registry_snapshot()
-            .get("build")
+            .get(&profile_text)
             .cloned()
             .expect("changed SSH session is routable");
-        let ConnectionTarget::SocketPath(socket) = route else {
+        let ConnectionTarget::SocketPath(socket) = route.target() else {
             panic!("changed SSH federation route must remain a local bridge");
         };
-        let stream = crate::ipc::connect_local_stream(&socket).expect("connect replacement bridge");
+        let stream = crate::ipc::connect_local_stream(socket).expect("connect replacement bridge");
         let mut stream = BufReader::new(stream);
         stream.get_mut().write_all(b"next\n").unwrap();
         let mut line = String::new();
@@ -4533,6 +4697,18 @@ mod federation_tests {
         drop(stream);
         let args = std::fs::read_to_string(&args_log).expect("replacement SSH invocation captured");
         assert!(args.contains("agent-next"));
+
+        catalog.set_enabled(&profile_id, false);
+        catalog.store_profiles().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!manager.live_aliases().is_empty()
+            || manager.registry_snapshot().contains_key(&profile_text))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(manager.live_aliases().is_empty());
+        assert!(manager.registry_snapshot().get(&profile_text).is_none());
 
         running.store(false, Ordering::Relaxed);
         manager.join_all();
@@ -4702,7 +4878,7 @@ mod federation_tests {
         assert_eq!(manager.live_aliases(), vec!["A".to_string()]);
 
         // The registry now routes A at the new addr.
-        match manager.registry_snapshot().get("A") {
+        match manager.registry_snapshot().get("A").map(PeerRoute::target) {
             Some(ConnectionTarget::Tcp { addr, .. }) => assert_eq!(*addr, peer_new.addr),
             other => panic!("expected A to route to the new tcp addr, got {other:?}"),
         }
@@ -4787,6 +4963,8 @@ mod federation_tests {
             &client,
             "gone",
             None,
+            None,
+            &shared_presentation("gone"),
             &cache,
             &mut tracker,
             &running,
@@ -4823,6 +5001,8 @@ mod federation_tests {
             &client,
             "home",
             None,
+            None,
+            &shared_presentation("home"),
             &cache,
             &mut tracker,
             &running,
@@ -4869,8 +5049,8 @@ mod federation_tests {
         assert_eq!(hostile.reachability, Some(Reachability::Reachable));
         assert_eq!(hostile.last_known_status, Some(AgentStatus::Working));
 
-        let normalized =
-            prefix_remote_agent("home", hostile).expect("unqualified remote agent is accepted");
+        let normalized = prefix_remote_agent("home", &presentation("home"), hostile)
+            .expect("unqualified remote agent is accepted");
         assert_eq!(
             normalized.machine_id.as_deref(),
             Some("home"),
@@ -4897,14 +5077,14 @@ mod federation_tests {
     fn prefix_remote_agent_rejects_already_qualified_identity() {
         let mut already_qualified = seeded_agent(AgentStatus::Working, "builder");
         already_qualified.terminal_id = "other/terminal".into();
-        assert!(prefix_remote_agent("home", already_qualified).is_none());
+        assert!(prefix_remote_agent("home", &presentation("home"), already_qualified).is_none());
     }
 
     #[test]
     fn prefix_remote_agent_allows_slashes_in_display_name() {
         let named = seeded_agent(AgentStatus::Working, "team/builder");
-        let qualified =
-            prefix_remote_agent("home", named).expect("display names are not route ids");
+        let qualified = prefix_remote_agent("home", &presentation("home"), named)
+            .expect("display names are not route ids");
         assert_eq!(qualified.name.as_deref(), Some("home/team/builder"));
     }
 
@@ -4920,8 +5100,8 @@ mod federation_tests {
             reason: None,
         });
 
-        let qualified =
-            prefix_remote_agent("home", archived).expect("archived agent remains visible");
+        let qualified = prefix_remote_agent("home", &presentation("home"), archived)
+            .expect("archived agent remains visible");
         assert_eq!(qualified.terminal_id, "home/term-remote");
         assert_eq!(qualified.workspace_id, "");
         assert_eq!(qualified.tab_id, "");
@@ -5041,7 +5221,10 @@ mod federation_tests {
         assert_eq!(federated_split("w1", &peers), None);
 
         // With no configured peers nothing routes.
-        assert_eq!(federated_split("w1/builder", &HashMap::new()), None);
+        assert_eq!(
+            federated_split("w1/builder", &HashMap::<String, ()>::new()),
+            None
+        );
     }
 
     /// The tier table and the routing table MUST agree.
@@ -5335,6 +5518,15 @@ mod federation_tests {
     }
 
     fn drive_home(registry: HashMap<String, ConnectionTarget>) -> HomeConn {
+        drive_home_routes(
+            registry
+                .into_iter()
+                .map(|(alias, target)| (alias, PeerRoute::for_test(target)))
+                .collect(),
+        )
+    }
+
+    fn drive_home_routes(registry: HashMap<String, PeerRoute>) -> HomeConn {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind home listener");
         let addr = listener.local_addr().expect("home addr");
         let client = TcpStream::connect(addr).expect("connect home");
@@ -5433,6 +5625,70 @@ mod federation_tests {
             "a proxied prompt reached the local app dispatch path"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn proxy_rejects_an_identity_pinned_route_before_validation() {
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+                addr: "127.0.0.1:9".parse().unwrap(),
+                token: None,
+            }),
+        )]);
+        let mut home = drive_home_routes(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "identity-gate",
+                "method": "agent.prompt",
+                "params": { "target": "remote/builder", "text": "must not route" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "federation_identity_unverified");
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "an unvalidated federated target reached the local app"
+        );
+    }
+
+    #[test]
+    fn pane_stream_rejects_an_identity_pinned_route_before_validation() {
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+                addr: "127.0.0.1:9".parse().unwrap(),
+                token: None,
+            }),
+        )]);
+        let mut home = drive_home_routes(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "stream-identity-gate",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/pane" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "federation_identity_unverified");
+        assert!(
+            home.api_rx.try_recv().is_err(),
+            "an unvalidated federated stream reached the local app"
+        );
+    }
+
+    #[test]
+    fn unpinned_route_remains_enabled_after_poll_failure() {
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr: "127.0.0.1:9".parse().unwrap(),
+            token: None,
+        });
+        route.set_identity_validated(false);
+        assert!(route.identity_validated());
     }
 
     #[test]

@@ -127,6 +127,7 @@ Federation lets one Herdr daemon reach another daemon's runtime. It is off by de
 
 ```toml
 [federation]
+coordinator = true
 listen = true
 listen_addr = "127.0.0.1:7020"
 
@@ -150,7 +151,8 @@ expected_node_id = "machine_0123456789abcdef0123456789abcdef"
 
 Each `[[federation.peers]]` table declares one peer:
 
-- `alias` — a local name for the peer, used in logs and diagnostics.
+- `alias` — a stable local routing identity for the peer, used in qualified IDs, logs, and diagnostics.
+- `display_label` — optional mutable display text. Changing it does not change routing identity or reconnect the peer.
 - `token_file` — path to the shared secret used by inbound and outbound TCP federation. Its trimmed contents are never logged. An unreadable or empty file grants no inbound access and sends no outbound TCP credential. SSH peers authenticate through OpenSSH instead.
 - `endpoint` — where to reach the peer for outbound connections: `tcp://host:port` or `ssh://[user@]host`.
 - `profile_id` — the immutable 32-character saved-machine profile ID used to key SSH executable metadata and bridge lifetime. Required for SSH endpoints.
@@ -165,7 +167,7 @@ Saved-machine federation trust is separate from both the endpoint catalog and ex
 expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 ```
 
-The table key is the saved machine's immutable profile ID. The endpoint catalog remains authoritative for its label, SSH target, remote session, and enabled state; renaming therefore cannot change routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
+The table key is the saved machine's immutable profile ID. Saved profiles are reconciled only when `federation.coordinator = true`; the default remote role never federates its own catalog back, so enabling this on one machine does not create a cycle. The endpoint catalog remains authoritative for each trusted profile's label, SSH target, remote session, and enabled state. Add, enable, disable, remove, target/session changes, and trust-policy changes are applied without restarting the daemon. A label-only rename changes display data without reconnecting or changing qualified routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
 
 Capability tiers are ordered, each including the one below it:
 

@@ -1042,7 +1042,7 @@ impl App {
         // empty peer list is a clean full teardown. The inbound listener is bound
         // at boot and is intentionally NOT touched here.
         if let Some(manager) = &self.federation_manager {
-            manager.reconcile(&config.federation.peers);
+            manager.reconcile_config(&config.federation);
         }
 
         let status = if diagnostics.is_empty() {

@@ -122,6 +122,18 @@ impl FederationStore {
         self.peers.get(alias)
     }
 
+    /// Update mutable saved-profile presentation on cached agents without
+    /// disturbing transport generation, reachability, status, or last-seen time.
+    pub fn update_peer_presentation(&mut self, alias: &str, profile_id: Option<&str>, label: &str) {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return;
+        };
+        for agent in &mut entry.agents {
+            agent.machine_profile_id = profile_id.map(str::to_owned);
+            agent.machine_label = Some(label.to_owned());
+        }
+    }
+
     /// Mark a peer's reachability without disturbing its last-known agents.
     ///
     /// Used on a poll miss: the agents from the last success are retained, only

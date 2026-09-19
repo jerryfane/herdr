@@ -1297,6 +1297,10 @@ pub enum CapabilityTier {
 pub struct FederationConfig {
     /// Accept inbound federation connections. Default: false.
     pub listen: bool,
+    /// Opt this daemon into coordinator behavior for saved-machine federation.
+    /// Remote daemons do not federate saved profiles back unless explicitly
+    /// configured as coordinators themselves.
+    pub coordinator: bool,
     /// Address the federation listener binds to when `listen` is enabled.
     pub listen_addr: Option<String>,
     /// Federation peers configured directly by endpoint and alias.
@@ -1360,6 +1364,8 @@ fn validate_expected_machine_id(machine_id: &str) -> Result<(), String> {
 pub struct FederationPeer {
     /// Local alias used to refer to this peer.
     pub alias: String,
+    /// Mutable display label. Routing continues to use `alias`.
+    pub display_label: Option<String>,
     /// Endpoint to reach the peer (e.g. an `ssh://` or `tcp://` target).
     pub endpoint: Option<String>,
     /// Immutable saved-machine profile id used for SSH metadata and bridge
@@ -1699,14 +1705,21 @@ mod tests {
     fn ssh_federation_peer_carries_saved_profile_and_named_session() {
         let config: FederationConfig = toml::from_str(
             r#"
+                coordinator = true
                 [[peers]]
                 alias = "build"
+                display_label = "Build Machine"
                 endpoint = "ssh://dev@build.example"
                 profile_id = "0123456789abcdef0123456789abcdef"
                 remote_session = "agent-work"
             "#,
         )
         .unwrap();
+        assert!(config.coordinator);
+        assert_eq!(
+            config.peers[0].display_label.as_deref(),
+            Some("Build Machine")
+        );
 
         assert_eq!(
             config.peers[0].profile_id.as_deref(),
