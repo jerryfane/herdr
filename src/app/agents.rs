@@ -1306,7 +1306,7 @@ fn archived_agent_info(
         machine_id: None,
         machine_profile_id: None,
         machine_label: None,
-        origin_machine_id: Some(crate::persist::machine::get_or_create()),
+        origin_machine_id: None,
         reachability: None,
         last_known_status: None,
         archived: Some(crate::api::schema::AgentArchivedInfo {

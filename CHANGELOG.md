@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-### Added
-- Saved SSH machines can carry federation trust policy keyed by immutable profile ID, while API responses expose the origin daemon's install identity separately from routing aliases and display labels. Renames keep trust attached; removal and re-addition mint a new identity. (#190)
-
 ## [0.9.1] - 2026-09-16
 
 ### Added

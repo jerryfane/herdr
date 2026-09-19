@@ -56,6 +56,8 @@ struct PeerHandle {
     endpoint: String,
     /// The peer's `token_file` this thread was spawned for, for `spec_differs`.
     token_file: Option<String>,
+    /// The peer's expected install identity this thread was spawned with.
+    expected_node_id: Option<String>,
 }
 
 /// Manages the outbound federation peer set at runtime: spawns a poll thread and
@@ -194,6 +196,7 @@ impl FederationPeerManager {
         let stop = Arc::new(AtomicBool::new(false));
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
+        let expected_node_id = peer.expected_node_id.clone();
         let cache = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let thread_stop = Arc::clone(&stop);
@@ -205,6 +208,7 @@ impl FederationPeerManager {
             join,
             endpoint,
             token_file,
+            expected_node_id,
         }
     }
 
@@ -279,9 +283,10 @@ impl FederationPeerManager {
     }
 }
 
-/// Whether a running peer's spec (`endpoint` or `token_file`) differs from the
-/// desired config, so its thread must be retired and respawned.
+/// Whether a running peer's connection or trust spec differs from the desired
+/// config, so its thread must be retired and respawned.
 fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
     handle.endpoint != peer.endpoint.clone().unwrap_or_default()
         || handle.token_file != peer.token_file
+        || handle.expected_node_id != peer.expected_node_id
 }

@@ -772,10 +772,7 @@ fn prefix_remote_agent(
         Some(format!("{alias}/{value}"))
     }
 
-    agent.name = match agent.name {
-        Some(name) => Some(qualify(alias, name)?),
-        None => None,
-    };
+    agent.name = agent.name.map(|name| format!("{alias}/{name}"));
     agent.terminal_id = qualify(alias, agent.terminal_id)?;
     agent.workspace_id = qualify(alias, agent.workspace_id)?;
     agent.tab_id = qualify(alias, agent.tab_id)?;
@@ -4563,6 +4560,36 @@ mod federation_tests {
         peer_new.shutdown();
     }
 
+    #[test]
+    fn reconcile_changed_identity_pin_respawns_and_revalidates_peer() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        let mut trusted = reachable_peer_on(peer_srv.addr, "A", &peer_srv.token_path);
+        trusted.expected_node_id = Some("machine-peer".into());
+        manager.reconcile(&[trusted.clone()]);
+        assert!(wait_for_cached(&cache, "A", "A/builder"));
+
+        let mut rotated = trusted.clone();
+        rotated.expected_node_id = Some("machine-after-reinstall".into());
+        manager.reconcile(&[rotated]);
+        assert!(
+            cache.lock().expect("cache lock").peer("A").is_none(),
+            "changing the pin must synchronously evict state validated under the old pin"
+        );
+
+        manager.reconcile(&[trusted]);
+        assert!(
+            wait_for_cached(&cache, "A", "A/builder"),
+            "restoring the matching pin must respawn and revalidate the peer"
+        );
+
+        manager.join_all();
+        peer_srv.shutdown();
+    }
+
     /// The under-store-lock stop guard skips the DEGRADE (miss) write once the
     /// peer's stop flag is set: the miss is still counted, but no cache entry is
     /// created for the evicted alias.
@@ -4694,8 +4721,17 @@ mod federation_tests {
 
     #[test]
     fn prefix_remote_agent_rejects_already_qualified_identity() {
-        let already_qualified = seeded_agent(AgentStatus::Working, "other/builder");
+        let mut already_qualified = seeded_agent(AgentStatus::Working, "builder");
+        already_qualified.terminal_id = "other/terminal".into();
         assert!(prefix_remote_agent("home", already_qualified).is_none());
+    }
+
+    #[test]
+    fn prefix_remote_agent_allows_slashes_in_display_name() {
+        let named = seeded_agent(AgentStatus::Working, "team/builder");
+        let qualified =
+            prefix_remote_agent("home", named).expect("display names are not route ids");
+        assert_eq!(qualified.name.as_deref(), Some("home/team/builder"));
     }
 
     /// FIX 1 (DoS hardening): a peer that returns an over-cap response line must
