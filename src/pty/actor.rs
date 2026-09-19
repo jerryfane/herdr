@@ -444,9 +444,12 @@ mod windows {
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        !matches!(
+                            err.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                        )
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -610,6 +613,65 @@ mod windows {
                     .map(|write| write.0.as_slice())
                     .collect::<Vec<_>>(),
                 vec![b"prompt"]
+            );
+        }
+
+        #[test]
+        fn withheld_submission_keeps_forwarding_later_input() {
+            let (flushed_tx, _flushed_rx) = std_mpsc::channel();
+            let mut writer = RecordingWriter {
+                writes: Vec::new(),
+                flushes: Vec::new(),
+                fail_after: None,
+                flushed: flushed_tx,
+            };
+            let (data_tx, mut data_rx) = mpsc::channel(2);
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            let watch = Arc::new(crate::terminal::PromptSubmitWatch::default());
+            let accepting = Arc::new(Mutex::new(true));
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"prompt"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::ZERO,
+                    deadline: None,
+                    guard: Some(SubmissionGuard {
+                        occupant_unchanged: Arc::new(|| false),
+                        watch: Some(Arc::clone(&watch)),
+                    }),
+                    reply: reply_tx,
+                })
+                .unwrap();
+            data_tx
+                .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                    b"user",
+                )))
+                .unwrap();
+
+            let writer_thread = std::thread::spawn(move || {
+                run_writer(&mut writer, write_rx);
+                writer
+            });
+            let input_write_tx = write_tx.clone();
+            let input_thread = std::thread::spawn(move || {
+                run_input_forwarder(&mut data_rx, input_write_tx, accepting)
+            });
+            let err = reply_rx.recv().unwrap().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            assert!(watch.abandoned.load(std::sync::atomic::Ordering::SeqCst));
+
+            drop(data_tx);
+            input_thread.join().unwrap();
+            drop(write_tx);
+            let writer = writer_thread.join().unwrap();
+            assert_eq!(
+                writer
+                    .writes
+                    .iter()
+                    .map(|write| write.0.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![b"prompt".as_slice(), b"user".as_slice()]
             );
         }
 
