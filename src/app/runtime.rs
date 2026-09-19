@@ -50,8 +50,6 @@ impl App {
         }
     }
 
-
-
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
@@ -243,83 +241,6 @@ impl App {
         }
     }
 
-    pub(crate) fn tick_selection_autoscroll(&mut self, now: Instant) {
-        let Some(autoscroll) = self.state.selection_autoscroll.clone() else {
-            // Self-heal: state cleared but deadline leaked
-            self.selection_autoscroll_deadline = None;
-            return;
-        };
-
-        // Selection must still be in progress for autoscroll to continue
-        let Some(pane_id) = self.state.selection.as_ref().map(|s| s.pane_id) else {
-            self.stop_selection_autoscroll();
-            return;
-        };
-        if !self
-            .state
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.is_dragging())
-        {
-            self.stop_selection_autoscroll();
-            return;
-        }
-
-        // Rect-change detection: if inner_rect changed since drag, stop
-        let current_rect = self
-            .state
-            .pane_info_by_id(pane_id)
-            .map(|info| info.inner_rect);
-        if current_rect != Some(autoscroll.inner_rect) {
-            self.stop_selection_autoscroll();
-            return;
-        }
-
-        // Scrollback boundary detection via ScrollMetrics — fail-closed if unavailable
-        let Some(metrics) = self
-            .state
-            .pane_scroll_metrics(&self.terminal_runtimes, pane_id)
-        else {
-            self.stop_selection_autoscroll();
-            return;
-        };
-        match autoscroll.direction {
-            crate::app::state::SelectionAutoscrollDirection::Up => {
-                let at_top = metrics.offset_from_bottom >= metrics.max_offset_from_bottom;
-                if at_top {
-                    self.stop_selection_autoscroll();
-                    return;
-                }
-                self.state
-                    .scroll_pane_up(&self.terminal_runtimes, pane_id, 1);
-            }
-            crate::app::state::SelectionAutoscrollDirection::Down => {
-                let at_bottom = metrics.offset_from_bottom == 0;
-                if at_bottom {
-                    self.stop_selection_autoscroll();
-                    return;
-                }
-                self.state
-                    .scroll_pane_down(&self.terminal_runtimes, pane_id, 1);
-            }
-        }
-
-        // Extend selection cursor to last known mouse position
-        self.state.update_selection_cursor(
-            &self.terminal_runtimes,
-            pane_id,
-            autoscroll.last_mouse_screen_col,
-            autoscroll.last_mouse_screen_row,
-        );
-
-        // Reschedule
-        self.selection_autoscroll_deadline = Some(now + SELECTION_AUTOSCROLL_INTERVAL);
-    }
-
-    pub(crate) fn stop_selection_autoscroll(&mut self) {
-        self.state.stop_selection_autoscroll_state();
-        self.selection_autoscroll_deadline = None;
-    }
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
             Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,

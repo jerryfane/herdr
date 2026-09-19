@@ -459,6 +459,8 @@ pub(crate) fn quote_windows_command_line_arg(value: &str) -> String {
     quoted.push_str(&"\\".repeat(backslashes * 2));
     quoted.push('"');
     quoted
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn managed_unix_resume_shell_command(
     argv: &[String],

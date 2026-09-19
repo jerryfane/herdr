@@ -50,8 +50,8 @@ pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalComposerFrame, TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome,
-    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextMatch,
-    TerminalTextPoint, TerminalWordMotion,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -326,23 +326,6 @@ async fn publish_agent_process_detected_event(
             pane = ?pane_id,
             err = %e,
             "failed to deliver AgentProcessDetected event"
-        );
-    }
-}
-
-async fn publish_input_state_changed_event(
-    state_events: mpsc::Sender<AppEvent>,
-    pane_id: PaneId,
-    kind: Option<crate::detect::InputPromptKind>,
-) {
-    if let Err(err) = state_events
-        .send(AppEvent::InputStateChanged { pane_id, kind })
-        .await
-    {
-        warn!(
-            pane = pane_id.raw(),
-            err = %err,
-            "failed to deliver InputStateChanged event"
         );
     }
 }
@@ -1556,21 +1539,23 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn queue_user_input_submission(
+    fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor
+                    .queue_user_input_submission_guarded(text, enter, delay, deadline, guard);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission_guarded(text, enter, delay, guard)
                 }
             }
             #[cfg(test)]
@@ -1579,13 +1564,42 @@ impl PaneRuntimeIo {
                 let sender = sender.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = sender
-                        .try_send(text)
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            std::thread::sleep(delay);
-                            sender.try_send(enter).map_err(std::io::Error::other)
-                        });
+                    let result = if text.is_empty() {
+                        Ok(())
+                    } else {
+                        sender.try_send(text).map_err(|err| {
+                            crate::pty::actor::submission_text_unwritten(&std::io::Error::other(
+                                err,
+                            ))
+                        })
+                    }
+                    .and_then(|()| {
+                        std::thread::sleep(delay);
+                        if let Some(guard) = guard.as_ref() {
+                            if !(guard.occupant_unchanged)() {
+                                if let Some(watch) = guard.watch.as_ref() {
+                                    watch
+                                        .abandoned
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                return Ok(());
+                            }
+                        }
+                        if let Err(err) = sender.try_send(enter) {
+                            if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Err(std::io::Error::other(err));
+                        }
+                        if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
+                            watch
+                                .submitted
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(())
+                    });
                     let _ = reply_tx.send(result);
                 });
                 Ok(reply_rx)
@@ -2537,10 +2551,8 @@ impl PaneRuntime {
                 // unknowable. Checkpoint conservatively; normal autosave settles clean exits.
                 let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
                     pane_id,
-                    exit_reason: crate::platform::ChildExitReason::Handoff,
-                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
-                    pane_id,
                     runtime_epoch: Some(epoch),
+                    exit_reason: crate::platform::ChildExitReason::Handoff,
                 }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
@@ -2581,7 +2593,6 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: true,
             compression,
-            epoch: next_pane_epoch(),
             epoch,
             detect_handle: Some(detect_handle),
         })
@@ -3216,7 +3227,6 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: false,
             compression,
-            epoch: next_pane_epoch(),
             epoch,
             detect_handle,
         })
@@ -3257,6 +3267,8 @@ impl PaneRuntime {
 
     pub(crate) fn content_seq(&self) -> u64 {
         self.content_seq.load(Ordering::Acquire)
+    }
+
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -3618,19 +3630,16 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
-    pub fn queue_user_input_submission(
+    pub fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
-    }
-
-    pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.send_bytes(self.paste_payload(text)).await
+            .queue_user_input_submission_guarded(text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3998,6 +4007,8 @@ mod tests {
         };
         assert_eq!(patch.rows.len(), 5);
         assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 24));
+    }
+
     /// THE INCIDENT'S ACCEPTANCE CRITERION, AT THE LAST LINK IN THE CHAIN.
     ///
     /// A staged update killed 30 panes; on restore all 11 Claude agents relaunched under

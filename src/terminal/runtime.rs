@@ -493,15 +493,16 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-    pub fn queue_user_input_submission(
+    pub fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_guarded(text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

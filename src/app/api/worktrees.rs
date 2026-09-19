@@ -2296,6 +2296,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            runtime_epoch: None,
         });
         assert!(app.state.pending_agent_notifications.contains_key(&pane_id));
         let (runtime, _input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -2344,6 +2345,7 @@ mod tests {
         let pane_updates = app.handle_internal_event_with_pane_updates(AppEvent::PaneDied {
             pane_id,
             exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         });
         assert!(matches!(
             pane_updates.as_slice(),

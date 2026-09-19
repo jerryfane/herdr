@@ -382,12 +382,6 @@ fn agent_start_command_works() {
         run_cli_json(&socket_path, &["agent", "get", "main"])["result"]["agent"]["agent_status"],
         "blocked"
     );
-    assert_eq!(stalled.status.code(), Some(1));
-    let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
-    assert_eq!(stalled["error"]["code"], "agent_prompt_stalled");
-    assert!(stalled["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("submission could not be observed")));
 
     let blocked_prompt = run_cli(
         &socket_path,

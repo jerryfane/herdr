@@ -1,3 +1,23 @@
+pub(crate) const SUBMISSION_TEXT_UNWRITTEN: std::io::ErrorKind = std::io::ErrorKind::NotConnected;
+
+pub(crate) fn submission_text_unwritten(source: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(SUBMISSION_TEXT_UNWRITTEN, source.to_string())
+}
+
+#[derive(Clone)]
+pub(crate) struct SubmissionGuard {
+    pub(crate) occupant_unchanged: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    pub(crate) watch: Option<std::sync::Arc<crate::terminal::PromptSubmitWatch>>,
+}
+
+impl std::fmt::Debug for SubmissionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmissionGuard")
+            .field("watch", &self.watch.is_some())
+            .finish()
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -6,6 +26,7 @@ pub(crate) use unix::*;
 
 #[cfg(windows)]
 mod windows {
+    use super::SubmissionGuard;
     use std::io::{Read, Write};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -50,6 +71,7 @@ mod windows {
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -68,14 +90,6 @@ mod windows {
         Shutdown,
     }
 
-    enum PtyIoDataCommand {
-        WriteUserInput(Bytes),
-        WriteUserInputAcknowledged {
-            bytes: Bytes,
-            reply: std_mpsc::Sender<std::io::Result<()>>,
-        },
-    }
-
     #[derive(Clone)]
     pub(crate) struct PtyIoActorHandle {
         data_tx: mpsc::Sender<PtyIoDataCommand>,
@@ -86,7 +100,6 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
-
         pub(crate) fn try_write_user_input(
             &self,
             bytes: Bytes,
@@ -123,6 +136,17 @@ mod windows {
             delay: Duration,
             deadline: Option<Instant>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            self.queue_user_input_submission_guarded(text, enter, delay, deadline, None)
+        }
+
+        pub(crate) fn queue_user_input_submission_guarded(
+            &self,
+            text: Bytes,
+            enter: Bytes,
+            delay: Duration,
+            deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
                 .lock()
@@ -141,6 +165,7 @@ mod windows {
                     delay,
                     deadline,
                     reply: reply_tx,
+                    guard,
                 })
                 .map_err(|err| match err {
                     mpsc::error::TrySendError::Full(_) => std::io::Error::new(
@@ -352,6 +377,7 @@ mod windows {
                     delay,
                     deadline,
                     reply,
+                    guard,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
                         deadline.saturating_duration_since(Instant::now()) <= delay
@@ -360,18 +386,53 @@ mod windows {
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            let accepting = accepting
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !*accepting {
-                                return Err(pty_actor_closed());
-                            }
-                            write_submission_part(&write_tx, enter, None)
-                        })
+                        write_submission_part(&write_tx, text, text_deadline)
+                            .map_err(|err| {
+                                if err.kind() == std::io::ErrorKind::TimedOut {
+                                    err
+                                } else {
+                                    super::submission_text_unwritten(&err)
+                                }
+                            })
+                            .and_then(|()| {
+                                // A started text write is committed. Finish Enter even if the caller
+                                // stops waiting so a timeout cannot leave a partial prompt.
+                                std::thread::sleep(delay);
+                                let accepting = accepting
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if !*accepting {
+                                    return Err(pty_actor_closed());
+                                }
+                                if let Some(guard) = guard.as_ref() {
+                                    if !(guard.occupant_unchanged)() {
+                                        if let Some(watch) = guard.watch.as_ref() {
+                                            watch.abandoned.store(
+                                                true,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            event = "pty.submission.withheld",
+                                            subsystem = "pty",
+                                            "delayed PTY input withheld: pane occupant changed during the submit delay"
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                                let written = write_submission_part(&write_tx, enter, None);
+                                if written.is_ok() {
+                                    if let Some(watch) =
+                                        guard.as_ref().and_then(|guard| guard.watch.as_ref())
+                                    {
+                                        watch.submitted.store(
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                    }
+                                }
+                                written
+                            })
                     };
                     let failed = result
                         .as_ref()

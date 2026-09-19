@@ -1365,30 +1365,6 @@ impl AppState {
                 );
             }
             assert!(
-                self.right_click_passthrough.is_none(),
-                "empty app state must not keep right-click passthrough gesture"
-            );
-            assert!(
-                self.drag.is_none(),
-                "empty app state must not keep drag state"
-            );
-            assert!(
-                self.workspace_presses.is_empty(),
-                "empty app state must not keep workspace press state"
-            );
-            assert!(
-                self.tab_presses.is_empty(),
-                "empty app state must not keep tab press state"
-            );
-            assert!(
-                self.context_menu.is_none(),
-                "empty app state must not keep context menu"
-            );
-            assert!(
-                self.host_mouse_pixels.is_none(),
-                "empty app state must not keep host mouse pixel provenance"
-            );
-            assert!(
                 self.pty_width_leases.is_empty(),
                 "empty app state must not keep pty width leases"
             );

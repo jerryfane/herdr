@@ -297,9 +297,9 @@ pub(super) fn compute_pane_infos_for_tab(
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
             if resize_panes
-                && tab.terminal_id(focused_id).is_some_and(|terminal_id| {
-                    !app.pty_geometry_externally_owned(terminal_id)
-                })
+                && tab
+                    .terminal_id(focused_id)
+                    .is_some_and(|terminal_id| !app.pty_geometry_externally_owned(terminal_id))
             {
                 rt.resize(
                     inner_rect.height,
@@ -335,9 +335,9 @@ pub(super) fn compute_pane_infos_for_tab(
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
             if resize_panes
-                && tab.terminal_id(info.id).is_some_and(|terminal_id| {
-                    !app.pty_geometry_externally_owned(terminal_id)
-                })
+                && tab
+                    .terminal_id(info.id)
+                    .is_some_and(|terminal_id| !app.pty_geometry_externally_owned(terminal_id))
             {
                 rt.resize(
                     inner_rect.height,

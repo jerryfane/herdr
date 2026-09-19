@@ -310,6 +310,7 @@ pub struct PaneCopySearchParams {
     pub content_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<PaneTextRange>,
+}
 
 /// Sets the real PTY window size (cols/rows) of a pane and takes or releases
 /// geometry ownership so a remote client can drive the pane size. Distinct from

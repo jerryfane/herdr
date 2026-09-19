@@ -30,12 +30,17 @@ pub fn run_server() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
+    let federation_store = Arc::new(std::sync::Mutex::new(
+        crate::api::federation_store::FederationStore::default(),
+    ));
 
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
+        &loaded_config.config.federation,
+        federation_store.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -60,6 +65,8 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_federation_store(federation_store);
+        app.set_federation_manager(_api_server.federation_manager());
         seed_startup_workspace_if_empty(&mut app);
 
         // Create the headless server.
@@ -152,8 +159,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .build()
         .map_err(io::Error::other)?;
 
+    let federation_store = Arc::new(std::sync::Mutex::new(
+        crate::api::federation_store::FederationStore::default(),
+    ));
     let result = rt.block_on(async {
-        let app = app::App::new_from_handoff(
+        let mut app = app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
@@ -173,7 +183,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            &loaded_config.config.federation,
+            federation_store.clone(),
         )?;
+        app.set_federation_store(federation_store);
+        app.set_federation_manager(api_server.federation_manager());
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,

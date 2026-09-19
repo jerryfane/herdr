@@ -12,6 +12,14 @@ use crate::app::App;
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+fn input_kind_suffix(kind: Option<crate::detect::InputPromptKind>) -> &'static str {
+    match kind {
+        Some(crate::detect::InputPromptKind::Confirm) => " (confirm)",
+        Some(crate::detect::InputPromptKind::Select) => " (select)",
+        Some(crate::detect::InputPromptKind::FreeText) => " (free text)",
+        Some(crate::detect::InputPromptKind::Unknown) | None => "",
+    }
+}
 
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
@@ -133,7 +141,13 @@ impl App {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Ok(())) => encode_success(
+                            id,
+                            ResponseResult::AgentPrompted {
+                                agent,
+                                delivery: Some(AgentPromptDelivery::WrittenToPty),
+                            },
+                        ),
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
@@ -372,18 +386,14 @@ impl App {
             return Err(agent_not_ready(id, &params.target));
         }
         if terminal.input_pending {
-            let kind = terminal
-                .input_prompt_kind
-                .map(crate::detect::manifest::input_prompt_kind_label)
-                .unwrap_or("unknown");
-            return encode_error(
+            return Err(encode_error(
                 id,
                 "agent_input_pending",
                 format!(
-                    "agent {} has a pending {kind} input prompt; chat prompt was not written",
-                    params.target
+                    "agent input is pending{}; answer it before prompting again",
+                    input_kind_suffix(terminal.input_prompt_kind)
                 ),
-            );
+            ));
         }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
@@ -419,9 +429,7 @@ impl App {
         }
         // Bind the occupant baseline HERE, before a single byte is written.
         // Capturing it after the blocking acknowledgement would adopt whatever
-        // occupies the pane by then as the expected occupant, so a same-kind
-        // swap during the write/ack window would be baselined as legitimate and
-        // the delayed key would land in a session that never received the text.
+        // occupies the pane by then as the expected occupant.
         let expected_group = super::super::agents::capture_occupant_group(runtime);
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
@@ -433,17 +441,37 @@ impl App {
         } else {
             text
         };
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
+        let composer_baseline = runtime.detection_content_seq();
+        let submit_watch = std::sync::Arc::new(crate::terminal::PromptSubmitWatch::default());
+        let guard = crate::pty::actor::SubmissionGuard {
+            occupant_unchanged: std::sync::Arc::new(super::super::agents::runtime_agent_guard(
+                runtime,
+                expected_agent,
+                expected_group,
+            )),
+            watch: Some(std::sync::Arc::clone(&submit_watch)),
         };
         let completion = runtime
-            .queue_user_input_submission(
+            .queue_user_input_submission_guarded(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
+                Some(guard),
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        self.record_pane_prompt_submit_watch(resolved.ws_idx, resolved.pane_id, submit_watch);
+        self.record_pane_composer_write(
+            resolved.ws_idx,
+            resolved.pane_id,
+            crate::terminal::ComposerInputSource::AgentPrompt,
+            composer_baseline,
+            true,
+            true,
+        );
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
         Ok((id, agent, completion))
     }
 
@@ -1466,11 +1494,13 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at,
+            runtime_epoch: None,
         });
         app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
             pane_id,
             agent: Agent::Pi,
             observed_at: observed_at + std::time::Duration::from_secs(1),
+            runtime_epoch: None,
         });
 
         let terminal = &app.state.terminals[&terminal_id];
@@ -1573,9 +1603,9 @@ mod tests {
         };
         assert_ne!(
             agent.composer.attempt_id.as_deref(),
-            Some(foreign_attempt_id.as_str())
+            Some(first_attempt),
+            "retry with identical text is still a fresh write attempt"
         );
-
 
         let rejected = run_deferred_agent_prompt(
             &mut app,
@@ -1615,20 +1645,23 @@ mod tests {
         let guard_flag = Arc::clone(&still_hosting);
         let abandoned = Arc::new(crate::terminal::PromptSubmitWatch::default());
 
-        runtime
-            .write_bytes_acknowledged(
+        let _completion = runtime
+            .queue_user_input_submission_guarded(
                 Bytes::from_static(b"prompt text"),
-                std::time::Duration::from_secs(5),
+                Bytes::from_static(b"\r"),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                None,
+                Some(crate::pty::actor::SubmissionGuard {
+                    occupant_unchanged: Arc::new(move || guard_flag.load(Ordering::SeqCst)),
+                    watch: Some(Arc::clone(&abandoned)),
+                }),
             )
-            .expect("text should reach the PTY");
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"prompt text"));
-
-        runtime.send_bytes_after_guarded(
-            Bytes::from_static(b"\r"),
-            AGENT_PROMPT_SUBMIT_DELAY,
-            Box::new(move || guard_flag.load(Ordering::SeqCst)),
-            Some(Arc::clone(&abandoned)),
-        );
+            .expect("the submission should queue");
+        let text = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("text should reach the PTY")
+            .expect("channel open");
+        assert_eq!(text, Bytes::from_static(b"prompt text"));
 
         // The pane changes hands while the Enter is still pending.
         still_hosting.store(false, Ordering::SeqCst);
@@ -1663,17 +1696,27 @@ mod tests {
                 80, 24, 0, b"", 1,
             );
         let abandoned = Arc::new(crate::terminal::PromptSubmitWatch::default());
-        runtime.send_bytes_after_guarded(
-            Bytes::from_static(b"\r"),
-            AGENT_PROMPT_SUBMIT_DELAY,
-            Box::new(|| true),
-            Some(Arc::clone(&abandoned)),
-        );
+        let completion = runtime
+            .queue_user_input_submission_guarded(
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                None,
+                Some(crate::pty::actor::SubmissionGuard {
+                    occupant_unchanged: Arc::new(|| true),
+                    watch: Some(Arc::clone(&abandoned)),
+                }),
+            )
+            .expect("the submission should queue");
         let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("Enter should arrive")
             .expect("channel open");
         assert_eq!(delivered, Bytes::from_static(b"\r"));
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the submission should answer")
+            .expect("an unchanged occupant should receive the submission");
         assert!(!abandoned.abandoned.load(Ordering::SeqCst));
         assert!(
             abandoned.submitted.load(Ordering::SeqCst),
@@ -1695,13 +1738,19 @@ mod tests {
         let watch = Arc::new(crate::terminal::PromptSubmitWatch::default());
         drop(rx); // the PTY side is gone, so the delayed write cannot land
 
-        runtime.send_bytes_after_guarded(
-            Bytes::from_static(b"\r"),
-            AGENT_PROMPT_SUBMIT_DELAY,
-            Box::new(|| true),
-            Some(Arc::clone(&watch)),
-        );
-        tokio::time::sleep(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(300)).await;
+        let completion = runtime
+            .queue_user_input_submission_guarded(
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                None,
+                Some(crate::pty::actor::SubmissionGuard {
+                    occupant_unchanged: Arc::new(|| true),
+                    watch: Some(Arc::clone(&watch)),
+                }),
+            )
+            .expect("the submission should queue");
+        let _ = completion.recv_timeout(Duration::from_secs(1));
 
         assert!(
             watch.abandoned.load(Ordering::SeqCst),
@@ -1739,8 +1788,9 @@ mod tests {
         app.state.insert_test_runtime(pane_id, runtime);
         let target = app.public_pane_id(0, pane_id).unwrap();
 
-        let response = app.handle_agent_prompt(
-            "req".into(),
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
             AgentPromptParams {
                 target,
                 text: "api prompt".into(),
@@ -1817,8 +1867,9 @@ mod tests {
         let target = app.public_pane_id(0, pane_id).unwrap();
 
         // Prompt A: submits, its turn completes, so A's claim retires.
-        let _ = app.handle_agent_prompt(
-            "req-a".into(),
+        let _ = run_deferred_agent_prompt(
+            &mut app,
+            "req-a",
             AgentPromptParams {
                 target: target.clone(),
                 text: "prompt a".into(),
@@ -1837,8 +1888,9 @@ mod tests {
             .record_completed_turn(0, Default::default());
 
         // Prompt B: freshly written, Enter not yet landed.
-        let response = app.handle_agent_prompt(
-            "req-b".into(),
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req-b",
             AgentPromptParams {
                 target,
                 text: "prompt b".into(),
@@ -1887,8 +1939,9 @@ mod tests {
         app.state.insert_test_runtime(pane_id, runtime);
 
         let target = app.public_pane_id(0, pane_id).unwrap();
-        let response = app.handle_agent_prompt(
-            "req".into(),
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
             AgentPromptParams {
                 target,
                 text: "stranded text".into(),
@@ -3089,6 +3142,7 @@ mod tests {
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id,
             runtime_epoch: Some(retired_target_epoch),
+            exit_reason: crate::platform::ChildExitReason::Exited,
         });
         assert_eq!(
             app.state.terminals[&terminal_id]
@@ -3107,6 +3161,7 @@ mod tests {
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id,
             runtime_epoch: Some(retired_target_epoch),
+            exit_reason: crate::platform::ChildExitReason::Exited,
         });
 
         let terminal = app.state.terminals.get(&terminal_id).unwrap();

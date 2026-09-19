@@ -175,7 +175,7 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    mut params: crate::api::schema::AgentPromptParams,
+    params: crate::api::schema::AgentPromptParams,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -194,7 +194,7 @@ pub(super) fn prompt_agent(
 
 fn prompt_agent_with_effect_timeout(
     request_id: String,
-    params: crate::api::schema::AgentPromptParams,
+    mut params: crate::api::schema::AgentPromptParams,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -212,8 +212,14 @@ fn prompt_agent_with_effect_timeout(
         )));
     };
 
-    let last_event_sequence = event_hub.current_sequence();
-    let before_prompt = match agent_get(&request_id, &params.target, api_tx) {
+    let wait_started = std::time::Instant::now();
+    let before_prompt = match agent_get_for_prompt(
+        &request_id,
+        &params.target,
+        api_tx,
+        wait.timeout_ms,
+        wait_started,
+    ) {
         Ok(agent) => agent,
         Err(response) => {
             return serde_json::to_string(&response)
@@ -221,16 +227,27 @@ fn prompt_agent_with_effect_timeout(
                 .map_err(std::io::Error::other);
         }
     };
+    let prompt_started_working =
+        before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
     let target = params.target.clone();
-    let initially_working = before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
-    let prompt_response = dispatch_to_app_with_timeout(
-        Request {
-            id: request_id.clone(),
-            method: Method::AgentPrompt(params),
-        },
+    if let Some(prompt_wait) = params.wait.as_mut() {
+        prompt_wait.submission_deadline = wait
+            .timeout_ms
+            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
+    }
+    let last_event_sequence = event_hub.current_sequence();
+    let prompt_request = Request {
+        id: request_id.clone(),
+        method: Method::AgentPrompt(params),
+    };
+    #[cfg(windows)]
+    let prompt_response = dispatch_to_app_with_caller_timeout(
+        prompt_request,
         api_tx,
-        None,
+        remaining_timeout_ms(wait.timeout_ms, wait_started).map(std::time::Duration::from_millis),
     );
+    #[cfg(not(windows))]
+    let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
@@ -243,8 +260,6 @@ fn prompt_agent_with_effect_timeout(
         return agent_wait_not_running(request_id).map(Some);
     }
     let composer_attempt_id = prompted.composer.attempt_id.clone();
-
-    let wait_started = std::time::Instant::now();
     let prompt_state_change_seq = prompted.state_change_seq;
     let until = agent_wait_statuses(wait.until);
     let effect_timeout_ms = wait.timeout_ms.map_or(effect_timeout_cap_ms, |timeout_ms| {
@@ -259,7 +274,7 @@ fn prompt_agent_with_effect_timeout(
         &before_prompt,
         prompted,
         prompt_state_change_seq,
-        initially_working,
+        prompt_started_working,
         composer_attempt_id.as_deref(),
         effect_timeout_ms,
         caller_timeout_is_effect_deadline,
@@ -270,7 +285,7 @@ fn prompt_agent_with_effect_timeout(
     else {
         return Ok(None);
     };
-    let (initial, delivery) = match effect {
+    let (mut initial, delivery) = match effect {
         PromptEffectOutcome::Submitted(agent) => {
             (agent, crate::api::schema::AgentPromptDelivery::Submitted)
         }
@@ -279,6 +294,49 @@ fn prompt_agent_with_effect_timeout(
         }
         PromptEffectOutcome::Response(response) => return Ok(Some(response)),
     };
+    let prompt_activity_observed = prompt_started_working
+        || matches!(
+            initial.agent_status,
+            crate::api::schema::AgentStatus::Working | crate::api::schema::AgentStatus::Blocked
+        );
+    if !prompt_activity_observed {
+        let remaining_timeout_ms = remaining_timeout_ms(wait.timeout_ms, wait_started);
+        let (stall_timeout_ms, timeout_kind) = match remaining_timeout_ms {
+            Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
+                (timeout_ms, AgentWaitTimeoutKind::Status)
+            }
+            _ => (
+                AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                AgentWaitTimeoutKind::PromptStalled {
+                    timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                },
+            ),
+        };
+        let Some(outcome) = wait_for_resolved_agent(
+            request_id.clone(),
+            ResolvedAgentWait {
+                target: target.clone(),
+                until: prompt_activity_statuses(),
+                timeout_ms: Some(stall_timeout_ms),
+                initial,
+                last_event_sequence,
+                after_state_change_seq: Some(prompt_state_change_seq),
+                accept_transient_status: true,
+                timeout_kind,
+            },
+            stream,
+            api_tx,
+            event_hub,
+            running,
+        )?
+        else {
+            return Ok(None);
+        };
+        initial = match outcome {
+            AgentWaitOutcome::Matched(agent) => *agent,
+            AgentWaitOutcome::Response(response) => return Ok(Some(response)),
+        };
+    }
     if agent_wait_matches(&initial, &until, None) {
         return agent_prompt_success(request_id, initial, delivery).map(Some);
     }
@@ -393,7 +451,7 @@ fn classify_prompt_observation(
     if !timed_out {
         return None;
     }
-    if caller_timeout_is_effect_deadline {
+    if caller_timeout_is_effect_deadline && !initially_working {
         return Some(PromptObservationVerdict::TimedOut);
     }
     if composer_matches {
@@ -878,7 +936,7 @@ fn agent_wait_success(
 fn agent_wait_timeout(
     request_id: String,
     kind: AgentWaitTimeoutKind,
-    _current: &crate::api::schema::AgentInfo,
+    current: &crate::api::schema::AgentInfo,
 ) -> std::io::Result<String> {
     let (code, message) = match kind {
         AgentWaitTimeoutKind::Status => {
@@ -1254,6 +1312,7 @@ mod tests {
                 wait: Some(crate::api::schema::AgentPromptWaitOptions {
                     until: vec![until],
                     timeout_ms: Some(10_000),
+                    submission_deadline: None,
                 }),
             },
             &mut client,
@@ -1290,6 +1349,16 @@ mod tests {
             classify_prompt_observation(false, 10, 10, false, true, true, true, false),
             Some(PromptObservationVerdict::Unsubmitted),
             "persistent same-attempt composer evidence proves non-submission"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 10, false, false, false, true, true),
+            Some(PromptObservationVerdict::WrittenToPty),
+            "an already-working pane reports what it can prove, not a timeout"
+        );
+        assert_eq!(
+            classify_prompt_observation(true, 10, 10, false, true, true, true, true),
+            Some(PromptObservationVerdict::Unsubmitted),
+            "a visible same-attempt draft outranks the already-working shortcut"
         );
         assert_eq!(
             classify_prompt_observation(false, 10, 10, false, false, true, true, false),

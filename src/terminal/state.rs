@@ -424,6 +424,8 @@ impl TerminalState {
             self.agent_process_acquisition_pending = false;
         }
         suppress_completion
+    }
+
     pub(crate) fn record_composer_write(
         &mut self,
         source: super::ComposerInputSource,
@@ -974,9 +976,10 @@ impl TerminalState {
         if agent_released {
             self.composer_write = None;
         }
-        // Release the name only once the agent actually leaves the pane. A
-        // deliberate restart or in-place transfer keeps the seat identity but
-        // drops its old session anchor so the replacement can adopt it.
+        // A process-exit notification is not enough to release a name: the
+        // agent may still occupy the pane. Once a later observation confirms
+        // absence, preserve deliberate restart/transfer identity while
+        // releasing its old session anchor; all other exits free the name.
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
             if self.pending_agent_resume_plan.is_some()
                 || self
@@ -1793,6 +1796,8 @@ impl TerminalState {
     ) {
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
+    }
+
     pub(crate) fn set_reported_agent_session_path(
         &mut self,
         source: &str,
@@ -6421,6 +6426,14 @@ mod tests {
             false,
             true, // process_exited
         );
+        // The next detection pass confirms the old process is gone.
+        terminal.set_detected_state_with_visible_blocker(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             terminal.agent_name.as_deref(),
             Some("keephair"),
@@ -6574,6 +6587,14 @@ mod tests {
             false,
             false,
             true, // process_exited
+        );
+        // The next detection pass confirms the process is actually gone.
+        terminal.set_detected_state_with_visible_blocker(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
         );
         assert!(
             terminal.agent_name.is_none(),

@@ -15,6 +15,12 @@ pub(crate) struct AgentViewContext {
 pub(crate) trait AgentViewEntry {
     fn scope(&self) -> usize;
     fn status(&self) -> &'static str;
+    fn input_pending(&self) -> bool {
+        false
+    }
+    fn input_prompt_kind(&self) -> Option<&'static str> {
+        None
+    }
     fn workspace_id(&self) -> Option<Cow<'_, str>>;
     fn tab_id(&self) -> Option<Cow<'_, str>>;
     fn pane_id(&self) -> Option<Cow<'_, str>>;
@@ -88,6 +94,12 @@ fn field_value<'a, E: AgentViewEntry + ?Sized>(
         AgentViewField::Builtin(AgentViewBuiltinField::Status) => {
             Some(EvalValue::String(Cow::Borrowed(entry.status())))
         }
+        AgentViewField::Builtin(AgentViewBuiltinField::InputPending) => {
+            Some(EvalValue::Bool(entry.input_pending()))
+        }
+        AgentViewField::Builtin(AgentViewBuiltinField::InputPromptKind) => entry
+            .input_prompt_kind()
+            .map(|value| EvalValue::String(Cow::Borrowed(value))),
         AgentViewField::Builtin(AgentViewBuiltinField::WorkspaceId) => {
             entry.workspace_id().map(|value| EvalValue::ScopedId {
                 scope: entry.scope(),

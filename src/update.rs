@@ -2880,6 +2880,10 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                pane_input_stream: false,
+                gram_upload_stream: false,
+                agent_session_transfer: false,
+                agent_session_transfer_harnesses: Vec::new(),
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3218,6 +3222,10 @@ mod tests {
                     ),
                     surface_interest: true,
                     health_check: true,
+                    pane_input_stream: false,
+                    gram_upload_stream: false,
+                    agent_session_transfer: false,
+                    agent_session_transfer_harnesses: Vec::new(),
                 }),
             },
         };

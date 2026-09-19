@@ -151,7 +151,6 @@ struct LoadedManifest {
     // Keep Regex search caches warm across manifest loads and pane polling.
     compiled_rules: Arc<[CompiledRule]>,
     compiled_input_rules: Arc<[CompiledRule]>,
-    compiled_composer_paste_token: Option<Regex>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -966,13 +965,6 @@ fn loaded_manifest(
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?.into();
     let compiled_input_rules = compile_input_manifest(&manifest)?.into();
-    let compiled_composer_paste_token = manifest
-        .composer
-        .as_ref()
-        .and_then(|composer| composer.paste_token_regex.as_deref())
-        .map(Regex::new)
-        .transpose()
-        .map_err(|err| format!("composer uses invalid paste_token_regex: {err}"))?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,

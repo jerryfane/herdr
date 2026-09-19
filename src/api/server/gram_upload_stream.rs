@@ -844,7 +844,7 @@ mod tests {
         let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             app_rx,
             crate::api::EventHub::default(),
@@ -897,7 +897,7 @@ mod tests {
         let (_unused_tx, app_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
-            false,
+            crate::app::AppPolicy::TEST,
             None,
             app_rx,
             crate::api::EventHub::default(),

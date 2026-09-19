@@ -4280,6 +4280,33 @@
           ],
           "type": "object"
         },
+        "PaneTurnsParams": {
+          "properties": {
+            "expected_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "since": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneWaitForOutputParams": {
           "properties": {
             "lines": {
@@ -5819,6 +5846,22 @@
         {
           "properties": {
             "method": {
+              "const": "notifications.register_device",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/NotificationsRegisterDeviceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "notifications.register_activity",
               "type": "string"
             },
@@ -6976,6 +7019,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneCopySearchParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.set_pty_size",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetPtySizeParams"
             }
           },
           "required": [
@@ -11184,6 +11243,87 @@
           ],
           "type": "object"
         },
+        "PaneTurnRecord": {
+          "properties": {
+            "agent_session_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message_truncated": {
+              "type": "boolean"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/TurnOutcome",
+              "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "turn_epoch",
+            "outcome",
+            "completed_unix_ms"
+          ],
+          "type": "object"
+        },
+        "PaneTurnsResult": {
+          "properties": {
+            "oldest_available": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "records": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PaneTurnRecord"
+              },
+              "type": "array"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "turn_epoch",
+            "records"
+          ],
+          "type": "object"
+        },
         "PaneZoomReason": {
           "enum": [
             "single_pane",
@@ -13556,17 +13696,22 @@
                 "null"
               ]
             },
+            "gram_upload_stream": {
+              "default": false,
+              "description": "The daemon serves `gram.upload.stream`, uploading a whole file over one\nconnection instead of one connection per chunk. Clients feature-detect this\nand otherwise fall back to per-chunk `gram.upload_chunk`.",
+              "type": "boolean"
+            },
             "health_check": {
               "default": false,
               "description": "Whether this server supports endpoint health probes.",
               "type": "boolean"
             },
-            "gram_upload_stream": {
-              "default": false,
-              "description": "The daemon serves `gram.upload.stream`, uploading a whole file over one\nconnection instead of one connection per chunk. Clients feature-detect this\nand otherwise fall back to per-chunk `gram.upload_chunk`."
+            "live_handoff": {
               "type": "boolean"
             },
-            "live_handoff": {
+            "pane_input_stream": {
+              "default": false,
+              "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
               "type": "boolean"
             },
             "surface_interest": {

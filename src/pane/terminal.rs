@@ -534,12 +534,10 @@ impl PaneTerminal {
 
     pub(crate) fn try_compression_activity(&self) -> Result<Option<u64>, crate::ghostty::Error> {
         self.ghostty.try_compression_activity()
-    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
-        self.ghostty.composer_frame()
     }
 
-    pub fn recent_text(&self, lines: usize) -> String {
-        self.ghostty.recent_text(lines)
+    pub(crate) fn composer_frame(&self) -> TerminalComposerFrame {
+        self.ghostty.composer_frame()
     }
 
     pub(crate) fn try_compress_incremental_if_activity(
@@ -2349,7 +2347,7 @@ impl GhosttyPaneTerminal {
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false);
-        let screen = ghostty_detection_text(&core).unwrap_or_default();
+        let screen = ghostty_detection_text(&mut core).unwrap_or_default();
         let current = current_cursor_state(&mut core);
         let cursor = effective_cursor_state(&mut core, current);
         TerminalComposerFrame {

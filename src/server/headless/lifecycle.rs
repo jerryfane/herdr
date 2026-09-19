@@ -75,6 +75,7 @@ impl HeadlessServer {
             &self.app.terminal_runtimes,
             self.app.state.active,
             self.app.state.selected,
+            &self.app.state.archived_agents,
         );
 
         let mut handoff_entries = Vec::new();
@@ -238,10 +239,13 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        let loaded_config = crate::config::Config::load();
         let api_server = api::start_server_with_stop_control(
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            &loaded_config.config.federation,
+            self.app.federation.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -251,6 +255,8 @@ impl HeadlessServer {
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
+        self.app
+            .set_federation_manager(api_server.federation_manager());
         self.api_server = Some(api_server);
         self.client_listener = listener;
         self.client_socket_path = client_path;

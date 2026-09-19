@@ -80,6 +80,20 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
     }
 }
 
+fn agent_entry_attention_priority(entry: &AgentPanelEntry) -> u8 {
+    if entry.input_pending {
+        5
+    } else {
+        match (entry.state, entry.seen) {
+            (crate::detect::AgentState::Blocked, false) => 4,
+            (crate::detect::AgentState::Idle, false) => 3,
+            (crate::detect::AgentState::Working, _) => 2,
+            (crate::detect::AgentState::Blocked, true) => 1,
+            _ => 0,
+        }
+    }
+}
+
 pub(crate) fn presented_workspace_idx(app: &AppState) -> Option<usize> {
     app.active
 }
@@ -111,6 +125,18 @@ impl AgentViewEntry for AppAgentViewEntry<'_> {
 
     fn status(&self) -> &'static str {
         status_name(self.entry.state, self.entry.seen)
+    }
+    fn input_pending(&self) -> bool {
+        self.entry.input_pending
+    }
+
+    fn input_prompt_kind(&self) -> Option<&'static str> {
+        self.entry.input_prompt_kind.map(|kind| match kind {
+            crate::detect::InputPromptKind::Confirm => "confirm",
+            crate::detect::InputPromptKind::Select => "select",
+            crate::detect::InputPromptKind::FreeText => "free_text",
+            crate::detect::InputPromptKind::Unknown => "unknown",
+        })
     }
 
     fn workspace_id(&self) -> Option<Cow<'_, str>> {
@@ -335,171 +361,6 @@ fn status_name(state: crate::detect::AgentState, seen: bool) -> &'static str {
     }
 }
 
-fn compare_entries(
-    app: &AppState,
-    left: &AgentPanelEntry,
-    right: &AgentPanelEntry,
-    sorts: &[AgentViewSort],
-) -> Ordering {
-    for sort in sorts {
-        let left = sort_value(app, left, &sort.field);
-        let right = sort_value(app, right, &sort.field);
-        let ordering = compare_optional_values(left, right, sort.order);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
-}
-
-fn compare_optional_values(
-    left: Option<EvalValue>,
-    right: Option<EvalValue>,
-    order: AgentViewSortOrder,
-) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            let ordering = left.cmp(&right);
-            if matches!(order, AgentViewSortOrder::Desc) {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn field_value(
-    app: &AppState,
-    entry: &AgentPanelEntry,
-    field: &AgentViewField,
-) -> Option<EvalValue> {
-    match field {
-        AgentViewField::Builtin(field) => builtin_field_value(app, entry, *field),
-        AgentViewField::Token { token } => entry.tokens.get(token).cloned().map(EvalValue::String),
-    }
-}
-
-fn builtin_field_value(
-    app: &AppState,
-    entry: &AgentPanelEntry,
-    field: AgentViewBuiltinField,
-) -> Option<EvalValue> {
-    match field {
-        AgentViewBuiltinField::Status => {
-            Some(EvalValue::String(status_name(entry.state, entry.seen)))
-        }
-        AgentViewBuiltinField::InputPending => Some(EvalValue::Bool(entry.input_pending)),
-        AgentViewBuiltinField::InputPromptKind => entry
-            .input_prompt_kind
-            .map(crate::detect::manifest::input_prompt_kind_label)
-            .map(str::to_string)
-            .map(EvalValue::String),
-        AgentViewBuiltinField::WorkspaceId => app
-            .workspaces
-            .get(entry.ws_idx)
-            .map(|workspace| EvalValue::String(workspace.id.clone())),
-        AgentViewBuiltinField::TabId => public_tab_id(app, entry).map(EvalValue::String),
-        AgentViewBuiltinField::PaneId => public_pane_id(app, entry).map(EvalValue::String),
-        AgentViewBuiltinField::Agent => entry.agent_kind_label.clone().map(EvalValue::String),
-        AgentViewBuiltinField::Seen => Some(EvalValue::Bool(entry.seen)),
-        AgentViewBuiltinField::StateChangeSeq => {
-            entry.last_agent_state_change_seq.map(EvalValue::Number)
-        }
-    }
-}
-
-fn operand_value(app: &AppState, value: &AgentViewValue) -> Option<EvalValue> {
-    match value {
-        AgentViewValue::String(value) => Some(EvalValue::String(value.clone())),
-        AgentViewValue::Bool(value) => Some(EvalValue::Bool(*value)),
-        AgentViewValue::Number(value) => Some(EvalValue::Number(*value)),
-        AgentViewValue::Context { context } => context_value(app, *context),
-    }
-}
-
-fn context_value(app: &AppState, context: AgentViewContext) -> Option<EvalValue> {
-    let ws_idx = presented_workspace_idx(app)?;
-    let workspace = app.workspaces.get(ws_idx)?;
-    match context {
-        AgentViewContext::CurrentWorkspaceId => Some(EvalValue::String(workspace.id.clone())),
-        AgentViewContext::CurrentTabId => {
-            let tab_number = workspace.public_tab_number(workspace.active_tab)?;
-            Some(EvalValue::String(
-                crate::workspace::public_tab_id_for_number(&workspace.id, tab_number),
-            ))
-        }
-    }
-}
-
-fn sort_value(
-    app: &AppState,
-    entry: &AgentPanelEntry,
-    field: &AgentViewSortField,
-) -> Option<EvalValue> {
-    match field {
-        AgentViewSortField::Token { token } => {
-            entry.tokens.get(token).cloned().map(EvalValue::String)
-        }
-        AgentViewSortField::Builtin(field) => match field {
-            AgentViewBuiltinSortField::WorkspaceOrder => {
-                Some(EvalValue::Number(entry.ws_idx as u64))
-            }
-            AgentViewBuiltinSortField::TabOrder => app
-                .workspaces
-                .get(entry.ws_idx)
-                .and_then(|workspace| workspace.public_tab_number(entry.tab_idx))
-                .map(|number| EvalValue::Number(number as u64)),
-            AgentViewBuiltinSortField::PaneOrder => app
-                .workspaces
-                .get(entry.ws_idx)
-                .and_then(|workspace| workspace.public_pane_number(entry.pane_id))
-                .map(|number| EvalValue::Number(number as u64)),
-            AgentViewBuiltinSortField::Attention => Some(EvalValue::Number(u64::from(
-                agent_entry_attention_priority(entry),
-            ))),
-            AgentViewBuiltinSortField::Status => {
-                Some(EvalValue::String(status_name(entry.state, entry.seen)))
-            }
-            AgentViewBuiltinSortField::Agent => {
-                entry.agent_kind_label.clone().map(EvalValue::String)
-            }
-            AgentViewBuiltinSortField::Seen => Some(EvalValue::Bool(entry.seen)),
-            AgentViewBuiltinSortField::StateChangeSeq => {
-                entry.last_agent_state_change_seq.map(EvalValue::Number)
-            }
-        },
-    }
-}
-
-fn agent_entry_attention_priority(entry: &AgentPanelEntry) -> u8 {
-    if entry.input_pending {
-        5
-    } else {
-        super::api_helpers::tab_attention_priority(entry.state, entry.seen)
-    }
-}
-
-fn status_name(state: crate::detect::AgentState, seen: bool) -> String {
-    let status = match (state, seen) {
-        (crate::detect::AgentState::Idle, false) => AgentStatus::Done,
-        (crate::detect::AgentState::Idle, true) => AgentStatus::Idle,
-        (crate::detect::AgentState::Working, _) => AgentStatus::Working,
-        (crate::detect::AgentState::Blocked, _) => AgentStatus::Blocked,
-        (crate::detect::AgentState::Unknown, _) => AgentStatus::Unknown,
-    };
-    match status {
-        AgentStatus::Idle => "idle",
-        AgentStatus::Working => "working",
-        AgentStatus::Blocked => "blocked",
-        AgentStatus::Done => "done",
-        AgentStatus::Unknown => "unknown",
-    }
-    .to_string()
-}
 fn public_tab_id(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
     let workspace = app.workspaces.get(entry.ws_idx)?;
     let number = workspace.public_tab_number(entry.tab_idx)?;
@@ -635,7 +496,7 @@ mod tests {
             .clone();
         state.terminals.get_mut(&blocked_terminal).unwrap().state = AgentState::Blocked;
 
-        let entries = crate::ui::agent_panel_entries(&state);
+        let entries = projected_entries(&state);
         let pending_entry = entries
             .iter()
             .find(|entry| entry.pane_id == pending_pane)
@@ -666,7 +527,7 @@ mod tests {
             }),
             sort: Vec::new(),
         });
-        let filtered = crate::ui::agent_panel_entries(&state);
+        let filtered = projected_entries(&state);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].pane_id, pending_pane);
     }

@@ -47,7 +47,6 @@ mod gram_upload_stream;
 mod pane_graphics_stream;
 mod pane_input_stream;
 mod pane_output_stream;
-pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 mod stream_read;
 
 /// The single-writer claim on a gram `upload_id`, held by every writer:
@@ -172,22 +171,6 @@ pub(crate) fn start_server_with_stop_control(
     )
 }
 
-pub fn start_server_with_capabilities(
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
-    federation: &FederationConfig,
-    federation_store: Arc<Mutex<FederationStore>>,
-) -> std::io::Result<ServerHandle> {
-    start_server_inner(
-        api_tx,
-        event_hub,
-        capabilities,
-        None,
-        federation,
-        federation_store,
-    )
-}
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
@@ -3404,6 +3387,7 @@ mod federation_tests {
             ("gram.get_file", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
+            ("client_shell.surface.set", Denied),
             ("session.snapshot", AllowedAt(Observe)),
             ("workspace.create", Denied),
             ("workspace.list", AllowedAt(Observe)),
@@ -3419,6 +3403,7 @@ mod federation_tests {
             ("worktree.open", Denied),
             ("worktree.remove", Denied),
             ("tab.create", Denied),
+            ("command.invoke", Denied),
             ("tab.list", AllowedAt(Observe)),
             ("tab.get", AllowedAt(Observe)),
             ("tab.focus", Denied),
@@ -3446,6 +3431,13 @@ mod federation_tests {
             ("fs.list_dir", Denied),
             ("agent.prompt", AllowedAt(Interact)),
             ("agent.wait", AllowedAt(Observe)),
+            ("pane.copy_motion", Denied),
+            ("pane.copy_search", Denied),
+            ("pane.edit_scrollback", Denied),
+            ("pane.link.activate", Denied),
+            ("pane.link.resolve", Denied),
+            ("pane.scroll", Denied),
+            ("pane.selection.read", Denied),
             ("pane.split", Denied),
             ("pane.swap", Denied),
             ("pane.move", Denied),
@@ -3498,6 +3490,7 @@ mod federation_tests {
             ("pane.wait_for_output", AllowedAt(Observe)),
             ("integration.install", Denied),
             ("integration.uninstall", Denied),
+            ("integration.list", Denied),
             ("plugin.link", Denied),
             ("plugin.list", Denied),
             ("plugin.unlink", Denied),
@@ -3509,6 +3502,8 @@ mod federation_tests {
             ("plugin.pane.open", Denied),
             ("plugin.pane.focus", Denied),
             ("plugin.pane.close", Denied),
+            ("product_announcement.dismiss", Denied),
+            ("release_notes.dismiss", Denied),
         ];
 
         for (name, access) in expected {

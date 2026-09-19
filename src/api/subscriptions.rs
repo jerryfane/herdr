@@ -2,9 +2,8 @@ use regex::Regex;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
-    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, PaneTurnCompletedEvent, Request,
-    Subscription,
-    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
+    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, PaneTurnCompletedEvent,
+    Request, Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
 use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
 use crate::api::{ApiRequestSender, EventHub};

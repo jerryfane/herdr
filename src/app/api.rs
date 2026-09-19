@@ -463,7 +463,6 @@ impl App {
                     self.sync_full_lifecycle_authority_detection_pauses();
                     self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                     self.emit_pane_state_update(&update);
-                    self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
                     self.emit_apns_agent_notifications(std::slice::from_ref(&update), true);
                     self.emit_live_activity_updates();
                 }
@@ -493,6 +492,7 @@ impl App {
             AppEvent::PaneDied {
                 pane_id,
                 exit_reason,
+                ..
             } if exit_reason.requires_session_checkpoint() && self.find_pane(*pane_id).is_some() && !self.overlay_panes.contains_key(pane_id)
         );
         if checkpointed_pane_exit {
@@ -906,6 +906,8 @@ impl App {
                 })
                 .await;
         });
+    }
+
     /// True when the pane's terminal holds a pending agent-resume plan — set by
     /// an `agent.restart` just before it killed the process, so the imminent
     /// `PaneDied` relaunches with `--resume` instead of a bare shell.
@@ -1008,78 +1010,6 @@ impl App {
                     },
                 });
             }
-        }
-    }
-
-    fn emit_terminal_or_system_agent_notifications(
-        &self,
-        pane_updates: &[crate::app::actions::PaneStateUpdate],
-    ) {
-        if !self.local_terminal_notifications
-            || self.state.toast_config.delay_seconds != 0
-            || !matches!(
-                self.state.toast_config.delivery,
-                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
-            )
-        {
-            return;
-        }
-
-        let notify = match self.state.toast_config.delivery {
-            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
-            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
-            _ => return,
-        };
-
-        for update in pane_updates {
-            let is_active_tab = self
-                .state
-                .pane_is_in_active_tab(update.ws_idx, update.pane_id);
-            let suppress_active_tab_notifications =
-                crate::app::actions::active_tab_suppresses_notifications(
-                    is_active_tab,
-                    self.state.outer_terminal_focus,
-                );
-            let Some(kind) = crate::app::actions::notification_toast_for_pane_state_update(
-                suppress_active_tab_notifications,
-                update,
-            ) else {
-                continue;
-            };
-            let Some(ws) = self.state.workspaces.get(update.ws_idx) else {
-                continue;
-            };
-            let Some(pane) = ws
-                .tabs
-                .iter()
-                .find_map(|tab| tab.panes.get(&update.pane_id))
-            else {
-                continue;
-            };
-            let Some(agent_label) = self
-                .state
-                .terminals
-                .get(&pane.attached_terminal_id)
-                .and_then(|terminal| terminal.effective_agent_label())
-            else {
-                continue;
-            };
-            let event_text = match kind {
-                ToastKind::NeedsAttention => "needs attention",
-                ToastKind::Finished => "finished",
-                ToastKind::UpdateInstalled => "updated",
-            };
-            let workspace_label =
-                ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
-            let _ = notify(
-                &format!("{} {}", agent_label, event_text),
-                Some(&crate::app::actions::notification_context(
-                    ws,
-                    &workspace_label,
-                    update.ws_idx,
-                    update.pane_id,
-                )),
-            );
         }
     }
 
@@ -1588,6 +1518,7 @@ impl App {
             }
             Method::CommandInvoke(params) => {
                 return self.handle_command_invoke(request.id, params);
+            }
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
             }
@@ -1743,6 +1674,7 @@ impl App {
             }
             Method::PaneCopySearch(params) => {
                 return self.handle_pane_copy_search(request.id, params);
+            }
             Method::PaneSetPtySize(params) => {
                 return self.handle_pane_set_pty_size(request.id, params);
             }
@@ -2131,14 +2063,6 @@ impl App {
         }
     }
 
-    fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
-        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
-            return;
-        }
-        if let Some(sound) = sound.to_sound() {
-            crate::sound::play(sound, &self.state.sound);
-        }
-    }
     pub(crate) fn api_notification_rate_limited(&self, now: Instant) -> bool {
         self.last_api_notification_at
             .is_some_and(|last| now.duration_since(last) < API_NOTIFICATION_RATE_LIMIT)
@@ -2660,7 +2584,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2823,7 +2747,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2913,7 +2837,6 @@ mod tests {
         // One entry per known agent kind, each with a non-empty label and a bool
         // `installed` flag.
         assert_eq!(kinds.len(), crate::detect::Agent::ALL.len());
-        assert_eq!(kinds.len(), 22);
         for entry in kinds {
             assert!(!entry["kind"].as_str().unwrap().is_empty());
             assert!(entry["installed"].is_boolean());
@@ -2972,7 +2895,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2985,7 +2908,7 @@ mod tests {
         let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
         let previous_epoch = app.state.terminals[&terminal_id].turn_epoch;
 
-        assert!(app.respawn_shell_for_launch_pane(pane_id));
+        assert!(app.respawn_shell_for_launch_pane(pane_id, true));
 
         let respawn_epoch = app.state.terminals[&terminal_id].turn_epoch;
         assert_ne!(respawn_epoch, previous_epoch);
@@ -3210,6 +3133,17 @@ mod tests {
     #[tokio::test]
     async fn agent_explain_evaluates_with_server_manifest_cache() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _env_guard = crate::config::test_config_env_lock().lock().unwrap();
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        let manifest_home = std::env::temp_dir().join(format!(
+            "herdr-agent-explain-manifests-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&manifest_home);
+        std::env::set_var("XDG_CONFIG_HOME", manifest_home.join("config"));
+        std::env::set_var("XDG_STATE_HOME", manifest_home.join("state"));
+        crate::detect::manifest::reload_manifests();
         let mut app = App::new(
             &crate::config::Config::default(),
             crate::app::AppPolicy::TEST,
@@ -3231,7 +3165,7 @@ mod tests {
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
             80,
             24,
-            b"press enter to confirm or esc to cancel",
+            b"\xe2\x80\xba review changes\npress enter to confirm or esc to cancel",
         );
         app.terminal_runtimes.insert(terminal_id, runtime);
         let target = app.public_pane_id(0, pane_id).unwrap();
@@ -3244,6 +3178,16 @@ mod tests {
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
+        match old_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_state {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        crate::detect::manifest::reload_manifests();
+        let _ = std::fs::remove_dir_all(&manifest_home);
         assert_eq!(response["result"]["type"], "agent_explain");
         assert_eq!(response["result"]["explain"]["state"], "blocked");
         assert_eq!(
@@ -3885,7 +3829,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -3946,7 +3890,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -3974,6 +3918,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id,
             runtime_epoch: None,
+            exit_reason: crate::platform::ChildExitReason::Exited,
         });
 
         assert!(
@@ -4173,7 +4118,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             event_hub.clone(),

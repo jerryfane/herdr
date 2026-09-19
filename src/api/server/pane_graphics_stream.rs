@@ -363,7 +363,6 @@ fn clear_layer(
     );
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

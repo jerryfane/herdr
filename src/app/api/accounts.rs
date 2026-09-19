@@ -85,6 +85,20 @@ fn fresh_account_id(accounts: &[AccountConfig], kind: &str, label: &str) -> Stri
 }
 
 impl App {
+    fn update_config_file(
+        &mut self,
+        description: &str,
+        update: impl FnOnce(&str) -> String,
+    ) -> bool {
+        match crate::config::update_file_at(&crate::config::config_path(), description, update) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, %description, "failed to update config file");
+                false
+            }
+        }
+    }
+
     /// The complete, deliberate `accounts.list` response: every configured
     /// account with best-effort, locally-derived usage. Read-only; returns only
     /// paths, labels, and usage NUMBERS — never a credential value.
@@ -749,7 +763,13 @@ mod tests {
             ..Default::default()
         };
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+        App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
     }
 
     fn account(id: &str, kind: &str, config_dir: &str) -> AccountConfig {

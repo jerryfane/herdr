@@ -2453,6 +2453,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
             pane_id: first_pane,
             agent: crate::detect::Agent::Claude,
             observed_at: Instant::now(),
+            runtime_epoch: None,
         })
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -4222,7 +4223,8 @@ async fn pane_death_reconciles_each_client_view_and_focus() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id: dead_pane,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -4291,7 +4293,8 @@ async fn pane_death_reapplies_controller_geometry() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id: dead_pane,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -4476,7 +4479,8 @@ fn expected_worktree_runtime_exit_does_not_release_agent() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -5134,6 +5138,8 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
+            process_pid: None,
+            session_cursor: None,
             state: crate::detect::AgentState::Working,
             message: None,
             seq: None,
@@ -6711,6 +6717,7 @@ fn startup_idle_does_not_forward_completion() {
             pane_id,
             agent: crate::detect::Agent::Pi,
             observed_at: Instant::now(),
+            runtime_epoch: None,
         })
     );
 
@@ -6735,6 +6742,7 @@ fn startup_idle_does_not_forward_completion() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: None,
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Idle,
             visible_blocker: false,
@@ -6831,6 +6839,8 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
             method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
                 pane_id: public_pane_id,
                 source: "herdr:pi".into(),
+                agent_process_pid: None,
+                agent_session_cursor: None,
                 agent: "pi".into(),
                 state: api::schema::PaneAgentState::Idle,
                 message: None,

@@ -77,6 +77,7 @@ enum PtyIoDataCommand {
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        guard: Option<super::SubmissionGuard>,
         reply: std_mpsc::Sender<std::io::Result<()>>,
     },
 }
@@ -137,20 +138,25 @@ impl PtyIoActorHandle {
                 };
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
-            Err(mpsc::error::TrySendError::Full(
-                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
-            )) => Err(mpsc::error::TrySendError::Full(bytes)),
-            Err(mpsc::error::TrySendError::Closed(
-                PtyIoDataCommand::WriteUserInputAcknowledged { bytes, .. },
-            )) => Err(mpsc::error::TrySendError::Closed(bytes)),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_user_input_submission_guarded(text, enter, delay, None)
+    }
+
+    pub(crate) fn queue_user_input_submission_guarded(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: Option<super::SubmissionGuard>,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
@@ -168,6 +174,7 @@ impl PtyIoActorHandle {
                 text,
                 enter,
                 delay,
+                guard,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -468,6 +475,7 @@ struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
+    guard: Option<super::SubmissionGuard>,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
 
@@ -490,11 +498,7 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
-    fn enqueue_write(
-        &mut self,
-        bytes: Bytes,
-        acknowledgement: Option<std_mpsc::Sender<std::io::Result<()>>>,
-    ) {
+    fn enqueue_write(&mut self, bytes: Bytes) {
         if !bytes.is_empty() {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
@@ -510,6 +514,11 @@ impl PtyIoActorRunner {
                 boundary: Some(boundary),
             });
         }
+    }
+    fn fail_pending_writes(&mut self, kind: std::io::ErrorKind, message: &'static str) {
+        self.pending_writes.clear();
+        self.current_write_offset = 0;
+        self.fail_active_submission(std::io::Error::new(kind, message));
     }
 
     fn run(&mut self) {
@@ -648,23 +657,14 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes, None);
-                }
-            }
-            PtyIoDataCommand::WriteUserInputAcknowledged { bytes, reply } => {
-                if self.state == ActorState::Running {
-                    self.enqueue_write(bytes, Some(reply));
-                } else {
-                    let _ = reply.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "PTY actor is not running",
-                    )));
+                    self.enqueue_write(bytes);
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
                 text,
                 enter,
                 delay,
+                guard,
                 reply,
             } => {
                 if self.state == ActorState::Running {
@@ -678,6 +678,7 @@ impl PtyIoActorRunner {
                         enter,
                         delay,
                         phase,
+                        guard,
                         reply,
                     });
                 } else {
@@ -876,7 +877,7 @@ impl PtyIoActorRunner {
             return;
         }
         for bytes in terminal_responses {
-            self.enqueue_write(bytes, None);
+            self.enqueue_write(bytes);
         }
     }
 
@@ -894,6 +895,15 @@ impl PtyIoActorRunner {
                     return;
                 };
                 debug_assert!(matches!(submission.phase, SubmissionPhase::WritingEnter));
+                if let Some(watch) = submission
+                    .guard
+                    .as_ref()
+                    .and_then(|guard| guard.watch.as_ref())
+                {
+                    watch
+                        .submitted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let _ = submission.reply.send(Ok(()));
             }
         }
@@ -910,6 +920,30 @@ impl PtyIoActorRunner {
         };
         if Instant::now() >= *deadline {
             let enter = enter.clone();
+            let occupant_changed = self
+                .active_submission
+                .as_ref()
+                .and_then(|submission| submission.guard.as_ref())
+                .is_some_and(|guard| !(guard.occupant_unchanged)());
+            if occupant_changed {
+                let submission = self.active_submission.take().unwrap();
+                if let Some(watch) = submission
+                    .guard
+                    .as_ref()
+                    .and_then(|guard| guard.watch.as_ref())
+                {
+                    watch
+                        .abandoned
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tracing::warn!(
+                    event = "pty.submission.withheld",
+                    subsystem = "pty",
+                    "delayed PTY input withheld: pane occupant changed during the submit delay"
+                );
+                let _ = submission.reply.send(Ok(()));
+                return;
+            }
             if enter.is_empty() {
                 let submission = self.active_submission.take().unwrap();
                 let _ = submission.reply.send(Ok(()));
@@ -937,6 +971,22 @@ impl PtyIoActorRunner {
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
         if let Some(submission) = self.active_submission.take() {
+            let err = if matches!(submission.phase, SubmissionPhase::WritingText)
+                && err.kind() != std::io::ErrorKind::TimedOut
+            {
+                super::submission_text_unwritten(&err)
+            } else {
+                err
+            };
+            if let Some(watch) = submission
+                .guard
+                .as_ref()
+                .and_then(|guard| guard.watch.as_ref())
+            {
+                watch
+                    .abandoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let _ = submission.reply.send(Err(err));
         }
     }

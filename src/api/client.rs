@@ -308,8 +308,8 @@ impl ApiClient {
         let response = match timeout {
             Some(timeout) => {
                 let mut stream = self.connect()?;
-                write_request(&mut stream, &request)?;
-                crate::ipc::set_local_stream_polling(&mut stream, true)?;
+                write_request_line(&mut stream, &request)?;
+                stream.set_polling(true)?;
                 let mut reader = BufReader::new(DeadlineReader {
                     stream: &mut stream,
                     deadline: Instant::now() + timeout,
@@ -622,7 +622,7 @@ fn write_request_line(stream: &mut ApiStream, request: &Request) -> io::Result<(
 }
 
 struct DeadlineReader<'a> {
-    stream: &'a mut LocalStream,
+    stream: &'a mut ApiStream,
     deadline: Instant,
 }
 
@@ -638,14 +638,10 @@ impl Read for DeadlineReader<'_> {
                     "server status probe timed out",
                 ));
             }
-            // Windows named pipes have no read timeout; peek-before-read keeps
-            // both idle and partial responses subject to the same deadline.
-            match crate::ipc::poll_local_stream_read_count(self.stream, buffer)? {
-                crate::ipc::LocalStreamReadCount::Data(count) => return Ok(count),
-                crate::ipc::LocalStreamReadCount::Closed => return Ok(0),
-                crate::ipc::LocalStreamReadCount::Pending => {
-                    std::thread::sleep(Duration::from_millis(2))
-                }
+            match self.stream.poll_read(buffer)? {
+                ApiStreamRead::Data(count) => return Ok(count),
+                ApiStreamRead::Closed => return Ok(0),
+                ApiStreamRead::Pending => std::thread::sleep(Duration::from_millis(2)),
             }
         }
     }
@@ -672,6 +668,7 @@ fn read_json_line<T, R>(reader: &mut R) -> Result<T, ApiClientError>
 where
     T: DeserializeOwned,
     R: BufRead,
+{
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
     if read == 0 || line.trim().is_empty() {
