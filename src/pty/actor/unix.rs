@@ -1285,6 +1285,7 @@ mod tests {
             std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
                 | std::io::ErrorKind::WriteZero
+                | crate::pty::actor::SUBMISSION_TEXT_UNWRITTEN
         ));
     }
 

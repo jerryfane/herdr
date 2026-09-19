@@ -290,6 +290,8 @@ test("Pi reports a Windows session path", async () => {
   await waitFor(() => requests.length === 2);
 
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
+});
+
 test("OMP reports the exact path, active leaf, and process on tree changes", async () => {
   const requests = await startRecordingServer("omp-session-proof");
   const { handlers, pi } = createExtensionHarness();
