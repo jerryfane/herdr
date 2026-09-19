@@ -145,9 +145,18 @@ Each `[[federation.peers]]` table declares one peer:
 
 - `alias` — a local name for the peer, used in logs and diagnostics.
 - `token_file` — path to the shared secret. Its trimmed contents are the token this peer presents; the file's bytes are never logged. A peer with no readable, non-empty token file is skipped.
-- `endpoint` — where to reach the peer for outbound connections (consumed by later federation work).
-- `expected_node_id` — the node identity to verify on connect (consumed by later federation work).
+- `endpoint` — where to reach the peer for outbound connections.
+- `expected_node_id` — an optional install-identity pin checked both when the peer connects inbound and when its outbound `agent.list` response is polled. Missing or changed identities are rejected while the pin is set.
 - `capability` — the tier this peer's token grants over inbound TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`.
+
+Saved-machine federation trust is separate from both the endpoint catalog and explicit peer endpoints:
+
+```toml
+[federation.saved_machines."0123456789abcdef0123456789abcdef"]
+expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+```
+
+The table key is the saved machine's immutable profile ID. The endpoint catalog remains authoritative for its label, SSH target, remote session, and enabled state; renaming therefore cannot change routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
 
 Capability tiers are ordered, each including the one below it:
 

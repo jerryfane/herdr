@@ -109,6 +109,10 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Install-stable identity of the daemon that produced this response.
+        /// Older peers omit it. It is a pinning value, not an authenticator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_machine_id: Option<String>,
     },
     AccountsList {
         accounts: Vec<super::accounts::AccountInfo>,

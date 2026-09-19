@@ -8681,13 +8681,34 @@
               "type": "boolean"
             },
             "machine_id": {
-              "description": "Federation: alias of the remote peer this agent lives on. `None` for a\nlocal agent (and serialized away).",
+              "description": "Federation compatibility field: the home-chosen routing alias for the\nremote peer. This is not the peer's persisted machine identity. `None`\nfor a local agent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_label": {
+              "description": "Mutable display label for the remote machine. Never used for routing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_profile_id": {
+              "description": "Immutable saved-machine profile id used as the routing namespace once\nthis agent comes from the upstream machine catalog. `None` for local\nagents and legacy explicit federation peers.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "origin_machine_id": {
+              "description": "Persisted install identity reported by the daemon that owns this agent.\nKept separate from the home-chosen routing namespace and mutable display\nlabel. It is an identity pin, not an authentication secret.",
               "type": [
                 "string",
                 "null"
@@ -12332,6 +12353,13 @@
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
                   },
                   "type": "array"
+                },
+                "origin_machine_id": {
+                  "description": "Install-stable identity of the daemon that produced this response.\nOlder peers omit it. It is a pinning value, not an authenticator.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "agent_list",

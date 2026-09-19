@@ -25,6 +25,37 @@ fn agent_list_params_preserve_aggregate_default_and_local_only_wire_shape() {
 }
 
 #[test]
+fn agent_list_response_preserves_legacy_shape_and_reports_origin_identity() {
+    let legacy: SuccessResponse = serde_json::from_value(serde_json::json!({
+        "id": "legacy",
+        "result": {
+            "type": "agent_list",
+            "agents": []
+        }
+    }))
+    .expect("legacy response without origin identity remains valid");
+    let ResponseResult::AgentList {
+        agents,
+        origin_machine_id,
+    } = legacy.result
+    else {
+        panic!("expected agent_list");
+    };
+    assert!(agents.is_empty());
+    assert_eq!(origin_machine_id, None);
+
+    let current = SuccessResponse {
+        id: "current".into(),
+        result: ResponseResult::AgentList {
+            agents: Vec::new(),
+            origin_machine_id: Some("machine_current".into()),
+        },
+    };
+    let encoded = serde_json::to_value(&current).unwrap();
+    assert_eq!(encoded["result"]["origin_machine_id"], "machine_current");
+}
+
+#[test]
 fn pane_info_without_composer_deserializes_as_unknown() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
