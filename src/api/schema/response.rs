@@ -113,6 +113,10 @@ pub enum ResponseResult {
         /// Older peers omit it. It is a pinning value, not an authenticator.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_machine_id: Option<String>,
+        /// Opaque identity of the daemon process that produced this response.
+        /// Changes on restart and fences replies from an earlier remote boot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_boot_id: Option<String>,
     },
     AccountsList {
         accounts: Vec<super::accounts::AccountInfo>,

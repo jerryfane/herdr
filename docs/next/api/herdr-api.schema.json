@@ -12354,6 +12354,13 @@
                   },
                   "type": "array"
                 },
+                "origin_boot_id": {
+                  "description": "Opaque identity of the daemon process that produced this response.\nChanges on restart and fences replies from an earlier remote boot.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "origin_machine_id": {
                   "description": "Install-stable identity of the daemon that produced this response.\nOlder peers omit it. It is a pinning value, not an authenticator.",
                   "type": [

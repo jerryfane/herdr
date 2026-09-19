@@ -37,22 +37,26 @@ fn agent_list_response_preserves_legacy_shape_and_reports_origin_identity() {
     let ResponseResult::AgentList {
         agents,
         origin_machine_id,
+        origin_boot_id,
     } = legacy.result
     else {
         panic!("expected agent_list");
     };
     assert!(agents.is_empty());
     assert_eq!(origin_machine_id, None);
+    assert_eq!(origin_boot_id, None);
 
     let current = SuccessResponse {
         id: "current".into(),
         result: ResponseResult::AgentList {
             agents: Vec::new(),
             origin_machine_id: Some("machine_current".into()),
+            origin_boot_id: Some("boot_current".into()),
         },
     };
     let encoded = serde_json::to_value(&current).unwrap();
     assert_eq!(encoded["result"]["origin_machine_id"], "machine_current");
+    assert_eq!(encoded["result"]["origin_boot_id"], "boot_current");
 }
 
 #[test]

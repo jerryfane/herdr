@@ -124,31 +124,33 @@ pub(crate) enum FederationAccess {
     Denied,
 }
 
-/// Classify an API method (by its wire name) for federation access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FederationMethodPolicy {
+    pub(crate) access: FederationAccess,
+    pub(crate) outbound_routable: bool,
+}
+
+/// Canonical federation ownership and capability policy for one wire method.
 ///
-/// **DEFAULT-DENY:** every method not explicitly listed here resolves to
-/// [`FederationAccess::Denied`], so a newly added API method is unreachable over
-/// federation until it is deliberately classified. Only the local unix socket
-/// bypasses this gate entirely.
-pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
+/// `outbound_routable` decides whether an alias-qualified target may leave the
+/// home daemon. `access` decides the minimum capability accepted by the remote
+/// daemon. Unknown methods are denied in both directions.
+pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMethodPolicy {
     use CapabilityTier::{Admin, Interact, Observe};
     use FederationAccess::AllowedAt;
-    match method_wire_name {
-        // Observe: read-only inspection of panes, agents, events, and layout.
+    let (access, outbound_routable) = match method_wire_name {
+        // Observe methods whose target can be owned by a remote peer.
+        "agent.get" | "agent.read" | "agent.explain" | "pane.read" | "pane.turns"
+        | "pane.stream" => (AllowedAt(Observe), true),
+        // Other read-only inspection stays local when called at the home.
         "ping"
         | "agent.list"
         | "accounts.list"
         | "agent.kinds"
-        | "agent.get"
-        | "agent.read"
-        | "agent.explain"
         | "agent.wait"
-        | "pane.read"
         | "pane.get"
         | "pane.list"
         | "pane.current"
-        | "pane.turns"
-        | "pane.stream"
         | "pane.wait_for_output"
         | "pane.process_info"
         | "pane.neighbor"
@@ -162,25 +164,30 @@ pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
         | "worktree.list"
         | "tab.list"
         | "tab.get"
-        | "layout.export" => AllowedAt(Observe),
-        // Interact: drive agents and panes.
+        | "layout.export" => (AllowedAt(Observe), false),
+        // Interact methods with an explicit remote-owned target.
         "agent.prompt" | "agent.send_keys" | "pane.send_text" | "pane.send_keys" => {
-            AllowedAt(Interact)
+            (AllowedAt(Interact), true)
         }
-        // Admin: focus, rename, and input/authority mutations.
+        // Admin methods with an explicit remote-owned target.
         "agent.focus" | "agent.rename" | "agent.restart" | "pane.send_input" | "pane.input.set"
-        | "pane.rename" | "pane.set_pty_size" | "agent.view.set" | "agent.view.clear" => {
-            AllowedAt(Admin)
-        }
+        | "pane.rename" | "pane.set_pty_size" => (AllowedAt(Admin), true),
+        // Admin methods whose payload has no remote ownership target.
+        "agent.view.set" | "agent.view.clear" => (AllowedAt(Admin), false),
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
         // notification(s).*, client.window_title.*, agent.start,
-        // agent.transfer_session (account-home filesystem authority), pane.close,
-        // popup.close, every workspace/worktree/tab/layout/pane mutation except
-        // the Admin `pane.set_pty_size` width-lease call above, the
-        // pane.report_*/authority calls, and pane.graphics.set/clear/stream) is
-        // denied to federation regardless of tier.
-        _ => FederationAccess::Denied,
+        // agent.transfer_session, pane.close, popup.close, and other mutations)
+        // is denied to federation regardless of tier.
+        _ => (FederationAccess::Denied, false),
+    };
+    FederationMethodPolicy {
+        access,
+        outbound_routable,
     }
+}
+
+pub(crate) fn federation_access(method_wire_name: &str) -> FederationAccess {
+    federation_method_policy(method_wire_name).access
 }
 
 /// Compare two byte strings without an early return, so the time taken does not
