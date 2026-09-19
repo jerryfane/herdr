@@ -765,18 +765,22 @@ fn prefix_remote_agent(
     alias: &str,
     mut agent: crate::api::schema::AgentInfo,
 ) -> Option<crate::api::schema::AgentInfo> {
-    fn qualify(alias: &str, value: String) -> Option<String> {
-        if value.is_empty() || value.contains('/') {
+    fn qualify(alias: &str, value: String, allow_empty: bool) -> Option<String> {
+        if value.is_empty() {
+            return allow_empty.then_some(value);
+        }
+        if value.contains('/') {
             return None;
         }
         Some(format!("{alias}/{value}"))
     }
 
+    let archived = agent.archived.is_some();
     agent.name = agent.name.map(|name| format!("{alias}/{name}"));
-    agent.terminal_id = qualify(alias, agent.terminal_id)?;
-    agent.workspace_id = qualify(alias, agent.workspace_id)?;
-    agent.tab_id = qualify(alias, agent.tab_id)?;
-    agent.pane_id = qualify(alias, agent.pane_id)?;
+    agent.terminal_id = qualify(alias, agent.terminal_id, false)?;
+    agent.workspace_id = qualify(alias, agent.workspace_id, archived)?;
+    agent.tab_id = qualify(alias, agent.tab_id, archived)?;
+    agent.pane_id = qualify(alias, agent.pane_id, archived)?;
     // Home-owned federation fields. The legacy `machine_id` remains the routing
     // alias for wire compatibility. Explicit peers have no saved profile id;
     // `origin_machine_id` is the response-level identity validated by the poll.
@@ -4732,6 +4736,27 @@ mod federation_tests {
         let qualified =
             prefix_remote_agent("home", named).expect("display names are not route ids");
         assert_eq!(qualified.name.as_deref(), Some("home/team/builder"));
+    }
+
+    #[test]
+    fn prefix_remote_agent_preserves_archived_agent_with_empty_live_ids() {
+        let mut archived = seeded_agent(AgentStatus::Idle, "archived");
+        archived.workspace_id.clear();
+        archived.tab_id.clear();
+        archived.pane_id.clear();
+        archived.archived = Some(crate::api::schema::AgentArchivedInfo {
+            at: "2026-09-19T00:00:00Z".into(),
+            by: "owner".into(),
+            reason: None,
+        });
+
+        let qualified =
+            prefix_remote_agent("home", archived).expect("archived agent remains visible");
+        assert_eq!(qualified.terminal_id, "home/term-remote");
+        assert_eq!(qualified.workspace_id, "");
+        assert_eq!(qualified.tab_id, "");
+        assert_eq!(qualified.pane_id, "");
+        assert!(qualified.archived.is_some());
     }
 
     /// FIX 1 (DoS hardening): a peer that returns an over-cap response line must

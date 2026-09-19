@@ -107,9 +107,10 @@ impl FederationPeerManager {
     /// and follows the lock order **H → S → R**:
     /// 1. Reap any finished retiring threads.
     /// 2. Compute the desired OUTBOUND set (peers with an `endpoint`) by alias.
-    /// 3. For each running alias no longer desired, or whose `endpoint`/
-    ///    `token_file` changed: set its `stop` flag AND evict its store entry
-    ///    under the store lock, then detach its join into the reaper.
+    /// 3. For each running alias no longer desired, or whose connection/trust
+    ///    spec (`endpoint`, `token_file`, or `expected_node_id`) changed: set its
+    ///    `stop` flag AND evict its store entry under the store lock, then detach
+    ///    its join into the reaper.
     /// 4. For each desired outbound alias not already running: spawn a fresh
     ///    poll thread.
     /// 5. Rebuild and swap the proxy registry (token-file reads happen in
