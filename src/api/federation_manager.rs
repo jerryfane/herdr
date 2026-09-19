@@ -21,10 +21,10 @@
 //! ## Locking model (no deadlock possible)
 //! Three locks — **H** (`handles`), **S** (`store`, external), **R**
 //! (`registry`). Only [`reconcile`](FederationPeerManager::reconcile) ever holds
-//! more than one, always in the order **H → S (briefly) → R**: `S` is taken and
-//! released per evicted alias (never across a spawn or join), and `R` is written
-//! only after the token-file reads in `build_peer_registry` are done, never
-//! across them. Poll threads take **S** only; accept/proxy threads take **R**
+//! more than one, always in the order **H → S (briefly) → R**. A changed SSH
+//! route is stopped and its bridge is shut down while H remains held so the
+//! replacement can safely reuse the profile's socket path; bridge workers do not
+//! take H, S, or R. Poll threads take **S** only; accept/proxy threads take **R**
 //! only (one `Arc::clone`). No cycle is reachable.
 //!
 //! ## Default-off byte-identical
@@ -42,7 +42,7 @@ use tracing::{debug, info};
 
 use crate::api::client::ConnectionTarget;
 use crate::api::federation_store::FederationStore;
-use crate::api::server::{build_peer_registry, run_federation_peer_poll};
+use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::config::FederationPeer;
 
 /// A single running outbound poll thread plus the handle to stop and join it.
@@ -58,6 +58,14 @@ struct PeerHandle {
     token_file: Option<String>,
     /// The peer's expected install identity this thread was spawned with.
     expected_node_id: Option<String>,
+    /// Saved-machine profile this SSH bridge was spawned for.
+    profile_id: Option<String>,
+    /// Named remote session this SSH bridge was spawned for.
+    remote_session: Option<String>,
+    /// Shared route used by both polling and target proxying.
+    route: ConnectionTarget,
+    /// Keeps the local socket and its `remote-api-bridge` launcher alive.
+    _ssh_bridge: Option<crate::remote::SavedSshApiBridge>,
 }
 
 /// Manages the outbound federation peer set at runtime: spawns a poll thread and
@@ -108,13 +116,13 @@ impl FederationPeerManager {
     /// 1. Reap any finished retiring threads.
     /// 2. Compute the desired OUTBOUND set (peers with an `endpoint`) by alias.
     /// 3. For each running alias no longer desired, or whose connection/trust
-    ///    spec (`endpoint`, `token_file`, or `expected_node_id`) changed: set its
-    ///    `stop` flag AND evict its store entry under the store lock, then detach
-    ///    its join into the reaper.
+    ///    spec (`endpoint`, `token_file`, `expected_node_id`, `profile_id`, or
+    ///    `remote_session`) changed: set its `stop` flag AND evict its store
+    ///    entry under the store lock, then detach its retirement into the reaper.
     /// 4. For each desired outbound alias not already running: spawn a fresh
     ///    poll thread.
-    /// 5. Rebuild and swap the proxy registry (token-file reads happen in
-    ///    `build_peer_registry`, before the registry write lock is taken).
+    /// 5. Rebuild and swap the proxy registry from the same live routes used by
+    ///    pollers.
     pub fn reconcile(&self, desired: &[FederationPeer]) {
         let mut handles = self
             .handles
@@ -157,13 +165,18 @@ impl FederationPeerManager {
                 handle.stop.store(true, Ordering::Relaxed);
                 store.remove_peer(alias);
             }
-            // Detach: never join on this (single-threaded app) call path. The
-            // reaper joins it later once it has finished.
+            // Close the bridge before starting its replacement: saved bridges
+            // intentionally use one socket path per immutable profile. Drop is
+            // bounded and cancels every active per-connection SSH worker.
+            let PeerHandle {
+                join, _ssh_bridge, ..
+            } = handle;
+            drop(_ssh_bridge);
             let mut reaper = self
                 .reaper
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reaper.push(handle.join);
+            reaper.push(retire_poll(join));
             info!(alias = %alias, "federation peer stopped and evicted (reconcile)");
         }
 
@@ -173,44 +186,95 @@ impl FederationPeerManager {
                 debug!(alias = %alias, "federation peer unchanged (reconcile)");
                 continue;
             }
-            let handle = self.spawn_peer_poll((*peer).clone());
-            handles.insert((*alias).to_string(), handle);
-            info!(alias = %alias, "federation peer spawned (reconcile)");
+            if let Some(handle) = self.spawn_peer_poll((*peer).clone()) {
+                handles.insert((*alias).to_string(), handle);
+                info!(alias = %alias, "federation peer spawned (reconcile)");
+            }
         }
 
-        // 5. Rebuild the outbound proxy registry and swap it in. The token-file
-        //    reads happen inside `build_peer_registry`, NOT under the registry
-        //    write lock, which is held only for the pointer swap.
-        let new_map = build_peer_registry(desired);
-        {
-            let mut registry = self
-                .registry
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *registry = Arc::new(new_map);
-        }
+        // 5. Rebuild the outbound proxy registry from the same routes held by
+        // the live pollers. SSH clones point at the manager-owned local bridge.
+        let new_map = handles
+            .iter()
+            .map(|(alias, handle)| (alias.clone(), handle.route.clone()))
+            .collect();
+        let mut registry = self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *registry = Arc::new(new_map);
     }
 
-    /// Spawn one outbound poll thread for `peer` with a fresh (unset) stop flag.
-    /// Only called for peers with an `endpoint`.
-    fn spawn_peer_poll(&self, peer: FederationPeer) -> PeerHandle {
+    /// Resolve one outbound route and spawn its poll thread. SSH peers use the
+    /// upstream saved-machine `remote-api-bridge`; the manager owns that bridge
+    /// and shares its local socket with polling and proxying.
+    fn spawn_peer_poll(&self, peer: FederationPeer) -> Option<PeerHandle> {
+        let endpoint = peer.endpoint.as_deref()?;
+        let token = endpoint
+            .starts_with("tcp://")
+            .then(|| read_peer_token(&peer))
+            .flatten();
+        let parsed = match crate::api::client::endpoint_to_target(endpoint, token) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(alias = %peer.alias, %endpoint, %error, "invalid federation endpoint; peer not started");
+                return None;
+            }
+        };
+        let (route, ssh_bridge) = match parsed {
+            ConnectionTarget::Ssh(target) => {
+                let Some(profile_id) = peer.profile_id.as_deref() else {
+                    tracing::warn!(alias = %peer.alias, "SSH federation peer requires profile_id");
+                    return None;
+                };
+                let Some(session) = peer.remote_session.as_deref() else {
+                    tracing::warn!(alias = %peer.alias, "SSH federation peer requires remote_session");
+                    return None;
+                };
+                let target = match target.user {
+                    Some(user) => format!("{user}@{}", target.host),
+                    None => target.host,
+                };
+                let bridge = match crate::remote::SavedSshApiBridge::start(
+                    profile_id, &target, session, true,
+                ) {
+                    Ok(bridge) => bridge,
+                    Err(error) => {
+                        tracing::warn!(alias = %peer.alias, %error, "SSH federation remote-api-bridge did not start");
+                        return None;
+                    }
+                };
+                (
+                    ConnectionTarget::SocketPath(bridge.socket_path().to_owned()),
+                    Some(bridge),
+                )
+            }
+            target => (target, None),
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
+        let profile_id = peer.profile_id.clone();
+        let remote_session = peer.remote_session.clone();
         let cache = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let thread_stop = Arc::clone(&stop);
+        let poll_route = route.clone();
         let join = std::thread::spawn(move || {
-            run_federation_peer_poll(peer, cache, running, thread_stop);
+            run_federation_peer_poll(peer, poll_route, cache, running, thread_stop);
         });
-        PeerHandle {
+        Some(PeerHandle {
             stop,
             join,
             endpoint,
             token_file,
             expected_node_id,
-        }
+            profile_id,
+            remote_session,
+            route,
+            _ssh_bridge: ssh_bridge,
+        })
     }
 
     /// Join every retiring thread that has already finished, leaving the rest in
@@ -245,7 +309,11 @@ impl FederationPeerManager {
         };
         for handle in live {
             handle.stop.store(true, Ordering::Relaxed);
-            let _ = handle.join.join();
+            let PeerHandle {
+                join, _ssh_bridge, ..
+            } = handle;
+            drop(_ssh_bridge);
+            let _ = join.join();
         }
         let pending: Vec<JoinHandle<()>> = {
             let mut reaper = self
@@ -290,4 +358,13 @@ fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
     handle.endpoint != peer.endpoint.clone().unwrap_or_default()
         || handle.token_file != peer.token_file
         || handle.expected_node_id != peer.expected_node_id
+        || handle.profile_id != peer.profile_id
+        || handle.remote_session != peer.remote_session
+}
+
+/// Join one stopped poll thread away from the reconcile caller.
+fn retire_poll(join: JoinHandle<()>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = join.join();
+    })
 }

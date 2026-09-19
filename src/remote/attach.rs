@@ -2655,7 +2655,18 @@ impl SshStdioBridge {
         let thread_ssh_options = ssh_options.cloned();
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !thread_stop.load(Ordering::Acquire) {
+                let mut index = 0;
+                while index < workers.len() {
+                    if workers[index].is_finished() {
+                        let worker = workers.swap_remove(index);
+                        let _ = worker.join();
+                    } else {
+                        index += 1;
+                    }
+                }
+
                 match listener.accept() {
                     Ok(stream) => {
                         let stream = match prepare_remote_bridge_stream(stream) {
@@ -2668,22 +2679,29 @@ impl SshStdioBridge {
                                 continue;
                             }
                         };
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_command,
-                            thread_ssh_options.as_ref(),
-                            noninteractive,
-                            &thread_stop,
-                        ) {
-                            let _ =
-                                failure_tx.try_send(io::Error::new(err.kind(), err.to_string()));
-                            if noninteractive {
-                                tracing::warn!(error = %err, "saved SSH endpoint bridge failed");
-                            } else {
-                                eprintln!("herdr: remote bridge failed: {err}");
+                        let worker_target = target.clone();
+                        let worker_command = remote_command.clone();
+                        let worker_options = thread_ssh_options.clone();
+                        let worker_stop = Arc::clone(&thread_stop);
+                        let worker_failure = failure_tx.clone();
+                        workers.push(thread::spawn(move || {
+                            if let Err(err) = bridge_connection(
+                                stream,
+                                &worker_target,
+                                &worker_command,
+                                worker_options.as_ref(),
+                                noninteractive,
+                                &worker_stop,
+                            ) {
+                                let _ = worker_failure
+                                    .try_send(io::Error::new(err.kind(), err.to_string()));
+                                if noninteractive {
+                                    tracing::warn!(error = %err, "saved SSH endpoint bridge failed");
+                                } else {
+                                    eprintln!("herdr: remote bridge failed: {err}");
+                                }
                             }
-                        }
+                        }));
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
@@ -2697,6 +2715,9 @@ impl SshStdioBridge {
                         break;
                     }
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
         });
 
@@ -3671,6 +3692,92 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn saved_bridge_serves_a_second_connection_while_a_stream_is_open() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct PathRestore(Option<std::ffi::OsString>);
+        impl Drop for PathRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+
+        let _env_lock = crate::config::test_config_env_lock().lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-bridge-concurrent-{}-{nonce}",
+            std::process::id()
+        ));
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nprintf '\\nherdr-remote-output-ready:1\\n'\nexec /bin/cat\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+
+        let _path_restore = PathRestore(std::env::var_os("PATH"));
+        std::env::set_var("PATH", &bin);
+        let socket = base.join("bridge.sock");
+        let bridge = SshStdioBridge::start_command(
+            "example".into(),
+            "ignored".into(),
+            socket.clone(),
+            None,
+            true,
+        )
+        .expect("start bridge");
+
+        let first = crate::ipc::connect_local_stream(&socket).expect("connect first stream");
+        let mut first = std::io::BufReader::new(first);
+        first.get_mut().write_all(b"first\n").unwrap();
+        let mut line = String::new();
+        first.read_line(&mut line).unwrap();
+        assert_eq!(line, "first\n");
+
+        let second_socket = socket.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let stream =
+                crate::ipc::connect_local_stream(&second_socket).expect("connect second stream");
+            let mut stream = std::io::BufReader::new(stream);
+            stream.get_mut().write_all(b"second\n").unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            done_tx.send(line).unwrap();
+        });
+
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second stream must not wait for first"),
+            "second\n"
+        );
+        second.join().unwrap();
+        let started = Instant::now();
+        drop(bridge);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dropping the bridge must cancel open stream workers"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn federation_managed_ssh_config_uses_per_connection_socket_and_connect_timeout() {
         let options = build_federation_ssh_options().expect("build federation ssh options");
         let control_path = options
@@ -4346,6 +4453,22 @@ mod tests {
                 .executable,
             path
         );
+    }
+
+    #[test]
+    fn cached_posix_api_command_preserves_spaced_path_and_named_session() {
+        let path = "/opt/Herdr Builds/herdr";
+        let command = cached_remote_api_command(
+            &crate::client::endpoint::SshMachineMetadata {
+                os: "linux".into(),
+                executable: path.into(),
+            },
+            "agent work",
+        );
+        assert!(command.contains(path));
+        assert!(command.contains("agent work"));
+        assert!(command.contains("remote-api-bridge"));
+        assert!(!command.contains(" api-bridge "));
     }
 
     #[test]

@@ -1362,6 +1362,12 @@ pub struct FederationPeer {
     pub alias: String,
     /// Endpoint to reach the peer (e.g. an `ssh://` or `tcp://` target).
     pub endpoint: Option<String>,
+    /// Immutable saved-machine profile id used for SSH metadata and bridge
+    /// lifetime. Required for `ssh://` endpoints.
+    pub profile_id: Option<String>,
+    /// Named remote Herdr session reached by `remote-api-bridge`. Required for
+    /// `ssh://` endpoints.
+    pub remote_session: Option<String>,
     /// Filesystem path to the shared auth token for this peer.
     pub token_file: Option<String>,
     /// Expected per-install identity for this peer. Inbound connections must
@@ -1687,6 +1693,29 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn ssh_federation_peer_carries_saved_profile_and_named_session() {
+        let config: FederationConfig = toml::from_str(
+            r#"
+                [[peers]]
+                alias = "build"
+                endpoint = "ssh://dev@build.example"
+                profile_id = "0123456789abcdef0123456789abcdef"
+                remote_session = "agent-work"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.peers[0].profile_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            config.peers[0].remote_session.as_deref(),
+            Some("agent-work")
+        );
     }
 
     #[test]

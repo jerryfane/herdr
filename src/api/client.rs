@@ -20,13 +20,11 @@ use crate::api::{ApiStream, ApiStreamRead};
 /// promptly, long enough not to busy-spin.
 const BOUNDED_READ_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Credential used for an outbound SSH federation connection.
+/// Credential marker on a parsed `ssh://` endpoint.
 ///
-/// v1 supports key-based auth only. [`SshCredential::Password`] is reserved for
-/// a future version and is NOT implemented — constructing an SSH transport with
-/// it is rejected.
-// Constructed by the federation tests and the SSH transport now; CLI wiring that
-// builds these from `[federation]` peer config lands in a later part.
+/// Saved-machine federation resolves key-based SSH endpoints to a local
+/// `remote-api-bridge` socket before constructing its [`ApiClient`].
+/// [`SshCredential::Password`] remains unsupported.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshCredential {
@@ -34,7 +32,8 @@ pub enum SshCredential {
     Password(String),
 }
 
-/// An outbound SSH federation target reached via `herdr api-bridge`.
+/// Parsed `ssh://` endpoint. The federation manager consumes this intermediate
+/// value to start the saved-machine `remote-api-bridge`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshTarget {
     pub host: String,
@@ -44,10 +43,8 @@ pub struct SshTarget {
 
 /// API connection target resolved by clients at the process edge.
 ///
-/// The `Tcp`/`Ssh` federation variants are constructed by tests and the SSH
-/// transport now; the CLI surface that builds them from `[federation]` peer
-/// config lands in a later part, so they read as unconstructed in a non-test
-/// build until then.
+/// Production SSH federation converts the parsed [`Self::Ssh`] value into a
+/// manager-owned [`Self::SocketPath`] before polling or proxying.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionTarget {
@@ -59,7 +56,9 @@ pub enum ConnectionTarget {
         addr: SocketAddr,
         token: Option<String>,
     },
-    /// A federation peer reached over key-based SSH (`herdr api-bridge`).
+    /// Parsed key-based SSH endpoint. Direct `ApiClient` use retains the legacy
+    /// one-request bridge for compatibility; production federation resolves it
+    /// to `SocketPath` first.
     Ssh(SshTarget),
 }
 
@@ -117,27 +116,42 @@ impl ApiClient {
     /// request (`events.subscribe`, `pane.stream`, …) yields many and terminates
     /// when the stream closes.
     ///
-    /// Works over every transport: Local/TCP connect then write the request and
-    /// read replies off the stream; SSH spawns a per-request `api-bridge` child
-    /// with the request embedded and reads replies off its stdout.
+    /// Local/TCP/socket targets connect then write the request. Direct legacy
+    /// `Ssh` targets spawn a one-request bridge; production SSH federation uses
+    /// the manager-owned `SocketPath` path instead.
     pub fn request_stream(&self, request: &Request) -> io::Result<ResponseLines> {
         Ok(ResponseLines::over(self.connect_and_write(request)?))
     }
 
-    /// Send `request` and return a [`FederatedStream`] — a bounded, per-frame-capped
-    /// NDJSON frame reader over the underlying transport.
+    /// Send `request` and return a [`FederatedStream`] while preserving the
+    /// not-delivered versus delivery-unknown boundary used by federation proxy
+    /// errors.
     ///
-    /// This is the long-lived-stream sibling of [`Self::request_stream`]: it does
-    /// the same connect + request-write, but hands back a reader that (unlike
-    /// [`ResponseLines`], whose `read_line` is uncapped/untimed) enforces a
-    /// per-frame byte cap, a per-read idle timeout, and prompt `running`-driven
-    /// abort. The federated `pane.stream` proxy reads a peer's live terminal
-    /// firehose through this, so a malicious or faulty peer can neither OOM nor
-    /// indefinitely hang the home connection thread. It deliberately does NOT wrap
-    /// the stream in a [`BufReader`], so no bytes are hidden behind an internal
-    /// buffer between the first-line read and the frame-piping loop.
-    pub fn open_frame_stream(&self, request: &Request) -> io::Result<FederatedStream> {
-        Ok(FederatedStream::over(self.connect_and_write(request)?))
+    /// This is the long-lived-stream sibling of [`Self::request_stream`]. It
+    /// hands back a reader that enforces a per-frame byte cap, a per-read idle
+    /// timeout, and prompt `running`-driven abort. The federated `pane.stream`
+    /// proxy reads a peer's live terminal firehose through this, so a malicious
+    /// or faulty peer can neither OOM nor indefinitely hang the home connection
+    /// thread. It deliberately does not wrap the stream in a [`BufReader`], so
+    /// no bytes are hidden between the first-line read and frame piping.
+    pub fn open_frame_stream_classified(
+        &self,
+        request: &Request,
+    ) -> Result<FederatedStream, ProxyError> {
+        let stream = match &self.target {
+            ConnectionTarget::Ssh(target) => {
+                let json = serde_json::to_string(request).map_err(|error| {
+                    ProxyError::Connect(io::Error::new(io::ErrorKind::InvalidInput, error))
+                })?;
+                ssh_transport::spawn_request(target, &json).map_err(ProxyError::Connect)?
+            }
+            _ => {
+                let mut stream = self.connect().map_err(ProxyError::Connect)?;
+                write_request_line(&mut stream, request).map_err(ProxyError::Read)?;
+                stream
+            }
+        };
+        Ok(FederatedStream::over(stream))
     }
 
     /// Shared connect-and-write for the streaming request paths: Local/TCP connect
@@ -233,19 +247,14 @@ impl ApiClient {
         serde_json::from_str(&line).map_err(ApiClientError::Json)
     }
 
-    /// Two-phase federation proxy: connect + write the request (phase 1), then
-    /// bounded-read the single response line (phase 2), returning that line's
-    /// content VERBATIM (trimmed of surrounding whitespace) for pass-through to
-    /// the originating client.
+    /// Federation proxy with a precise delivery boundary: establish the
+    /// connection first, then write and read the request.
     ///
-    /// Unlike [`Self::request_value_bounded`], the two phases are distinguished in
-    /// the error so the caller can tell a request that never reached the peer
-    /// ([`ProxyError::Connect`] — connect or request-write failed) from one that
-    /// was delivered but whose response could not be read back
-    /// ([`ProxyError::Read`] — EOF, timeout, oversized, empty, or shutdown). That
-    /// distinction is the home's delivered-vs-unknown verdict: a `Connect` failure
-    /// is safe to report as not-delivered and may be retried; a `Read` failure
-    /// means the peer may or may not have acted, so the caller must NOT retry.
+    /// Unlike [`Self::request_value_bounded`], the errors distinguish a request
+    /// that definitely never left the home ([`ProxyError::Connect`]) from one
+    /// whose delivery is unknown ([`ProxyError::Read`]). Any failure after the
+    /// connection is established, including a partial request write, is unknown
+    /// and must not be blindly retried.
     ///
     /// The response read is bounded by BOTH `max_bytes` and `total_timeout` and
     /// abortable via `running`, exactly like [`Self::request_value_bounded`], so a
@@ -269,7 +278,7 @@ impl ApiClient {
             }
             _ => {
                 let mut stream = self.connect().map_err(ProxyError::Connect)?;
-                write_request_line(&mut stream, request).map_err(ProxyError::Connect)?;
+                write_request_line(&mut stream, request).map_err(ProxyError::Read)?;
                 stream
             }
         };
@@ -585,23 +594,20 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-/// Which phase of a [`ApiClient::proxy_request_bounded`] federation proxy failed.
+/// Which delivery phase of a federation proxy failed.
 ///
-/// The distinction is the home daemon's delivered-vs-unknown verdict: a
-/// `Connect` failure happened before the request left the home, so the peer never
-/// received it (safe to report not-delivered / retry); a `Read` failure happened
-/// after the request was written, so the peer may or may not have acted on it
-/// (report delivery-unknown / never retry).
+/// The distinction is the home daemon's delivered-vs-unknown verdict:
+/// [`ProxyError::Connect`] happens before a transport is established, so the
+/// request was not delivered. [`ProxyError::Read`] happens after establishment,
+/// including while writing the request, so the peer may have received all or
+/// part of it and callers must not retry blindly.
 #[derive(Debug)]
 pub enum ProxyError {
-    /// Connecting to the peer or writing the request failed — the request never
-    /// reached the peer.
+    /// Transport establishment or request serialization failed; not delivered.
     Connect(io::Error),
-    /// The request was written but reading the response line back failed (EOF,
-    /// timeout, oversized, empty, or an in-flight shutdown).
+    /// Request write or response read failed after connection; delivery unknown.
     Read(io::Error),
 }
-
 impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
