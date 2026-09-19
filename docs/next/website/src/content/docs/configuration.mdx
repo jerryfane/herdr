@@ -157,6 +157,8 @@ Capability tiers are ordered, each including the one below it:
 
 Federation exposes only a deliberate, read-and-drive subset of the API. Anything not in a tier — server lifecycle, plugin, integration, gram, notification, window-title, agent/pane/workspace/tab/worktree/layout mutation, and graphics — is denied to every federated peer regardless of tier. Inbound connections are also capped so a peer cannot exhaust the daemon's threads or file descriptors.
 
+`agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
+
 :::caution[Security]
 A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path (`herdr --remote` / `herdr api-bridge`), which runs against the local unix socket and therefore grants full, unfiltered control-plane access — federation capability tiers do not apply to it. The local unix socket itself is never token-checked or tier-filtered.
 :::

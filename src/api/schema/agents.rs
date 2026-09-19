@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use super::common::{AgentStatus, ReadFormat, ReadSource};
 
+/// Controls whether `agent.list` returns the coordinator's cached remote agents.
+///
+/// Ordinary callers get the aggregate view. Federation pollers request the
+/// local-only view so peers never re-export an already aggregated directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentListParams {
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub local_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentReadParams {
     pub target: String,

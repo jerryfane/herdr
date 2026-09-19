@@ -696,7 +696,7 @@ fn poll_peer_agent_list(
 ) -> Result<Vec<crate::api::schema::AgentInfo>, ApiClientError> {
     let request = Request {
         id: "federation:agent.list".into(),
-        method: Method::AgentList(crate::api::schema::EmptyParams {}),
+        method: Method::AgentList(crate::api::schema::AgentListParams { local_only: true }),
     };
     let value = client.request_value_bounded(
         &request,
@@ -706,7 +706,14 @@ fn poll_peer_agent_list(
     )?;
     let response = parse_response_value(value)?;
     match response.result {
-        ResponseResult::AgentList { agents } => Ok(agents),
+        ResponseResult::AgentList { mut agents } => {
+            // Older peers ignore the new local_only parameter because their
+            // empty-params schema accepts unknown fields. Filter their aggregate
+            // response as a fail-safe: a local agent never has federation-owned
+            // machine identity, while every cached remote agent does.
+            agents.retain(|agent| agent.machine_id.is_none());
+            Ok(agents)
+        }
         other => Err(ApiClientError::UnexpectedResult(format!("{other:?}"))),
     }
 }
@@ -3619,7 +3626,11 @@ mod federation_tests {
 
         // agent.list (observe) reaches the app dispatch path.
         let mut reader = raw_hello(fed.addr, "obs");
-        send_request(&mut reader, "list", Method::AgentList(EmptyParams {}));
+        send_request(
+            &mut reader,
+            "list",
+            Method::AgentList(crate::api::schema::AgentListParams::default()),
+        );
         let message = recv_dispatched(&mut fed.api_rx);
         assert!(matches!(message.request.method, Method::AgentList(_)));
         drop(message);
@@ -3795,7 +3806,11 @@ mod federation_tests {
         // matching machine_id passes the pin and reaches the app dispatch path.
         let mut fed = start_federation(one_peer_pinned("tok", CapabilityTier::Observe, "node-A"));
         let mut stream = raw_hello_with_machine_id(fed.addr, "tok", "node-A");
-        send_request(&mut stream, "list", Method::AgentList(EmptyParams {}));
+        send_request(
+            &mut stream,
+            "list",
+            Method::AgentList(crate::api::schema::AgentListParams::default()),
+        );
         let message = recv_dispatched(&mut fed.api_rx);
         assert!(matches!(message.request.method, Method::AgentList(_)));
     }
@@ -3820,7 +3835,7 @@ mod federation_tests {
             .unwrap();
         let request = serde_json::to_string(&Request {
             id: "list".into(),
-            method: Method::AgentList(EmptyParams {}),
+            method: Method::AgentList(crate::api::schema::AgentListParams::default()),
         })
         .unwrap();
         let mut stream = TcpStream::connect(fed.addr).expect("connect");
@@ -3863,7 +3878,11 @@ mod federation_tests {
         // Back-compat: a peer with no pin admits any presented machine_id.
         let mut fed = start_federation(one_peer("tok", CapabilityTier::Observe));
         let mut stream = raw_hello_with_machine_id(fed.addr, "tok", "any-unpinned-id");
-        send_request(&mut stream, "list", Method::AgentList(EmptyParams {}));
+        send_request(
+            &mut stream,
+            "list",
+            Method::AgentList(crate::api::schema::AgentListParams::default()),
+        );
         let message = recv_dispatched(&mut fed.api_rx);
         assert!(matches!(message.request.method, Method::AgentList(_)));
     }
@@ -3975,7 +3994,9 @@ mod federation_tests {
     }
 
     impl SeededPeer {
-        /// Bind a loopback listener + responder returning one `agent_name` agent.
+        /// Bind a loopback listener + responder returning one local agent and
+        /// one already-federated agent, as an older peer would after ignoring
+        /// the `local_only` parameter.
         fn spawn(agent_name: &'static str) -> Self {
             let listener =
                 TcpListener::bind("127.0.0.1:0").expect("bind loopback federation listener");
@@ -3996,13 +4017,24 @@ mod federation_tests {
             let responder = std::thread::spawn(move || {
                 while let Some(msg) = api_rx.blocking_recv() {
                     let response = match msg.request.method {
-                        Method::AgentList(_) => serde_json::to_string(&SuccessResponse {
-                            id: msg.request.id,
-                            result: ResponseResult::AgentList {
-                                agents: vec![seeded_agent(AgentStatus::Working, agent_name)],
-                            },
-                        })
-                        .expect("encode agent.list response"),
+                        Method::AgentList(params) => {
+                            assert!(
+                                params.local_only,
+                                "federation polls must not request an aggregated agent directory"
+                            );
+                            let mut reexported = seeded_agent(AgentStatus::Working, "nested");
+                            reexported.machine_id = Some("other-peer".into());
+                            serde_json::to_string(&SuccessResponse {
+                                id: msg.request.id,
+                                result: ResponseResult::AgentList {
+                                    agents: vec![
+                                        seeded_agent(AgentStatus::Working, agent_name),
+                                        reexported,
+                                    ],
+                                },
+                            })
+                            .expect("encode agent.list response")
+                        }
                         _ => error_response_json(
                             msg.request.id,
                             "unexpected_dispatch",
@@ -4072,9 +4104,10 @@ mod federation_tests {
         false
     }
 
-    /// The manager, reconciled with one endpoint peer, spawns a poll thread that
-    /// caches the peer's agent alias-prefixed and `Reachable`, rewriting all five
-    /// identity fields plus `machine_id`, and registers a proxy route for it.
+    /// The manager requests local-only state, drops a legacy peer's already
+    /// federated entry, caches the owned agent alias-prefixed and `Reachable`,
+    /// rewrites all five identity fields plus `machine_id`, and registers a
+    /// proxy route for it.
     #[test]
     fn federation_client_caches_alias_prefixed_reachable_agents() {
         let peer_srv = SeededPeer::spawn("builder");
@@ -4784,7 +4817,7 @@ mod federation_tests {
         assert!(routable_target_mut(&mut local_set_pty_size).is_none());
 
         // A method with no proxyable target is never routed.
-        let mut list = Method::AgentList(EmptyParams {});
+        let mut list = Method::AgentList(crate::api::schema::AgentListParams::default());
         assert!(routable_target_mut(&mut list).is_none());
     }
 

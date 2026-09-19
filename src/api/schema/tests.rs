@@ -3,6 +3,28 @@ use std::collections::HashMap;
 use super::*;
 
 #[test]
+fn agent_list_params_preserve_aggregate_default_and_local_only_wire_shape() {
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "list",
+        "method": "agent.list",
+        "params": {}
+    }))
+    .expect("legacy empty params remain valid");
+    let Method::AgentList(legacy_params) = legacy.method else {
+        panic!("expected agent.list");
+    };
+    assert!(!legacy_params.local_only);
+
+    let local = Request {
+        id: "local".into(),
+        method: Method::AgentList(AgentListParams { local_only: true }),
+    };
+    let encoded = serde_json::to_value(&local).expect("encode local-only agent.list");
+    assert_eq!(encoded["params"]["local_only"], true);
+    assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), local);
+}
+
+#[test]
 fn pane_info_without_composer_deserializes_as_unknown() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
