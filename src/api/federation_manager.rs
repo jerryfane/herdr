@@ -1,31 +1,26 @@
 //! Runtime manager for the OUTBOUND federation peer set.
 //!
 //! One [`FederationPeerManager`] is shared (as an `Arc`) between the API
-//! [`ServerHandle`](crate::api::ServerHandle) — which spawns the initial peer
-//! set at boot and reads the outbound proxy registry on the hot per-connection
-//! path — and the [`App`](crate::app::App), whose `reload-config` handler calls
-//! [`FederationPeerManager::reconcile`] to add, remove, or re-point peers with
-//! no daemon restart.
+//! [`ServerHandle`](crate::api::ServerHandle), the app's `reload-config` path,
+//! and a lightweight saved-profile watcher. It owns:
+//! - the coordinator source: explicit peers plus last-good saved profiles and
+//!   immutable-profile trust policy;
+//! - one poll thread and one proxy route per resolved outbound peer;
+//! - retiring poll joins, kept off the single-threaded app path.
 //!
-//! It owns three things behind their own locks:
-//! - `handles`: one poll thread per outbound peer (a peer with an `endpoint`),
-//!   each carrying a per-peer `stop` flag so it can be retired individually.
-//! - `registry`: the alias→target map the outbound proxy router reads, kept
-//!   behind `RwLock<Arc<_>>` so the hot path takes a brief read lock and an
-//!   `Arc::clone` (arc-swap semantics, no new dependency) and reconcile swaps a
-//!   freshly built map in under a brief write lock.
-//! - `reaper`: joins of threads being retired, joined only once they have
-//!   finished so the reconcile (called on the single-threaded app loop) never
-//!   blocks on a thread teardown.
+//! `reconcile_config` and the watcher serialize source changes under the
+//! coordinator lock, then reconcile the complete desired set. Explicit TCP or
+//! non-profile peers remain available when coordinator mode is off. Saved SSH
+//! profiles are included only when coordinator mode and per-profile policy are
+//! both present.
 //!
 //! ## Locking model (no deadlock possible)
-//! Three locks — **H** (`handles`), **S** (`store`, external), **R**
-//! (`registry`). Only [`reconcile`](FederationPeerManager::reconcile) ever holds
-//! more than one, always in the order **H → S (briefly) → R**. A changed SSH
-//! route is stopped and its bridge is shut down while H remains held so the
-//! replacement can safely reuse the profile's socket path; bridge workers do not
-//! take H, S, or R. Poll threads take **S** only; accept/proxy threads take **R**
-//! only (one `Arc::clone`). No cycle is reachable.
+//! Source-driven updates take **C** (`coordinator`) before **H** (`handles`).
+//! Reconcile then takes **S** (`store`) only briefly per eviction, **P**
+//! (`reaper`) after releasing S, and finally **R** (`registry`): **C → H → S /
+//! P → R**. Poll threads take S only; proxy threads take R only; bridge workers
+//! take none of these locks. Shutdown joins the catalog watcher before draining
+//! H, so it never waits for C while holding a downstream lock.
 //!
 //! ## Default-off byte-identical
 //! With no peer configured (or none with an `endpoint`), reconcile spawns zero
@@ -33,10 +28,10 @@
 //! and the local `agent.list` path is unchanged. `reconcile(&[])` is a clean
 //! no-op / full teardown.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -45,7 +40,25 @@ use tracing::{debug, info};
 use crate::api::client::ConnectionTarget;
 use crate::api::federation_store::FederationStore;
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
-use crate::config::FederationPeer;
+use crate::config::{FederationConfig, FederationPeer, FederationSavedMachinePolicy};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeerPresentation {
+    pub(crate) profile_id: Option<String>,
+    pub(crate) label: String,
+}
+
+impl PeerPresentation {
+    fn from_peer(peer: &FederationPeer) -> Self {
+        Self {
+            profile_id: peer.profile_id.clone(),
+            label: peer
+                .display_label
+                .clone()
+                .unwrap_or_else(|| peer.alias.clone()),
+        }
+    }
+}
 
 /// Owns the persistent SSH process behind a saved peer's local bridge. A
 /// monitor replaces the process in place when it reports a terminal failure.
@@ -70,6 +83,50 @@ impl Drop for SavedBridgeSupervisor {
     }
 }
 
+/// One outbound route plus the identity-validation state established by its
+/// poller. Identity-pinned routes never proxy before a successful validation.
+#[derive(Clone, Debug)]
+pub(crate) struct PeerRoute {
+    target: ConnectionTarget,
+    identity_validated: Arc<AtomicBool>,
+    identity_validation_required: bool,
+}
+
+impl PeerRoute {
+    fn new(target: ConnectionTarget, requires_identity_validation: bool) -> Self {
+        Self {
+            target,
+            identity_validated: Arc::new(AtomicBool::new(!requires_identity_validation)),
+            identity_validation_required: requires_identity_validation,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &ConnectionTarget {
+        &self.target
+    }
+
+    pub(crate) fn identity_validated(&self) -> bool {
+        self.identity_validated.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_identity_validated(&self, validated: bool) {
+        self.identity_validated.store(
+            validated || !self.identity_validation_required,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(target: ConnectionTarget) -> Self {
+        Self::new(target, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_unvalidated(target: ConnectionTarget) -> Self {
+        Self::new(target, true)
+    }
+}
+
 /// A single running outbound poll thread plus the handle to stop and join it.
 struct PeerHandle {
     /// Per-peer stop flag shared by the poller and optional bridge supervisor.
@@ -89,9 +146,20 @@ struct PeerHandle {
     /// Named remote session this SSH bridge was spawned for.
     remote_session: Option<String>,
     /// Shared route used by both polling and target proxying.
-    route: ConnectionTarget,
+    route: PeerRoute,
+    /// Mutable label/profile presentation shared with the poll thread. Label-only
+    /// changes update this cell without reconnecting the transport.
+    presentation: Arc<RwLock<PeerPresentation>>,
     /// Keeps the saved peer's persistent SSH bridge supervised and alive.
     _ssh_bridge: Option<SavedBridgeSupervisor>,
+}
+
+#[derive(Clone, Default)]
+struct CoordinatorSource {
+    enabled: bool,
+    explicit: Vec<FederationPeer>,
+    policies: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+    profiles: Vec<crate::client::endpoint::SavedSshEndpoint>,
 }
 
 /// Manages the outbound federation peer set at runtime: spawns a poll thread and
@@ -104,39 +172,116 @@ pub struct FederationPeerManager {
     /// One running poll thread per outbound peer, keyed by alias.
     handles: Mutex<HashMap<String, PeerHandle>>,
     /// The outbound proxy registry, snapshot-swapped on reconcile.
-    registry: RwLock<Arc<HashMap<String, ConnectionTarget>>>,
+    registry: RwLock<Arc<HashMap<String, PeerRoute>>>,
     /// Joins of retiring threads, joined only once `is_finished()`.
     reaper: Mutex<Vec<JoinHandle<()>>>,
     /// Shared cache the poll threads write and `agent.list` reads.
     store: Arc<Mutex<FederationStore>>,
     /// Global daemon-running flag; poll threads also observe it for shutdown.
     running: Arc<AtomicBool>,
+    /// Coordinator config plus the last successfully loaded saved profiles.
+    coordinator: Mutex<CoordinatorSource>,
+    /// Stops the saved-profile catalog watcher independently of the daemon flag.
+    catalog_stop: Arc<AtomicBool>,
+    /// Catalog watcher that detects CLI add/enable/disable/remove/rename writes.
+    catalog_watcher: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl FederationPeerManager {
-    /// Build an empty manager sharing `store` and the global `running` flag. The
-    /// registry starts empty; call [`reconcile`](Self::reconcile) with the boot
-    /// peer set to populate it.
+    /// Build an empty manager sharing `store` and the global `running` flag. A
+    /// lightweight watcher observes saved-profile catalog changes; it is inert
+    /// until coordinator mode is enabled by [`Self::reconcile_config`].
     pub fn new(store: Arc<Mutex<FederationStore>>, running: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self {
+        let catalog_stop = Arc::new(AtomicBool::new(false));
+        let manager = Arc::new(Self {
             reconcile_lock: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
             registry: RwLock::new(Arc::new(HashMap::new())),
             reaper: Mutex::new(Vec::new()),
             store,
             running,
-        })
+            coordinator: Mutex::new(CoordinatorSource::default()),
+            catalog_stop: Arc::clone(&catalog_stop),
+            catalog_watcher: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&manager);
+        let watcher = std::thread::spawn(move || watch_saved_profiles(weak, catalog_stop));
+        *manager
+            .catalog_watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
+        manager
     }
 
     /// A cheap snapshot of the outbound proxy registry for the hot per-connection
     /// path: a brief read lock and an `Arc::clone`. The returned `Arc` is a
     /// consistent view even if a reconcile swaps the map immediately after.
-    pub fn registry_snapshot(&self) -> Arc<HashMap<String, ConnectionTarget>> {
+    pub fn registry_snapshot(&self) -> Arc<HashMap<String, PeerRoute>> {
         let registry = self
             .registry
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(&registry)
+    }
+
+    /// Apply explicit federation config and coordinator saved-machine policy.
+    /// A successful catalog read is folded in immediately; later catalog writes
+    /// are detected by the manager's watcher without restarting the server.
+    pub fn reconcile_config(&self, config: &FederationConfig) {
+        let loaded_profiles = if config.coordinator {
+            match crate::client::endpoint::EndpointCatalog::load_profiles() {
+                Ok(profiles) => Some(profiles),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "saved-machine federation catalog reload failed; keeping last good routes"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut source = self
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        source.enabled = config.coordinator;
+        source.explicit.clone_from(&config.peers);
+        source.policies.clone_from(&config.saved_machines);
+        if let Some(profiles) = loaded_profiles {
+            source.profiles = profiles;
+        }
+        let desired = compose_desired(&source);
+        self.reconcile(&desired);
+    }
+
+    fn refresh_saved_profiles(&self) {
+        let enabled = self
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .enabled;
+        if !enabled {
+            return;
+        }
+        let profiles = match crate::client::endpoint::EndpointCatalog::load_profiles() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(%error, "saved-machine federation catalog reload failed; keeping last good routes");
+                return;
+            }
+        };
+        let mut source = self
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if source.profiles == profiles {
+            return;
+        }
+        source.profiles = profiles;
+        let desired = compose_desired(&source);
+        self.reconcile(&desired);
     }
 
     /// Reconcile the running outbound peer set against `desired`.
@@ -158,6 +303,9 @@ impl FederationPeerManager {
             .reconcile_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
         let mut handles = self
             .handles
             .lock()
@@ -223,10 +371,25 @@ impl FederationPeerManager {
             .handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // 4. Spawn a poll thread for every newly desired outbound alias.
+
+        // 4. Update display-only presentation in place, or spawn a poll thread
+        //    for every newly desired outbound alias.
         for (alias, peer) in &desired_out {
-            if handles.contains_key(*alias) {
-                debug!(alias = %alias, "federation peer unchanged (reconcile)");
+            if let Some(handle) = handles.get(*alias) {
+                let presentation = PeerPresentation::from_peer(peer);
+                *handle
+                    .presentation
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = presentation.clone();
+                self.store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .update_peer_presentation(
+                        alias,
+                        presentation.profile_id.as_deref(),
+                        &presentation.label,
+                    );
+                debug!(alias = %alias, "federation peer route unchanged; presentation updated");
                 continue;
             }
             if let Some(handle) = self.spawn_peer_poll((*peer).clone()) {
@@ -296,17 +459,27 @@ impl FederationPeerManager {
             }
             target => (target, None),
         };
+        let route = PeerRoute::new(route, peer.expected_node_id.is_some());
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
         let profile_id = peer.profile_id.clone();
         let remote_session = peer.remote_session.clone();
+        let presentation = Arc::new(RwLock::new(PeerPresentation::from_peer(&peer)));
         let cache = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let thread_stop = Arc::clone(&stop);
         let poll_route = route.clone();
+        let poll_presentation = Arc::clone(&presentation);
         let join = std::thread::spawn(move || {
-            run_federation_peer_poll(peer, poll_route, cache, running, thread_stop);
+            run_federation_peer_poll(
+                peer,
+                poll_route,
+                poll_presentation,
+                cache,
+                running,
+                thread_stop,
+            );
         });
         Some(PeerHandle {
             stop,
@@ -318,6 +491,7 @@ impl FederationPeerManager {
             profile_id,
             remote_session,
             route,
+            presentation,
             _ssh_bridge: ssh_bridge,
         })
     }
@@ -340,11 +514,27 @@ impl FederationPeerManager {
         }
     }
 
-    /// Stop and join every poll thread, then join every retiring thread. Called
-    /// once from [`ServerHandle`](crate::api::ServerHandle)'s drop, where a
-    /// blocking join is acceptable. Drains `handles` before joining so no lock is
-    /// held across a join.
+    /// Stop the catalog watcher and every poll thread, then join every retiring
+    /// thread. Called once from [`ServerHandle`](crate::api::ServerHandle)'s
+    /// drop, where a blocking join is acceptable. Drains `handles` before
+    /// joining so no lock is held across a poll join.
     pub fn join_all(&self) {
+        self.catalog_stop.store(true, Ordering::Release);
+        {
+            let barrier = self
+                .reconcile_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(barrier);
+        }
+        let watcher = self
+            .catalog_watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(watcher) = watcher {
+            let _ = watcher.join();
+        }
         let live: Vec<PeerHandle> = {
             let mut handles = self
                 .handles
@@ -396,6 +586,32 @@ impl FederationPeerManager {
         aliases
     }
 
+    /// Current mutable presentation for one live route, for reload tests.
+    #[cfg(test)]
+    pub(crate) fn presentation_for(&self, alias: &str) -> Option<PeerPresentation> {
+        let handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handles.get(alias).map(|handle| {
+            handle
+                .presentation
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+    }
+
+    /// Remote session attached to one live transport generation, for reload tests.
+    #[cfg(test)]
+    pub(crate) fn remote_session_for(&self, alias: &str) -> Option<String> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(alias)
+            .and_then(|handle| handle.remote_session.clone())
+    }
+
     /// Reap finished retiring threads, then report how many are still pending,
     /// for tests polling that a retired thread has actually finished.
     #[cfg(test)]
@@ -407,6 +623,61 @@ impl FederationPeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reaper.len()
     }
+}
+
+fn watch_saved_profiles(manager: Weak<FederationPeerManager>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Acquire) {
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+        manager.refresh_saved_profiles();
+        drop(manager);
+        for _ in 0..10 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+fn compose_desired(source: &CoordinatorSource) -> Vec<FederationPeer> {
+    let mut desired = source.explicit.clone();
+    if !source.enabled {
+        return desired;
+    }
+    let mut aliases: std::collections::HashSet<String> =
+        desired.iter().map(|peer| peer.alias.clone()).collect();
+    for profile in source.profiles.iter().filter(|profile| profile.enabled) {
+        let Some(policy) = source.policies.get(&profile.id) else {
+            continue;
+        };
+        let alias = profile.id.to_string();
+        if !aliases.insert(alias.clone()) {
+            tracing::warn!(
+                %alias,
+                "saved-machine federation alias collides with an explicit peer; explicit peer wins"
+            );
+            continue;
+        }
+        desired.push(FederationPeer {
+            alias,
+            display_label: Some(profile.label.clone()),
+            endpoint: Some(format!(
+                "ssh://{}",
+                profile
+                    .target
+                    .strip_prefix("ssh://")
+                    .unwrap_or(&profile.target)
+            )),
+            profile_id: Some(profile.id.to_string()),
+            remote_session: Some(profile.session.clone()),
+            token_file: None,
+            expected_node_id: Some(policy.expected_machine_id.clone()),
+            capability: crate::config::CapabilityTier::Admin,
+        });
+    }
+    desired
 }
 
 /// Whether a running peer's connection or trust spec differs from the desired
@@ -619,10 +890,96 @@ mod tests {
         let _ = std::fs::remove_file(token_path);
     }
 
-    fn route_token(route: &ConnectionTarget) -> Option<&str> {
-        match route {
+    fn route_token(route: &PeerRoute) -> Option<&str> {
+        match route.target() {
             ConnectionTarget::Tcp { token, .. } => token.as_deref(),
             _ => panic!("expected TCP route"),
         }
+    }
+
+    #[test]
+    fn coordinator_adapts_enabled_trusted_profiles_without_label_routing() {
+        let mut profile = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "ssh://dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        let profile_id = profile.id.clone();
+        let mut source = CoordinatorSource {
+            enabled: true,
+            explicit: Vec::new(),
+            policies: BTreeMap::from([(
+                profile_id.clone(),
+                FederationSavedMachinePolicy {
+                    expected_machine_id: "machine_build".into(),
+                },
+            )]),
+            profiles: vec![profile.clone()],
+        };
+
+        let desired = compose_desired(&source);
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].alias, profile_id.as_str());
+        assert_eq!(desired[0].display_label.as_deref(), Some("Build"));
+        assert_eq!(
+            desired[0].endpoint.as_deref(),
+            Some("ssh://dev@build.example")
+        );
+        assert_eq!(desired[0].remote_session.as_deref(), Some("agent-work"));
+        assert_eq!(
+            desired[0].expected_node_id.as_deref(),
+            Some("machine_build")
+        );
+
+        profile.label = "Renamed".into();
+        source.profiles = vec![profile.clone()];
+        let renamed = compose_desired(&source);
+        assert_eq!(renamed[0].alias, desired[0].alias);
+        assert_eq!(renamed[0].endpoint, desired[0].endpoint);
+        assert_eq!(renamed[0].display_label.as_deref(), Some("Renamed"));
+
+        profile.enabled = false;
+        source.profiles = vec![profile];
+        assert!(compose_desired(&source).is_empty());
+    }
+
+    #[test]
+    fn coordinator_role_and_profile_identity_fail_closed() {
+        let profile = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        let mut source = CoordinatorSource {
+            enabled: false,
+            explicit: Vec::new(),
+            policies: BTreeMap::from([(
+                profile.id.clone(),
+                FederationSavedMachinePolicy {
+                    expected_machine_id: "machine_build".into(),
+                },
+            )]),
+            profiles: vec![profile.clone()],
+        };
+        assert!(
+            compose_desired(&source).is_empty(),
+            "remote/default role must not auto-federate saved machines"
+        );
+
+        source.enabled = true;
+        let replacement = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        assert_ne!(replacement.id, profile.id);
+        source.profiles = vec![replacement];
+        assert!(
+            compose_desired(&source).is_empty(),
+            "remove/re-add must not inherit trust keyed to the old profile id"
+        );
     }
 }

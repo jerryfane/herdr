@@ -1461,6 +1461,12 @@
           "description": "Accept inbound federation connections over TCP. Default off. The listener only binds when `federation.listen_addr` is set and at least one peer token file yields a token; otherwise it refuses to start rather than expose an unauthenticated port. Each accepted TCP connection is authenticated by a shared token and restricted to the granting peer's `capability` tier, and inbound connections are capped so a peer cannot exhaust threads or file descriptors. The local unix socket and the SSH control path are never filtered by this setting."
         },
         {
+          "key": "federation.coordinator",
+          "type": "boolean",
+          "default": "false",
+          "description": "Reconcile enabled saved SSH profiles that have explicit `federation.saved_machines` trust policy into outbound federation peers. Default off, including on remote machines, so saved profiles never create automatic cyclic topology."
+        },
+        {
           "key": "federation.listen_addr",
           "type": "string",
           "default": "unset",
