@@ -34,13 +34,15 @@
 //! no-op / full teardown.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tracing::{debug, info};
 
-use crate::api::client::ConnectionTarget;
+use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::federation_store::FederationStore;
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::config::FederationPeer;
@@ -56,6 +58,8 @@ struct PeerHandle {
     endpoint: String,
     /// The peer's `token_file` this thread was spawned for, for `spec_differs`.
     token_file: Option<String>,
+    /// Resolved token contents used by the live TCP route.
+    token: Option<String>,
     /// The peer's expected install identity this thread was spawned with.
     expected_node_id: Option<String>,
     /// Saved-machine profile this SSH bridge was spawned for.
@@ -214,7 +218,7 @@ impl FederationPeerManager {
             .starts_with("tcp://")
             .then(|| read_peer_token(&peer))
             .flatten();
-        let parsed = match crate::api::client::endpoint_to_target(endpoint, token) {
+        let parsed = match crate::api::client::endpoint_to_target(endpoint, token.clone()) {
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(alias = %peer.alias, %endpoint, %error, "invalid federation endpoint; peer not started");
@@ -235,9 +239,7 @@ impl FederationPeerManager {
                     Some(user) => format!("{user}@{}", target.host),
                     None => target.host,
                 };
-                let bridge = match crate::remote::SavedSshApiBridge::start(
-                    profile_id, &target, session, true,
-                ) {
+                let bridge = match start_saved_peer_bridge(profile_id, &target, session) {
                     Ok(bridge) => bridge,
                     Err(error) => {
                         tracing::warn!(alias = %peer.alias, %error, "SSH federation remote-api-bridge did not start");
@@ -270,6 +272,7 @@ impl FederationPeerManager {
             endpoint,
             token_file,
             expected_node_id,
+            token,
             profile_id,
             remote_session,
             route,
@@ -355,11 +358,49 @@ impl FederationPeerManager {
 /// Whether a running peer's connection or trust spec differs from the desired
 /// config, so its thread must be retired and respawned.
 fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
+    let token = peer
+        .endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint.starts_with("tcp://"))
+        .then(|| read_peer_token(peer))
+        .flatten();
     handle.endpoint != peer.endpoint.clone().unwrap_or_default()
         || handle.token_file != peer.token_file
+        || handle.token != token
         || handle.expected_node_id != peer.expected_node_id
         || handle.profile_id != peer.profile_id
         || handle.remote_session != peer.remote_session
+}
+
+fn start_saved_peer_bridge(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+) -> io::Result<crate::remote::SavedSshApiBridge> {
+    let bridge = crate::remote::SavedSshApiBridge::start(profile_id, target, session, true)?;
+    let probe = |bridge: &crate::remote::SavedSshApiBridge| {
+        ApiClient::for_target(ConnectionTarget::SocketPath(
+            bridge.socket_path().to_owned(),
+        ))
+        .status_with_timeout(Duration::from_secs(15))
+    };
+    let first_error = match probe(&bridge) {
+        Ok(_) => return Ok(bridge),
+        Err(error) => error,
+    };
+    let Some(failure) = bridge.reported_failure() else {
+        return Err(io::Error::other(first_error.to_string()));
+    };
+    if !bridge.used_cached_metadata
+        || !crate::remote::SavedSshApiBridge::stale_metadata_failure(&failure)
+    {
+        return Err(failure);
+    }
+    bridge.invalidate_metadata();
+    drop(bridge);
+    let bridge = crate::remote::SavedSshApiBridge::start(profile_id, target, session, false)?;
+    probe(&bridge).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(bridge)
 }
 
 /// Join one stopped poll thread away from the reconcile caller.
@@ -367,4 +408,54 @@ fn retire_poll(join: JoinHandle<()>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let _ = join.join();
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_applies_in_place_tcp_token_rotation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let token_path = std::env::temp_dir().join(format!("herdr-federation-token-{nonce}.txt"));
+        std::fs::write(&token_path, "old-token\n").unwrap();
+        let peer = FederationPeer {
+            alias: "build".into(),
+            endpoint: Some("tcp://127.0.0.1:9".into()),
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(
+            Arc::new(Mutex::new(FederationStore::default())),
+            Arc::clone(&running),
+        );
+
+        manager.reconcile(std::slice::from_ref(&peer));
+        assert_eq!(
+            route_token(&manager.registry_snapshot()["build"]),
+            Some("old-token")
+        );
+
+        std::fs::write(&token_path, "new-token\n").unwrap();
+        manager.reconcile(std::slice::from_ref(&peer));
+        assert_eq!(
+            route_token(&manager.registry_snapshot()["build"]),
+            Some("new-token")
+        );
+
+        running.store(false, Ordering::Relaxed);
+        manager.join_all();
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    fn route_token(route: &ConnectionTarget) -> Option<&str> {
+        match route {
+            ConnectionTarget::Tcp { token, .. } => token.as_deref(),
+            _ => panic!("expected TCP route"),
+        }
+    }
 }
