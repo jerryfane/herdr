@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[cfg(unix)]
 pub(super) fn configure_child_tree(command: &mut std::process::Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
 }
+
+#[cfg(not(unix))]
+pub(super) fn configure_child_tree(_command: &mut std::process::Command) {}
 
 pub(super) fn wait_with_output_timeout(
     child: std::process::Child,
