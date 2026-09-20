@@ -59,6 +59,7 @@ impl App {
             ResponseResult::AgentList {
                 agents,
                 origin_machine_id: Some(crate::persist::machine::get_or_create()),
+                origin_boot_id: Some(crate::api::server_boot_id().to_owned()),
             },
         )
     }
@@ -1441,6 +1442,7 @@ mod tests {
         let ResponseResult::AgentList {
             agents: aggregate_agents,
             origin_machine_id: aggregate_origin,
+            origin_boot_id: aggregate_boot,
         } = aggregate.result
         else {
             panic!("expected aggregate agent list");
@@ -1448,6 +1450,7 @@ mod tests {
         let ResponseResult::AgentList {
             agents: local_agents,
             origin_machine_id: local_origin,
+            origin_boot_id: local_boot,
         } = local.result
         else {
             panic!("expected local-only agent list");
@@ -1459,6 +1462,8 @@ mod tests {
         assert!(!local_agents.iter().any(|agent| agent.machine_id.is_some()));
         assert_eq!(aggregate_origin, local_origin);
         assert!(local_origin.is_some());
+        assert_eq!(aggregate_boot, local_boot);
+        assert!(local_boot.is_some());
     }
 
     fn start_deferred_agent_prompt(

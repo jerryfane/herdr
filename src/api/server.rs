@@ -14,14 +14,15 @@ use tracing::{debug, error, info, warn};
 use std::fs;
 
 use crate::api::client::{
-    parse_response_value, ApiClient, ApiClientError, ConnectionTarget, ProxyError,
-    FEDERATION_STREAM_IDLE_TIMEOUT,
+    parse_response_value, ApiClient, ApiClientError, ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
 use crate::api::federation::{
-    authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
-    FEDERATION_PROTOCOL_VERSION,
+    authorized_peer, federation_access, federation_method_policy, FederationAccess,
+    FederationHello, PeerContext, FEDERATION_PROTOCOL_VERSION,
 };
-use crate::api::federation_manager::{FederationPeerManager, PeerPresentation, PeerRoute};
+use crate::api::federation_manager::{
+    FederationPeerManager, PeerPresentation, PeerRoute, PeerRouteStamp,
+};
 use crate::api::federation_store::{
     FederationStore, PeerCacheEntry, Reachability, ReachabilityTracker,
 };
@@ -579,7 +580,10 @@ fn poll_once_into_cache(
     peer_stop: &Arc<AtomicBool>,
 ) -> Reachability {
     match poll_peer_agent_list(client, running, expected_machine_id) {
-        Ok(agents) => {
+        Ok((agents, remote_boot_id)) => {
+            if let Some(route) = route {
+                route.observe_remote_boot(remote_boot_id.as_deref());
+            }
             let mut rejected = 0usize;
             let presentation = presentation
                 .read()
@@ -681,7 +685,7 @@ fn poll_peer_agent_list(
     client: &ApiClient,
     running: &Arc<AtomicBool>,
     expected_machine_id: Option<&str>,
-) -> Result<Vec<crate::api::schema::AgentInfo>, ApiClientError> {
+) -> Result<(Vec<crate::api::schema::AgentInfo>, Option<String>), ApiClientError> {
     let request = Request {
         id: "federation:agent.list".into(),
         method: Method::AgentList(crate::api::schema::AgentListParams { local_only: true }),
@@ -697,6 +701,7 @@ fn poll_peer_agent_list(
         ResponseResult::AgentList {
             mut agents,
             origin_machine_id,
+            origin_boot_id,
         } => {
             if let Some(expected) = expected_machine_id {
                 if origin_machine_id.as_deref() != Some(expected) {
@@ -717,7 +722,7 @@ fn poll_peer_agent_list(
             for agent in &mut agents {
                 agent.origin_machine_id.clone_from(&origin_machine_id);
             }
-            Ok(agents)
+            Ok((agents, origin_boot_id))
         }
         other => Err(ApiClientError::UnexpectedResult(format!("{other:?}"))),
     }
@@ -1118,7 +1123,7 @@ fn handle_connection_with_stop(
                         request_id.clone(),
                         &alias,
                         params,
-                        peer_target.target().clone(),
+                        peer_target,
                         running,
                     )
                 }
@@ -1299,6 +1304,9 @@ fn finish_wait_response(
 /// like S-Tab, `^C`, and Ctrl-chords); both are already `AllowedAt` on the inbound
 /// (peer) side, so routing them completes the send symmetry with `agent.send_keys`.
 fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
+    if !federation_method_policy(api_method_name(method)).outbound_routable {
+        return None;
+    }
     match method {
         Method::AgentPrompt(params) => Some(&mut params.target),
         Method::AgentSendKeys(params) => Some(&mut params.target),
@@ -1404,13 +1412,21 @@ fn maybe_route_to_peer(
         }
         return Some(result);
     }
-    let peer_target = peer_route.target().clone();
+    let peer_target = peer_route;
     // Federated: strip the `<alias>/` prefix so the peer sees its own local id.
     *target = rest;
 
-    let client = ApiClient::for_target(peer_target);
-    let response = proxy_federated_response(&client, request, running);
-    let result = write_text_line_allow_disconnect(stream, &response);
+    let stamp = peer_target.stamp();
+    let response = proxy_federated_response(&peer_target, &stamp, request, running);
+    let result = match peer_target.with_current(&stamp, || {
+        write_text_line_allow_disconnect(stream, &response)
+    }) {
+        Some(result) => result,
+        None => {
+            let stale = stale_peer_generation_response(request.id.clone(), &stamp);
+            write_text_line_allow_disconnect(stream, &stale)
+        }
+    };
     match &result {
         Ok(()) => crate::logging::api_request_completed(
             request_id,
@@ -1436,17 +1452,26 @@ fn maybe_route_to_peer(
 ///   `delivery_unknown`, because the peer may or may not have acted — and the home
 ///   NEVER auto-retries, so a write that did land is not duplicated.
 fn proxy_federated_response(
-    client: &ApiClient,
+    route: &PeerRoute,
+    stamp: &PeerRouteStamp,
     request: &Request,
     running: &Arc<AtomicBool>,
 ) -> String {
-    match client.proxy_request_bounded(
-        request,
-        FEDERATION_MAX_RESPONSE_BYTES,
-        FEDERATION_PROXY_REQUEST_TIMEOUT,
-        Some(running),
-    ) {
-        Ok(line) => line,
+    let client = ApiClient::for_target(route.target().clone());
+    let Some(opened) = route.with_current(stamp, || client.open_proxy_request(request)) else {
+        return stale_peer_generation_response(request.id.clone(), stamp);
+    };
+    let result = opened.and_then(|stream| {
+        ApiClient::read_proxy_response_bounded(
+            stream,
+            FEDERATION_MAX_RESPONSE_BYTES,
+            FEDERATION_PROXY_REQUEST_TIMEOUT,
+            Some(running),
+        )
+    });
+    match result {
+        Ok(line) if route.is_current(stamp) => line,
+        Ok(_) => stale_peer_generation_response(request.id.clone(), stamp),
         Err(ProxyError::Connect(err)) => {
             warn!(id = %request.id, err = %err, "federation proxy could not reach peer");
             error_response_json(
@@ -1472,6 +1497,19 @@ fn proxy_federated_response(
     }
 }
 
+fn stale_peer_generation_response(id: String, stamp: &PeerRouteStamp) -> String {
+    let boot = stamp.remote_boot_id.as_deref().unwrap_or("unknown");
+    error_response_json(
+        id,
+        "stale_peer_generation",
+        format!(
+            "federation peer route changed while the request was in flight \
+             (generation {}, remote boot {boot})",
+            stamp.generation
+        ),
+    )
+}
+
 /// Resolve a `pane.stream` target into `(alias, peer-pane-id, peer connection)`
 /// when it names a configured federation peer (`<alias>/<pane-id>`), owning the
 /// alias/pane-id so the borrow of `params.pane_id` is released before it is
@@ -1482,6 +1520,9 @@ fn federated_stream_target(
     pane_id: &str,
     peers: &HashMap<String, PeerRoute>,
 ) -> Option<(String, String, PeerRoute)> {
+    if !federation_method_policy("pane.stream").outbound_routable {
+        return None;
+    }
     let (alias, rest) = federated_split(pane_id, peers)?;
     let target = peers.get(alias)?.clone();
     Some((alias.to_string(), rest.to_string(), target))
@@ -1509,18 +1550,24 @@ fn proxy_federated_pane_stream(
     request_id: String,
     alias: &str,
     params: PaneStreamParams,
-    peer_target: ConnectionTarget,
+    peer_route: PeerRoute,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let client = ApiClient::for_target(peer_target);
+    let stamp = peer_route.stamp();
+    let client = ApiClient::for_target(peer_route.target().clone());
     let request = Request {
         id: request_id.clone(),
         method: Method::PaneStream(params),
     };
 
-    // Phase 1: establish the route, then write. Only establishment failure is
-    // definitely not delivered; a write failure may have reached the peer.
-    let mut peer_stream = match client.open_frame_stream_classified(&request) {
+    // Phase 1 is lifecycle-linearized through the request write. A retired
+    // snapshot cannot connect to or send bytes to its former peer.
+    let opened = peer_route.with_current(&stamp, || client.open_frame_stream_classified(&request));
+    let Some(opened) = opened else {
+        let response = stale_peer_generation_response(request_id, &stamp);
+        return write_text_line_allow_disconnect(&mut client_stream, &response);
+    };
+    let mut peer_stream = match opened {
         Ok(peer_stream) => peer_stream,
         Err(ProxyError::Connect(err)) => {
             warn!(
@@ -1588,10 +1635,18 @@ fn proxy_federated_pane_stream(
     // error verbatim. `keep_streaming` is false for anything but a real ack, so a
     // peer error ends the proxy after this single line.
     let (first_line, keep_streaming) = prepare_first_stream_line(&first, alias);
-    if !emit_line_to_client(&mut client_stream, &first_line)? || !keep_streaming {
-        // Client dropped, or the peer's first line was an error/terminal: done.
-        // `peer_stream` drops here, tearing the peer connection down.
-        return Ok(());
+    match peer_route.with_current(&stamp, || {
+        emit_line_to_client(&mut client_stream, &first_line)
+    }) {
+        Some(result) => {
+            if !result? || !keep_streaming {
+                return Ok(());
+            }
+        }
+        None => {
+            let response = stale_peer_generation_response(request_id, &stamp);
+            return write_text_line_allow_disconnect(&mut client_stream, &response);
+        }
     }
 
     // Phase 3: pipe every subsequent frame verbatim. Read-one / write-one: a slow
@@ -1601,14 +1656,28 @@ fn proxy_federated_pane_stream(
         if !running.load(Ordering::Relaxed) {
             break;
         }
+        if !peer_route.is_current(&stamp) {
+            let response = stale_peer_generation_response(request_id.clone(), &stamp);
+            let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+            break;
+        }
         match peer_stream.next_frame(
             FEDERATION_MAX_STREAM_FRAME_BYTES,
             FEDERATION_STREAM_IDLE_TIMEOUT,
             running,
         ) {
             Ok(Some(frame)) => {
-                if !emit_line_to_client(&mut client_stream, &frame)? {
-                    break; // client dropped
+                match peer_route
+                    .with_current(&stamp, || emit_line_to_client(&mut client_stream, &frame))
+                {
+                    Some(Ok(true)) => {}
+                    Some(Ok(false)) => break,
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        let response = stale_peer_generation_response(request_id.clone(), &stamp);
+                        let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+                        break;
+                    }
                 }
             }
             Ok(None) => break, // peer/pane ended (sent `exited` then closed)
@@ -4112,6 +4181,7 @@ mod federation_tests {
                                         reexported,
                                     ],
                                     origin_machine_id: Some("machine-peer".into()),
+                                    origin_boot_id: Some("boot-peer".into()),
                                 },
                             })
                             .expect("encode agent.list response")
@@ -4872,10 +4942,18 @@ mod federation_tests {
         // Alias A points at the OLD addr.
         manager.reconcile(&[reachable_peer_on(peer_old.addr, "A", &peer_old.token_path)]);
         assert!(wait_for_cached(&cache, "A", "A/old-agent"));
+        let old_route = manager.registry_snapshot().get("A").cloned().unwrap();
+        let old_stamp = old_route.stamp();
 
         // Re-point alias A at the NEW addr: endpoint changed → respawn.
         manager.reconcile(&[reachable_peer_on(peer_new.addr, "A", &peer_new.token_path)]);
         assert_eq!(manager.live_aliases(), vec!["A".to_string()]);
+        assert!(
+            !old_route.is_current(&old_stamp),
+            "the retired transport generation must fence delayed replies"
+        );
+        let new_stamp = manager.registry_snapshot().get("A").unwrap().stamp();
+        assert!(new_stamp.generation > old_stamp.generation);
 
         // The registry now routes A at the new addr.
         match manager.registry_snapshot().get("A").map(PeerRoute::target) {
@@ -5198,10 +5276,10 @@ mod federation_tests {
         let mut peers = HashMap::new();
         peers.insert(
             "w1".to_string(),
-            ConnectionTarget::Tcp {
+            PeerRoute::for_test(ConnectionTarget::Tcp {
                 addr: "127.0.0.1:9000".parse().unwrap(),
                 token: None,
-            },
+            }),
         );
 
         // `<alias>/x` routes; the rest keeps everything after the FIRST slash.
@@ -5381,11 +5459,12 @@ mod federation_tests {
             probe.local_addr().expect("probe addr")
             // `probe` drops here, freeing the port so connects are refused.
         };
-        let unreachable = ApiClient::for_target(ConnectionTarget::Tcp {
+        let unreachable = PeerRoute::for_test(ConnectionTarget::Tcp {
             addr: dead_addr,
             token: Some("t".into()),
         });
-        let line = proxy_federated_response(&unreachable, &request, &running);
+        let stamp = unreachable.stamp();
+        let line = proxy_federated_response(&unreachable, &stamp, &request, &running);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["id"], "u1");
         assert_eq!(value["error"]["code"], "peer_unreachable");
@@ -5411,14 +5490,73 @@ mod federation_tests {
                 }
             }
         });
-        let dropper = ApiClient::for_target(ConnectionTarget::Tcp {
+        let dropper = PeerRoute::for_test(ConnectionTarget::Tcp {
             addr: peer.addr,
             token: Some("t".into()),
         });
-        let line = proxy_federated_response(&dropper, &request, &running);
+        let stamp = dropper.stamp();
+        let line = proxy_federated_response(&dropper, &stamp, &request, &running);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["id"], "u1");
         assert_eq!(value["error"]["code"], "delivery_unknown");
+    }
+
+    #[test]
+    fn delayed_response_from_previous_remote_boot_is_rejected() {
+        use std::io::BufRead as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept peer");
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            request_seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let response = serde_json::to_string(&SuccessResponse {
+                id: "stale-1".into(),
+                result: ResponseResult::Pong {
+                    version: "test".into(),
+                    protocol: 1,
+                    capabilities: None,
+                },
+            })
+            .unwrap();
+            writeln!(socket, "{response}").unwrap();
+        });
+
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr,
+            token: Some("t".into()),
+        });
+        route.force_remote_boot_for_test("boot-before");
+        let request = Request {
+            id: "stale-1".into(),
+            method: Method::Ping(PingParams::default()),
+        };
+        let request_route = route.clone();
+        let request_stamp = route.stamp();
+        let running = Arc::new(AtomicBool::new(true));
+        let request_running = Arc::clone(&running);
+        let request_thread = std::thread::spawn(move || {
+            proxy_federated_response(&request_route, &request_stamp, &request, &request_running)
+        });
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer received request");
+        route.force_remote_boot_for_test("boot-after");
+        release_tx.send(()).unwrap();
+
+        let line = request_thread.join().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["id"], "stale-1");
+        assert_eq!(value["error"]["code"], "stale_peer_generation");
+        peer.join().unwrap();
     }
 
     /// A raw loopback "peer daemon" for the outbound-proxy tests. It accepts
@@ -5651,6 +5789,40 @@ mod federation_tests {
         assert!(
             home.api_rx.try_recv().is_err(),
             "an unvalidated federated target reached the local app"
+        );
+    }
+
+    #[test]
+    fn retired_connection_snapshot_sends_no_unary_or_stream_request_bytes() {
+        let peer = start_proxy_peer(|_, _| panic!("retired route reached its former peer"));
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some("tok".into()),
+        });
+        let registry = HashMap::from([("remote".to_string(), route.clone())]);
+        route.retire();
+
+        for request in [
+            serde_json::json!({
+                "id": "retired-unary",
+                "method": "agent.prompt",
+                "params": { "target": "remote/builder", "text": "must not send" },
+            }),
+            serde_json::json!({
+                "id": "retired-stream",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/pane" },
+            }),
+        ] {
+            let mut home = drive_home_routes(registry.clone());
+            let response = home_roundtrip(&mut home, request);
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["error"]["code"], "stale_peer_generation");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            peer.seen.lock().expect("seen lock").is_empty(),
+            "a retired route delivered request bytes from an older connection snapshot"
         );
     }
 
@@ -5986,6 +6158,69 @@ mod federation_tests {
             "a proxied pane.stream reached the local app dispatch path"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn pane_stream_stops_before_forwarding_a_stale_generation_frame() {
+        let started = serde_json::to_string(&SuccessResponse {
+            id: "stale-stream".into(),
+            result: ResponseResult::StreamStarted {
+                pane_id: "screen".into(),
+                epoch: 7,
+                cols: 80,
+                rows: 24,
+                base_seq: 100,
+                resync: true,
+            },
+        })
+        .unwrap();
+        let stale_data =
+            r#"{"stream":"pane.bytes","frame":"data","seq":100,"epoch":7,"data_b64":"c3RhbGU="}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream peer");
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept stream peer");
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            writeln!(socket, "{started}").unwrap();
+            socket.flush().unwrap();
+            release_rx.recv().unwrap();
+            writeln!(socket, "{stale_data}").unwrap();
+            socket.flush().unwrap();
+        });
+
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr,
+            token: Some("tok".into()),
+        });
+        route.force_remote_boot_for_test("boot-before");
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route.clone())]));
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({
+                "id": "stale-stream",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/screen" },
+            }),
+        );
+        let started = next_stream_line(&mut reader).expect("stream_started line");
+        let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(value["result"]["type"], "stream_started");
+
+        route.force_remote_boot_for_test("boot-after");
+        release_tx.send(()).unwrap();
+        let stale = next_stream_line(&mut reader).expect("stale generation error");
+        let value: serde_json::Value = serde_json::from_str(&stale).unwrap();
+        assert_eq!(value["error"]["code"], "stale_peer_generation");
+        assert!(
+            next_stream_line(&mut reader).is_none(),
+            "stale peer frame must not cross the generation fence"
+        );
+        peer.join().unwrap();
     }
 
     #[test]

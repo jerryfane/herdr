@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -82,22 +82,48 @@ impl Drop for SavedBridgeSupervisor {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeerRouteStamp {
+    pub(crate) generation: u64,
+    pub(crate) remote_boot_id: Option<String>,
+}
 
-/// One outbound route plus the identity-validation state established by its
-/// poller. Identity-pinned routes never proxy before a successful validation.
+/// One resolved outbound route plus the generation/boot fence shared by every
+/// request and stream using it.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerRoute {
     target: ConnectionTarget,
-    identity_validated: Arc<AtomicBool>,
-    identity_validation_required: bool,
+    state: Arc<PeerRouteState>,
 }
 
+#[derive(Debug)]
+struct PeerRouteState {
+    generation: AtomicU64,
+    remote_boot_id: RwLock<Option<String>>,
+    lifecycle: RwLock<()>,
+    retired: AtomicBool,
+    generation_clock: Arc<AtomicU64>,
+    identity_validated: AtomicBool,
+    identity_validation_required: bool,
+}
 impl PeerRoute {
-    fn new(target: ConnectionTarget, requires_identity_validation: bool) -> Self {
+    fn new(
+        target: ConnectionTarget,
+        generation_clock: Arc<AtomicU64>,
+        requires_identity_validation: bool,
+    ) -> Self {
+        let generation = generation_clock.fetch_add(1, Ordering::AcqRel) + 1;
         Self {
             target,
-            identity_validated: Arc::new(AtomicBool::new(!requires_identity_validation)),
-            identity_validation_required: requires_identity_validation,
+            state: Arc::new(PeerRouteState {
+                generation: AtomicU64::new(generation),
+                remote_boot_id: RwLock::new(None),
+                lifecycle: RwLock::new(()),
+                retired: AtomicBool::new(false),
+                generation_clock,
+                identity_validated: AtomicBool::new(!requires_identity_validation),
+                identity_validation_required: requires_identity_validation,
+            }),
         }
     }
 
@@ -106,30 +132,113 @@ impl PeerRoute {
     }
 
     pub(crate) fn identity_validated(&self) -> bool {
-        self.identity_validated.load(Ordering::Acquire)
+        self.state.identity_validated.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_identity_validated(&self, validated: bool) {
-        self.identity_validated.store(
-            validated || !self.identity_validation_required,
+        self.state.identity_validated.store(
+            validated || !self.state.identity_validation_required,
             Ordering::Release,
         );
     }
 
+    fn stamp_unlocked(&self) -> PeerRouteStamp {
+        PeerRouteStamp {
+            generation: self.state.generation.load(Ordering::Acquire),
+            remote_boot_id: self
+                .state
+                .remote_boot_id
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
+
+    pub(crate) fn stamp(&self) -> PeerRouteStamp {
+        let _lifecycle = self
+            .state
+            .lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stamp_unlocked()
+    }
+
+    pub(crate) fn is_current(&self, stamp: &PeerRouteStamp) -> bool {
+        let _lifecycle = self
+            .state
+            .lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !self.state.retired.load(Ordering::Acquire) && self.stamp_unlocked() == *stamp
+    }
+
+    /// Linearize an externally visible write against route retirement and
+    /// remote-boot changes. The transition waits until `write` returns.
+    pub(crate) fn with_current<T>(
+        &self,
+        stamp: &PeerRouteStamp,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _lifecycle = self
+            .state
+            .lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!self.state.retired.load(Ordering::Acquire) && self.stamp_unlocked() == *stamp).then(write)
+    }
+
+    pub(crate) fn observe_remote_boot(&self, remote_boot_id: Option<&str>) {
+        let Some(remote_boot_id) = remote_boot_id else {
+            return;
+        };
+        let _lifecycle = self
+            .state
+            .lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = self
+            .state
+            .remote_boot_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_deref() == Some(remote_boot_id) {
+            return;
+        }
+        if current.is_some() {
+            let generation = self.state.generation_clock.fetch_add(1, Ordering::AcqRel) + 1;
+            self.state.generation.store(generation, Ordering::Release);
+        }
+        *current = Some(remote_boot_id.to_owned());
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(target: ConnectionTarget) -> Self {
-        Self::new(target, false)
+        Self::new(target, Arc::new(AtomicU64::new(0)), false)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test_unvalidated(target: ConnectionTarget) -> Self {
-        Self::new(target, true)
+        Self::new(target, Arc::new(AtomicU64::new(0)), true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_remote_boot_for_test(&self, remote_boot_id: &str) {
+        self.observe_remote_boot(Some(remote_boot_id));
+    }
+
+    pub(crate) fn retire(&self) {
+        let _lifecycle = self
+            .state
+            .lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.state.retired.store(true, Ordering::Release);
     }
 }
 
 /// A single running outbound poll thread plus the handle to stop and join it.
 struct PeerHandle {
-    /// Per-peer stop flag shared by the poller and optional bridge supervisor.
+    /// Per-peer cancellation flag shared by the poller and optional bridge supervisor.
     stop: Arc<AtomicBool>,
     /// Join handle for the poll thread.
     join: JoinHandle<()>,
@@ -179,6 +288,8 @@ pub struct FederationPeerManager {
     store: Arc<Mutex<FederationStore>>,
     /// Global daemon-running flag; poll threads also observe it for shutdown.
     running: Arc<AtomicBool>,
+    /// Monotonic source for transport and remote-boot generations.
+    generation_clock: Arc<AtomicU64>,
     /// Coordinator config plus the last successfully loaded saved profiles.
     coordinator: Mutex<CoordinatorSource>,
     /// Stops the saved-profile catalog watcher independently of the daemon flag.
@@ -200,6 +311,7 @@ impl FederationPeerManager {
             reaper: Mutex::new(Vec::new()),
             store,
             running,
+            generation_clock: Arc::new(AtomicU64::new(0)),
             coordinator: Mutex::new(CoordinatorSource::default()),
             catalog_stop: Arc::clone(&catalog_stop),
             catalog_watcher: Mutex::new(None),
@@ -337,6 +449,7 @@ impl FederationPeerManager {
             let Some(handle) = handles.remove(alias) else {
                 continue;
             };
+            handle.route.retire();
             // S (brief): set stop AND evict the alias while holding the store
             // Mutex, so a retiring thread's under-lock stop check (see
             // `poll_once_into_cache`) can never write a stale entry afterward.
@@ -459,7 +572,11 @@ impl FederationPeerManager {
             }
             target => (target, None),
         };
-        let route = PeerRoute::new(route, peer.expected_node_id.is_some());
+        let route = PeerRoute::new(
+            route,
+            Arc::clone(&self.generation_clock),
+            peer.expected_node_id.is_some(),
+        );
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
@@ -543,6 +660,8 @@ impl FederationPeerManager {
             handles.drain().map(|(_, handle)| handle).collect()
         };
         for handle in &live {
+            handle.stop.store(true, Ordering::Relaxed);
+            handle.route.retire();
             handle.stop.store(true, Ordering::Relaxed);
         }
         let mut poll_joins = Vec::with_capacity(live.len());

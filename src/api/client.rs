@@ -259,30 +259,31 @@ impl ApiClient {
     /// The response read is bounded by BOTH `max_bytes` and `total_timeout` and
     /// abortable via `running`, exactly like [`Self::request_value_bounded`], so a
     /// malicious or faulty peer can neither OOM nor indefinitely hang the home.
-    pub fn proxy_request_bounded(
-        &self,
-        request: &Request,
-        max_bytes: usize,
-        total_timeout: Duration,
-        running: Option<&Arc<AtomicBool>>,
-    ) -> Result<String, ProxyError> {
-        let deadline = Instant::now() + total_timeout;
-        let mut stream = match &self.target {
+    pub(crate) fn open_proxy_request(&self, request: &Request) -> Result<ApiStream, ProxyError> {
+        match &self.target {
             ConnectionTarget::Ssh(target) => {
                 // The per-request SSH child embeds the request at spawn time, so a
                 // spawn failure is the connect/write phase.
                 let json = serde_json::to_string(request).map_err(|err| {
                     ProxyError::Connect(io::Error::new(io::ErrorKind::InvalidInput, err))
                 })?;
-                ssh_transport::spawn_request(target, &json).map_err(ProxyError::Connect)?
+                ssh_transport::spawn_request(target, &json).map_err(ProxyError::Connect)
             }
             _ => {
                 let mut stream = self.connect().map_err(ProxyError::Connect)?;
                 write_request_line(&mut stream, request).map_err(ProxyError::Read)?;
-                stream
+                Ok(stream)
             }
-        };
+        }
+    }
 
+    pub(crate) fn read_proxy_response_bounded(
+        mut stream: ApiStream,
+        max_bytes: usize,
+        total_timeout: Duration,
+        running: Option<&Arc<AtomicBool>>,
+    ) -> Result<String, ProxyError> {
+        let deadline = Instant::now() + total_timeout;
         let line = read_bounded_response_line(&mut stream, max_bytes, deadline, running)
             .map_err(ProxyError::Read)?;
         let trimmed = line.trim();
