@@ -5,9 +5,26 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[cfg(unix)]
+pub(super) fn configure_child_tree(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(super) fn configure_child_tree(_command: &mut std::process::Command) {}
+
 pub(super) fn wait_with_output_timeout(
+    child: std::process::Child,
+    timeout: Duration,
+) -> io::Result<Output> {
+    wait_with_output_timeout_or_cancel(child, timeout, || false)
+}
+
+pub(super) fn wait_with_output_timeout_or_cancel(
     mut child: std::process::Child,
     timeout: Duration,
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<Output> {
     let stdout = child
         .stdout
@@ -33,16 +50,23 @@ pub(super) fn wait_with_output_timeout(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_tree(&mut child);
                 let _ = stdout.join();
                 let _ = stderr.join();
                 return Err(error);
             }
         }
+        if cancelled() {
+            terminate_child_tree(&mut child);
+            let _ = stdout.join();
+            let _ = stderr.join();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "noninteractive SSH command cancelled",
+            ));
+        }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_tree(&mut child);
             let _ = stdout.join();
             let _ = stderr.join();
             return Err(io::Error::new(
@@ -65,6 +89,27 @@ pub(super) fn wait_with_output_timeout(
     })
 }
 
+fn terminate_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group_id) = i32::try_from(child.id()) {
+            // The caller starts the command as its process-group leader. Killing
+            // the group closes descendant-held stdout/stderr pipes as well.
+            unsafe {
+                libc::kill(-process_group_id, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -78,10 +123,31 @@ mod tests {
             .arg("exec sleep 10")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_child_tree(&mut command);
         let started = Instant::now();
         let error = wait_with_output_timeout(command.spawn().unwrap(), Duration::from_millis(25))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellation_kills_the_child() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 10 & wait")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_tree(&mut command);
+        let started = Instant::now();
+        let error = wait_with_output_timeout_or_cancel(
+            command.spawn().unwrap(),
+            Duration::from_secs(10),
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

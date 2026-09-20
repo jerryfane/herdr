@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 use std::fs;
 
 use crate::api::client::{
-    endpoint_to_target, parse_response_value, ApiClient, ApiClientError, ConnectionTarget,
-    ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
+    parse_response_value, ApiClient, ApiClientError, ConnectionTarget, ProxyError,
+    FEDERATION_STREAM_IDLE_TIMEOUT,
 };
 use crate::api::federation::{
     authorized_peer, federation_access, FederationAccess, FederationHello, PeerContext,
@@ -531,21 +531,11 @@ fn classify_accept_error(err: &io::Error) -> AcceptBackoff {
 /// removed peer can be stopped without disturbing the others.
 pub(crate) fn run_federation_peer_poll(
     peer: FederationPeer,
+    target: ConnectionTarget,
     cache: Arc<Mutex<FederationStore>>,
     running: Arc<AtomicBool>,
     peer_stop: Arc<AtomicBool>,
 ) {
-    let Some(endpoint) = peer.endpoint.as_deref() else {
-        return; // guarded by the caller; keeps the thread body self-contained
-    };
-    let token = read_peer_token(&peer);
-    let target = match endpoint_to_target(endpoint, token) {
-        Ok(target) => target,
-        Err(err) => {
-            warn!(alias = %peer.alias, endpoint = %endpoint, err = %err, "invalid federation endpoint; peer poll not started");
-            return;
-        }
-    };
     let client = ApiClient::for_target(target);
     let mut tracker = ReachabilityTracker::default();
 
@@ -645,7 +635,7 @@ fn poll_once_into_cache(
 /// [`resolve_federation_tokens`] read logic. `None` when there is no token file
 /// or it is unreadable/empty; the outbound connection then sends no
 /// `federation.hello` credential.
-fn read_peer_token(peer: &FederationPeer) -> Option<String> {
+pub(crate) fn read_peer_token(peer: &FederationPeer) -> Option<String> {
     let path = peer.token_file.as_deref()?;
     match std::fs::read_to_string(path) {
         Ok(contents) => {
@@ -662,37 +652,6 @@ fn read_peer_token(peer: &FederationPeer) -> Option<String> {
             None
         }
     }
-}
-
-/// Build the alias→[`ConnectionTarget`] registry the outbound proxy router (W4)
-/// uses, from every configured peer that has an `endpoint`. Reuses
-/// [`read_peer_token`] + [`endpoint_to_target`], exactly mirroring the poll
-/// client's resolution, so an alias reachable for polling is reachable for
-/// proxying. A peer with no endpoint, or whose endpoint fails to parse, is skipped
-/// (the latter logged). When no peer has a usable endpoint the map is empty — the
-/// router then never matches and local behavior is byte-identical.
-pub(crate) fn build_peer_registry(peers: &[FederationPeer]) -> HashMap<String, ConnectionTarget> {
-    let mut registry = HashMap::new();
-    for peer in peers {
-        let Some(endpoint) = peer.endpoint.as_deref() else {
-            continue;
-        };
-        let token = read_peer_token(peer);
-        match endpoint_to_target(endpoint, token) {
-            Ok(target) => {
-                registry.insert(peer.alias.clone(), target);
-            }
-            Err(err) => {
-                warn!(
-                    alias = %peer.alias,
-                    endpoint = %endpoint,
-                    err = %err,
-                    "invalid federation endpoint; peer not routable for proxying"
-                );
-            }
-        }
-    }
-    registry
 }
 
 /// Poll one peer's `agent.list` and return its agents. A transport error, a
@@ -1451,13 +1410,13 @@ fn proxy_federated_response(
             warn!(
                 id = %request.id,
                 err = %err,
-                "federation proxy: response read failed after the request was delivered"
+                "federation proxy failed after connection; delivery is unknown"
             );
             error_response_json(
                 request.id.clone(),
                 "delivery_unknown",
                 format!(
-                    "request was delivered to the federation peer but its response could not be read: {err}"
+                    "federation peer may have received the request but completion is unknown: {err}"
                 ),
             )
         }
@@ -1487,10 +1446,11 @@ fn federated_stream_target(
 /// ack's `pane_id` so the client keeps seeing the federated identity. The client's
 /// request id is preserved on the forwarded request so the peer echoes it.
 ///
-/// Phases: (1) connect + write — a failure here means the request never reached
-/// the peer, so a `peer_unreachable` line is returned; (2) read the first line —
-/// re-prefix and forward a `stream_started` ack, or forward a peer error
-/// (`forbidden` from its allowlist, `pane_not_found`) VERBATIM and end, the peer's
+/// Phases: (1) connect, then write — connect failure is `peer_unreachable`; any
+/// write failure is `delivery_unknown` because bytes may have reached the peer;
+/// (2) read the first line, re-prefix and forward a `stream_started` ack, or
+/// forward a peer error (`forbidden` from its allowlist, `pane_not_found`)
+/// VERBATIM and end, the peer's
 /// allowlist staying authoritative with no home-side capability logic; (3) pipe
 /// every subsequent frame verbatim until the peer/pane ends, the client drops, or
 /// `running` clears. On EVERY exit path the peer stream is dropped, so no orphan
@@ -1509,10 +1469,11 @@ fn proxy_federated_pane_stream(
         method: Method::PaneStream(params),
     };
 
-    // Phase 1: connect + write. A connect/write failure never reached the peer.
-    let mut peer_stream = match client.open_frame_stream(&request) {
+    // Phase 1: establish the route, then write. Only establishment failure is
+    // definitely not delivered; a write failure may have reached the peer.
+    let mut peer_stream = match client.open_frame_stream_classified(&request) {
         Ok(peer_stream) => peer_stream,
-        Err(err) => {
+        Err(ProxyError::Connect(err)) => {
             warn!(
                 id = %request_id,
                 alias,
@@ -1526,8 +1487,21 @@ fn proxy_federated_pane_stream(
             );
             return write_text_line_allow_disconnect(&mut client_stream, &response);
         }
+        Err(ProxyError::Read(err)) => {
+            warn!(
+                id = %request_id,
+                alias,
+                err = %err,
+                "federated pane.stream write failed after connection"
+            );
+            let response = error_response_json(
+                request_id,
+                "delivery_unknown",
+                format!("federation peer may have received the pane stream request: {err}"),
+            );
+            return write_text_line_allow_disconnect(&mut client_stream, &response);
+        }
     };
-
     // Phase 2: the first line is the peer's `stream_started` ack or an error line.
     let first = match peer_stream.next_frame(
         FEDERATION_MAX_STREAM_FRAME_BYTES,
@@ -4120,6 +4094,8 @@ mod federation_tests {
         FederationPeer {
             alias: alias.into(),
             endpoint: Some(format!("tcp://{addr}")),
+            profile_id: None,
+            remote_session: None,
             token_file: Some(token_path.to_string_lossy().into_owned()),
             expected_node_id: None,
             capability: CapabilityTier::Observe,
@@ -4353,6 +4329,8 @@ mod federation_tests {
         manager.reconcile(&[FederationPeer {
             alias: "listen-only".into(),
             endpoint: None,
+            profile_id: None,
+            remote_session: None,
             token_file: None,
             expected_node_id: None,
             capability: CapabilityTier::Observe,
@@ -4367,6 +4345,198 @@ mod federation_tests {
         );
         assert!(cache.lock().expect("cache lock").is_empty());
         manager.join_all();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_federation_poll_and_proxy_share_named_remote_api_bridge() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..).rev() {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+
+        let _env_lock = crate::config::test_config_env_lock().lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-fed-remote-api-{}-{nonce}",
+            std::process::id()
+        ));
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let args_log = base.join("ssh-args");
+        let fail_bridge = base.join("fail-bridge");
+        let bridge_failed = base.join("bridge-failed");
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_TEST_SSH_ARGS\"\nprintf '\\nherdr-remote-output-ready:1\\n'\nwhile IFS= read -r line; do\n  if [ -e \"$HERDR_TEST_SSH_FAIL\" ]; then\n    : > \"$HERDR_TEST_SSH_FAILED\"\n    printf '%s\\n' 'bridge-failed' >&2\n    exit 1\n  fi\n  case \"$line\" in\n    *'\"id\":\"api-client:status\"'*) printf '%s\\n' '{\"id\":\"api-client:status\",\"result\":{\"type\":\"pong\",\"version\":\"test\",\"protocol\":22}}' ;;\n    *) printf '%s\\n' \"$line\" ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+
+        let _restore = EnvRestore(vec![
+            ("PATH", std::env::var_os("PATH")),
+            ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+            (
+                "HERDR_TEST_SSH_ARGS",
+                std::env::var_os("HERDR_TEST_SSH_ARGS"),
+            ),
+            (
+                "HERDR_TEST_SSH_FAIL",
+                std::env::var_os("HERDR_TEST_SSH_FAIL"),
+            ),
+            (
+                "HERDR_TEST_SSH_FAILED",
+                std::env::var_os("HERDR_TEST_SSH_FAILED"),
+            ),
+        ]);
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("XDG_STATE_HOME", base.join("state"));
+        std::env::set_var("HERDR_TEST_SSH_ARGS", &args_log);
+        std::env::set_var("HERDR_TEST_SSH_FAIL", &fail_bridge);
+        std::env::set_var("HERDR_TEST_SSH_FAILED", &bridge_failed);
+
+        let profile_text = format!("{nonce:032x}");
+        crate::client::endpoint::SshMetadataCache::new(
+            &profile_text,
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap()
+        .store(&crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: "/opt/Herdr Builds/herdr".into(),
+        });
+
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let peer = FederationPeer {
+            alias: "build".into(),
+            endpoint: Some("ssh://dev@build.example".into()),
+            profile_id: Some(profile_text.clone()),
+            remote_session: Some("agent-work".into()),
+            token_file: None,
+            expected_node_id: None,
+            capability: CapabilityTier::Observe,
+        };
+        manager.reconcile(std::slice::from_ref(&peer));
+
+        let route = manager
+            .registry_snapshot()
+            .get("build")
+            .cloned()
+            .expect("SSH peer is routable");
+        let ConnectionTarget::SocketPath(socket) = route else {
+            panic!("SSH federation must route through the local saved bridge");
+        };
+        let stream = crate::ipc::connect_local_stream(&socket).expect("connect shared bridge");
+        let mut stream = BufReader::new(stream);
+        stream.get_mut().write_all(b"probe\n").unwrap();
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        assert_eq!(line, "probe\n");
+        drop(stream);
+
+        std::fs::write(&fail_bridge, b"fail").unwrap();
+        let mut failing =
+            crate::ipc::connect_local_stream(&socket).expect("connect bridge before failure");
+        failing.write_all(b"trigger\n").unwrap();
+        drop(failing);
+        let failure_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !bridge_failed.exists() && std::time::Instant::now() < failure_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(bridge_failed.exists(), "fake SSH process did not fail");
+        std::fs::remove_file(&fail_bridge).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let recovered_line = loop {
+            if let Ok(stream) = crate::ipc::connect_local_stream(&socket) {
+                let mut recovered = BufReader::new(stream);
+                if recovered.get_mut().write_all(b"recovered\n").is_ok() {
+                    let mut line = String::new();
+                    if recovered.read_line(&mut line).is_ok() && line == "recovered\n" {
+                        break line;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bridge supervisor did not recover after the SSH process failed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(recovered_line, "recovered\n");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !args_log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let args = std::fs::read_to_string(&args_log).expect("fake SSH invocation captured");
+        assert!(args.contains("/opt/Herdr Builds/herdr"));
+        assert!(args.contains("agent-work"));
+        assert!(args.contains("remote-api-bridge"));
+        assert!(args.contains("ControlMaster=auto"));
+        assert!(args.contains("ControlPersist=yes"));
+        assert!(!args.contains(" api-bridge "));
+
+        crate::client::endpoint::SshMetadataCache::new(
+            &profile_text,
+            "dev@build.example",
+            "agent-next",
+        )
+        .unwrap()
+        .store(&crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: "/opt/Herdr Builds/herdr".into(),
+        });
+        let mut changed = peer;
+        changed.remote_session = Some("agent-next".into());
+        let reconcile_started = std::time::Instant::now();
+        manager.reconcile(&[changed]);
+        assert!(
+            reconcile_started.elapsed() < Duration::from_millis(750),
+            "bridge retirement must not serialize one-second monitor waits"
+        );
+
+        let route = manager
+            .registry_snapshot()
+            .get("build")
+            .cloned()
+            .expect("changed SSH session is routable");
+        let ConnectionTarget::SocketPath(socket) = route else {
+            panic!("changed SSH federation route must remain a local bridge");
+        };
+        let stream = crate::ipc::connect_local_stream(&socket).expect("connect replacement bridge");
+        let mut stream = BufReader::new(stream);
+        stream.get_mut().write_all(b"next\n").unwrap();
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        assert_eq!(line, "next\n");
+        drop(stream);
+        let args = std::fs::read_to_string(&args_log).expect("replacement SSH invocation captured");
+        assert!(args.contains("agent-next"));
+
+        running.store(false, Ordering::Relaxed);
+        manager.join_all();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// `reconcile(&[])` from empty is byte-identical to no federation: zero

@@ -139,15 +139,24 @@ capability = "observe"
 alias = "ops"
 token_file = "/etc/herdr/peers/ops.token"
 capability = "interact"
+
+[[federation.peers]]
+alias = "build"
+endpoint = "ssh://dev@build.example"
+profile_id = "0123456789abcdef0123456789abcdef"
+remote_session = "agent-work"
+expected_node_id = "machine_0123456789abcdef0123456789abcdef"
 ```
 
 Each `[[federation.peers]]` table declares one peer:
 
 - `alias` — a local name for the peer, used in logs and diagnostics.
-- `token_file` — path to the shared secret. Its trimmed contents are the token this peer presents; the file's bytes are never logged. A peer with no readable, non-empty token file is skipped.
-- `endpoint` — where to reach the peer for outbound connections.
-- `expected_node_id` — an optional install-identity pin checked both when the peer connects inbound and when its outbound `agent.list` response is polled. Missing or changed identities are rejected while the pin is set.
-- `capability` — the tier this peer's token grants over inbound TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`.
+- `token_file` — path to the shared secret used by inbound and outbound TCP federation. Its trimmed contents are never logged. An unreadable or empty file grants no inbound access and sends no outbound TCP credential. SSH peers authenticate through OpenSSH instead.
+- `endpoint` — where to reach the peer for outbound connections: `tcp://host:port` or `ssh://[user@]host`.
+- `profile_id` — the immutable 32-character saved-machine profile ID used to key SSH executable metadata and bridge lifetime. Required for SSH endpoints.
+- `remote_session` — the explicit named Herdr session served by `remote-api-bridge`. Required for SSH endpoints.
+- `expected_node_id` — an optional install-identity pin checked both when a TCP peer connects inbound and when any outbound peer's `agent.list` response is polled. Missing or changed identities are rejected while the pin is set.
+- `capability` — the tier a token grants over TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`. SSH remains a full-control trust boundary.
 
 Saved-machine federation trust is separate from both the endpoint catalog and explicit peer endpoints:
 
@@ -169,7 +178,7 @@ Federation exposes only a deliberate, read-and-drive subset of the API. Anything
 `agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
 
 :::caution[Security]
-A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path (`herdr --remote` / `herdr api-bridge`), which runs against the local unix socket and therefore grants full, unfiltered control-plane access — federation capability tiers do not apply to it. The local unix socket itself is never token-checked or tier-filtered.
+A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path, which runs a discovered remote Herdr executable's `remote-api-bridge` against the named session's local socket and therefore grants full, unfiltered control-plane access. OpenSSH owns authentication, host-key checks, and interactive-auth failure. The local unix socket itself is never token-checked or tier-filtered.
 :::
 
 ## Keybindings
