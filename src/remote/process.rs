@@ -6,8 +6,16 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(super) fn wait_with_output_timeout(
+    child: std::process::Child,
+    timeout: Duration,
+) -> io::Result<Output> {
+    wait_with_output_timeout_or_cancel(child, timeout, || false)
+}
+
+pub(super) fn wait_with_output_timeout_or_cancel(
     mut child: std::process::Child,
     timeout: Duration,
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<Output> {
     let stdout = child
         .stdout
@@ -39,6 +47,16 @@ pub(super) fn wait_with_output_timeout(
                 let _ = stderr.join();
                 return Err(error);
             }
+        }
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout.join();
+            let _ = stderr.join();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "noninteractive SSH command cancelled",
+            ));
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
@@ -82,6 +100,25 @@ mod tests {
         let error = wait_with_output_timeout(command.spawn().unwrap(), Duration::from_millis(25))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellation_kills_the_child() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exec sleep 10")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let error = wait_with_output_timeout_or_cancel(
+            command.spawn().unwrap(),
+            Duration::from_secs(10),
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

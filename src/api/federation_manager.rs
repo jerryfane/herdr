@@ -51,16 +51,19 @@ use crate::config::FederationPeer;
 /// monitor replaces the process in place when it reports a terminal failure.
 struct SavedBridgeSupervisor {
     join: Option<JoinHandle<()>>,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl SavedBridgeSupervisor {
     fn retire(mut self) -> JoinHandle<()> {
+        self.cancellation.store(true, Ordering::Release);
         retire_poll(self.join.take().expect("bridge supervisor join handle"))
     }
 }
 
 impl Drop for SavedBridgeSupervisor {
     fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
             drop(retire_poll(join));
         }
@@ -430,17 +433,36 @@ fn start_saved_peer_bridge(
     running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<(ConnectionTarget, SavedBridgeSupervisor)> {
-    let bridge = crate::remote::SavedSshApiBridge::start(profile_id, target, session, true)?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let bridge = crate::remote::SavedSshApiBridge::start_cancellable(
+        profile_id,
+        target,
+        session,
+        true,
+        Arc::clone(&cancellation),
+    )?;
     let path = bridge.socket_path().to_owned();
     let profile_id = profile_id.to_owned();
     let target = target.to_owned();
     let session = session.to_owned();
+    let thread_cancellation = Arc::clone(&cancellation);
     let join = std::thread::spawn(move || {
-        supervise_saved_peer_bridge(bridge, &profile_id, &target, &session, &running, &stop);
+        supervise_saved_peer_bridge(
+            bridge,
+            &profile_id,
+            &target,
+            &session,
+            &running,
+            &stop,
+            &thread_cancellation,
+        );
     });
     Ok((
         ConnectionTarget::SocketPath(path),
-        SavedBridgeSupervisor { join: Some(join) },
+        SavedBridgeSupervisor {
+            join: Some(join),
+            cancellation,
+        },
     ))
 }
 
@@ -451,10 +473,11 @@ fn supervise_saved_peer_bridge(
     session: &str,
     running: &AtomicBool,
     stop: &AtomicBool,
+    cancellation: &Arc<AtomicBool>,
 ) {
     let mut bridge = Some(initial);
     let mut use_cached_metadata = true;
-    while !bridge_stopping(running, stop) {
+    while !bridge_stopping(running, stop, cancellation) {
         if let Some(active) = bridge.as_ref() {
             let failure = match active.try_reported_failure() {
                 Ok(Some(failure)) => failure,
@@ -464,7 +487,7 @@ fn supervise_saved_peer_bridge(
                 }
                 Err(failure) => failure,
             };
-            if bridge_stopping(running, stop) {
+            if bridge_stopping(running, stop, cancellation) {
                 break;
             }
             use_cached_metadata =
@@ -475,7 +498,7 @@ fn supervise_saved_peer_bridge(
             tracing::warn!(%failure, "saved federation bridge exited; restarting");
             drop(bridge.take());
         }
-        if bridge_stopping(running, stop) {
+        if bridge_stopping(running, stop, cancellation) {
             break;
         }
 
@@ -483,32 +506,47 @@ fn supervise_saved_peer_bridge(
         let profile_id = profile_id.to_owned();
         let target = target.to_owned();
         let session = session.to_owned();
-        std::thread::spawn(move || {
-            let result = crate::remote::SavedSshApiBridge::start(
+        let restart_cancellation = Arc::clone(cancellation);
+        let mut restart = Some(std::thread::spawn(move || {
+            let result = crate::remote::SavedSshApiBridge::start_cancellable(
                 &profile_id,
                 &target,
                 &session,
                 use_cached_metadata,
+                restart_cancellation,
             );
             let _ = result_tx.send(result);
-        });
+        }));
 
         loop {
-            if bridge_stopping(running, stop) {
+            if bridge_stopping(running, stop, cancellation) {
+                cancellation.store(true, Ordering::Release);
+                if let Some(join) = restart.take() {
+                    let _ = join.join();
+                }
                 return;
             }
             match result_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(started)) => {
+                    if let Some(join) = restart.take() {
+                        let _ = join.join();
+                    }
                     bridge = Some(started);
                     use_cached_metadata = true;
                     break;
                 }
                 Ok(Err(error)) => {
+                    if let Some(join) = restart.take() {
+                        let _ = join.join();
+                    }
                     tracing::warn!(%error, "saved federation bridge restart failed");
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(join) = restart.take() {
+                        let _ = join.join();
+                    }
                     tracing::warn!("saved federation bridge restart worker disconnected");
                     break;
                 }
@@ -516,17 +554,20 @@ fn supervise_saved_peer_bridge(
         }
         if bridge.is_none() {
             for _ in 0..10 {
-                if bridge_stopping(running, stop) {
+                if bridge_stopping(running, stop, cancellation) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
+    cancellation.store(true, Ordering::Release);
 }
 
-fn bridge_stopping(running: &AtomicBool, stop: &AtomicBool) -> bool {
-    !running.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed)
+fn bridge_stopping(running: &AtomicBool, stop: &AtomicBool, cancellation: &AtomicBool) -> bool {
+    !running.load(Ordering::Relaxed)
+        || stop.load(Ordering::Relaxed)
+        || cancellation.load(Ordering::Acquire)
 }
 
 /// Join one stopped poll thread away from the reconcile caller.

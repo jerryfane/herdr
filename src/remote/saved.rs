@@ -1,6 +1,9 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use super::attach::{find_installed_remote_herdr, ManagedSshOptions, RemoteSsh, SshStdioBridge};
 
@@ -55,7 +58,38 @@ impl SavedSshApiBridge {
         session: &str,
         use_cached_metadata: bool,
     ) -> io::Result<Self> {
-        let ssh = validated_saved_ssh(profile_id, target, session)?;
+        Self::start_inner(profile_id, target, session, use_cached_metadata, None)
+    }
+
+    pub(crate) fn start_cancellable(
+        profile_id: &str,
+        target: &str,
+        session: &str,
+        use_cached_metadata: bool,
+        cancellation: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            profile_id,
+            target,
+            session,
+            use_cached_metadata,
+            Some(cancellation),
+        )
+    }
+
+    fn start_inner(
+        profile_id: &str,
+        target: &str,
+        session: &str,
+        use_cached_metadata: bool,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Self> {
+        let ssh = validated_saved_ssh_with_cancellation(
+            profile_id,
+            target,
+            session,
+            cancellation.clone(),
+        )?;
         let metadata_cache =
             crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?;
         let cached = use_cached_metadata.then(|| metadata_cache.load()).flatten();
@@ -68,6 +102,15 @@ impl SavedSshApiBridge {
                 metadata
             }
         };
+        if cancellation
+            .as_deref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "saved SSH bridge startup cancelled",
+            ));
+        }
         let command = super::attach::cached_remote_api_command(&metadata, session);
         let path = crate::platform::remote_bridge_endpoint_path(
             &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
@@ -152,6 +195,9 @@ pub(crate) fn saved_ssh_failure_needs_attention(error: &io::Error) -> bool {
         "permission denied",
         "host key verification failed",
         "remote host identification has changed",
+        "could not resolve hostname",
+        "connection timed out",
+        "connection refused",
         "no matching host key",
         "unsupported remote platform",
         "not ready",
@@ -171,10 +217,24 @@ fn saved_bridge_path(profile_id: &str) -> PathBuf {
 }
 
 fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteSsh> {
+    validated_saved_ssh_with_cancellation(profile_id, target, session, None)
+}
+
+fn validated_saved_ssh_with_cancellation(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<RemoteSsh> {
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    Ok(RemoteSsh::new_noninteractive(target.to_owned()))
+    Ok(match cancellation {
+        Some(cancellation) => {
+            RemoteSsh::new_noninteractive_cancellable(target.to_owned(), cancellation)
+        }
+        None => RemoteSsh::new_noninteractive(target.to_owned()),
+    })
 }
 
 fn validate_profile_path_id(profile_id: &str) -> io::Result<()> {

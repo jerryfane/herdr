@@ -1,6 +1,11 @@
 //! Remote thin-client launcher over SSH command stdio.
 
-use super::{args::*, process::wait_with_output_timeout, restart_policy::*, shell_quote};
+use super::{
+    args::*,
+    process::{wait_with_output_timeout, wait_with_output_timeout_or_cancel},
+    restart_policy::*,
+    shell_quote,
+};
 use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -637,6 +642,7 @@ pub(super) struct RemoteSsh {
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl RemoteSsh {
@@ -656,6 +662,7 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            cancellation: None,
         }
     }
 
@@ -665,6 +672,20 @@ impl RemoteSsh {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: true,
+            cancellation: None,
+        }
+    }
+
+    pub(super) fn new_noninteractive_cancellable(
+        target: String,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            target,
+            session_name: crate::session::DEFAULT_SESSION_NAME.into(),
+            managed_config: None,
+            noninteractive: true,
+            cancellation: Some(cancellation),
         }
     }
 
@@ -687,6 +708,16 @@ impl RemoteSsh {
         }
         command.arg("-T").arg(&self.target);
         command
+    }
+
+    fn wait_noninteractive(&self, child: Child) -> io::Result<Output> {
+        if let Some(cancellation) = &self.cancellation {
+            wait_with_output_timeout_or_cancel(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT, || {
+                cancellation.load(Ordering::Acquire)
+            })
+        } else {
+            wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+        }
     }
 
     fn base_command(&self) -> Command {
@@ -726,7 +757,7 @@ impl RemoteSsh {
                 "ssh bootstrap stdin missing",
             ))
         };
-        let output = wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?;
+        let output = self.wait_noninteractive(child)?;
         write_result?;
         normalize_remote_output(output)
     }
@@ -741,7 +772,7 @@ impl RemoteSsh {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
-            wait_with_output_timeout(command.spawn()?, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+            self.wait_noninteractive(command.spawn()?)
         } else {
             output_with_forwarded_stderr(command.spawn()?, None)
         }?;
@@ -2707,6 +2738,7 @@ impl SshStdioBridge {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
+                        let _ = failure_tx.try_send(io::Error::new(err.kind(), err.to_string()));
                         if noninteractive {
                             tracing::warn!(error = %err, "saved SSH endpoint listener failed");
                         } else {
@@ -3901,6 +3933,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancellation: None,
         };
 
         let command = ssh.command();
@@ -4145,6 +4178,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: false,
+            cancellation: None,
         };
 
         let command = ssh.command();
