@@ -548,6 +548,15 @@ fn main() -> io::Result<()> {
 
     finish_cli(cli::maybe_run(&args))?;
 
+    // Compatibility entrypoint for the HerdrUp app, which opens one SSH channel
+    // per request and runs `herdr api-bridge <base64(request)>`. #194 removed
+    // this with herdr's own SSH federation, but the app is an out-of-repo
+    // consumer that had not migrated, so every upgraded host stopped answering
+    // it. Keep it until the app ships on `remote-api-bridge`; see #206.
+    if args.get(1).map(String::as_str) == Some("api-bridge") {
+        return remote::run_api_client_bridge(&args[2..]);
+    }
+
     if args.get(1).map(String::as_str) == Some("remote-api-bridge") {
         return remote::run_remote_api_bridge(&args[2..]);
     }
