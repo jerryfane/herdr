@@ -3730,7 +3730,13 @@ mod tests {
 
         let _path_restore = PathRestore(std::env::var_os("PATH"));
         std::env::set_var("PATH", &bin);
-        let socket = base.join("bridge.sock");
+        let socket = crate::platform::remote_bridge_endpoint_path(
+            &format!(
+                "herdr-bridge-concurrent-{}-{nonce}.sock",
+                std::process::id()
+            ),
+            &format!("hb-{}-{nonce}.sock", std::process::id()),
+        );
         let bridge = SshStdioBridge::start_command(
             "example".into(),
             "ignored".into(),
