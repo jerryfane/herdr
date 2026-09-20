@@ -181,6 +181,8 @@ Federation exposes only a deliberate, read-and-drive subset of the API. Anything
 
 `agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
 
+Use `herdr machine status` (or `herdr machine status --json`) on the coordinator to inspect each saved profile without conflating the independent planes. The result reports saved-profile state, endpoint/TUI status when the coordinator has one, federation reachability, the validated remote machine ID, last successful poll time, a bounded error class, negotiated API version/capabilities, and whether cached data is stale. A saved machine can therefore remain enabled while its federation API is degraded or unreachable. Error details never include SSH command lines, token material, or remote stderr.
+
 :::caution[Security]
 A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path, which runs a discovered remote Herdr executable's `remote-api-bridge` against the named session's local socket and therefore grants full, unfiltered control-plane access. OpenSSH owns authentication, host-key checks, and interactive-auth failure. The local unix socket itself is never token-checked or tier-filtered.
 :::

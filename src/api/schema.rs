@@ -8,6 +8,7 @@ pub mod events;
 pub mod fs;
 pub mod gram;
 pub mod integrations;
+pub mod machines;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -25,6 +26,7 @@ pub use events::*;
 pub use fs::*;
 pub use gram::*;
 pub use integrations::*;
+pub use machines::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -59,6 +61,8 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "machine.status")]
+    MachineStatus(EmptyParams),
     #[serde(rename = "server.staged_update")]
     ServerStagedUpdate(EmptyParams),
     #[serde(rename = "server.apply_staged_update")]

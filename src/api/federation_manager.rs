@@ -33,12 +33,13 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info};
 
 use crate::api::client::ConnectionTarget;
 use crate::api::federation_store::FederationStore;
+use crate::api::schema::{CoordinatorMachineStatus, MachineEndpointStatus, SavedMachineState};
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::config::{FederationConfig, FederationPeer, FederationSavedMachinePolicy};
 
@@ -336,6 +337,117 @@ impl FederationPeerManager {
         Arc::clone(&registry)
     }
 
+    pub fn machine_statuses_with_endpoint_statuses(
+        &self,
+        endpoint_statuses: &HashMap<String, MachineEndpointStatus>,
+    ) -> BTreeMap<String, CoordinatorMachineStatus> {
+        self.machine_statuses_from_profiles(None, endpoint_statuses)
+    }
+
+    #[cfg(test)]
+    fn machine_statuses_with_profiles(
+        &self,
+        profile_override: Option<&[crate::client::endpoint::SavedSshEndpoint]>,
+    ) -> BTreeMap<String, CoordinatorMachineStatus> {
+        self.machine_statuses_from_profiles(profile_override, &HashMap::new())
+    }
+
+    fn machine_statuses_from_profiles(
+        &self,
+        profile_override: Option<&[crate::client::endpoint::SavedSshEndpoint]>,
+        endpoint_statuses: &HashMap<String, MachineEndpointStatus>,
+    ) -> BTreeMap<String, CoordinatorMachineStatus> {
+        const STALE_AFTER: Duration = Duration::from_secs(15);
+        let loaded_profiles = profile_override
+            .is_none()
+            .then(crate::client::endpoint::EndpointCatalog::load_profiles)
+            .and_then(Result::ok);
+        let source = self
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let explicit_aliases: std::collections::HashSet<&str> = source
+            .explicit
+            .iter()
+            .map(|peer| peer.alias.as_str())
+            .collect();
+        let saved_owned_aliases: std::collections::HashSet<String> = source
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.enabled
+                    && source.policies.contains_key(&profile.id)
+                    && !explicit_aliases.contains(profile.id.as_str())
+            })
+            .map(|profile| profile.id.to_string())
+            .collect();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+
+        profile_override
+            .or(loaded_profiles.as_deref())
+            .unwrap_or(&source.profiles)
+            .iter()
+            .map(|profile| {
+                let profile_id = profile.id.to_string();
+                let trusted = source.policies.contains_key(&profile.id);
+                let saved_state = if !profile.enabled {
+                    SavedMachineState::Disabled
+                } else if !trusted {
+                    SavedMachineState::Untrusted
+                } else if !source.enabled {
+                    SavedMachineState::CoordinatorDisabled
+                } else {
+                    SavedMachineState::Coordinated
+                };
+                let peer = saved_owned_aliases
+                    .contains(&profile_id)
+                    .then(|| store.peer(&profile_id))
+                    .flatten();
+                let stale = saved_state == SavedMachineState::Coordinated
+                    && peer.is_none_or(|entry| {
+                        entry.reachability != crate::api::federation_store::Reachability::Reachable
+                            || entry.last_success_unix_ms.is_none_or(|last_success| {
+                                now_unix_ms.is_none_or(|now| {
+                                    now.saturating_sub(last_success)
+                                        > u64::try_from(STALE_AFTER.as_millis()).unwrap_or(u64::MAX)
+                                })
+                            })
+                    });
+                let status = CoordinatorMachineStatus {
+                    profile_id: profile_id.clone(),
+                    display_label: profile.label.clone(),
+                    remote_session: profile.session.clone(),
+                    saved_state,
+                    endpoint_status: if profile.enabled {
+                        endpoint_statuses.get(&profile_id).copied()
+                    } else {
+                        Some(MachineEndpointStatus::Disabled)
+                    },
+                    validated_machine_id: peer
+                        .and_then(|entry| entry.observation.validated_machine_id.clone()),
+                    remote_boot_id: peer.and_then(|entry| entry.observation.remote_boot_id.clone()),
+                    federation_reachability: peer.map(|entry| entry.reachability),
+                    last_success_unix_ms: peer.and_then(|entry| entry.last_success_unix_ms),
+                    last_error_class: peer.and_then(|entry| entry.last_error_class),
+                    remote_version: peer.and_then(|entry| entry.observation.remote_version.clone()),
+                    remote_protocol: peer.and_then(|entry| entry.observation.remote_protocol),
+                    remote_capabilities: peer
+                        .and_then(|entry| entry.observation.remote_capabilities.clone()),
+                    stale,
+                };
+                (profile_id, status)
+            })
+            .collect()
+    }
+
     /// Apply explicit federation config and coordinator saved-machine policy.
     /// A successful catalog read is folded in immediately; later catalog writes
     /// are detected by the manager's watcher without restarting the server.
@@ -561,9 +673,14 @@ impl FederationPeerManager {
                     session,
                     Arc::clone(&self.running),
                     Arc::clone(&stop),
+                    peer.alias.clone(),
+                    Arc::clone(&self.store),
                 ) {
                     Ok(started) => started,
                     Err(error) => {
+                        let mut tracker =
+                            crate::api::federation_store::ReachabilityTracker::default();
+                        record_saved_bridge_failure(&self.store, &peer.alias, &mut tracker, &error);
                         tracing::warn!(alias = %peer.alias, %error, "SSH federation remote-api-bridge did not start");
                         return None;
                     }
@@ -742,6 +859,19 @@ impl FederationPeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reaper.len()
     }
+
+    #[cfg(test)]
+    fn stop_catalog_watcher_for_test(&self) {
+        self.catalog_stop.store(true, Ordering::Release);
+        if let Some(watcher) = self
+            .catalog_watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = watcher.join();
+        }
+    }
 }
 
 fn watch_saved_profiles(manager: Weak<FederationPeerManager>, stop: Arc<AtomicBool>) {
@@ -822,6 +952,8 @@ fn start_saved_peer_bridge(
     session: &str,
     running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    alias: String,
+    store: Arc<Mutex<FederationStore>>,
 ) -> io::Result<(ConnectionTarget, SavedBridgeSupervisor)> {
     let cancellation = Arc::new(AtomicBool::new(false));
     let bridge = crate::remote::SavedSshApiBridge::start_cancellable(
@@ -845,6 +977,8 @@ fn start_saved_peer_bridge(
             &running,
             &stop,
             &thread_cancellation,
+            &alias,
+            &store,
         );
     });
     Ok((
@@ -856,6 +990,33 @@ fn start_saved_peer_bridge(
     ))
 }
 
+fn saved_bridge_failure_class(error: &io::Error) -> crate::api::schema::FederationPollErrorClass {
+    let message = error.to_string().to_ascii_lowercase();
+    if error.kind() == io::ErrorKind::PermissionDenied
+        || message.contains("permission denied")
+        || message.contains("authentication")
+    {
+        crate::api::schema::FederationPollErrorClass::AuthenticationFailed
+    } else {
+        crate::api::schema::FederationPollErrorClass::Transport
+    }
+}
+
+fn record_saved_bridge_failure(
+    store: &Mutex<FederationStore>,
+    alias: &str,
+    tracker: &mut crate::api::federation_store::ReachabilityTracker,
+    error: &io::Error,
+) {
+    let reachability = tracker.record_miss();
+    let class = saved_bridge_failure_class(error);
+    let mut store = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    store.degrade_peer(alias, reachability);
+    store.record_poll_error(alias, class);
+}
+
 fn supervise_saved_peer_bridge(
     initial: crate::remote::SavedSshApiBridge,
     profile_id: &str,
@@ -864,7 +1025,10 @@ fn supervise_saved_peer_bridge(
     running: &AtomicBool,
     stop: &AtomicBool,
     cancellation: &Arc<AtomicBool>,
+    alias: &str,
+    store: &Mutex<FederationStore>,
 ) {
+    let mut failure_tracker = crate::api::federation_store::ReachabilityTracker::default();
     let mut bridge = Some(initial);
     let mut use_cached_metadata = true;
     while !bridge_stopping(running, stop, cancellation) {
@@ -886,6 +1050,7 @@ fn supervise_saved_peer_bridge(
                 active.invalidate_metadata();
             }
             tracing::warn!(%failure, "saved federation bridge exited; restarting");
+            record_saved_bridge_failure(store, alias, &mut failure_tracker, &failure);
             drop(bridge.take());
         }
         if bridge_stopping(running, stop, cancellation) {
@@ -1099,6 +1264,164 @@ mod tests {
         assert!(
             compose_desired(&source).is_empty(),
             "remove/re-add must not inherit trust keyed to the old profile id"
+        );
+    }
+
+    #[test]
+    fn machine_status_separates_saved_endpoint_and_federation_health() {
+        let mut profile = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        let profile_id = profile.id.clone();
+        let profile_text = profile_id.to_string();
+        let store = Arc::new(Mutex::new(FederationStore::default()));
+        let manager =
+            FederationPeerManager::new(Arc::clone(&store), Arc::new(AtomicBool::new(true)));
+        manager.stop_catalog_watcher_for_test();
+        *manager
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = CoordinatorSource {
+            enabled: true,
+            explicit: Vec::new(),
+            policies: BTreeMap::from([(
+                profile_id,
+                FederationSavedMachinePolicy {
+                    expected_machine_id: "machine_build".into(),
+                },
+            )]),
+            profiles: vec![profile.clone()],
+        };
+
+        let endpoint_statuses =
+            HashMap::from([(profile_text.clone(), MachineEndpointStatus::Online)]);
+        let pending = manager.machine_statuses_from_profiles(
+            Some(std::slice::from_ref(&profile)),
+            &endpoint_statuses,
+        );
+        assert_eq!(
+            pending[&profile_text].saved_state,
+            SavedMachineState::Coordinated
+        );
+        assert_eq!(
+            pending[&profile_text].endpoint_status,
+            Some(MachineEndpointStatus::Online)
+        );
+        assert_eq!(pending[&profile_text].federation_reachability, None);
+        assert!(pending[&profile_text].stale);
+
+        store.lock().unwrap().set_peer(
+            profile_text.clone(),
+            crate::api::federation_store::PeerCacheEntry::reachable_observed(
+                Vec::new(),
+                std::time::Instant::now(),
+                crate::api::federation_store::PeerObservation {
+                    validated_machine_id: Some("machine_build".into()),
+                    remote_boot_id: Some("boot-1".into()),
+                    remote_version: Some("0.9.1".into()),
+                    remote_protocol: Some(2),
+                    remote_capabilities: crate::api::default_capabilities(),
+                },
+            ),
+        );
+        let online = manager.machine_statuses_from_profiles(
+            Some(std::slice::from_ref(&profile)),
+            &endpoint_statuses,
+        );
+        assert_eq!(
+            online[&profile_text].federation_reachability,
+            Some(crate::api::federation_store::Reachability::Reachable)
+        );
+        assert_eq!(
+            online[&profile_text].validated_machine_id.as_deref(),
+            Some("machine_build")
+        );
+        assert_eq!(
+            online[&profile_text].remote_boot_id.as_deref(),
+            Some("boot-1")
+        );
+        assert_eq!(online[&profile_text].remote_protocol, Some(2));
+        assert!(!online[&profile_text].stale);
+        let encoded = serde_json::to_string(&online[&profile_text]).unwrap();
+        assert!(!encoded.contains("dev@build.example"));
+        assert!(!encoded.contains("token"));
+
+        profile.enabled = false;
+        manager
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .profiles = vec![profile.clone()];
+        let disabled = manager.machine_statuses_with_profiles(Some(std::slice::from_ref(&profile)));
+        assert_eq!(
+            disabled[&profile_text].endpoint_status,
+            Some(MachineEndpointStatus::Disabled)
+        );
+        assert_eq!(
+            disabled[&profile_text].saved_state,
+            SavedMachineState::Disabled
+        );
+        assert!(!disabled[&profile_text].stale);
+
+        manager.join_all();
+    }
+
+    #[test]
+    fn machine_status_ignores_explicit_peer_cache_on_profile_alias_collision() {
+        let profile = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        let alias = profile.id.to_string();
+        let store = Arc::new(Mutex::new(FederationStore::default()));
+        store.lock().unwrap().degrade_peer(
+            &alias,
+            crate::api::federation_store::Reachability::Unreachable,
+        );
+        let manager =
+            FederationPeerManager::new(Arc::clone(&store), Arc::new(AtomicBool::new(true)));
+        manager.stop_catalog_watcher_for_test();
+        *manager
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = CoordinatorSource {
+            enabled: true,
+            explicit: vec![FederationPeer {
+                alias: alias.clone(),
+                display_label: None,
+                endpoint: Some("ssh://dev@explicit.example".into()),
+                profile_id: Some(profile.id.to_string()),
+                remote_session: Some("explicit-session".into()),
+                token_file: None,
+                expected_node_id: None,
+                capability: crate::config::CapabilityTier::Admin,
+            }],
+            policies: BTreeMap::from([(
+                profile.id.clone(),
+                FederationSavedMachinePolicy {
+                    expected_machine_id: "machine_build".into(),
+                },
+            )]),
+            profiles: vec![profile.clone()],
+        };
+
+        let statuses = manager.machine_statuses_with_profiles(Some(std::slice::from_ref(&profile)));
+        assert_eq!(statuses[&alias].federation_reachability, None);
+        assert_eq!(statuses[&alias].last_error_class, None);
+        manager.join_all();
+    }
+
+    #[test]
+    fn saved_bridge_permission_failure_is_classified_as_authentication() {
+        let error = io::Error::other("Permission denied (publickey)");
+        assert_eq!(
+            saved_bridge_failure_class(&error),
+            crate::api::schema::FederationPollErrorClass::AuthenticationFailed
         );
     }
 }

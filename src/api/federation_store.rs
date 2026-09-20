@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::schema::{AgentInfo, AgentStatus};
+use crate::api::schema::{AgentInfo, AgentStatus, FederationPollErrorClass, ServerCapabilities};
 
 /// Reachability of a federation peer, derived from consecutive poll outcomes.
 ///
@@ -74,6 +74,14 @@ impl ReachabilityTracker {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PeerObservation {
+    pub validated_machine_id: Option<String>,
+    pub remote_boot_id: Option<String>,
+    pub remote_version: Option<String>,
+    pub remote_protocol: Option<u32>,
+    pub remote_capabilities: Option<ServerCapabilities>,
+}
 /// One federation peer's cached agents plus its current reachability.
 ///
 /// `agents` are stored already alias-prefixed (see the poll thread); the honest
@@ -89,15 +97,33 @@ pub struct PeerCacheEntry {
     /// on the merge path, so it reads as unused in a non-test build.
     #[allow(dead_code)]
     pub last_seen: Option<Instant>,
+    pub last_success_unix_ms: Option<u64>,
+    pub last_error_class: Option<FederationPollErrorClass>,
+    pub observation: PeerObservation,
 }
 
 impl PeerCacheEntry {
+    #[cfg(test)]
     /// A fresh entry from a successful poll.
     pub fn reachable(agents: Vec<AgentInfo>, last_seen: Instant) -> Self {
+        Self::reachable_observed(agents, last_seen, PeerObservation::default())
+    }
+
+    pub fn reachable_observed(
+        agents: Vec<AgentInfo>,
+        last_seen: Instant,
+        observation: PeerObservation,
+    ) -> Self {
         Self {
             reachability: Reachability::Reachable,
             agents,
             last_seen: Some(last_seen),
+            last_success_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+            last_error_class: None,
+            observation,
         }
     }
 }
@@ -149,9 +175,18 @@ impl FederationStore {
                         reachability,
                         agents: Vec::new(),
                         last_seen: None,
+                        last_success_unix_ms: None,
+                        last_error_class: None,
+                        observation: PeerObservation::default(),
                     },
                 );
             }
+        }
+    }
+
+    pub fn record_poll_error(&mut self, alias: &str, class: FederationPollErrorClass) {
+        if let Some(entry) = self.peers.get_mut(alias) {
+            entry.last_error_class = Some(class);
         }
     }
 
@@ -290,6 +325,9 @@ mod tests {
                 reachability: Reachability::Degraded,
                 agents: vec![agent(AgentStatus::Blocked, "home/reviewer")],
                 last_seen: Some(Instant::now()),
+                last_success_unix_ms: None,
+                last_error_class: None,
+                observation: PeerObservation::default(),
             },
         );
         let merged = store.merged_agents();
@@ -315,6 +353,9 @@ mod tests {
                 reachability: Reachability::Unreachable,
                 agents: vec![agent(AgentStatus::Idle, "home/idler")],
                 last_seen: Some(Instant::now()),
+                last_success_unix_ms: None,
+                last_error_class: None,
+                observation: PeerObservation::default(),
             },
         );
         let merged = store.merged_agents();

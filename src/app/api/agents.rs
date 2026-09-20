@@ -60,6 +60,9 @@ impl App {
                 agents,
                 origin_machine_id: Some(crate::persist::machine::get_or_create()),
                 origin_boot_id: Some(crate::api::server_boot_id().to_owned()),
+                origin_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                origin_protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                origin_capabilities: crate::api::default_capabilities(),
             },
         )
     }
@@ -1443,6 +1446,7 @@ mod tests {
             agents: aggregate_agents,
             origin_machine_id: aggregate_origin,
             origin_boot_id: aggregate_boot,
+            ..
         } = aggregate.result
         else {
             panic!("expected aggregate agent list");
@@ -1451,6 +1455,7 @@ mod tests {
             agents: local_agents,
             origin_machine_id: local_origin,
             origin_boot_id: local_boot,
+            ..
         } = local.result
         else {
             panic!("expected local-only agent list");

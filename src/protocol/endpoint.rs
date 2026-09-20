@@ -174,6 +174,24 @@ impl EndpointServerWelcome {
     }
 }
 
+pub const ENDPOINT_RUNTIME_STATUS_KIND: &str = "endpoint.runtime-status.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointRuntimeStatus {
+    Connecting,
+    Online,
+    Reconnecting,
+    Attention,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointRuntimeStatusReport {
+    pub profile_id: String,
+    pub status: EndpointRuntimeStatus,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

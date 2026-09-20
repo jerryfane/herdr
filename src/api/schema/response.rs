@@ -117,6 +117,15 @@ pub enum ResponseResult {
         /// Changes on restart and fences replies from an earlier remote boot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_boot_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_protocol: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_capabilities: Option<ServerCapabilities>,
+    },
+    MachineStatus {
+        machines: std::collections::BTreeMap<String, super::CoordinatorMachineStatus>,
     },
     AccountsList {
         accounts: Vec<super::accounts::AccountInfo>,

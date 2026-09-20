@@ -11,6 +11,11 @@ pub(super) fn command() -> Command {
                 .arg(json_flag()),
         )
         .subcommand(
+            Command::new("status")
+                .about("Show saved, endpoint, and federation health separately")
+                .arg(json_flag()),
+        )
+        .subcommand(
             Command::new("add")
                 .about("Prepare the remote Herdr server and save an SSH machine")
                 .arg(

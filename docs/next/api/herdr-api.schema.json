@@ -5727,6 +5727,22 @@
         {
           "properties": {
             "method": {
+              "const": "machine.status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.staged_update",
               "type": "string"
             },
@@ -9240,6 +9256,107 @@
           ],
           "type": "string"
         },
+        "CoordinatorMachineStatus": {
+          "properties": {
+            "display_label": {
+              "type": "string"
+            },
+            "endpoint_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/MachineEndpointStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "federation_reachability": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/Reachability"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "last_error_class": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/FederationPollErrorClass"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "last_success_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "profile_id": {
+              "type": "string"
+            },
+            "remote_boot_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "remote_capabilities": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ServerCapabilities"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "remote_protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "remote_session": {
+              "type": "string"
+            },
+            "remote_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "saved_state": {
+              "$ref": "#/schemas/success_response/$defs/SavedMachineState"
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "validated_machine_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "profile_id",
+            "display_label",
+            "remote_session",
+            "saved_state",
+            "stale"
+          ],
+          "type": "object"
+        },
         "DirEntryInfo": {
           "description": "One entry in a directory listing returned by `fs.list_dir`. `name` is the\nentry's file name only (not a full path); `is_dir` is resolved through\nsymlinks, so a symlink to a directory reports `true`.",
           "properties": {
@@ -10036,6 +10153,15 @@
           ],
           "type": "string"
         },
+        "FederationPollErrorClass": {
+          "enum": [
+            "authentication_failed",
+            "identity_mismatch",
+            "protocol",
+            "transport"
+          ],
+          "type": "string"
+        },
         "GramDirection": {
           "description": "Direction of a gram message on the wire. Mirrors\n[`crate::persist::gram::GramDirection`]; the handler maps between them so the\nstorage record and the public contract can evolve independently.",
           "enum": [
@@ -10464,6 +10590,16 @@
               "type": "object"
             }
           ]
+        },
+        "MachineEndpointStatus": {
+          "enum": [
+            "connecting",
+            "online",
+            "reconnecting",
+            "attention",
+            "disabled"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -12361,8 +12497,32 @@
                     "null"
                   ]
                 },
+                "origin_capabilities": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/ServerCapabilities"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "origin_machine_id": {
                   "description": "Install-stable identity of the daemon that produced this response.\nOlder peers omit it. It is a pinning value, not an authenticator.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "origin_protocol": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "origin_version": {
                   "type": [
                     "string",
                     "null"
@@ -12376,6 +12536,25 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "machines": {
+                  "additionalProperties": {
+                    "$ref": "#/schemas/success_response/$defs/CoordinatorMachineStatus"
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "const": "machine_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "machines"
               ],
               "type": "object"
             },
@@ -13712,6 +13891,15 @@
               "type": "object"
             }
           ]
+        },
+        "SavedMachineState": {
+          "enum": [
+            "disabled",
+            "untrusted",
+            "coordinator_disabled",
+            "coordinated"
+          ],
+          "type": "string"
         },
         "ServerCapabilities": {
           "properties": {

@@ -241,6 +241,15 @@ impl ClientShellState {
             .map(|endpoint| endpoint.status)
     }
 
+    pub(crate) fn endpoint_runtime_statuses(
+        &self,
+    ) -> Vec<(ClientEndpointId, ClientEndpointStatus)> {
+        self.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.endpoint_id.clone(), endpoint.status))
+            .collect()
+    }
+
     pub(crate) fn endpoint_has_snapshot(&self, endpoint_id: &ClientEndpointId) -> bool {
         self.endpoints
             .iter()
