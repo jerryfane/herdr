@@ -553,6 +553,7 @@ pub(crate) fn run_federation_peer_poll(
         let reachability = poll_once_into_cache(
             &client,
             &peer.alias,
+            peer.expected_node_id.as_deref(),
             &cache,
             &mut tracker,
             &running,
@@ -577,17 +578,30 @@ pub(crate) fn run_federation_peer_poll(
 fn poll_once_into_cache(
     client: &ApiClient,
     alias: &str,
+    expected_machine_id: Option<&str>,
     cache: &Mutex<FederationStore>,
     tracker: &mut ReachabilityTracker,
     running: &Arc<AtomicBool>,
     peer_stop: &Arc<AtomicBool>,
 ) -> Reachability {
-    match poll_peer_agent_list(client, running) {
+    match poll_peer_agent_list(client, running, expected_machine_id) {
         Ok(agents) => {
+            let mut rejected = 0usize;
             let prefixed = agents
                 .into_iter()
-                .map(|agent| prefix_remote_agent(alias, agent))
+                .filter_map(|agent| {
+                    let prefixed = prefix_remote_agent(alias, agent);
+                    rejected += usize::from(prefixed.is_none());
+                    prefixed
+                })
                 .collect();
+            if rejected != 0 {
+                warn!(
+                    alias = %alias,
+                    rejected,
+                    "federation peer returned already-qualified or invalid agent identities"
+                );
+            }
             let reachability = tracker.record_success();
             let mut store = cache
                 .lock()
@@ -693,6 +707,7 @@ pub(crate) fn build_peer_registry(peers: &[FederationPeer]) -> HashMap<String, C
 fn poll_peer_agent_list(
     client: &ApiClient,
     running: &Arc<AtomicBool>,
+    expected_machine_id: Option<&str>,
 ) -> Result<Vec<crate::api::schema::AgentInfo>, ApiClientError> {
     let request = Request {
         id: "federation:agent.list".into(),
@@ -706,12 +721,29 @@ fn poll_peer_agent_list(
     )?;
     let response = parse_response_value(value)?;
     match response.result {
-        ResponseResult::AgentList { mut agents } => {
+        ResponseResult::AgentList {
+            mut agents,
+            origin_machine_id,
+        } => {
+            if let Some(expected) = expected_machine_id {
+                if origin_machine_id.as_deref() != Some(expected) {
+                    return Err(ApiClientError::UnexpectedResult(format!(
+                        "peer machine identity mismatch: expected {expected:?}, received {:?}",
+                        origin_machine_id.as_deref()
+                    )));
+                }
+            }
             // Older peers ignore the new local_only parameter because their
             // empty-params schema accepts unknown fields. Filter their aggregate
             // response as a fail-safe: a local agent never has federation-owned
             // machine identity, while every cached remote agent does.
             agents.retain(|agent| agent.machine_id.is_none());
+            // The response-level value is the authoritative peer report. Clear
+            // any per-agent claim from mixed or malicious peers, then stamp the
+            // validated identity consistently across this snapshot.
+            for agent in &mut agents {
+                agent.origin_machine_id.clone_from(&origin_machine_id);
+            }
             Ok(agents)
         }
         other => Err(ApiClientError::UnexpectedResult(format!("{other:?}"))),
@@ -719,31 +751,45 @@ fn poll_peer_agent_list(
 }
 
 /// Rewrite a remote agent's identity fields so it is unambiguous once merged into
-/// the local `agent.list`: `name` and all four id fields gain an `<alias>/`
-/// prefix, and `machine_id` records the peer alias.
+/// the local `agent.list`: `name` and all four id fields gain exactly one
+/// `<alias>/` prefix, `machine_id` retains the compatibility routing alias, and
+/// `machine_label` carries its display value.
 ///
-/// The home OWNS the federation-derived fields and must never trust what the peer
-/// put in the [`AgentInfo`](crate::api::schema::AgentInfo) it returned: a
-/// malicious peer could set `machine_id`/`reachability`/`last_known_status` to
-/// forge a live status or a false origin. So `machine_id` is overwritten with the
-/// peer's local alias and `reachability`/`last_known_status` are cleared here. The
-/// read helper [`FederationStore::merged_agents`] is the ONLY thing that sets
-/// `reachability`/`last_known_status`, from the home's own poll-outcome tracking.
+/// The home owns the routing alias, saved-profile namespace, display label, and
+/// reachability fields. `poll_peer_agent_list` has already replaced every
+/// per-agent origin claim with the response-level machine identity and checked
+/// an optional pin. An already-qualified target is rejected rather than prefixed
+/// twice. [`FederationStore::merged_agents`] is the only code that sets
+/// `reachability`/`last_known_status`, from the home's poll-outcome tracking.
 fn prefix_remote_agent(
     alias: &str,
     mut agent: crate::api::schema::AgentInfo,
-) -> crate::api::schema::AgentInfo {
-    agent.name = Some(format!("{alias}/{}", agent.name.unwrap_or_default()));
-    agent.terminal_id = format!("{alias}/{}", agent.terminal_id);
-    agent.workspace_id = format!("{alias}/{}", agent.workspace_id);
-    agent.tab_id = format!("{alias}/{}", agent.tab_id);
-    agent.pane_id = format!("{alias}/{}", agent.pane_id);
-    // Home-owned federation fields: normalize `machine_id` to the peer's local
-    // alias and discard any peer-supplied reachability/last-known status.
+) -> Option<crate::api::schema::AgentInfo> {
+    fn qualify(alias: &str, value: String, allow_empty: bool) -> Option<String> {
+        if value.is_empty() {
+            return allow_empty.then_some(value);
+        }
+        if value.contains('/') {
+            return None;
+        }
+        Some(format!("{alias}/{value}"))
+    }
+
+    let archived = agent.archived.is_some();
+    agent.name = agent.name.map(|name| format!("{alias}/{name}"));
+    agent.terminal_id = qualify(alias, agent.terminal_id, false)?;
+    agent.workspace_id = qualify(alias, agent.workspace_id, archived)?;
+    agent.tab_id = qualify(alias, agent.tab_id, archived)?;
+    agent.pane_id = qualify(alias, agent.pane_id, archived)?;
+    // Home-owned federation fields. The legacy `machine_id` remains the routing
+    // alias for wire compatibility. Explicit peers have no saved profile id;
+    // `origin_machine_id` is the response-level identity validated by the poll.
     agent.machine_id = Some(alias.to_string());
+    agent.machine_profile_id = None;
+    agent.machine_label = Some(alias.to_string());
     agent.reachability = None;
     agent.last_known_status = None;
-    agent
+    Some(agent)
 }
 
 /// Sleep up to `total`, waking every [`FEDERATION_POLL_STEP`] to re-check the
@@ -4031,6 +4077,7 @@ mod federation_tests {
                                         seeded_agent(AgentStatus::Working, agent_name),
                                         reexported,
                                     ],
+                                    origin_machine_id: Some("machine-peer".into()),
                                 },
                             })
                             .expect("encode agent.list response")
@@ -4114,11 +4161,9 @@ mod federation_tests {
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
         let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
-        manager.reconcile(&[reachable_peer_on(
-            peer_srv.addr,
-            "home",
-            &peer_srv.token_path,
-        )]);
+        let mut peer = reachable_peer_on(peer_srv.addr, "home", &peer_srv.token_path);
+        peer.expected_node_id = Some("machine-peer".into());
+        manager.reconcile(&[peer]);
         assert_eq!(
             manager.live_aliases(),
             vec!["home".to_string()],
@@ -4138,6 +4183,8 @@ mod federation_tests {
             assert_eq!(agent.tab_id, "home/tab-remote");
             assert_eq!(agent.pane_id, "home/pane-remote");
             assert_eq!(agent.machine_id.as_deref(), Some("home"));
+            assert_eq!(agent.machine_label.as_deref(), Some("home"));
+            assert_eq!(agent.origin_machine_id.as_deref(), Some("machine-peer"));
         }
 
         // The read/merge helper stamps a reachable peer as-is with the status.
@@ -4156,6 +4203,39 @@ mod federation_tests {
         peer_srv.shutdown();
     }
 
+    #[test]
+    fn federation_client_rejects_changed_machine_identity() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let client = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: peer_srv.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        let mut tracker = ReachabilityTracker::default();
+
+        assert_eq!(
+            poll_once_into_cache(
+                &client,
+                "home",
+                Some("machine-before-reinstall"),
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            ),
+            Reachability::Degraded
+        );
+        assert!(
+            cache.lock().expect("cache lock").merged_agents().is_empty(),
+            "an identity mismatch must not publish the peer's agents"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        peer_srv.shutdown();
+    }
+
     /// The poll→cache path degrades a peer that stops answering: two misses keep
     /// the last-known agents (`Degraded`), a third flips it `Unreachable`, and the
     /// read helper then stamps `Unknown` while preserving the last-known status —
@@ -4170,10 +4250,10 @@ mod federation_tests {
             store.set_peer(
                 "home",
                 PeerCacheEntry::reachable(
-                    vec![prefix_remote_agent(
-                        "home",
-                        seeded_agent(AgentStatus::Idle, "idler"),
-                    )],
+                    vec![
+                        prefix_remote_agent("home", seeded_agent(AgentStatus::Idle, "idler"))
+                            .expect("local agent identity can be qualified"),
+                    ],
                     Instant::now(),
                 ),
             );
@@ -4200,11 +4280,27 @@ mod federation_tests {
         // (an honest-offline peer never shows a stale idle/done) with the real
         // status preserved in `last_known_status`.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
+            poll_once_into_cache(
+                &client,
+                "home",
+                None,
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            ),
             Reachability::Degraded
         );
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
+            poll_once_into_cache(
+                &client,
+                "home",
+                None,
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            ),
             Reachability::Degraded
         );
         {
@@ -4220,7 +4316,15 @@ mod federation_tests {
 
         // Third miss: Unreachable → the read helper still stamps Unknown + last-known.
         assert_eq!(
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop),
+            poll_once_into_cache(
+                &client,
+                "home",
+                None,
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            ),
             Reachability::Unreachable
         );
         let merged = cache.lock().expect("cache lock").merged_agents();
@@ -4460,6 +4564,36 @@ mod federation_tests {
         peer_new.shutdown();
     }
 
+    #[test]
+    fn reconcile_changed_identity_pin_respawns_and_revalidates_peer() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+
+        let mut trusted = reachable_peer_on(peer_srv.addr, "A", &peer_srv.token_path);
+        trusted.expected_node_id = Some("machine-peer".into());
+        manager.reconcile(&[trusted.clone()]);
+        assert!(wait_for_cached(&cache, "A", "A/builder"));
+
+        let mut rotated = trusted.clone();
+        rotated.expected_node_id = Some("machine-after-reinstall".into());
+        manager.reconcile(&[rotated]);
+        assert!(
+            cache.lock().expect("cache lock").peer("A").is_none(),
+            "changing the pin must synchronously evict state validated under the old pin"
+        );
+
+        manager.reconcile(&[trusted]);
+        assert!(
+            wait_for_cached(&cache, "A", "A/builder"),
+            "restoring the matching pin must respawn and revalidate the peer"
+        );
+
+        manager.join_all();
+        peer_srv.shutdown();
+    }
+
     /// The under-store-lock stop guard skips the DEGRADE (miss) write once the
     /// peer's stop flag is set: the miss is still counted, but no cache entry is
     /// created for the evicted alias.
@@ -4479,8 +4613,15 @@ mod federation_tests {
         let peer_stop = Arc::new(AtomicBool::new(true));
         let mut tracker = ReachabilityTracker::default();
 
-        let reachability =
-            poll_once_into_cache(&client, "gone", &cache, &mut tracker, &running, &peer_stop);
+        let reachability = poll_once_into_cache(
+            &client,
+            "gone",
+            None,
+            &cache,
+            &mut tracker,
+            &running,
+            &peer_stop,
+        );
         assert_eq!(
             reachability,
             Reachability::Degraded,
@@ -4508,8 +4649,15 @@ mod federation_tests {
         let peer_stop = Arc::new(AtomicBool::new(true));
         let mut tracker = ReachabilityTracker::default();
 
-        let reachability =
-            poll_once_into_cache(&client, "home", &cache, &mut tracker, &running, &peer_stop);
+        let reachability = poll_once_into_cache(
+            &client,
+            "home",
+            None,
+            &cache,
+            &mut tracker,
+            &running,
+            &peer_stop,
+        );
         assert_eq!(
             reachability,
             Reachability::Reachable,
@@ -4523,11 +4671,11 @@ mod federation_tests {
         peer_srv.shutdown();
     }
 
-    /// FIX 3: the home OWNS the federation fields. A malicious/faulty peer cannot
-    /// smuggle `machine_id`/`reachability`/`last_known_status` into the cache:
-    /// `prefix_remote_agent` normalizes `machine_id` to the peer's local alias and
-    /// CLEARS `reachability`/`last_known_status` (only the read helper sets them,
-    /// from the home's own poll tracking).
+    /// The home owns routing and reachability fields. A malicious/faulty peer
+    /// cannot smuggle `machine_id`/`reachability`/`last_known_status` into the
+    /// cache: `prefix_remote_agent` normalizes `machine_id` to the local alias and
+    /// clears the poll-derived fields. The poll has already stamped the validated
+    /// response-level `origin_machine_id`.
     #[test]
     fn prefix_remote_agent_discards_peer_supplied_federation_fields() {
         let hostile: AgentInfo = serde_json::from_value(serde_json::json!({
@@ -4543,6 +4691,7 @@ mod federation_tests {
             "machine_id": "not-home",
             "reachability": "reachable",
             "last_known_status": "working",
+            "origin_machine_id": "machine-peer",
         }))
         .expect("hostile agent deserializes");
         // Sanity: the peer really did set the home-owned fields.
@@ -4550,7 +4699,8 @@ mod federation_tests {
         assert_eq!(hostile.reachability, Some(Reachability::Reachable));
         assert_eq!(hostile.last_known_status, Some(AgentStatus::Working));
 
-        let normalized = prefix_remote_agent("home", hostile);
+        let normalized =
+            prefix_remote_agent("home", hostile).expect("unqualified remote agent is accepted");
         assert_eq!(
             normalized.machine_id.as_deref(),
             Some("home"),
@@ -4565,6 +4715,48 @@ mod federation_tests {
             "a peer-supplied last_known_status must be discarded"
         );
         assert_eq!(normalized.name.as_deref(), Some("home/sneaky"));
+        assert_eq!(normalized.machine_profile_id, None);
+        assert_eq!(normalized.machine_label.as_deref(), Some("home"));
+        assert_eq!(
+            normalized.origin_machine_id.as_deref(),
+            Some("machine-peer")
+        );
+    }
+
+    #[test]
+    fn prefix_remote_agent_rejects_already_qualified_identity() {
+        let mut already_qualified = seeded_agent(AgentStatus::Working, "builder");
+        already_qualified.terminal_id = "other/terminal".into();
+        assert!(prefix_remote_agent("home", already_qualified).is_none());
+    }
+
+    #[test]
+    fn prefix_remote_agent_allows_slashes_in_display_name() {
+        let named = seeded_agent(AgentStatus::Working, "team/builder");
+        let qualified =
+            prefix_remote_agent("home", named).expect("display names are not route ids");
+        assert_eq!(qualified.name.as_deref(), Some("home/team/builder"));
+    }
+
+    #[test]
+    fn prefix_remote_agent_preserves_archived_agent_with_empty_live_ids() {
+        let mut archived = seeded_agent(AgentStatus::Idle, "archived");
+        archived.workspace_id.clear();
+        archived.tab_id.clear();
+        archived.pane_id.clear();
+        archived.archived = Some(crate::api::schema::AgentArchivedInfo {
+            at: "2026-09-19T00:00:00Z".into(),
+            by: "owner".into(),
+            reason: None,
+        });
+
+        let qualified =
+            prefix_remote_agent("home", archived).expect("archived agent remains visible");
+        assert_eq!(qualified.terminal_id, "home/term-remote");
+        assert_eq!(qualified.workspace_id, "");
+        assert_eq!(qualified.tab_id, "");
+        assert_eq!(qualified.pane_id, "");
+        assert!(qualified.archived.is_some());
     }
 
     /// FIX 1 (DoS hardening): a peer that returns an over-cap response line must

@@ -465,6 +465,16 @@ mod tests {
     }
 
     #[test]
+    fn removing_and_readding_a_machine_mints_a_new_profile_identity() {
+        let mut catalog = EndpointCatalog::default();
+        let removed = catalog.add_ssh("Build", "build", "agents").unwrap();
+        assert!(catalog.remove_ssh(&removed));
+
+        let replacement = catalog.add_ssh("Build", "build", "agents").unwrap();
+        assert_ne!(replacement, removed);
+    }
+
+    #[test]
     fn removal_and_disable_return_selection_to_local() {
         let mut catalog = EndpointCatalog::default();
         let first = catalog.add_ssh("One", "one", "default").unwrap();

@@ -1465,6 +1465,12 @@
           "type": "string",
           "default": "unset",
           "description": "Address the federation TCP listener binds to when `federation.listen` is enabled, for example `0.0.0.0:7020` or `127.0.0.1:7020`. Leave unset to keep the listener off."
+        },
+        {
+          "key": "federation.saved_machines",
+          "type": "table keyed by saved profile ID",
+          "default": "{}",
+          "description": "Opt saved SSH profiles into federation trust policy by immutable profile ID. Each entry requires expected_machine_id. Labels, targets, sessions, and enabled state remain owned by the saved-machine catalog; OpenSSH remains the credential authority."
         }
       ]
     },

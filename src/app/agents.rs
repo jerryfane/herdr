@@ -1031,6 +1031,9 @@ impl App {
             revision: pane.revision,
             // Local agents carry no federation stamping; these serialize away.
             machine_id: None,
+            machine_profile_id: None,
+            machine_label: None,
+            origin_machine_id: Some(crate::persist::machine::get_or_create()),
             reachability: None,
             last_known_status: None,
             // A live pane is never archived; the archived list is emitted
@@ -1301,6 +1304,9 @@ fn archived_agent_info(
         foreground_cwd: None,
         revision: 0,
         machine_id: None,
+        machine_profile_id: None,
+        machine_label: None,
+        origin_machine_id: None,
         reachability: None,
         last_known_status: None,
         archived: Some(crate::api::schema::AgentArchivedInfo {

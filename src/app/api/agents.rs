@@ -54,7 +54,13 @@ impl App {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             agents.extend(store.merged_agents());
         }
-        encode_success(id, ResponseResult::AgentList { agents })
+        encode_success(
+            id,
+            ResponseResult::AgentList {
+                agents,
+                origin_machine_id: Some(crate::persist::machine::get_or_create()),
+            },
+        )
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
@@ -1434,12 +1440,14 @@ mod tests {
         .expect("local-only agent.list response");
         let ResponseResult::AgentList {
             agents: aggregate_agents,
+            origin_machine_id: aggregate_origin,
         } = aggregate.result
         else {
             panic!("expected aggregate agent list");
         };
         let ResponseResult::AgentList {
             agents: local_agents,
+            origin_machine_id: local_origin,
         } = local.result
         else {
             panic!("expected local-only agent list");
@@ -1449,6 +1457,8 @@ mod tests {
             .iter()
             .any(|agent| agent.terminal_id == "peer/remote-terminal"));
         assert!(!local_agents.iter().any(|agent| agent.machine_id.is_some()));
+        assert_eq!(aggregate_origin, local_origin);
+        assert!(local_origin.is_some());
     }
 
     fn start_deferred_agent_prompt(

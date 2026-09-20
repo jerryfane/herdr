@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::client::endpoint::{EndpointCatalog, ProfileId};
@@ -25,6 +27,8 @@ struct MachineListRow<'a> {
     session: &'a str,
     enabled: bool,
     selected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    federation_expected_machine_id: Option<&'a str>,
 }
 
 pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
@@ -56,18 +60,8 @@ fn list(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let catalog = load_catalog()?;
-    let rows = catalog
-        .ssh
-        .iter()
-        .map(|profile| MachineListRow {
-            id: profile.id.as_str(),
-            label: &profile.label,
-            target: &profile.target,
-            session: &profile.session,
-            enabled: profile.enabled,
-            selected: catalog.selected_profile.as_ref() == Some(&profile.id),
-        })
-        .collect::<Vec<_>>();
+    let config = crate::config::Config::load().config;
+    let rows = machine_list_rows(&catalog, &config.federation.saved_machines);
     if json {
         println!(
             "{}",
@@ -87,6 +81,27 @@ fn list(args: &[String]) -> std::io::Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn machine_list_rows<'a>(
+    catalog: &'a EndpointCatalog,
+    policies: &'a BTreeMap<ProfileId, crate::config::FederationSavedMachinePolicy>,
+) -> Vec<MachineListRow<'a>> {
+    catalog
+        .ssh
+        .iter()
+        .map(|profile| MachineListRow {
+            id: profile.id.as_str(),
+            label: &profile.label,
+            target: &profile.target,
+            session: &profile.session,
+            enabled: profile.enabled,
+            selected: catalog.selected_profile.as_ref() == Some(&profile.id),
+            federation_expected_machine_id: policies
+                .get(&profile.id)
+                .map(|policy| policy.expected_machine_id.as_str()),
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -395,9 +410,44 @@ mod tests {
             session: "agents",
             enabled: true,
             selected: false,
+            federation_expected_machine_id: None,
         })
         .unwrap();
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("key"));
+    }
+
+    #[test]
+    fn federation_policy_follows_profile_identity_not_label_or_target() {
+        let mut catalog = EndpointCatalog::default();
+        let profile_id = catalog.add_ssh("Build", "dev@build", "agents").unwrap();
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            profile_id.clone(),
+            crate::config::FederationSavedMachinePolicy {
+                expected_machine_id: "machine_build".into(),
+            },
+        );
+
+        catalog.rename_ssh(&profile_id, "Renamed").unwrap();
+        let rows = machine_list_rows(&catalog, &policies);
+        assert_eq!(rows[0].id, profile_id.as_str());
+        assert_eq!(rows[0].label, "Renamed");
+        assert_eq!(
+            rows[0].federation_expected_machine_id,
+            Some("machine_build")
+        );
+
+        assert_eq!(
+            serde_json::to_value(&rows).unwrap()[0]["federation_expected_machine_id"],
+            "machine_build"
+        );
+        assert!(catalog.remove_ssh(&profile_id));
+        let replacement = catalog.add_ssh("Renamed", "dev@build", "agents").unwrap();
+        assert_ne!(replacement, profile_id);
+        assert_eq!(
+            machine_list_rows(&catalog, &policies)[0].federation_expected_machine_id,
+            None
+        );
     }
 }

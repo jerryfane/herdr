@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     path::{Path, PathBuf},
 };
@@ -1299,12 +1299,62 @@ pub struct FederationConfig {
     pub listen: bool,
     /// Address the federation listener binds to when `listen` is enabled.
     pub listen_addr: Option<String>,
-    /// Federation peers this daemon may reach out to.
+    /// Federation peers configured directly by endpoint and alias.
     pub peers: Vec<FederationPeer>,
+    /// Coordinator policy for saved SSH machines, keyed by the immutable
+    /// upstream profile id. Connection details, labels, sessions, and enabled
+    /// state remain owned by the endpoint catalog.
+    #[serde(default, deserialize_with = "deserialize_saved_machine_policies")]
+    pub saved_machines: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
 }
 
-/// A single federation peer. Connection details are consumed by later parts of
-/// the federation work (outbound transports and node-identity verification).
+/// Federation-only policy attached to one saved SSH profile.
+///
+/// Presence opts the profile into coordinator federation. SSH remains a
+/// full-control OpenSSH trust boundary; no token or private-key setting is
+/// accepted here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationSavedMachinePolicy {
+    /// Persisted install identity expected from the remote Herdr daemon.
+    /// Required so catalog reconciliation fails closed on a missing or changed
+    /// machine identity.
+    pub expected_machine_id: String,
+}
+
+fn deserialize_saved_machine_policies<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let policies =
+        BTreeMap::<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>::deserialize(
+            deserializer,
+        )?;
+    for (profile_id, policy) in &policies {
+        crate::client::endpoint::ProfileId::parse(profile_id.to_string())
+            .map_err(de::Error::custom)?;
+        validate_expected_machine_id(&policy.expected_machine_id).map_err(de::Error::custom)?;
+    }
+    Ok(policies)
+}
+
+fn validate_expected_machine_id(machine_id: &str) -> Result<(), String> {
+    if machine_id.is_empty()
+        || machine_id.len() > 128
+        || machine_id.trim() != machine_id
+        || machine_id.chars().any(char::is_control)
+    {
+        return Err(
+            "saved federation machine expected_machine_id must be 1-128 visible bytes with no surrounding whitespace"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// A directly configured federation peer.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FederationPeer {
@@ -1314,15 +1364,13 @@ pub struct FederationPeer {
     pub endpoint: Option<String>,
     /// Filesystem path to the shared auth token for this peer.
     pub token_file: Option<String>,
-    /// Expected per-install node identity the peer must present in its handshake
-    /// (its persisted `machine_id`), verified on connect: a mismatch is rejected
-    /// with the same opaque error as a bad token. Optional — omit to authenticate
-    /// by the shared token alone.
+    /// Expected per-install identity for this peer. Inbound connections must
+    /// present it in their authenticated hello; outbound polls must report it in
+    /// `agent.list`. A missing or changed value fails closed. Optional — omit to
+    /// authenticate by the shared token or OpenSSH alone.
     ///
-    /// Operator note: only pin this against a peer running a build that sends a
-    /// machine_id (herdr with cross-restart identity, or newer). An older peer
-    /// presents an empty id, and a home that pins it will — correctly — reject the
-    /// connection, so roll the pin out only after the peer is upgraded.
+    /// Only pin peers running a build that reports an install identity. Older
+    /// peers omit it and are rejected when a pin is configured.
     pub expected_node_id: Option<String>,
     /// Capability tier this peer's token grants over inbound TCP federation.
     /// Default: `observe` (read-only).
@@ -1587,6 +1635,59 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_federation_machine_policy_is_keyed_by_valid_profile_id() {
+        let profile_id = "0123456789abcdef0123456789abcdef";
+        let config: FederationConfig = toml::from_str(&format!(
+            r#"
+                [saved_machines."{profile_id}"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#
+        ))
+        .unwrap();
+
+        let key = crate::client::endpoint::ProfileId::parse(profile_id).unwrap();
+        assert_eq!(
+            config.saved_machines[&key].expected_machine_id,
+            "machine_0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn saved_federation_machine_policy_fails_closed_without_identity() {
+        let missing_identity = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_identity.contains("expected_machine_id"));
+
+        let invalid_profile = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines.not-a-profile-id]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_profile.contains("32 lowercase hexadecimal"));
+    }
+
+    #[test]
+    fn saved_federation_machine_policy_rejects_credentials() {
+        let error = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                token_file = "/secret/token"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown field"));
+    }
 
     #[test]
     fn env_var_for_kind_maps_supported_harnesses() {

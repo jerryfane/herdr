@@ -390,10 +390,24 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
-    /// Federation: alias of the remote peer this agent lives on. `None` for a
-    /// local agent (and serialized away).
+    /// Federation compatibility field: the home-chosen routing alias for the
+    /// remote peer. This is not the peer's persisted machine identity. `None`
+    /// for a local agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Immutable saved-machine profile id used as the routing namespace once
+    /// this agent comes from the upstream machine catalog. `None` for local
+    /// agents and legacy explicit federation peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_profile_id: Option<String>,
+    /// Mutable display label for the remote machine. Never used for routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
+    /// Persisted install identity reported by the daemon that owns this agent.
+    /// Kept separate from the home-chosen routing namespace and mutable display
+    /// label. It is an identity pin, not an authentication secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_machine_id: Option<String>,
     /// Federation: reachability of the remote peer as of the last poll. `None`
     /// for a local agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

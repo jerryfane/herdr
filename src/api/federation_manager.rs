@@ -56,6 +56,8 @@ struct PeerHandle {
     endpoint: String,
     /// The peer's `token_file` this thread was spawned for, for `spec_differs`.
     token_file: Option<String>,
+    /// The peer's expected install identity this thread was spawned with.
+    expected_node_id: Option<String>,
 }
 
 /// Manages the outbound federation peer set at runtime: spawns a poll thread and
@@ -105,9 +107,10 @@ impl FederationPeerManager {
     /// and follows the lock order **H → S → R**:
     /// 1. Reap any finished retiring threads.
     /// 2. Compute the desired OUTBOUND set (peers with an `endpoint`) by alias.
-    /// 3. For each running alias no longer desired, or whose `endpoint`/
-    ///    `token_file` changed: set its `stop` flag AND evict its store entry
-    ///    under the store lock, then detach its join into the reaper.
+    /// 3. For each running alias no longer desired, or whose connection/trust
+    ///    spec (`endpoint`, `token_file`, or `expected_node_id`) changed: set its
+    ///    `stop` flag AND evict its store entry under the store lock, then detach
+    ///    its join into the reaper.
     /// 4. For each desired outbound alias not already running: spawn a fresh
     ///    poll thread.
     /// 5. Rebuild and swap the proxy registry (token-file reads happen in
@@ -194,6 +197,7 @@ impl FederationPeerManager {
         let stop = Arc::new(AtomicBool::new(false));
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
+        let expected_node_id = peer.expected_node_id.clone();
         let cache = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let thread_stop = Arc::clone(&stop);
@@ -205,6 +209,7 @@ impl FederationPeerManager {
             join,
             endpoint,
             token_file,
+            expected_node_id,
         }
     }
 
@@ -279,9 +284,10 @@ impl FederationPeerManager {
     }
 }
 
-/// Whether a running peer's spec (`endpoint` or `token_file`) differs from the
-/// desired config, so its thread must be retired and respawned.
+/// Whether a running peer's connection or trust spec differs from the desired
+/// config, so its thread must be retired and respawned.
 fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
     handle.endpoint != peer.endpoint.clone().unwrap_or_default()
         || handle.token_file != peer.token_file
+        || handle.expected_node_id != peer.expected_node_id
 }
