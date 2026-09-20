@@ -1,7 +1,8 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
+use super::attach::{find_installed_remote_herdr, ManagedSshOptions, RemoteSsh, SshStdioBridge};
 
 pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
@@ -80,7 +81,7 @@ impl SavedSshApiBridge {
             target.to_owned(),
             command,
             path.clone(),
-            ssh.options(),
+            saved_federation_ssh_options(),
             true,
         )?;
         Ok(Self {
@@ -108,6 +109,19 @@ impl SavedSshApiBridge {
             .to_string()
             .contains(super::attach::STALE_API_METADATA)
     }
+}
+
+fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
+    static OPTIONS: OnceLock<Option<ManagedSshOptions>> = OnceLock::new();
+    OPTIONS
+        .get_or_init(|| {
+            super::attach::build_federation_ssh_options()
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "could not create saved federation SSH config; using plain SSH");
+                })
+                .ok()
+        })
+        .as_ref()
 }
 
 pub(crate) fn saved_ssh_bootstrap_command(target: &str, session: &str) -> String {

@@ -4378,10 +4378,12 @@ mod federation_tests {
         let bin = base.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let args_log = base.join("ssh-args");
+        let fail_bridge = base.join("fail-bridge");
+        let bridge_failed = base.join("bridge-failed");
         let ssh = bin.join("ssh");
         std::fs::write(
             &ssh,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_TEST_SSH_ARGS\"\nprintf '\\nherdr-remote-output-ready:1\\n'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"id\":\"api-client:status\"'*) printf '%s\\n' '{\"id\":\"api-client:status\",\"result\":{\"type\":\"pong\",\"version\":\"test\",\"protocol\":22}}' ;;\n    *) printf '%s\\n' \"$line\" ;;\n  esac\ndone\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_TEST_SSH_ARGS\"\nprintf '\\nherdr-remote-output-ready:1\\n'\nwhile IFS= read -r line; do\n  if [ -e \"$HERDR_TEST_SSH_FAIL\" ]; then\n    : > \"$HERDR_TEST_SSH_FAILED\"\n    printf '%s\\n' 'bridge-failed' >&2\n    exit 1\n  fi\n  case \"$line\" in\n    *'\"id\":\"api-client:status\"'*) printf '%s\\n' '{\"id\":\"api-client:status\",\"result\":{\"type\":\"pong\",\"version\":\"test\",\"protocol\":22}}' ;;\n    *) printf '%s\\n' \"$line\" ;;\n  esac\ndone\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
@@ -4395,10 +4397,20 @@ mod federation_tests {
                 "HERDR_TEST_SSH_ARGS",
                 std::env::var_os("HERDR_TEST_SSH_ARGS"),
             ),
+            (
+                "HERDR_TEST_SSH_FAIL",
+                std::env::var_os("HERDR_TEST_SSH_FAIL"),
+            ),
+            (
+                "HERDR_TEST_SSH_FAILED",
+                std::env::var_os("HERDR_TEST_SSH_FAILED"),
+            ),
         ]);
         std::env::set_var("PATH", &bin);
         std::env::set_var("XDG_STATE_HOME", base.join("state"));
         std::env::set_var("HERDR_TEST_SSH_ARGS", &args_log);
+        std::env::set_var("HERDR_TEST_SSH_FAIL", &fail_bridge);
+        std::env::set_var("HERDR_TEST_SSH_FAILED", &bridge_failed);
 
         let profile_text = format!("{nonce:032x}");
         crate::client::endpoint::SshMetadataCache::new(
@@ -4442,6 +4454,37 @@ mod federation_tests {
         assert_eq!(line, "probe\n");
         drop(stream);
 
+        std::fs::write(&fail_bridge, b"fail").unwrap();
+        let mut failing =
+            crate::ipc::connect_local_stream(&socket).expect("connect bridge before failure");
+        failing.write_all(b"trigger\n").unwrap();
+        drop(failing);
+        let failure_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !bridge_failed.exists() && std::time::Instant::now() < failure_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(bridge_failed.exists(), "fake SSH process did not fail");
+        std::fs::remove_file(&fail_bridge).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let recovered_line = loop {
+            if let Ok(stream) = crate::ipc::connect_local_stream(&socket) {
+                let mut recovered = BufReader::new(stream);
+                if recovered.get_mut().write_all(b"recovered\n").is_ok() {
+                    let mut line = String::new();
+                    if recovered.read_line(&mut line).is_ok() && line == "recovered\n" {
+                        break line;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bridge supervisor did not recover after the SSH process failed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(recovered_line, "recovered\n");
+
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !args_log.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -4450,6 +4493,8 @@ mod federation_tests {
         assert!(args.contains("/opt/Herdr Builds/herdr"));
         assert!(args.contains("agent-work"));
         assert!(args.contains("remote-api-bridge"));
+        assert!(args.contains("ControlMaster=auto"));
+        assert!(args.contains("ControlPersist=yes"));
         assert!(!args.contains(" api-bridge "));
 
         crate::client::endpoint::SshMetadataCache::new(

@@ -42,15 +42,28 @@ use std::time::Duration;
 
 use tracing::{debug, info};
 
-use crate::api::client::{ApiClient, ConnectionTarget};
+use crate::api::client::ConnectionTarget;
 use crate::api::federation_store::FederationStore;
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::config::FederationPeer;
 
+/// Owns the persistent SSH process behind a saved peer's local bridge. A
+/// monitor replaces the process in place when it reports a terminal failure.
+struct SavedBridgeSupervisor {
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for SavedBridgeSupervisor {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// A single running outbound poll thread plus the handle to stop and join it.
 struct PeerHandle {
-    /// Per-peer stop flag. Setting it (while holding the store lock, in
-    /// reconcile) retires just this peer's poll thread.
+    /// Per-peer stop flag shared by the poller and optional bridge supervisor.
     stop: Arc<AtomicBool>,
     /// Join handle for the poll thread.
     join: JoinHandle<()>,
@@ -68,8 +81,8 @@ struct PeerHandle {
     remote_session: Option<String>,
     /// Shared route used by both polling and target proxying.
     route: ConnectionTarget,
-    /// Keeps the local socket and its `remote-api-bridge` launcher alive.
-    _ssh_bridge: Option<crate::remote::SavedSshApiBridge>,
+    /// Keeps the saved peer's persistent SSH bridge supervised and alive.
+    _ssh_bridge: Option<SavedBridgeSupervisor>,
 }
 
 /// Manages the outbound federation peer set at runtime: spawns a poll thread and
@@ -218,6 +231,7 @@ impl FederationPeerManager {
             .starts_with("tcp://")
             .then(|| read_peer_token(&peer))
             .flatten();
+        let stop = Arc::new(AtomicBool::new(false));
         let parsed = match crate::api::client::endpoint_to_target(endpoint, token.clone()) {
             Ok(target) => target,
             Err(error) => {
@@ -239,21 +253,23 @@ impl FederationPeerManager {
                     Some(user) => format!("{user}@{}", target.host),
                     None => target.host,
                 };
-                let bridge = match start_saved_peer_bridge(profile_id, &target, session) {
-                    Ok(bridge) => bridge,
+                let (route, bridge) = match start_saved_peer_bridge(
+                    profile_id,
+                    &target,
+                    session,
+                    Arc::clone(&self.running),
+                    Arc::clone(&stop),
+                ) {
+                    Ok(started) => started,
                     Err(error) => {
                         tracing::warn!(alias = %peer.alias, %error, "SSH federation remote-api-bridge did not start");
                         return None;
                     }
                 };
-                (
-                    ConnectionTarget::SocketPath(bridge.socket_path().to_owned()),
-                    Some(bridge),
-                )
+                (route, Some(bridge))
             }
             target => (target, None),
         };
-        let stop = Arc::new(AtomicBool::new(false));
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
@@ -376,31 +392,67 @@ fn start_saved_peer_bridge(
     profile_id: &str,
     target: &str,
     session: &str,
-) -> io::Result<crate::remote::SavedSshApiBridge> {
+    running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> io::Result<(ConnectionTarget, SavedBridgeSupervisor)> {
     let bridge = crate::remote::SavedSshApiBridge::start(profile_id, target, session, true)?;
-    let probe = |bridge: &crate::remote::SavedSshApiBridge| {
-        ApiClient::for_target(ConnectionTarget::SocketPath(
-            bridge.socket_path().to_owned(),
-        ))
-        .status_with_timeout(Duration::from_secs(15))
-    };
-    let first_error = match probe(&bridge) {
-        Ok(_) => return Ok(bridge),
-        Err(error) => error,
-    };
-    let Some(failure) = bridge.reported_failure() else {
-        return Err(io::Error::other(first_error.to_string()));
-    };
-    if !bridge.used_cached_metadata
-        || !crate::remote::SavedSshApiBridge::stale_metadata_failure(&failure)
-    {
-        return Err(failure);
+    let path = bridge.socket_path().to_owned();
+    let profile_id = profile_id.to_owned();
+    let target = target.to_owned();
+    let session = session.to_owned();
+    let join = std::thread::spawn(move || {
+        supervise_saved_peer_bridge(bridge, &profile_id, &target, &session, &running, &stop);
+    });
+    Ok((
+        ConnectionTarget::SocketPath(path),
+        SavedBridgeSupervisor { join: Some(join) },
+    ))
+}
+
+fn supervise_saved_peer_bridge(
+    initial: crate::remote::SavedSshApiBridge,
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    running: &AtomicBool,
+    stop: &AtomicBool,
+) {
+    let mut bridge = Some(initial);
+    let mut use_cached_metadata = true;
+    while running.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        if let Some(active) = bridge.as_ref() {
+            let Some(failure) = active.reported_failure() else {
+                continue;
+            };
+            use_cached_metadata =
+                !crate::remote::SavedSshApiBridge::stale_metadata_failure(&failure);
+            if !use_cached_metadata {
+                active.invalidate_metadata();
+            }
+            tracing::warn!(%failure, "saved federation bridge exited; restarting");
+            drop(bridge.take());
+        }
+        match crate::remote::SavedSshApiBridge::start(
+            profile_id,
+            target,
+            session,
+            use_cached_metadata,
+        ) {
+            Ok(started) => {
+                bridge = Some(started);
+                use_cached_metadata = true;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "saved federation bridge restart failed");
+                for _ in 0..10 {
+                    if !running.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
-    bridge.invalidate_metadata();
-    drop(bridge);
-    let bridge = crate::remote::SavedSshApiBridge::start(profile_id, target, session, false)?;
-    probe(&bridge).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(bridge)
 }
 
 /// Join one stopped poll thread away from the reconcile caller.
