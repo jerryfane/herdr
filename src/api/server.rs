@@ -4381,7 +4381,7 @@ mod federation_tests {
         let ssh = bin.join("ssh");
         std::fs::write(
             &ssh,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_TEST_SSH_ARGS\"\nprintf '\\nherdr-remote-output-ready:1\\n'\nexec /bin/cat\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_TEST_SSH_ARGS\"\nprintf '\\nherdr-remote-output-ready:1\\n'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"id\":\"api-client:status\"'*) printf '%s\\n' '{\"id\":\"api-client:status\",\"result\":{\"type\":\"pong\",\"version\":\"test\",\"protocol\":22}}' ;;\n    *) printf '%s\\n' \"$line\" ;;\n  esac\ndone\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
