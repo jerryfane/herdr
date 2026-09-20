@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -203,6 +204,49 @@ fi
         self.assertIn(f'DEFAULT_MANIFEST_URL="{manifest_url}"', installer)
         self.assertIn(manifest_url, updater)
         self.assertIn(manifest_url, remote)
+
+    def test_committed_manifest_serves_assets_the_installer_accepts(self) -> None:
+        # An upstream sync overwrote distribution/preview.json with herdrdev's
+        # copy on 2026-09-16: the file stayed valid JSON and its URLs stayed
+        # reachable, so every existing check passed while install.sh refused
+        # each asset and nobody could install. Pin the committed manifest to
+        # the same contract the installer enforces at runtime.
+        installer = INSTALLER.read_text(encoding="utf-8")
+        match = re.search(r'^EXPECTED_RELEASE_ROOT="(.*)"$', installer, re.MULTILINE)
+        self.assertIsNotNone(match, "install.sh no longer declares EXPECTED_RELEASE_ROOT")
+        release_root = match.group(1)
+
+        manifest = json.loads(
+            (REPO_ROOT / "distribution" / "preview.json").read_text(encoding="utf-8")
+        )
+        build_id = manifest.get("build_id")
+        build = manifest.get("builds", {}).get(build_id, {})
+        self.assertTrue(
+            build.get("tag"),
+            f"build {build_id!r} has no release tag; install.sh cannot build an asset URL",
+        )
+        # install.sh reads builds[<build_id>].assets; the top-level assets map
+        # is what the updater consumes. Both described herdrdev during the
+        # outage, so pin both. Archived builds are excluded: they keep the URLs
+        # they shipped with and the installer never selects them.
+        checked = {
+            f"builds[{build_id}].{name}": asset.get("url")
+            for name, asset in build.get("assets", {}).items()
+        }
+        checked.update(
+            {f"assets.{name}": asset.get("url") for name, asset in manifest["assets"].items()}
+        )
+        self.assertTrue(checked, "manifest exposes no asset urls to check")
+        offenders = {
+            where: url
+            for where, url in checked.items()
+            if not str(url).startswith(release_root)
+        }
+        self.assertEqual(
+            offenders,
+            {},
+            f"committed manifest points at assets outside {release_root}",
+        )
 
     def test_archived_asset_is_not_selected_for_current_build(self) -> None:
         result = self._run()

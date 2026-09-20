@@ -28,6 +28,7 @@ on:
     branches: [master]
     paths:
       - "install.sh"
+      - "distribution/preview.json"
       - ".github/workflows/installer-drift.yml"
 
 permissions:
@@ -110,4 +111,48 @@ jobs:
           if missing:
               sys.exit(f"manifest is missing {missing}")
           print("manifest build_id:", m["build_id"])
+          PY
+
+      - name: Verify the manifest serves fork-owned assets
+        # A reachable, well-formed manifest can still break every install: on
+        # 2026-09-16 an upstream sync replaced distribution/preview.json with
+        # herdrdev's copy, so install.sh refused every asset URL and nobody
+        # could install. The two checks above both passed through that outage
+        # because neither looks at where the assets live. Enforce here exactly
+        # what install.sh enforces at its EXPECTED_RELEASE_ROOT guard, and
+        # require the current build to carry the tag the installer reads.
+        run: |
+          set -euo pipefail
+          root=$(sed -n 's/^EXPECTED_RELEASE_ROOT="\(.*\)"$/\1/p' install.sh | head -n 1)
+          if [ -z "$root" ]; then
+            echo "::error::could not read EXPECTED_RELEASE_ROOT out of install.sh"
+            exit 1
+          fi
+          echo "expected release root: $root"
+          EXPECTED_ROOT="$root" python3 - <<'PY'
+          import json, os, sys
+          root = os.environ["EXPECTED_ROOT"]
+          m = json.load(open("/tmp/manifest.json"))
+          build_id = m.get("build_id")
+          build = m.get("builds", {}).get(build_id, {})
+          if not build.get("tag"):
+              sys.exit(f"build {build_id!r} has no release tag; install.sh cannot build an asset URL")
+          # Only the current build is checked. Archived builds keep whatever
+          # URLs they shipped with, including upstream ones, and install.sh
+          # never selects them.
+          checked = {
+              f"builds[{build_id}].{name}": asset.get("url")
+              for name, asset in build.get("assets", {}).items()
+          }
+          checked.update(
+              {f"assets.{name}": asset.get("url") for name, asset in m.get("assets", {}).items()}
+          )
+          bad = sorted(
+              f"{where}: {url}" for where, url in checked.items() if not str(url).startswith(root)
+          )
+          if bad:
+              sys.exit(
+                  "manifest points at assets outside " + root + ":\n  " + "\n  ".join(bad)
+              )
+          print("all", len(checked), "current-build asset urls resolve under", root)
           PY
