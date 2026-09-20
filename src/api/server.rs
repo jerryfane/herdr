@@ -4509,7 +4509,12 @@ mod federation_tests {
         });
         let mut changed = peer;
         changed.remote_session = Some("agent-next".into());
+        let reconcile_started = std::time::Instant::now();
         manager.reconcile(&[changed]);
+        assert!(
+            reconcile_started.elapsed() < Duration::from_millis(750),
+            "bridge retirement must not serialize one-second monitor waits"
+        );
 
         let route = manager
             .registry_snapshot()

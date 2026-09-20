@@ -53,10 +53,16 @@ struct SavedBridgeSupervisor {
     join: Option<JoinHandle<()>>,
 }
 
+impl SavedBridgeSupervisor {
+    fn retire(mut self) -> JoinHandle<()> {
+        retire_poll(self.join.take().expect("bridge supervisor join handle"))
+    }
+}
+
 impl Drop for SavedBridgeSupervisor {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            drop(retire_poll(join));
         }
     }
 }
@@ -89,6 +95,9 @@ struct PeerHandle {
 /// a proxy route per peer, and reconciles that set against desired config on
 /// `reload-config`. See the module docs for the locking model.
 pub struct FederationPeerManager {
+    /// Serializes full reconciliation while allowing the handle lock to be
+    /// released during bounded bridge retirement.
+    reconcile_lock: Mutex<()>,
     /// One running poll thread per outbound peer, keyed by alias.
     handles: Mutex<HashMap<String, PeerHandle>>,
     /// The outbound proxy registry, snapshot-swapped on reconcile.
@@ -107,6 +116,7 @@ impl FederationPeerManager {
     /// peer set to populate it.
     pub fn new(store: Arc<Mutex<FederationStore>>, running: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
+            reconcile_lock: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
             registry: RwLock::new(Arc::new(HashMap::new())),
             reaper: Mutex::new(Vec::new()),
@@ -141,6 +151,10 @@ impl FederationPeerManager {
     /// 5. Rebuild and swap the proxy registry from the same live routes used by
     ///    pollers.
     pub fn reconcile(&self, desired: &[FederationPeer]) {
+        let _reconcile = self
+            .reconcile_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut handles = self
             .handles
             .lock()
@@ -167,6 +181,7 @@ impl FederationPeerManager {
             })
             .map(|(alias, _)| alias.clone())
             .collect();
+        let mut bridge_retirements = Vec::new();
         for alias in &to_stop {
             let Some(handle) = handles.remove(alias) else {
                 continue;
@@ -182,13 +197,12 @@ impl FederationPeerManager {
                 handle.stop.store(true, Ordering::Relaxed);
                 store.remove_peer(alias);
             }
-            // Close the bridge before starting its replacement: saved bridges
-            // intentionally use one socket path per immutable profile. Drop is
-            // bounded and cancels every active per-connection SSH worker.
             let PeerHandle {
                 join, _ssh_bridge, ..
             } = handle;
-            drop(_ssh_bridge);
+            if let Some(bridge) = _ssh_bridge {
+                bridge_retirements.push(bridge.retire());
+            }
             let mut reaper = self
                 .reaper
                 .lock()
@@ -196,7 +210,16 @@ impl FederationPeerManager {
             reaper.push(retire_poll(join));
             info!(alias = %alias, "federation peer stopped and evicted (reconcile)");
         }
-
+        // Supervisor joins run concurrently and never hold the handle registry
+        // lock. Waiting here closes stable profile sockets before replacement.
+        drop(handles);
+        for join in bridge_retirements {
+            let _ = join.join();
+        }
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // 4. Spawn a poll thread for every newly desired outbound alias.
         for (alias, peer) in &desired_out {
             if handles.contains_key(*alias) {
@@ -326,12 +349,24 @@ impl FederationPeerManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             handles.drain().map(|(_, handle)| handle).collect()
         };
-        for handle in live {
+        for handle in &live {
             handle.stop.store(true, Ordering::Relaxed);
+        }
+        let mut poll_joins = Vec::with_capacity(live.len());
+        let mut bridge_joins = Vec::new();
+        for handle in live {
             let PeerHandle {
                 join, _ssh_bridge, ..
             } = handle;
-            drop(_ssh_bridge);
+            poll_joins.push(join);
+            if let Some(bridge) = _ssh_bridge {
+                bridge_joins.push(bridge.retire());
+            }
+        }
+        for join in poll_joins {
+            let _ = join.join();
+        }
+        for join in bridge_joins {
             let _ = join.join();
         }
         let pending: Vec<JoinHandle<()>> = {
@@ -419,11 +454,19 @@ fn supervise_saved_peer_bridge(
 ) {
     let mut bridge = Some(initial);
     let mut use_cached_metadata = true;
-    while running.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+    while !bridge_stopping(running, stop) {
         if let Some(active) = bridge.as_ref() {
-            let Some(failure) = active.reported_failure() else {
-                continue;
+            let failure = match active.try_reported_failure() {
+                Ok(Some(failure)) => failure,
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(failure) => failure,
             };
+            if bridge_stopping(running, stop) {
+                break;
+            }
             use_cached_metadata =
                 !crate::remote::SavedSshApiBridge::stale_metadata_failure(&failure);
             if !use_cached_metadata {
@@ -432,27 +475,58 @@ fn supervise_saved_peer_bridge(
             tracing::warn!(%failure, "saved federation bridge exited; restarting");
             drop(bridge.take());
         }
-        match crate::remote::SavedSshApiBridge::start(
-            profile_id,
-            target,
-            session,
-            use_cached_metadata,
-        ) {
-            Ok(started) => {
-                bridge = Some(started);
-                use_cached_metadata = true;
+        if bridge_stopping(running, stop) {
+            break;
+        }
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let profile_id = profile_id.to_owned();
+        let target = target.to_owned();
+        let session = session.to_owned();
+        std::thread::spawn(move || {
+            let result = crate::remote::SavedSshApiBridge::start(
+                &profile_id,
+                &target,
+                &session,
+                use_cached_metadata,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        loop {
+            if bridge_stopping(running, stop) {
+                return;
             }
-            Err(error) => {
-                tracing::warn!(%error, "saved federation bridge restart failed");
-                for _ in 0..10 {
-                    if !running.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+            match result_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(started)) => {
+                    bridge = Some(started);
+                    use_cached_metadata = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "saved federation bridge restart failed");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::warn!("saved federation bridge restart worker disconnected");
+                    break;
                 }
             }
         }
+        if bridge.is_none() {
+            for _ in 0..10 {
+                if bridge_stopping(running, stop) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
+}
+
+fn bridge_stopping(running: &AtomicBool, stop: &AtomicBool) -> bool {
+    !running.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed)
 }
 
 /// Join one stopped poll thread away from the reconcile caller.

@@ -2735,6 +2735,17 @@ impl SshStdioBridge {
             .recv_timeout(BRIDGE_FAILURE_REPORT_TIMEOUT)
             .ok()
     }
+
+    pub(super) fn try_reported_failure(&self) -> io::Result<Option<io::Error>> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Ok(Some(error)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SSH bridge failure monitor disconnected",
+            )),
+        }
+    }
 }
 
 fn prepare_remote_bridge_stream(
@@ -3312,6 +3323,35 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnected_bridge_failure_monitor_is_terminal() {
+        let (failure_tx, failure_rx) = std::sync::mpsc::channel();
+        drop(failure_tx);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let local_socket = crate::platform::remote_bridge_endpoint_path(
+            &format!("herdr-disconnected-bridge-{nonce}.sock"),
+            &format!("hdb-{nonce}.sock"),
+        );
+        let listener = crate::ipc::bind_local_listener(&local_socket).unwrap();
+        let socket_identity = crate::ipc::socket_file_identity(&local_socket).unwrap();
+        drop(listener);
+        let bridge = SshStdioBridge {
+            local_socket,
+            socket_identity,
+            should_stop: Arc::new(AtomicBool::new(true)),
+            failure_rx,
+            thread: None,
+        };
+
+        let error = bridge
+            .try_reported_failure()
+            .expect_err("disconnected monitor must trigger bridge replacement");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
 
     fn decode_windows_command(command: &str) -> String {
         let encoded = command

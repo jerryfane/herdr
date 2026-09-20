@@ -100,6 +100,10 @@ impl SavedSshApiBridge {
         self.bridge.reported_failure()
     }
 
+    pub(crate) fn try_reported_failure(&self) -> io::Result<Option<io::Error>> {
+        self.bridge.try_reported_failure()
+    }
+
     pub(crate) fn invalidate_metadata(&self) {
         self.metadata_cache.invalidate();
     }
