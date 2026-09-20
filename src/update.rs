@@ -31,9 +31,9 @@ const PREVIEW_UPDATE_MANIFEST_URL: &str =
 /// updater did not, and that gap is a real downgrade path: `herdr.dev/latest.json`
 /// is upstream-owned and advertises the SAME version number as a fork build
 /// (0.9.0 at the time of writing) while serving `herdrdev/herdr` binaries. With
-/// `stable_channel_should_install` short-circuiting on `installed_is_preview`, a
-/// fork preview build would install upstream's binary over itself and silently
-/// lose `api-bridge` - the transport the app speaks.
+/// stable-channel short-circuiting on `installed_is_preview`, a fork preview
+/// build would install upstream's binary over itself and silently lose the
+/// saved-machine and federation features the app speaks.
 const EXPECTED_RELEASE_ROOT: &str = "https://github.com/jerryfane/herdr/releases/download/";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";

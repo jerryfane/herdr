@@ -143,9 +143,8 @@ capability = "interact"
 
 [[federation.peers]]
 alias = "build"
-endpoint = "ssh://dev@build.example"
-profile_id = "0123456789abcdef0123456789abcdef"
-remote_session = "agent-work"
+endpoint = "tcp://build.internal:7020"
+token_file = "/etc/herdr/peers/build.token"
 expected_node_id = "machine_0123456789abcdef0123456789abcdef"
 ```
 
@@ -153,14 +152,12 @@ Each `[[federation.peers]]` table declares one peer:
 
 - `alias` — a stable local routing identity for the peer, used in qualified IDs, logs, and diagnostics.
 - `display_label` — optional mutable display text. Changing it does not change routing identity or reconnect the peer.
-- `token_file` — path to the shared secret used by inbound and outbound TCP federation. Its trimmed contents are never logged. An unreadable or empty file grants no inbound access and sends no outbound TCP credential. SSH peers authenticate through OpenSSH instead.
-- `endpoint` — where to reach the peer for outbound connections: `tcp://host:port` or `ssh://[user@]host`.
-- `profile_id` — the immutable 32-character saved-machine profile ID used to key SSH executable metadata and bridge lifetime. Required for SSH endpoints.
-- `remote_session` — the explicit named Herdr session served by `remote-api-bridge`. Required for SSH endpoints.
+- `token_file` — path to the shared secret used by inbound and outbound TCP federation. Its trimmed contents are never logged. An unreadable or empty file grants no inbound access and sends no outbound credential.
+- `endpoint` — optional `tcp://host:port` destination for outbound connections. Omit it for an inbound-only peer. SSH targets belong in the saved-machine catalog and `federation.saved_machines`, not this table.
 - `expected_node_id` — an optional install-identity pin checked both when a TCP peer connects inbound and when any outbound peer's `agent.list` response is polled. Missing or changed identities are rejected while the pin is set.
-- `capability` — the tier a token grants over TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`. SSH remains a full-control trust boundary.
+- `capability` — the tier a token grants over TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`.
 
-Saved-machine federation trust is separate from both the endpoint catalog and explicit peer endpoints:
+Saved-machine federation trust is separate from both the endpoint catalog and explicit TCP peers:
 
 ```toml
 [federation.saved_machines."0123456789abcdef0123456789abcdef"]
@@ -182,6 +179,14 @@ Federation exposes only a deliberate, read-and-drive subset of the API. Anything
 `agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
 
 Use `herdr machine status` (or `herdr machine status --json`) on the coordinator to inspect each saved profile without conflating the independent planes. The result reports saved-profile state, endpoint/TUI status when the coordinator has one, federation reachability, the validated remote machine ID, last successful poll time, a bounded error class, negotiated API version/capabilities, and whether cached data is stale. A saved machine can therefore remain enabled while its federation API is degraded or unreachable. Error details never include SSH command lines, token material, or remote stderr.
+
+### Migrating SSH federation peers
+
+For an SSH peer that duplicates a saved machine, remove its `[[federation.peers]]` table, enable `federation.coordinator`, and add one `federation.saved_machines."<profile-id>"` policy keyed by the existing immutable profile ID. Keep `expected_machine_id` pinned to the remote daemon's install identity. Do not use the mutable label as an alias or recreate the profile: removing and re-adding it produces a new ID and intentionally drops the old trust policy.
+
+The coordinator now uses only the saved-machine `remote-api-bridge`; the one-request `api-bridge` command and direct SSH request transport no longer exist. Direct `herdr --machine <label-or-id> …` commands use the same saved profile and remain available independently of federation policy. Upgrade from a release that provides both bridge commands before enabling coordinator mode. Rolling the coordinator back across this cutover requires rolling remote binaries back too, or federation through those remotes will fail because the newer binary no longer serves `api-bridge`. Back up the config first; an older binary may also reject the newer `coordinator`, `display_label`, or `saved_machines` keys until they are removed.
+
+OpenSSH credentials are not migrated into Herdr. Existing agents, host-key policy, SSH config, and private-key handling stay with OpenSSH; federation config stores only the immutable profile ID and expected machine ID.
 
 :::caution[Security]
 A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path, which runs a discovered remote Herdr executable's `remote-api-bridge` against the named session's local socket and therefore grants full, unfiltered control-plane access. OpenSSH owns authentication, host-key checks, and interactive-auth failure. The local unix socket itself is never token-checked or tier-filtered.
