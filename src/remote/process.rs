@@ -41,16 +41,14 @@ pub(super) fn wait_with_output_timeout_or_cancel(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_tree(&mut child);
                 let _ = stdout.join();
                 let _ = stderr.join();
                 return Err(error);
             }
         }
         if cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_tree(&mut child);
             let _ = stdout.join();
             let _ = stderr.join();
             return Err(io::Error::new(
@@ -59,8 +57,7 @@ pub(super) fn wait_with_output_timeout_or_cancel(
             ));
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_tree(&mut child);
             let _ = stdout.join();
             let _ = stderr.join();
             return Err(io::Error::new(
@@ -83,6 +80,21 @@ pub(super) fn wait_with_output_timeout_or_cancel(
     })
 }
 
+fn terminate_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group_id) = i32::try_from(child.id()) {
+            // The caller starts the command as its process-group leader. Killing
+            // the group closes descendant-held stdout/stderr pipes as well.
+            unsafe {
+                libc::kill(-process_group_id, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -96,6 +108,7 @@ mod tests {
             .arg("exec sleep 10")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        crate::platform::configure_status_command(&mut command);
         let started = Instant::now();
         let error = wait_with_output_timeout(command.spawn().unwrap(), Duration::from_millis(25))
             .unwrap_err();
@@ -108,9 +121,10 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("exec sleep 10")
+            .arg("sleep 10 & wait")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        crate::platform::configure_status_command(&mut command);
         let started = Instant::now();
         let error = wait_with_output_timeout_or_cancel(
             command.spawn().unwrap(),

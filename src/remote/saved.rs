@@ -196,8 +196,6 @@ pub(crate) fn saved_ssh_failure_needs_attention(error: &io::Error) -> bool {
         "host key verification failed",
         "remote host identification has changed",
         "could not resolve hostname",
-        "connection timed out",
-        "connection refused",
         "no matching host key",
         "unsupported remote platform",
         "not ready",
@@ -285,9 +283,14 @@ mod tests {
                 message
             )));
         }
-        assert!(!saved_ssh_failure_needs_attention(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "network timed out"
-        )));
+        for message in [
+            "ssh: connect to host build port 22: Connection timed out",
+            "ssh: connect to host build port 22: Connection refused",
+        ] {
+            assert!(
+                !saved_ssh_failure_needs_attention(&io::Error::other(message)),
+                "transient reachability failures must remain retryable"
+            );
+        }
     }
 }

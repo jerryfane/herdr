@@ -705,6 +705,7 @@ impl RemoteSsh {
         let mut command = self.base_command();
         if self.noninteractive {
             apply_noninteractive_ssh_options(&mut command);
+            crate::platform::configure_status_command(&mut command);
         }
         command.arg("-T").arg(&self.target);
         command
