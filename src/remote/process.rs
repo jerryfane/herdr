@@ -5,6 +5,14 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+pub(super) fn configure_child_tree(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+}
+
 pub(super) fn wait_with_output_timeout(
     child: std::process::Child,
     timeout: Duration,
@@ -91,6 +99,12 @@ fn terminate_child_tree(child: &mut std::process::Child) {
             }
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -108,7 +122,7 @@ mod tests {
             .arg("exec sleep 10")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::platform::configure_status_command(&mut command);
+        configure_child_tree(&mut command);
         let started = Instant::now();
         let error = wait_with_output_timeout(command.spawn().unwrap(), Duration::from_millis(25))
             .unwrap_err();
@@ -124,7 +138,7 @@ mod tests {
             .arg("sleep 10 & wait")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::platform::configure_status_command(&mut command);
+        configure_child_tree(&mut command);
         let started = Instant::now();
         let error = wait_with_output_timeout_or_cancel(
             command.spawn().unwrap(),

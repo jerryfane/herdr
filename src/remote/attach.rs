@@ -2,7 +2,7 @@
 
 use super::{
     args::*,
-    process::{wait_with_output_timeout, wait_with_output_timeout_or_cancel},
+    process::{configure_child_tree, wait_with_output_timeout, wait_with_output_timeout_or_cancel},
     restart_policy::*,
     shell_quote,
 };
@@ -705,7 +705,7 @@ impl RemoteSsh {
         let mut command = self.base_command();
         if self.noninteractive {
             apply_noninteractive_ssh_options(&mut command);
-            crate::platform::configure_status_command(&mut command);
+            configure_child_tree(&mut command);
         }
         command.arg("-T").arg(&self.target);
         command
