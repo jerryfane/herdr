@@ -196,7 +196,7 @@ fn server_command() -> Command {
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")
-                .about("Show active agent detection manifests")
+                .about("Show active manifests and submission verification support")
                 .arg(json_flag()),
         )
         .subcommand(
@@ -449,7 +449,22 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. Otherwise Herdr first acknowledges the complete text+Enter PTY write; if a modal input request is already visible, it returns agent_input_pending without writing. With --wait, when an accepted submission starts from another non-working state Herdr first requires an observed state change within 5000ms, otherwise it returns agent_prompt_stalled when the composer was observable and showed nothing, or agent_prompt_unverifiable when the pane exposes no composer observation at all (neither is proof of non-delivery) and a shorter --timeout returns timeout instead. A settled agent's lifecycle advance, or the same writer-attributed composer attempt being observed and then cleared, proves delivery=submitted; a persistent attributed attempt returns agent_prompt_unsubmitted, and any other outcome returns one of the two negative verdicts above. Bracketed paste does not depend on rendered token text. For an already-working agent, an unrelated lifecycle completion is never claimed as this prompt's submission, though that active turn's completion may still match the wait. It then matches idle, done, or blocked by default, or any exact --until state. Without --timeout, the settled-state wait is indefinite.",
+                    concat!(
+                        "A blocked agent or visible modal rejects input before any PTY write. ",
+                        "Otherwise Herdr writes text+Enter first. With --wait it then observes ",
+                        "submission and the requested agent state. If submission cannot be ",
+                        "confirmed after the write, the CLI returns agent_prompt_unconfirmed ",
+                        "with delivery=written_to_pty and exit code 0, not a delivery failure. ",
+                        "Its reason distinguishes an unsupported/unobservable composer ",
+                        "(agent_prompt_unverifiable), no observed submission ",
+                        "(agent_prompt_stalled), or a still-visible attributed draft ",
+                        "(agent_prompt_unsubmitted). Do not resend without checking the pane. ",
+                        "A timeout can occur before the PTY write; it remains an error. ",
+                        "Run `herdr server agent-manifests` to see active composer coverage. ",
+                        "A settled agent's lifecycle advance or an observed composer clear ",
+                        "confirms submission; an unrelated completion of an already-working ",
+                        "agent does not. Without --timeout, the settled-state wait is indefinite."
+                    ),
                 ),
         )
         .subcommand(

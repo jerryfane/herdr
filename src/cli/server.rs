@@ -161,6 +161,9 @@ fn print_agent_manifest_status(response: &serde_json::Value) {
     let last_result = result["last_result"].as_str().unwrap_or("not checked");
     println!("last check: {last_check}");
     println!("result: {last_result}");
+    println!(
+        "submission verification: active manifest [composer] coverage (not a live observation)"
+    );
     println!();
 
     let Some(manifests) = result["manifests"].as_array() else {
@@ -184,8 +187,16 @@ fn print_agent_manifest_status(response: &serde_json::Value) {
         } else {
             " "
         };
+        let verification = if manifest["submission_verification_supported"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            "yes"
+        } else {
+            "no"
+        };
         println!(
-            "{marker} {agent:<9} {source:<14} active {active_version:<14} remote {remote_version:<14} {remote_result}"
+            "{marker} {agent:<9} {source:<14} active {active_version:<14} remote {remote_version:<14} {remote_result}  submit-verify {verification}"
         );
         if let Some(error) = manifest["remote_update_error"].as_str() {
             println!("  {error}");

@@ -89,6 +89,42 @@ fn write_local_codex(content: &str) {
 }
 
 #[test]
+fn submission_verification_reports_the_effective_manifest() {
+    with_manifest_dirs("composer-support", || {
+        let summaries = manifest_summaries();
+        assert!(
+            summaries
+                .iter()
+                .find(|summary| summary.agent == Agent::Claude)
+                .unwrap()
+                .submission_verification_supported
+        );
+        assert!(
+            !summaries
+                .iter()
+                .find(|summary| summary.agent == Agent::Codex)
+                .unwrap()
+                .submission_verification_supported
+        );
+        assert!(submission_verification_supported(Agent::Claude));
+        assert!(!submission_verification_supported(Agent::Codex));
+
+        write_local_codex(&format!(
+            "{}\n[composer]\nregion = \"prompt_box_body\"\n",
+            local_manifest("working", "active-marker")
+        ));
+        assert!(
+            manifest_summaries()
+                .iter()
+                .find(|summary| summary.agent == Agent::Codex)
+                .unwrap()
+                .submission_verification_supported
+        );
+        assert!(submission_verification_supported(Agent::Codex));
+    });
+}
+
+#[test]
 fn known_agent_no_match_defaults_to_idle_fallback() {
     with_manifest_dirs("no-match", || {
         write_local_codex(&local_manifest("working", "active-marker"));

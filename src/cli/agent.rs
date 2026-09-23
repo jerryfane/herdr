@@ -1294,7 +1294,33 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             }),
         }),
     })?;
-    super::print_response(&response)
+    print_prompt_response(&response)
+}
+
+fn print_prompt_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    if let Some(unconfirmed) = unconfirmed_prompt_response(response) {
+        return super::print_response(&unconfirmed);
+    }
+    super::print_response(response)
+}
+
+fn unconfirmed_prompt_response(response: &serde_json::Value) -> Option<serde_json::Value> {
+    let code = response["error"]["code"].as_str()?;
+    if !matches!(
+        code,
+        "agent_prompt_unverifiable" | "agent_prompt_stalled" | "agent_prompt_unsubmitted"
+    ) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "id": response["id"],
+        "result": {
+            "type": "agent_prompt_unconfirmed",
+            "delivery": "written_to_pty",
+            "reason": code,
+            "message": response["error"]["message"],
+        }
+    }))
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
@@ -1563,5 +1589,30 @@ mod tests {
         assert!(!session_transfer_poll_may_retry(&serde_json::json!({
             "error": { "code": "agent_blocked" }
         })));
+    }
+    #[test]
+    fn written_prompt_without_submission_confirmation_is_not_a_delivery_failure() {
+        for code in [
+            "agent_prompt_unverifiable",
+            "agent_prompt_stalled",
+            "agent_prompt_unsubmitted",
+        ] {
+            let response = serde_json::json!({
+                "id": "prompt-1",
+                "error": {"code": code, "message": "prompt written to the PTY"},
+            });
+            let result = unconfirmed_prompt_response(&response).unwrap();
+            assert!(result.get("error").is_none());
+            assert_eq!(result["result"]["type"], "agent_prompt_unconfirmed");
+            assert_eq!(result["result"]["delivery"], "written_to_pty");
+            assert_eq!(result["result"]["reason"], code);
+            assert_eq!(print_prompt_response(&response).unwrap(), 0);
+        }
+
+        for code in ["agent_not_found", "agent_prompt_write_failed", "timeout"] {
+            let response = serde_json::json!({"error": {"code": code}});
+            assert!(unconfirmed_prompt_response(&response).is_none());
+            assert_eq!(print_prompt_response(&response).unwrap(), 1);
+        }
     }
 }

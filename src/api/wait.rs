@@ -580,9 +580,9 @@ fn observe_prompt_effect(
                 return agent_prompt_observation_error(
                     request_id,
                     "agent_prompt_unverifiable",
-                    "agent prompt was written to the PTY; this pane exposes no composer \
-                     observation, so submission can be neither confirmed nor denied \
-                     — do not treat this as non-delivery",
+                    unverifiable_prompt_message(
+                        current.agent.as_deref().or(before_prompt.agent.as_deref()),
+                    ),
                 )
                 .map(PromptEffectOutcome::Response)
                 .map(Some);
@@ -608,6 +608,21 @@ fn observe_prompt_effect(
                     .map(Some);
             }
         };
+    }
+}
+
+fn unverifiable_prompt_message(agent_label: Option<&str>) -> &'static str {
+    if agent_label
+        .and_then(crate::detect::parse_agent_label)
+        .is_some_and(|agent| !crate::detect::manifest::submission_verification_supported(agent))
+    {
+        "agent prompt was written to the PTY; submission verification is unsupported \
+         for this agent (its active manifest has no composer observation), so \
+         submission cannot be confirmed — do not treat this as non-delivery"
+    } else {
+        "agent prompt was written to the PTY; this pane exposes no composer \
+         observation, so submission can be neither confirmed nor denied \
+         — do not treat this as non-delivery"
     }
 }
 

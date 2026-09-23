@@ -125,6 +125,8 @@ herdr server reload-agent-manifests
 ```
 
 `herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
+`submit-verify` 列（`--json` 中为 `submission_verification_supported`）表示当前生效的清单是否声明了 `[composer]`，但不保证某个窗格在运行时一定可观察。
+
 
 ## 通知
 
@@ -353,6 +355,8 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。此后 Herdr 会等待请求的 settled 状态。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
 
 写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。对于完全不暴露 composer 观察的窗格，返回 `agent_prompt_unverifiable` 而非 `agent_prompt_stalled`，以便调用方区分“已观察但无证据”与“无法观察”；两者都不能证明未送达。
+对于 `agent prompt --wait`，PTY 已写入但无法确认提交的三种结果会写到 stdout：`result.type: "agent_prompt_unconfirmed"`、`delivery: "written_to_pty"`，以及 `agent_prompt_unverifiable`、`agent_prompt_stalled` 或 `agent_prompt_unsubmitted` 作为原因代码。CLI 退出状态为 0；再次发送前先检查窗格。若当前清单没有 composer 覆盖，提示会明确说明该智能体不支持提交验证。直接调用 API 仍会收到原有错误代码。
+
 
 `idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 
@@ -393,7 +397,7 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 超时或 `agent_prompt_stalled` 并不代表未发送提示。重试前请先检查智能体。
 
-`pane wait-output` 和 `agent wait` 在省略 `--timeout` 时会无限等待。对于 `agent prompt --wait`，观察到活动后，或提示开始时已处于 `working`，等待稳定状态的过程不会超时；如果提示从 non-working 状态开始且未观察到活动，五秒后仍会返回 `agent_prompt_stalled`。超时或服务器错误以 JSON 写到 stderr,退出状态为 1。CLI 用法错误的退出状态为 2。
+`pane wait-output` 和 `agent wait` 在省略 `--timeout` 时会无限等待。对于 `agent prompt --wait`，观察到活动后，或提示开始时已处于 `working`，等待稳定状态的过程不会超时；如果提示从 non-working 状态开始且未观察到活动，五秒后会返回提交未确认的结果。超时可能发生在 PTY 写入得到确认之前，仍属于错误。真正的投递失败和服务器错误以 JSON 写到 stderr，退出状态为 1；CLI 用法错误的退出状态为 2。
 
 ## 集成
 
