@@ -198,10 +198,15 @@ fn edit_policy(
             .as_array_of_tables_mut()
             .ok_or("legacy federation.peers is not an array of tables")?;
         peers.retain(|peer| {
-            !peer
-                .get("alias")
+            let migrated_ssh = peer
+                .get("endpoint")
                 .and_then(Item::as_str)
-                .is_some_and(|alias| migrated_aliases.iter().any(|selected| selected == alias))
+                .is_some_and(|endpoint| endpoint.starts_with("ssh://"))
+                && peer
+                    .get("alias")
+                    .and_then(Item::as_str)
+                    .is_some_and(|alias| migrated_aliases.iter().any(|selected| selected == alias));
+            !migrated_ssh
         });
         if peers.is_empty() {
             doc["federation"].as_table_mut().unwrap().remove("peers");
@@ -317,7 +322,7 @@ fn reload_live() -> i32 {
 pub(super) fn federate(args: &[String]) -> io::Result<i32> {
     let (selector, migrate_all) = match args {
         [selector] => (selector, false),
-        [selector, flag] if flag == "--migrate-all-legacy" => (selector, true),
+        [flag, selector] | [selector, flag] if flag == "--migrate-all-legacy" => (selector, true),
         _ => {
             eprintln!("usage: herdr machine federate <label-or-id> [--migrate-all-legacy]");
             return Ok(2);
@@ -547,6 +552,29 @@ endpoint = "ssh://jerry@laptop"
         let value: toml::Value = unfederated.parse().unwrap();
         assert!(value["federation"].get("saved_machines").is_none());
         assert_eq!(value["federation"]["peers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_keeps_non_ssh_peer_with_same_alias() {
+        let original = r#"[federation]
+[[federation.peers]]
+alias = "shared"
+endpoint = "ssh://jerry@laptop"
+[[federation.peers]]
+alias = "shared"
+endpoint = "tcp://127.0.0.1:7020"
+"#;
+        let migrated = edit_policy(
+            original,
+            &[(profile_id(), "machine_verified".into())],
+            None,
+            &["shared".into()],
+        )
+        .unwrap();
+        let value: toml::Value = migrated.parse().unwrap();
+        let peers = value["federation"]["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["endpoint"].as_str(), Some("tcp://127.0.0.1:7020"));
     }
 
     #[test]

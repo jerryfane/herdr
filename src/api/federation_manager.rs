@@ -426,6 +426,7 @@ impl FederationPeerManager {
                     display_label: profile.label.clone(),
                     remote_session: profile.session.clone(),
                     saved_state,
+                    federation_configured: trusted,
                     endpoint_status: if profile.enabled {
                         endpoint_statuses.get(&profile_id).copied()
                     } else {
@@ -1342,6 +1343,7 @@ mod tests {
         );
         assert_eq!(online[&profile_text].remote_protocol, Some(2));
         assert!(!online[&profile_text].stale);
+        assert!(online[&profile_text].federation_configured);
         let encoded = serde_json::to_string(&online[&profile_text]).unwrap();
         assert!(!encoded.contains("dev@build.example"));
         assert!(!encoded.contains("token"));
@@ -1362,6 +1364,16 @@ mod tests {
             SavedMachineState::Disabled
         );
         assert!(!disabled[&profile_text].stale);
+        assert!(disabled[&profile_text].federation_configured);
+        manager
+            .coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .policies
+            .clear();
+        let disabled_without_policy =
+            manager.machine_statuses_with_profiles(Some(std::slice::from_ref(&profile)));
+        assert!(!disabled_without_policy[&profile_text].federation_configured);
 
         manager.join_all();
     }
