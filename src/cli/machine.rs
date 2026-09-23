@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use super::machine_federation::{federate, unfederate};
 use crate::api::client::ApiClient;
 use crate::api::schema::{EmptyParams, Method, Request, ResponseResult};
 use crate::client::endpoint::{EndpointCatalog, ProfileId};
@@ -14,6 +15,8 @@ const HELP: &str = "Usage:
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
+  herdr machine federate <label-or-id> [--migrate-all-legacy]
+  herdr machine unfederate <label-or-id>
 
 Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
@@ -43,6 +46,8 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
         Some("disable") => set_enabled(&args[1..], false),
+        Some("federate") => federate(&args[1..]),
+        Some("unfederate") => unfederate(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             Ok(0)
@@ -108,9 +113,15 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         ));
     };
     if json {
+        let mut output = serde_json::to_value(&machines).map_err(std::io::Error::other)?;
+        for (id, machine) in &machines {
+            if machine.saved_state == crate::api::schema::SavedMachineState::Untrusted {
+                output[id]["next_action"] = format!("herdr machine federate {id}").into();
+            }
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&machines).map_err(std::io::Error::other)?
+            serde_json::to_string_pretty(&output).map_err(std::io::Error::other)?
         );
         return Ok(0);
     }
@@ -160,6 +171,9 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         }
         if let Some(error) = machine.last_error_class {
             println!("  last error: {}", format!("{error:?}").to_lowercase());
+        }
+        if machine.saved_state == crate::api::schema::SavedMachineState::Untrusted {
+            println!("  next: herdr machine federate {}", machine.profile_id);
         }
         if machine.stale {
             println!("  cached federation data is stale");

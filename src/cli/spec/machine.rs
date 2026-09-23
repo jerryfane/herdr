@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 use super::{json_flag, option};
 
@@ -43,6 +43,22 @@ pub(super) fn command() -> Command {
         .subcommand(profile_command("remove", "Remove a saved SSH machine"))
         .subcommand(profile_command("enable", "Enable a saved SSH machine"))
         .subcommand(profile_command("disable", "Disable a saved SSH machine"))
+        .subcommand(
+            Command::new("federate")
+                .about("Opt a saved SSH machine into federation and pin its identity")
+                .arg(Arg::new("machine").value_name("LABEL_OR_ID").required(true))
+                .arg(
+                    Arg::new("migrate-all-legacy")
+                        .long("migrate-all-legacy")
+                        .action(ArgAction::SetTrue)
+                        .help("Explicitly migrate every legacy SSH peer in one policy update"),
+                ),
+        )
+        .subcommand(
+            Command::new("unfederate")
+                .about("Stop federating a saved SSH machine")
+                .arg(Arg::new("machine").value_name("LABEL_OR_ID").required(true)),
+        )
 }
 
 fn profile_command(name: &'static str, about: &'static str) -> Command {
