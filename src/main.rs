@@ -123,11 +123,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 [update]
 # Update channel used by background version checks and `herdr update`.
-# Stable builds default to "stable". Windows preview builds default to "preview"
-# so existing preview installs stay there until explicitly switched.
-# channel = "stable"
+# HerdrUp publishes only "preview" builds; "stable" refuses to update rather than
+# read upstream's herdr.dev manifest, which would replace HerdrUp with upstream Herdr.
+# Builds default to "stable" unless stamped as preview builds.
+# channel = "preview"
 
-# Check herdr.dev for new Herdr versions in the background.
+# Check the HerdrUp release manifest for new builds in the background.
 # version_check = true
 
 # Check herdr.dev for remote agent-detection manifest updates in the background.

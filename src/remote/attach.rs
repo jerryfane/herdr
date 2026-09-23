@@ -35,9 +35,6 @@ const NONINTERACTIVE_SSH_STDERR_LIMIT: usize = 16 * 1024;
 const BRIDGE_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const REMOTE_OUTPUT_READY_MARKER: &str = "herdr-remote-output-ready:1";
 const WINDOWS_REMOTE_PATH_MARKER: &str = "herdr-remote-path:1:";
@@ -472,26 +469,6 @@ impl RemoteAssetRef {
 }
 
 #[derive(Deserialize)]
-struct RemoteUpdateManifest {
-    version: String,
-    protocol: Option<u32>,
-    assets: BTreeMap<String, RemoteAssetRef>,
-    #[serde(default)]
-    sha256: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_remote_manifest_releases")]
-    releases: BTreeMap<String, RemoteReleaseMetadata>,
-}
-
-#[derive(Deserialize)]
-struct RemoteReleaseMetadata {
-    protocol: Option<u32>,
-    #[serde(default)]
-    assets: BTreeMap<String, RemoteAssetRef>,
-    #[serde(default)]
-    sha256: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
 struct RemotePreviewManifest {
     build_id: String,
     protocol: u32,
@@ -504,53 +481,6 @@ struct RemotePreviewManifest {
 struct RemotePreviewBuildMetadata {
     protocol: u32,
     assets: BTreeMap<String, RemoteAssetRef>,
-}
-
-fn deserialize_remote_manifest_releases<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, RemoteReleaseMetadata>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::Object(object)) => object
-            .into_iter()
-            .filter_map(|(version, release)| {
-                serde_json::from_value::<RemoteReleaseMetadata>(release)
-                    .ok()
-                    .map(|metadata| (version, metadata))
-            })
-            .collect(),
-        _ => BTreeMap::new(),
-    })
-}
-
-impl RemoteUpdateManifest {
-    fn release_for_version(&self, version: &str) -> Option<RemoteManifestReleaseRef<'_>> {
-        if self.version.trim_start_matches('v') == version {
-            return Some(RemoteManifestReleaseRef {
-                protocol: self.protocol,
-                assets: &self.assets,
-                sha256: &self.sha256,
-            });
-        }
-
-        self.releases.get(version).and_then(|release| {
-            (!release.assets.is_empty()).then_some(RemoteManifestReleaseRef {
-                protocol: release.protocol,
-                assets: &release.assets,
-                sha256: &release.sha256,
-            })
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RemoteManifestReleaseRef<'a> {
-    protocol: Option<u32>,
-    assets: &'a BTreeMap<String, RemoteAssetRef>,
-    sha256: &'a BTreeMap<String, String>,
 }
 
 fn current_version() -> String {
@@ -2338,60 +2268,42 @@ fn preview_assets_for_build<'a>(
     Ok((build.protocol, &build.assets))
 }
 
+/// The published asset that installs this exact build on a remote host.
+///
+/// Only HerdrUp preview builds have one. A stable-stamped build used to resolve
+/// upstream's `herdr.dev/latest.json`, whose release for the same version number
+/// is a herdrdev binary, so connecting to a host this binary could not seed itself
+/// (another OS or architecture, or a package-managed local install) silently
+/// installed upstream Herdr there.
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
-    if crate::build_info::is_preview() {
-        let build_id = crate::build_info::build_id().ok_or_else(|| {
-            io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
-        })?;
-        let manifest_bytes = fetch_remote_manifest(PREVIEW_UPDATE_MANIFEST_URL)?;
-        let manifest: RemotePreviewManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|err| {
-                io::Error::other(format!("failed to parse preview manifest JSON: {err}"))
-            })?;
-        let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
-        if protocol != CURRENT_PROTOCOL {
-            return Err(io::Error::other(format!(
-                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
-            )));
-        }
-        return assets.get(asset_key).map(remote_asset_info).ok_or_else(|| {
+    if !crate::build_info::is_preview() {
+        return Err(io::Error::other(format!(
+            "HerdrUp publishes no stable release of herdr {} for {asset_key}, and upstream's would replace HerdrUp on the remote; set {REMOTE_BINARY_ENV_VAR} to a HerdrUp binary for {asset_key}, or install HerdrUp on the remote with `{}`",
+            current_version(),
+            crate::update::FORK_INSTALL_COMMAND
+        )));
+    }
+    let build_id = crate::build_info::build_id().ok_or_else(|| {
+        io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
+    })?;
+    let manifest_bytes = fetch_remote_manifest(crate::update::PREVIEW_UPDATE_MANIFEST_URL)?;
+    let manifest: RemotePreviewManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| io::Error::other(format!("failed to parse preview manifest JSON: {err}")))?;
+    let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
+    if protocol != CURRENT_PROTOCOL {
+        return Err(io::Error::other(format!(
+            "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
+        )));
+    }
+    let asset = assets
+        .get(asset_key)
+        .map(remote_asset_info)
+        .ok_or_else(|| {
             io::Error::other(format!(
                 "no {asset_key} binary in the preview manifest for build {build_id}"
             ))
-        });
-    }
-
-    let current_version = current_version();
-    let manifest_bytes = fetch_remote_manifest(STABLE_UPDATE_MANIFEST_URL)?;
-    let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
-    let release = manifest.release_for_version(&current_version).ok_or_else(|| {
-        io::Error::other(format!(
-            "release manifest does not include herdr {current_version}; build herdr for {} or install it there manually",
-            asset_key
-        ))
-    })?;
-    if let Some(protocol) = release.protocol {
-        if protocol != CURRENT_PROTOCOL {
-            return Err(io::Error::other(format!(
-                "release manifest has herdr {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching herdr on the remote host manually"
-            )));
-        }
-    }
-    let asset = release.assets.get(asset_key).ok_or_else(|| {
-        io::Error::other(format!(
-            "no {asset_key} binary in the release manifest for herdr {current_version}"
-        ))
-    })?;
-    let mut asset = remote_asset_info(asset);
-    asset.sha256 = asset
-        .sha256
-        .or_else(|| release.sha256.get(asset_key).cloned());
-    if asset.sha256.is_none() {
-        return Err(io::Error::other(format!(
-            "release manifest asset {asset_key} is missing a SHA-256 checksum"
-        )));
-    }
+        })?;
+    crate::update::ensure_fork_release_asset(&asset.url).map_err(io::Error::other)?;
     Ok(asset)
 }
 
@@ -5142,123 +5054,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_update_manifest_uses_root_assets_for_latest_version() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.3",
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "sha256": {
-                    "linux-x86_64": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let release = manifest.release_for_version("1.2.3").unwrap();
-        assert_eq!(
-            release.assets.get("linux-x86_64").map(RemoteAssetRef::url),
-            Some("https://example.com/latest")
+    fn stable_stamped_build_refuses_to_seed_a_remote_from_upstream_releases() {
+        // HerdrUp's release assets are stable-stamped (they report `0.9.1 (d79b021)`),
+        // and this path used to install upstream's herdr.dev release of the same
+        // version on any remote the local binary could not seed itself.
+        assert!(
+            !crate::build_info::is_preview(),
+            "this test covers stable-stamped builds; rebuild without HERDR_BUILD_CHANNEL"
         );
-        assert_eq!(
-            release.sha256.get("linux-x86_64").map(String::as_str),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_reads_archived_release_assets() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.assets.get("linux-x86_64"))
-                .map(RemoteAssetRef::url),
-            Some("https://example.com/archive")
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_uses_archived_release_protocol() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "protocol": 42,
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "protocol": 41,
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.protocol),
-            Some(41)
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_does_not_inherit_latest_protocol_for_archived_assets() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "protocol": 42,
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.protocol),
-            None
+        let error = match remote_release_asset("linux-x86_64") {
+            Ok(asset) => panic!(
+                "a stable-stamped build resolved a remote asset: {}",
+                asset.url
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(crate::update::FORK_INSTALL_COMMAND),
+            "refusal does not name the fork installer: {error}"
         );
     }
 

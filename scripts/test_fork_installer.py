@@ -192,19 +192,6 @@ fi
         for source_tool in ("cargo", "git", "rustc", "rustup", "zig"):
             self.assertIsNone(shutil.which(source_tool, path=str(self.fake_bin)))
 
-    def test_installer_and_preview_updaters_share_the_fork_manifest(self) -> None:
-        manifest_url = (
-            "https://raw.githubusercontent.com/jerryfane/herdr/master/"
-            "distribution/preview.json"
-        )
-        installer = INSTALLER.read_text(encoding="utf-8")
-        updater = (REPO_ROOT / "src" / "update.rs").read_text(encoding="utf-8")
-        remote = (REPO_ROOT / "src" / "remote" / "attach.rs").read_text(encoding="utf-8")
-
-        self.assertIn(f'DEFAULT_MANIFEST_URL="{manifest_url}"', installer)
-        self.assertIn(manifest_url, updater)
-        self.assertIn(manifest_url, remote)
-
     def test_committed_manifest_serves_assets_the_installer_accepts(self) -> None:
         # An upstream sync overwrote distribution/preview.json with herdrdev's
         # copy on 2026-09-16: the file stayed valid JSON and its URLs stayed

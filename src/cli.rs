@@ -241,15 +241,14 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     }
 }
 
-fn channel_set_rejection(
-    channel: &str,
-    install_rejection: Option<&'static str>,
-) -> Option<&'static str> {
-    if channel == "preview" {
-        return install_rejection;
+/// Refuse before persisting a channel the update will not follow: HerdrUp publishes
+/// no stable channel, so writing `stable` would only make every later update refuse.
+fn channel_set_rejection(channel: &str, install_rejection: Option<&'static str>) -> Option<String> {
+    if channel == "stable" {
+        return Some(crate::update::stable_channel_refusal());
     }
 
-    None
+    install_rejection.map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1078,16 +1077,18 @@ mod tests {
     }
 
     #[test]
-    fn channel_set_only_applies_package_rejection_to_preview() {
+    fn channel_set_refuses_stable_and_applies_package_rejection_to_preview() {
         assert_eq!(
-            super::channel_set_rejection("preview", Some("no preview")),
+            super::channel_set_rejection("preview", Some("no preview")).as_deref(),
             Some("no preview")
         );
-        assert_eq!(
-            super::channel_set_rejection("stable", Some("no preview")),
-            None
-        );
         assert_eq!(super::channel_set_rejection("preview", None), None);
+        let stable = super::channel_set_rejection("stable", None)
+            .expect("HerdrUp publishes no stable channel to switch to");
+        assert!(
+            stable.contains(crate::update::FORK_INSTALL_COMMAND),
+            "stable refusal does not name the fork installer: {stable}"
+        );
     }
 
     #[test]

@@ -72,6 +72,8 @@ herdr          # the interactive TUI
 
 Now run `herdr pair` and scan the code from the Herdrup app. Building from source remains a developer path and requires the repository's pinned Rust and Zig toolchains.
 
+To update later, run the installer again, or `herdr channel set preview` once and then `herdr update`. Herdrup publishes only preview builds, so the stable channel refuses to update instead of installing upstream Herdr over the fork.
+
 ## docs
 
 everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
