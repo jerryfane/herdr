@@ -43,7 +43,7 @@ const WINDOWS_REMOTE_INSTALL_RESULT_MARKER: &str = "herdr-remote-install-result:
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 /// Apply non-interactive authentication, bounded connect, and keepalive options
 /// to a saved-machine SSH command.
-fn apply_noninteractive_ssh_options(command: &mut Command) {
+pub(super) fn apply_noninteractive_ssh_options(command: &mut Command) {
     command
         .arg("-o")
         .arg("BatchMode=yes")

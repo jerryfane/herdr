@@ -171,6 +171,68 @@ fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
         .as_ref()
 }
 
+/// Establish an authenticated SSH streamlocal reverse forward, never a forward
+/// to the unrestricted Herdr API. A readiness marker is emitted by the remote
+/// command only after OpenSSH has accepted all requested forwards.
+#[cfg(unix)]
+pub(crate) fn spawn_saved_reverse_forward(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    remote_socket: &std::path::Path,
+    gateway_socket: &std::path::Path,
+) -> io::Result<std::process::Child> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    validate_profile_path_id(profile_id)?;
+    crate::session::validate_name(session)
+        .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause))?;
+    if target.is_empty() || target.starts_with('-') || target.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid saved SSH target",
+        ));
+    }
+    let options = saved_federation_ssh_options().ok_or_else(|| {
+        io::Error::other("managed SSH configuration unavailable; reverse forwarding refused")
+    })?;
+    let mut command = Command::new("ssh");
+    super::attach::apply_managed_ssh_options(&mut command, Some(options));
+    super::attach::apply_noninteractive_ssh_options(&mut command);
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            gateway_socket.display()
+        ))
+        .arg(target)
+        .arg("printf 'herdr-reverse-ready\\n'; exec sleep 2147483647")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let mut line = String::new();
+    let ready = child.stdout.take().is_some_and(|stdout| {
+        BufReader::new(stdout).read_line(&mut line).is_ok() && line == "herdr-reverse-ready\n"
+    });
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(
+            "SSH reverse streamlocal forwarding rejected; check host-key trust, AllowStreamLocalForwarding and remote socket permissions",
+        ));
+    }
+    Ok(child)
+}
+
 pub(crate) fn saved_ssh_bootstrap_command(target: &str, session: &str) -> String {
     format!(
         "herdr --remote {} --session {}",

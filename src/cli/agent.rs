@@ -19,6 +19,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "list" => agent_list(&args[1..]),
+        "federated-list" => federated_agent_command(&args[1..], false),
+        "federated-prompt" => federated_agent_command(&args[1..], true),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
@@ -477,6 +479,57 @@ fn agent_list(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:list".into(),
         method: Method::AgentList(AgentListParams::default()),
     })?)
+}
+
+/// Explicit trusted-machine reverse request. The pane id is supplied by the
+/// caller, not OS-attested; a malicious same-user process can spoof it.
+fn federated_agent_command(args: &[String], prompt: bool) -> std::io::Result<i32> {
+    let coordinator = crate::config::Config::load()
+        .config
+        .federation
+        .reverse_coordinator_machine_id;
+    let Some(coordinator) = coordinator else {
+        eprintln!("reverse federation disabled: set federation.reverse_coordinator_machine_id to the trusted coordinator's pinned install id");
+        return Ok(1);
+    };
+    let mut caller = std::env::var("HERDR_PANE_ID").ok();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--caller-pane" {
+            let Some(value) = args.get(index + 1) else {
+                eprintln!("--caller-pane requires the live local agent terminal id");
+                return Ok(2);
+            };
+            caller = Some(value.clone());
+            index += 2;
+        } else {
+            positional.push(args[index].as_str());
+            index += 1;
+        }
+    }
+    let Some(caller) = caller.filter(|caller| !caller.is_empty()) else {
+        eprintln!("HERDR_PANE_ID (or --caller-pane) is required; same-user processes can spoof opted-in pane identities");
+        return Ok(2);
+    };
+    let method = match (prompt, positional.as_slice()) {
+        (false, []) => crate::api::reverse_agents::ReverseMethod::AgentList,
+        (true, [target, text]) => crate::api::reverse_agents::ReverseMethod::AgentPrompt {
+            target: (*target).to_owned(),
+            text: (*text).to_owned(),
+        },
+        _ => {
+            eprintln!("usage: herdr agent federated-list [--caller-pane ID]\n       herdr agent federated-prompt <machine-qualified-target> <text> [--caller-pane ID]");
+            return Ok(2);
+        }
+    };
+    match crate::api::reverse_agents::request_remote(&coordinator, caller, method) {
+        Ok(response) => super::print_response(&response),
+        Err(error) => {
+            eprintln!("reverse federation failed: {error}");
+            Ok(1)
+        }
+    }
 }
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
@@ -1405,6 +1458,13 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
 fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
+    eprintln!("  herdr agent federated-list [--caller-pane ID] (trusted-machine grant; HERDR_PANE_ID by default)");
+    eprintln!(
+        "  herdr agent federated-prompt <machine-qualified-target> <text> [--caller-pane ID]"
+    );
+    eprintln!(
+        "  Reverse grants do not isolate same-user processes: they can spoof an opted-in pane ID."
+    );
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");

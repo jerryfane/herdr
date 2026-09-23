@@ -25,8 +25,8 @@ pub use self::{
         auth_env_vars_to_clear, default_config_dir, env_var_for_kind, is_default_config_dir,
         kind_for_config_env_var, validated_sidebar_bounds, AccountConfig, AccountLaunchEnv,
         AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport, ConfigReloadStatus,
-        FederationConfig, FederationPeer, FederationSavedMachinePolicy, HostCursorModeConfig,
-        NewTerminalCwdConfig, PaneBordersConfig, PushConfig, ShellModeConfig,
+        FederationAgentGrant, FederationConfig, FederationPeer, FederationSavedMachinePolicy,
+        HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig, PushConfig, ShellModeConfig,
         SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
@@ -42,7 +42,7 @@ pub use self::{
 };
 
 pub(crate) use self::keybinds::parse_key_combo;
-pub(crate) use self::write::{update_file_at, write_edit, ConfigEdit};
+pub(crate) use self::write::{update_file_at, update_file_at_checked, write_edit, ConfigEdit};
 pub(crate) use self::{
     io::upsert_top_level_bool,
     model::omp_sessions_dir,

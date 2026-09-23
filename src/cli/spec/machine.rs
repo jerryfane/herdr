@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 use super::{json_flag, option};
 
@@ -39,6 +39,19 @@ pub(super) fn command() -> Command {
                     .required(true)
                     .help("Set the machine label shown in the sidebar"),
             ),
+        )
+        .subcommand(
+            profile_command("grant", "Grant a selected live remote agent reverse observe/interact on a trusted machine")
+                .arg(Arg::new("agent-terminal-id").value_name("MACHINE/TERMINAL_ID").required(true))
+                .arg(Arg::new("observe").long("observe").action(ArgAction::SetTrue))
+                .arg(Arg::new("interact").long("interact").action(ArgAction::SetTrue))
+                .arg(option("observe-peer", "ALIAS").action(ArgAction::Append))
+                .arg(option("interact-peer", "ALIAS").action(ArgAction::Append))
+                .after_help("Requires a pinned saved federation machine and explicit reverse_coordinator_machine_id on the remote. Same-user processes can spoof the granted pane identity; this is not per-process isolation."),
+        )
+        .subcommand(
+            profile_command("revoke", "Revoke a selected remote agent's reverse access")
+                .arg(Arg::new("agent-terminal-id").value_name("MACHINE/TERMINAL_ID").required(true)),
         )
         .subcommand(profile_command("remove", "Remove a saved SSH machine"))
         .subcommand(profile_command("enable", "Enable a saved SSH machine"))
