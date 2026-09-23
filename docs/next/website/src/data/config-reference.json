@@ -1473,6 +1473,12 @@
           "description": "Address the federation TCP listener binds to when `federation.listen` is enabled, for example `0.0.0.0:7020` or `127.0.0.1:7020`. Leave unset to keep the listener off."
         },
         {
+          "key": "federation.reverse_coordinator_machine_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Pin the coordinator machine ID before this machine accepts explicitly granted reverse agent access. The remote socket is available only over saved SSH; local processes running as the same user can impersonate a pane."
+        },
+        {
           "key": "federation.saved_machines",
           "type": "table keyed by saved profile ID",
           "default": "{}",

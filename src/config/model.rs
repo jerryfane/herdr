@@ -1301,6 +1301,10 @@ pub struct FederationConfig {
     /// Remote daemons do not federate saved profiles back unless explicitly
     /// configured as coordinators themselves.
     pub coordinator: bool,
+    /// Remote-side explicit trusted-machine opt-in. The coordinator's SSH reverse
+    /// socket is accepted only when its install identity matches this pin.
+    /// Same-user processes can impersonate a granted pane; this is not process isolation.
+    pub reverse_coordinator_machine_id: Option<String>,
     /// Address the federation listener binds to when `listen` is enabled.
     pub listen_addr: Option<String>,
     /// Federation peers configured directly by endpoint and alias. SSH peers
@@ -1347,8 +1351,32 @@ pub struct FederationSavedMachinePolicy {
     /// Required so catalog reconciliation fails closed on a missing or changed
     /// machine identity.
     pub expected_machine_id: String,
+    /// Selected live agents allowed through the coordinator's restricted reverse
+    /// gateway. Empty by default; a saved profile alone grants no reverse access.
+    #[serde(default)]
+    pub agent_grants: Vec<FederationAgentGrant>,
 }
 
+/// A trusted-machine grant bound to the observed pane and harness session,
+/// including its mutable label so a rename/reuse fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationAgentGrant {
+    pub terminal_id: String,
+    pub session: crate::api::schema::AgentSessionInfo,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub observe: bool,
+    #[serde(default)]
+    pub interact: bool,
+    /// Other peer aliases whose agents may be observed, in addition to the
+    /// coordinator. This never delegates those peers' own federation rosters.
+    #[serde(default)]
+    pub observe_peers: Vec<String>,
+    /// Other peer aliases whose agents may receive prompts.
+    #[serde(default)]
+    pub interact_peers: Vec<String>,
+}
 fn deserialize_saved_machine_policies<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>, D::Error>
@@ -1363,6 +1391,25 @@ where
         crate::client::endpoint::ProfileId::parse(profile_id.to_string())
             .map_err(de::Error::custom)?;
         validate_expected_machine_id(&policy.expected_machine_id).map_err(de::Error::custom)?;
+        let mut granted = std::collections::HashSet::new();
+        for grant in &policy.agent_grants {
+            if grant.terminal_id.is_empty()
+                || grant.session.value.is_empty()
+                || !granted.insert(&grant.terminal_id)
+                || !grant.observe && !grant.interact
+                || grant
+                    .observe_peers
+                    .iter()
+                    .chain(&grant.interact_peers)
+                    .any(|alias| {
+                        alias.is_empty() || alias == &profile_id.to_string() || alias.contains('/')
+                    })
+            {
+                return Err(de::Error::custom(
+                    "invalid or duplicate saved federation agent grant",
+                ));
+            }
+        }
     }
     Ok(policies)
 }

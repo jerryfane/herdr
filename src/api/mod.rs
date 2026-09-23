@@ -4,6 +4,7 @@ pub(crate) mod federation;
 pub mod federation_manager;
 pub mod federation_store;
 pub(crate) mod output_registry;
+pub(crate) mod reverse_agents;
 pub mod schema;
 mod server;
 pub(crate) use server::{default_capabilities, UploadClaim};

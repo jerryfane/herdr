@@ -408,6 +408,19 @@ fn agent_command() -> Command {
     Command::new("agent")
         .about("Control and inspect agent panes")
         .subcommand(Command::new("list").about("List agents"))
+        .subcommand(
+            Command::new("federated-list")
+                .about("List coordinator and permitted peer agents via an explicit trusted-machine reverse grant")
+                .arg(option("caller-pane", "ID"))
+                .after_help("Requires federation.reverse_coordinator_machine_id on this machine. Same-user processes can spoof a granted HERDR_PANE_ID; this is not per-process isolation."),
+        )
+        .subcommand(
+            Command::new("federated-prompt")
+                .about("Prompt an authorized coordinator or explicitly permitted peer agent")
+                .arg(agent_target())
+                .arg(required("text", "TEXT"))
+                .arg(option("caller-pane", "ID")),
+        )
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
             Command::new("read")

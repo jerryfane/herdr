@@ -262,6 +262,9 @@ struct PeerHandle {
     presentation: Arc<RwLock<PeerPresentation>>,
     /// Keeps the saved peer's persistent SSH bridge supervised and alive.
     _ssh_bridge: Option<SavedBridgeSupervisor>,
+    #[cfg(unix)]
+    _reverse_gateway: Option<crate::api::reverse_agents::ReverseGateway>,
+    reverse_grants: Vec<crate::config::FederationAgentGrant>,
 }
 
 #[derive(Clone, Default)]
@@ -478,7 +481,7 @@ impl FederationPeerManager {
             source.profiles = profiles;
         }
         let desired = compose_desired(&source);
-        self.reconcile(&desired);
+        self.reconcile_with_grants(&desired, &source.policies);
     }
 
     fn refresh_saved_profiles(&self) {
@@ -506,7 +509,12 @@ impl FederationPeerManager {
         }
         source.profiles = profiles;
         let desired = compose_desired(&source);
-        self.reconcile(&desired);
+        self.reconcile_with_grants(&desired, &source.policies);
+    }
+
+    #[cfg(test)]
+    pub fn reconcile(&self, desired: &[FederationPeer]) {
+        self.reconcile_with_grants(desired, &BTreeMap::new());
     }
 
     /// Reconcile the running outbound peer set against `desired`.
@@ -523,7 +531,11 @@ impl FederationPeerManager {
     ///    poll thread.
     /// 5. Rebuild and swap the proxy registry from the same live routes used by
     ///    pollers.
-    pub fn reconcile(&self, desired: &[FederationPeer]) {
+    fn reconcile_with_grants(
+        &self,
+        desired: &[FederationPeer],
+        policies: &BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+    ) {
         let _reconcile = self
             .reconcile_lock
             .lock()
@@ -553,11 +565,16 @@ impl FederationPeerManager {
             .iter()
             .filter(|(alias, handle)| match desired_out.get(alias.as_str()) {
                 None => true,
-                Some(peer) => spec_differs(handle, peer),
+                Some(peer) => {
+                    spec_differs(handle, peer)
+                        || handle.reverse_grants != grants_for(peer, policies)
+                }
             })
             .map(|(alias, _)| alias.clone())
             .collect();
         let mut bridge_retirements = Vec::new();
+        #[cfg(unix)]
+        let mut retired_gateways = Vec::new();
         for alias in &to_stop {
             let Some(handle) = handles.remove(alias) else {
                 continue;
@@ -573,6 +590,10 @@ impl FederationPeerManager {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 handle.stop.store(true, Ordering::Relaxed);
                 store.remove_peer(alias);
+            }
+            #[cfg(unix)]
+            if let Some(gateway) = handle._reverse_gateway {
+                retired_gateways.push(gateway);
             }
             let PeerHandle {
                 join, _ssh_bridge, ..
@@ -590,6 +611,8 @@ impl FederationPeerManager {
         // Supervisor joins run concurrently and never hold the handle registry
         // lock. Waiting here closes stable profile sockets before replacement.
         drop(handles);
+        #[cfg(unix)]
+        drop(retired_gateways);
         for join in bridge_retirements {
             let _ = join.join();
         }
@@ -618,7 +641,8 @@ impl FederationPeerManager {
                 debug!(alias = %alias, "federation peer route unchanged; presentation updated");
                 continue;
             }
-            if let Some(handle) = self.spawn_peer_poll((*peer).clone()) {
+            if let Some(handle) = self.spawn_peer_poll((*peer).clone(), grants_for(peer, policies))
+            {
                 handles.insert((*alias).to_string(), handle);
                 info!(alias = %alias, "federation peer spawned (reconcile)");
             }
@@ -640,7 +664,11 @@ impl FederationPeerManager {
     /// Resolve one outbound route and spawn its poll thread. SSH peers use the
     /// upstream saved-machine `remote-api-bridge`; the manager owns that bridge
     /// and shares its local socket with polling and proxying.
-    fn spawn_peer_poll(&self, peer: FederationPeer) -> Option<PeerHandle> {
+    fn spawn_peer_poll(
+        &self,
+        peer: FederationPeer,
+        reverse_grants: Vec<crate::config::FederationAgentGrant>,
+    ) -> Option<PeerHandle> {
         let endpoint = peer.endpoint.as_deref()?;
         let token = endpoint
             .starts_with("tcp://")
@@ -693,6 +721,34 @@ impl FederationPeerManager {
             peer.expected_node_id.is_some(),
         );
         let endpoint = peer.endpoint.clone().unwrap_or_default();
+        #[cfg(unix)]
+        let reverse_gateway = if reverse_grants.is_empty() {
+            None
+        } else {
+            match (
+                peer.profile_id.as_deref(),
+                peer.remote_session.as_deref(),
+                peer.expected_node_id.as_deref(),
+            ) {
+                (Some(profile), Some(_session), Some(machine)) => {
+                    let target = endpoint.strip_prefix("ssh://").unwrap_or_default();
+                    match crate::api::reverse_agents::ReverseGateway::start(
+                        profile,
+                        target,
+                        machine,
+                        route.clone(),
+                        reverse_grants.clone(),
+                    ) {
+                        Ok(gateway) => Some(gateway),
+                        Err(error) => {
+                            tracing::warn!(alias = %peer.alias, %error, "restricted reverse gateway did not start");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
         let profile_id = peer.profile_id.clone();
@@ -724,6 +780,9 @@ impl FederationPeerManager {
             remote_session,
             route,
             presentation,
+            #[cfg(unix)]
+            _reverse_gateway: reverse_gateway,
+            reverse_grants,
             _ssh_bridge: ssh_bridge,
         })
     }
@@ -929,6 +988,18 @@ fn compose_desired(source: &CoordinatorSource) -> Vec<FederationPeer> {
 
 /// Whether a running peer's connection or trust spec differs from the desired
 /// config, so its thread must be retired and respawned.
+fn grants_for(
+    peer: &FederationPeer,
+    policies: &BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+) -> Vec<crate::config::FederationAgentGrant> {
+    peer.profile_id
+        .as_deref()
+        .and_then(|id| crate::client::endpoint::ProfileId::parse(id.to_owned()).ok())
+        .and_then(|id| policies.get(&id))
+        .map(|policy| policy.agent_grants.clone())
+        .unwrap_or_default()
+}
+
 fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
     let token = peer
         .endpoint
@@ -1195,6 +1266,7 @@ mod tests {
                 profile_id.clone(),
                 FederationSavedMachinePolicy {
                     expected_machine_id: "machine_build".into(),
+                    agent_grants: Vec::new(),
                 },
             )]),
             profiles: vec![profile.clone()],
@@ -1241,6 +1313,7 @@ mod tests {
                 profile.id.clone(),
                 FederationSavedMachinePolicy {
                     expected_machine_id: "machine_build".into(),
+                    agent_grants: Vec::new(),
                 },
             )]),
             profiles: vec![profile.clone()],
@@ -1289,6 +1362,7 @@ mod tests {
                 profile_id,
                 FederationSavedMachinePolicy {
                     expected_machine_id: "machine_build".into(),
+                    agent_grants: Vec::new(),
                 },
             )]),
             profiles: vec![profile.clone()],
@@ -1414,6 +1488,7 @@ mod tests {
                 profile.id.clone(),
                 FederationSavedMachinePolicy {
                     expected_machine_id: "machine_build".into(),
+                    agent_grants: Vec::new(),
                 },
             )]),
             profiles: vec![profile.clone()],
