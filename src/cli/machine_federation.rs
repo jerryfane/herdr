@@ -432,19 +432,25 @@ pub(super) fn federate(args: &[String]) -> io::Result<i32> {
     }
     let aliases: Vec<_> = peers.iter().map(|peer| peer.alias.clone()).collect();
     let updated = edit_policy(&original_config, &pins, None, &aliases).map_err(io::Error::other)?;
+    if EndpointCatalog::load_profiles().map_err(io::Error::other)? != original_catalog.ssh {
+        return Err(io::Error::other(
+            "saved machine profiles changed while checking remote identities; retry federation command",
+        ));
+    }
     let catalog_changed = catalog.ssh != original_catalog.ssh;
     if catalog_changed {
         catalog.store_profiles().map_err(io::Error::other)?;
     }
     if updated != original_config {
-        if let Err(error) = store_if_unchanged(&original_config, &updated) {
-            if catalog_changed {
-                original_catalog.store_profiles().map_err(|rollback| {
-                    io::Error::other(format!("{error}; catalog rollback failed: {rollback}"))
-                })?;
-            }
-            return Err(io::Error::other(error));
-        }
+        store_if_unchanged(&original_config, &updated).map_err(|error| {
+            // A saved profile without a federation policy is untrusted. Rewriting
+            // the old catalog here could erase another process's profile edits.
+            io::Error::other(if catalog_changed {
+                format!("{error}; saved profile remains untrusted")
+            } else {
+                error
+            })
+        })?;
     }
     println!("Federated {} machine(s), including {selector}.", pins.len());
     if updated == original_config {
