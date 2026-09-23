@@ -1792,13 +1792,19 @@ mod tests {
 
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
-        crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
-            Some(&crate::product_announcements::ManifestAnnouncement {
-                id: "startup-announcement".into(),
-                title: Some("Startup announcement".into()),
-                body: "### Announcement\n- One".into(),
-            }),
+        let announcements = crate::product_announcements::store_path();
+        std::fs::create_dir_all(announcements.parent().unwrap()).unwrap();
+        std::fs::write(
+            &announcements,
+            serde_json::json!({
+                "latest": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "id": "startup-announcement",
+                    "title": "Startup announcement",
+                    "body": "### Announcement\n- One",
+                },
+            })
+            .to_string(),
         )
         .unwrap();
 

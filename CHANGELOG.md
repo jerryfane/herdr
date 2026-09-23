@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- HerdrUp updates use only this fork's preview releases. The stable channel refuses with installer guidance because this fork has no stable release stream; remote setup and package-manager guidance no longer offer upstream binaries as fork updates. (#208)
+
 
 ## [0.9.1] - 2026-09-16
 

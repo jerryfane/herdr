@@ -192,18 +192,18 @@ fi
         for source_tool in ("cargo", "git", "rustc", "rustup", "zig"):
             self.assertIsNone(shutil.which(source_tool, path=str(self.fake_bin)))
 
-    def test_installer_and_preview_updaters_share_the_fork_manifest(self) -> None:
-        manifest_url = (
+    def test_default_manifest_url_installs_from_fork_preview(self) -> None:
+        # Exercise the default, not HERDR_MANIFEST_URL: an upstream sync once
+        # replaced the committed preview manifest and broke real installs.
+        fork_manifest = (
             "https://raw.githubusercontent.com/jerryfane/herdr/master/"
             "distribution/preview.json"
         )
-        installer = INSTALLER.read_text(encoding="utf-8")
-        updater = (REPO_ROOT / "src" / "update.rs").read_text(encoding="utf-8")
-        remote = (REPO_ROOT / "src" / "remote" / "attach.rs").read_text(encoding="utf-8")
+        result = self._run(HERDR_MANIFEST_URL="", FAKE_MANIFEST_URL=fork_manifest)
 
-        self.assertIn(f'DEFAULT_MANIFEST_URL="{manifest_url}"', installer)
-        self.assertIn(manifest_url, updater)
-        self.assertIn(manifest_url, remote)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._installed_binary().read_bytes(), self.binary_content)
+        self.assertIn(f"curl:{fork_manifest}", self._command_log())
 
     def test_committed_manifest_serves_assets_the_installer_accepts(self) -> None:
         # An upstream sync overwrote distribution/preview.json with herdrdev's
