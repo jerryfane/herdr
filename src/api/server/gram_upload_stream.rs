@@ -910,6 +910,7 @@ mod tests {
                     upload_id: upload_id.to_string(),
                     name: "half.bin".into(),
                     mime: "application/octet-stream".into(),
+                    sha256: None,
                 }),
             }),
         };

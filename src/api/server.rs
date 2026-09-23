@@ -215,6 +215,8 @@ fn start_server_inner(
     // add/remove/change peers live.
     let federation_manager =
         FederationPeerManager::new(Arc::clone(&federation_store), Arc::clone(&running));
+    #[cfg(unix)]
+    federation_manager.set_gram_api_sender(api_tx.clone());
     federation_manager.reconcile_config(federation);
 
     let listener_running = Arc::clone(&running);
@@ -1098,6 +1100,16 @@ fn handle_connection_with_stop(
     }
 
     crate::logging::api_request_started(&request_id, method, changes_ui);
+    // Remote Gram is opt-in on the remote daemon too. Its local clients keep
+    // using the ordinary Gram API, but requests go to the coordinator's
+    // restricted reverse SSH socket instead of a second local store. The
+    // gateway stamps the pinned machine alias; TCP federation never enters here.
+    #[cfg(unix)]
+    if federation.is_none() {
+        if let Some(response) = crate::api::reverse::forward_local(&request) {
+            return write_text_line_allow_disconnect(&mut stream, &response);
+        }
+    }
 
     // Federation outbound router (W4). BEFORE the local dispatch match — so it
     // covers both the early-match methods (e.g. `agent.prompt`) and the catch-all
@@ -1789,6 +1801,14 @@ fn emit_line_to_client(stream: &mut ApiStream, line: &str) -> std::io::Result<bo
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn handle_reverse_gram(request: Request, tx: &ApiRequestSender) -> String {
+    // Only api::reverse creates this envelope, after accepting its five-method
+    // whitelist on the per-peer SSH gateway. The regular TCP policy still denies
+    // gram.* and the local API remains local.
+    handle_request(request, tx, None, None, None)
+}
+
 fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
@@ -1865,6 +1885,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::GramDelete(_) => "gram.delete",
         Method::GramUploadChunk(_) => "gram.upload_chunk",
         Method::GramGetFile(_) => "gram.get_file",
+        Method::GramGetFileChunk(_) => "gram.get_file_chunk",
+        Method::GramRelay(_) => "gram.relay",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
@@ -3583,6 +3605,8 @@ mod federation_tests {
             ("gram.delete", Denied),
             ("gram.upload_chunk", Denied),
             ("gram.get_file", Denied),
+            ("gram.get_file_chunk", Denied),
+            ("gram.relay", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
             ("client_shell.surface.set", Denied),

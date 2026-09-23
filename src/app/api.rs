@@ -1541,6 +1541,24 @@ impl App {
                 return self.handle_gram_upload_chunk(request.id, params);
             }
             Method::GramGetFile(params) => return self.handle_gram_get_file(request.id, params),
+            Method::GramGetFileChunk(params) => {
+                return self.handle_gram_get_file_chunk(request.id, params);
+            }
+            Method::GramRelay(params) => {
+                #[cfg(unix)]
+                {
+                    return self.handle_gram_relay(request.id, params);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = params;
+                    return responses::encode_error(
+                        request.id,
+                        "unsupported_platform",
+                        "Gram reverse SSH requires Unix sockets",
+                    );
+                }
+            }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
                     request.id,

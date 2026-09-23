@@ -158,6 +158,74 @@ impl SavedSshApiBridge {
     }
 }
 
+/// Dedicated reverse stream-local forward; NEVER point this at the unrestricted
+/// coordinator API socket. The caller provides its restricted per-peer gateway.
+pub(crate) fn reverse_forward_command(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    remote_socket: &std::path::Path,
+    local_gateway: &std::path::Path,
+) -> io::Result<std::process::Command> {
+    let _ = validated_saved_ssh(profile_id, target, session)?;
+    // sshd leaves a stream-local -R socket pathname behind after the forwarding
+    // session exits. StreamLocalBindUnlink is client-side and does not remove
+    // that remote pathname on ordinary sshd installations. Clear only the
+    // socket reserved for this pinned machine pair before every (re)bind.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote Gram reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
+    let mut command = std::process::Command::new("ssh");
+    // A persistent multiplexing master exits successfully after forking, which
+    // makes the gateway treat a live -R forward as a failed startup and remove
+    // its local listener. Keep this dedicated forward in the foreground.
+    command.arg("-C").arg("-S").arg("none");
+    if let Some(options) = saved_federation_ssh_options() {
+        command.arg("-F").arg(&options.config_path);
+    }
+    command
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-N")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            local_gateway.display()
+        ))
+        .arg("--")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
 fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
     static OPTIONS: OnceLock<Option<ManagedSshOptions>> = OnceLock::new();
     OPTIONS

@@ -101,6 +101,11 @@ pub enum Method {
     GramUploadChunk(GramUploadChunkParams),
     #[serde(rename = "gram.get_file")]
     GramGetFile(GramGetFileParams),
+    #[serde(rename = "gram.get_file_chunk")]
+    GramGetFileChunk(GramGetFileChunkParams),
+    /// Internal only: the restricted reverse SSH gateway inserts the machine alias.
+    #[serde(rename = "gram.relay")]
+    GramRelay(GramRelayParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]

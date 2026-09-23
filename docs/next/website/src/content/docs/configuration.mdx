@@ -202,6 +202,18 @@ This is **not per-process security**. Herdr's local Unix API trusts a caller-sup
 A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path, which runs a discovered remote Herdr executable's `remote-api-bridge` against the named session's local socket and therefore grants full, unfiltered control-plane access. OpenSSH owns authentication, host-key checks, and interactive-auth failure. The local unix socket itself is never token-checked or tier-filtered.
 :::
 
+### Gram files across trusted machines
+
+Gram remains in the coordinator's canonical store. A saved, identity-pinned SSH peer can use a separate, default-off reverse Unix socket for remote `gram send --file`, list, file download, and delete. The owner posts to a remote agent by its machine-qualified name (`herdr gram post "message" --to <profile-id>/<agent>`). This does **not** add `gram.*` to the ordinary TCP federation allowlist or forward the coordinator's unrestricted local API.
+
+Set `HERDR_GRAM_RELAY_PEERS=<profile-id>` in the **coordinator daemon's** environment before starting it (comma-separate explicitly trusted profile IDs). Read the coordinator's install ID from its `machine.json` under the Herdr config directory. On the **remote daemon**, set `HERDR_GRAM_REVERSE_SOCKET` to the output of `herdr gram relay-path <coordinator-install-id>` before starting it. Both sides need the updated binary; the coordinator's saved SSH profile must already pin the remote install ID. OpenSSH must permit reverse stream-local forwarding. No private SSH key is copied to the remote machine.
+
+The reverse socket is private to the remote account and reconnects with the saved SSH session. While disconnected, remote Gram operations fail instead of silently writing to a second local store. Coordinator-only methods such as `gram post` and `gram grab` also fail explicitly on the remote; run those on the coordinator. Files are staged with the existing size limits, then committed to the coordinator only after their length and SHA-256 match; downloads verify both before atomically replacing the destination. The default credential-shaped download warning scans every chunk; `--reveal` is an explicit override. A deleted source attachment cannot be downloaded, and an interrupted upload leaves only bounded staging that is swept after its expiry.
+
+:::caution[Trusted-machine boundary]
+Another process running as the same user on an enabled remote machine can claim a recipient pane ID and read that pane's Gram files. These controls keep other machines and ordinary wrong-recipient calls out; they are **not** per-process isolation. Enable only machines whose user account you trust.
+:::
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

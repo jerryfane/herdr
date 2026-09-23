@@ -395,6 +395,16 @@ pub enum ResponseResult {
         size: u64,
         data_base64: String,
     },
+    /// One bounded range of an attachment. `sha256` and `size` describe the
+    /// complete committed file, so a downloader can reject truncation/corruption.
+    GramFileChunk {
+        name: String,
+        mime: String,
+        size: u64,
+        sha256: String,
+        offset: u64,
+        data_base64: String,
+    },
     /// `server.staged_update` — the running daemon version/protocol/commit, plus the staged (built
     /// but not-yet-running) build if one is available. `staged` present with a `sha` different from
     /// `running_sha` means an update is ready to apply. `running_sha` is the running binary's short
