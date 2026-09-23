@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::{value, DocumentMut, Item, Table, Value};
 
 use crate::api::client::{parse_response_value, ApiClient, ConnectionTarget};
 use crate::api::schema::{AgentListParams, EmptyParams, Method, Request, ResponseResult};
@@ -19,9 +19,9 @@ struct LegacyPeer {
 }
 
 fn read_config() -> Result<String, String> {
-    match std::fs::read_to_string(crate::config::config_path()) {
-        Ok(content) => Ok(content),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+    match crate::config::read_optional_config(&crate::config::config_path()) {
+        Ok(Some(content)) => Ok(content),
+        Ok(None) => Ok(String::new()),
         Err(error) => Err(format!("failed to read config: {error}")),
     }
 }
@@ -240,18 +240,23 @@ fn edit_policy(
         }
     }
     if let Some(id) = remove {
-        if let Some(policies) = doc["federation"]
+        let federation = doc["federation"]
             .as_table_mut()
-            .unwrap()
-            .get_mut("saved_machines")
-            .and_then(Item::as_table_mut)
-        {
-            policies.remove(id.as_str());
-            if policies.is_empty() {
-                doc["federation"]
-                    .as_table_mut()
-                    .unwrap()
-                    .remove("saved_machines");
+            .ok_or("federation config must be a table")?;
+        if let Some(item) = federation.get_mut("saved_machines") {
+            let empty = match item {
+                Item::Table(policies) => {
+                    policies.remove(id.as_str());
+                    policies.is_empty()
+                }
+                Item::Value(Value::InlineTable(policies)) => {
+                    policies.remove(id.as_str());
+                    policies.is_empty()
+                }
+                _ => return Err("federation.saved_machines must be a table".into()),
+            };
+            if empty {
+                federation.remove("saved_machines");
             }
         }
     }
@@ -624,6 +629,30 @@ endpoint = "ssh://jerry@second"
         let unfederated = edit_policy(&federated, &[], Some(&id), &[]).unwrap();
         let config: toml::Value = unfederated.parse().unwrap();
         assert!(config["federation"].get("saved_machines").is_none());
+    }
+
+    #[test]
+    fn unfederate_removes_inline_policy_without_touching_other_machines() {
+        let id = profile_id();
+        let other = "fedcba9876543210fedcba9876543210";
+        let config = format!(
+            "[federation]\ncoordinator = true\nsaved_machines = {{ \"{}\" = {{ expected_machine_id = \"machine_one\" }}, \"{other}\" = {{ expected_machine_id = \"machine_two\" }} }}\n",
+            id.as_str()
+        );
+        let updated = edit_policy(&config, &[], Some(&id), &[]).unwrap();
+        let parsed: toml::Value = updated.parse().unwrap();
+        assert!(parsed["federation"]["saved_machines"]
+            .get(id.as_str())
+            .is_none());
+        assert_eq!(
+            parsed["federation"]["saved_machines"][other]["expected_machine_id"].as_str(),
+            Some("machine_two")
+        );
+        assert_eq!(parsed["federation"]["coordinator"].as_bool(), Some(true));
+        let other = ProfileId::parse(other.to_owned()).unwrap();
+        let cleared = edit_policy(&updated, &[], Some(&other), &[]).unwrap();
+        let parsed: toml::Value = cleared.parse().unwrap();
+        assert!(parsed["federation"].get("saved_machines").is_none());
     }
 
     #[test]

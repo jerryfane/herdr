@@ -122,7 +122,7 @@ fn normalize_utf8_bom(content: &str) -> String {
     normalized
 }
 
-pub(super) fn read_optional_config(path: &Path) -> std::io::Result<Option<String>> {
+pub(crate) fn read_optional_config(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(Some(normalize_utf8_bom(&content))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
