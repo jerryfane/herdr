@@ -192,6 +192,19 @@ fi
         for source_tool in ("cargo", "git", "rustc", "rustup", "zig"):
             self.assertIsNone(shutil.which(source_tool, path=str(self.fake_bin)))
 
+    def test_default_manifest_url_installs_from_fork_preview(self) -> None:
+        # Exercise the default, not HERDR_MANIFEST_URL: an upstream sync once
+        # replaced the committed preview manifest and broke real installs.
+        fork_manifest = (
+            "https://raw.githubusercontent.com/jerryfane/herdr/master/"
+            "distribution/preview.json"
+        )
+        result = self._run(HERDR_MANIFEST_URL="", FAKE_MANIFEST_URL=fork_manifest)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._installed_binary().read_bytes(), self.binary_content)
+        self.assertIn(f"curl:{fork_manifest}", self._command_log())
+
     def test_committed_manifest_serves_assets_the_installer_accepts(self) -> None:
         # An upstream sync overwrote distribution/preview.json with herdrdev's
         # copy on 2026-09-16: the file stayed valid JSON and its URLs stayed
