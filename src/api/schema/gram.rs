@@ -44,6 +44,9 @@ pub struct GramFileUpload {
     pub name: String,
     #[serde(default)]
     pub mime: String,
+    /// Expected digest of the source bytes. Required by the cross-machine relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// `gram.post` — the owner posts a message to agents (from the app).
@@ -183,18 +186,43 @@ pub struct GramUploadStreamParams {
     pub upload_id: String,
 }
 
-/// `gram.get_file` — download the file attached to a message. The bytes come back
-/// inline as base64 in one reply (the response path is not size-capped). The owner
-/// (no `caller_pane_id`) may download any file; an agent supplies its
-/// `caller_pane_id` and may download only a file on a message it can see (the same
-/// audience as `gram.list`).
+/// `gram.get_file` — legacy one-response download on the local socket. The
+/// bytes are inline base64 and can be as large as 100 MiB. For a remote relay,
+/// and for bounded new clients, use `gram.get_file_chunk` instead. Owner (no
+/// caller pane) may download any file; an agent may only download one it can see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramGetFileParams {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pane_id: Option<String>,
 }
+/// Bounded file read. A response contains at most 512 KiB of decoded bytes.
+/// `offset == size` returns an empty chunk; a deleted file returns `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramGetFileChunkParams {
+    pub id: String,
+    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
 
+/// Internal gateway envelope. The reverse SSH gateway overwrites `peer_alias`
+/// from its pinned saved-machine route; it must never trust the wire value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayParams {
+    pub peer_alias: String,
+    pub call: GramRelayCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
+pub enum GramRelayCall {
+    Send(GramSendParams),
+    List(GramListParams),
+    UploadChunk(GramUploadChunkParams),
+    GetFileChunk(GramGetFileChunkParams),
+    Delete(GramDeleteParams),
+}
 /// File attached to a gram message, as returned to clients. Metadata only — fetch
 /// the bytes with `gram.get_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

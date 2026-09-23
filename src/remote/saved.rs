@@ -158,6 +158,44 @@ impl SavedSshApiBridge {
     }
 }
 
+/// Dedicated reverse stream-local forward; NEVER point this at the unrestricted
+/// coordinator API socket. The caller provides its restricted per-peer gateway.
+pub(crate) fn reverse_forward_command(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    remote_socket: &std::path::Path,
+    local_gateway: &std::path::Path,
+) -> io::Result<std::process::Command> {
+    let _ = validated_saved_ssh(profile_id, target, session)?;
+    let mut command = std::process::Command::new("ssh");
+    super::attach::apply_managed_ssh_options(&mut command, saved_federation_ssh_options());
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-N")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            local_gateway.display()
+        ))
+        .arg("--")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
 fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
     static OPTIONS: OnceLock<Option<ManagedSshOptions>> = OnceLock::new();
     OPTIONS

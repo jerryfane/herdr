@@ -166,6 +166,25 @@ fn append_chunk_in(dir: &Path, upload_id: &str, offset: u64, bytes: &[u8]) -> io
         Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
         Err(err) => return Err(err),
     };
+    // A lost ACK may cause a caller to resend a chunk after it was committed.
+    // Accept only an exact byte-for-byte replay; never append duplicate bytes.
+    if current >= offset.saturating_add(bytes.len() as u64) && !bytes.is_empty() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut previous = fs::File::open(&path)?;
+        previous.seek(SeekFrom::Start(offset))?;
+        let mut matches = true;
+        let mut scratch = [0u8; 8192];
+        for expected in bytes.chunks(scratch.len()) {
+            previous.read_exact(&mut scratch[..expected.len()])?;
+            if &scratch[..expected.len()] != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Ok(());
+        }
+    }
     if offset != 0 && offset != current {
         return Err(invalid(
             "upload chunk offset does not match the staged size; resend from offset 0",
@@ -266,6 +285,41 @@ fn finalize_in(
     })
 }
 
+/// Read a bounded range without allocating the whole attachment. Metadata and
+/// the persisted digest are checked by the caller against the committed record.
+pub fn read_message_file_chunk(
+    message_id: &str,
+    name: &str,
+    offset: u64,
+    size: u64,
+) -> io::Result<Vec<u8>> {
+    read_message_file_chunk_in(&config_base(), message_id, name, offset, size)
+}
+
+fn read_message_file_chunk_in(
+    dir: &Path,
+    message_id: &str,
+    name: &str,
+    offset: u64,
+    size: u64,
+) -> io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if size > MAX_CHUNK_BYTES as u64 {
+        return Err(invalid("file chunk exceeds 512 KiB"));
+    }
+    let directory = message_dir_in(dir, message_id).ok_or_else(|| invalid("invalid message id"))?;
+    let path = directory.join(safe_file_name(name));
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if offset > length {
+        return Err(invalid("file offset exceeds size"));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; size.min(length - offset) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read an assembled attachment's bytes for download. The reply path is not
 /// size-capped, so the whole file is returned in one response.
 pub fn read_message_file(message_id: &str, name: &str) -> io::Result<Vec<u8>> {
@@ -333,6 +387,13 @@ fn staging_total_bytes(dir: &Path) -> u64 {
         .filter_map(|entry| entry.metadata().ok())
         .map(|metadata| metadata.len())
         .sum()
+}
+
+/// Reclaim interrupted uploads even when no further upload arrives. The Gram
+/// reverse gateway runs this at startup and hourly; successful sends consume
+/// their staging file immediately.
+pub fn sweep_stale_uploads() {
+    cleanup_stale(&staging_dir_in(&config_base()));
 }
 
 fn cleanup_stale(dir: &Path) {
@@ -439,6 +500,50 @@ mod tests {
         assert!(staging_path_in(&dir, upload)
             .map(|p| !p.exists())
             .unwrap_or(false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_upload_replay_preserves_bytes_and_delete_removes_committed_file() {
+        use sha2::{Digest as _, Sha256};
+        let dir = unique_temp_dir("relay-replay");
+        let first = vec![0x9d; MAX_CHUNK_BYTES];
+        let second = b"tail after reconnect";
+        append_chunk_in(&dir, "remote-upload", 0, &first).unwrap();
+        // A lost acknowledgement does not duplicate an already persisted range.
+        append_chunk_in(&dir, "remote-upload", 0, &first).unwrap();
+        append_chunk_in(&dir, "remote-upload", first.len() as u64, second).unwrap();
+        append_chunk_in(&dir, "remote-upload", first.len() as u64, second).unwrap();
+        assert!(append_chunk_in(&dir, "remote-upload", first.len() as u64, b"tampered").is_err());
+        let finalized = finalize_in(&dir, "remote-message", "remote-upload", "bytes.bin").unwrap();
+        let mut actual = read_message_file_chunk_in(
+            &dir,
+            "remote-message",
+            "bytes.bin",
+            0,
+            MAX_CHUNK_BYTES as u64,
+        )
+        .unwrap();
+        actual.extend(
+            read_message_file_chunk_in(
+                &dir,
+                "remote-message",
+                "bytes.bin",
+                first.len() as u64,
+                MAX_CHUNK_BYTES as u64,
+            )
+            .unwrap(),
+        );
+        let expected = [first, second.to_vec()].concat();
+        assert_eq!(actual, expected);
+        assert_eq!(finalized.sha256, format!("{:x}", Sha256::digest(&actual)));
+        remove_message_files_in(&dir, "remote-message");
+        assert_eq!(
+            read_message_file_chunk_in(&dir, "remote-message", "bytes.bin", 0, 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

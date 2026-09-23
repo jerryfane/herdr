@@ -38,9 +38,10 @@ use base64::Engine as _;
 
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
-    GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileParams,
-    GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo, GramPostParams,
-    GramSendParams, GramUploadChunkParams, GramUploadStreamParams, ResponseResult,
+    GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileChunkParams,
+    GramGetFileParams, GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo,
+    GramPostParams, GramRelayCall, GramRelayParams, GramSendParams, GramUploadChunkParams,
+    GramUploadStreamParams, ResponseResult,
 };
 use crate::app::App;
 use crate::persist::gram::{
@@ -76,6 +77,179 @@ enum DeleteOutcome {
 }
 
 impl App {
+    /// Resolve a peer's claimed pane only within that peer's pinned roster.
+    /// Same-user processes on the trusted peer can claim another pane ID; this
+    /// is an ordinary-caller boundary, not per-process isolation.
+    #[cfg(unix)]
+    fn relay_identity(&self, alias: &str, pane: Option<&str>) -> Option<String> {
+        let pane = pane?.trim();
+        if pane.is_empty() || pane.contains('/') {
+            return None;
+        }
+        let qualified = format!("{alias}/{pane}");
+        self.federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .merged_agents()
+            .into_iter()
+            .find(|agent| {
+                agent.pane_id == qualified
+                    && agent.reachability
+                        == Some(crate::api::federation_store::Reachability::Reachable)
+            })
+            .map(|agent| agent.name.unwrap_or(qualified))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn handle_gram_relay(&mut self, id: String, params: GramRelayParams) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        let alias = params.peer_alias;
+        if !crate::api::reverse::allowed_alias(&alias) {
+            return encode_error(id, "forbidden", "Gram relay is disabled for this peer");
+        }
+        match params.call {
+            GramRelayCall::UploadChunk(mut chunk) => {
+                chunk.upload_id = relay_upload_id(&alias, &chunk.upload_id);
+                self.handle_gram_upload_chunk(id, chunk)
+            }
+            GramRelayCall::Send(mut send) => {
+                let Some(from) = self.relay_identity(&alias, send.caller_pane_id.as_deref()) else {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "pane does not belong to this machine's live agent roster",
+                    );
+                };
+                if let Some(error) = validate_label(&id, "from", Some(&from)) {
+                    return error;
+                }
+                let text = send.text.trim();
+                if let Some(error) = validate_text(&id, text, send.file.is_some()) {
+                    return error;
+                }
+                if let Some(file) = send.file.as_mut() {
+                    if file.sha256.as_deref().is_none_or(|hash| {
+                        hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }) {
+                        return encode_error(
+                            id,
+                            "invalid_params",
+                            "remote attachment requires a source SHA-256",
+                        );
+                    }
+                    file.upload_id = relay_upload_id(&alias, &file.upload_id);
+                }
+                // A transport retry with the same request id reads the durable
+                // result rather than creating a duplicate or consuming staging
+                // twice. The CLI mints a fresh id per new send.
+                use sha2::{Digest as _, Sha256};
+                let message_id = format!("relay-{:x}", Sha256::digest(format!("{alias}\\0{id}")));
+                let store_id = crate::persist::machine::get_or_create();
+                if let Some(item) = crate::persist::gram::load()
+                    .into_iter()
+                    .find(|item| item.id == message_id)
+                {
+                    let same_file = match (&item.file, &send.file) {
+                        (Some(stored), Some(incoming)) => {
+                            stored.name
+                                == crate::persist::gram_files::safe_file_name(&incoming.name)
+                                && incoming.sha256.as_deref() == Some(stored.sha256.as_str())
+                                && stored.mime == incoming.mime
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if item.direction != StoredDirection::AgentToOwner
+                        || item.from != from
+                        || item.text != text
+                        || !same_file
+                    {
+                        return encode_error(
+                            id,
+                            "idempotency_conflict",
+                            "relay delivery id was already used for different content",
+                        );
+                    }
+                    return encode_success(
+                        id,
+                        ResponseResult::GramSent {
+                            message: gram_item_to_info(item),
+                            store_id,
+                        },
+                    );
+                }
+                let file = match attach_file(&id, &message_id, send.file) {
+                    Ok(file) => file,
+                    Err(error) => return error,
+                };
+                let item = GramItem {
+                    id: message_id,
+                    direction: StoredDirection::AgentToOwner,
+                    from: from.clone(),
+                    to: None,
+                    text: text.to_owned(),
+                    grabbed_by: None,
+                    grabbed_unix_ms: None,
+                    created_unix_ms: super::unix_millis_now(),
+                    read_by_owner: false,
+                    file,
+                    origin_id: store_id.clone(),
+                };
+                match crate::persist::gram::append(item.clone()) {
+                    Ok(_) => {
+                        self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                        encode_success(
+                            id,
+                            ResponseResult::GramSent {
+                                message: gram_item_to_info(item),
+                                store_id,
+                            },
+                        )
+                    }
+                    Err(error) => {
+                        crate::persist::gram_files::remove_message_files(&item.id);
+                        encode_error(id, "gram_store_save_failed", error.to_string())
+                    }
+                }
+            }
+            GramRelayCall::List(list) => {
+                let Some(identity) = self.relay_identity(&alias, list.caller_pane_id.as_deref())
+                else {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "pane does not belong to this machine's live agent roster",
+                    );
+                };
+                self.handle_gram_list_for(id, list, Some(&identity))
+            }
+            GramRelayCall::GetFileChunk(file) => {
+                let Some(identity) = self.relay_identity(&alias, file.caller_pane_id.as_deref())
+                else {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "pane does not belong to this machine's live agent roster",
+                    );
+                };
+                self.read_gram_file_chunk(id, &file.id, file.offset, Some(&identity))
+            }
+            GramRelayCall::Delete(delete) => {
+                let Some(identity) = self.relay_identity(&alias, delete.caller_pane_id.as_deref())
+                else {
+                    return encode_error(
+                        id,
+                        "unknown_caller",
+                        "pane does not belong to this machine's live agent roster",
+                    );
+                };
+                self.handle_gram_delete_for(id, delete.id, Some(identity))
+            }
+        }
+    }
+
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
         let text = params.text.trim();
         // A file-only message (no caption) is fine; an empty text-only message is
@@ -200,6 +374,15 @@ impl App {
     }
 
     pub(super) fn handle_gram_list(&mut self, id: String, params: GramListParams) -> String {
+        self.handle_gram_list_for(id, params, None)
+    }
+
+    fn handle_gram_list_for(
+        &mut self,
+        id: String,
+        params: GramListParams,
+        forced_identity: Option<&str>,
+    ) -> String {
         if self.no_session {
             return gram_unavailable(id);
         }
@@ -221,13 +404,13 @@ impl App {
         };
 
         let items = crate::persist::gram::load();
-        let filtered = match params.caller_pane_id.as_deref() {
+        let filtered = match (forced_identity, params.caller_pane_id.as_deref()) {
             // A supplied caller pane selects the agent view. Failing open to the
             // owner view (as an earlier version did) would silently drop
             // `only_queue` and return a state-dependent answer; mirror
             // `pane.current`'s pane_not_found instead. (Not a confidentiality
             // boundary — the owner view is reachable by omitting the pane.)
-            Some(pane) => {
+            (None, Some(pane)) => {
                 // `unread_only` is an owner-view filter with no meaning here; reject
                 // the combination rather than silently ignore it.
                 if params.unread_only {
@@ -246,8 +429,20 @@ impl App {
                 };
                 filter_agent_view(&items, &identity, params.only_queue)
             }
-            // No caller pane: the owner (app) view.
-            None => filter_owner_view(&items, params.only_queue, params.unread_only),
+            (None, None) => filter_owner_view(&items, params.only_queue, params.unread_only),
+            (Some(identity), Some(_)) => {
+                if params.unread_only {
+                    return encode_error(
+                        id,
+                        "invalid_params",
+                        "unread_only is only valid in the owner view",
+                    );
+                }
+                filter_agent_view(&items, identity, params.only_queue)
+            }
+            (Some(_), None) => {
+                return encode_error(id, "forbidden", "a remote caller must identify its pane")
+            }
         };
         // Counted over the whole filtered list, BEFORE paging: the badge and the
         // Read-all affordance describe the inbox, not the window the client happens
@@ -429,11 +624,15 @@ impl App {
             None => None,
         };
 
-        let target_id = params.id.clone();
-        // The decision (find, authorize, remove) is pure over the list so it is
-        // unit-tested without an App; the store is rewritten only when a message
-        // was actually removed, so a not-found / forbidden delete does not churn
-        // the file.
+        self.handle_gram_delete_for(id, params.id, identity)
+    }
+
+    fn handle_gram_delete_for(
+        &mut self,
+        id: String,
+        target_id: String,
+        identity: Option<String>,
+    ) -> String {
         let outcome = crate::persist::gram::update_if_changed(move |items| {
             apply_delete(items, &target_id, identity.as_deref())
         });
@@ -562,6 +761,72 @@ impl App {
             Err(err) => encode_error(id, "gram_file_error", format!("failed to read file: {err}")),
         }
     }
+    pub(super) fn handle_gram_get_file_chunk(
+        &mut self,
+        id: String,
+        params: GramGetFileChunkParams,
+    ) -> String {
+        if self.no_session {
+            return gram_unavailable(id);
+        }
+        let identity = match params.caller_pane_id.as_deref() {
+            Some(pane) => match self.caller_identity(pane) {
+                Some(identity) => Some(identity),
+                None => {
+                    return encode_error(id, "unknown_caller", "caller_pane_id is not a known pane")
+                }
+            },
+            None => None,
+        };
+        self.read_gram_file_chunk(id, &params.id, params.offset, identity.as_deref())
+    }
+
+    fn read_gram_file_chunk(
+        &self,
+        id: String,
+        message_id: &str,
+        offset: u64,
+        identity: Option<&str>,
+    ) -> String {
+        let Some(item) = crate::persist::gram::load()
+            .into_iter()
+            .find(|item| item.id == message_id)
+        else {
+            return encode_error(id, "not_found", "no gram message with that id");
+        };
+        if identity.is_some_and(|identity| !agent_can_see(&item, identity)) {
+            return encode_error(
+                id,
+                "forbidden",
+                "you can only download a file on a message you can see",
+            );
+        }
+        let Some(file) = item.file else {
+            return encode_error(id, "no_file", "that message has no attached file");
+        };
+        if offset > file.size {
+            return encode_error(id, "invalid_params", "file offset exceeds size");
+        }
+        match crate::persist::gram_files::read_message_file_chunk(
+            &item.id,
+            &file.name,
+            offset,
+            crate::persist::gram_files::MAX_CHUNK_BYTES as u64,
+        ) {
+            Ok(bytes) => encode_success(
+                id,
+                ResponseResult::GramFileChunk {
+                    name: file.name,
+                    mime: file.mime,
+                    size: file.size,
+                    sha256: file.sha256,
+                    offset,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                },
+            ),
+            Err(err) => encode_error(id, "gram_file_error", format!("failed to read file: {err}")),
+        }
+    }
 
     /// Resolve the label to record as `from` for an agent->owner message: an
     /// explicit override, else the caller pane's identity, else "agent". An
@@ -598,6 +863,33 @@ impl App {
             .terminals
             .values()
             .any(|terminal| terminal.agent_name.as_deref() == Some(name))
+            || {
+                #[cfg(unix)]
+                {
+                    name.contains('/')
+                        && self
+                            .federation
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .merged_agents()
+                            .iter()
+                            .any(|agent| {
+                                agent.name.as_deref() == Some(name)
+                                    && agent.reachability
+                                        == Some(
+                                            crate::api::federation_store::Reachability::Reachable,
+                                        )
+                                    && agent
+                                        .machine_id
+                                        .as_deref()
+                                        .is_some_and(crate::api::reverse::allowed_alias)
+                            })
+                }
+                #[cfg(not(unix))]
+                {
+                    false
+                }
+            }
     }
 
     /// Deliver one gram alert to registered devices that opted into gram push.
@@ -636,6 +928,17 @@ impl App {
             tracing::warn!(error = %err, "failed to spawn gram push sender thread; dropping message");
         }
     }
+}
+
+/// A peer cannot collide with another peer's staging upload, even by reusing
+/// the same client-chosen upload id.
+#[cfg(unix)]
+fn relay_upload_id(alias: &str, upload_id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!(
+        "relay-{:x}",
+        Sha256::digest(format!("{alias}\\0{upload_id}"))
+    )
 }
 
 /// Reject an over-long message, and an empty one unless a file is attached (a
@@ -713,12 +1016,26 @@ fn attach_file(
         ));
     };
     match crate::persist::gram_files::finalize(message_id, &upload.upload_id, &upload.name) {
-        Ok(finalized) => Ok(Some(GramFile {
-            name: finalized.name,
-            size: finalized.size,
-            mime: upload.mime,
-            sha256: finalized.sha256,
-        })),
+        Ok(finalized) => {
+            if upload
+                .sha256
+                .as_deref()
+                .is_some_and(|hash| hash != finalized.sha256.as_str())
+            {
+                crate::persist::gram_files::remove_message_files(message_id);
+                return Err(encode_error(
+                    request_id.to_string(),
+                    "hash_mismatch",
+                    "uploaded bytes do not match the source SHA-256",
+                ));
+            }
+            Ok(Some(GramFile {
+                name: finalized.name,
+                size: finalized.size,
+                mime: upload.mime,
+                sha256: finalized.sha256,
+            }))
+        }
         // A malformed upload (unknown id, empty or oversized staging, bad name) is
         // the caller's mistake; anything else is a real I/O failure.
         Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Err(encode_error(

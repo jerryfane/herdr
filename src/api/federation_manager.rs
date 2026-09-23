@@ -260,6 +260,8 @@ struct PeerHandle {
     /// Mutable label/profile presentation shared with the poll thread. Label-only
     /// changes update this cell without reconnecting the transport.
     presentation: Arc<RwLock<PeerPresentation>>,
+    #[cfg(unix)]
+    _gram_reverse: Option<crate::api::reverse::ReverseGateway>,
     /// Keeps the saved peer's persistent SSH bridge supervised and alive.
     _ssh_bridge: Option<SavedBridgeSupervisor>,
 }
@@ -287,6 +289,8 @@ pub struct FederationPeerManager {
     reaper: Mutex<Vec<JoinHandle<()>>>,
     /// Shared cache the poll threads write and `agent.list` reads.
     store: Arc<Mutex<FederationStore>>,
+    #[cfg(unix)]
+    gram_api_tx: Mutex<Option<crate::api::ApiRequestSender>>,
     /// Global daemon-running flag; poll threads also observe it for shutdown.
     running: Arc<AtomicBool>,
     /// Monotonic source for transport and remote-boot generations.
@@ -311,6 +315,8 @@ impl FederationPeerManager {
             registry: RwLock::new(Arc::new(HashMap::new())),
             reaper: Mutex::new(Vec::new()),
             store,
+            #[cfg(unix)]
+            gram_api_tx: Mutex::new(None),
             running,
             generation_clock: Arc::new(AtomicU64::new(0)),
             coordinator: Mutex::new(CoordinatorSource::default()),
@@ -324,6 +330,13 @@ impl FederationPeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
         manager
+    }
+    #[cfg(unix)]
+    pub(crate) fn set_gram_api_sender(&self, tx: crate::api::ApiRequestSender) {
+        *self
+            .gram_api_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tx);
     }
 
     /// A cheap snapshot of the outbound proxy registry for the hot per-connection
@@ -691,6 +704,46 @@ impl FederationPeerManager {
             Arc::clone(&self.generation_clock),
             peer.expected_node_id.is_some(),
         );
+        #[cfg(unix)]
+        let gram_reverse = if crate::api::reverse::allowed_alias(&peer.alias) {
+            match (
+                peer.profile_id.as_deref(),
+                peer.remote_session.as_deref(),
+                peer.expected_node_id.as_deref(),
+                peer.endpoint
+                    .as_deref()
+                    .and_then(|endpoint| endpoint.strip_prefix("ssh://")),
+                self.gram_api_tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ) {
+                (Some(profile), Some(session), Some(machine), Some(target), Some(tx)) => {
+                    match crate::api::reverse::ReverseGateway::start(
+                        profile,
+                        target,
+                        session,
+                        peer.alias.clone(),
+                        machine,
+                        route.clone(),
+                        tx,
+                        Arc::clone(&self.running),
+                    ) {
+                        Ok(gateway) => Some(gateway),
+                        Err(error) => {
+                            tracing::warn!(alias = %peer.alias, %error, "Gram reverse gateway failed closed");
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!(alias = %peer.alias, "Gram reverse gateway requires a pinned saved SSH peer and API sender");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         let token_file = peer.token_file.clone();
         let expected_node_id = peer.expected_node_id.clone();
@@ -720,6 +773,8 @@ impl FederationPeerManager {
             expected_node_id,
             token,
             profile_id,
+            #[cfg(unix)]
+            _gram_reverse: gram_reverse,
             remote_session,
             route,
             presentation,

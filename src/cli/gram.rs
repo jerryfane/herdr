@@ -3,7 +3,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 use crate::api::schema::{
-    GramDeleteParams, GramFileUpload, GramGetFileParams, GramGrabParams, GramListParams,
+    GramDeleteParams, GramFileUpload, GramGetFileChunkParams, GramGrabParams, GramListParams,
     GramMarkReadParams, GramPostParams, GramSendParams, GramUploadChunkParams, Method, Request,
 };
 
@@ -33,6 +33,18 @@ pub(super) fn run_gram_command(args: &[String]) -> std::io::Result<i32> {
         "mark-read" => gram_mark_read(&args[1..]),
         "delete" => gram_delete(&args[1..]),
         "get-file" => gram_get_file(&args[1..]),
+        #[cfg(unix)]
+        "relay-path" if args.len() == 2 => {
+            println!(
+                "{}",
+                crate::api::reverse::reverse_socket_path(
+                    &args[1],
+                    &crate::persist::machine::get_or_create(),
+                )
+                .display()
+            );
+            Ok(0)
+        }
         "help" | "--help" | "-h" => {
             print_gram_help();
             Ok(0)
@@ -70,7 +82,7 @@ fn gram_send(args: &[String]) -> std::io::Result<i32> {
     };
 
     let mut response = super::send_request(&Request {
-        id: "cli:gram:send".into(),
+        id: format!("cli:gram:send:{}", crate::persist::gram::new_id()),
         method: Method::GramSend(GramSendParams {
             text,
             caller_pane_id: env_pane_id(),
@@ -108,21 +120,22 @@ fn gram_post(args: &[String]) -> std::io::Result<i32> {
 /// server error from a rejected chunk (e.g. the file is too large); the outer
 /// error is a local I/O failure (the file could not be read).
 fn upload_file(path: &str) -> std::io::Result<Result<GramFileUpload, serde_json::Value>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.is_empty() {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut source = std::fs::File::open(path)?;
+    let size = source.metadata()?.len();
+    if size == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "file is empty",
         ));
     }
-    // The server enforces this too, but fail fast with a clear message.
-    if bytes.len() as u64 > crate::persist::gram_files::MAX_FILE_BYTES {
+    if size > crate::persist::gram_files::MAX_FILE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "file exceeds the size limit",
         ));
     }
-
     let name = std::path::Path::new(path)
         .file_name()
         .and_then(|component| component.to_str())
@@ -132,7 +145,21 @@ fn upload_file(path: &str) -> std::io::Result<Result<GramFileUpload, serde_json:
     let upload_id = crate::persist::gram::new_id();
 
     let mut offset: u64 = 0;
-    for chunk in bytes.chunks(CLI_CHUNK_BYTES) {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; CLI_CHUNK_BYTES];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if offset + count as u64 > crate::persist::gram_files::MAX_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file grew beyond the size limit",
+            ));
+        }
+        let chunk = &buffer[..count];
+        digest.update(chunk);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(chunk);
         let response = super::send_request(&Request {
             id: "cli:gram:upload_chunk".into(),
@@ -147,15 +174,23 @@ fn upload_file(path: &str) -> std::io::Result<Result<GramFileUpload, serde_json:
         }
         offset += chunk.len() as u64;
     }
-
+    if offset != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source file changed during upload",
+        ));
+    }
     Ok(Ok(GramFileUpload {
         upload_id,
         name,
         mime,
+        sha256: Some(format!("{:x}", digest.finalize())),
     }))
 }
 
 fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Write as _;
     let (id, out, reveal) = match parse_get_file_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -163,81 +198,154 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     };
-
-    let response = super::send_request(&Request {
-        id: "cli:gram:get_file".into(),
-        method: Method::GramGetFile(GramGetFileParams {
-            id,
-            caller_pane_id: env_pane_id(),
-        }),
-    })?;
-    if response.get("error").is_some() {
-        return super::print_response(&response);
-    }
-
-    let Some(data_base64) = response
-        .pointer("/result/data_base64")
-        .and_then(|value| value.as_str())
-    else {
-        eprintln!("unexpected response: {response}");
-        return Ok(1);
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_base64)
-        .map_err(|_| {
+    let mut offset = 0u64;
+    let mut size = None;
+    let mut expected_hash = String::new();
+    let mut name = String::new();
+    let mut digest = Sha256::new();
+    let mut target: Option<PrivateDownload> = None;
+    loop {
+        let response = super::send_request(&Request {
+            id: format!(
+                "cli:gram:get_file:{}:{offset}",
+                crate::persist::gram::new_id()
+            ),
+            method: Method::GramGetFileChunk(GramGetFileChunkParams {
+                id: id.clone(),
+                offset,
+                caller_pane_id: env_pane_id(),
+            }),
+        })?;
+        if response.get("error").is_some() {
+            return super::print_response(&response);
+        }
+        let result = response.get("result").ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "server returned invalid base64",
+                "missing Gram file chunk result",
             )
         })?;
-
-    let name = response
-        .pointer("/result/name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("file");
-    // Refuse a credential-shaped attachment by default. #96 redacts credential
-    // BODIES on the read path, but a file attachment has no body to scan, so a
-    // secret sent as a file would otherwise be written to disk and into this
-    // agent's transcript verbatim. `--reveal` overrides for a deliberate download.
-    // refs #109
-    if should_refuse_download(name, &bytes, reveal) {
-        eprintln!(
-            "refused: \"{name}\" ({} bytes) looks like it contains a credential. \
-             Saving it would write the secret to disk and into this transcript. \
-             Re-run with --reveal to download it anyway.",
-            bytes.len()
-        );
-        return Ok(3);
+        let chunk_size = result
+            .get("size")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing file size")
+            })?;
+        let chunk_hash = result
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing file SHA-256")
+            })?;
+        let chunk_name = result
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing filename")
+            })?;
+        if chunk_size > crate::persist::gram_files::MAX_FILE_BYTES
+            || result.get("offset").and_then(|value| value.as_u64()) != Some(offset)
+            || size.is_some_and(|expected| expected != chunk_size)
+            || (size.is_some() && (chunk_hash != expected_hash || chunk_name != name))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inconsistent Gram file chunk",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                result
+                    .get("data_base64")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing file bytes")
+                    })?,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if bytes.len() > crate::persist::gram_files::MAX_CHUNK_BYTES
+            || bytes.is_empty() && offset != chunk_size
+            || offset + bytes.len() as u64 > chunk_size
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid Gram file chunk length",
+            ));
+        }
+        if size.is_none() {
+            if should_refuse_download(chunk_name, &bytes, reveal) {
+                eprintln!("refused: \"{chunk_name}\" ({chunk_size} bytes) looks like it contains a credential. Re-run with --reveal to download it anyway.");
+                return Ok(3);
+            }
+            let temporary = format!("{out}.herdr-{}.part", crate::persist::gram::new_id());
+            target = Some(PrivateDownload::new(temporary)?);
+            size = Some(chunk_size);
+            expected_hash = chunk_hash.to_owned();
+            name = chunk_name.to_owned();
+        }
+        digest.update(&bytes);
+        target
+            .as_mut()
+            .expect("created on first chunk")
+            .file
+            .write_all(&bytes)?;
+        offset += bytes.len() as u64;
+        if offset == chunk_size {
+            break;
+        }
     }
-
-    // Write owner-only (0600): a downloaded file may be a secret (a temporary API
-    // key), and the default umask would otherwise leave it world-readable.
-    write_private(&out, &bytes)?;
-
-    eprintln!("saved {name} ({} bytes) to {out}", bytes.len());
+    if format!("{:x}", digest.finalize()) != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Gram file SHA-256 mismatch",
+        ));
+    }
+    target
+        .expect("file must have at least one chunk")
+        .commit(&out)?;
+    eprintln!("saved {name} ({offset} bytes) to {out}");
     Ok(0)
 }
 
-/// Write a downloaded file with owner-only permissions so a secret is not left
-/// world-readable at the default umask. Enforces the mode even if the target
-/// already existed with looser permissions.
-#[cfg(unix)]
-fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(bytes)
+/// The destination is replaced only after every chunk and the complete digest
+/// have been verified. A failed transfer removes the private staging file.
+struct PrivateDownload {
+    path: String,
+    file: std::fs::File,
+    committed: bool,
 }
 
-#[cfg(not(unix))]
-fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+impl PrivateDownload {
+    fn new(path: String) -> std::io::Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self, destination: &str) -> std::io::Result<()> {
+        self.file.sync_all()?;
+        std::fs::rename(&self.path, destination)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PrivateDownload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Best-effort MIME type from a file's extension. Advisory only — the server
@@ -850,6 +958,7 @@ fn print_gram_help() {
     eprintln!("  herdr gram list [--queue] [--unread] [--owner] [--reveal] [--limit N]   list messages (--owner: read as the owner; --limit: newest N only)");
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram get-file <id> -o PATH         download a message's attached file");
+    eprintln!("  herdr gram relay-path <COORDINATOR_MACHINE_ID>   remote SSH socket path");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
     eprintln!("  herdr gram mark-read <id>                owner: mark an agent message read");
     eprintln!(
@@ -864,6 +973,15 @@ fn print_gram_help() {
     eprintln!("routine `gram list` can't spill a secret into your transcript; pass --reveal to");
     eprintln!("print raw values. Threads are PER-AGENT: `list` only ever shows YOUR own thread,");
     eprintln!("so it cannot audit another agent's grams.");
+    eprintln!();
+    eprintln!(
+        "Cross-machine files: owner daemon must set HERDR_GRAM_RELAY_PEERS=<saved-peer-alias>"
+    );
+    eprintln!("and use a pinned saved SSH machine profile. Remote daemon must set");
+    eprintln!("HERDR_GRAM_REVERSE_SOCKET=$(herdr gram relay-path <coordinator-machine-id>)");
+    eprintln!("before startup. OpenSSH must allow StreamLocalForwarding and -R Unix sockets;");
+    eprintln!("remote-to-coordinator SSH keys are NOT copied or required. This is trusted-machine");
+    eprintln!("access: another same-user process on the trusted peer can claim a pane ID.");
 }
 
 #[cfg(test)]

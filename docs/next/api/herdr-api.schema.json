@@ -2674,6 +2674,13 @@
             "name": {
               "type": "string"
             },
+            "sha256": {
+              "description": "Expected digest of the source bytes. Required by the cross-machine relay.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "upload_id": {
               "type": "string"
             }
@@ -2684,8 +2691,32 @@
           ],
           "type": "object"
         },
+        "GramGetFileChunkParams": {
+          "description": "Bounded file read. A response contains at most 512 KiB of decoded bytes.\n`offset == size` returns an empty chunk; a deleted file returns `not_found`.",
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "offset": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "offset"
+          ],
+          "type": "object"
+        },
         "GramGetFileParams": {
-          "description": "`gram.get_file` — download the file attached to a message. The bytes come back\ninline as base64 in one reply (the response path is not size-capped). The owner\n(no `caller_pane_id`) may download any file; an agent supplies its\n`caller_pane_id` and may download only a file on a message it can see (the same\naudience as `gram.list`).",
+          "description": "`gram.get_file` — legacy one-response download on the local socket. The\nbytes are inline base64 and can be as large as 100 MiB. For a remote relay,\nand for bounded new clients, use `gram.get_file_chunk` instead. Owner (no\ncaller pane) may download any file; an agent may only download one it can see.",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -2809,6 +2840,106 @@
           },
           "required": [
             "text"
+          ],
+          "type": "object"
+        },
+        "GramRelayCall": {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "send",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramSendParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "list",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramListParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "upload_chunk",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramUploadChunkParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "get_file_chunk",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramGetFileChunkParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "delete",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramDeleteParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "GramRelayParams": {
+          "description": "Internal gateway envelope. The reverse SSH gateway overwrites `peer_alias`\nfrom its pinned saved-machine route; it must never trust the wire value.",
+          "properties": {
+            "call": {
+              "$ref": "#/schemas/request/$defs/GramRelayCall"
+            },
+            "peer_alias": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "peer_alias",
+            "call"
           ],
           "type": "object"
         },
@@ -6036,6 +6167,39 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GramGetFileParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "gram.get_file_chunk",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramGetFileChunkParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Internal only: the restricted reverse SSH gateway inserts the machine alias.",
+          "properties": {
+            "method": {
+              "const": "gram.relay",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GramRelayParams"
             }
           },
           "required": [
@@ -13840,6 +14004,47 @@
                 "name",
                 "mime",
                 "size",
+                "data_base64"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One bounded range of an attachment. `sha256` and `size` describe the\ncomplete committed file, so a downloader can reject truncation/corruption.",
+              "properties": {
+                "data_base64": {
+                  "type": "string"
+                },
+                "mime": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "offset": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "gram_file_chunk",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "name",
+                "mime",
+                "size",
+                "sha256",
+                "offset",
                 "data_base64"
               ],
               "type": "object"

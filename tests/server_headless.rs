@@ -314,18 +314,22 @@ fn gram_file_round_trip_upload_download_delete() {
         .expect("message id")
         .to_string();
 
-    // Download the bytes (owner view: no caller pane) and verify they reassemble.
+    // The bounded API returns exact bytes and the digest of the complete file.
     let got = api_request(
         &api_socket,
-        &format!(r#"{{"id":"g","method":"gram.get_file","params":{{"id":"{message_id}"}}}}"#),
+        &format!(
+            r#"{{"id":"g","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0}}}}"#
+        ),
     );
     assert_eq!(
-        got["result"]["type"], "gram_file_content",
-        "get_file should return content: {got}"
+        got["result"]["type"], "gram_file_chunk",
+        "get_file_chunk failed: {got}"
     );
-    let data_b64 = got["result"]["data_base64"].as_str().expect("data_base64");
+    assert_eq!(got["result"]["size"], 11);
+    assert_eq!(got["result"]["offset"], 0);
+    assert_eq!(got["result"]["sha256"], file["sha256"]);
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_b64)
+        .decode(got["result"]["data_base64"].as_str().expect("data_base64"))
         .unwrap();
     assert_eq!(bytes, b"hello world");
 
@@ -350,7 +354,9 @@ fn gram_file_round_trip_upload_download_delete() {
     assert_eq!(del["result"]["type"], "ok", "delete should succeed: {del}");
     let gone = api_request(
         &api_socket,
-        &format!(r#"{{"id":"g2","method":"gram.get_file","params":{{"id":"{message_id}"}}}}"#),
+        &format!(
+            r#"{{"id":"g2","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0}}}}"#
+        ),
     );
     assert!(
         gone.get("error").is_some(),
@@ -441,6 +447,13 @@ fn gram_file_rejects_oversized_mime_and_unknown_caller() {
         denied["error"]["code"], "unknown_caller",
         "a bogus caller pane must not fall through to owner authority: {denied}"
     );
+    let denied_chunk = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"dc","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0,"caller_pane_id":"w9:p9"}}}}"#
+        ),
+    );
+    assert_eq!(denied_chunk["error"]["code"], "unknown_caller");
 
     // The owner (no caller pane) can still read it.
     let owner = api_request(
