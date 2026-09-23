@@ -57,7 +57,14 @@ pub(crate) fn forward_local(request: &Request) -> Option<String> {
             | Method::GramGetFileChunk(_)
             | Method::GramDelete(_)
     ) {
-        return None;
+        let name = crate::api::server::api_method_name(method);
+        return name.starts_with("gram.").then(|| {
+            serde_json::json!({"id":request.id,"error":{
+                "code":"gram_relay_unsupported",
+                "message":format!("{name} is unavailable through the restricted Gram relay; use the coordinator")
+            }})
+            .to_string()
+        });
     }
     let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.into()));
     let reply =

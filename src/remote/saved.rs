@@ -174,9 +174,19 @@ pub(crate) fn reverse_forward_command(
     // socket reserved for this pinned machine pair before every (re)bind.
     let quoted = super::shell_quote(&remote_socket.to_string_lossy());
     let cleanup = format!(
-        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
     );
-    super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote Gram reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
     let mut command = std::process::Command::new("ssh");
     // A persistent multiplexing master exits successfully after forking, which
     // makes the gateway treat a live -R forward as a failed startup and remove

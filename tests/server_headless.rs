@@ -102,7 +102,23 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_server_with_relay(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+        None,
+    )
+}
+
+fn spawn_server_with_relay(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
+    relay_socket: Option<&Path>,
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -130,6 +146,11 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    if let Some(socket) = relay_socket {
+        cmd.env("HERDR_GRAM_REVERSE_SOCKET", socket);
+    } else {
+        cmd.env_remove("HERDR_GRAM_REVERSE_SOCKET");
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -366,6 +387,124 @@ fn gram_file_round_trip_upload_download_delete() {
         !file_dir.exists(),
         "file bytes should be purged after delete: {file_dir:?}"
     );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn opted_in_remote_gram_refuses_methods_outside_restricted_relay() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let relay_socket = base.join("absent-relay.sock");
+    let spawned = spawn_server_with_relay(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        Some(&relay_socket),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let ping = api_request(&api_socket, r#"{"id":"ping","method":"ping","params":{}}"#);
+    assert_eq!(
+        ping["result"]["type"], "pong",
+        "server should be healthy: {ping}"
+    );
+    let post = api_request(
+        &api_socket,
+        r#"{"id":"post","method":"gram.post","params":{"text":"must not enter a second store"}}"#,
+    );
+    assert_eq!(
+        post["error"]["code"], "gram_relay_unsupported",
+        "owner post must not silently write the remote store: {post}"
+    );
+    let list = api_request(
+        &api_socket,
+        r#"{"id":"list","method":"gram.list","params":{}}"#,
+    );
+    assert_eq!(
+        list["error"]["code"], "gram_relay_unavailable",
+        "supported methods must use the absent coordinator, not the remote store: {list}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn gram_download_refuses_late_credentials_without_reveal() {
+    use base64::Engine as _;
+    use std::process::Command;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let mut bytes = vec![b'a'; 512 * 1024];
+    bytes.extend(std::iter::repeat_n(b'b', 300_000));
+    let synthetic_token = format!("{}{}", "ghp_", "0a1b2c3d4e".repeat(4));
+    bytes.extend_from_slice(format!(" {synthetic_token}\n").as_bytes());
+    let upload_id = "late-secret-upload";
+    for (index, chunk) in bytes.chunks(256 * 1024).enumerate() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let offset = index * 256 * 1024;
+        let response = api_request(
+            &api_socket,
+            &format!(
+                r#"{{"id":"upload-{index}","method":"gram.upload_chunk","params":{{"upload_id":"{upload_id}","offset":{offset},"data_base64":"{encoded}"}}}}"#
+            ),
+        );
+        assert_eq!(
+            response["result"]["type"], "ok",
+            "upload failed: {response}"
+        );
+    }
+    let post = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"post","method":"gram.post","params":{{"text":"attachment","file":{{"upload_id":"{upload_id}","name":"report.txt","mime":"text/plain"}}}}}}"#
+        ),
+    );
+    assert_eq!(post["result"]["type"], "gram_sent", "post failed: {post}");
+    let id = post["result"]["message"]["id"]
+        .as_str()
+        .expect("message id");
+    let out = base.join("download.txt");
+    let run_download = |reveal: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        command
+            .args(["gram", "get-file", id, "--out"])
+            .arg(&out)
+            .env("HERDR_SOCKET_PATH", &api_socket)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("HERDR_PANE_ID")
+            .env("XDG_RUNTIME_DIR", &runtime_dir);
+        if reveal {
+            command.arg("--reveal");
+        }
+        command.output().expect("gram get-file CLI")
+    };
+    let refused = run_download(false);
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "unexpected result: {refused:?}"
+    );
+    assert!(!out.exists(), "refusal must leave no partial download");
+    let allowed = run_download(true);
+    assert!(
+        allowed.status.success(),
+        "explicit reveal failed: {allowed:?}"
+    );
+    assert_eq!(fs::read(&out).unwrap(), bytes);
 
     cleanup_spawned_herdr(spawned, base);
 }

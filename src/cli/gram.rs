@@ -204,6 +204,7 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
     let mut name = String::new();
     let mut digest = Sha256::new();
     let mut target: Option<PrivateDownload> = None;
+    let mut sniff_tail = Vec::new();
     loop {
         let response = super::send_request(&Request {
             id: format!(
@@ -272,11 +273,11 @@ fn gram_get_file(args: &[String]) -> std::io::Result<i32> {
                 "invalid Gram file chunk length",
             ));
         }
+        if should_refuse_download_chunk(chunk_name, &bytes, reveal, &mut sniff_tail) {
+            eprintln!("refused: \"{chunk_name}\" ({chunk_size} bytes) looks like it contains a credential. Re-run with --reveal to download it anyway.");
+            return Ok(3);
+        }
         if size.is_none() {
-            if should_refuse_download(chunk_name, &bytes, reveal) {
-                eprintln!("refused: \"{chunk_name}\" ({chunk_size} bytes) looks like it contains a credential. Re-run with --reveal to download it anyway.");
-                return Ok(3);
-            }
             let temporary = format!("{out}.herdr-{}.part", crate::persist::gram::new_id());
             target = Some(PrivateDownload::new(temporary)?);
             size = Some(chunk_size);
@@ -728,19 +729,42 @@ fn content_has_credential_shape(text: &str) -> bool {
     redact_credentials(text) != text || content_has_session_or_token(text)
 }
 
-/// Whether a downloaded attachment looks like it carries a credential — by
-/// filename shape, or by the content detector applied to a bounded, text-decoded
-/// prefix of the bytes. Credentials are short and appear early, so a 256 KiB
-/// prefix is enough; binary files (images, archives, video) decode to noise the
-/// scanner won't match, so they don't false-positive. refs #109
+/// Whether a bounded download chunk looks like it carries a credential — by
+/// filename or by text content. Every chunk is scanned, not just the first:
+/// credentials can appear anywhere in a relayed file. refs #109
 fn attachment_is_credential_shaped(name: &str, bytes: &[u8]) -> bool {
     if filename_suggests_credential(name) {
         return true;
     }
-    const SNIFF_LIMIT: usize = 256 * 1024;
-    let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
-    let text = String::from_utf8_lossy(head);
+    let text = String::from_utf8_lossy(bytes);
     content_has_credential_shape(&text)
+}
+
+/// Carry a short overlap across chunks so a token split by the transfer
+/// boundary cannot evade the per-chunk scan. The chunk itself is bounded by
+/// MAX_CHUNK_BYTES; the overlap retains at most 4 KiB.
+fn should_refuse_download_chunk(
+    name: &str,
+    bytes: &[u8],
+    reveal: bool,
+    tail: &mut Vec<u8>,
+) -> bool {
+    if reveal {
+        return false;
+    }
+    if should_refuse_download(name, bytes, false) {
+        return true;
+    }
+    const OVERLAP: usize = 4096;
+    if !tail.is_empty() {
+        tail.extend_from_slice(&bytes[..bytes.len().min(OVERLAP)]);
+        if should_refuse_download(name, tail, false) {
+            return true;
+        }
+    }
+    tail.clear();
+    tail.extend_from_slice(&bytes[bytes.len().saturating_sub(OVERLAP)..]);
+    false
 }
 
 /// Pure decision for `gram get-file`: refuse to write this attachment? Kept
@@ -1178,6 +1202,44 @@ mod tests {
         let secret = format!("ghp_{}", filler());
         let bytes = format!("export TOKEN={secret}\n").into_bytes();
         assert!(attachment_is_credential_shaped("notes.txt", &bytes));
+    }
+
+    #[test]
+    fn download_refuses_credentials_after_first_chunk_and_across_boundary() {
+        let secret = format!("ghp_{}", filler());
+        let mut tail = Vec::new();
+        let first = vec![b'a'; crate::persist::gram_files::MAX_CHUNK_BYTES];
+        assert!(!should_refuse_download_chunk(
+            "report.txt",
+            &first,
+            false,
+            &mut tail
+        ));
+        let mut second = vec![b'b'; 300_000];
+        second.extend_from_slice(format!(" {secret}\n").as_bytes());
+        assert!(should_refuse_download_chunk(
+            "report.txt",
+            &second,
+            false,
+            &mut tail
+        ));
+
+        let mut tail = Vec::new();
+        let mut split_first = vec![b'a'; crate::persist::gram_files::MAX_CHUNK_BYTES - 5];
+        split_first.push(b' ');
+        split_first.extend_from_slice(&secret.as_bytes()[..4]);
+        assert!(!should_refuse_download_chunk(
+            "report.txt",
+            &split_first,
+            false,
+            &mut tail
+        ));
+        assert!(should_refuse_download_chunk(
+            "report.txt",
+            &secret.as_bytes()[4..],
+            false,
+            &mut tail
+        ));
     }
 
     #[test]
