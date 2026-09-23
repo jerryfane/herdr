@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use super::machine_federation::{federate, unfederate};
 use crate::api::client::ApiClient;
 use crate::api::schema::{EmptyParams, Method, Request, ResponseResult};
 use crate::client::endpoint::{EndpointCatalog, ProfileId};
@@ -11,15 +12,23 @@ const HELP: &str = "Usage:
   herdr machine status [--json]
   herdr machine add <ssh-target> --label <label> [--remote-session <name>]
   herdr machine rename <profile-id> --label <label>
+  herdr machine grant <profile-id> <agent-terminal-id> --observe|--interact [--observe-peer ID] [--interact-peer ID]
+  herdr machine revoke <profile-id> <agent-terminal-id>
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
+  herdr machine federate <label-or-id> [--migrate-all-legacy]
+  herdr machine unfederate <label-or-id>
 
 Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
 Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
+Reverse grants are OFF by default. Set federation.reverse_coordinator_machine_id
+on the trusted remote to this coordinator's install id; SSH streamlocal -R must
+be permitted. Same-user processes on that remote can spoof a granted pane id.
+Grants are not process isolation and never confer Gram/admin/server powers.
 SSH credentials and key material remain owned by OpenSSH.";
 
 #[derive(Serialize)]
@@ -40,9 +49,13 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
         Some("status") => status(&args[1..]),
         Some("add") => add(&args[1..]),
         Some("rename") => rename(&args[1..]),
+        Some("grant") => grant(&args[1..]),
+        Some("revoke") => revoke(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
         Some("disable") => set_enabled(&args[1..], false),
+        Some("federate") => federate(&args[1..]),
+        Some("unfederate") => unfederate(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             Ok(0)
@@ -52,6 +65,248 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn grant(args: &[String]) -> std::io::Result<i32> {
+    let [profile, terminal_id, options @ ..] = args else {
+        eprintln!("{HELP}");
+        return Ok(2);
+    };
+    let profile_id = match ProfileId::parse(profile.clone()) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(2);
+        }
+    };
+    let config = crate::config::Config::load().config;
+    let Some(policy) = config.federation.saved_machines.get(&profile_id) else {
+        eprintln!("profile has no pinned federation.saved_machines policy; a saved SSH profile alone grants nothing");
+        return Ok(1);
+    };
+    if !config.federation.coordinator {
+        eprintln!("federation coordinator is disabled");
+        return Ok(1);
+    }
+    let mut observe = false;
+    let mut interact = false;
+    let mut observe_peers = Vec::new();
+    let mut interact_peers = Vec::new();
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--observe" => observe = true,
+            "--interact" => interact = true,
+            "--observe-peer" | "--interact-peer" => {
+                let Some(value) = options.get(index + 1) else {
+                    eprintln!("peer option requires an alias");
+                    return Ok(2);
+                };
+                if options[index] == "--observe-peer" {
+                    observe_peers.push(value.clone());
+                } else {
+                    interact_peers.push(value.clone());
+                }
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown grant option: {other}");
+                return Ok(2);
+            }
+        }
+        index += 1;
+    }
+    if (!observe && (!interact || !observe_peers.is_empty()))
+        || (!interact && !interact_peers.is_empty())
+    {
+        eprintln!("grant requires --observe or --interact; peer permissions require their respective capability");
+        return Ok(2);
+    }
+    if observe_peers.iter().chain(&interact_peers).any(|peer| {
+        peer.as_str() == profile.as_str()
+            || (!config
+                .federation
+                .saved_machines
+                .keys()
+                .any(|id| id.as_str() == peer.as_str())
+                && !config
+                    .federation
+                    .peers
+                    .iter()
+                    .any(|item| item.alias == *peer))
+    }) {
+        eprintln!("a peer alias is unknown or refers to the caller machine");
+        return Ok(2);
+    }
+    let Some(local_id) = terminal_id.strip_prefix(&format!("{profile}/")) else {
+        eprintln!("agent-terminal-id must be machine qualified as {profile}/<remote-terminal-id>");
+        return Ok(2);
+    };
+    let roster = match ApiClient::local().request(Request {
+        id: "cli:machine:grant:list".into(),
+        method: Method::AgentList(crate::api::schema::AgentListParams::default()),
+    }) {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!("cannot verify live selected agent: {error}");
+            return Ok(1);
+        }
+    };
+    let ResponseResult::AgentList { agents, .. } = roster.result else {
+        eprintln!("agent roster unavailable");
+        return Ok(1);
+    };
+    let Some(agent) = agents.into_iter().find(|agent| {
+        agent.machine_id.as_deref() == Some(profile)
+            && agent.terminal_id == *terminal_id
+            && agent.origin_machine_id.as_deref() == Some(&policy.expected_machine_id)
+            && agent.reachability == Some(crate::api::federation_store::Reachability::Reachable)
+    }) else {
+        eprintln!(
+            "selected agent is offline, stale, or machine identity does not match the saved pin"
+        );
+        return Ok(1);
+    };
+    let Some(session) = agent.agent_session else {
+        eprintln!("selected agent has no stable harness session identity yet");
+        return Ok(1);
+    };
+    if agent.archived.is_some() || agent.session_transfer.is_some() {
+        eprintln!("selected agent is archived or transferring; grant refused");
+        return Ok(1);
+    }
+    let mut grants = policy.agent_grants.clone();
+    grants.retain(|grant| grant.terminal_id != local_id);
+    grants.push(crate::config::FederationAgentGrant {
+        terminal_id: local_id.to_owned(),
+        session,
+        name: agent.name.map(|name| {
+            name.strip_prefix(&format!("{profile}/"))
+                .unwrap_or(&name)
+                .to_owned()
+        }),
+        observe,
+        interact,
+        observe_peers,
+        interact_peers,
+    });
+    save_agent_grants(&profile_id, &grants)?;
+    println!("granted {terminal_id} on pinned machine {}; remote opt-in requires federation.reverse_coordinator_machine_id = \"{}\"; same-user processes can spoof this pane id", policy.expected_machine_id, crate::persist::machine::get_or_create());
+    reload_grants()
+}
+
+fn revoke(args: &[String]) -> std::io::Result<i32> {
+    let [profile, terminal_id] = args else {
+        eprintln!("{HELP}");
+        return Ok(2);
+    };
+    let profile_id = match ProfileId::parse(profile.clone()) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(2);
+        }
+    };
+    let config = crate::config::Config::load().config;
+    let Some(policy) = config.federation.saved_machines.get(&profile_id) else {
+        eprintln!("no pinned federation policy for profile");
+        return Ok(1);
+    };
+    let local_id = terminal_id
+        .strip_prefix(&format!("{profile}/"))
+        .unwrap_or(terminal_id);
+    let mut grants = policy.agent_grants.clone();
+    grants.retain(|grant| grant.terminal_id != local_id);
+    if grants.len() == policy.agent_grants.len() {
+        eprintln!("no grant for that terminal id");
+        return Ok(1);
+    }
+    save_agent_grants(&profile_id, &grants)?;
+    println!("revoked {profile}/{local_id}; reloading coordinator");
+    reload_grants()
+}
+
+fn reload_grants() -> std::io::Result<i32> {
+    match super::send_request(&Request {
+        id: "cli:machine:grants:reload".into(),
+        method: Method::ServerReloadConfig(EmptyParams::default()),
+    }) {
+        Ok(response) => super::print_response(&response),
+        Err(error) => {
+            eprintln!("grant saved, but coordinator reload failed: {error}; run `herdr server reload-config` before relying on this change");
+            Ok(1)
+        }
+    }
+}
+
+fn save_agent_grants(
+    profile: &ProfileId,
+    grants: &[crate::config::FederationAgentGrant],
+) -> std::io::Result<()> {
+    fn quoted(value: &str) -> String {
+        toml::Value::String(value.to_owned()).to_string()
+    }
+    fn peers(values: &[String]) -> String {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| quoted(value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+    let rendered = grants
+        .iter()
+        .map(|grant| {
+            let kind = serde_json::to_value(grant.session.kind).expect("serializable session kind");
+            let kind = kind.as_str().expect("string session kind");
+            let mut fields = vec![
+                format!("terminal_id = {}", quoted(&grant.terminal_id)),
+                format!(
+                    "session = {{ source = {}, agent = {}, kind = {}, value = {} }}",
+                    quoted(&grant.session.source),
+                    quoted(&grant.session.agent),
+                    quoted(kind),
+                    quoted(&grant.session.value)
+                ),
+                format!("observe = {}", grant.observe),
+                format!("interact = {}", grant.interact),
+                format!("observe_peers = {}", peers(&grant.observe_peers)),
+                format!("interact_peers = {}", peers(&grant.interact_peers)),
+            ];
+            if let Some(name) = &grant.name {
+                fields.push(format!("name = {}", quoted(name)));
+            }
+            format!("{{ {} }}", fields.join(", "))
+        })
+        .collect::<Vec<_>>();
+    let value = format!("[{}]", rendered.join(", "));
+    let path = crate::config::config_path();
+    let original = std::fs::read_to_string(&path)?;
+    let bare_section = format!("federation.saved_machines.{profile}");
+    let section = if original
+        .lines()
+        .any(|line| line.trim() == format!("[{bare_section}]"))
+    {
+        bare_section
+    } else {
+        format!("federation.saved_machines.\"{profile}\"")
+    };
+    toml::from_str::<toml::Value>(&original)
+        .map_err(|cause| std::io::Error::new(std::io::ErrorKind::InvalidData, cause))?;
+    let updated = crate::config::upsert_section_value(&original, &section, "agent_grants", &value);
+    toml::from_str::<toml::Value>(&updated)
+        .map_err(|cause| std::io::Error::new(std::io::ErrorKind::InvalidData, cause))?;
+    crate::config::update_file_at_checked(&path, "federation agent grants", |current| {
+        if current != original {
+            return Err(
+                "config changed while selecting the live agent; retry the grant command".into(),
+            );
+        }
+        Ok(updated)
+    })
+    .map_err(std::io::Error::other)
 }
 
 fn list(args: &[String]) -> std::io::Result<i32> {
@@ -108,9 +363,15 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         ));
     };
     if json {
+        let mut output = serde_json::to_value(&machines).map_err(std::io::Error::other)?;
+        for (id, machine) in &machines {
+            if machine.saved_state == crate::api::schema::SavedMachineState::Untrusted {
+                output[id]["next_action"] = format!("herdr machine federate {id}").into();
+            }
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&machines).map_err(std::io::Error::other)?
+            serde_json::to_string_pretty(&output).map_err(std::io::Error::other)?
         );
         return Ok(0);
     }
@@ -160,6 +421,9 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         }
         if let Some(error) = machine.last_error_class {
             println!("  last error: {}", format!("{error:?}").to_lowercase());
+        }
+        if machine.saved_state == crate::api::schema::SavedMachineState::Untrusted {
+            println!("  next: herdr machine federate {}", machine.profile_id);
         }
         if machine.stale {
             println!("  cached federation data is stale");
@@ -511,6 +775,7 @@ mod tests {
             profile_id.clone(),
             crate::config::FederationSavedMachinePolicy {
                 expected_machine_id: "machine_build".into(),
+                agent_grants: Vec::new(),
             },
         );
 

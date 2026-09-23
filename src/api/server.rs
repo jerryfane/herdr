@@ -4733,6 +4733,7 @@ mod federation_tests {
             profile_id.clone(),
             crate::config::FederationSavedMachinePolicy {
                 expected_machine_id: "machine-build".into(),
+                agent_grants: Vec::new(),
             },
         );
         manager.reconcile_config(&config);

@@ -29,6 +29,7 @@ mod completion;
 mod gram;
 mod integration;
 mod machine;
+mod machine_federation;
 mod notification;
 mod pair;
 mod pair_qr;

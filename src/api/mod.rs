@@ -6,6 +6,7 @@ pub mod federation_store;
 pub(crate) mod output_registry;
 #[cfg(unix)]
 pub(crate) mod reverse;
+pub(crate) mod reverse_agents;
 pub mod schema;
 mod server;
 pub(crate) use server::{default_capabilities, UploadClaim};

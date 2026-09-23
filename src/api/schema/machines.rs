@@ -38,6 +38,9 @@ pub struct CoordinatorMachineStatus {
     pub display_label: String,
     pub remote_session: String,
     pub saved_state: SavedMachineState,
+    /// Policy presence is independent of whether the saved SSH profile is enabled.
+    #[serde(default)]
+    pub federation_configured: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_status: Option<MachineEndpointStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

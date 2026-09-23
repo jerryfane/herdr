@@ -9440,6 +9440,11 @@
                 }
               ]
             },
+            "federation_configured": {
+              "default": false,
+              "description": "Policy presence is independent of whether the saved SSH profile is enabled.",
+              "type": "boolean"
+            },
             "federation_reachability": {
               "anyOf": [
                 {

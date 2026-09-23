@@ -239,6 +239,137 @@ fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
         .as_ref()
 }
 
+/// Establish an authenticated SSH streamlocal reverse forward, never a forward
+/// to the unrestricted Herdr API. A readiness marker is emitted by the remote
+/// command only after OpenSSH has accepted all requested forwards.
+#[cfg(unix)]
+pub(crate) fn spawn_saved_reverse_forward(
+    profile_id: &str,
+    target: &str,
+    remote_socket: &std::path::Path,
+    gateway_socket: &std::path::Path,
+) -> io::Result<std::process::Child> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    validate_profile_path_id(profile_id)?;
+    if target.is_empty() || target.starts_with('-') || target.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid saved SSH target",
+        ));
+    }
+    let options = saved_federation_ssh_options().ok_or_else(|| {
+        io::Error::other("managed SSH configuration unavailable; reverse forwarding refused")
+    })?;
+    // sshd retains the remote socket pathname after disconnect. Remove only
+    // this socket (never a file or symlink) before binding the new forward.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
+    let mut command = Command::new("ssh");
+    // A managed multiplexing master may return before the dedicated forward
+    // closes. Keep this transport owned by the gateway for its entire lifetime.
+    command
+        .arg("-C")
+        .arg("-S")
+        .arg("none")
+        .arg("-F")
+        .arg(&options.config_path)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
+    super::attach::apply_noninteractive_ssh_options(&mut command);
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            gateway_socket.display()
+        ))
+        .arg(target)
+        .arg("printf 'herdr-reverse-ready\\n'; exec sleep 2147483647")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped SSH stdout");
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut output = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut total = 0usize;
+        let result = loop {
+            let available = match output.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSH closed before reverse forward readiness",
+                    ))
+                }
+                Err(error) => break Err(error),
+            };
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(available.len(), |position| position + 1);
+            total += count;
+            if total > 16 * 1024 {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSH stdout exceeded readiness limit",
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            output.consume(count);
+            if newline.is_some() {
+                if line == b"herdr-reverse-ready\n" {
+                    break Ok(());
+                }
+                line.clear();
+            }
+        };
+        let _ = tx.send(result);
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(20));
+    if !matches!(ready, Ok(Ok(()))) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(match ready {
+            Err(mpsc::RecvTimeoutError::Timeout) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH reverse streamlocal forwarding did not become ready within 20 seconds",
+            ),
+            Ok(Err(error)) => error,
+            _ => io::Error::other("SSH reverse streamlocal forwarding rejected"),
+        });
+    }
+    let _ = reader.join();
+    Ok(child)
+}
+
 pub(crate) fn saved_ssh_bootstrap_command(target: &str, session: &str) -> String {
     format!(
         "herdr --remote {} --session {}",
