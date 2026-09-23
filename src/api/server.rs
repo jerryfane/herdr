@@ -1107,7 +1107,7 @@ fn handle_connection_with_stop(
     #[cfg(unix)]
     if federation.is_none() {
         if let Some(response) = crate::api::reverse::forward_local(&request) {
-            return write_json_line_allow_disconnect(&mut stream, &response);
+            return write_text_line_allow_disconnect(&mut stream, &response);
         }
     }
 

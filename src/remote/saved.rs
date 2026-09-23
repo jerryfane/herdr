@@ -168,8 +168,28 @@ pub(crate) fn reverse_forward_command(
     local_gateway: &std::path::Path,
 ) -> io::Result<std::process::Command> {
     let _ = validated_saved_ssh(profile_id, target, session)?;
+    // sshd leaves a stream-local -R socket pathname behind after the forwarding
+    // session exits. StreamLocalBindUnlink is client-side and does not remove
+    // that remote pathname on ordinary sshd installations. Clear only the
+    // socket reserved for this pinned machine pair before every (re)bind.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
     let mut command = std::process::Command::new("ssh");
-    super::attach::apply_managed_ssh_options(&mut command, saved_federation_ssh_options());
+    // A persistent multiplexing master exits successfully after forking, which
+    // makes the gateway treat a live -R forward as a failed startup and remove
+    // its local listener. Keep this dedicated forward in the foreground.
+    command.arg("-C").arg("-S").arg("none");
+    if let Some(options) = saved_federation_ssh_options() {
+        command.arg("-F").arg(&options.config_path);
+    }
+    command
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
     command
         .arg("-o")
         .arg("BatchMode=yes")
