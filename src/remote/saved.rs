@@ -202,7 +202,17 @@ pub(crate) fn spawn_saved_reverse_forward(
     let cleanup = format!(
         "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
     );
-    super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
     let mut command = Command::new("ssh");
     // A managed multiplexing master may return before the dedicated forward
     // closes. Keep this transport owned by the gateway for its entire lifetime.
