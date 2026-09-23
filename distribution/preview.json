@@ -2,36 +2,67 @@
   "schema_version": 1,
   "channel": "preview",
   "base_version": "0.9.1",
-  "build_id": "2026-09-23-48d2aad1ac5d",
-  "commit": "48d2aad1ac5d003d4d136f23b09bfece30c218a8",
-  "built_at": "2026-09-23T06:46:47Z",
+  "build_id": "2026-09-23-efb47d6378a6",
+  "commit": "efb47d6378a63b0d3e8ea9493f8ae95771c25f71",
+  "built_at": "2026-09-23T08:40:40Z",
   "protocol": 22,
   "endpoint_generation": 1,
-  "notes": "HerdrUp preview 2026-09-23-48d2aad1ac5d\n\n- `herdr update` on the preview channel fetches only fork release assets and refuses a foreign manifest asset.\n- The stable channel has no fork releases yet; it refuses with HerdrUp installer guidance rather than reading upstream Herdr.\n- Stable-stamped fork binaries recognize their own published preview commit as up to date.\n- Windows remains the prior binary, carried forward because the Windows build is broken (#204).\n\n[Changes since the prior preview](https://github.com/jerryfane/herdr/compare/d79b0216a175d4707c8b3a18cbf50f362dcc2325...48d2aad1ac5d003d4d136f23b09bfece30c218a8)",
+  "notes": "Herdr 0.9.1 fork preview from efb47d6378a63b0d3e8ea9493f8ae95771c25f71. Wire protocol 22; endpoint generation 1.\n\n- Issue #210: herdr agent prompt --wait now reports a PTY-written but unconfirmed submission as an agent_prompt_unconfirmed result with exit 0, preserving the reason. Real delivery failures and timeouts remain errors. herdr server agent-manifests shows active submission-verification support, and unsupported agents are named explicitly.\n- Compatible with HerdrUp 1.0.7 build 165, which fixes app-side duplicate retry after an unconfirmed send.\n- Issue #208 fork-only preview updater remains in effect. Stable has no fork release stream.\n- Linux x86_64/aarch64 and macOS x86_64/aarch64 assets are new builds from this commit.\n- Windows x86_64 is carried forward byte-for-byte from preview-2026-09-23-48d2aad1ac5d because Windows compilation remains broken (#204). Its embedded commit is older; the current preview can be re-offered on Windows. No protocol change. Do not treat it as a Windows build of efb47d63.",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-48d2aad1ac5d/herdr-linux-x86_64",
-      "sha256": "c9b74aec67ee30bddd38107e463e18d6b4296e778d49117be7f8777fd44696b9"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-linux-x86_64",
+      "sha256": "7780ba13acb8f3e12f596fb021e67c029b6bcbc28a75794ba77962470422984e"
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-48d2aad1ac5d/herdr-linux-aarch64",
-      "sha256": "144d8e679e77b315262bbd82dfe3187cb5446d73eebb4fb598a2de2e3f49f547"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-linux-aarch64",
+      "sha256": "53eaf90dfa0e7bb9894db1d5e851b4e4fb85df30bbb8e7afc1c5b74777dca903"
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-48d2aad1ac5d/herdr-macos-x86_64",
-      "sha256": "4ee763bea4432071d58bc696732264ec688621c449398784c44cec847c5c023d"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-macos-x86_64",
+      "sha256": "6e37bf2b8e203216d3cfe755f99f0016a2abadad103e18124c99ccc30fdc143d"
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-48d2aad1ac5d/herdr-macos-aarch64",
-      "sha256": "68c4183a9f07f4a99a95250e5d29f417a476a7ca7eb1e161e0747a9529b71ef1"
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-macos-aarch64",
+      "sha256": "49364c2b882ac54cf1ad6c69f49571a90cc9d0c9dc4a8ac388c32c67044538d2"
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-48d2aad1ac5d/herdr-windows-x86_64.zip",
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-windows-x86_64.zip",
       "sha256": "80d3d70c30b5aeb160c94142ba4b1b6d0b7176b9b04d5265b56dbed9f4a3cc42",
       "format": "zip"
     }
   },
   "builds": {
+    "2026-09-23-efb47d6378a6": {
+      "base_version": "0.9.1",
+      "commit": "efb47d6378a63b0d3e8ea9493f8ae95771c25f71",
+      "built_at": "2026-09-23T08:40:40Z",
+      "protocol": 22,
+      "endpoint_generation": 1,
+      "tag": "preview-2026-09-23-efb47d6378a6",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-linux-x86_64",
+          "sha256": "7780ba13acb8f3e12f596fb021e67c029b6bcbc28a75794ba77962470422984e"
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-linux-aarch64",
+          "sha256": "53eaf90dfa0e7bb9894db1d5e851b4e4fb85df30bbb8e7afc1c5b74777dca903"
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-macos-x86_64",
+          "sha256": "6e37bf2b8e203216d3cfe755f99f0016a2abadad103e18124c99ccc30fdc143d"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-macos-aarch64",
+          "sha256": "49364c2b882ac54cf1ad6c69f49571a90cc9d0c9dc4a8ac388c32c67044538d2"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-09-23-efb47d6378a6/herdr-windows-x86_64.zip",
+          "sha256": "80d3d70c30b5aeb160c94142ba4b1b6d0b7176b9b04d5265b56dbed9f4a3cc42",
+          "format": "zip"
+        }
+      }
+    },
     "2026-09-23-48d2aad1ac5d": {
       "base_version": "0.9.1",
       "commit": "48d2aad1ac5d003d4d136f23b09bfece30c218a8",
@@ -884,31 +915,6 @@
         "macos-aarch64": {
           "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-05-1ce4213d9ebb/herdr-macos-aarch64",
           "sha256": "4bd46e2f4e3d76bf730b105fe11de53093c5b580b7e0a042359a887c5ac6aef0"
-        }
-      }
-    },
-    "2026-06-04-670656b26f1a": {
-      "base_version": "0.6.8",
-      "commit": "670656b26f1aeadc3f18e6692a9fdf1b02da799c",
-      "built_at": "2026-06-04T19:48:01Z",
-      "protocol": 12,
-      "tag": "preview-2026-06-04-670656b26f1a",
-      "assets": {
-        "linux-x86_64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-04-670656b26f1a/herdr-linux-x86_64",
-          "sha256": "24dbbcc8f56d0d6fb05f08b30b42034de10155f09326a9f535810d0f4d53812a"
-        },
-        "linux-aarch64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-04-670656b26f1a/herdr-linux-aarch64",
-          "sha256": "8f3708274a4e56f613709d05b4b8d56ba8d7b3a10705c12f2b57899cc5ff105b"
-        },
-        "macos-x86_64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-04-670656b26f1a/herdr-macos-x86_64",
-          "sha256": "1a24cc6793a61a70c5e9a52514b809d267adde795152dd236f854048a82aa4bf"
-        },
-        "macos-aarch64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-04-670656b26f1a/herdr-macos-aarch64",
-          "sha256": "396c97c613f33e490f66c36456d47cfb34dd9aca50a5911ef0adf6e1914c6c4c"
         }
       }
     }
