@@ -111,9 +111,8 @@ fn grant(args: &[String]) -> std::io::Result<i32> {
         }
         index += 1;
     }
-    if !observe && !interact
-        || !observe && !observe_peers.is_empty()
-        || !interact && !interact_peers.is_empty()
+    if (!observe && (!interact || !observe_peers.is_empty()))
+        || (!interact && !interact_peers.is_empty())
     {
         eprintln!("grant requires --observe or --interact; peer permissions require their respective capability");
         return Ok(2);
@@ -255,8 +254,7 @@ fn save_agent_grants(
     let rendered = grants
         .iter()
         .map(|grant| {
-            let kind =
-                serde_json::to_value(&grant.session.kind).expect("serializable session kind");
+            let kind = serde_json::to_value(grant.session.kind).expect("serializable session kind");
             let kind = kind.as_str().expect("string session kind");
             let mut fields = vec![
                 format!("terminal_id = {}", quoted(&grant.terminal_id)),

@@ -729,12 +729,11 @@ impl FederationPeerManager {
                 peer.remote_session.as_deref(),
                 peer.expected_node_id.as_deref(),
             ) {
-                (Some(profile), Some(session), Some(machine)) => {
+                (Some(profile), Some(_session), Some(machine)) => {
                     let target = endpoint.strip_prefix("ssh://").unwrap_or_default();
                     match crate::api::reverse_agents::ReverseGateway::start(
                         profile,
                         target,
-                        session,
                         machine,
                         route.clone(),
                         reverse_grants.clone(),

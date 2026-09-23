@@ -498,7 +498,7 @@ fn federated_agent_command(args: &[String], prompt: bool) -> std::io::Result<i32
     while index < args.len() {
         if args[index] == "--caller-pane" {
             let Some(value) = args.get(index + 1) else {
-                eprintln!("--caller-pane requires the live local agent terminal id");
+                eprintln!("--caller-pane requires a live local agent pane or terminal id");
                 return Ok(2);
             };
             caller = Some(value.clone());
@@ -523,6 +523,34 @@ fn federated_agent_command(args: &[String], prompt: bool) -> std::io::Result<i32
             return Ok(2);
         }
     };
+    let roster = match crate::api::client::ApiClient::local().request(Request {
+        id: "cli:agent:federated:caller".into(),
+        method: Method::AgentList(AgentListParams { local_only: true }),
+    }) {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!("cannot verify live local caller: {error}");
+            return Ok(1);
+        }
+    };
+    let crate::api::schema::ResponseResult::AgentList { agents, .. } = roster.result else {
+        eprintln!("local agent roster unavailable");
+        return Ok(1);
+    };
+    let mut matches = agents.into_iter().filter(|agent| {
+        (agent.pane_id == caller || agent.terminal_id == caller)
+            && agent.machine_id.is_none()
+            && agent.archived.is_none()
+    });
+    let Some(agent) = matches.next() else {
+        eprintln!("caller is not a live local agent pane or terminal");
+        return Ok(1);
+    };
+    if matches.next().is_some() {
+        eprintln!("caller identity is ambiguous");
+        return Ok(1);
+    }
+    let caller = agent.terminal_id;
     match crate::api::reverse_agents::request_remote(&coordinator, caller, method) {
         Ok(response) => super::print_response(&response),
         Err(error) => {

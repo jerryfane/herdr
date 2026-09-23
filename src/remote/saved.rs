@@ -178,15 +178,15 @@ fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
 pub(crate) fn spawn_saved_reverse_forward(
     profile_id: &str,
     target: &str,
-    session: &str,
     remote_socket: &std::path::Path,
     gateway_socket: &std::path::Path,
 ) -> io::Result<std::process::Child> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     validate_profile_path_id(profile_id)?;
-    crate::session::validate_name(session)
-        .map_err(|cause| io::Error::new(io::ErrorKind::InvalidInput, cause))?;
     if target.is_empty() || target.starts_with('-') || target.chars().any(char::is_whitespace) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -219,17 +219,58 @@ pub(crate) fn spawn_saved_reverse_forward(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = command.spawn()?;
-    let mut line = String::new();
-    let ready = child.stdout.take().is_some_and(|stdout| {
-        BufReader::new(stdout).read_line(&mut line).is_ok() && line == "herdr-reverse-ready\n"
+    let stdout = child.stdout.take().expect("piped SSH stdout");
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut output = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut total = 0usize;
+        let result = loop {
+            let available = match output.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSH closed before reverse forward readiness",
+                    ))
+                }
+                Err(error) => break Err(error),
+            };
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(available.len(), |position| position + 1);
+            total += count;
+            if total > 16 * 1024 {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSH stdout exceeded readiness limit",
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            output.consume(count);
+            if newline.is_some() {
+                if line == b"herdr-reverse-ready\n" {
+                    break Ok(());
+                }
+                line.clear();
+            }
+        };
+        let _ = tx.send(result);
     });
-    if !ready {
+    let ready = rx.recv_timeout(Duration::from_secs(20));
+    if !matches!(ready, Ok(Ok(()))) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(io::Error::other(
-            "SSH reverse streamlocal forwarding rejected; check host-key trust, AllowStreamLocalForwarding and remote socket permissions",
-        ));
+        let _ = reader.join();
+        return Err(match ready {
+            Err(mpsc::RecvTimeoutError::Timeout) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH reverse streamlocal forwarding did not become ready within 20 seconds",
+            ),
+            Ok(Err(error)) => error,
+            _ => io::Error::other("SSH reverse streamlocal forwarding rejected"),
+        });
     }
+    let _ = reader.join();
     Ok(child)
 }
 

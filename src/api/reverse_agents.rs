@@ -34,8 +34,8 @@ pub(crate) fn reverse_socket_path(
     let digest = Sha256::digest(
         format!("herdr-reverse-v1\0{coordinator_machine_id}\0{remote_machine_id}").as_bytes(),
     );
-    let name = format!("herdr-rev-{:x}.sock", digest);
-    PathBuf::from("/tmp").join(&name[..31])
+    let name = format!("herdr-rev-{:x}", digest);
+    PathBuf::from("/tmp").join(format!("{}.sock", &name[..27]))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,11 +158,22 @@ fn read_line_bounded(stream: &mut impl Read, limit: usize) -> io::Result<Vec<u8>
 }
 
 #[cfg(unix)]
+struct PrivateGatewayDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for PrivateGatewayDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.join("gateway.sock"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[cfg(unix)]
 pub(crate) struct ReverseGateway {
     stop: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
     forward: Option<JoinHandle<()>>,
-    path: PathBuf,
+    _private_dir: PrivateGatewayDir,
 }
 
 #[cfg(unix)]
@@ -170,7 +181,6 @@ impl ReverseGateway {
     pub(crate) fn start(
         profile_id: &str,
         target: &str,
-        session: &str,
         expected_machine_id: &str,
         route: PeerRoute,
         grants: Vec<FederationAgentGrant>,
@@ -184,18 +194,18 @@ impl ReverseGateway {
         }
         let coord_id = crate::persist::machine::get_or_create();
         let remote = reverse_socket_path(&coord_id, expected_machine_id);
-        let path = crate::platform::remote_bridge_endpoint_path(
-            &format!(
-                "herdr-reverse-gateway-{}-{profile_id}.sock",
-                std::process::id()
-            ),
-            &format!("hrg-{}-{}.sock", std::process::id(), &profile_id[..16]),
-        );
-        crate::ipc::prepare_socket_path(&path, |path| {
-            format!("reverse gateway already bound: {}", path.display())
-        })?;
+        use std::os::unix::fs::DirBuilderExt;
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-rg-{}-{:016x}",
+            std::process::id(),
+            u64::from_be_bytes(nonce)
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let private_dir = PrivateGatewayDir(dir);
+        let path = private_dir.0.join("gateway.sock");
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let listener_stop = stop.clone();
@@ -238,41 +248,55 @@ impl ReverseGateway {
                         Err(cause) if cause.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(50))
                         }
-                        Err(_) => break,
+                        Err(cause) if cause.kind() == io::ErrorKind::Interrupted => {}
+                        Err(cause) => {
+                            tracing::warn!(%cause, "restricted reverse gateway accept failed");
+                            thread::sleep(Duration::from_secs(1));
+                        }
                     }
                 }
             })?;
         let forward_stop = stop.clone();
         let target = target.to_owned();
-        let session = session.to_owned();
         let profile = profile_id.to_owned();
         let gateway_path = path.clone();
-        let forward_join = thread::Builder::new().name("reverse-ssh-forward".into()).spawn(move || {
-            while !forward_stop.load(Ordering::Acquire) {
-                match crate::remote::spawn_saved_reverse_forward(&profile, &target, &session, &remote, &gateway_path) {
-                    Ok(mut child) => {
-                        while !forward_stop.load(Ordering::Acquire) {
-                            match child.try_wait() {
-                                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                                _ => break,
+        let forward_join = match thread::Builder::new()
+            .name("reverse-ssh-forward".into())
+            .spawn(move || {
+                while !forward_stop.load(Ordering::Acquire) {
+                    match crate::remote::spawn_saved_reverse_forward(
+                        &profile, &target, &remote, &gateway_path,
+                    ) {
+                        Ok(mut child) => {
+                            while !forward_stop.load(Ordering::Acquire) {
+                                match child.try_wait() {
+                                    Ok(None) => thread::sleep(Duration::from_millis(100)),
+                                    _ => break,
+                                }
                             }
+                            let _ = child.kill();
+                            let _ = child.wait();
                         }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        Err(cause) => tracing::warn!(%cause, profile_id = %profile, "reverse SSH forward unavailable"),
                     }
-                    Err(cause) => tracing::warn!(%cause, profile_id = %profile, "reverse SSH forward unavailable"),
+                    for _ in 0..50 {
+                        if forward_stop.load(Ordering::Acquire) { break; }
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
-                for _ in 0..50 {
-                    if forward_stop.load(Ordering::Acquire) { break; }
-                    thread::sleep(Duration::from_millis(100));
-                }
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                let _ = listener_join.join();
+                return Err(error);
             }
-        })?;
+        };
         Ok(Self {
             stop,
             listener: Some(listener_join),
             forward: Some(forward_join),
-            path,
+            _private_dir: private_dir,
         })
     }
 }
@@ -287,7 +311,6 @@ impl Drop for ReverseGateway {
         if let Some(join) = self.listener.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
