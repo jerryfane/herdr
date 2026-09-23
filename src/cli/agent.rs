@@ -519,7 +519,7 @@ fn federated_agent_command(args: &[String], prompt: bool) -> std::io::Result<i32
             text: (*text).to_owned(),
         },
         _ => {
-            eprintln!("usage: herdr agent federated-list [--caller-pane ID]\n       herdr agent federated-prompt <machine-qualified-target> <text> [--caller-pane ID]");
+            eprintln!("usage: herdr agent federated-list [--caller-pane ID]\n       herdr agent federated-prompt <terminal-id-from-federated-list> <text> [--caller-pane ID]");
             return Ok(2);
         }
     };
@@ -1488,7 +1488,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent federated-list [--caller-pane ID] (trusted-machine grant; HERDR_PANE_ID by default)");
     eprintln!(
-        "  herdr agent federated-prompt <machine-qualified-target> <text> [--caller-pane ID]"
+        "  herdr agent federated-prompt <terminal-id-from-federated-list> <text> [--caller-pane ID]"
     );
     eprintln!(
         "  Reverse grants do not isolate same-user processes: they can spoof an opted-in pane ID."

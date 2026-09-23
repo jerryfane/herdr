@@ -196,8 +196,26 @@ pub(crate) fn spawn_saved_reverse_forward(
     let options = saved_federation_ssh_options().ok_or_else(|| {
         io::Error::other("managed SSH configuration unavailable; reverse forwarding refused")
     })?;
+    // sshd retains the remote socket pathname after disconnect. Remove only
+    // this socket (never a file or symlink) before binding the new forward.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
     let mut command = Command::new("ssh");
-    super::attach::apply_managed_ssh_options(&mut command, Some(options));
+    // A managed multiplexing master may return before the dedicated forward
+    // closes. Keep this transport owned by the gateway for its entire lifetime.
+    command
+        .arg("-C")
+        .arg("-S")
+        .arg("none")
+        .arg("-F")
+        .arg(&options.config_path)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
     super::attach::apply_noninteractive_ssh_options(&mut command);
     command
         .arg("-T")

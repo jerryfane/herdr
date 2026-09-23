@@ -404,7 +404,7 @@ fn handle_request(
             let request = Request {
                 id: "reverse:agent.prompt".into(),
                 method: Method::AgentPrompt(AgentPromptParams {
-                    target,
+                    target: target_agent.pane_id.clone(),
                     text,
                     wait: None,
                 }),
