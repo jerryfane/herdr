@@ -40,9 +40,10 @@ use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
     GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileChunkParams,
     GramGetFileParams, GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo,
-    GramPostParams, GramRelayCall, GramRelayParams, GramSendParams, GramUploadChunkParams,
-    GramUploadStreamParams, ResponseResult,
+    GramPostParams, GramSendParams, GramUploadChunkParams, GramUploadStreamParams, ResponseResult,
 };
+#[cfg(unix)]
+use crate::api::schema::{GramRelayCall, GramRelayParams};
 use crate::app::App;
 use crate::persist::gram::{
     new_id, GramDirection as StoredDirection, GramFile, GramItem, MAX_LABEL_BYTES, MAX_MIME_BYTES,

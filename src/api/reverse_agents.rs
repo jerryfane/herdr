@@ -3,10 +3,13 @@
 //! The SSH host-key trust and saved machine pin authenticate the machine; the
 //! caller pane is a trusted-machine assertion, not same-user process isolation.
 
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
