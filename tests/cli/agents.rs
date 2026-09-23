@@ -441,17 +441,19 @@ fn agent_start_command_works() {
     assert_eq!(stale_idle["error"]["code"], "timeout");
 
     let stalled = prompt_wait("do not transition", "6000");
-    assert_eq!(stalled.status.code(), Some(1));
-    let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
+    assert_eq!(stalled.status.code(), Some(0));
+    let stalled: serde_json::Value = serde_json::from_slice(&stalled.stdout).unwrap();
     // `unverifiable`, not `stalled`: this harness runs a test pane whose agent
     // declares no `[composer]` region, so the daemon has nothing to observe and must
     // say so. `stalled` is reserved for a composer it COULD read that showed nothing
     // either way — the distinction this verdict exists to make, and one this fixture
     // cannot exercise precisely because it has no composer.
-    assert_eq!(stalled["error"]["code"], "agent_prompt_unverifiable");
-    assert!(stalled["error"]["message"]
+    assert_eq!(stalled["result"]["type"], "agent_prompt_unconfirmed");
+    assert_eq!(stalled["result"]["delivery"], "written_to_pty");
+    assert_eq!(stalled["result"]["reason"], "agent_prompt_unverifiable");
+    assert!(stalled["result"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("do not treat this as non-delivery")));
+        .is_some_and(|message| message.contains("unsupported for this agent")));
 
     for prompt in ["done churn", "session churn"] {
         let settled_only = prompt_wait(prompt, "500");

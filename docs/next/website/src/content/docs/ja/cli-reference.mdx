@@ -125,6 +125,8 @@ herdr server reload-agent-manifests
 ```
 
 `herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
+`submit-verify` 列（`--json` では `submission_verification_supported`）は、現在有効なマニフェストに `[composer]` があるかを示します。個々のペインで実際に観測できることまでは保証しません。
+
 
 ## 通知
 
@@ -353,6 +355,8 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。その後 Herdr は要求された settled 状態を待ちます。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
 
 書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。コンポーザー観測をまったく公開しないペインでは、`agent_prompt_stalled` ではなく `agent_prompt_unverifiable` を返します。呼び出し側は「観測したが何もなかった」と「観測できなかった」を区別できます。どちらも未送信の証明ではありません。
+`agent prompt --wait` では、PTY への書き込み後に送信を確認できない 3 種類の結果を、`result.type: "agent_prompt_unconfirmed"`、`delivery: "written_to_pty"` と理由コード（`agent_prompt_unverifiable`、`agent_prompt_stalled`、`agent_prompt_unsubmitted`）として stdout に出力し、終了コード 0 で返します。再送前にペインを確認してください。有効なマニフェストに composer がない場合は、そのエージェントでは送信確認がサポートされていないことを明示します。直接 API を使う呼び出し元には従来のエラーコードが返ります。
+
 
 `idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
 
@@ -393,7 +397,7 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 タイムアウトや `agent_prompt_stalled` は未送信を保証しません。再試行前にエージェントを確認してください。
 
-`pane wait-output` と `agent wait` は、`--timeout` を省略すると無期限に待ちます。`agent prompt --wait` では、活動を観測した後、またはプロンプト開始時に `working` だった場合の安定状態待機は無期限です。non-working 状態から開始して活動を観測できない場合は、5 秒後に `agent_prompt_stalled` を返します。タイムアウトまたはサーバーエラーは JSON として stderr に出力され、終了コード 1 になります。CLI 使用法のエラーは終了コード 2 です。
+`pane wait-output` と `agent wait` は、`--timeout` を省略すると無期限に待ちます。`agent prompt --wait` では、活動を観測した後、またはプロンプト開始時に `working` だった場合の安定状態待機は無期限です。non-working 状態から開始して活動を観測できない場合は、5 秒後に送信未確認の結果を返します。タイムアウトは PTY への書き込み確認前にも起こり得るため、引き続きエラーです。実際の配信失敗やサーバーエラーは JSON として stderr に出力され、終了コード 1 になります。CLI 使用法のエラーは終了コード 2 です。
 
 ## インテグレーション
 

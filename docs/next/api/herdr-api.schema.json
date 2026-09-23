@@ -8918,6 +8918,11 @@
             "source_kind": {
               "type": "string"
             },
+            "submission_verification_supported": {
+              "default": false,
+              "description": "The active manifest declares a composer observation region; runtime\nvisibility can still prevent confirmation of a particular submission.",
+              "type": "boolean"
+            },
             "warning": {
               "type": [
                 "string",

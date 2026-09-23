@@ -440,6 +440,10 @@ pub struct AgentManifestInfo {
     pub agent: String,
     pub source: String,
     pub source_kind: String,
+    /// The active manifest declares a composer observation region; runtime
+    /// visibility can still prevent confirmation of a particular submission.
+    #[serde(default)]
+    pub submission_verification_supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

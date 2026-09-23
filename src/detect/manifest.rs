@@ -81,6 +81,7 @@ pub(crate) struct AgentManifestSummary {
     pub(crate) agent: Agent,
     pub(crate) active_source: ManifestSource,
     pub(crate) active_version: Option<String>,
+    pub(crate) submission_verification_supported: bool,
     pub(crate) cached_remote_version: Option<String>,
     pub(crate) local_override_shadowing_remote: bool,
     pub(crate) warning: Option<String>,
@@ -93,6 +94,19 @@ pub(crate) fn manifest_summaries() -> Vec<AgentManifestSummary> {
         Err(poisoned) => poisoned.into_inner(),
     };
     manifest_summaries_from_cache(&guard)
+}
+pub(crate) fn submission_verification_supported(agent: Agent) -> bool {
+    let lock = manifest_cache();
+    let guard = match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .manifests
+        .iter()
+        .find(|(candidate, _)| *candidate == agent)
+        .and_then(|(_, loaded)| loaded.as_ref())
+        .is_some_and(|loaded| loaded.manifest.composer.is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +420,7 @@ fn manifest_summary_from_loaded(agent: Agent, loaded: LoadedManifest) -> AgentMa
     AgentManifestSummary {
         agent,
         active_version: loaded.manifest.version.as_ref().map(ToString::to_string),
+        submission_verification_supported: loaded.manifest.composer.is_some(),
         active_source: loaded.source,
         cached_remote_version: loaded.cached_remote_version,
         local_override_shadowing_remote: loaded.local_override_shadowing_remote,

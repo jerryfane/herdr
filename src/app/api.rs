@@ -2418,6 +2418,7 @@ fn agent_manifest_info(
         agent: crate::detect::agent_label(summary.agent).to_string(),
         source: summary.active_source.label(),
         source_kind: summary.active_source.kind().to_string(),
+        submission_verification_supported: summary.submission_verification_supported,
         active_version: summary.active_version,
         cached_remote_version: summary.cached_remote_version,
         local_override_shadowing_remote: summary.local_override_shadowing_remote,
