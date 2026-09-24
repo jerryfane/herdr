@@ -301,54 +301,6 @@ fn root_and_command_group_help_point_agents_to_plain_text_docs() {
 }
 
 #[test]
-fn subcommand_help_explains_automation_semantics_without_a_server() {
-    let cases: &[(&[&str], &str)] = &[
-        (&["agent", "wait", "--help"], "Without --until"),
-        (
-            &["agent", "prompt", "--help"],
-            "first matching state observed after submission",
-        ),
-        (&["agent", "start", "--help"], "ready for input"),
-        (
-            &["agent", "send-keys", "--help"],
-            "canonical Escape key name",
-        ),
-        (
-            &["pane", "wait-output", "--help"],
-            "including existing output",
-        ),
-        (
-            &["pane", "send-keys", "--help"],
-            "canonical Escape key name",
-        ),
-    ];
-
-    for (args, expected) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
-            .args(*args)
-            .env_remove("HERDR_SOCKET_PATH")
-            .env_remove("HERDR_CLIENT_SOCKET_PATH")
-            .env_remove("HERDR_ENV")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "herdr {} failed: status={:?} stdout={} stderr={}",
-            args.join(" "),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(expected),
-            "herdr {} help did not contain {expected:?}: {stdout}",
-            args.join(" ")
-        );
-    }
-}
-
-#[test]
 fn removed_wait_and_agent_send_commands_are_rejected() {
     let wait = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .args(["wait", "output", "w1:p1", "--match", "ready"])

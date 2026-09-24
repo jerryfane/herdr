@@ -296,13 +296,17 @@ fn prompt_agent_with_effect_timeout(
     else {
         return Ok(None);
     };
-    let (mut initial, delivery) = match effect {
-        PromptEffectOutcome::Submitted(agent) => {
-            (agent, crate::api::schema::AgentPromptDelivery::Submitted)
-        }
-        PromptEffectOutcome::WrittenToPty(agent) => {
-            (agent, crate::api::schema::AgentPromptDelivery::WrittenToPty)
-        }
+    let (mut initial, delivery, composer_submission_observed) = match effect {
+        PromptEffectOutcome::Submitted(agent, composer_cleared) => (
+            agent,
+            crate::api::schema::AgentPromptDelivery::Submitted,
+            composer_cleared,
+        ),
+        PromptEffectOutcome::WrittenToPty(agent) => (
+            agent,
+            crate::api::schema::AgentPromptDelivery::WrittenToPty,
+            false,
+        ),
         PromptEffectOutcome::Response(response) => return Ok(Some(response)),
     };
     // A PTY write is a receipt, not proof of submission. If submission could
@@ -312,8 +316,11 @@ fn prompt_agent_with_effect_timeout(
         return agent_prompt_success(request_id, initial, delivery).map(Some);
     }
     // The submission observation itself may capture a fast settled transition.
-    // Require a new lifecycle sequence so a pre-prompt idle frame cannot match.
-    if agent_wait_matches(&initial, &until, Some(prompt_state_change_seq)) {
+    // A new lifecycle sequence or an observed same-attempt composer clear proves
+    // this status belongs to a post-write sample, not a pre-prompt idle frame.
+    if agent_wait_matches(&initial, &until, Some(prompt_state_change_seq))
+        || (composer_submission_observed && until.contains(&initial.agent_status))
+    {
         return agent_prompt_success(request_id, initial, delivery).map(Some);
     }
     let prompt_activity_observed = prompt_started_working
@@ -414,7 +421,7 @@ fn agent_prompt_success(
 }
 
 enum PromptEffectOutcome {
-    Submitted(crate::api::schema::AgentInfo),
+    Submitted(crate::api::schema::AgentInfo, bool),
     WrittenToPty(crate::api::schema::AgentInfo),
     Response(String),
 }
@@ -511,7 +518,10 @@ fn observe_prompt_effect(
             std::time::Instant::now() >= deadline,
         ) {
             Some(PromptObservationVerdict::Submitted) => {
-                return Ok(Some(PromptEffectOutcome::Submitted(current)));
+                return Ok(Some(PromptEffectOutcome::Submitted(
+                    current,
+                    composer_clear_observed,
+                )));
             }
             Some(PromptObservationVerdict::WrittenToPty) => {
                 return Ok(Some(PromptEffectOutcome::WrittenToPty(current)));
@@ -1449,6 +1459,37 @@ mod tests {
             response["error"]["code"], "agent_status_unobserved_after_submit",
             "{response}"
         );
+    }
+
+    #[test]
+    fn prompt_agent_accepts_post_write_composer_clear_in_requested_idle() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-idle-clear"),
+        );
+        let cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-idle-clear"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let response = run_prompt_harness(
+            "idle-clear",
+            "fast completed turn",
+            crate::api::schema::AgentStatus::Idle,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    cleared,
+                ]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_eq!(response["result"]["delivery"], "submitted", "{response}");
+        assert_eq!(response["result"]["agent"]["agent_status"], "idle");
     }
 
     #[test]
