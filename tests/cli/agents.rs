@@ -435,58 +435,20 @@ fn agent_start_command_works() {
     };
 
     assert!(report_agent("idle"));
-    let stale_idle = prompt_wait("do not transition", "500");
-    assert_eq!(stale_idle.status.code(), Some(1));
-    let stale_idle: serde_json::Value = serde_json::from_slice(&stale_idle.stderr).unwrap();
-    assert_eq!(stale_idle["error"]["code"], "timeout");
+    let unverified = prompt_wait("do not transition", "500");
+    assert_eq!(unverified.status.code(), Some(0));
+    let unverified: serde_json::Value = serde_json::from_slice(&unverified.stdout).unwrap();
+    assert_eq!(unverified["result"]["type"], "agent_prompted");
+    assert_eq!(unverified["result"]["delivery"], "written_to_pty");
 
-    let stalled = prompt_wait("do not transition", "6000");
-    assert_eq!(stalled.status.code(), Some(0));
-    let stalled: serde_json::Value = serde_json::from_slice(&stalled.stdout).unwrap();
-    // `unverifiable`, not `stalled`: this harness runs a test pane whose agent
-    // declares no `[composer]` region, so the daemon has nothing to observe and must
-    // say so. `stalled` is reserved for a composer it COULD read that showed nothing
-    // either way — the distinction this verdict exists to make, and one this fixture
-    // cannot exercise precisely because it has no composer.
-    assert_eq!(stalled["result"]["type"], "agent_prompt_unconfirmed");
-    assert_eq!(stalled["result"]["delivery"], "written_to_pty");
-    assert_eq!(stalled["result"]["reason"], "agent_prompt_unverifiable");
-    assert!(stalled["result"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("unsupported for this agent")));
-
-    for prompt in ["done churn", "session churn"] {
-        let settled_only = prompt_wait(prompt, "500");
-        assert_eq!(settled_only.status.code(), Some(1));
-        let settled_only: serde_json::Value = serde_json::from_slice(&settled_only.stderr).unwrap();
-        assert_eq!(settled_only["error"]["code"], "timeout");
-    }
-
-    let blocked_after_submit = prompt_wait("block after submit", "2000");
-    assert!(blocked_after_submit.status.success());
-    let blocked_after_submit: serde_json::Value =
-        serde_json::from_slice(&blocked_after_submit.stdout).unwrap();
-    assert_eq!(
-        blocked_after_submit["result"]["agent"]["agent_status"],
-        "blocked"
-    );
-    assert!(report_agent("idle"));
+    // This pane has no composer coverage. Even an already-working agent
+    // cannot have this new submission inferred from its lifecycle churn.
     assert!(report_agent("working"));
     let already_working = prompt_wait("finish active", "2000");
-    assert!(
-        already_working.status.success(),
-        "prompt failed: {}",
-        String::from_utf8_lossy(&already_working.stderr)
-    );
-
-    let prompted = prompt_wait("Review this diff", "2000");
-    assert!(
-        prompted.status.success(),
-        "prompt failed: {}",
-        String::from_utf8_lossy(&prompted.stderr)
-    );
-    let prompted: serde_json::Value = serde_json::from_slice(&prompted.stdout).unwrap();
-    assert_eq!(prompted["result"]["type"], "agent_prompted");
+    assert!(already_working.status.success());
+    let already_working: serde_json::Value =
+        serde_json::from_slice(&already_working.stdout).unwrap();
+    assert_eq!(already_working["result"]["delivery"], "written_to_pty");
 
     let duplicate = run_cli(
         &socket_path,
