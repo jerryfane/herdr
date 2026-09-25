@@ -121,6 +121,98 @@ manage_ssh_config = true
 
 启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含用户和系统 SSH 配置，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Linux 和 macOS 客户端还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接；Windows OpenSSH 不使用此复用方式。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
 
+## 联邦
+
+联邦功能让一个 Herdr 守护进程访问另一个守护进程的运行时。默认关闭。只有同时启用入站 TCP 监听并提供至少一个用于身份验证的对等方令牌时，监听器才会绑定端口；否则它会拒绝启动，而不会暴露未经身份验证的端口。
+
+```toml
+[federation]
+coordinator = true
+listen = true
+listen_addr = "127.0.0.1:7020"
+
+[[federation.peers]]
+alias = "laptop"
+token_file = "/etc/herdr/peers/laptop.token"
+capability = "observe"
+
+[[federation.peers]]
+alias = "ops"
+token_file = "/etc/herdr/peers/ops.token"
+capability = "interact"
+
+[[federation.peers]]
+alias = "build"
+endpoint = "tcp://build.internal:7020"
+token_file = "/etc/herdr/peers/build.token"
+expected_node_id = "machine_0123456789abcdef0123456789abcdef"
+```
+
+每个 `[[federation.peers]]` 表声明一个对等方：
+
+- `alias` — 对等方稳定的本地路由标识，用于限定名称的 ID、日志和诊断信息。
+- `display_label` — 可选、可修改的显示文本。修改它不会改变路由标识，也不会让对等方重新连接。
+- `token_file` — 入站和出站 TCP 联邦使用的共享密钥文件路径。去除首尾空白后的内容绝不会写入日志。文件不可读或为空时，既不授予入站访问权限，也不发送出站凭据。
+- `endpoint` — 可选的出站连接目标，格式为 `tcp://host:port`。省略则该对等方仅供入站连接。SSH 目标应配置在已保存机器目录和 `federation.saved_machines` 中，而不是此表。
+- `expected_node_id` — 可选的安装身份固定值；TCP 对等方入站连接时，以及轮询任一出站对等方的 `agent.list` 响应时，都会检查它。设置了固定值后，缺失或变化的身份都会被拒绝。
+- `capability` — 令牌通过 TCP 联邦授予的能力级别，可为 `observe`、`interact` 或 `admin`，默认为 `observe`。
+
+已保存机器的联邦信任策略独立于端点目录和显式配置的 TCP 对等方：
+
+```toml
+[federation.saved_machines."0123456789abcdef0123456789abcdef"]
+expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+```
+
+表的键是已保存机器不可变的配置档案 ID。只有 `federation.coordinator = true` 时才会同步已保存的配置档案；默认的远端角色不会把自己的目录再次联邦出去，因此在一台机器上启用此功能不会形成循环。端点目录仍是每个受信任配置档案的标签、SSH 目标、远端会话和启用状态的权威来源。添加、启用、禁用、移除、修改目标或会话以及修改信任策略，都无需重启守护进程即可生效。仅重命名标签只会改变显示信息，不会重新连接或改变限定名称的路由标识。移除机器后再添加会产生新的配置档案 ID，不会继承旧信任策略。`expected_machine_id` 是必填项，未知的凭据字段会被拒绝。身份验证仍由 OpenSSH 负责，而 SSH 联邦仍是授予完全控制权的信任边界；此策略绝不存储或派生令牌、密码或私钥。
+
+能力级别依次递增，每一级都包含其下一级的权限：
+
+- `observe` — 只读：列出、读取和检查窗格、代理、事件及布局。
+- `interact` — 包含 `observe` 的所有权限，另可操控代理和窗格（`agent.prompt`、`agent.send_keys`、`pane.send_text`、`pane.send_keys`）。
+- `admin` — 包含 `interact` 的所有权限，另可修改焦点、名称和输入/控制权（`agent.focus`、`agent.rename`、`pane.rename`、`pane.input.set`、`pane.send_input`、`agent.view.set`、`agent.view.clear`）。
+
+每条出站传输连接都有单调递增的对等方代次，并从 `agent.list` 得知远端守护进程不透明的启动 ID。普通响应和每个 `pane.stream` 帧都会与请求开始时观测到的代次及启动 ID 核对。因此，目标或会话重新加载、断线后连接被替换、或远端重启时，旧路由会终止并返回 `stale_peer_generation`，而不会转发过期数据。本机绝不会自动重试：`peer_unreachable` 表示连接未建立，而 `delivery_unknown` 表示建立连接后写入或响应失败，对等方可能已经执行了操作。`forbidden` 及其他对等方错误会原样传递。
+联邦只开放特意限定的 API 只读与操控子集。任何不属于上述级别的功能——服务器生命周期、插件、集成、gram、通知、窗口标题，以及代理/窗格/工作区/标签页/worktree/布局的变更和图形功能——无论级别如何，所有联邦对等方都无法访问。入站连接数也受到限制，防止对等方耗尽守护进程的线程或文件描述符。
+
+`agent.list` 默认返回本地代理及协调端缓存的远端代理。联邦轮询器会设置其 `local_only` 参数，让对等方只返回自己拥有的代理；这可防止环状对等方拓扑再次导出已经限定名称的代理。轮询器还会丢弃已带有联邦机器身份的返回代理，以便在旧版守护进程忽略新参数时，混合版本的对等方仍有边界。
+
+在协调端运行 `herdr machine status`（或 `herdr machine status --json`），分别查看已保存配置档案、端点/TUI 和联邦的健康状况。不受信任的配置档案会显示 `herdr machine federate <profile-id>` 作为下一步操作（JSON 中为 `next_action`）。联邦可达性、已验证的远端机器 ID、上次成功轮询、有限类别的错误、协商的版本/能力及过期数据会分别报告。错误信息不会暴露 SSH 命令、令牌或远端 stderr。
+
+运行 `herdr machine add --label <label> <user@host>` 后，再运行 `herdr machine federate <label-or-id>`，仅为该已保存机器启用联邦。该命令通过 OpenSSH 连接，首次使用时获取远端安装身份，将其固定在 `federation.saved_machines` 中，启用协调端模式并重新加载正在运行的守护进程。用 `herdr machine status` 验证可达性；`herdr machine unfederate <label-or-id>` 仅移除该策略，保留已保存的 SSH 配置档案。后续身份不匹配时会拒绝访问，而不会替换固定的身份。首次连接前请检查 SSH 主机密钥：该命令不会让未知主机自动变得可信。
+
+### 迁移 SSH 联邦对等方
+
+对于旧版 `[[federation.peers]]` 中的 SSH 条目，运行 `herdr machine federate <alias>`；它会将条目迁移为已保存的配置档案和固定身份策略，而不会将凭据带入配置。如果还存在多个旧版 SSH 对等方，可通过 `herdr machine federate <alias> --migrate-all-legacy` 明确选择一次性迁移全部；仅迁移一个对等方时，命令会拒绝留下无效的半迁移配置。TCP 和仅入站的对等方保持不变。不要重新创建已有的已保存配置档案：移除后重新添加会生成新 ID，并丢失旧信任策略。
+
+协调端现在只使用已保存机器的 `remote-api-bridge`；单请求 `api-bridge` 命令和直接 SSH 请求传输已不再存在。直接运行的 `herdr --machine <label-or-id> …` 命令仍使用同一已保存配置档案，且独立于联邦策略继续可用。启用协调端模式前，请先升级到同时提供两个 bridge 命令的版本。如果将协调端回滚到此次切换之前的版本，也必须回滚远端二进制文件，否则通过那些远端的联邦连接会失败，因为较新的二进制文件不再提供 `api-bridge`。请先备份配置；旧版二进制文件也可能拒绝较新的 `coordinator`、`display_label` 或 `saved_machines` 键，直至移除这些键。
+
+OpenSSH 凭据不会迁移到 Herdr。现有代理、主机密钥策略、SSH 配置和私钥处理仍由 OpenSSH 管理；联邦配置只保存不可变的配置档案 ID 和预期机器 ID。
+
+### 指定代理的反向访问（受信任机器）
+
+在协调端启用 `[federation] coordinator = true`、在 `[federation.saved_machines.<profile-id>]` 下拥有固定身份的已保存 SSH 机器，并授予一个在线代理权限之前，反向访问始终关闭。例如，在协调端运行 `herdr machine grant <profile-id> <profile-id>/<terminal-id> --observe --interact`。`--observe-peer <alias>` 和 `--interact-peer <alias>` 分别允许其他对等方访问；不指定这些选项时，只暴露协调端的代理。`herdr machine revoke <profile-id> <profile-id>/<terminal-id>` 会移除授权并重新加载协调端。授权绑定源窗格 ID、显示的代理名称和 harness 会话引用；换用不同会话重启、重命名、归档、转移或机器身份固定值不匹配时，都会拒绝访问。撤销授权会停止反向 SSH 转发；已经提交的提示仍可能处于送达结果未知的状态。
+
+在**远端**机器上，须在 `[federation]` 下显式设置 `reverse_coordinator_machine_id = "<coordinator-install-id>"`（授权命令会打印该 ID）。获授权的代理调用 `herdr agent federated-list` 和 `herdr agent federated-prompt <coordinator-terminal-id> "message"`；默认由 `HERDR_PANE_ID` 标识其在线的本地窗格。也可以用 `--caller-pane` 指定该公开窗格 ID 或其本地终端 ID。CLI 会在向协调端发出请求前，将两种 ID 都解析为当前在线的终端。列表包含协调端代理以及明确获准访问的对等方代理，并附带协调端观测到的可达性。
+
+这**不是进程级安全隔离**。Herdr 的本地 Unix API 信任调用者提供的窗格身份。受信任远端机器上以同一用户身份运行的任何恶意进程，都可以冒用获授权的窗格 ID 并使用其权限。只为其同一用户进程也值得信任的机器启用此功能；选择代理只是方便路由，并非由操作系统强制执行的沙箱。
+
+:::caution[安全]
+TCP 联邦令牌只授予对应对等方的能力级别，不会授予更多权限。应将每个令牌文件视为仅适用于该级别的秘密：对只需查看的对等方提供 `observe` 令牌，`admin` 只留给完全信任的对等方。SSH 路径则不同：它会针对指定会话的本地 socket 运行所发现的远端 Herdr 可执行文件的 `remote-api-bridge`，因而授予完整、未经筛选的控制平面访问权限。身份验证、主机密钥检查和交互式身份验证失败均由 OpenSSH 负责。本地 Unix socket 本身绝不会检查令牌或按能力级别筛选。
+:::
+
+### 受信任机器之间的 Gram 文件
+
+Gram 仍保存在协调端的规范存储中。已保存且固定了身份的 SSH 对等方可以通过另一个默认关闭的反向 Unix socket，在远端执行 `gram send --file`、列出文件、下载文件和删除文件。所有者通过带机器限定名称的代理名向远端代理发送消息（`herdr gram post "message" --to <profile-id>/<agent>`）。这**不会**将 `gram.*` 添加到普通 TCP 联邦的允许列表，也不会转发协调端不受限制的本地 API。
+
+启动**协调端守护进程**前，在其环境中设置 `HERDR_GRAM_RELAY_PEERS=<profile-id>`（多个明确受信任的配置档案 ID 以逗号分隔）。从 Herdr 配置目录下的 `machine.json` 读取协调端安装 ID。启动**远端守护进程**前，将其 `HERDR_GRAM_REVERSE_SOCKET` 设置为 `herdr gram relay-path <coordinator-install-id>` 的输出。两端都需要更新后的二进制文件；协调端已保存的 SSH 配置档案必须已固定远端安装 ID。OpenSSH 必须允许反向 stream-local 转发。不会将任何私有 SSH 密钥复制到远端机器。
+
+反向 socket 仅供远端账户私用，并随已保存的 SSH 会话重新连接。断开连接期间，远端 Gram 操作会失败，而不会悄悄写入另一个本地存储。`gram post` 和 `gram grab` 等仅供协调端使用的方法在远端也会明确失败；请在协调端运行它们。文件先按现有大小限制暂存，只有长度和 SHA-256 均匹配后才提交到协调端；下载也会验证两者，然后以原子方式替换目标文件。默认的疑似凭据下载警告会扫描每个数据块；`--reveal` 是显式覆盖选项。已删除的源附件无法下载；上传中断只会留下有大小上限的暂存数据，并在过期后清理。
+
+:::caution[受信任机器边界]
+在已启用的远端机器上，以同一用户身份运行的另一个进程可以冒用接收方窗格 ID，读取该窗格的 Gram 文件。这些控制措施会挡住其他机器和普通的错误接收方调用，但**不提供**进程级隔离。只为你信任其用户账户的机器启用。
+:::
+
 ## 按键绑定
 
 有关前缀键的引导式介绍和经过验证的免前缀配置，请参阅[键盘](/docs/keyboard/)。
