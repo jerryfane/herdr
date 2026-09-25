@@ -3842,6 +3842,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancellation: None,
         };
         let args = ssh
             .command()

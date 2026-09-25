@@ -3,33 +3,49 @@
 //! The SSH host-key trust and saved machine pin authenticate the machine; the
 //! caller pane is a trusted-machine assertion, not same-user process isolation.
 
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
-use std::io::{self, Read};
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
 use std::thread::{self, JoinHandle};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use crate::api::client::ApiClient;
+#[cfg(unix)]
 use crate::api::federation_manager::PeerRoute;
+#[cfg(unix)]
 use crate::api::schema::{
     AgentInfo, AgentListParams, AgentPromptParams, Method, Request, ResponseResult, SuccessResponse,
 };
+#[cfg(unix)]
 use crate::config::FederationAgentGrant;
 
+#[cfg(unix)]
 const REQUEST_LIMIT: usize = 64 * 1024;
+#[cfg(unix)]
 const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+#[cfg(unix)]
 const DEADLINE: Duration = Duration::from_secs(20);
+#[cfg(unix)]
 const WIRE_VERSION: u32 = 1;
 
 /// Stable on the remote machine, independent of mutable profile labels and
 /// remote sessions. The owner must explicitly pin the coordinator in config.
+#[cfg(unix)]
 pub(crate) fn reverse_socket_path(
     coordinator_machine_id: &str,
     remote_machine_id: &str,
@@ -41,6 +57,7 @@ pub(crate) fn reverse_socket_path(
     PathBuf::from("/tmp").join(format!("{}.sock", &name[..27]))
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReverseRequest {
@@ -56,6 +73,7 @@ pub(crate) enum ReverseMethod {
     AgentPrompt { target: String, text: String },
 }
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ReverseResponse {
     pub version: u32,
@@ -64,6 +82,7 @@ pub(crate) struct ReverseResponse {
     pub error: Option<String>,
 }
 
+#[cfg(unix)]
 fn error(message: impl Into<String>) -> ReverseResponse {
     ReverseResponse {
         version: WIRE_VERSION,
@@ -132,6 +151,7 @@ pub(crate) fn request_remote(
     ))
 }
 
+#[cfg(unix)]
 fn read_line_bounded(stream: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -317,6 +337,7 @@ impl Drop for ReverseGateway {
     }
 }
 
+#[cfg(unix)]
 fn handle_request(
     request: ReverseRequest,
     route: &PeerRoute,
@@ -434,6 +455,7 @@ fn handle_request(
     }
 }
 
+#[cfg(unix)]
 fn agent_list(
     client: &ApiClient,
     local_only: bool,
@@ -461,6 +483,7 @@ fn agent_list(
     serde_json::from_value(value).map_err(io::Error::other)
 }
 
+#[cfg(unix)]
 fn grant_matches(grant: &FederationAgentGrant, agent: &AgentInfo) -> bool {
     grant.terminal_id == agent.terminal_id
         && grant.name == agent.name
@@ -469,7 +492,7 @@ fn grant_matches(grant: &FederationAgentGrant, agent: &AgentInfo) -> bool {
         && agent.session_transfer.is_none()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -6,6 +6,7 @@
 //! `server.apply_staged_update`. Device-local JSON, secret-free, mirroring the other small
 //! persist stores ([`crate::persist::machine`]).
 
+#[cfg(unix)]
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -44,21 +45,24 @@ fn load_from_path(path: &Path) -> Option<StagedBuild> {
 
 /// Remove the staged manifest — called once the staged build is the one running, so the app
 /// stops reporting an available update.
+#[cfg(any(unix, test))]
 pub fn clear() {
     let _ = std::fs::remove_file(manifest_path());
 }
 
 /// Append a suffix to a path's file name (not [`Path::with_extension`], which would REPLACE any
 /// existing extension — the daemon binary has none, but appending is unambiguous).
+#[cfg(unix)]
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
 }
 
-/// Verify a staged binary is safe to swap in: it exists, is a regular non-empty file, and (unix)
+/// Verify a staged binary is safe to swap in: it exists, is a regular non-empty file, and
 /// has an executable bit. This is a cheap sanity gate; the real correctness guard is that the
 /// live-handoff validates the replacement reports the expected version.
+#[cfg(unix)]
 pub fn verify_staged_binary(path: &Path) -> io::Result<()> {
     let meta = std::fs::metadata(path)?;
     if !meta.is_file() {
@@ -73,15 +77,12 @@ pub fn verify_staged_binary(path: &Path) -> io::Result<()> {
             "staged binary is empty",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o111 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "staged binary is not executable",
-            ));
-        }
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staged binary is not executable",
+        ));
     }
     Ok(())
 }
@@ -94,11 +95,6 @@ fn set_executable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, perms)
 }
 
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 /// Swap the staged binary onto the `live` path: copy to a temp beside it, mark it executable, then
 /// rename over `live` (atomic, and ETXTBSY-safe — you cannot overwrite a RUNNING executable in
 /// place, but you can rename another file over its path).
@@ -108,6 +104,7 @@ fn set_executable(_path: &Path) -> io::Result<()> {
 /// and this only updates the on-disk live path so a future restart runs the new build too. The
 /// old binary is being intentionally replaced. Assumes `staged` was verified with
 /// [`verify_staged_binary`].
+#[cfg(unix)]
 pub fn activate_on_disk(staged: &Path, live: &Path) -> io::Result<()> {
     let tmp = sibling(live, ".apply-tmp");
     if let Err(err) = std::fs::copy(staged, &tmp).and_then(|_| set_executable(&tmp)) {
@@ -122,6 +119,7 @@ pub fn activate_on_disk(staged: &Path, live: &Path) -> io::Result<()> {
 }
 
 /// The outcome of a staged apply once the handoff has committed.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// The new build is running AND the on-disk live path was updated to it.
@@ -141,6 +139,7 @@ pub enum ApplyOutcome {
 ///
 /// `handoff` is injected so this ordering invariant — the whole point of the apply path — is
 /// unit-testable without a real process re-exec.
+#[cfg(unix)]
 pub fn apply_with_handoff<F>(staged: &Path, live: &Path, handoff: F) -> io::Result<ApplyOutcome>
 where
     F: FnOnce() -> io::Result<()>,

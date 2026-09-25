@@ -160,6 +160,7 @@ impl SavedSshApiBridge {
 
 /// Dedicated reverse stream-local forward; NEVER point this at the unrestricted
 /// coordinator API socket. The caller provides its restricted per-peer gateway.
+#[cfg(unix)]
 pub(crate) fn reverse_forward_command(
     profile_id: &str,
     target: &str,
