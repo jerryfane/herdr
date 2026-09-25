@@ -997,7 +997,7 @@ fn managed_resume_powershell_script(argv: &[String], replace_shell: bool) -> Opt
     if !args.is_empty() {
         let command_line = args
             .iter()
-            .map(|arg| quote_windows_command_line_arg(arg))
+            .map(|arg| super::quote_windows_command_line_arg(arg))
             .collect::<Vec<_>>()
             .join(" ");
         start.push_str(" -ArgumentList ");

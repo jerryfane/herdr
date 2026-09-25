@@ -233,7 +233,7 @@ mod windows {
             let mut reader = master
                 .try_clone_reader()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
-            let writer = master
+            let mut writer = master
                 .take_writer()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             let (data_tx, mut data_rx) = mpsc::channel::<PtyIoDataCommand>(1024);
@@ -259,6 +259,7 @@ mod windows {
             {
                 let write_tx = write_tx.clone();
                 let response_order = Arc::clone(&response_order);
+                let accepting = Arc::clone(&accepting);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {
