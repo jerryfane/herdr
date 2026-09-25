@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   createGit,
+  compareGitTree,
   extractGitTree,
   gitPathExists,
   gitTreesEqual,
@@ -53,10 +54,12 @@ async function readManifest() {
 
 async function writeManifest(manifest) {
   manifest.versions = sortVersionsNewestFirst(manifest.versions).map(
-    ({ version, tag, commit, source }) => ({
+    ({ version, tag, commit, release_commit, source_tag, source }) => ({
       version,
       tag,
       ...(commit ? { commit } : {}),
+      ...(release_commit ? { release_commit } : {}),
+      ...(source_tag ? { source_tag } : {}),
       source,
     }),
   );
@@ -152,15 +155,32 @@ export async function checkVersions() {
     if (requiresCommit && !entry.commit) {
       throw new Error(`docs version ${entry.version} is missing commit provenance`);
     }
+    const separateSource = entry.source_tag !== undefined || entry.release_commit !== undefined;
+    if (separateSource && (
+      entry.source_tag !== `upstream/${entry.tag}` ||
+      !/^[0-9a-f]{40}$/.test(entry.release_commit) ||
+      !entry.commit
+    )) {
+      throw new Error(`docs version ${entry.version} has incomplete release/source provenance`);
+    }
     if (entry.commit) {
       if (!/^[0-9a-f]{40}$/.test(entry.commit)) {
         throw new Error(`docs version ${entry.version} has invalid commit ${entry.commit}`);
       }
       const taggedCommit = resolveCommit(git, entry.tag);
-      if (taggedCommit !== entry.commit) {
+      const releaseCommit = separateSource ? entry.release_commit : entry.commit;
+      if (taggedCommit !== releaseCommit) {
         throw new Error(
-          `docs version ${entry.version} tag ${entry.tag} moved from ${entry.commit} to ${taggedCommit}`,
+          `docs version ${entry.version} tag ${entry.tag} moved from ${releaseCommit} to ${taggedCommit}`,
         );
+      }
+      if (separateSource) {
+        const sourceCommit = resolveCommit(git, `refs/tags/${entry.source_tag}`);
+        if (sourceCommit !== entry.commit) {
+          throw new Error(
+            `docs version ${entry.version} source tag ${entry.source_tag} moved from ${entry.commit} to ${sourceCommit}`,
+          );
+        }
       }
     }
     if (!['website/src/content/docs', 'docs/next/website/src/content/docs'].includes(entry.source)) {
@@ -168,6 +188,14 @@ export async function checkVersions() {
     }
 
     const versionRoot = resolve(versionsDir, entry.version, 'website');
+    if (separateSource) {
+      await compareGitTree(
+        git,
+        `refs/tags/${entry.source_tag}`,
+        entry.source.slice(0, -'/src/content/docs'.length),
+        versionRoot,
+      );
+    }
     const documentationPaths = await listDocumentationPaths(
       resolve(versionRoot, 'src/content/docs'),
     );
@@ -201,7 +229,7 @@ export async function publishVersion(tag) {
       process.stdout.write(`documentation ${release.tag} is already published with the legacy stable source\n`);
       return;
     }
-    if (!existing?.commit || existing.commit !== release.commit) {
+    if (!existing?.commit || (existing.release_commit ?? existing.commit) !== release.commit) {
       throw new Error(`published documentation ${release.version} has mismatched commit provenance`);
     }
     process.stdout.write(`documentation ${release.tag} is already published\n`);
@@ -212,7 +240,7 @@ export async function publishVersion(tag) {
       if (existing.tag !== release.tag) {
         throw new Error(`version ${release.version} is already associated with ${existing.tag}`);
       }
-      if (existing.commit && existing.commit !== release.commit) {
+      if (existing.commit && (existing.release_commit ?? existing.commit) !== release.commit) {
         throw new Error(`version ${release.version} has mismatched commit provenance`);
       }
       process.stdout.write(`documentation ${release.tag} is already archived\n`);

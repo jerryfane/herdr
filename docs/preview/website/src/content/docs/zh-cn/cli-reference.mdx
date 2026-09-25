@@ -125,6 +125,8 @@ herdr server reload-agent-manifests
 ```
 
 `herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
+`submit-verify` 列（`--json` 中为 `submission_verification_supported`）表示当前生效的清单是否声明了 `[composer]`，但不保证某个窗格在运行时一定可观察。
+
 
 ## 通知
 
@@ -133,6 +135,24 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 ```
 
 `notification show` 使用配置的 `[ui.toast]` 投递方式。`--position` 只影响 Herdr 应用内的 toast。`--sound` 默认为 `none`;`done` 和 `request` 只在通知实际显示时播放已有的完成音和需要关注音。
+
+## Gram
+
+Gram 是在 Herdr 应用中呈现的所有者↔智能体消息通道。
+
+```bash
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # 给所有者发消息(推送通知)
+herdr gram list [--queue] [--unread] [--owner] [--limit N]  # --owner 以所有者身份查看;--limit 仅取最新 N 条
+herdr gram grab <id> [--as LABEL]               # 认领共享队列中的一项(先到先得)
+herdr gram get-file <id> -o PATH                # 下载消息附带的文件
+herdr gram post "<text>" [--to AGENT]           # 所有者:共享队列,或指定某个智能体
+herdr gram mark-read <id>                       # 所有者:将消息标记为已读
+herdr gram delete <id> [--owner]                # 彻底删除一条消息(及其附件)
+```
+
+智能体的身份来自 `HERDR_PANE_ID`,解析为其智能体名称(没有名称则为窗格 id)。该名称在重启或部署交接后仍然保持,但它是一个名称:重命名、清除或复用它会改变 `gram list` 中显示为“我的”的项。认领(grab)本身始终是先到先得且原子的,与身份无关——两个智能体永远无法认领同一项。归属信息(`from` 以及所有者发布的消息)仅供参考,并非经过认证。
+
+`send --file` 附加一个文件(说明文字可选),并分块上传以适应请求大小上限;`get-file` 用于下载。`delete` 会彻底删除消息及其附件字节——适合只发送一次随后即弃的短期机密(例如临时 API 密钥)。你可以删除自己发送的、认领的或发给你的消息;`--owner` 可删除任意消息。
 
 ## 会话
 
@@ -218,7 +238,7 @@ herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--f
 herdr pane close <pane_id>
 ```
 
-接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言,显式窗格 ID 或 `--pane ID` 拆分该窗格,`--current` 拆分调用方窗格,省略目标则使用 UI 当前聚焦的窗格。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
+接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言，显式窗格 ID 或 `--pane ID` 拆分指定窗格。省略目标时，若存在 `HERDR_PANE_ID` 则拆分调用方窗格，否则使用当前聚焦的窗格。`--current` 必须有调用方窗格；缺少 `HERDR_PANE_ID` 时会报错。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
 
 执行 `pane move` 后,后续命令应使用 `.result.move_result.pane.pane_id`。跨工作区移动会改变带工作区前缀的窗格 ID;旧值保留在 `.result.move_result.previous_pane_id`。运行中进程的 `HERDR_PANE_ID`、`HERDR_TAB_ID` 和 `HERDR_WORKSPACE_ID` 保持启动时的值,但 Herdr 会把旧窗格 ID 保留为该终端的别名,所以使用 `--current` 的窗格命令仍能解析它。实时智能体名称也会跟随终端。
 
@@ -264,6 +284,8 @@ herdr pane report-agent-session <pane_id> \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH] \
+  [--agent-session-cursor ID] \
+  [--agent-process-pid PID] \
   [--session-start-source SOURCE]
 
 herdr pane release-agent <pane_id> \
@@ -272,7 +294,7 @@ herdr pane release-agent <pane_id> \
   [--seq N]
 ```
 
-`report-agent-session` 只更新原生会话身份,不上报生命周期状态。`release-agent` 在智能体进程退出时结束该来源的生命周期权威。
+`report-agent-session` 只更新原生会话身份,不上报生命周期状态。使用树形会话日志的集成还可以用 `--agent-session-cursor` 上报当前选中的叶子,并用 `--agent-process-pid` 将该报告绑定到准确的运行时进程。`release-agent` 在智能体进程退出时结束该来源的生命周期权威。
 
 当官方集成上报了原生会话引用时,`pane get`、`pane list`、`agent get` 和 `agent list` 会包含一个只读的 `agent_session` 对象。没有存储原生会话引用时,该字段被省略。
 
@@ -328,9 +350,15 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
-`agent prompt` 遵循当前的 bracketed paste 模式，即使智能体处于 working，也会将文本和延迟的 Enter 作为一次有序提交写入。不带 `--wait` 时，成功只确认写入完成，不代表轮次已经开始。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在提交后的最多五秒内产生可观察的 `working` 或 `blocked` 状态，否则 Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的第一个稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+`agent prompt` 遵循当前的 bracketed paste 模式,即使智能体处于 working 也会先发送文本,短暂延迟后再发送编码后的 Enter。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在五秒内产生可观察的生命周期变化，否则 Herdr 返回 `agent_prompt_stalled`（能观察到 composer 但没有看到证据）或 `agent_prompt_unverifiable`（没有可观察的 composer）；调用方超时不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
 
-`idle` 和 `done` 都表示可以接受输入。CLI/API 使用服务器的已查看状态：`done` 表示尚未标记为已查看的 idle；显式 `pane focus` / `agent focus` 会标记目标，读取不会。每个 TUI 客户端独立记录它已显示的完成状态，因此其 Done 标记可能与 CLI 或其他客户端不同。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
+写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。此后 Herdr 会等待请求的 settled 状态。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+
+写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。对于完全不暴露 composer 观察的窗格，返回 `agent_prompt_unverifiable` 而非 `agent_prompt_stalled`，以便调用方区分“已观察但无证据”与“无法观察”；两者都不能证明未送达。
+对于 `agent prompt --wait`，PTY 已写入但无法确认提交的三种结果会写到 stdout：`result.type: "agent_prompt_unconfirmed"`、`delivery: "written_to_pty"`，以及 `agent_prompt_unverifiable`、`agent_prompt_stalled` 或 `agent_prompt_unsubmitted` 作为原因代码。CLI 退出状态为 0；再次发送前先检查窗格。若当前清单没有 composer 覆盖，提示会明确说明该智能体不支持提交验证。直接调用 API 仍会收到原有错误代码。
+
+
+`idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
 
 `agent send-keys` 发送 `enter`、`up`、`esc`、`ctrl+c` 等逻辑按键。Herdr 会在写入任何字节前验证所有按键。`agent read` 读取解析出的终端流,`agent rename` 为已检测到的智能体命名。
 
@@ -342,11 +370,17 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 ```bash
 herdr terminal attach <terminal_id> [--takeover]
+herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
+herdr terminal session observe <target> [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
 ```
 
 从直接附加中用 `ctrl+b q` 分离。用 `ctrl+b ctrl+b` 发送字面的 `ctrl+b`。
+`terminal session control` 为窗格、终端或智能体打开可写的实时终端流，输出与 observe 相同的逐行 JSON `terminal.frame` 和 `terminal.closed`，并从标准输入读取 `terminal.input`、`terminal.resize`、`terminal.scroll`、`terminal.release` 命令。同一终端同时只能有一个控制方，可用 `--takeover` 接管。
+
+`terminal session observe` 为相同目标打开只读实时流，输出包含 base64 ANSI 字节的逐行 JSON `terminal.frame`，服务器关闭流时输出 `terminal.closed`。多个观察方可以同时查看终端，不获取输入、调整尺寸、滚动或接管权限。Linux/macOS 上，若套接字写入连续 30 秒没有进展，观察方会被断开；此时可能没有最后的 `terminal.closed` 记录，但窗格和其他客户端继续运行。安静、没有输出的窗格不会触发此超时。
+
 `terminal title clear` 把外层终端窗口标题交还给 `ui.window_title`。
 
 ## 输出等待
@@ -363,7 +397,7 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 超时或 `agent_prompt_stalled` 并不代表未发送提示。重试前请先检查智能体。
 
-`pane wait-output` 和 `agent wait` 在省略 `--timeout` 时会无限等待。对于 `agent prompt --wait`，观察到活动后，或提示开始时已处于 `working`，等待稳定状态的过程不会超时；如果提示从 non-working 状态开始且未观察到活动，五秒后仍会返回 `agent_prompt_stalled`。超时或服务器错误以 JSON 写到 stderr,退出状态为 1。CLI 用法错误的退出状态为 2。
+`pane wait-output` 和 `agent wait` 在省略 `--timeout` 时会无限等待。对于 `agent prompt --wait`，观察到活动后，或提示开始时已处于 `working`，等待稳定状态的过程不会超时；如果提示从 non-working 状态开始且未观察到活动，五秒后会返回提交未确认的结果。超时可能发生在 PTY 写入得到确认之前，仍属于错误。真正的投递失败和服务器错误以 JSON 写到 stderr，退出状态为 1；CLI 用法错误的退出状态为 2。
 
 ## 集成
 

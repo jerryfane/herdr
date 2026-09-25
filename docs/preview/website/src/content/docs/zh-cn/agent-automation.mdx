@@ -73,7 +73,13 @@ herdr agent rename w1:p2 reviewer
 
 窗格输入直接指定终端,不关心当前进程。智能体输入会解析实时智能体;如果该智能体已不再控制此窗格,操作会被拒绝。
 
-如果智能体已经是 `blocked`，`agent prompt --wait` 会返回 `agent_blocked`，不会发送输入或开始等待。否则，它会将提示文本和延迟的 Enter 作为一次有序提交写入，然后等待状态。在 Windows 上，Codex 在 Enter 前会收到粘贴边界，因此提交不依赖提示大小；调用方的超时包含提交时间。如果提示从其他非 working 状态开始，提交后最多等待五秒来观察 `working` 或 `blocked`。如果没有观察到，Herdr 返回 `agent_prompt_stalled`；如果调用方的超时先到期，则返回普通的 `timeout` 错误。这可防止无关的 `idle`、`done` 或会话变化错误地完成等待。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
+除非智能体已经是 `blocked`,`agent prompt --wait` 会立即提交提示。已经是 `blocked` 时,它不会开始等待,而是返回 `agent_blocked`。已接受的提示从其他非 working 状态开始时,Herdr 首先要求在五秒内观察到生命周期变化。如果状态序列没有前进，它不会无限等待：能够观察到 composer 但没有看到任何证据时返回 `agent_prompt_stalled`，完全不暴露 composer 观察的窗格则返回 `agent_prompt_unverifiable`；调用方设置的 `--timeout` 不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
+
+`agent prompt --wait` 会区分 Herdr 在 PTY 确认写入后能够证明的投递状态。对于最初处于 settled 状态的智能体，生命周期序列前进会返回 `delivery: "submitted"`。Herdr 还会给 PTY 批次附加不透明的 attempt id，并在 writer 侧跟踪编辑器输入。同一个 attempt 仍留在由光标佐证的编辑器中时返回 `agent_prompt_unsubmitted`；该 attempt 被观察到后清空时返回 `submitted`。bracketed paste 不再依赖宿主 CLI 渲染的 paste token 文本。字节已经写入但无法证明其去向时，Herdr 返回 `agent_prompt_stalled`。 该判定现在表示 Herdr **能够**观察 composer，但未获得任何方向的证据。当该窗格完全不暴露 composer 观察时（智能体清单未声明 `[composer]` 区域，或其 manifest 未声明 `[composer]` 小节），Herdr 会改为返回 `agent_prompt_unverifiable`。两种判定都不能证明未送达；`agent_prompt_unverifiable` 报告的是缺少观测手段，而不是缺少提示，监督方不得据此按提示被拒绝来升级处理。
+
+`pane get` 的 `composer.state` 为 `empty`、`draft_present` 或 `unknown`，`attempt_id` 和 `evidence` 会说明来源及视觉佐证。Herdr 未写入、且仅出现在光标右侧的建议文本不是草稿。找不到编辑器区域、画面正在重绘、证据冲突，或旧 daemon 未返回 `composer` 时都必须是 `unknown`，绝不能静默变成 `empty`。光标只用于佐证 writer provenance；颜色本身不能产生确定结论。
+
+如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示：只有观察到同一个 writer-attributed attempt 随后清除才返回 `submitted`，否则成功状态仍是 `written_to_pty`。完成投递检查后，Herdr 会等待请求的 settled 状态。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
 
 `idle` 和 `done` 都表示可以接受输入。CLI/API 使用服务器的已查看状态：`done` 表示尚未标记为已查看的 idle；显式 `pane focus` / `agent focus` 会标记目标，读取不会。每个 TUI 客户端独立记录它已显示的完成状态，因此其 Done 标记可能与 CLI 或其他客户端不同。`blocked` 表示 Herdr 识别到了审批或提问界面。`unknown` 表示智能体存在,但 Herdr 无法可靠判断其生命周期;它不代表工作成功完成。区别重要时,请指定精确的 `--until` 状态。
 
