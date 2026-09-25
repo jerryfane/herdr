@@ -3115,6 +3115,7 @@ impl HeadlessServer {
             return true;
         }
 
+        #[cfg(unix)]
         if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
             use crate::persist::staged_build::ApplyOutcome;
             let apply_result = self.apply_staged_update();
@@ -3172,6 +3173,20 @@ impl HeadlessServer {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
                 self.finish_live_handoff_shutdown();
             }
+            return true;
+        }
+
+        #[cfg(not(unix))]
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            let response = serde_json::to_string(&api::schema::ErrorResponse {
+                id: msg.request.id,
+                error: api::schema::ErrorBody {
+                    code: "apply_staged_update_unsupported_platform".into(),
+                    message: "applying a staged build is unsupported on this platform".into(),
+                },
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
             return true;
         }
 

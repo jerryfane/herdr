@@ -16,7 +16,7 @@ DEFAULT_BUNDLED_DIR = PROJECT_ROOT / "src" / "detect" / "manifests"
 DEFAULT_PUBLISHED_DIR = PROJECT_ROOT / "distribution" / "agent-detection"
 ENGINE_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest_update.rs"
 
-MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
+MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules", "input_rules", "composer"}
 RULE_KEYS = {
     "id",
     "state",
@@ -34,6 +34,8 @@ RULE_KEYS = {
     "line_regex",
 }
 GATE_KEYS = {"all", "any", "not", "contains", "regex", "line_regex"}
+INPUT_RULE_KEYS = GATE_KEYS | {"id", "kind", "priority", "region"}
+INPUT_KINDS = {"confirm", "select", "free_text", "unknown"}
 STATES = {"idle", "working", "blocked", "unknown"}
 REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
@@ -57,6 +59,12 @@ MAX_MATCHER_CHARS = 512
 # can consume top_non_empty_lines. Remove this entry when the distribution
 # publishes the bundled Grok manifest.
 STAGED_PUBLISHED_MANIFESTS = {
+    # Keep engine-2 Claude clients on the published manifest until engine-5 input rules ship.
+    "claude": (
+        "2026.09.25.1",
+        "2026.09.11.1",
+        "038d0aa23fee3f9b39cb3c9ca117d0f95b0b3a5873cf0f38284ccbac279c9664",
+    ),
     "grok": (
         "2026.09.18.2",
         "2026.09.18.1",
@@ -125,7 +133,7 @@ def compare_versions(left: str, right: str, path: Path) -> int:
     return (left_parts > right_parts) - (left_parts < right_parts)
 
 
-def validate_manifest(path: Path, engine_version: int) -> dict:
+def validate_manifest(path: Path, engine_version: int, *, optional_version: bool = False) -> dict:
     manifest = load_toml(path)
     unknown = sorted(set(manifest) - MANIFEST_KEYS)
     if unknown:
@@ -136,7 +144,8 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
         raise CheckError(f"{path}: id must be a non-empty string")
 
     version = manifest.get("version")
-    version_tuple(version, path)
+    if version is not None or not optional_version:
+        version_tuple(version, path)
 
     min_engine = manifest.get("min_engine_version")
     if not isinstance(min_engine, int):
@@ -150,10 +159,13 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
     if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
         raise CheckError(f"{path}: aliases must be an array of strings")
 
-    rules = manifest.get("rules")
-    if not isinstance(rules, list) or not rules:
-        raise CheckError(f"{path}: rules must be a non-empty array")
-    if len(rules) > MAX_RULES_PER_MANIFEST:
+    rules = manifest.get("rules", [])
+    input_rules = manifest.get("input_rules", [])
+    if not isinstance(rules, list) or not isinstance(input_rules, list):
+        raise CheckError(f"{path}: rules and input_rules must be arrays")
+    if not rules and not input_rules:
+        raise CheckError(f"{path}: manifest must contain a rule or input rule")
+    if len(rules) + len(input_rules) > MAX_RULES_PER_MANIFEST:
         raise CheckError(f"{path}: manifest exceeds max rule count {MAX_RULES_PER_MANIFEST}")
     complexity = {"gates": 0, "matchers": 0}
     for index, rule in enumerate(rules):
@@ -163,6 +175,19 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
             raise CheckError(
                 f"{path}: rule {rule['id']} region {region!r} requires min_engine_version 3"
             )
+
+    for index, rule in enumerate(input_rules):
+        validate_input_rule(path, index, rule, complexity)
+    composer = manifest.get("composer")
+    if composer is not None:
+        if not isinstance(composer, dict) or set(composer) != {"region"}:
+            raise CheckError(f"{path}: composer must be a table with only region")
+        region = composer["region"]
+        if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+            raise CheckError(f"{path}: composer has invalid region {region!r}")
+        count_match = REGION_COUNT_RE.search(region)
+        if region.startswith("top_non_empty_lines(") and count_match and int(count_match.group(1)) > MAX_TOP_REGION_LINE_COUNT:
+            raise CheckError(f"{path}: composer has invalid region {region!r}")
 
     return manifest
 
@@ -194,7 +219,31 @@ def validate_rule(path: Path, index: int, rule: object, complexity: dict[str, in
             raise CheckError(f"{path}: rule {rule_id} skip_state_update requires state unknown")
         if rule.get("visible_idle") or rule.get("visible_blocker") or rule.get("visible_working"):
             raise CheckError(f"{path}: rule {rule_id} skip_state_update cannot set visible flags")
-    validate_gate(path, f"rule {rule_id}", rule, require_positive=True, depth=0, complexity=complexity)
+    validate_gate(path, f"rule {rule_id}", rule, require_positive=True, depth=0, complexity=complexity, allowed_fields=RULE_KEYS)
+
+
+def validate_input_rule(path: Path, index: int, rule: object, complexity: dict[str, int]) -> None:
+    if not isinstance(rule, dict):
+        raise CheckError(f"{path}: input rule {index} must be a table")
+    unknown = sorted(set(rule) - INPUT_RULE_KEYS)
+    if unknown:
+        raise CheckError(f"{path}: input rule {index} has unknown field(s): {', '.join(unknown)}")
+    rule_id = rule.get("id")
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise CheckError(f"{path}: input rule {index} id must be a non-empty string")
+    kind = rule.get("kind")
+    if kind not in INPUT_KINDS:
+        raise CheckError(f"{path}: input rule {rule_id} has invalid kind {kind!r}")
+    priority = rule.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int) or not -(2**31) <= priority < 2**31:
+        raise CheckError(f"{path}: input rule {rule_id} has invalid priority {priority!r}")
+    region = rule.get("region", "whole_recent")
+    if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+        raise CheckError(f"{path}: input rule {rule_id} has invalid region {region!r}")
+    count_match = REGION_COUNT_RE.search(region)
+    if region.startswith("top_non_empty_lines(") and count_match and int(count_match.group(1)) > MAX_TOP_REGION_LINE_COUNT:
+        raise CheckError(f"{path}: input rule {rule_id} has invalid region {region!r}")
+    validate_gate(path, f"input rule {rule_id}", rule, require_positive=True, depth=0, complexity=complexity, allowed_fields=INPUT_RULE_KEYS)
 
 
 def validate_gate(
@@ -204,13 +253,14 @@ def validate_gate(
     require_positive: bool,
     depth: int,
     complexity: dict[str, int],
+    allowed_fields: set[str] = GATE_KEYS,
 ) -> None:
     if depth > MAX_GATE_DEPTH:
         raise CheckError(f"{path}: {label} exceeds max gate depth {MAX_GATE_DEPTH}")
     complexity["gates"] += 1
     if complexity["gates"] > MAX_TOTAL_GATES:
         raise CheckError(f"{path}: manifest exceeds max gate count {MAX_TOTAL_GATES}")
-    unknown = sorted(set(gate) - (RULE_KEYS if label.startswith("rule ") else GATE_KEYS))
+    unknown = sorted(set(gate) - allowed_fields)
     if unknown:
         raise CheckError(f"{path}: {label} has unknown gate field(s): {', '.join(unknown)}")
     matcher_count = 0
@@ -273,12 +323,17 @@ def has_any_matcher(gate: dict) -> bool:
     )
 
 
-def load_manifest_dir(path: Path, engine_version: int) -> dict[str, tuple[Path, dict]]:
+def load_manifest_dir(path: Path, engine_version: int, *, bundled: bool = False) -> dict[str, tuple[Path, dict]]:
     if not path.is_dir():
         raise CheckError(f"{path}: manifest directory is missing")
     manifests: dict[str, tuple[Path, dict]] = {}
     for manifest_path in sorted(path.glob("*.toml")):
         if manifest_path.name == "index.toml":
+            continue
+        if bundled and manifest_path.name == "shared-input.toml":
+            shared = validate_manifest(manifest_path, engine_version, optional_version=True)
+            if shared["id"] != "shared":
+                raise CheckError(f"{manifest_path}: shared input manifest must have id 'shared'")
             continue
         manifest = validate_manifest(manifest_path, engine_version)
         agent_id = manifest["id"]
@@ -336,7 +391,7 @@ def validate_catalog(
         stages_new_engine_manifest = (
             staged_manifest
             == (bundled_manifest["version"], manifest["version"], published_digest)
-            and bundled_manifest["min_engine_version"] == engine_version
+            and bundled_manifest["min_engine_version"] <= engine_version
             and manifest["min_engine_version"] < bundled_manifest["min_engine_version"]
         )
         if cmp < 0 and not stages_new_engine_manifest:
@@ -372,7 +427,7 @@ def main() -> int:
     args = parse_args()
     try:
         engine_version = read_engine_version(args.engine_version)
-        bundled = load_manifest_dir(args.bundled_dir, engine_version)
+        bundled = load_manifest_dir(args.bundled_dir, engine_version, bundled=True)
         if args.require_published or args.require_all_published or args.published_dir.exists():
             if not args.published_dir.is_dir():
                 raise CheckError(f"{args.published_dir}: published manifest directory is missing")

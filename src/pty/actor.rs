@@ -129,16 +129,6 @@ mod windows {
                 })
         }
 
-        pub(crate) fn queue_user_input_submission(
-            &self,
-            text: Bytes,
-            enter: Bytes,
-            delay: Duration,
-            deadline: Option<Instant>,
-        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-            self.queue_user_input_submission_guarded(text, enter, delay, deadline, None)
-        }
-
         pub(crate) fn queue_user_input_submission_guarded(
             &self,
             text: Bytes,
@@ -233,7 +223,7 @@ mod windows {
             let mut reader = master
                 .try_clone_reader()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
-            let writer = master
+            let mut writer = master
                 .take_writer()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             let (data_tx, mut data_rx) = mpsc::channel::<PtyIoDataCommand>(1024);
@@ -259,6 +249,7 @@ mod windows {
             {
                 let write_tx = write_tx.clone();
                 let response_order = Arc::clone(&response_order);
+                let accepting = Arc::clone(&accepting);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {

@@ -392,6 +392,7 @@ fn staging_total_bytes(dir: &Path) -> u64 {
 /// Reclaim interrupted uploads even when no further upload arrives. The Gram
 /// reverse gateway runs this at startup and hourly; successful sends consume
 /// their staging file immediately.
+#[cfg(unix)]
 pub fn sweep_stale_uploads() {
     cleanup_stale(&staging_dir_in(&config_base()));
 }

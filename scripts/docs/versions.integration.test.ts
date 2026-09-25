@@ -109,6 +109,59 @@ describe('documentation release publishing', () => {
     await write(root, 'docs/versions/manifest.json', `${JSON.stringify(archivedManifest)}\n`);
     expect(() => runScript(root, ['check'])).toThrow();
   }, fixtureTimeoutMs);
+
+  test('preserves both release identities and the original archived website', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'herdr-docs-dual-'));
+    temporaryDirectories.push(root);
+    const originalDocs = 'original release docs\n';
+    await write(root, 'docs/next/website/src/content/docs/index.mdx', originalDocs);
+    await write(root, 'docs/next/website/src/data/config-reference.json', '{"release":true}\n');
+    git(root, ['init', '-q']);
+    git(root, ['config', 'user.email', 'test@example.com']);
+    git(root, ['config', 'user.name', 'Test']);
+    git(root, ['add', '.']);
+    git(root, ['commit', '-qm', 'original release']);
+    const originalCommit = git(root, ['rev-parse', 'HEAD']).trim();
+    git(root, ['tag', '-a', 'upstream/v0.9.0', '-m', 'original release']);
+
+    await write(root, 'docs/next/website/src/content/docs/index.mdx', 'fork release docs\n');
+    git(root, ['add', '.']);
+    git(root, ['commit', '-qm', 'fork release']);
+    const releaseCommit = git(root, ['rev-parse', 'HEAD']).trim();
+    git(root, ['tag', '-a', 'v0.9.0', '-m', 'fork release']);
+
+    await write(root, 'docs/versions/0.9.0/website/src/content/docs/index.mdx', originalDocs);
+    await write(root, 'docs/versions/0.9.0/website/src/data/config-reference.json', '{"release":true}\n');
+    await write(root, 'distribution/latest.json', '{"version":"0.9.0"}\n');
+    const entry = {
+      version: '0.9.0',
+      tag: 'v0.9.0',
+      commit: originalCommit,
+      release_commit: releaseCommit,
+      source_tag: 'upstream/v0.9.0',
+      source: 'docs/next/website/src/content/docs',
+    };
+    const manifestPath = 'docs/versions/manifest.json';
+    await write(root, manifestPath, `${JSON.stringify({
+      schema_version: 1, stable_source: 'snapshot', current: '0.9.0', versions: [entry],
+    })}\n`);
+    runScript(root, ['check']);
+    runScript(root, ['publish', 'v0.9.0']);
+    runScript(root, ['backfill']);
+    expect(JSON.parse(await read(root, manifestPath)).versions[0]).toEqual(entry);
+    runScript(root, ['check']);
+
+    await write(root, 'docs/versions/0.9.0/website/src/content/docs/index.mdx', 'changed\n');
+    expect(() => runScript(root, ['check'])).toThrow(/index.mdx differs/);
+    await write(root, 'docs/versions/0.9.0/website/src/content/docs/index.mdx', originalDocs);
+
+    git(root, ['tag', '-f', 'upstream/v0.9.0', releaseCommit]);
+    expect(() => runScript(root, ['check'])).toThrow(/source tag upstream\/v0.9.0 moved/);
+    git(root, ['tag', '-f', 'upstream/v0.9.0', originalCommit]);
+
+    git(root, ['tag', '-f', 'v0.9.0', originalCommit]);
+    expect(() => runScript(root, ['check'])).toThrow(/tag v0.9.0 moved/);
+  }, fixtureTimeoutMs);
 });
 
 async function write(root: string, path: string, content: string) {
