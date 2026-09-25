@@ -129,16 +129,6 @@ mod windows {
                 })
         }
 
-        pub(crate) fn queue_user_input_submission(
-            &self,
-            text: Bytes,
-            enter: Bytes,
-            delay: Duration,
-            deadline: Option<Instant>,
-        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
-            self.queue_user_input_submission_guarded(text, enter, delay, deadline, None)
-        }
-
         pub(crate) fn queue_user_input_submission_guarded(
             &self,
             text: Bytes,
