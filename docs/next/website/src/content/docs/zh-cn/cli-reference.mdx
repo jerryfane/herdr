@@ -350,12 +350,11 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 
-`agent prompt` 遵循当前的 bracketed paste 模式,即使智能体处于 working 也会先发送文本,短暂延迟后再发送编码后的 Enter。如果智能体已经是 `blocked`,它不会发送输入,而是返回 `agent_blocked`。使用 `--wait` 时,从其他非 working 状态接受的提示必须在五秒内产生可观察的生命周期变化，否则 Herdr 返回 `agent_prompt_stalled`（能观察到 composer 但没有看到证据）或 `agent_prompt_unverifiable`（没有可观察的 composer）；调用方超时不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+`agent prompt` 遵循 bracketed paste 模式，将文本和 Enter 写入 PTY。如果智能体已经是 `blocked`，则写入前返回 `agent_blocked`。使用 `--wait` 时，只有确认提交后才等待请求的状态；无法确认时返回 `result.type: "agent_prompted"`、`delivery: "written_to_pty"` 和退出码 0，不声称智能体已开始新轮次。没有 composer 观测能力时可能很快返回。同一个 attempt 的草稿仍留在 composer 中则是 `agent_prompt_unsubmitted` 错误。`--until` 必须与 `--wait` 同用。独立的 `agent wait` 在当前状态匹配时立即返回；默认目标是 `idle`、`done` 或 `blocked`。
 
-写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。此后 Herdr 会等待请求的 settled 状态。`--until` 用于缩小匹配状态，不带 `--wait` 时会被拒绝。独立的 `agent wait` 在当前状态匹配时立即返回。两者默认匹配 `idle`、`done` 或 `blocked`；需要 `unknown` 时请明确使用 `--until unknown`。
+确认提交后，如截止时未观察到请求的状态，则返回 `agent_status_unobserved_after_submit`（退出码 1），这不代表投递失败。直接进入请求的稳定状态也算成功，无需观察到中间的 `working` 状态。不要重发提示。
 
-写入后仍无法证明去向时返回 `agent_prompt_stalled`。如果智能体已经处于 working，正在进行的其他轮次结束不会归因于新提示。`pane get` 会返回 `composer.state`（`empty`、`draft_present` 或 `unknown`）以及 provenance 和佐证。区域缺失、重绘中的画面、冲突和旧 daemon 响应都是 `unknown`。对于完全不暴露 composer 观察的窗格，返回 `agent_prompt_unverifiable` 而非 `agent_prompt_stalled`，以便调用方区分“已观察但无证据”与“无法观察”；两者都不能证明未送达。
-对于 `agent prompt --wait`，PTY 已写入但无法确认提交的三种结果会写到 stdout：`result.type: "agent_prompt_unconfirmed"`、`delivery: "written_to_pty"`，以及 `agent_prompt_unverifiable`、`agent_prompt_stalled` 或 `agent_prompt_unsubmitted` 作为原因代码。CLI 退出状态为 0；再次发送前先检查窗格。若当前清单没有 composer 覆盖，提示会明确说明该智能体不支持提交验证。直接调用 API 仍会收到原有错误代码。
+`delivery: "submitted"` 需要可归因的证据：最初处于稳定状态的智能体生命周期序列前进，或同一个 writer-attributed composer attempt 被观察到后清空。已经处于 working 的智能体完成其他轮次不算证据。没有证据时，`written_to_pty` 只确认 PTY 写入。`pane get` 返回带 provenance 的 `composer.state`；区域缺失、重绘中、证据冲突或旧 daemon 的响应均为 `unknown`。无法确认提交时，不会继续等待请求的状态；重试前先检查窗格。
 
 
 `idle` 表示智能体在等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,用于未查看的后台工作完成后。聚焦该标签页或用 `pane focus` / `agent focus` 指向它会标记为已查看;仅通过 CLI 读取不会改变它。`blocked` 表示 Herdr 识别到审批或提问界面。`unknown` 表示智能体存在但无法可靠分类,不代表工作成功。
@@ -395,9 +394,9 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 `pane wait-output` 会立即检查所选快照,所以已经存在的输出也能匹配。默认来源名是 `recent`;匹配时会把最近 80 个已渲染终端行作为未折行输出处理。`--lines` 可以修改这个行数限制。`--match` 在单行中查找字面子串;`--regex` 使用 Rust 正则表达式语法并逐行匹配。
 
-超时或 `agent_prompt_stalled` 并不代表未发送提示。重试前请先检查智能体。
+超时可能发生在 PTY 写入前；`written_to_pty` 表示已写入，但尚未确认智能体提交。重试前请检查窗格。
 
-`pane wait-output` 和 `agent wait` 在省略 `--timeout` 时会无限等待。对于 `agent prompt --wait`，观察到活动后，或提示开始时已处于 `working`，等待稳定状态的过程不会超时；如果提示从 non-working 状态开始且未观察到活动，五秒后会返回提交未确认的结果。超时可能发生在 PTY 写入得到确认之前，仍属于错误。真正的投递失败和服务器错误以 JSON 写到 stderr，退出状态为 1；CLI 用法错误的退出状态为 2。
+`pane wait-output` 和独立的 `agent wait` 在省略 `--timeout` 时可无限等待。`agent prompt --wait` 仅在确认提交后继续等待指定的稳定状态；未确认的写入则返回 PTY 回执。PTY 写入得到确认前的超时仍是错误。真正的投递失败和服务器错误以 JSON 写到 stderr，退出码为 1；CLI 用法错误的退出码为 2。
 
 ## 集成
 

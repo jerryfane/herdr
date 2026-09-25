@@ -248,8 +248,18 @@ fn prompt_agent_with_effect_timeout(
     );
     #[cfg(not(windows))]
     let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
-    let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
-        return Ok(Some(prompt_response));
+    // Only the app's explicit PTY-write receipt authorizes a later
+    // WrittenToPty result. A generic agent-shaped success is not evidence.
+    let prompted = match serde_json::from_str::<SuccessResponse>(&prompt_response) {
+        Ok(SuccessResponse {
+            id,
+            result:
+                ResponseResult::AgentPrompted {
+                    agent,
+                    delivery: Some(crate::api::schema::AgentPromptDelivery::WrittenToPty),
+                },
+        }) if id == request_id => agent,
+        _ => return Ok(Some(prompt_response)),
     };
     if !agent_wait_identity_matches(
         &prompted,
@@ -257,7 +267,12 @@ fn prompt_agent_with_effect_timeout(
         before_prompt.name.as_deref().filter(|name| *name == target),
         before_prompt.agent.as_deref(),
     ) {
-        return agent_wait_not_running(request_id).map(Some);
+        return agent_prompt_success(
+            request_id,
+            prompted,
+            crate::api::schema::AgentPromptDelivery::WrittenToPty,
+        )
+        .map(Some);
     }
     let composer_attempt_id = prompted.composer.attempt_id.clone();
     let prompt_state_change_seq = prompted.state_change_seq;
@@ -265,9 +280,6 @@ fn prompt_agent_with_effect_timeout(
     let effect_timeout_ms = wait.timeout_ms.map_or(effect_timeout_cap_ms, |timeout_ms| {
         timeout_ms.min(effect_timeout_cap_ms)
     });
-    let caller_timeout_is_effect_deadline = wait
-        .timeout_ms
-        .is_some_and(|timeout_ms| timeout_ms <= effect_timeout_cap_ms);
     let Some(effect) = observe_prompt_effect(
         &request_id,
         &target,
@@ -277,7 +289,6 @@ fn prompt_agent_with_effect_timeout(
         prompt_started_working,
         composer_attempt_id.as_deref(),
         effect_timeout_ms,
-        caller_timeout_is_effect_deadline,
         stream,
         api_tx,
         running,
@@ -285,15 +296,33 @@ fn prompt_agent_with_effect_timeout(
     else {
         return Ok(None);
     };
-    let (mut initial, delivery) = match effect {
-        PromptEffectOutcome::Submitted(agent) => {
-            (agent, crate::api::schema::AgentPromptDelivery::Submitted)
-        }
-        PromptEffectOutcome::WrittenToPty(agent) => {
-            (agent, crate::api::schema::AgentPromptDelivery::WrittenToPty)
-        }
+    let (mut initial, delivery, composer_submission_observed) = match effect {
+        PromptEffectOutcome::Submitted(agent, composer_cleared) => (
+            agent,
+            crate::api::schema::AgentPromptDelivery::Submitted,
+            composer_cleared,
+        ),
+        PromptEffectOutcome::WrittenToPty(agent) => (
+            agent,
+            crate::api::schema::AgentPromptDelivery::WrittenToPty,
+            false,
+        ),
         PromptEffectOutcome::Response(response) => return Ok(Some(response)),
     };
+    // A PTY write is a receipt, not proof of submission. If submission could
+    // not be verified, do not turn the subsequent status wait into a failure
+    // (or imply that resending the prompt is safe).
+    if delivery == crate::api::schema::AgentPromptDelivery::WrittenToPty {
+        return agent_prompt_success(request_id, initial, delivery).map(Some);
+    }
+    // The submission observation itself may capture a fast settled transition.
+    // A new lifecycle sequence or an observed same-attempt composer clear proves
+    // this status belongs to a post-write sample, not a pre-prompt idle frame.
+    if agent_wait_matches(&initial, &until, Some(prompt_state_change_seq))
+        || (composer_submission_observed && until.contains(&initial.agent_status))
+    {
+        return agent_prompt_success(request_id, initial, delivery).map(Some);
+    }
     let prompt_activity_observed = prompt_started_working
         || matches!(
             initial.agent_status,
@@ -301,28 +330,29 @@ fn prompt_agent_with_effect_timeout(
         );
     if !prompt_activity_observed {
         let remaining_timeout_ms = remaining_timeout_ms(wait.timeout_ms, wait_started);
-        let (stall_timeout_ms, timeout_kind) = match remaining_timeout_ms {
-            Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
-                (timeout_ms, AgentWaitTimeoutKind::Status)
+        let stall_timeout_ms = remaining_timeout_ms
+            .filter(|ms| *ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS)
+            .unwrap_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS);
+        // A fast turn can go directly to done/idle without a sampled working
+        // frame. Its new lifecycle sequence is enough to satisfy a requested
+        // status; stale pre-prompt status is excluded below.
+        let mut activity_statuses = prompt_activity_statuses();
+        for status in &until {
+            if !activity_statuses.contains(status) {
+                activity_statuses.push(*status);
             }
-            _ => (
-                AGENT_PROMPT_EFFECT_TIMEOUT_MS,
-                AgentWaitTimeoutKind::PromptStalled {
-                    timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
-                },
-            ),
-        };
+        }
         let Some(outcome) = wait_for_resolved_agent(
             request_id.clone(),
             ResolvedAgentWait {
                 target: target.clone(),
-                until: prompt_activity_statuses(),
+                until: activity_statuses,
                 timeout_ms: Some(stall_timeout_ms),
                 initial,
                 last_event_sequence,
                 after_state_change_seq: Some(prompt_state_change_seq),
                 accept_transient_status: true,
-                timeout_kind,
+                timeout_kind: AgentWaitTimeoutKind::AfterSubmitted,
             },
             stream,
             api_tx,
@@ -351,7 +381,7 @@ fn prompt_agent_with_effect_timeout(
             last_event_sequence,
             after_state_change_seq: None,
             accept_transient_status: false,
-            timeout_kind: AgentWaitTimeoutKind::Status,
+            timeout_kind: AgentWaitTimeoutKind::AfterSubmitted,
         },
         stream,
         api_tx,
@@ -391,7 +421,7 @@ fn agent_prompt_success(
 }
 
 enum PromptEffectOutcome {
-    Submitted(crate::api::schema::AgentInfo),
+    Submitted(crate::api::schema::AgentInfo, bool),
     WrittenToPty(crate::api::schema::AgentInfo),
     Response(String),
 }
@@ -401,69 +431,28 @@ enum PromptObservationVerdict {
     Submitted,
     WrittenToPty,
     Unsubmitted,
-    Stalled,
-    Unverifiable,
-    TimedOut,
 }
 
-/// Classifies what the daemon can PROVE about a prompt it has already written.
-///
-/// `composer_observable` is what separates the two negative verdicts, and the
-/// distinction is the whole point of this function. `Stalled` means the daemon
-/// LOCATED and READ the composer region and saw no evidence either way.
-/// `Unverifiable` means it had no composer to look at — no loadable manifest for
-/// this agent, or a manifest with no `[composer]` section — so it never had the
-/// instrument that `Unsubmitted` requires.
-///
-/// Deliberately NOT claimed here: that a pane whose SCREEN DETECTION is skipped
-/// reports `Unverifiable`. It does not. `screen_detection_skipped` gates STATE
-/// detection only; the composer is built unconditionally, so a hook-authority pane
-/// still yields a readable region and still reports `Stalled`.
-///
-/// One residual class, named rather than hidden: `ComposerRegionEvidence::Missing`
-/// — a manifest that DOES declare `[composer]` whose region cannot be located on
-/// screen (alternate screen buffer, a transcript view, manifest drift) — counts as
-/// observable and reports `Stalled`. That is a narrower instance of the same
-/// conflation this function fixes. It is left as-is deliberately: folding it into
-/// the unobservable set would report `Unverifiable` for a pane the daemon can
-/// normally read, which would hide a real stall behind a drifted region.
-///
-/// Collapsing the two is how a supervisor ends up escalating on the absence of an
-/// instrument: `agent_prompt_stalled` is honest about a pane whose disposition is
-/// unknown, and dishonest as a report that nothing was observed when nothing COULD
-/// be observed. Neither verdict is proof that the prompt was not delivered.
+/// Classifies only evidence attributable to this PTY write. A missing composer
+/// observation is not proof of non-submission, nor is a deadline.
 fn classify_prompt_observation(
     initially_working: bool,
     baseline: u64,
     current_sequence: u64,
     composer_clear_observed: bool,
     composer_matches: bool,
-    composer_observable: bool,
     timed_out: bool,
-    caller_timeout_is_effect_deadline: bool,
 ) -> Option<PromptObservationVerdict> {
-    if composer_clear_observed {
-        return Some(PromptObservationVerdict::Submitted);
-    }
-    if !initially_working && current_sequence > baseline {
+    if composer_clear_observed || (!initially_working && current_sequence > baseline) {
         return Some(PromptObservationVerdict::Submitted);
     }
     if !timed_out {
         return None;
     }
-    if caller_timeout_is_effect_deadline && !initially_working {
-        return Some(PromptObservationVerdict::TimedOut);
-    }
     if composer_matches {
         return Some(PromptObservationVerdict::Unsubmitted);
     }
-    if initially_working {
-        return Some(PromptObservationVerdict::WrittenToPty);
-    }
-    if !composer_observable {
-        return Some(PromptObservationVerdict::Unverifiable);
-    }
-    Some(PromptObservationVerdict::Stalled)
+    Some(PromptObservationVerdict::WrittenToPty)
 }
 
 // The observation boundary keeps identity, evidence, timeout, and transport
@@ -478,7 +467,6 @@ fn observe_prompt_effect(
     initially_working: bool,
     composer_attempt_id: Option<&str>,
     timeout_ms: u64,
-    caller_timeout_is_effect_deadline: bool,
     stream: &mut ApiStream,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
@@ -486,9 +474,6 @@ fn observe_prompt_effect(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let expected_name = before_prompt.name.as_deref().filter(|name| *name == target);
     let mut composer_observed = false;
-    // Latched across polls: once the daemon has had a composer to look at, a later
-    // sample that momentarily reports none must not downgrade the verdict.
-    let mut composer_ever_observable = false;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -500,9 +485,9 @@ fn observe_prompt_effect(
             expected_name,
             before_prompt.agent.as_deref(),
         ) {
-            return agent_wait_not_running(request_id.to_string())
-                .map(PromptEffectOutcome::Response)
-                .map(Some);
+            return Ok(Some(PromptEffectOutcome::WrittenToPty(
+                before_prompt.clone(),
+            )));
         }
 
         let mut composer_clear_observed = false;
@@ -523,24 +508,6 @@ fn observe_prompt_effect(
         if same_attempt && stable_empty_region && composer_observed {
             composer_clear_observed = true;
         }
-        // Whether the daemon has a composer to look at AT ALL for this pane. Its
-        // absence is structural — no loadable manifest for the agent, or a manifest
-        // with no `[composer]` section — not a negative observation, and it must not
-        // be reported as one.
-        //
-        // LATCHED, mirroring `composer_observed` above. Recomputing it from the final
-        // sample alone meant a pane that was observable for the whole window reported
-        // `unverifiable` if its LAST `agent_get` happened to return a default composer
-        // (momentarily unresolved agent label, or a failed runtime lookup reaching
-        // `unwrap_or_default()`). That loses the stronger "we looked and saw nothing"
-        // signal in the one direction that makes the answer look more benign, which is
-        // the failure this whole distinction exists to prevent.
-        if current.composer.evidence.region
-            != crate::api::schema::ComposerRegionEvidence::Unavailable
-        {
-            composer_ever_observable = true;
-        }
-        let composer_observable = composer_ever_observable;
 
         match classify_prompt_observation(
             initially_working,
@@ -548,12 +515,13 @@ fn observe_prompt_effect(
             current.state_change_seq,
             composer_clear_observed,
             composer_matches,
-            composer_observable,
             std::time::Instant::now() >= deadline,
-            caller_timeout_is_effect_deadline,
         ) {
             Some(PromptObservationVerdict::Submitted) => {
-                return Ok(Some(PromptEffectOutcome::Submitted(current)));
+                return Ok(Some(PromptEffectOutcome::Submitted(
+                    current,
+                    composer_clear_observed,
+                )));
             }
             Some(PromptObservationVerdict::WrittenToPty) => {
                 return Ok(Some(PromptEffectOutcome::WrittenToPty(current)));
@@ -567,34 +535,21 @@ fn observe_prompt_effect(
                 .map(PromptEffectOutcome::Response)
                 .map(Some);
             }
-            Some(PromptObservationVerdict::Stalled) => {
-                return agent_prompt_observation_error(
-                    request_id,
-                    "agent_prompt_stalled",
-                    "agent prompt was written to the PTY, but submission could not be observed",
-                )
-                .map(PromptEffectOutcome::Response)
-                .map(Some);
-            }
-            Some(PromptObservationVerdict::Unverifiable) => {
-                return agent_prompt_observation_error(
-                    request_id,
-                    "agent_prompt_unverifiable",
-                    unverifiable_prompt_message(
-                        current.agent.as_deref().or(before_prompt.agent.as_deref()),
-                    ),
-                )
-                .map(PromptEffectOutcome::Response)
-                .map(Some);
-            }
-            Some(PromptObservationVerdict::TimedOut) => {
-                return agent_wait_timeout(
-                    request_id.to_string(),
-                    AgentWaitTimeoutKind::Status,
-                    &current,
-                )
-                .map(PromptEffectOutcome::Response)
-                .map(Some);
+            None if current.composer.evidence.region
+                == crate::api::schema::ComposerRegionEvidence::Unavailable
+                && current
+                    .agent
+                    .as_deref()
+                    .or(before_prompt.agent.as_deref())
+                    .and_then(crate::detect::parse_agent_label)
+                    .is_some_and(|agent| {
+                        !crate::detect::manifest::submission_verification_supported(agent)
+                    }) =>
+            {
+                // The active manifest expressly cannot observe the composer.
+                // Submission proof above still wins, but waiting for an
+                // instrument we do not have cannot improve this receipt.
+                return Ok(Some(PromptEffectOutcome::WrittenToPty(current)));
             }
             None => {}
         }
@@ -602,27 +557,12 @@ fn observe_prompt_effect(
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
         current = match agent_get(request_id, target, api_tx) {
             Ok(agent) => agent,
-            Err(response) => {
-                return agent_wait_probe_error(response)
-                    .map(PromptEffectOutcome::Response)
-                    .map(Some);
+            Err(_) => {
+                // The write has already been acknowledged. A failed probe
+                // cannot revoke it or establish non-submission.
+                return Ok(Some(PromptEffectOutcome::WrittenToPty(current)));
             }
         };
-    }
-}
-
-fn unverifiable_prompt_message(agent_label: Option<&str>) -> &'static str {
-    if agent_label
-        .and_then(crate::detect::parse_agent_label)
-        .is_some_and(|agent| !crate::detect::manifest::submission_verification_supported(agent))
-    {
-        "agent prompt was written to the PTY; submission verification is unsupported \
-         for this agent (its active manifest has no composer observation), so \
-         submission cannot be confirmed — do not treat this as non-delivery"
-    } else {
-        "agent prompt was written to the PTY; this pane exposes no composer \
-         observation, so submission can be neither confirmed nor denied \
-         — do not treat this as non-delivery"
     }
 }
 
@@ -655,7 +595,7 @@ struct ResolvedAgentWait {
 #[derive(Clone, Copy)]
 enum AgentWaitTimeoutKind {
     Status,
-    PromptStalled { timeout_ms: u64 },
+    AfterSubmitted,
 }
 
 enum AgentWaitOutcome {
@@ -957,12 +897,12 @@ fn agent_wait_timeout(
         AgentWaitTimeoutKind::Status => {
             ("timeout", "timed out waiting for agent status".to_string())
         }
-        AgentWaitTimeoutKind::PromptStalled { timeout_ms } => {
+        AgentWaitTimeoutKind::AfterSubmitted => {
             let status = format!("{:?}", current.agent_status).to_ascii_lowercase();
             (
-                "agent_prompt_stalled",
+                "agent_status_unobserved_after_submit",
                 format!(
-                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; current status is {status}"
+                    "prompt submission was confirmed, but the requested agent status was not observed before the wait deadline; current status is {status}"
                 ),
             )
         }
@@ -1350,63 +1290,35 @@ mod tests {
 
     #[test]
     fn prompt_observation_verdicts_preserve_the_evidence_boundaries() {
-        // Argument order: initially_working, baseline, current_sequence,
-        // composer_clear_observed, composer_matches, composer_observable, timed_out,
-        // caller_timeout_is_effect_deadline.
         assert_eq!(
-            classify_prompt_observation(false, 10, 11, false, false, true, false, false),
+            classify_prompt_observation(false, 10, 11, false, false, false),
             Some(PromptObservationVerdict::Submitted),
-            "settled lifecycle advance is attributable submission evidence"
+            "a new lifecycle sequence is submission evidence"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, true, false, true, false, false),
+            classify_prompt_observation(true, 10, 11, true, false, false),
             Some(PromptObservationVerdict::Submitted),
-            "composer observed then cleared is stronger submission evidence"
+            "an already-working pane needs same-attempt composer clearance"
         );
         assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, true, true, true, false),
+            classify_prompt_observation(false, 10, 10, false, true, true),
             Some(PromptObservationVerdict::Unsubmitted),
-            "persistent same-attempt composer evidence proves non-submission"
+            "a same-attempt draft remains a real error, even at the caller deadline"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 10, false, false, false, true, true),
+            classify_prompt_observation(false, 10, 10, false, false, false),
+            None,
+            "an inconclusive write may still gather evidence"
+        );
+        assert_eq!(
+            classify_prompt_observation(false, 10, 10, false, false, true),
             Some(PromptObservationVerdict::WrittenToPty),
-            "an already-working pane reports what it can prove, not a timeout"
+            "observation expiry cannot erase an acknowledged PTY write"
         );
         assert_eq!(
-            classify_prompt_observation(true, 10, 10, false, true, true, true, true),
-            Some(PromptObservationVerdict::Unsubmitted),
-            "a visible same-attempt draft outranks the already-working shortcut"
-        );
-        assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, false, true, true, false),
-            Some(PromptObservationVerdict::Stalled),
-            "an OBSERVABLE composer showing nothing is the residual stalled case"
-        );
-        assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, false, false, true, false),
-            Some(PromptObservationVerdict::Unverifiable),
-            "with no composer to observe the verdict must say so, not report stalled"
-        );
-        assert_eq!(
-            classify_prompt_observation(true, 10, 11, false, false, true, true, false),
+            classify_prompt_observation(true, 10, 11, false, false, true),
             Some(PromptObservationVerdict::WrittenToPty),
-            "an already-working completion is not attributable to the new prompt"
-        );
-        assert_eq!(
-            classify_prompt_observation(true, 10, 11, false, false, false, true, false),
-            Some(PromptObservationVerdict::WrittenToPty),
-            "an already-working pane keeps its own verdict regardless of observability"
-        );
-        assert_eq!(
-            classify_prompt_observation(true, 10, 11, true, false, true, false, false),
-            Some(PromptObservationVerdict::Submitted),
-            "already-working prompts still use composer-cleared evidence"
-        );
-        assert_eq!(
-            classify_prompt_observation(false, 10, 10, false, true, true, true, true),
-            Some(PromptObservationVerdict::TimedOut),
-            "caller deadlines at the observation boundary preserve ordinary timeout"
+            "already-working lifecycle changes cannot prove this submission"
         );
     }
 
@@ -1486,6 +1398,101 @@ mod tests {
     }
 
     #[test]
+    fn prompt_agent_accepts_fast_done_after_confirmed_submission() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-fast"),
+        );
+        let cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Done, 11),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-fast"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let response = run_prompt_harness(
+            "fast-done",
+            "quick turn",
+            crate::api::schema::AgentStatus::Done,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    cleared,
+                ]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_eq!(response["result"]["delivery"], "submitted", "{response}");
+        assert_eq!(response["result"]["agent"]["agent_status"], "done");
+    }
+
+    #[test]
+    fn prompt_agent_reports_status_timeout_after_confirmed_submission() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-no-state"),
+        );
+        let cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-no-state"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let response = run_prompt_harness(
+            "submitted-status-unobserved",
+            "still waiting for status",
+            crate::api::schema::AgentStatus::Done,
+            500,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    cleared,
+                ]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_eq!(
+            response["error"]["code"], "agent_status_unobserved_after_submit",
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn prompt_agent_accepts_post_write_composer_clear_in_requested_idle() {
+        let prompted = with_composer(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::DraftPresent,
+            Some("attempt-idle-clear"),
+        );
+        let cleared = with_composer_region(
+            test_agent(crate::api::schema::AgentStatus::Idle, 10),
+            crate::api::schema::ComposerState::Unknown,
+            Some("attempt-idle-clear"),
+            crate::api::schema::ComposerRegionEvidence::Empty,
+        );
+        let response = run_prompt_harness(
+            "idle-clear",
+            "fast completed turn",
+            crate::api::schema::AgentStatus::Idle,
+            2_000,
+            PromptHarness {
+                agents: VecDeque::from([
+                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
+                    cleared,
+                ]),
+                prompted,
+                prompt_error: None,
+            },
+        );
+        assert_eq!(response["result"]["delivery"], "submitted", "{response}");
+        assert_eq!(response["result"]["agent"]["agent_status"], "idle");
+    }
+
+    #[test]
     fn prompt_agent_does_not_attribute_another_attempt_clearing_our_draft() {
         let prompted = with_composer(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
@@ -1498,30 +1505,33 @@ mod tests {
             Some("attempt-other"),
             crate::api::schema::ComposerRegionEvidence::Empty,
         );
+        // Keep the other attempt's observation in the queue throughout the
+        // deadline. The harness otherwise repeats `prompted` after exhausting
+        // the queue, which would expose our original draft again and correctly
+        // produce an unsubmitted verdict instead of testing cross-attribution.
+        let window_ms = 3 * CONNECTION_POLL_INTERVAL.as_millis() as u64;
         let response = run_prompt_harness(
             "different-clear-attempt",
             "our delivery",
             crate::api::schema::AgentStatus::Idle,
-            250,
+            window_ms,
             PromptHarness {
-                agents: VecDeque::from([
-                    test_agent(crate::api::schema::AgentStatus::Idle, 10),
-                    other_cleared,
-                ]),
+                agents: std::iter::once(test_agent(crate::api::schema::AgentStatus::Idle, 10))
+                    .chain(std::iter::repeat_n(other_cleared, 6))
+                    .collect(),
                 prompted,
                 prompt_error: None,
             },
         );
-        assert_ne!(response["result"]["delivery"], "submitted");
-        assert_eq!(response["error"]["code"], "agent_prompt_unsubmitted");
+        assert_eq!(
+            response["result"]["delivery"], "written_to_pty",
+            "{response}"
+        );
     }
 
     #[test]
     fn prompt_agent_does_not_use_another_attempts_draft_to_clear_ours() {
-        // Region `Empty` (not `Unavailable`): this test is about attribution, not
-        // observability, so the composer must be OBSERVABLE for the residual verdict
-        // to be `stalled`. With no composer to observe the honest verdict is
-        // `unverifiable`, which is pinned separately.
+        // Another attempt's draft must not count as evidence for this one.
         let prompted = with_composer_region(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
             crate::api::schema::ComposerState::Unknown,
@@ -1554,7 +1564,7 @@ mod tests {
                 prompt_error: None,
             },
         );
-        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+        assert_eq!(response["result"]["delivery"], "written_to_pty");
     }
 
     #[test]
@@ -1584,10 +1594,9 @@ mod tests {
         );
     }
 
-    /// A pane the daemon COULD observe, where it saw no evidence either way. The
-    /// composer is empty and observable, so the honest verdict is `stalled`.
+    /// An observable but inconclusive composer must retain the PTY receipt.
     #[test]
-    fn prompt_agent_reports_stalled_when_an_observable_composer_shows_nothing() {
+    fn prompt_agent_reports_written_to_pty_when_observation_stalls() {
         let observable = with_composer(
             test_agent(crate::api::schema::AgentStatus::Idle, 10),
             crate::api::schema::ComposerState::Empty,
@@ -1605,17 +1614,14 @@ mod tests {
             },
         );
 
-        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+        assert_eq!(response["result"]["type"], "agent_prompted");
+        assert_eq!(response["result"]["delivery"], "written_to_pty");
     }
 
-    /// The same absence of evidence on a pane the daemon CANNOT observe — no loadable
-    /// manifest for the agent, or a manifest with no `[composer]` section — which is
-    /// every live pane on the fleet that reported this incident (31 of 31 measured
-    /// `region = unavailable`). It must NOT read as `stalled`: a supervisor that
-    /// escalates on `stalled` would be escalating on a missing instrument, which is
-    /// what made the wake failure silent.
+    /// Missing composer coverage cannot turn a completed PTY write into an
+    /// API error, even when the caller requested a status wait.
     #[test]
-    fn prompt_agent_reports_unverifiable_when_no_composer_can_be_observed() {
+    fn prompt_agent_reports_written_to_pty_without_composer_observation() {
         let unobservable = test_agent(crate::api::schema::AgentStatus::Idle, 10);
         assert_eq!(
             unobservable.composer.evidence.region,
@@ -1634,76 +1640,8 @@ mod tests {
             },
         );
 
-        assert_eq!(response["error"]["code"], "agent_prompt_unverifiable");
-        let message = response["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("do not treat this as non-delivery"),
-            "the verdict must tell the caller what it may not conclude: {message}"
-        );
-    }
-
-    /// Observability is LATCHED: a pane the daemon could read for most of the window
-    /// must not be downgraded to `unverifiable` because the FINAL sample happened to
-    /// report no composer (an unresolved agent label or a failed runtime lookup both
-    /// reach `unwrap_or_default()`). Without the latch the verdict flips on the last
-    /// poll alone, and it flips toward the more benign answer — losing the stronger
-    /// "we looked and saw nothing" signal in exactly the direction that hides a real
-    /// stall.
-    #[test]
-    fn prompt_agent_keeps_stalled_when_only_the_last_sample_is_unobservable() {
-        let observable = with_composer_region(
-            test_agent(crate::api::schema::AgentStatus::Idle, 10),
-            crate::api::schema::ComposerState::Empty,
-            None,
-            crate::api::schema::ComposerRegionEvidence::Empty,
-        );
-        let blind = test_agent(crate::api::schema::AgentStatus::Idle, 10);
-        assert_eq!(
-            observable.composer.evidence.region,
-            crate::api::schema::ComposerRegionEvidence::Empty,
-            "first sample must be observable, or this pins nothing"
-        );
-        assert_eq!(
-            blind.composer.evidence.region,
-            crate::api::schema::ComposerRegionEvidence::Unavailable,
-            "last sample must be unobservable, or this pins nothing"
-        );
-
-        // The window must span SEVERAL polls, with the DECIDING sample blind. The
-        // verdict is taken on whichever sample is in hand once the deadline passes, so
-        // a cap of 0 (what the other negative-verdict tests use) would decide on the
-        // very first in-loop sample and could not exercise a latch at all.
-        //
-        // DERIVED from `CONNECTION_POLL_INTERVAL` rather than hardcoded: the window is
-        // only valid relative to the poll rate. Pinned to a literal, raising that
-        // constant past the window would make the observable sample itself the
-        // timed-out one, `composer_observable` would be true with or without the
-        // latch, and this test would silently pass either way — rejoining the vacuous
-        // state its first version was in, with no signal that it had.
-        //
-        // The queue feeds `AgentGet`s in order and then repeats `prompted` forever
-        // (`pop_front().unwrap_or_else(|| prompted.clone())`). The FIRST `AgentGet` is
-        // the pre-prompt snapshot, so two observable entries are needed to put one
-        // observable sample inside the loop; every later poll — including the one that
-        // decides — is blind.
-        let window_ms = 12 * CONNECTION_POLL_INTERVAL.as_millis() as u64;
-        let response = run_prompt_harness(
-            "latched",
-            "review the diff",
-            crate::api::schema::AgentStatus::Idle,
-            window_ms,
-            PromptHarness {
-                agents: VecDeque::from([observable.clone(), observable]),
-                prompted: blind,
-                prompt_error: None,
-            },
-        );
-
-        assert_eq!(
-            response["error"]["code"], "agent_prompt_stalled",
-            "the daemon DID have an instrument during the window; \
-             a blind final sample must not rewrite that into 'never had one'"
-        );
+        assert_eq!(response["result"]["type"], "agent_prompted");
+        assert_eq!(response["result"]["delivery"], "written_to_pty");
     }
 
     #[test]

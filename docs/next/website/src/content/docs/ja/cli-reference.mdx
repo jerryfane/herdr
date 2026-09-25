@@ -350,12 +350,11 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 成功した start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。起動中の検出状態が `blocked` の場合、コマンドは直ちに `agent_not_ready` を返します。名前は `agent read` と `agent send-keys` で引き続き使用でき、検出状態が `idle` になるとプロンプトを送信できるようになります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 
-`agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストを送信してから短い遅延の後にエンコード済み Enter を送信します。エージェントがすでに `blocked` の場合は、入力を送信せずに `agent_blocked` を返します。`--wait` を使う場合、別の non-working 状態から受け付けたプロンプトは 5 秒以内に観測可能なライフサイクル変化を起こす必要があり、変化がなければ Herdr は `agent_prompt_stalled`（コンポーザーを観測できて何も見えなかった場合）または `agent_prompt_unverifiable`（観測するコンポーザーがない場合）を返します。呼び出し側のタイムアウトが 5 秒以下なら、通常の `timeout` エラーを維持します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+`agent prompt` は bracketed paste モードを尊重し、テキストと Enter を PTY に書き込みます。すでに `blocked` なら書き込み前に `agent_blocked` を返します。`--wait` 指定時は、送信を確認できた場合だけ要求された状態を待ちます。確認できなければ `result.type: "agent_prompted"`、`delivery: "written_to_pty"`、終了コード 0 の受領応答を返し、エージェントが新しいターンを始めたとは判断しません。コンポーザーを観測できない場合は早く返ることがあります。同じ attempt の草稿が残っていれば `agent_prompt_unsubmitted` エラーです。`--until` には `--wait` が必要です。単独の `agent wait` は現在の状態が一致すれば即座に返り、デフォルトの対象は `idle`、`done`、`blocked` です。
 
-書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。その後 Herdr は要求された settled 状態を待ちます。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
+送信確認後も期限までに要求した状態を観測できなければ、`agent_status_unobserved_after_submit`（終了コード 1）を返します。配送失敗ではありません。途中の `working` 状態を観測せず指定した settled 状態へ直接進んだ場合も成功です。再送しないでください。
 
-書き込まれたものの行方を証明できなければ `agent_prompt_stalled` です。すでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、provenance と補強証拠も返します。領域欠落、再描画途中、矛盾、古い daemon の応答は `unknown` です。コンポーザー観測をまったく公開しないペインでは、`agent_prompt_stalled` ではなく `agent_prompt_unverifiable` を返します。呼び出し側は「観測したが何もなかった」と「観測できなかった」を区別できます。どちらも未送信の証明ではありません。
-`agent prompt --wait` では、PTY への書き込み後に送信を確認できない 3 種類の結果を、`result.type: "agent_prompt_unconfirmed"`、`delivery: "written_to_pty"` と理由コード（`agent_prompt_unverifiable`、`agent_prompt_stalled`、`agent_prompt_unsubmitted`）として stdout に出力し、終了コード 0 で返します。再送前にペインを確認してください。有効なマニフェストに composer がない場合は、そのエージェントでは送信確認がサポートされていないことを明示します。直接 API を使う呼び出し元には従来のエラーコードが返ります。
+`delivery: "submitted"` の証拠は、最初に settled だったエージェントのライフサイクルシーケンスの進行か、同じ writer-attributed composer attempt が観測後に消えたことです。すでに working のエージェントで別のターンが終わっても証拠にはなりません。証拠がなければ `written_to_pty` は PTY への書き込みだけを確認します。`pane get` は provenance とともに `composer.state` を返し、領域欠落、再描画中、矛盾、旧 daemon の応答は `unknown` です。送信を確認できない場合、状態待ちは続けません。再送前にペインを確認してください。
 
 
 `idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
@@ -395,9 +394,9 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 `pane wait-output` は選択したスナップショットを最初にすぐ検索するため、すでに存在する出力も一致します。デフォルトのソース名は `recent` で、直近 80 行の描画済みターミナル行を折り返し前の出力として扱います。`--lines` でその行数を変更できます。`--match` は 1 行内のリテラル部分文字列を検索し、`--regex` は Rust の正規表現構文で 1 行ずつ一致します。
 
-タイムアウトや `agent_prompt_stalled` は未送信を保証しません。再試行前にエージェントを確認してください。
+タイムアウトは PTY 書き込み前にも起こり得ます。`written_to_pty` は書き込み済みですがエージェントの送信は未確認です。再送前にペインを確認してください。
 
-`pane wait-output` と `agent wait` は、`--timeout` を省略すると無期限に待ちます。`agent prompt --wait` では、活動を観測した後、またはプロンプト開始時に `working` だった場合の安定状態待機は無期限です。non-working 状態から開始して活動を観測できない場合は、5 秒後に送信未確認の結果を返します。タイムアウトは PTY への書き込み確認前にも起こり得るため、引き続きエラーです。実際の配信失敗やサーバーエラーは JSON として stderr に出力され、終了コード 1 になります。CLI 使用法のエラーは終了コード 2 です。
+`pane wait-output` と単独の `agent wait` は、`--timeout` を省略すると無期限に待ちます。`agent prompt --wait` は送信を確認できた場合にだけ要求された安定状態を待ち、確認できない書き込みには PTY 受領応答を返します。PTY 書き込み確認前のタイムアウトはエラーです。実際の配信失敗やサーバーエラーは JSON として stderr に出力され終了コード 1、CLI 使用法のエラーは終了コード 2 です。
 
 ## インテグレーション
 

@@ -447,7 +447,7 @@ fn agent_command() -> Command {
                 .arg(required("text", "TEXT"))
                 .arg(
                     flag("wait")
-                        .help("Wait for the first matching state observed after submission"),
+                        .help("Observe submission and then wait for the first matching state, when submission is verified"),
                 )
                 .arg(
                     option("until", "STATUS")
@@ -459,21 +459,20 @@ fn agent_command() -> Command {
                 .arg(
                     option("timeout", "MS")
                         .requires("wait")
-                        .help("Fail after this many milliseconds"),
+                        .help("Set a deadline for observable submission and requested state"),
                 )
                 .after_help(
                     concat!(
                         "A blocked agent or visible modal rejects input before any PTY write. ",
-                        "Otherwise Herdr writes text+Enter first. With --wait it then observes ",
-                        "submission and the requested agent state. If submission cannot be ",
-                        "confirmed after the write, the CLI returns agent_prompt_unconfirmed ",
-                        "with delivery=written_to_pty and exit code 0, not a delivery failure. ",
-                        "Its reason distinguishes an unsupported/unobservable composer ",
-                        "(agent_prompt_unverifiable), no observed submission ",
-                        "(agent_prompt_stalled), or a still-visible attributed draft ",
-                        "(agent_prompt_unsubmitted). Do not resend without checking the pane. ",
-                        "A timeout can occur before the PTY write; it remains an error. ",
-                        "Run `herdr server agent-manifests` to see active composer coverage. ",
+                        "Otherwise Herdr writes text+Enter first. With --wait it observes ",
+                        "submission and, if verified, the requested agent state. A proven ",
+                        "submission returns delivery=submitted. If observation stalls or ",
+                        "composer verification is unsupported, the response is agent_prompted ",
+                        "with delivery=written_to_pty, not a confirmation of submission; ",
+                        "do not resend without checking the pane. An attributed draft still ",
+                        "visible after the observation deadline returns agent_prompt_unsubmitted. ",
+                        "A timeout before the PTY write remains an error. Run ",
+                        "`herdr server agent-manifests` to see active composer coverage. ",
                         "A settled agent's lifecycle advance or an observed composer clear ",
                         "confirms submission; an unrelated completion of an already-working ",
                         "agent does not. Without --timeout, the settled-state wait is indefinite."

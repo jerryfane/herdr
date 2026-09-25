@@ -73,17 +73,19 @@ herdr agent rename w1:p2 reviewer
 
 ペイン入力は、現在のプロセスに関係なくターミナルを指定します。エージェント入力はライブエージェントを解決し、そのエージェントがペインを制御しなくなっていれば操作を拒否します。
 
-`agent prompt --wait` は、エージェントがすでに `blocked` でない限り、プロンプトをすぐ送信します。すでに `blocked` の場合は待機を開始せずに `agent_blocked` を返します。受け付けたプロンプトが別の non-working 状態から始まる場合、Herdr はまず 5 秒以内にライフサイクル変化が観測されることを要求します。状態シーケンスが進まなければ、無期限に待たず、コンポーザーを観測できて何も見えなかった場合は `agent_prompt_stalled`、コンポーザー観測をまったく公開していないペインの場合は `agent_prompt_unverifiable` を返します。呼び出し側の `--timeout` が 5 秒以下なら、通常の `timeout` エラーを返します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。エージェントがすでに working の場合、進行中ターンの完了が待機を満たすことがあります。単独の `agent wait` は現在のエージェントを監視し、すでに状態が一致していれば即座に返ります。どちらもデフォルトでは `idle`、`done`、`blocked` を待ちます。複数の正確な状態を許可するには、`--until idle --until done` のように `--until` を繰り返します。`unknown` が必要な場合は `--until unknown` を明示してください。`agent prompt` では `--until` に `--wait` が必要です。
+`agent prompt --wait` は、エージェントがすでに `blocked` なら PTY に書き込まず `agent_blocked` を返します。それ以外はプロンプトを書き込み、送信された証拠を調べます。送信を確認できた場合だけ指定した状態を待ちます。確認できない場合は、エラーではなく `type: "agent_prompted"`、`delivery: "written_to_pty"`、終了コード 0 を返します。コンポーザーを観測できないエージェントでは、この応答をすぐ返す場合があります。これはエージェントがターンを開始した証明ではありません。同じ attempt の草稿がコンポーザーに残る場合は `agent_prompt_unsubmitted`、PTY 書き込み前の失敗はエラーです。単独の `agent wait` は現在の状態を観測し、一致していればすぐ返ります。デフォルトの対象は `idle`、`done`、`blocked` です。`--until` は繰り返し指定でき、`agent prompt` では `--wait` が必要です。
 
-`agent prompt --wait` は PTY の確認応答後に Herdr が証明できる配送状態を区別します。最初に settled だったエージェントでは、ライフサイクルシーケンスが進むと `delivery: "submitted"` になります。Herdr は PTY バッチに不透明な attempt id も付け、writer でコンポーザー入力を追跡します。同じ attempt がカーソルで裏付けられたコンポーザーに残れば `agent_prompt_unsubmitted`、観測後に消えれば `submitted` です。bracketed paste も表示された paste token の文字列には依存しません。それ以外で書き込み後の行方を観測できなければ `agent_prompt_stalled` になります。 この判定は、Herdr がコンポーザーを**観測できた**うえで、どちらの証拠も得られなかった場合を意味します。ペインがコンポーザー観測をまったく公開していない場合（エージェントのマニフェストに `[composer]` 領域が宣言されていない、またはマニフェストに `[composer]` セクションがない場合）、Herdr は代わりに `agent_prompt_unverifiable` を返します。どちらの判定も未送信の証明ではありません。`agent_prompt_unverifiable` は計器の欠如を報告するものであり、プロンプトが拒否されたかのようにエスカレーションしてはいけません。
+`delivery: "submitted"` には、この送信に帰属できる証拠が必要です。最初に settled だったエージェントのライフサイクルシーケンスが進むか、同じ writer-attributed composer attempt が観測後に消えた場合です。すでに working のエージェントで別ターンが完了しても証拠にはなりません。証拠がなければ `written_to_pty` は PTY への書き込みだけを保証します。二重送信を避けるため再試行前にペインを確認してください。観測エラーやログにプロンプト本文は含まれません。
+
+送信を確認できても期限までに指定した状態を観測できなければ、`agent_status_unobserved_after_submit` を返します。これは配送失敗ではなく状態待ちのエラーです。`working` の観測なしで指定した settled 状態へ直接進んだ場合は成功とみなします。状態待ちのエラーを理由に再送しないでください。
 
 `pane get` の `composer.state` は `empty`、`draft_present`、`unknown` のいずれかで、`attempt_id` と `evidence` が根拠を示します。Herdr が書いていない、カーソルより右側だけの候補テキストは draft ではありません。領域が見つからない、再描画途中、証拠が矛盾する、または古い daemon が `composer` を返さない場合は必ず `unknown` です。カーソルは provenance の補強にのみ使われ、色だけで確定判定はしません。
 
-エージェントがすでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。`submitted` には同じ writer-attributed attempt が観測され、その後クリアされた証拠が必要で、それ以外の成功は `written_to_pty` のままです。配送確認の後、Herdr は要求された settled 状態を待ちます。単独の `agent wait` は現在のエージェントを監視し、すでに状態が一致していれば即座に返ります。どちらもデフォルトでは `idle`、`done`、`blocked` を待ちます。複数の正確な状態を許可するには、`--until idle --until done` のように `--until` を繰り返します。`unknown` が必要な場合は `--until unknown` を明示してください。`agent prompt` では `--until` に `--wait` が必要です。
+エージェントがすでに working の場合、進行中の別ターンの完了は新しいプロンプトに帰属されません。送信を確認できた場合だけ `--wait` は要求された settled 状態を待ちます。確認できない場合は `written_to_pty` を返し、状態待ちは続けません。因果関係を推定せず状態だけを観測するには別途 `agent wait` を使ってください。デフォルトの対象は `idle`、`done`、`blocked` です。複数の状態には `--until idle --until done` のように `--until` を繰り返し、`unknown` は明示してください。`agent prompt` では `--until` に `--wait` が必要です。
 
 `idle` と `done` はどちらも入力可能な状態です。CLI/API はサーバーの既読状態を使い、未確認の idle を `done` とします。明示的な `pane focus` / `agent focus` は対象を既読にしますが、読み取りでは変わりません。各 TUI クライアントは表示済みの完了を独立して管理するため、Done バッジが CLI やほかのクライアントと異なる場合があります。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するもののライフサイクルを確実に分類できない状態で、成功完了を意味しません。違いが重要なら正確な `--until` を指定してください。
 
-タイムアウトや `agent_prompt_stalled` は、入力が送られていないことを保証しません。二重送信を避けるため、再試行の前にエージェントを読み取ってください。ID とエージェント名はサーバーごとに独立しています。TUI で別のマシンを選んでも、既存ペイン内の CLI コマンドの接続先は変わりません。
+タイムアウトは PTY 書き込み前にも起こり得ます。`written_to_pty` は書き込み済みだがエージェントの送信は未確認という意味です。二重送信を避けるため、再試行の前にペインを確認してください。ID とエージェント名はサーバーごとに独立しています。TUI で別のマシンを選んでも、既存ペイン内の CLI コマンドの接続先は変わりません。
 
 `pane wait-output` はエージェントのライフサイクルを解釈しません。選択したターミナルスナップショットをポーリングし、最初にすぐ検索するため、すでに存在する文字列も一致します。デフォルトのソース名は `recent` で、直近 80 行の描画済みターミナル行を折り返し前の出力として扱います。`--lines` でその行数を変更でき、`--regex` は Rust の正規表現構文で 1 行ずつ一致します。
 
