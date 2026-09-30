@@ -1034,16 +1034,29 @@ const RECONCILE_MAX_IMPORTS: usize = 50;
 /// confirms the Gram still exists unchanged and serves its file, which is
 /// checked against the witnessed size and SHA-256.
 fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
-    let Ok(copies) = crate::guest::mirror::load(&guest.dir) else {
+    let Ok(copies) = crate::guest::mirror::load_verified(&guest.dir) else {
         return;
     };
     let witnessed = crate::guest::mirror::witnessed(&guest.dir).unwrap_or_else(|err| {
         tracing::warn!(err = %err, "witnessed guest grams unavailable");
         Vec::new()
     });
-    let copied: HashSet<&str> = copies.iter().map(|item| item.id.as_str()).collect();
+    // A copy whose file is gone or damaged counts as not copied: it is
+    // fetched again, from its witnessed record or else its own.
+    let copied: HashSet<&str> = copies
+        .iter()
+        .filter(|(_, intact)| *intact)
+        .map(|(item, _)| item.id.as_str())
+        .collect();
+    let witnessed_ids: HashSet<&str> = witnessed.iter().map(|item| item.id.as_str()).collect();
     let missing: Vec<&GramItem> = witnessed
         .iter()
+        .chain(
+            copies
+                .iter()
+                .filter(|(item, intact)| !intact && !witnessed_ids.contains(item.id.as_str()))
+                .map(|(item, _)| item),
+        )
         .filter(|item| {
             crate::guest::gram::visible(guest, item) && !copied.contains(item.id.as_str())
         })
@@ -1052,7 +1065,7 @@ fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
     if missing.is_empty()
         && !copies
             .iter()
-            .any(|item| crate::guest::gram::visible(guest, item))
+            .any(|(item, _)| crate::guest::gram::visible(guest, item))
     {
         return;
     }
@@ -3873,6 +3886,19 @@ mod tests {
             .unwrap();
         let listed = guest_list(&harness, &guest, json!({}));
         assert_eq!(texts(&listed), ["shared"], "{listed}");
+        assert_eq!(guest_file(&harness, &guest, &sent), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn a_copy_whose_file_went_missing_is_fetched_again() {
+        let (_config, harness, _coordinator) = relay_remote("relay-repair");
+        let guest = harness.admit_with(0, true);
+        let sent = agent_sends_file(&harness, "report", "report.txt");
+        let file = crate::guest::mirror::file_of(&guest.dir, &sent).expect("a kept file");
+        std::fs::remove_file(&file).unwrap();
+
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["report"], "{listed}");
         assert_eq!(guest_file(&harness, &guest, &sent), "aGVsbG8gd29ybGQ=");
     }
 }
