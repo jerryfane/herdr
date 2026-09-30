@@ -65,7 +65,9 @@ pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Resul
             ))
         }
     }
-    let evicted = store::update_side(dir, MIRROR_FILE, |items: &mut Vec<GramItem>| {
+    let id = item.id.clone();
+    let has_file = item.file.is_some();
+    let updated = store::update_side(dir, MIRROR_FILE, |items: &mut Vec<GramItem>| {
         items.retain(|existing| existing.id != item.id);
         items.push(item);
         items.sort_by_key(|item| item.created_unix_ms);
@@ -81,7 +83,18 @@ pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Resul
             evicted.push(items.remove(0));
         }
         (evicted, true)
-    })?;
+    });
+    let evicted = match updated {
+        Ok(evicted) => evicted,
+        Err(err) => {
+            // The record was not kept: do not leave its bytes behind,
+            // outside the byte budget.
+            if has_file {
+                let _ = std::fs::remove_file(file_path(dir, &id));
+            }
+            return Err(err);
+        }
+    };
     for item in evicted {
         remove_file(dir, &item);
     }
@@ -118,6 +131,11 @@ pub(crate) fn read_file(
     Ok(bytes)
 }
 
+/// Drop the copy of `message_id`, if kept.
+pub(crate) fn remove(dir: &Path, message_id: &str) -> io::Result<()> {
+    prune(dir, |item| item.id != message_id)
+}
+
 /// Drop every copy `keep` rejects, with its file.
 pub(crate) fn prune(dir: &Path, keep: impl Fn(&GramItem) -> bool) -> io::Result<()> {
     if !dir.join(MIRROR_FILE).exists() {
@@ -138,5 +156,52 @@ pub(crate) fn prune(dir: &Path, keep: impl Fn(&GramItem) -> bool) -> io::Result<
 fn remove_file(dir: &Path, item: &GramItem) {
     if item.file.is_some() {
         let _ = std::fs::remove_file(file_path(dir, &item.id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persist::gram::{GramDirection, GramFile};
+
+    fn item_with_file(bytes: &[u8]) -> GramItem {
+        let sha: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        GramItem {
+            id: "relay-1".into(),
+            direction: GramDirection::AgentToOwner,
+            from: "llm-opt".into(),
+            to: None,
+            text: String::new(),
+            grabbed_by: None,
+            grabbed_unix_ms: None,
+            created_unix_ms: 1,
+            read_by_owner: false,
+            file: Some(GramFile {
+                name: "a.txt".into(),
+                size: bytes.len() as u64,
+                mime: "text/plain".into(),
+                sha256: sha,
+            }),
+            origin_id: String::new(),
+            sender: None,
+        }
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_recorded_leaves_no_file() {
+        let dir = store::tests::TempDir::new("mirror-orphan");
+        store::ensure_dir(&dir.0).unwrap();
+        store::write_private(&dir.0.join(MIRROR_FILE), b"not json").unwrap();
+        assert!(add(&dir.0, item_with_file(b"hello"), Some(b"hello")).is_err());
+        assert!(!file_path(&dir.0, "relay-1").exists());
+
+        std::fs::remove_file(dir.0.join(MIRROR_FILE)).unwrap();
+        add(&dir.0, item_with_file(b"hello"), Some(b"hello")).unwrap();
+        assert_eq!(read_file(&dir.0, "relay-1", 0, 5).unwrap(), b"hello");
+        remove(&dir.0, "relay-1").unwrap();
+        assert!(!file_path(&dir.0, "relay-1").exists());
     }
 }

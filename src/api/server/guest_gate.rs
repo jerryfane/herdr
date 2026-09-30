@@ -736,6 +736,7 @@ pub(super) fn serve_request(
             if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
                 guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
             }
+            reconcile_copies(guest, api_tx);
             let items = crate::guest::gram::items(guest);
             let reply = match crate::guest::gram::list(
                 guest,
@@ -955,18 +956,36 @@ fn mirrored_file(
 /// `gram.send`, keep a guest copy of it when a sharing guest's grant names
 /// the sending pane's agent, and notify those guests. The owner's copy and
 /// the owner's notifications stay with the coordinator.
-pub(super) fn mirror_relayed_send(request: &Request, response: &str, api_tx: &ApiRequestSender) {
-    let Method::GramSend(params) = &request.method else {
-        return;
-    };
-    let Some(pane) = params.caller_pane_id.as_deref() else {
-        return;
-    };
+///
+/// A relayed `gram.delete` that the coordinator accepted drops the copy too.
+pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &ApiRequestSender) {
     // No guest was ever invited here: leave the guest directory alone.
     let dir = crate::guest::store::guest_dir();
     if !dir.join("guests.json").exists() {
         return;
     }
+    let params = match &request.method {
+        Method::GramSend(params) => params,
+        Method::GramDelete(delete) => {
+            let deleted = matches!(
+                serde_json::from_str::<SuccessResponse>(response),
+                Ok(SuccessResponse {
+                    result: ResponseResult::Ok {},
+                    ..
+                })
+            );
+            if deleted {
+                if let Err(err) = crate::guest::mirror::remove(&dir, &delete.id) {
+                    tracing::warn!(err = %err, "guest gram copy removal failed");
+                }
+            }
+            return;
+        }
+        _ => return,
+    };
+    let Some(pane) = params.caller_pane_id.as_deref() else {
+        return;
+    };
     let Ok(Probe {
         agent: Some(agent), ..
     }) = probe_target(api_tx, None, Some(pane))
@@ -980,6 +999,85 @@ pub(super) fn mirror_relayed_send(request: &Request, response: &str, api_tx: &Ap
     if let Some(item) = mirror_relayed(&dir, response, pane, Some(sender)) {
         let cfg = crate::config::Config::load().config.push;
         crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item)]);
+    }
+}
+
+/// Most pages of the agent's coordinator Gram one check reads.
+const RECONCILE_MAX_PAGES: usize = 20;
+const RECONCILE_PAGE: usize = 500;
+/// A guest's copies are checked against the coordinator at most this often.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+static RECONCILED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+
+/// On a Gram-relay remote, drop the guest's copies of Grams the coordinator
+/// no longer has (deleted there, by the owner or the agent). Reads the shared
+/// agent's own view of the coordinator's Gram, which holds exactly the Grams
+/// it sent and those addressed to it, page by page. Anything short of the
+/// whole view (the agent not running, the relay down, the page bound hit)
+/// drops nothing.
+fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
+    let copies = match crate::guest::mirror::load(&guest.dir) {
+        Ok(copies) => copies,
+        Err(_) => return,
+    };
+    if !copies
+        .iter()
+        .any(|item| crate::guest::gram::visible(guest, item))
+    {
+        return;
+    }
+    {
+        let now = Instant::now();
+        let mut reconciled = RECONCILED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reconciled.retain(|(_, at)| now.duration_since(*at) < RECONCILE_INTERVAL);
+        if reconciled.iter().any(|(id, _)| *id == guest.guest_id) {
+            return;
+        }
+        reconciled.push((guest.guest_id.clone(), now));
+    }
+    let GrantState::Live(agent) = grant_state(guest, api_tx) else {
+        return;
+    };
+    let mut present = HashSet::new();
+    let mut before_id = None;
+    for _ in 0..RECONCILE_MAX_PAGES {
+        let request = Request {
+            id: "guest:reconcile".into(),
+            method: Method::GramList(crate::api::schema::GramListParams {
+                caller_pane_id: Some(agent.pane_id.clone()),
+                limit: Some(RECONCILE_PAGE),
+                before_id: before_id.take(),
+                ..Default::default()
+            }),
+        };
+        let Some(response) = crate::api::reverse::forward_relay(&request) else {
+            return;
+        };
+        let Ok(SuccessResponse {
+            result: ResponseResult::GramList {
+                messages, has_more, ..
+            },
+            ..
+        }) = serde_json::from_str::<SuccessResponse>(&response)
+        else {
+            return;
+        };
+        before_id = messages.last().map(|message| message.id.clone());
+        present.extend(messages.into_iter().map(|message| message.id));
+        if !has_more {
+            let pruned = crate::guest::mirror::prune(&guest.dir, |item| {
+                !crate::guest::gram::visible(guest, item) || present.contains(&item.id)
+            });
+            if let Err(err) = pruned {
+                tracing::warn!(err = %err, "guest gram copies prune failed");
+            }
+            return;
+        }
+        if before_id.is_none() {
+            return;
+        }
     }
 }
 
@@ -3097,6 +3195,8 @@ mod tests {
         /// Each stored message with its file bytes.
         messages: Vec<(Value, Vec<u8>)>,
         posts: Vec<Value>,
+        /// Relayed `gram.list` calls answered.
+        lists: usize,
     }
 
     /// A coordinator behind the production gateway (`serve_one`) that answers
@@ -3104,21 +3204,60 @@ mod tests {
     /// `other-agent`. It serves files 3 bytes per chunk.
     struct Coordinator {
         state: Arc<Mutex<CoordinatorState>>,
-        _socket_dir: TempDir,
+        _socket: RelaySocket,
+    }
+
+    /// This process as a Gram-relay remote of the socket at `path`, until
+    /// dropped: then the variable, the relay policy and the socket file are
+    /// back as they were. The path is short, since macOS limits a socket path
+    /// to 104 bytes and its temp directory alone is about 50.
+    struct RelaySocket {
+        path: std::path::PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl RelaySocket {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let path = std::path::PathBuf::from(format!(
+                "/tmp/hg-{:x}-{:x}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self {
+                path,
+                previous: std::env::var_os(crate::api::gram_relay::SOCKET_ENV),
+            }
+        }
+
+        /// Point this daemon's Gram at the socket.
+        fn enable(&self) {
+            std::env::set_var(crate::api::gram_relay::SOCKET_ENV, &self.path);
+            crate::api::gram_relay::apply_config(&crate::config::Config::default().gram_relay);
+            assert!(crate::api::gram_relay::policy().remote_socket().is_some());
+        }
+    }
+
+    impl Drop for RelaySocket {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(crate::api::gram_relay::SOCKET_ENV, value),
+                None => std::env::remove_var(crate::api::gram_relay::SOCKET_ENV),
+            }
+            crate::api::gram_relay::apply_config(&crate::config::Config::default().gram_relay);
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     impl Coordinator {
         /// Makes this daemon (the harness) a Gram-relay remote of it.
         fn start(harness: &Harness) -> Self {
             use base64::Engine as _;
-            let socket_dir = TempDir::new("relay-socket");
-            std::fs::create_dir_all(&socket_dir.0).unwrap();
-            let socket = socket_dir.0.join("gram.sock");
+            let socket = RelaySocket::new();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
-            crate::api::reverse::serve_test_gateway(&socket, "mac-studio", tx);
-            std::env::set_var(crate::api::gram_relay::SOCKET_ENV, &socket);
-            crate::api::gram_relay::apply_config(&crate::config::Config::default().gram_relay);
-            assert!(crate::api::gram_relay::policy().remote_socket().is_some());
+            crate::api::reverse::serve_test_gateway(&socket.path, "mac-studio", tx);
+            socket.enable();
 
             let state: Arc<Mutex<CoordinatorState>> = Arc::default();
             let names: HashMap<String, &str> = [
@@ -3226,7 +3365,52 @@ mod tests {
                                 }
                             }
                         }
-                        other => panic!("unexpected relay call {other:?}"),
+                        GramRelayCall::List(list) => {
+                            let Some(identity) = caller(&list.caller_pane_id) else {
+                                let _ = message.respond_to.send(
+                                    json!({"id": id, "error": {"code": "unknown_caller", "message": "?"}}).to_string(),
+                                );
+                                continue;
+                            };
+                            state.lists += 1;
+                            let view: Vec<&Value> = state
+                                .messages
+                                .iter()
+                                .rev()
+                                .map(|(stored, _)| stored)
+                                .filter(|stored| {
+                                    stored["from"] == identity || stored["to"] == identity
+                                })
+                                .collect();
+                            let start = list.before_id.as_deref().map_or(0, |before| {
+                                view.iter()
+                                    .position(|stored| stored["id"] == before)
+                                    .map_or(view.len(), |at| at + 1)
+                            });
+                            let limit = list.limit.unwrap_or(usize::MAX);
+                            let page: Vec<&Value> =
+                                view.iter().skip(start).take(limit).copied().collect();
+                            let has_more = start + page.len() < view.len();
+                            json!({"type": "gram_list", "messages": page, "store_id": "coordinator",
+                                "digest": "", "has_more": has_more, "unread_count": 0})
+                        }
+                        GramRelayCall::Delete(delete) => {
+                            let identity = caller(&delete.caller_pane_id);
+                            let before = state.messages.len();
+                            state.messages.retain(|(stored, _)| {
+                                stored["id"] != delete.id.as_str()
+                                    || !identity.is_some_and(|identity| {
+                                        stored["from"] == identity || stored["to"] == identity
+                                    })
+                            });
+                            if state.messages.len() == before {
+                                let _ = message.respond_to.send(
+                                    json!({"id": id, "error": {"code": "not_found", "message": "?"}}).to_string(),
+                                );
+                                continue;
+                            }
+                            json!({"type": "ok"})
+                        }
                     };
                     let _ = message
                         .respond_to
@@ -3235,8 +3419,18 @@ mod tests {
             });
             Self {
                 state,
-                _socket_dir: socket_dir,
+                _socket: socket,
             }
+        }
+    }
+
+    impl Coordinator {
+        /// The owner deletes a Gram in the coordinator's own store.
+        fn owner_deletes(&self, id: &str) {
+            let mut state = self.state.lock().unwrap();
+            let before = state.messages.len();
+            state.messages.retain(|(stored, _)| stored["id"] != id);
+            assert_eq!(state.messages.len() + 1, before, "{id} was stored");
         }
     }
 
@@ -3402,5 +3596,107 @@ mod tests {
             json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
         );
         assert_eq!(whole[0]["result"]["data_base64"], "aGVsbG8=", "{whole:?}");
+    }
+
+    fn copy_ids(guest: &GuestPrincipal) -> Vec<String> {
+        crate::guest::mirror::load(&guest.dir)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    fn agent_sends(harness: &Harness, pane: usize, text: &str) -> String {
+        let sent = local_call(
+            harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": text, "caller_pane_id": harness.pane_ids[pane]}}),
+        );
+        sent["result"]["message"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sent: {sent}"))
+            .to_string()
+    }
+
+    #[test]
+    fn an_agents_relayed_delete_drops_the_guest_copy() {
+        let (_config, harness, _coordinator) = relay_remote("relay-delete");
+        let guest = harness.admit_with(0, true);
+        let kept = agent_sends(&harness, 0, "kept");
+        let deleted = agent_sends(&harness, 0, "deleted");
+        assert_eq!(copy_ids(&guest), [kept.clone(), deleted.clone()]);
+
+        let answer = local_call(
+            &harness,
+            json!({"id": "d", "method": "gram.delete", "params": {"id": deleted, "caller_pane_id": harness.pane_ids[0]}}),
+        );
+        assert_eq!(answer["result"]["type"], "ok", "{answer}");
+        assert_eq!(copy_ids(&guest), std::slice::from_ref(&kept));
+
+        // A delete the coordinator refuses keeps the copy.
+        let refused = local_call(
+            &harness,
+            json!({"id": "d", "method": "gram.delete", "params": {"id": kept, "caller_pane_id": harness.pane_ids[1]}}),
+        );
+        assert_eq!(refused["error"]["code"], "not_found", "{refused}");
+        assert_eq!(copy_ids(&guest), [kept]);
+    }
+
+    #[test]
+    fn copies_of_grams_the_owner_deleted_on_the_coordinator_are_dropped() {
+        let (_config, harness, coordinator) = relay_remote("relay-owner-delete");
+        let guest = harness.admit_with(0, true);
+        let kept = agent_sends(&harness, 0, "kept");
+        let gone = agent_sends(&harness, 0, "gone");
+        let own = harness.call(
+            &guest,
+            json!({"id": "p", "method": "gram.post", "params": {"text": "mine"}}),
+        );
+        let own = own[0]["result"]["message"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        coordinator.owner_deletes(&gone);
+        coordinator.owner_deletes(&own);
+
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["kept"], "{listed}");
+        assert_eq!(copy_ids(&guest), std::slice::from_ref(&kept));
+        let fetch = harness.call(
+            &guest,
+            json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [gone]}}),
+        );
+        assert_eq!(code(&fetch), "guest_forbidden");
+
+        // Checked at most once per interval, not on every poll.
+        guest_list(&harness, &guest, json!({}));
+        assert_eq!(coordinator.state.lock().unwrap().lists, 1);
+    }
+
+    #[test]
+    fn an_unreachable_view_drops_no_copy() {
+        let (_config, harness, _coordinator) = relay_remote("relay-paused");
+        let guest = harness.admit_with(0, true);
+        agent_sends(&harness, 0, "kept");
+        // The agent is not running: its coordinator view cannot be read.
+        harness.agent_exits();
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["kept"], "{listed}");
+    }
+
+    #[test]
+    fn the_relay_fixture_leaves_no_relay_behind() {
+        let previous = std::env::var_os(crate::api::gram_relay::SOCKET_ENV);
+        let (config, harness, coordinator) = relay_remote("relay-scope");
+        drop(coordinator);
+        drop(harness);
+        drop(config);
+        assert_eq!(
+            std::env::var_os(crate::api::gram_relay::SOCKET_ENV),
+            previous
+        );
+        assert_eq!(
+            crate::api::gram_relay::policy().remote_socket().is_some(),
+            previous.is_some()
+        );
     }
 }

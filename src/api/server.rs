@@ -1402,7 +1402,7 @@ fn handle_principal_connection(
             let written = write_text_line_allow_disconnect(&mut stream, &response);
             // The coordinator keeps the Gram; the guests of the sending agent
             // on this machine get their own copy.
-            guest_gate::mirror_relayed_send(&request, &response, api_tx);
+            guest_gate::after_relayed_gram(&request, &response, api_tx);
             return written;
         }
     }

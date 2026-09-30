@@ -63,7 +63,10 @@ pub(crate) fn any_guest_sees(guests: &[store::GuestRecord], item: &GramItem) -> 
 /// copies kept for guests, oldest first.
 pub(crate) fn items(guest: &GuestPrincipal) -> Vec<GramItem> {
     let mut items = crate::persist::gram::load();
-    items.extend(super::mirror::load(&guest.dir).unwrap_or_default());
+    match super::mirror::load(&guest.dir) {
+        Ok(copies) => items.extend(copies),
+        Err(err) => tracing::warn!(err = %err, "guest gram copies unavailable"),
+    }
     items.sort_by_key(|item| item.created_unix_ms);
     items
 }
