@@ -939,7 +939,7 @@ pub(super) fn poll_peer_agent_list(
 /// an optional pin. An already-qualified target is rejected rather than prefixed
 /// twice. [`FederationStore::merged_agents`] is the only code that sets
 /// `reachability`/`last_known_status`, from the home's poll-outcome tracking.
-pub(super) fn prefix_remote_agent(
+pub(crate) fn prefix_remote_agent(
     alias: &str,
     presentation: &PeerPresentation,
     mut agent: crate::api::schema::AgentInfo,

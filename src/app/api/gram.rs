@@ -283,9 +283,16 @@ impl App {
             }
             GramRelayCall::Post(post) => {
                 // Only a HerdrUp guest's post, and only to an agent of the
-                // relaying machine: that machine serves the agent's guest.
+                // relaying machine: that machine serves the agent's guest. It
+                // names the agent as it knows it; here that agent is
+                // `<alias>/<name>`, as the federation roster qualifies it and
+                // as the agent's own relayed list and file reads identify it.
+                let to = post.to.trim();
+                let qualified = format!("{alias}/{to}");
                 if !crate::guest::store::valid_guest_name(&post.guest)
-                    || !self.relay_agent_named(&alias, post.to.trim())
+                    || to.is_empty()
+                    || to.contains('/')
+                    || !self.relay_agent_named(&alias, &qualified)
                 {
                     return encode_error(
                         id,
@@ -299,7 +306,7 @@ impl App {
                 });
                 let params = GramPostParams {
                     text: post.text,
-                    to: Some(post.to),
+                    to: Some(qualified),
                     file,
                     from: Some(crate::guest::post_from(&post.guest)),
                 };
@@ -308,7 +315,7 @@ impl App {
         }
     }
 
-    /// Whether a reachable agent of peer `alias` has this name.
+    /// Whether a reachable agent of peer `alias` has this qualified name.
     #[cfg(unix)]
     fn relay_agent_named(&self, alias: &str, name: &str) -> bool {
         let prefix = format!("{alias}/");
@@ -2300,7 +2307,8 @@ mod tests {
         }
 
         /// A coordinator allowing `PEER`, whose roster has `llm-opt` in pane
-        /// `w1-1` and `other-agent` in `w1-2`.
+        /// `w1-1` and `other-agent` in `w1-2`, merged as the coordinator's
+        /// federation poll merges them: every name and id `PEER/`-qualified.
         fn coordinator() -> App {
             let (mut app, path) = app_with_config_file();
             reload(
@@ -2308,21 +2316,24 @@ mod tests {
                 &path,
                 &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
             );
+            let presentation = crate::api::federation_manager::PeerPresentation {
+                profile_id: Some(PEER.into()),
+                label: "Jerrys-Mac-Studio".into(),
+            };
             let agent = |pane: &str, name: &str| -> crate::api::schema::AgentInfo {
-                serde_json::from_value(serde_json::json!({
-                    "terminal_id": format!("{PEER}/t-{pane}"),
+                let local = serde_json::from_value(serde_json::json!({
+                    "terminal_id": format!("term_65c2c15717c84.{pane}"),
                     "name": name,
-                    "agent": "claude",
+                    "agent": "omp",
                     "agent_status": "idle",
-                    "workspace_id": format!("{PEER}/w1"),
-                    "tab_id": format!("{PEER}/w1:t1"),
-                    "pane_id": format!("{PEER}/{pane}"),
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "pane_id": pane,
                     "focused": false,
                     "revision": 1,
-                    "machine_id": PEER,
-                    "reachability": "reachable",
                 }))
-                .unwrap()
+                .unwrap();
+                crate::api::prefix_remote_agent(PEER, &presentation, local).unwrap()
             };
             app.federation.lock().unwrap().set_peer(
                 PEER,
@@ -2364,7 +2375,8 @@ mod tests {
             );
             let message = &posted["result"]["message"];
             assert_eq!(message["direction"], "owner_to_agent", "{posted}");
-            assert_eq!(message["to"], "llm-opt");
+            // Addressed as the coordinator names that machine's agent.
+            assert_eq!(message["to"], format!("{PEER}/llm-opt"));
             let id = message["id"].as_str().unwrap();
 
             let listed = relay(
@@ -2403,6 +2415,8 @@ mod tests {
                 guest_post("llm-opt", "owner (via HerdrUp)"),
                 guest_post("not-on-the-peer", "plotarmordev"),
                 guest_post("", "plotarmordev"),
+                // The remote names its own agent; a qualified name is not one.
+                guest_post(&format!("{PEER}/llm-opt"), "plotarmordev"),
             ] {
                 let answer = relay(&mut app, call.clone());
                 assert_eq!(answer["error"]["code"], "forbidden", "{call} -> {answer}");

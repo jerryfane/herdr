@@ -708,8 +708,9 @@ pub(super) fn serve_request(
             };
             let response = match crate::api::reverse::forward_relay(&relayed) {
                 Some(response) => {
-                    mirror_relayed(&guest.dir, &response, &agent.pane_id, None);
-                    response
+                    let local = agent.name.as_deref().unwrap_or_default();
+                    mirror_relayed(&guest.dir, &response, &agent.pane_id, local, None);
+                    localize_sent(&response, local)
                 }
                 None => {
                     let request = Request {
@@ -993,11 +994,14 @@ pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &Api
     else {
         return;
     };
+    let Some(local) = agent.name else {
+        return;
+    };
     let sender = crate::persist::gram::GramSender {
         terminal_id: agent.terminal_id,
         agent: agent.agent,
     };
-    if let Some(item) = mirror_relayed(&dir, response, pane, Some(sender)) {
+    if let Some(item) = mirror_relayed(&dir, response, pane, &local, Some(sender)) {
         let cfg = crate::config::Config::load().config.push;
         crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item)]);
     }
@@ -1144,8 +1148,15 @@ fn apply_reconcile(
         tracing::warn!(err = %err, "guest gram copies prune failed");
     }
     let unchanged = |item: &GramItem, message: &crate::api::schema::GramMessageInfo| {
-        message.from == item.from
-            && message.to == item.to
+        let same = |coordinator: &str, local: &str| {
+            coordinator == local || names_local_agent(coordinator, local)
+        };
+        same(&message.from, &item.from)
+            && match (&message.to, &item.to) {
+                (Some(coordinator), Some(local)) => same(coordinator, local),
+                (None, None) => true,
+                _ => false,
+            }
             && message.text == item.text
             && message
                 .file
@@ -1175,15 +1186,44 @@ fn apply_reconcile(
     }
 }
 
+/// Whether `coordinator`, a name in the coordinator's Gram, is this
+/// machine's agent `local`. The coordinator names a relaying machine's agents
+/// as its federation roster does, `<alias>/<name>`, where agent names never
+/// contain `/`; the alias is the coordinator's own for this machine, which
+/// this machine does not know, and it only ever talks to that coordinator.
+fn names_local_agent(coordinator: &str, local: &str) -> bool {
+    !local.is_empty()
+        && coordinator
+            .split_once('/')
+            .is_some_and(|(alias, name)| !alias.is_empty() && name == local)
+}
+
+/// A relayed `gram.post` reply with the addressee named as this machine
+/// names it, `local`, rather than as the coordinator does.
+fn localize_sent(response: &str, local: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(response) else {
+        return response.to_string();
+    };
+    let to = &mut value["result"]["message"]["to"];
+    if to.as_str().is_some_and(|to| names_local_agent(to, local)) {
+        *to = serde_json::Value::String(local.to_string());
+        return value.to_string();
+    }
+    response.to_string()
+}
+
 /// Record the Gram the coordinator answered with `response` as witnessed when
 /// an active guest's grant covers it, and keep a guest copy of it when an
 /// active sharing guest can see it, pulling its file back through
-/// the relay as the agent in `pane`. `sender` binds an agent's own Gram to
-/// the pane that sent it. Returns the copy kept.
+/// the relay as the agent in `pane`, named `local` on this machine. `sender`
+/// binds an agent's own Gram to the pane that sent it. The copy names the
+/// agent as this machine does, not as the coordinator (see
+/// [`names_local_agent`]). Returns the copy kept.
 fn mirror_relayed(
     dir: &std::path::Path,
     response: &str,
     pane: &str,
+    local: &str,
     sender: Option<crate::persist::gram::GramSender>,
 ) -> Option<GramItem> {
     let Ok(SuccessResponse {
@@ -1201,11 +1241,30 @@ fn mirror_relayed(
             crate::persist::gram::GramDirection::OwnerToAgent
         }
     };
+    // The coordinator answered for this machine's agent; it must name it.
+    let (from, to) = match direction {
+        crate::persist::gram::GramDirection::AgentToOwner => {
+            if !names_local_agent(&message.from, local) {
+                return None;
+            }
+            (local.to_string(), None)
+        }
+        crate::persist::gram::GramDirection::OwnerToAgent => {
+            if !message
+                .to
+                .as_deref()
+                .is_some_and(|to| names_local_agent(to, local))
+            {
+                return None;
+            }
+            (message.from, Some(local.to_string()))
+        }
+    };
     let item = GramItem {
         id: message.id,
         direction,
-        from: message.from,
-        to: message.to,
+        from,
+        to,
         text: message.text,
         grabbed_by: None,
         grabbed_unix_ms: None,
@@ -3304,7 +3363,9 @@ mod tests {
 
     /// A coordinator behind the production gateway (`serve_one`) that answers
     /// the relay calls in memory, naming the remote's two panes `llm-opt` and
-    /// `other-agent`. It serves files 3 bytes per chunk.
+    /// `other-agent` as a real coordinator does, qualified with the relay
+    /// alias (`mac-studio/llm-opt`): the name its federation roster gives them
+    /// and so the name its Gram stores. It serves files 3 bytes per chunk.
     struct Coordinator {
         state: Arc<Mutex<CoordinatorState>>,
         _socket: RelaySocket,
@@ -3364,8 +3425,8 @@ mod tests {
 
             let state: Arc<Mutex<CoordinatorState>> = Arc::default();
             let names: HashMap<String, &str> = [
-                (harness.pane_ids[0].clone(), "llm-opt"),
-                (harness.pane_ids[1].clone(), "other-agent"),
+                (harness.pane_ids[0].clone(), "mac-studio/llm-opt"),
+                (harness.pane_ids[1].clone(), "mac-studio/other-agent"),
             ]
             .into_iter()
             .collect();
@@ -3434,7 +3495,7 @@ mod tests {
                                 "id": format!("gram-{}", state.messages.len()),
                                 "direction": "owner_to_agent",
                                 "from": crate::guest::post_from(&post.guest),
-                                "to": post.to, "text": post.text,
+                                "to": format!("mac-studio/{}", post.to), "text": post.text,
                                 "created_unix_ms": now_ms(), "read_by_owner": true,
                             });
                             if !file.is_null() {
@@ -3534,7 +3595,7 @@ mod tests {
         fn foreign_gram(&self, text: &str) {
             let mut state = self.state.lock().unwrap();
             let stored = json!({
-                "id": "relay-foreign", "direction": "agent_to_owner", "from": "llm-opt",
+                "id": "relay-foreign", "direction": "agent_to_owner", "from": "mac-studio/llm-opt",
                 "text": text, "created_unix_ms": now_ms(), "read_by_owner": false,
             });
             state.messages.push((stored, Vec::new()));
@@ -3686,6 +3747,8 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("posted: {posted:?}"))
             .to_string();
+        // The guest sees the agent under the name it knows.
+        assert_eq!(posted[0]["result"]["message"]["to"], "llm-opt");
         assert!(
             crate::persist::gram::load().is_empty(),
             "nothing stays local"
