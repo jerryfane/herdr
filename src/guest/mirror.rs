@@ -8,6 +8,11 @@
 //! Copies live in `gram-mirror.json` and `gram-mirror/` beside the guest
 //! store, bounded by count and bytes (oldest dropped first), and are pruned
 //! when no active sharing guest can see them any more.
+//!
+//! Every such relayed Gram is also recorded without its bytes in
+//! `gram-witnessed.json`, even while its guest does not share the Gram, so
+//! turning sharing on (again) can bring the guest's history back from the
+//! coordinator.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +25,8 @@ use super::store;
 
 const MIRROR_FILE: &str = "gram-mirror.json";
 const FILES_DIR: &str = "gram-mirror";
+/// Records (no bytes) of the Grams relayed for guests; see [`witnessed`].
+const WITNESS_FILE: &str = "gram-witnessed.json";
 /// Most copies kept.
 const MAX_ITEMS: usize = 500;
 /// Most file bytes kept across all copies.
@@ -39,10 +46,13 @@ pub(crate) fn load(dir: &Path) -> io::Result<Vec<GramItem>> {
 }
 
 /// Keep a copy of `item` with its file `bytes`, which must match the
-/// recorded size and SHA-256. Replaces an earlier copy with the same id.
+/// recorded size and SHA-256. Replaces an earlier copy with the same id. The
+/// bytes are staged beside the store and take the copy's place only once its
+/// record is saved, so a failed call leaves an earlier copy of the same id,
+/// record and file, as it was.
 pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Result<()> {
-    match (&item.file, bytes) {
-        (None, None) => {}
+    let staged = match (&item.file, bytes) {
+        (None, None) => None,
         (Some(file), Some(bytes)) => {
             let digest: String = Sha256::digest(bytes)
                 .iter()
@@ -54,9 +64,10 @@ pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Resul
                     "mirrored file does not match its record",
                 ));
             }
-            let path = file_path(dir, &item.id);
             store::ensure_dir(&dir.join(FILES_DIR))?;
-            store::write_private(&path, bytes)?;
+            let staged = staging_path(dir, &item.id);
+            store::write_private(&staged, bytes)?;
+            Some(staged)
         }
         _ => {
             return Err(io::Error::new(
@@ -64,9 +75,8 @@ pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Resul
                 "a file record needs its bytes",
             ))
         }
-    }
-    let id = item.id.clone();
-    let has_file = item.file.is_some();
+    };
+    let final_path = file_path(dir, &item.id);
     let updated = store::update_side(dir, MIRROR_FILE, |items: &mut Vec<GramItem>| {
         items.retain(|existing| existing.id != item.id);
         items.push(item);
@@ -87,18 +97,76 @@ pub(crate) fn add(dir: &Path, item: GramItem, bytes: Option<&[u8]>) -> io::Resul
     let evicted = match updated {
         Ok(evicted) => evicted,
         Err(err) => {
-            // The record was not kept: do not leave its bytes behind,
-            // outside the byte budget.
-            if has_file {
-                let _ = std::fs::remove_file(file_path(dir, &id));
+            // Only the bytes this call staged go; an earlier copy stays.
+            if let Some(staged) = &staged {
+                let _ = std::fs::remove_file(staged);
             }
             return Err(err);
         }
     };
+    if let Some(staged) = &staged {
+        if let Err(err) = std::fs::rename(staged, &final_path) {
+            let _ = std::fs::remove_file(staged);
+            return Err(err);
+        }
+    }
     for item in evicted {
         remove_file(dir, &item);
     }
     Ok(())
+}
+
+/// A unique staging path for a copy's bytes, in the copies' directory.
+fn staging_path(dir: &Path, message_id: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut path = file_path(dir, message_id).into_os_string();
+    path.push(format!(
+        ".{}-{}.part",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    PathBuf::from(path)
+}
+
+/// Record that this machine relayed `item` from a pane a guest's grant names
+/// (see `witnessed`). Kept whether or not the guest shares the Gram now.
+pub(crate) fn witness(dir: &Path, item: GramItem) -> io::Result<()> {
+    let item = GramItem {
+        read_by_owner: false,
+        ..item
+    };
+    store::update_side(dir, WITNESS_FILE, |items: &mut Vec<GramItem>| {
+        items.retain(|existing| existing.id != item.id);
+        items.push(item);
+        items.sort_by_key(|item| item.created_unix_ms);
+        while items.len() > MAX_ITEMS {
+            items.remove(0);
+        }
+        ((), true)
+    })
+}
+
+/// Grams this machine relayed to the coordinator for a guest's shared agent
+/// or from a guest: the agents' sends with the sender binding taken from the
+/// pane that sent them, and the guests' own posts. Only these are brought
+/// back from the coordinator when Gram sharing is turned on (again).
+pub(crate) fn witnessed(dir: &Path) -> io::Result<Vec<GramItem>> {
+    if !dir.join(WITNESS_FILE).exists() {
+        return Ok(Vec::new());
+    }
+    store::load_side(dir, WITNESS_FILE)
+}
+
+/// Forget every witnessed Gram `keep` rejects.
+pub(crate) fn forget_witnessed(dir: &Path, keep: impl Fn(&GramItem) -> bool) -> io::Result<()> {
+    if !dir.join(WITNESS_FILE).exists() {
+        return Ok(());
+    }
+    store::update_side(dir, WITNESS_FILE, |items: &mut Vec<GramItem>| {
+        let before = items.len();
+        items.retain(|item| keep(item));
+        ((), items.len() != before)
+    })
 }
 
 /// The copy with this id, if kept.
@@ -196,12 +264,47 @@ mod tests {
         store::ensure_dir(&dir.0).unwrap();
         store::write_private(&dir.0.join(MIRROR_FILE), b"not json").unwrap();
         assert!(add(&dir.0, item_with_file(b"hello"), Some(b"hello")).is_err());
-        assert!(!file_path(&dir.0, "relay-1").exists());
+        assert_eq!(
+            files(&dir.0),
+            Vec::<String>::new(),
+            "nothing staged is left"
+        );
 
         std::fs::remove_file(dir.0.join(MIRROR_FILE)).unwrap();
         add(&dir.0, item_with_file(b"hello"), Some(b"hello")).unwrap();
         assert_eq!(read_file(&dir.0, "relay-1", 0, 5).unwrap(), b"hello");
         remove(&dir.0, "relay-1").unwrap();
         assert!(!file_path(&dir.0, "relay-1").exists());
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir.join(FILES_DIR))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_failed_retry_of_a_kept_copy_keeps_its_file() {
+        let dir = store::tests::TempDir::new("mirror-retry");
+        add(&dir.0, item_with_file(b"hello"), Some(b"hello")).unwrap();
+        let record = std::fs::read(dir.0.join(MIRROR_FILE)).unwrap();
+
+        // The same message again, while its record cannot be written.
+        store::write_private(&dir.0.join(MIRROR_FILE), b"not json").unwrap();
+        assert!(add(&dir.0, item_with_file(b"hello"), Some(b"hello")).is_err());
+        store::write_private(&dir.0.join(MIRROR_FILE), &record).unwrap();
+
+        assert_eq!(get(&dir.0, "relay-1").unwrap().id, "relay-1");
+        assert_eq!(read_file(&dir.0, "relay-1", 0, 5).unwrap(), b"hello");
+        assert_eq!(
+            files(&dir.0).len(),
+            1,
+            "only the kept file: {:?}",
+            files(&dir.0)
+        );
     }
 }

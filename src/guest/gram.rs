@@ -52,6 +52,13 @@ fn visible_in(
     }
 }
 
+/// Whether an active guest, sharing the Gram or not, could see `item`.
+pub(crate) fn any_guest_may_see(guests: &[store::GuestRecord], item: &GramItem) -> bool {
+    guests
+        .iter()
+        .any(|guest| !guest.revoked && visible_to(guest, item))
+}
+
 /// Whether an active guest sharing the Gram can see `item`.
 pub(crate) fn any_guest_sees(guests: &[store::GuestRecord], item: &GramItem) -> bool {
     guests

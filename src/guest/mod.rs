@@ -481,10 +481,13 @@ fn forget_guest(dir: &std::path::Path, guest_id: &str) {
     prune_mirror(dir);
 }
 
-/// Drop the Gram copies no active sharing guest can see any more.
+/// Drop the Gram copies no active sharing guest can see any more, and the
+/// witnessed records no active guest could.
 fn prune_mirror(dir: &std::path::Path) {
-    let pruned = store::load_store(dir)
-        .and_then(|store| mirror::prune(dir, |item| gram::any_guest_sees(&store.guests, item)));
+    let pruned = store::load_store(dir).and_then(|store| {
+        mirror::prune(dir, |item| gram::any_guest_sees(&store.guests, item))?;
+        mirror::forget_witnessed(dir, |item| gram::any_guest_may_see(&store.guests, item))
+    });
     if let Err(err) = pruned {
         tracing::warn!(err = %err, "guest gram copies prune failed");
     }

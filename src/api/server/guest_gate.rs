@@ -708,9 +708,7 @@ pub(super) fn serve_request(
             };
             let response = match crate::api::reverse::forward_relay(&relayed) {
                 Some(response) => {
-                    if guest.shares_gram() {
-                        mirror_relayed(&guest.dir, &response, &agent.pane_id, None);
-                    }
+                    mirror_relayed(&guest.dir, &response, &agent.pane_id, None);
                     response
                 }
                 None => {
@@ -975,7 +973,10 @@ pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &Api
                 })
             );
             if deleted {
-                if let Err(err) = crate::guest::mirror::remove(&dir, &delete.id) {
+                let removed = crate::guest::mirror::remove(&dir, &delete.id).and_then(|()| {
+                    crate::guest::mirror::forget_witnessed(&dir, |item| item.id != delete.id)
+                });
+                if let Err(err) = removed {
                     tracing::warn!(err = %err, "guest gram copy removal failed");
                 }
             }
@@ -1009,20 +1010,49 @@ const RECONCILE_PAGE: usize = 500;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 static RECONCILED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
-/// On a Gram-relay remote, drop the guest's copies of Grams the coordinator
-/// no longer has (deleted there, by the owner or the agent). Reads the shared
-/// agent's own view of the coordinator's Gram, which holds exactly the Grams
-/// it sent and those addressed to it, page by page. Anything short of the
-/// whole view (the agent not running, the relay down, the page bound hit)
-/// drops nothing.
+/// Most witnessed Grams one check brings back; the rest follow at the next.
+const RECONCILE_MAX_IMPORTS: usize = 50;
+
+/// On a Gram-relay remote, bring the guest's copies in line with the
+/// coordinator: drop copies of Grams it no longer has (deleted there, by the
+/// owner or the agent), and bring back the guest's Grams it has but this
+/// machine kept no copy of (sent or posted while the guest did not share the
+/// Gram, or dropped when sharing was turned off).
+///
+/// It reads the shared agent's own view of the coordinator's Gram, which
+/// holds the Grams it sent and those addressed to it, page by page. Anything
+/// short of the whole view (the agent not running, the relay down, the page
+/// bound hit) changes nothing.
+///
+/// Only Grams this machine witnessed relaying (see
+/// `crate::guest::mirror::witnessed`) are brought back. The coordinator's
+/// view cannot tell this machine's agent apart: its records carry a bare
+/// `from` name, which an agent on another machine or on the coordinator may
+/// share, and no sender binding. The witnessed record carries the binding
+/// taken from the sending pane when it was relayed, so what comes back meets
+/// the same rule as a live copy (`grant_sent`); the coordinator only
+/// confirms the Gram still exists unchanged and serves its file, which is
+/// checked against the witnessed size and SHA-256.
 fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
-    let copies = match crate::guest::mirror::load(&guest.dir) {
-        Ok(copies) => copies,
-        Err(_) => return,
+    let Ok(copies) = crate::guest::mirror::load(&guest.dir) else {
+        return;
     };
-    if !copies
+    let witnessed = crate::guest::mirror::witnessed(&guest.dir).unwrap_or_else(|err| {
+        tracing::warn!(err = %err, "witnessed guest grams unavailable");
+        Vec::new()
+    });
+    let copied: HashSet<&str> = copies.iter().map(|item| item.id.as_str()).collect();
+    let missing: Vec<&GramItem> = witnessed
         .iter()
-        .any(|item| crate::guest::gram::visible(guest, item))
+        .filter(|item| {
+            crate::guest::gram::visible(guest, item) && !copied.contains(item.id.as_str())
+        })
+        .collect();
+    // No copy to check and nothing to bring back: nothing to ask.
+    if missing.is_empty()
+        && !copies
+            .iter()
+            .any(|item| crate::guest::gram::visible(guest, item))
     {
         return;
     }
@@ -1040,7 +1070,7 @@ fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
     let GrantState::Live(agent) = grant_state(guest, api_tx) else {
         return;
     };
-    let mut present = HashSet::new();
+    let mut present: HashMap<String, crate::api::schema::GramMessageInfo> = HashMap::new();
     let mut before_id = None;
     for _ in 0..RECONCILE_MAX_PAGES {
         let request = Request {
@@ -1065,14 +1095,13 @@ fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
             return;
         };
         before_id = messages.last().map(|message| message.id.clone());
-        present.extend(messages.into_iter().map(|message| message.id));
+        present.extend(
+            messages
+                .into_iter()
+                .map(|message| (message.id.clone(), message)),
+        );
         if !has_more {
-            let pruned = crate::guest::mirror::prune(&guest.dir, |item| {
-                !crate::guest::gram::visible(guest, item) || present.contains(&item.id)
-            });
-            if let Err(err) = pruned {
-                tracing::warn!(err = %err, "guest gram copies prune failed");
-            }
+            apply_reconcile(guest, &agent.pane_id, &present, &missing);
             return;
         }
         if before_id.is_none() {
@@ -1081,8 +1110,61 @@ fn reconcile_copies(guest: &GuestPrincipal, api_tx: &ApiRequestSender) {
     }
 }
 
-/// Keep a guest copy of the Gram the coordinator answered with `response`,
-/// when an active sharing guest can see it, pulling its file back through
+/// With the agent's whole coordinator view in `present`: drop the stale
+/// copies and witnessed records, and bring back the `missing` ones.
+fn apply_reconcile(
+    guest: &GuestPrincipal,
+    pane: &str,
+    present: &HashMap<String, crate::api::schema::GramMessageInfo>,
+    missing: &[&GramItem],
+) {
+    let visible = |item: &GramItem| crate::guest::gram::visible(guest, item);
+    let pruned = crate::guest::mirror::prune(&guest.dir, |item| {
+        !visible(item) || present.contains_key(&item.id)
+    })
+    .and_then(|()| {
+        crate::guest::mirror::forget_witnessed(&guest.dir, |item| {
+            !visible(item) || present.contains_key(&item.id)
+        })
+    });
+    if let Err(err) = pruned {
+        tracing::warn!(err = %err, "guest gram copies prune failed");
+    }
+    let unchanged = |item: &GramItem, message: &crate::api::schema::GramMessageInfo| {
+        message.from == item.from
+            && message.to == item.to
+            && message.text == item.text
+            && message
+                .file
+                .as_ref()
+                .map(|file| (&file.name, file.size, &file.sha256))
+                == item
+                    .file
+                    .as_ref()
+                    .map(|file| (&file.name, file.size, &file.sha256))
+    };
+    let back = missing.iter().filter(|item| {
+        present
+            .get(&item.id)
+            .is_some_and(|message| unchanged(item, message))
+    });
+    for item in back.take(RECONCILE_MAX_IMPORTS) {
+        let bytes = match &item.file {
+            Some(file) => match pull_relayed_file(&item.id, file.size, pane) {
+                Some(bytes) => Some(bytes),
+                None => continue,
+            },
+            None => None,
+        };
+        if let Err(err) = crate::guest::mirror::add(&guest.dir, (*item).clone(), bytes.as_deref()) {
+            tracing::warn!(err = %err, "guest gram copy failed");
+        }
+    }
+}
+
+/// Record the Gram the coordinator answered with `response` as witnessed when
+/// an active guest's grant covers it, and keep a guest copy of it when an
+/// active sharing guest can see it, pulling its file back through
 /// the relay as the agent in `pane`. `sender` binds an agent's own Gram to
 /// the pane that sent it. Returns the copy kept.
 fn mirror_relayed(
@@ -1126,6 +1208,14 @@ fn mirror_relayed(
         sender,
     };
     let guests = crate::guest::store::load_store(dir).ok()?.guests;
+    // Witnessed for any guest the Gram is meant for, sharing or not, so a
+    // guest who turns sharing on later gets it back (see `reconcile_copies`).
+    if !crate::guest::gram::any_guest_may_see(&guests, &item) {
+        return None;
+    }
+    if let Err(err) = crate::guest::mirror::witness(dir, item.clone()) {
+        tracing::warn!(err = %err, "witnessed guest gram record failed");
+    }
     if !crate::guest::gram::any_guest_sees(&guests, &item) {
         return None;
     }
@@ -3426,6 +3516,17 @@ mod tests {
 
     impl Coordinator {
         /// The owner deletes a Gram in the coordinator's own store.
+        /// A Gram labeled `llm-opt` this machine never relayed, as another
+        /// machine's agent of that name would send.
+        fn foreign_gram(&self, text: &str) {
+            let mut state = self.state.lock().unwrap();
+            let stored = json!({
+                "id": "relay-foreign", "direction": "agent_to_owner", "from": "llm-opt",
+                "text": text, "created_unix_ms": now_ms(), "read_by_owner": false,
+            });
+            state.messages.push((stored, Vec::new()));
+        }
+
         fn owner_deletes(&self, id: &str) {
             let mut state = self.state.lock().unwrap();
             let before = state.messages.len();
@@ -3698,5 +3799,80 @@ mod tests {
             crate::api::gram_relay::policy().remote_socket().is_some(),
             previous.is_some()
         );
+    }
+
+    fn agent_sends_file(harness: &Harness, text: &str, name: &str) -> String {
+        let upload = format!("up-{name}");
+        let staged = local_call(
+            harness,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8gd29ybGQ="}}),
+        );
+        assert_eq!(staged["result"]["type"], "ok", "{staged}");
+        let sent = local_call(
+            harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": text, "caller_pane_id": harness.pane_ids[0], "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
+        );
+        sent["result"]["message"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sent: {sent}"))
+            .to_string()
+    }
+
+    fn guest_file(harness: &Harness, guest: &GuestPrincipal, id: &str) -> Value {
+        harness.call(
+            guest,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
+        )[0]["result"]["data_base64"]
+            .clone()
+    }
+
+    #[test]
+    fn turning_sharing_on_brings_back_what_was_relayed_meanwhile() {
+        let (_config, harness, coordinator) = relay_remote("relay-backfill");
+        let guest = harness.admit_with(0, false);
+        let sent = agent_sends_file(&harness, "while off", "report.txt");
+        let staged = harness.call(
+            &guest,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": "g-up", "offset": 0, "data_base64": "aGVsbG8="}}),
+        );
+        assert_eq!(staged[0]["result"]["type"], "ok", "{staged:?}");
+        let posted = harness.call(
+            &guest,
+            json!({"id": "p", "method": "gram.post", "params": {"text": "my post", "file": {"upload_id": "g-up", "name": "a.txt", "mime": "text/plain"}}}),
+        );
+        let own = posted[0]["result"]["message"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("posted: {posted:?}"))
+            .to_string();
+        // Named like the shared agent, but never relayed from its pane here.
+        coordinator.foreign_gram("impostor");
+        assert!(copy_ids(&guest).is_empty(), "no copy while not sharing");
+
+        crate::guest::update_at(&guest.dir, &guest.guest_id, true)
+            .unwrap()
+            .unwrap();
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["my post", "while off"], "{listed}");
+        assert_eq!(guest_file(&harness, &guest, &sent), "aGVsbG8gd29ybGQ=");
+        assert_eq!(guest_file(&harness, &guest, &own), "aGVsbG8=");
+    }
+
+    #[test]
+    fn copies_dropped_by_turning_sharing_off_come_back_when_it_is_on_again() {
+        let (_config, harness, _coordinator) = relay_remote("relay-reshare");
+        let guest = harness.admit_with(0, true);
+        let sent = agent_sends_file(&harness, "shared", "report.txt");
+        assert_eq!(copy_ids(&guest), std::slice::from_ref(&sent));
+        crate::guest::update_at(&guest.dir, &guest.guest_id, false)
+            .unwrap()
+            .unwrap();
+        assert!(copy_ids(&guest).is_empty());
+
+        crate::guest::update_at(&guest.dir, &guest.guest_id, true)
+            .unwrap()
+            .unwrap();
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["shared"], "{listed}");
+        assert_eq!(guest_file(&harness, &guest, &sent), "aGVsbG8gd29ybGQ=");
     }
 }
