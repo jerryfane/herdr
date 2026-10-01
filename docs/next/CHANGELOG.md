@@ -12,6 +12,7 @@
 ### Fixed
 - HerdrUp updates use only this fork's preview releases. The stable channel refuses with installer guidance because this fork has no stable release stream; remote setup and package-manager guidance no longer offer upstream binaries as fork updates. (#208)
 - Agent prompt CLI reports a written but unconfirmed submission as a non-failure result instead of a delivery error. `server agent-manifests` now shows which active manifests declare submission verification; unsupported agents are identified explicitly. (#210)
+- Grams from agents on federated machines name the machine instead of its id. Their message objects carry `machine_label` (the label the machine's agents carry), resolved when read so older Grams are covered too, and the owner's push reads "llm-opt on Jerry's Mac Studio". (#277)
 
 ## [0.9.3] - 2026-09-29
 

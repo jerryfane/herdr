@@ -207,7 +207,7 @@ impl App {
                     return encode_success(
                         id,
                         ResponseResult::GramSent {
-                            message: gram_item_to_info(item),
+                            message: gram_item_to_info(item, &self.gram_machine_labels()),
                             store_id,
                         },
                     );
@@ -237,7 +237,7 @@ impl App {
                         encode_success(
                             id,
                             ResponseResult::GramSent {
-                                message: gram_item_to_info(item),
+                                message: gram_item_to_info(item, &self.gram_machine_labels()),
                                 store_id,
                             },
                         )
@@ -380,7 +380,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::GramSent {
-                        message: gram_item_to_info(item),
+                        message: gram_item_to_info(item, &self.gram_machine_labels()),
                         store_id,
                     },
                 )
@@ -459,7 +459,8 @@ impl App {
             Ok(_) => encode_success(
                 id,
                 ResponseResult::GramSent {
-                    message: gram_item_to_info(item),
+                    // An owner post names no sender machine.
+                    message: gram_item_to_info(item, &MachineLabels::new()),
                     store_id,
                 },
             ),
@@ -545,9 +546,13 @@ impl App {
         // Read-all affordance describe the inbox, not the window the client happens
         // to be holding.
         let unread_count = filtered.iter().filter(|item| is_unread(item)).count();
+        let labels = self.gram_machine_labels();
         // Store order is oldest-first; clients want newest-first.
-        let mut messages: Vec<GramMessageInfo> =
-            filtered.into_iter().rev().map(gram_item_to_info).collect();
+        let mut messages: Vec<GramMessageInfo> = filtered
+            .into_iter()
+            .rev()
+            .map(|item| gram_item_to_info(item, &labels))
+            .collect();
         let store_id = crate::persist::machine::get_or_create();
         // Over the FULL list, not the page, so a paging client can keep polling the
         // head for a few hundred bytes.
@@ -651,7 +656,8 @@ impl App {
             Ok((Ok(item), _)) => encode_success(
                 id,
                 ResponseResult::GramGrabbed {
-                    message: gram_item_to_info(item),
+                    // A claimed queue item is an owner post: no sender machine.
+                    message: gram_item_to_info(item, &MachineLabels::new()),
                 },
             ),
             Ok((Err(GrabError::NotFound), _)) => {
@@ -1015,18 +1021,80 @@ impl App {
         if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
+        let labels = self.gram_machine_labels();
         crate::push::dispatch(
             self.state.push_config.clone(),
-            vec![gram_push_notification(item)],
+            vec![gram_push_notification(
+                item,
+                sender_machine_label(item, &labels),
+            )],
         );
+    }
+
+    /// Display label of each federated machine by routing alias: the label the
+    /// federation store stamps on that machine's cached agents and workspaces.
+    /// A machine whose label is only its alias has none.
+    fn gram_machine_labels(&self) -> MachineLabels {
+        self.federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peers()
+            .filter_map(|(alias, entry)| {
+                entry
+                    .agents
+                    .iter()
+                    .filter_map(|agent| agent.machine_label.as_deref())
+                    .chain(
+                        entry
+                            .workspaces
+                            .iter()
+                            .filter_map(|workspace| workspace.machine_label.as_deref()),
+                    )
+                    .map(str::trim)
+                    .find(|label| !label.is_empty() && *label != alias)
+                    .map(|label| (alias.to_owned(), label.to_owned()))
+            })
+            .collect()
     }
 }
 
+/// Federated machines' display labels by routing alias.
+type MachineLabels = std::collections::HashMap<String, String>;
+
+/// The label of the federated machine a relayed Gram came from: `from` is
+/// `<alias>/<name>` and `alias` has a label. `None` for a local Gram, an
+/// owner post, or an alias without a label.
+fn sender_machine_label<'a>(item: &GramItem, labels: &'a MachineLabels) -> Option<&'a str> {
+    if item.direction != StoredDirection::AgentToOwner {
+        return None;
+    }
+    let (alias, name) = item.from.split_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    labels.get(alias).map(String::as_str)
+}
+
 /// The alert for a new Gram to the owner. It deep-links to the app's Gram
-/// page, so it carries no pane or workspace id.
-pub(crate) fn gram_push_notification(item: &GramItem) -> crate::push::PushNotification {
-    let title = super::sanitized_notification_text(&item.from, 80)
-        .unwrap_or_else(|| "New gram".to_string());
+/// page, so it carries no pane or workspace id. A Gram from a labeled
+/// federated machine names it the way remote agent alerts do:
+/// "llm-opt on Jerry's Mac Studio".
+pub(crate) fn gram_push_notification(
+    item: &GramItem,
+    machine_label: Option<&str>,
+) -> crate::push::PushNotification {
+    let sender = match machine_label {
+        Some(label) => {
+            let name = item
+                .from
+                .split_once('/')
+                .map_or(item.from.as_str(), |(_, name)| name);
+            format!("{name} on {label}")
+        }
+        None => item.from.clone(),
+    };
+    let title =
+        super::sanitized_notification_text(&sender, 80).unwrap_or_else(|| "New gram".to_string());
     let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
     // Note an attachment so a file-only (or captioned) gram reads sensibly on
     // the lock screen. The name is already a sanitized basename.
@@ -1211,7 +1279,8 @@ fn gram_unavailable(id: String) -> String {
     )
 }
 
-fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
+fn gram_item_to_info(item: GramItem, labels: &MachineLabels) -> GramMessageInfo {
+    let machine_label = sender_machine_label(&item, labels).map(str::to_owned);
     GramMessageInfo {
         id: item.id,
         direction: match item.direction {
@@ -1232,6 +1301,7 @@ fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
             sha256: file.sha256,
         }),
         origin_id: item.origin_id,
+        machine_label,
     }
 }
 
@@ -1580,7 +1650,10 @@ mod tests {
     fn gram_item_to_info_carries_origin_id_to_the_wire() {
         let mut item = owner_shared("m1");
         item.origin_id = "machine_abc123".to_string();
-        assert_eq!(gram_item_to_info(item).origin_id, "machine_abc123");
+        assert_eq!(
+            gram_item_to_info(item, &MachineLabels::new()).origin_id,
+            "machine_abc123"
+        );
     }
 
     #[test]
@@ -1677,7 +1750,7 @@ mod tests {
     /// and the whole store ships every 6 seconds, which is the bug being fixed.
     #[test]
     fn list_digest_is_stable_for_the_same_answer() {
-        let messages = vec![gram_item_to_info(owner_shared("g1"))];
+        let messages = vec![gram_item_to_info(owner_shared("g1"), &MachineLabels::new())];
         assert_eq!(
             list_digest("store-1", &messages),
             list_digest("store-1", &messages)
@@ -1689,13 +1762,13 @@ mod tests {
     /// field at once, including ones added later.
     #[test]
     fn list_digest_changes_with_content_and_with_the_store() {
-        let base = vec![gram_item_to_info(owner_shared("g1"))];
+        let base = vec![gram_item_to_info(owner_shared("g1"), &MachineLabels::new())];
         let mut read = owner_shared("g1");
         read.read_by_owner = false;
-        let flipped = vec![gram_item_to_info(read)];
+        let flipped = vec![gram_item_to_info(read, &MachineLabels::new())];
         let two = vec![
-            gram_item_to_info(owner_shared("g1")),
-            gram_item_to_info(owner_shared("g2")),
+            gram_item_to_info(owner_shared("g1"), &MachineLabels::new()),
+            gram_item_to_info(owner_shared("g2"), &MachineLabels::new()),
         ];
 
         let digest = list_digest("store-1", &base);
@@ -2140,6 +2213,92 @@ mod tests {
         assert_eq!(answer["error"]["code"], "invalid_params");
     }
 
+    /// A federated machine's agent as the coordinator caches it, stamped with
+    /// the machine's label.
+    fn labeled_peer_agent(alias: &str, label: &str) -> crate::api::schema::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": format!("{alias}/t1"),
+            "name": format!("{alias}/llm-opt"),
+            "agent": "omp",
+            "agent_status": "idle",
+            "workspace_id": format!("{alias}/w1"),
+            "tab_id": format!("{alias}/w1:t1"),
+            "pane_id": format!("{alias}/w1-1"),
+            "focused": false,
+            "revision": 1,
+            "machine_id": alias,
+            "machine_label": label,
+            "reachability": "reachable",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn owner_list_labels_only_grams_relayed_from_a_labeled_machine() {
+        const STUDIO: &str = "8195b6326f748f4da1945364a4e205b9";
+        let sent = |id: &str, from: &str| GramItem {
+            direction: StoredDirection::AgentToOwner,
+            from: from.to_string(),
+            to: None,
+            read_by_owner: false,
+            ..owner_shared(id)
+        };
+        let mut post = owner_shared("post");
+        post.to = Some(format!("{STUDIO}/llm-opt"));
+        let items = [
+            sent("relayed", &format!("{STUDIO}/llm-opt")),
+            sent("unknown", "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f/llm-opt"),
+            // An explicit peer without a display label is labeled by its alias.
+            sent("bare", "home/builder"),
+            sent("local", "llm-local"),
+            post,
+        ];
+        let answer = with_gram_store(&items, |app| {
+            {
+                let mut store = app.federation.lock().unwrap();
+                for (alias, label) in [(STUDIO, "Jerry's Mac Studio"), ("home", "home")] {
+                    store.set_peer(
+                        alias,
+                        crate::api::federation_store::PeerCacheEntry::reachable(
+                            vec![labeled_peer_agent(alias, label)],
+                            std::time::Instant::now(),
+                        ),
+                    );
+                }
+            }
+            list(app, GramListParams::default())
+        });
+        let messages = answer["result"]["messages"].as_array().unwrap();
+        let mut labels: Vec<_> = messages
+            .iter()
+            .map(|message| {
+                (
+                    message["id"].as_str().unwrap(),
+                    message["from"].as_str().unwrap(),
+                    message
+                        .get("machine_label")
+                        .and_then(|label| label.as_str()),
+                )
+            })
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            [
+                ("bare", "home/builder", None),
+                ("local", "llm-local", None),
+                ("post", "owner", None),
+                (
+                    "relayed",
+                    "8195b6326f748f4da1945364a4e205b9/llm-opt",
+                    Some("Jerry's Mac Studio")
+                ),
+                ("unknown", "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f/llm-opt", None),
+            ],
+            "{answer}"
+        );
+    }
+
     #[cfg(unix)]
     mod relay_reload {
         use super::*;
@@ -2423,6 +2582,55 @@ mod tests {
             }
             let answer = relay(&mut app, guest_post("other-agent", "friend"));
             assert_eq!(answer["result"]["type"], "gram_sent", "{answer}");
+        }
+
+        #[test]
+        fn a_relayed_gram_carries_its_machine_label_to_lists_and_the_owner_push() {
+            let mut app = coordinator();
+            app.state.push_config = crate::config::PushConfig {
+                mode: crate::config::PushMode::Direct,
+                enabled: true,
+                key_path: Some("/tmp/AuthKey.p8".to_string()),
+                key_id: Some("ABC123DEFG".to_string()),
+                team_id: Some("TEAM123456".to_string()),
+                topic: Some("app.herdr.ios".to_string()),
+                ..crate::config::PushConfig::default()
+            };
+            let capture = crate::push::test_sink::Capture::install();
+
+            let sent = relay(
+                &mut app,
+                serde_json::json!({"kind": "send", "params": {"text": "build done", "caller_pane_id": "w1-1"}}),
+            );
+            let message = &sent["result"]["message"];
+            assert_eq!(message["from"], format!("{PEER}/llm-opt"), "{sent}");
+            assert_eq!(message["machine_label"], "Jerrys-Mac-Studio", "{sent}");
+            let id = message["id"].as_str().unwrap();
+
+            let alerts = capture.take().alerts;
+            assert_eq!(alerts.len(), 1, "{alerts:?}");
+            assert_eq!(alerts[0].title, "llm-opt on Jerrys-Mac-Studio");
+            assert_eq!(alerts[0].body, "build done");
+
+            let owner: serde_json::Value = serde_json::from_str(
+                &app.handle_gram_list("owner".into(), GramListParams::default()),
+            )
+            .unwrap();
+            let agent = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-1"}}),
+            );
+            for answer in [owner, agent] {
+                let listed = answer["result"]["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the relayed Gram is listed: {answer}"));
+                assert_eq!(listed["from"], format!("{PEER}/llm-opt"));
+                assert_eq!(listed["machine_label"], "Jerrys-Mac-Studio", "{answer}");
+            }
         }
     }
 }

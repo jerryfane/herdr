@@ -12840,6 +12840,13 @@
             "id": {
               "type": "string"
             },
+            "machine_label": {
+              "description": "Display label of the federated machine a relayed Gram came from, when\n`from` is `<alias>/<name>` and that machine has a label: the same label\nthe machine's agents carry as `machine_label`. Resolved when read, so it\nfollows a rename and covers Grams stored before it. Absent for local\nGrams, for an alias without a label, and from older daemons.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "origin_id": {
               "default": "",
               "description": "Install-stable identity of the daemon/store that wrote this message (see\n[`crate::persist::gram::GramItem::origin_id`]). Stable across daemon\nrestarts; empty for messages written by an older build.",

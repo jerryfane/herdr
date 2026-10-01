@@ -993,7 +993,8 @@ pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &Api
     };
     if let Some(item) = mirror_relayed(&dir, response, pane, &local, Some(sender)) {
         let cfg = crate::config::Config::load().config.push;
-        crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item)]);
+        // The guest's copy names the agent as this machine does: no machine label.
+        crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item, None)]);
     }
 }
 

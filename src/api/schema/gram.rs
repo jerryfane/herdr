@@ -289,6 +289,13 @@ pub struct GramMessageInfo {
     /// restarts; empty for messages written by an older build.
     #[serde(default)]
     pub origin_id: String,
+    /// Display label of the federated machine a relayed Gram came from, when
+    /// `from` is `<alias>/<name>` and that machine has a label: the same label
+    /// the machine's agents carry as `machine_label`. Resolved when read, so it
+    /// follows a rename and covers Grams stored before it. Absent for local
+    /// Grams, for an alias without a label, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
 }
 
 /// Where an effective Gram relay setting came from.
