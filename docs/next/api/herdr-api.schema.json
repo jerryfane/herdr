@@ -13186,26 +13186,6 @@
               "type": "string"
             },
             {
-              "const": "read",
-              "description": "The guest read the granted agent's scrollback (at most once a minute).",
-              "type": "string"
-            },
-            {
-              "const": "resize",
-              "description": "The guest resized the granted agent's terminal (at most once a minute).",
-              "type": "string"
-            },
-            {
-              "const": "gram_list",
-              "description": "The guest listed the shared Gram (at most once a minute).",
-              "type": "string"
-            },
-            {
-              "const": "gram_read",
-              "description": "The guest marked shared Grams read (at most once a minute).",
-              "type": "string"
-            },
-            {
               "const": "gram_file",
               "description": "The guest opened a shared Gram's file.",
               "type": "string"

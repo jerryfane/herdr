@@ -519,9 +519,6 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
-            if audit_due(GuestAuditEvent::Read, &guest.guest_id) {
-                guest.audit(GuestAuditEvent::Read, Some(method), None, None);
-            }
             // A passive pane read of the grant: the snapshot only, never the
             // idle alternate-screen capture that scrolls the agent's TUI.
             let request = Request {
@@ -550,9 +547,6 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
-            if audit_due(GuestAuditEvent::Resize, &guest.guest_id) {
-                guest.audit(GuestAuditEvent::Resize, Some(method), None, None);
-            }
             // Only while one of the guest's streams watches the grant: the lease
             // then ends with the guest's last stream, and a revoke closes those.
             let request = Request {
@@ -732,9 +726,6 @@ pub(super) fn serve_request(
             )
         }
         Method::GramList(params) if guest.shares_gram() => {
-            if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
-                guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
-            }
             reconcile_copies(guest, api_tx);
             let items = crate::guest::gram::items(guest);
             let reply = match crate::guest::gram::list(
@@ -771,9 +762,6 @@ pub(super) fn serve_request(
                 .collect();
             if !ids.iter().all(|id| visible.contains(id.as_str())) {
                 return forbidden(&mut stream);
-            }
-            if audit_due(GuestAuditEvent::GramRead, &guest.guest_id) {
-                guest.audit(GuestAuditEvent::GramRead, Some(method), None, None);
             }
             let reply =
                 match crate::guest::gram::mark_read(&guest.dir, &guest.guest_id, &ids, &visible) {
@@ -2064,15 +2052,6 @@ mod tests {
             !text.lines().any(|line| line.trim_end() == "history-0"),
             "{visible:?}"
         );
-        // Every reseed reads again; the audit records one `read` a minute.
-        let reads: Vec<_> = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 50)
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.event == GuestAuditEvent::Read)
-            .collect();
-        assert_eq!(reads.len(), 1, "{reads:?}");
-        assert_eq!(reads[0].method.as_deref(), Some("agent.read"));
-        assert_eq!(reads[0].text, None);
     }
 
     #[test]
@@ -2407,8 +2386,10 @@ mod tests {
     }
 
     #[test]
-    fn resizes_are_audited_once_a_minute_apart_from_reads() {
-        let harness = start("resize-audit");
+    fn viewing_the_agent_writes_nothing_to_the_owners_log() {
+        // Reading scrollback and resizing are what a watching guest does
+        // continuously; logging them buried the owner's activity log.
+        let harness = start("view-audit");
         let guest = harness.admit();
         let _stream = open_stream(&harness, &guest);
         for cols in [100, 110, 120] {
@@ -2420,20 +2401,15 @@ mod tests {
             "<success>"
         );
         let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 50).unwrap();
-        let resizes: Vec<_> = audit
+        let methods: Vec<_> = audit
             .iter()
-            .filter(|entry| entry.event == GuestAuditEvent::Resize)
+            .filter_map(|entry| entry.method.as_deref())
             .collect();
-        assert_eq!(resizes.len(), 1, "{audit:?}");
-        assert_eq!(resizes[0].method.as_deref(), Some("pane.set_pty_size"));
-        assert_eq!(resizes[0].text, None);
-        assert_eq!(
-            audit
+        assert!(
+            !methods
                 .iter()
-                .filter(|entry| entry.event == GuestAuditEvent::Read)
-                .count(),
-            1,
-            "a read after a resize is still audited: {audit:?}"
+                .any(|m| *m == "agent.read" || *m == "pane.set_pty_size"),
+            "{audit:?}"
         );
     }
 

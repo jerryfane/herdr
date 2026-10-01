@@ -119,4 +119,36 @@ mod tests {
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].ts_ms, 4);
     }
+
+    #[test]
+    fn entries_of_retired_viewing_kinds_are_left_out() {
+        // Logs written before viewing stopped being audited still hold
+        // `read`, `resize`, `gram_list` and `gram_read` lines; the owner's log
+        // must not show them, and a page of `limit` holds only real events.
+        let dir = TempDir::new("audit-retired");
+        append_with_limit(&dir.0, &entry(1, "a"), 1 << 20).unwrap();
+        let mut lines = String::new();
+        for (ts, kind) in [
+            (2, "read"),
+            (3, "resize"),
+            (4, "gram_list"),
+            (5, "gram_read"),
+        ] {
+            let mut value = serde_json::to_value(entry(ts, "a")).unwrap();
+            value["event"] = kind.into();
+            lines.push_str(&format!("{value}\n"));
+        }
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.0.join("audit.jsonl"))
+            .unwrap();
+        io::Write::write_all(&mut file, lines.as_bytes()).unwrap();
+        append_with_limit(&dir.0, &entry(6, "a"), 1 << 20).unwrap();
+        let shown: Vec<u64> = read(&dir.0, None, None, 2)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.ts_ms)
+            .collect();
+        assert_eq!(shown, vec![6, 1]);
+    }
 }

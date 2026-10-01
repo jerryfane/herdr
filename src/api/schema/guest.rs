@@ -169,14 +169,6 @@ pub enum GuestAuditEvent {
     Revoked,
     /// The granted agent came back under a new harness session.
     Resumed,
-    /// The guest read the granted agent's scrollback (at most once a minute).
-    Read,
-    /// The guest resized the granted agent's terminal (at most once a minute).
-    Resize,
-    /// The guest listed the shared Gram (at most once a minute).
-    GramList,
-    /// The guest marked shared Grams read (at most once a minute).
-    GramRead,
     /// The guest opened a shared Gram's file.
     GramFile,
 }
