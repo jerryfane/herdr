@@ -1566,6 +1566,7 @@ impl AppState {
                                 session_ref,
                                 session_cursor,
                                 process_pid,
+                                None,
                             );
                         }
                     }
@@ -1605,6 +1606,7 @@ impl AppState {
                 session_path,
                 session_cursor,
                 process_pid,
+                notification,
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
@@ -1632,6 +1634,7 @@ impl AppState {
                                 session_ref,
                                 session_cursor,
                                 process_pid,
+                                Some(notification),
                             );
                         }
                     }
@@ -3510,6 +3513,73 @@ mod tests {
     }
 
     #[test]
+    fn notification_binding_survives_report_before_process_detection() {
+        let mut app = app_with_workspaces(&["notification"]);
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path("/tmp/omp-notification-startup.jsonl")
+                .unwrap();
+        let binding = crate::api::schema::AgentNotificationEndpoint {
+            endpoint: "/private/notify.sock".into(),
+            target: crate::api::schema::AgentNotificationTarget {
+                runtime_id: "runtime".into(),
+                session_id: "session".into(),
+                generation: 0,
+            },
+        };
+        let report = |seq, notification| AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:omp".into(),
+            agent_label: "omp".into(),
+            seq: Some(seq),
+            session_ref: Some(session_ref.clone()),
+            session_path: None,
+            session_cursor: None,
+            process_pid: Some(4321),
+            notification,
+            session_start_source: Some("startup".into()),
+        };
+        app.handle_app_event(report(1, Some(binding.clone())));
+        assert!(app.terminals[&terminal_id]
+            .effective_known_agent()
+            .is_none());
+        app.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: Some(Agent::Omp),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        let retained = || {
+            app.terminals[&terminal_id]
+                .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+                .and_then(|runtime| runtime.notification.as_ref())
+                .cloned()
+        };
+        assert_eq!(retained(), Some(binding.clone()));
+        // A replayed withdrawal is stale; a newer lifecycle report may withdraw.
+        app.handle_app_event(report(1, None));
+        assert_eq!(
+            app.terminals[&terminal_id]
+                .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+                .and_then(|runtime| runtime.notification.as_ref()),
+            Some(&binding),
+        );
+        app.handle_app_event(report(2, None));
+        assert!(app.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap()
+            .notification
+            .is_none());
+    }
+
+    #[test]
     fn completion_guard_idle_session_replacement_clears_seen_and_pending_delivery() {
         let mut app = app_with_workspaces(&["active", "background"]);
         app.active = Some(0);
@@ -3517,6 +3587,7 @@ mod tests {
         let pane_id = app.workspaces[1].tabs[0].root_pane;
         for (seq, session, reason) in [(1, "old-session", "startup"), (2, "new-session", "clear")] {
             let updates = app.handle_app_event(AppEvent::AgentSessionReported {
+                notification: None,
                 pane_id,
                 source: "herdr:claude".into(),
                 agent_label: "claude".into(),
@@ -3919,6 +3990,7 @@ mod tests {
 
         for (session, seq) in [("first", 1), ("second", 4)] {
             state.handle_app_event(AppEvent::AgentSessionReported {
+                notification: None,
                 pane_id,
                 source: "herdr:codex".into(),
                 agent_label: "codex".into(),

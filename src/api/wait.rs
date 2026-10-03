@@ -1083,6 +1083,7 @@ mod tests {
             account_unresolved: false,
             terminal_id: "term_1".into(),
             name: Some("reviewer".into()),
+            notification_target: None,
             agent: Some("claude".into()),
             title: None,
             terminal_title: None,

@@ -2,10 +2,13 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 
 const HERDR_ENV = process.env.HERDR_ENV;
@@ -14,6 +17,108 @@ const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:omp";
+
+let notificationContext: ExtensionContext | undefined;
+let notificationListener: { server: net.Server; directory: string; endpoint?: string } | undefined;
+
+function closeNotificationListener() {
+  const listener = notificationListener;
+  notificationListener = undefined;
+  if (!listener) return;
+  listener.server.close(() => {
+    fs.rmSync(listener.directory, { recursive: true, force: true });
+  });
+}
+
+function startNotificationListener(ctx: ExtensionContext) {
+  notificationContext = ctx;
+  if (!ctx.notification || notificationListener) return;
+  let directory: string | undefined;
+  try {
+    const base = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "herdr", "notification-runtimes");
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+    directory = fs.mkdtempSync(path.join(base, "omp-"));
+    const endpoint = process.platform === "win32"
+      ? `\\\\.\\pipe\\herdr-notify-${ctx.notification.target().runtimeId}`
+      : path.join(directory, "notify.sock");
+    const server = net.createServer(socket => {
+      let body = "";
+      let bytes = 0;
+      let handled = false;
+      socket.setEncoding("utf8");
+      socket.setTimeout(2000, () => socket.destroy());
+      socket.on("error", () => socket.destroy());
+      socket.on("data", chunk => {
+        if (handled) return;
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > 6 * 32768 + 4096) {
+          handled = true;
+          socket.destroy();
+          return;
+        }
+        body += chunk;
+        const newline = body.indexOf("\n");
+        if (newline < 0) return;
+        handled = true;
+        try {
+          const request: unknown = JSON.parse(body.slice(0, newline));
+          if (typeof request !== "object" || request === null ||
+              !("method" in request) || request.method !== "agent.prompt_safe" ||
+              !("id" in request) || typeof request.id !== "string" || request.id.length > 256 ||
+              !("params" in request) || typeof request.params !== "object" || request.params === null ||
+              body.slice(newline + 1).trim() !== "") {
+            socket.destroy();
+            return;
+          }
+          const params = request.params;
+          if (!("content" in params) || typeof params.content !== "string" ||
+              !("target" in params) || typeof params.target !== "object" || params.target === null) {
+            socket.destroy();
+            return;
+          }
+          const target = params.target;
+          if (!("runtimeId" in target) || typeof target.runtimeId !== "string" ||
+              !("sessionId" in target) || typeof target.sessionId !== "string" ||
+              !("generation" in target) || typeof target.generation !== "number" ||
+              !Number.isSafeInteger(target.generation) || target.generation < 0) {
+            socket.destroy();
+            return;
+          }
+          // Check and admission execute in one JS turn inside OMP, never through the PTY.
+          const result = notificationContext?.notification?.submit({
+            content: params.content,
+            target: { runtimeId: target.runtimeId, sessionId: target.sessionId, generation: target.generation },
+          })
+            ?? { status: "deferred", reason: "unavailable" };
+          socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+        } catch {
+          // An exception might follow admission. No refusal receipt means unknown, not retryable.
+          socket.destroy();
+        }
+      });
+    });
+    const listener = { server, directory, endpoint: undefined as string | undefined };
+    notificationListener = listener;
+    server.on("error", () => {
+      if (notificationListener === listener) closeNotificationListener();
+    });
+    server.listen(endpoint, () => {
+      if (notificationListener !== listener) return;
+      try {
+        if (process.platform !== "win32") fs.chmodSync(endpoint, 0o600);
+      } catch {
+        closeNotificationListener();
+        return;
+      }
+      listener.endpoint = endpoint;
+      void reportSession();
+    });
+    server.unref();
+  } catch {
+    notificationListener = undefined;
+    if (directory) fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
 // OMP marks every shell it spawns with OMPCODE=1. A nested `omp` launched from
 // a parent session's shell inherits it, so that process is not the pane's root
 // agent and must not report its short-lived session over the parent's.
@@ -180,6 +285,9 @@ function reportSession(sessionStartSource = "startup"): Promise<void> {
       agent: "omp",
       seq: nextReportSeq(),
       session_start_source: sessionStartSource,
+      agent_notification: notificationListener?.endpoint && notificationContext?.notification
+        ? { endpoint: notificationListener.endpoint, target: notificationContext.notification.target() }
+        : undefined,
       ...sessionRef,
     },
   });
@@ -353,6 +461,7 @@ export default function (pi) {
       return false;
     }
     rootSession = true;
+    startNotificationListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
     return true;
@@ -500,6 +609,8 @@ export default function (pi) {
   pi.on("session_shutdown", () => {
     if (rootSession) {
       clearPendingTimers();
+      notificationContext = undefined;
+      closeNotificationListener();
     }
   });
 }

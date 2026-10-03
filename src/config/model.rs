@@ -402,17 +402,16 @@ pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
 /// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.omp/agent`,
 /// `$HOME/.kimi-code`). OMP honors its two native directory overrides so the
 /// integration installer, transcript verifier, and launched runtime all resolve
-/// one authoritative account home. `None` when `HOME` is unset or the kind has
-/// no config-home lever.
+/// one authoritative account home. `None` when a home-relative path needs an
+/// unset `HOME`, or the kind has no config-home lever.
 pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
     if kind == "omp" {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
         if let Some(agent_dir) =
             std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
         {
             let agent_dir = PathBuf::from(agent_dir);
             return Some(if let Ok(relative) = agent_dir.strip_prefix("~") {
-                home.join(relative)
+                PathBuf::from(std::env::var_os("HOME")?).join(relative)
             } else {
                 agent_dir
             });
@@ -421,7 +420,13 @@ pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".omp"));
-        return Some(home.join(config_dir).join("agent"));
+        return Some(if config_dir.is_absolute() {
+            config_dir.join("agent")
+        } else {
+            PathBuf::from(std::env::var_os("HOME")?)
+                .join(config_dir)
+                .join("agent")
+        });
     }
     let sub = match kind {
         "claude" => ".claude",

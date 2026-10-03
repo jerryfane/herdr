@@ -142,6 +142,7 @@ pub enum AppEvent {
         session_path: Option<String>,
         session_cursor: Option<String>,
         process_pid: Option<u32>,
+        notification: Option<crate::api::schema::AgentNotificationEndpoint>,
         session_start_source: Option<String>,
     },
     /// Background transcript staging and destination-file verification finished.

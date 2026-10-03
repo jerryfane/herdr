@@ -1716,6 +1716,45 @@
           },
           "type": "object"
         },
+        "AgentNotificationEndpoint": {
+          "additionalProperties": false,
+          "description": "Volatile local-runtime capability; never persisted or included in AgentInfo.",
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/schemas/request/$defs/AgentNotificationTarget"
+            }
+          },
+          "required": [
+            "endpoint",
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentNotificationTarget": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runtimeId": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtimeId",
+            "sessionId",
+            "generation"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1733,6 +1772,32 @@
                   "type": "null"
                 }
               ]
+            }
+          },
+          "required": [
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
+        "AgentPromptSafeParams": {
+          "additionalProperties": false,
+          "properties": {
+            "expected_target": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentNotificationTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
             }
           },
           "required": [
@@ -4181,6 +4246,16 @@
           "properties": {
             "agent": {
               "type": "string"
+            },
+            "agent_notification": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentNotificationEndpoint"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "agent_process_pid": {
               "format": "uint32",
@@ -7201,6 +7276,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_safe",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptSafeParams"
             }
           },
           "required": [
@@ -11213,6 +11304,17 @@
                 "null"
               ]
             },
+            "notification_target": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentNotificationTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Volatile runtime identity for pinning a later safe notification request."
+            },
             "origin_machine_id": {
               "description": "Persisted install identity reported by the daemon that owns this agent.\nKept separate from the home-chosen routing namespace and mutable display\nlabel. It is an identity pin, not an authentication secret.",
               "type": [
@@ -11428,12 +11530,68 @@
           ],
           "type": "object"
         },
+        "AgentNotificationTarget": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runtimeId": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtimeId",
+            "sessionId",
+            "generation"
+          ],
+          "type": "object"
+        },
         "AgentPromptDelivery": {
           "enum": [
             "written_to_pty",
             "submitted"
           ],
           "type": "string"
+        },
+        "AgentPromptSafeOutcome": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "const": "accepted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "AgentSessionInfo": {
           "properties": {
@@ -15572,6 +15730,26 @@
               "required": [
                 "type",
                 "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/AgentPromptSafeOutcome"
+                },
+                "type": {
+                  "const": "agent_prompt_safe",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "outcome"
               ],
               "type": "object"
             },

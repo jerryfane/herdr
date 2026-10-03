@@ -496,6 +496,8 @@ pub struct PaneReportAgentSessionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_process_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_notification: Option<super::AgentNotificationEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
     /// Command that resumes this agent's session after a Herdr restart. The
     /// first element must be a plain command name.

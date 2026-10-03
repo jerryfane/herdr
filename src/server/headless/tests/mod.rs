@@ -7385,6 +7385,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
             id: "not-owner".into(),
             method: api::schema::Method::PaneReportAgentSession(
                 api::schema::PaneReportAgentSessionParams {
+                    agent_notification: None,
                     pane_id: public_pane_id.clone(),
                     source: "custom:intruder".into(),
                     agent: "intruder".into(),
@@ -7430,6 +7431,7 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
     });
     let report = |session: &str| {
         api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
+            agent_notification: None,
             pane_id: public_pane_id.clone(),
             source: "herdr:claude".into(),
             agent: "claude".into(),
@@ -7574,6 +7576,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
             completion_guard_api_report(
                 &mut server,
                 Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                    agent_notification: None,
                     pane_id: public_pane_id.clone(),
                     source: "herdr:pi".into(),
                     agent: "pi".into(),

@@ -107,6 +107,10 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery: Option<AgentPromptDelivery>,
     },
+    AgentPromptSafe {
+        agent: AgentInfo,
+        outcome: super::AgentPromptSafeOutcome,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
         /// Install-stable identity of the daemon that produced this response.
