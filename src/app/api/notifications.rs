@@ -378,10 +378,9 @@ mod tests {
         let (directory, listener, binding) = endpoint();
         let peer = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             let mut bytes = Vec::new();
+            // The sole client closes on return; EOF bounds this read without
+            // racing Darwin's timeout socket option against that disconnect.
             socket.read_to_end(&mut bytes).unwrap();
             bytes
         });
