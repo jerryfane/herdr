@@ -170,28 +170,38 @@ fn forward_notification(
     request.push(b'\n');
     let mut remaining = request.as_slice();
     while !remaining.is_empty() {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
+        let result = if Instant::now() >= deadline {
+            Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "runtime notification write deadline expired",
-            ));
-        }
-        match stream.write(remaining) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "runtime notification connection closed",
-                ))
+            ))
+        } else {
+            stream.write(remaining)
+        };
+        let err = match result {
+            Ok(0) => io::Error::new(
+                io::ErrorKind::WriteZero,
+                "runtime notification connection closed",
+            ),
+            Ok(written) => {
+                remaining = &remaining[written..];
+                continue;
             }
-            Ok(written) => remaining = &remaining[written..],
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5))
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => err,
+        };
+        if remaining.len() == request.len() {
+            return Ok(AgentPromptSafeOutcome::Deferred {
+                reason: "runtime_unreachable".into(),
+            });
         }
+        return Err(err);
     }
-    // From the first write onward, any missing or malformed receipt is unknown.
+    // Once any bytes have been written, a missing or malformed receipt is unknown.
     // Never reconnect, retry, or fall back to writing into the PTY.
     let line = ApiClient::read_proxy_response_bounded(
         stream,
@@ -291,6 +301,31 @@ mod tests {
             },
         };
         (directory, listener, binding)
+    }
+
+    #[test]
+    fn notification_peer_closed_before_write_remains_pending() {
+        let (directory, listener, binding) = endpoint();
+        let (closed, observed) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            drop(socket);
+            closed.send(()).unwrap();
+        });
+        let outcome =
+            forward_notification("notice", "Keep this in the inbox", &binding, None, || {
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AgentPromptSafeOutcome::Deferred {
+                reason: "runtime_unreachable".into()
+            },
+        );
+        peer.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

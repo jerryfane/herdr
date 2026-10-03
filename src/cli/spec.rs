@@ -519,6 +519,7 @@ fn agent_command() -> Command {
                 .about("Notify an idle local runtime without touching its composer")
                 .arg(agent_target())
                 .arg(Arg::new("text").required(true))
+                .arg(option("expected-target", "JSON").help("Pin the runtime/session target returned by agent.get or agent.list"))
                 .after_help("Returns accepted only after atomic runtime admission. Busy, draft, dialog, stale or unsupported runtimes return deferred without input. A lost receipt is unknown and must not be blindly retried. Never falls back to PTY typing."),
         )
         .subcommand(

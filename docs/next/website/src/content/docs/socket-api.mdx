@@ -144,7 +144,7 @@ admission. The method is unavailable to guest and federation callers.
 
 `outcome.status = "accepted"` confirms runtime admission only—not persistence,
 reading or completion. Keep deferred mail pending; a missing or invalid receipt
-is `notification_delivery_unknown` and must not be blindly retried. Never fall
+is `agent_prompt_safe_unknown` and must not be blindly retried. Never fall
 back to `agent.prompt` or pane input when safe notification is unavailable.
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this combines a prompt write with submission observation and, only after verified submission, a status wait. If the resolved agent is already `blocked`, it returns `agent_blocked` before writing. Successful prompts include `delivery: "written_to_pty"` after a complete text+Enter PTY write, or `delivery: "submitted"` after an attributable lifecycle advance from a settled agent or an observed same-attempt composer clear. A successful `written_to_pty` with `wait` means submission was not verified; the request does not continue waiting for status, and callers must inspect the pane before resending. A persistent same-attempt draft returns `agent_prompt_unsubmitted`; a visible modal returns `agent_input_pending` before any write. Bracketed paste relies on writer provenance rather than rendered token text.
