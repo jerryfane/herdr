@@ -321,38 +321,6 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentPromptSafeParams {
-    pub target: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_target: Option<AgentNotificationTarget>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentNotificationTarget {
-    pub runtime_id: String,
-    pub session_id: String,
-    pub generation: u64,
-}
-
-/// Volatile local-runtime capability; never persisted or included in AgentInfo.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentNotificationEndpoint {
-    pub endpoint: String,
-    pub target: AgentNotificationTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AgentPromptSafeOutcome {
-    Accepted,
-    Deferred { reason: String },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPromptDelivery {
@@ -368,9 +336,6 @@ pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Volatile runtime identity for pinning a later safe notification request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notification_target: Option<AgentNotificationTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

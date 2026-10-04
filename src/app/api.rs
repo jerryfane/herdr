@@ -5,7 +5,6 @@ mod agent_view;
 pub(super) mod agents;
 mod env;
 mod gram;
-mod notifications;
 #[cfg(unix)]
 pub(crate) use gram::gram_push_notification;
 mod integrations;
@@ -1667,11 +1666,11 @@ impl App {
             }
             Method::AgentKinds(_) => return self.handle_agent_kinds(request.id),
             Method::FsListDir(params) => return self.handle_fs_list_dir(request.id, params),
-            Method::AgentPrompt(_) | Method::AgentPromptSafe(_) => {
+            Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
-                    "agent prompt methods are handled asynchronously by the app runtime",
+                    "agent.prompt is handled asynchronously by the app runtime",
                 );
             }
             Method::AgentWait(_) => {

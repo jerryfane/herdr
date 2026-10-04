@@ -999,23 +999,9 @@ impl App {
         });
         let account_unresolved = account.is_some() && resolved_account.is_none();
         let account_config_dir = resolved_account.map(|entry| entry.config_dir.clone());
-        let notification_target = terminal
-            .hook_authority
-            .as_ref()
-            .filter(|authority| authority.source == "herdr:omp" && authority.agent_label == "omp")
-            .and_then(|authority| {
-                terminal.reported_agent_session_runtime_for(
-                    "herdr:omp",
-                    "omp",
-                    authority.session_ref.as_ref()?,
-                )
-            })
-            .and_then(|proof| proof.notification.as_ref())
-            .map(|binding| binding.target.clone());
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
-            notification_target,
             agent: pane.agent,
             title: pane.title,
             terminal_title: pane.terminal_title,
@@ -1286,7 +1272,6 @@ fn archived_agent_info(
     crate::api::schema::AgentInfo {
         terminal_id: record.terminal_id.clone(),
         name: record.name.clone(),
-        notification_target: None,
         agent: Some(record.kind.clone()),
         title: None,
         terminal_title: None,

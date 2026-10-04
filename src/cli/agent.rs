@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentArchiveParams, AgentListParams, AgentPromptParams, AgentPromptSafeParams,
-    AgentPromptWaitOptions, AgentReadParams, AgentRenameParams, AgentRestartParams,
-    AgentSendKeysParams, AgentSessionTransferHarness, AgentStartParams, AgentTarget,
-    AgentTransferSessionParams, AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse,
-    Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentArchiveParams, AgentListParams, AgentPromptParams, AgentPromptWaitOptions,
+    AgentReadParams, AgentRenameParams, AgentRestartParams, AgentSendKeysParams,
+    AgentSessionTransferHarness, AgentStartParams, AgentTarget, AgentTransferSessionParams,
+    AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams,
+    PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -25,7 +25,6 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
-        "prompt-safe" => agent_prompt_safe(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "archive" => agent_archive(&args[1..]),
         "unarchive" => agent_unarchive(&args[1..]),
@@ -1309,29 +1308,6 @@ fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_prompt_safe(args: &[String]) -> std::io::Result<i32> {
-    let (target, text, expected_target) = match args {
-        [target, text] => (target, text, None),
-        [target, text, flag, value] if flag == "--expected-target" => {
-            let expected = serde_json::from_str(value)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-            (target, text, Some(expected))
-        }
-        _ => {
-            eprintln!("usage: herdr agent prompt-safe <target> <text> [--expected-target JSON]");
-            return Ok(2);
-        }
-    };
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:prompt-safe".into(),
-        method: Method::AgentPromptSafe(AgentPromptSafeParams {
-            target: target.clone(),
-            text: text.clone(),
-            expected_target,
-        }),
-    })?)
-}
-
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
@@ -1501,7 +1477,6 @@ fn print_agent_help() {
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
-    eprintln!("  herdr agent prompt-safe <target> <text> [--expected-target JSON] (atomic runtime admission; never types into the pane)");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]");
     eprintln!("  herdr agent unarchive <target> [--fresh] [--json]");

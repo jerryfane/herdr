@@ -205,10 +205,6 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        if let crate::api::schema::Method::AgentPromptSafe(params) = request.method {
-            self.handle_deferred_agent_prompt_safe(request.id, params, respond_to);
-            return true;
-        }
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
@@ -3535,7 +3531,6 @@ mod tests {
         let report = app.handle_pane_report_agent_session(
             "target-report".into(),
             PaneReportAgentSessionParams {
-                agent_notification: None,
                 pane_id: public_pane_id.clone(),
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
@@ -3584,7 +3579,6 @@ mod tests {
         let report = app.handle_pane_report_agent_session(
             "source-report".into(),
             PaneReportAgentSessionParams {
-                agent_notification: None,
                 pane_id: public_pane_id,
                 source: "herdr:claude".into(),
                 agent: "claude".into(),
@@ -3631,7 +3625,6 @@ mod tests {
 
         app.handle_internal_event_with_render_impact(
             crate::events::AppEvent::AgentSessionReported {
-                notification: None,
                 pane_id,
                 source: "herdr:codex".into(),
                 agent_label: "codex".into(),
@@ -3675,7 +3668,6 @@ mod tests {
 
         app.handle_internal_event_with_render_impact(
             crate::events::AppEvent::AgentSessionReported {
-                notification: None,
                 pane_id,
                 source: "herdr:claude".into(),
                 agent_label: "claude".into(),

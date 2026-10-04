@@ -1428,7 +1428,6 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
 
     super::send_ok_request(Method::PaneReportAgentSession(
         PaneReportAgentSessionParams {
-            agent_notification: None,
             pane_id,
             source,
             agent,

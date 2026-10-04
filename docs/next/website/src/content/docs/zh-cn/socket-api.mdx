@@ -103,16 +103,11 @@ herdr pane read w1:p2 --source recent --lines 50
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.transfer_session` |
-| 安全通知 | `agent.prompt_safe`（仅限本机） |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 在联邦协调端上，`workspace.list` 先返回本地工作区，再按各出站对等方自身的侧边栏顺序返回其拥有的工作区。远端工作区保留对等方的 `number`、`label` 和 `focused`，而 `workspace_id` 与 `active_tab_id` 会加上 `<alias>/` 前缀。`machine_id`（路由别名）、`machine_label`、`machine_profile_id` 和 `reachability` 标识其所属机器；不可达或降级的对等方会保留最后已知的工作区，`agent_status` 显示为 `"unknown"`，真实值保存在 `last_known_status` 中。设置 `local_only: true` 可排除远端工作区。带 `<alias>/…` 工作区或标签页 ID 的 `workspace.get`、`tab.get` 和 `tab.list` 会转发到该对等方，回复中的 ID 也以同样方式限定。前缀不是已配置别名的 ID 会在本地解析，并返回 `workspace_not_found` 或 `tab_not_found`。
-`agent.prompt_safe`（`herdr agent prompt-safe <target> <text>`）通过 OMP 集成的专用运行时连接发送通知，绝不写入 PTY。自动调用方必须保留 `agent.list` 或 `agent.get` 返回的 `notification_target`，并通过 `expected_target`（CLI 参数为 `--expected-target JSON`）传入。名称和窗格 ID 可能被重新分配，只有运行时与会话身份校验才能防止误投。未提供安全通知能力、正在工作、存在草稿、输入缓冲、对话框或会话已过期时，会返回 `outcome.status = "deferred"`，且不接收通知。访客和联邦调用方不能使用此方法。
-
-`outcome.status = "accepted"` 只表示运行时已接收，不表示已持久化、已读或已完成。延迟的消息应保持待发送状态。响应缺失或无效时，结果为 `agent_prompt_safe_unknown`，不得盲目重试，也不得降级为 `agent.prompt` 或窗格输入。
-
 
 `gram.*` 是所有者与智能体之间的消息通道。`gram.grab` 认领共享队列中的一项,并在存储层先到先得且原子,因此无论身份如何,两个智能体都无法认领同一项。发送者与认领者的身份是从 `caller_pane_id` 解析出的智能体名称(没有名称则为窗格 id),它在重启或实时交接后仍然保持,但带有名称语义:重命名、清除或复用名称会改变 `gram.list` 中显示为“我的”的项。省略 `caller_pane_id` 时 `gram.list` 返回所有者视图,指定时返回该窗格的智能体视图。`gram.list` 支持分页:可选的 `limit`(最新 N 条,上限钳制为 500)与 `before_id`(游标,只返回严格早于该 id 的消息;该 id 必须存在于同一过滤后的列表中,否则返回 `invalid_params`)。响应新增 `has_more`,以及在整个过滤后列表(而非当前页)上统计的 `unread_count`。条件请求只作用于首页:存在 `before_id` 时忽略 `if_unchanged_digest`,而摘要始终基于完整的过滤后列表计算。归属信息仅供参考,并非经过认证。
 

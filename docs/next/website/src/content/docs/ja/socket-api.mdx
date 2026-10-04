@@ -103,16 +103,11 @@ herdr pane read w1:p2 --source recent --lines 50
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.transfer_session` |
-| 安全な通知 | `agent.prompt_safe`（ローカルのみ） |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 Federation のコーディネーターでは、`workspace.list` はまずローカルのワークスペースを返し、続いて各アウトバウンドピアが所有するワークスペースをそのピアのサイドバー順で返します。リモートのワークスペースはピア側の `number`、`label`、`focused` をそのまま保持し、`workspace_id` と `active_tab_id` には `<alias>/` プレフィックスが付きます。所有者は `machine_id`（ルーティング用エイリアス）、`machine_label`、`machine_profile_id`、`reachability` で識別できます。到達できない、または劣化したピアは最後に取得したワークスペースを保持し、`agent_status: "unknown"` とし、実際の値を `last_known_status` に残します。リモートのワークスペースを除外するには `local_only: true` を設定します。`<alias>/…` 形式のワークスペース ID またはタブ ID を指定した `workspace.get`、`tab.get`、`tab.list` はそのピアへ転送され、応答の ID も同じ方法で修飾されます。プレフィックスが設定済みのエイリアスでない ID はローカルで解決され、`workspace_not_found` または `tab_not_found` を返します。
-`agent.prompt_safe`（`herdr agent prompt-safe <target> <text>`）は OMP 連携の専用ランタイム接続を使い、PTY には入力しません。自動送信では `agent.list` または `agent.get` の `notification_target` を保存し、`expected_target`（CLI では `--expected-target JSON`）として渡してください。名前やペイン ID だけでは再割り当てを検出できません。未対応、処理中、下書き、入力バッファ、ダイアログ、古いセッションの場合は、受け付けずに `outcome.status = "deferred"` を返します。ゲストやフェデレーションからは利用できません。
-
-`outcome.status = "accepted"` はランタイムでの受け付けだけを示し、保存・既読・完了を意味しません。保留されたメッセージは待機状態に残してください。応答の欠落や不正は `agent_prompt_safe_unknown` とし、無条件で再送したり、`agent.prompt` やペイン入力に切り替えたりしないでください。
-
 
 `gram.*` はオーナーとエージェント間のメッセージチャネルです。`gram.grab` は共有キューの項目を取得し、ストレージ層で先着順かつアトミックなので、識別子に関わらず 2 つのエージェントが同じ項目を取得することはありません。送信者・取得者の識別子は `caller_pane_id` から解決されるエージェント名(名前がなければペイン id)で、再起動やライブハンドオフをまたいでも保持されますが、名前のセマンティクスを持ちます。名前の変更・クリア・再利用により、`gram.list` で「自分のもの」として表示される項目が変わります。`gram.list` は `caller_pane_id` を省略するとオーナービューを、指定するとそのペインのエージェントビューを返します。`gram.list` は任意の `limit`(最新 N 件、上限 500 にクランプ)と `before_id`(カーソル。その id より厳密に古いものだけを返し、id は同じフィルタ済みリストに含まれていなければ `invalid_params`)でページングできます。レスポンスには `has_more` と、ページではなくフィルタ済みリスト全体で数えた `unread_count` が加わります。条件付き取得は先頭ページ専用で、`before_id` がある場合 `if_unchanged_digest` は無視され、ダイジェストは常にフィルタ済みリスト全体に対して計算されます。属性表示は参考情報であり、認証されたものではありません。
 

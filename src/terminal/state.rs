@@ -53,7 +53,6 @@ pub(crate) struct ReportedAgentSessionRuntime {
     session_ref: crate::agent_resume::AgentSessionRef,
     pub(crate) cursor: Option<String>,
     pub(crate) process_pid: Option<u32>,
-    pub(crate) notification: Option<crate::api::schema::AgentNotificationEndpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1917,28 +1916,13 @@ impl TerminalState {
         session_ref: &crate::agent_resume::AgentSessionRef,
         cursor: Option<String>,
         process_pid: Option<u32>,
-        notification: Option<Option<crate::api::schema::AgentNotificationEndpoint>>,
     ) {
-        // State reports preserve a capability only for the same process/session;
-        // lifecycle reports use Some(None) to explicitly withdraw it.
-        let previous = self.reported_agent_session_runtime.take();
-        let notification = notification.unwrap_or_else(|| {
-            previous
-                .filter(|reported| {
-                    reported.source == source
-                        && reported.agent == agent
-                        && &reported.session_ref == session_ref
-                        && reported.process_pid == process_pid
-                })
-                .and_then(|reported| reported.notification)
-        });
         self.reported_agent_session_runtime = Some(ReportedAgentSessionRuntime {
             source: source.to_string(),
             agent: agent.to_string(),
             session_ref: session_ref.clone(),
             cursor,
             process_pid,
-            notification,
         });
     }
 
@@ -2098,14 +2082,7 @@ impl TerminalState {
                     self.accepted_session_report_generation.wrapping_add(1);
                 return Some(mutation);
             }
-            // The sequenced report was accepted for promotion once the process
-            // is detected. Retain its volatile runtime metadata now, without
-            // publishing a session change or completing a transfer yet.
-            return Some(TerminalStateMutation {
-                effective_state_change: None,
-                session_ref_changed: false,
-                agent_released: false,
-            });
+            return None;
         }
         if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
             return None;
@@ -2437,8 +2414,6 @@ impl TerminalState {
         if !self.self_reported_agent_active() || !self.hook_authority_not_newer_than(observed_at) {
             return None;
         }
-        self.reported_agent_session_runtime = None;
-        self.reported_agent_session_path = None;
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
@@ -2906,8 +2881,6 @@ impl TerminalState {
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
         self.reset_turn_counter(TurnCounterResetPath::PaneRespawn);
-        self.reported_agent_session_runtime = None;
-        self.reported_agent_session_path = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -3984,13 +3957,14 @@ mod tests {
             Some(2001),
             now + Duration::from_millis(4),
         );
-        let _ = terminal.set_agent_session_ref_for_session_start(
+        let startup = terminal.set_agent_session_ref_for_session_start(
             "herdr:pi".into(),
             "pi".into(),
             crate::agent_resume::AgentSessionRef::path(session_path),
             Some(2000),
             Some("startup".into()),
         );
+        assert!(startup.is_none());
         assert!(lower_sequence.is_none());
         assert!(missing_sequence.is_none());
         assert!(buffered_working.is_none());

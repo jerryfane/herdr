@@ -1953,7 +1953,6 @@ impl App {
         // AwaitingTarget/RollingBack even though the correct harness was live.
         self.handle_internal_event_with_render_impact(
             crate::events::AppEvent::AgentSessionReported {
-                notification: params.agent_notification,
                 pane_id,
                 session_ref: session_ref.clone(),
                 session_path,
@@ -2774,7 +2773,6 @@ mod tests {
                 &session_ref,
                 Some("stale-leaf".into()),
                 Some(41),
-                None,
             );
         }
 

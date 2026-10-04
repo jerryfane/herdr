@@ -1491,12 +1491,7 @@ mod tests {
                     }
                 }
                 match api_rx.try_recv() {
-                    Ok(message)
-                        if matches!(
-                            message.request.method,
-                            Method::AgentPrompt(_) | Method::AgentPromptSafe(_)
-                        ) =>
-                    {
+                    Ok(message) if matches!(message.request.method, Method::AgentPrompt(_)) => {
                         app.handle_deferred_agent_api_request(message.request, message.respond_to);
                     }
                     Ok(message) => {
