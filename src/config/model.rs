@@ -1452,7 +1452,7 @@ pub(crate) fn is_install_machine_id(machine_id: &str) -> bool {
 /// The listener, outbound transports (TCP/SSH), and peer connection handling
 /// land in later parts of the federation work; these fields are declared now so
 /// the `[federation]` config section parses and defaults cleanly.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FederationConfig {
     /// Accept inbound federation connections. Default: false.
@@ -1476,6 +1476,72 @@ pub struct FederationConfig {
     /// state remain owned by the endpoint catalog.
     #[serde(default, deserialize_with = "deserialize_saved_machine_policies")]
     pub saved_machines: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+    /// Named sessions (`herdr --session <name>`) that federate like the default
+    /// session. Every session reads this machine-wide config, so by default
+    /// only the default session coordinates saved machines, polls outbound
+    /// peers, and binds `listen_addr`; other named sessions remain reachable
+    /// as a remote coordinator's SSH target. `"default"` is accepted and
+    /// redundant.
+    #[serde(default, deserialize_with = "deserialize_federation_named_sessions")]
+    pub named_sessions: Vec<String>,
+}
+
+impl FederationConfig {
+    /// Whether the server for `session` (`None` = default session) runs this
+    /// federation config: the default session always does, a named session
+    /// only when listed in `named_sessions`.
+    pub(crate) fn federates_session(&self, session: Option<&str>) -> bool {
+        session.is_none_or(|name| {
+            name == crate::session::DEFAULT_SESSION_NAME
+                || self.named_sessions.iter().any(|listed| listed == name)
+        })
+    }
+
+    /// The federation config the server for `session` actually runs.
+    ///
+    /// A named session that is not listed in `named_sessions` keeps no
+    /// coordinator role, no outbound explicit peers, and no inbound listener:
+    /// the default session's server already polls every saved machine and owns
+    /// `listen_addr`. Remote-side settings such as
+    /// `reverse_coordinator_machine_id` stay in effect. Returns
+    /// `Cow::Owned` only when the session rule actually suppressed something.
+    pub(crate) fn for_session(&self, session: Option<&str>) -> std::borrow::Cow<'_, Self> {
+        let suppresses = self.coordinator
+            || self.listen
+            || self.peers.iter().any(|peer| peer.endpoint.is_some());
+        if !suppresses || self.federates_session(session) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(Self {
+            listen: false,
+            coordinator: false,
+            peers: self
+                .peers
+                .iter()
+                .filter(|peer| peer.endpoint.is_none())
+                .cloned()
+                .collect(),
+            reverse_coordinator_machine_id: self.reverse_coordinator_machine_id.clone(),
+            listen_addr: self.listen_addr.clone(),
+            saved_machines: self.saved_machines.clone(),
+            named_sessions: self.named_sessions.clone(),
+        })
+    }
+}
+
+fn deserialize_federation_named_sessions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let sessions = Vec::<String>::deserialize(deserializer)?;
+    for session in &sessions {
+        crate::session::validate_name(session).map_err(|error| {
+            de::Error::custom(format!(
+                "federation.named_sessions entry {session:?} is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(sessions)
 }
 
 fn deserialize_explicit_federation_peers<'de, D>(
@@ -1949,6 +2015,109 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("must use federation.saved_machines"));
+    }
+
+    fn coordinator_federation_config(named_sessions: &str) -> FederationConfig {
+        toml::from_str(&format!(
+            r#"
+                coordinator = true
+                listen = true
+                listen_addr = "127.0.0.1:7020"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                named_sessions = {named_sessions}
+
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+
+                [[peers]]
+                alias = "build"
+                endpoint = "tcp://build.internal:7020"
+                token_file = "/etc/herdr/peers/build.token"
+
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn federation_for_unlisted_named_session_drops_coordinator_outbound_and_listener() {
+        let config = coordinator_federation_config(r#"["ops"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert!(!effective.coordinator);
+        assert!(!effective.listen);
+        assert_eq!(
+            effective
+                .peers
+                .iter()
+                .map(|peer| peer.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["laptop"],
+            "only the inbound-only peer survives; no outbound polling"
+        );
+        // Remote-side acceptance and trust policy stay, so the session remains
+        // a valid SSH target and `machine status` reads "coordinator disabled".
+        assert_eq!(
+            effective.reverse_coordinator_machine_id,
+            config.reverse_coordinator_machine_id
+        );
+        assert_eq!(effective.saved_machines, config.saved_machines);
+    }
+
+    #[test]
+    fn federation_for_listed_named_session_is_unchanged() {
+        let config = coordinator_federation_config(r#"["ops", "work"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+        assert!(effective.coordinator && effective.listen);
+        assert_eq!(effective.peers.len(), 2);
+    }
+
+    #[test]
+    fn federation_for_default_session_is_unchanged() {
+        let config = coordinator_federation_config("[]");
+        for session in [None, Some(crate::session::DEFAULT_SESSION_NAME)] {
+            let effective = config.for_session(session);
+            assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+            assert!(effective.coordinator && effective.listen);
+            assert_eq!(effective.peers.len(), 2);
+        }
+
+        // `"default"` in the list is redundant and harmless.
+        let redundant = coordinator_federation_config(r#"["default"]"#);
+        assert!(redundant.federates_session(None));
+        assert!(!redundant.federates_session(Some("work")));
+    }
+
+    #[test]
+    fn federation_session_rule_is_silent_when_nothing_is_suppressed() {
+        let config: FederationConfig = toml::from_str(
+            r#"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.for_session(Some("work")),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn federation_named_sessions_reject_invalid_names() {
+        let error = toml::from_str::<FederationConfig>(r#"named_sessions = ["../escape"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("federation.named_sessions"), "{error}");
+        assert!(toml::from_str::<FederationConfig>(r#"named_sessions = [""]"#).is_err());
     }
 
     #[test]

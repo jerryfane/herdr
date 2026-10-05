@@ -351,6 +351,9 @@ pub struct FederationPeerManager {
     generation_clock: Arc<AtomicU64>,
     /// Coordinator config plus the last successfully loaded saved profiles.
     coordinator: Mutex<CoordinatorSource>,
+    /// Whether the last reconcile dropped federation because the active named
+    /// session is not in `federation.named_sessions`; logs the skip only once.
+    session_suppressed: AtomicBool,
     /// Stops the saved-profile catalog watcher independently of the daemon flag.
     catalog_stop: Arc<AtomicBool>,
     /// Catalog watcher that detects CLI add/enable/disable/remove/rename writes.
@@ -403,6 +406,7 @@ impl FederationPeerManager {
             running,
             generation_clock: Arc::new(AtomicU64::new(0)),
             coordinator: Mutex::new(CoordinatorSource::default()),
+            session_suppressed: AtomicBool::new(false),
             catalog_stop: Arc::clone(&catalog_stop),
             catalog_watcher: Mutex::new(None),
         });
@@ -667,10 +671,34 @@ impl FederationPeerManager {
             .collect()
     }
 
-    /// Apply explicit federation config and coordinator saved-machine policy.
-    /// A successful catalog read is folded in immediately; later catalog writes
-    /// are detected by the manager's watcher without restarting the server.
+    /// Apply explicit federation config and coordinator saved-machine policy
+    /// for the active session. A successful catalog read is folded in
+    /// immediately; later catalog writes are detected by the manager's watcher
+    /// without restarting the server.
     pub fn reconcile_config(&self, config: &FederationConfig) {
+        self.reconcile_config_for_session(config, crate::session::active_name().as_deref());
+    }
+
+    /// [`Self::reconcile_config`] for an explicit session (`None` = default),
+    /// after [`FederationConfig::for_session`] drops the coordinator role and
+    /// outbound peers of a named session not in `federation.named_sessions`.
+    pub(crate) fn reconcile_config_for_session(
+        &self,
+        config: &FederationConfig,
+        session: Option<&str>,
+    ) {
+        let config = config.for_session(session);
+        let suppressed = matches!(config, std::borrow::Cow::Owned(_));
+        if suppressed && !self.session_suppressed.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                session = session.unwrap_or_default(),
+                "federation coordinator, outbound peers and listener are off in this named \
+                 session; only the default session federates unless the session is listed in \
+                 federation.named_sessions"
+            );
+        } else if !suppressed {
+            self.session_suppressed.store(false, Ordering::Relaxed);
+        }
         let loaded_profiles = if config.coordinator {
             match crate::client::endpoint::EndpointCatalog::load_profiles() {
                 Ok(profiles) => Some(profiles),
@@ -1531,6 +1559,93 @@ mod tests {
             ConnectionTarget::Tcp { token, .. } => token.as_deref(),
             _ => panic!("expected TCP route"),
         }
+    }
+
+    #[test]
+    fn reconcile_config_applies_named_session_rule_on_every_reload() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let token_path =
+            std::env::temp_dir().join(format!("herdr-federation-session-token-{nonce}.txt"));
+        std::fs::write(&token_path, "token\n").unwrap();
+        let profile = crate::client::endpoint::SavedSshEndpoint::new(
+            "Build",
+            "dev@build.example",
+            "agent-work",
+        )
+        .unwrap();
+        let mut config = FederationConfig {
+            coordinator: true,
+            peers: vec![FederationPeer {
+                alias: "build".into(),
+                endpoint: Some("tcp://127.0.0.1:9".into()),
+                token_file: Some(token_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.saved_machines.insert(
+            profile.id.clone(),
+            FederationSavedMachinePolicy {
+                expected_machine_id: "machine_build".into(),
+                agent_grants: Vec::new(),
+            },
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let manager = FederationPeerManager::new(
+            Arc::new(Mutex::new(FederationStore::default())),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
+        manager.stop_catalog_watcher_for_test();
+        let coordinates = |manager: &FederationPeerManager| {
+            let source = manager
+                .coordinator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Probe with the trusted saved profile present, without letting the
+            // manager spawn an SSH bridge for it.
+            let mut probe = source.clone();
+            probe.profiles = vec![profile.clone()];
+            let saved_machine_desired = compose_desired(&probe)
+                .iter()
+                .any(|peer| peer.alias == profile.id.as_str());
+            assert_eq!(source.enabled, saved_machine_desired);
+            source.enabled
+        };
+        let routed =
+            |manager: &FederationPeerManager| manager.registry_snapshot().contains_key("build");
+
+        // Boot and every reload of an unlisted named session: no coordinator
+        // role, no saved machines, no outbound explicit peer.
+        manager.reconcile_config_for_session(&config, Some("work"));
+        assert!(!coordinates(&manager));
+        assert!(!routed(&manager));
+        manager.reconcile_config_for_session(&config, Some("work"));
+        assert!(!routed(&manager));
+
+        // Reload that lists the session federates exactly like the default one.
+        config.named_sessions = vec!["work".into()];
+        manager.reconcile_config_for_session(&config, Some("work"));
+        assert!(coordinates(&manager));
+        assert!(routed(&manager));
+
+        // Reload that unlists it again tears the outbound peer back down.
+        config.named_sessions.clear();
+        manager.reconcile_config_for_session(&config, Some("work"));
+        assert!(!coordinates(&manager));
+        assert!(!routed(&manager));
+
+        // The default session is never suppressed.
+        manager.reconcile_config_for_session(&config, None);
+        assert!(coordinates(&manager));
+        assert!(routed(&manager));
+
+        running.store(false, Ordering::Relaxed);
+        manager.join_all();
+        let _ = std::fs::remove_file(token_path);
     }
 
     #[test]

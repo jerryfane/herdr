@@ -264,7 +264,11 @@ fn start_server_inner(
     );
     #[cfg(unix)]
     federation_manager.set_gram_api_sender(api_tx.clone());
-    federation_manager.reconcile_config(federation);
+    // Every session reads the machine-wide config; read the active session
+    // once so the boot reconcile and the listener apply the same
+    // default-session rule (`FederationConfig::for_session`).
+    let session = crate::session::active_name();
+    federation_manager.reconcile_config_for_session(federation, session.as_deref());
     #[cfg(unix)]
     guest_gate::install_context(api_tx.clone(), event_hub.clone(), Arc::clone(&running));
 
@@ -325,6 +329,7 @@ fn start_server_inner(
     // registry out of this chain makes that unreachable by construction.
     let federation_thread = maybe_start_federation_listener(
         federation,
+        session.as_deref(),
         &api_tx,
         &event_hub,
         &capabilities,
@@ -348,17 +353,21 @@ fn start_server_inner(
 }
 
 /// Bind the federation TCP listener and spawn its accept thread when federation
-/// is enabled and configured. Returns `None` (federation disabled) for any
-/// non-fatal reason — disabled, no address, no usable token, or a bind failure —
-/// after logging, so the daemon keeps running on the unix socket alone.
+/// is enabled and configured for `session`. Returns `None` (federation
+/// disabled) for any non-fatal reason — disabled, a named session not in
+/// `federation.named_sessions` (the default session owns `listen_addr`), no
+/// address, no usable token, or a bind failure — after logging, so the daemon
+/// keeps running on the unix socket alone.
 fn maybe_start_federation_listener(
     federation: &FederationConfig,
+    session: Option<&str>,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     capabilities: &Option<ServerCapabilities>,
     running: &Arc<AtomicBool>,
     server_stop: &Option<Arc<AtomicBool>>,
 ) -> Option<JoinHandle<()>> {
+    let federation = federation.for_session(session);
     if !federation.listen {
         return None;
     }
@@ -369,7 +378,7 @@ fn maybe_start_federation_listener(
 
     // Safety floor: never open a federation listener without at least one token
     // to authenticate against, or every peer would be admitted.
-    let peers = resolve_federation_tokens(federation);
+    let peers = resolve_federation_tokens(&federation);
     if peers.is_empty() {
         warn!(
             addr = %addr,
@@ -3231,6 +3240,45 @@ mod tests {
     }
 
     #[test]
+    fn federation_listener_binds_only_for_sessions_that_federate() {
+        let dir = unique_test_path("federation-listener-session");
+        fs::create_dir_all(&dir).unwrap();
+        let token_file = dir.join("laptop.token");
+        fs::write(&token_file, "laptop-token\n").unwrap();
+        let mut federation = FederationConfig {
+            listen: true,
+            listen_addr: Some("127.0.0.1:0".into()),
+            peers: vec![FederationPeer {
+                alias: "laptop".into(),
+                token_file: Some(token_file.to_string_lossy().into_owned()),
+                ..FederationPeer::default()
+            }],
+            ..FederationConfig::default()
+        };
+        let (api_tx, _api_rx) = mpsc::unbounded_channel();
+        let event_hub = EventHub::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let start = |federation: &FederationConfig, session| {
+            maybe_start_federation_listener(
+                federation, session, &api_tx, &event_hub, &None, &running, &None,
+            )
+        };
+
+        assert!(
+            start(&federation, Some("work")).is_none(),
+            "an unlisted named session must leave listen_addr to the default session"
+        );
+        let default_session = start(&federation, None).expect("default session binds");
+        federation.named_sessions = vec!["work".into()];
+        let listed_session = start(&federation, Some("work")).expect("listed session binds");
+
+        running.store(false, Ordering::Relaxed);
+        default_session.join().unwrap();
+        listed_session.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restrict_socket_permissions_sets_user_only_mode() {
         let dir = unique_test_path("socket-perms");
         fs::create_dir_all(&dir).unwrap();
@@ -5948,7 +5996,7 @@ mod federation_tests {
                 agent_grants: Vec::new(),
             },
         );
-        manager.reconcile_config(&config);
+        manager.reconcile_config_for_session(&config, None);
 
         let route = manager
             .registry_snapshot()

@@ -166,6 +166,16 @@ expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 
 The table key is the saved machine's immutable profile ID. Saved profiles are reconciled only when `federation.coordinator = true`; the default remote role never federates its own catalog back, so enabling this on one machine does not create a cycle. The endpoint catalog remains authoritative for each trusted profile's label, SSH target, remote session, and enabled state. Add, enable, disable, remove, target/session changes, and trust-policy changes are applied without restarting the daemon. A label-only rename changes display data without reconnecting or changing qualified routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
 
+Every named session (`herdr --session <name>`) reads this same config, so federation runs only in the default session's server unless a session is listed in `federation.named_sessions`. In any other named session, `coordinator`, explicit peers with an `endpoint`, and `listen` are ignored: it polls no saved machines or outbound peers and leaves `listen_addr` to the default session. Its `herdr machine status` reports saved machines as coordinator-disabled. A named session can still be the target a coordinator on another machine reaches through a saved profile's session.
+
+```toml
+[federation]
+coordinator = true
+named_sessions = ["agents"]
+```
+
+List a session only when it should federate alongside the default session; two sessions that both coordinate each poll every saved machine, and two with `listen = true` contend for the same `listen_addr`. `"default"` is accepted and redundant. Names follow the `--session` naming rules.
+
 Capability tiers are ordered, each including the one below it:
 
 - `observe` — read-only: list, read, and inspect panes, agents, events, and layout.
