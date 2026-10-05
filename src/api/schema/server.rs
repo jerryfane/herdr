@@ -60,4 +60,7 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `agent.forget` (remove an archived agent's record).
+    #[serde(default)]
+    pub agent_forget: bool,
 }

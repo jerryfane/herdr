@@ -2705,6 +2705,7 @@ mod tests {
                 agent_session_transfer_harnesses: Vec::new(),
                 events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2785,6 +2786,7 @@ mod tests {
                     agent_session_transfer_harnesses: Vec::new(),
                     events_v2: false,
                     ssh_agent_registration: false,
+                    agent_forget: false,
                 }),
             },
         };
@@ -3051,6 +3053,7 @@ mod tests {
                     agent_session_transfer_harnesses: Vec::new(),
                     events_v2: false,
                     ssh_agent_registration: false,
+                    agent_forget: false,
                 }),
             },
         };

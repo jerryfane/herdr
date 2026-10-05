@@ -1122,6 +1122,7 @@ fn success_response_round_trips() {
                 ],
                 events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
         },
     };

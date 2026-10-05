@@ -17154,6 +17154,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_forget": {
+              "default": false,
+              "description": "Supports `agent.forget` (remove an archived agent's record).",
+              "type": "boolean"
+            },
             "agent_session_transfer": {
               "default": false,
               "description": "The server can transactionally transfer visible session history between\nClaude Code, Codex, and OMP in the same logical pane.",

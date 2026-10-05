@@ -204,6 +204,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ],
         events_v2: true,
         ssh_agent_registration: false,
+        agent_forget: true,
     })
 }
 
@@ -3373,6 +3374,7 @@ mod tests {
                 ],
                 events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
             None,
             None,
