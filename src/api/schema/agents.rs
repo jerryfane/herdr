@@ -95,6 +95,15 @@ pub struct AgentUnarchiveParams {
     pub fresh: bool,
 }
 
+/// `agent.forget` — permanently drop an archived agent's record (issue #291).
+/// Only herdr's resume pointer is removed; the harness transcript and session
+/// files on disk are left untouched. Live agents are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentForgetParams {
+    /// The archived agent's name or terminal id.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentViewSetParams {
     pub source: String,

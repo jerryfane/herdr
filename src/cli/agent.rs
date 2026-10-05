@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentArchiveParams, AgentListParams, AgentPromptParams, AgentPromptWaitOptions,
-    AgentReadParams, AgentRenameParams, AgentRestartParams, AgentSendKeysParams,
-    AgentSessionTransferHarness, AgentStartParams, AgentTarget, AgentTransferSessionParams,
-    AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams,
-    PaneTarget, ReadFormat, ReadSource, Request,
+    AgentArchiveParams, AgentForgetParams, AgentListParams, AgentPromptParams,
+    AgentPromptWaitOptions, AgentReadParams, AgentRenameParams, AgentRestartParams,
+    AgentSendKeysParams, AgentSessionTransferHarness, AgentStartParams, AgentTarget,
+    AgentTransferSessionParams, AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse,
+    Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -28,6 +28,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "rename" => agent_rename(&args[1..]),
         "archive" => agent_archive(&args[1..]),
         "unarchive" => agent_unarchive(&args[1..]),
+        "forget" => agent_forget(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
@@ -1308,6 +1309,31 @@ fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_forget(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent forget <target> [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    for arg in &args[1..] {
+        match arg.as_str() {
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:forget".into(),
+        method: Method::AgentForget(AgentForgetParams {
+            target: target.clone(),
+        }),
+    })?)
+}
+
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
@@ -1480,6 +1506,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]");
     eprintln!("  herdr agent unarchive <target> [--fresh] [--json]");
+    eprintln!("  herdr agent forget <target> [--json]");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");

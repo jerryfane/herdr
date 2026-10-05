@@ -198,6 +198,8 @@ pub enum Method {
     AgentArchive(AgentArchiveParams),
     #[serde(rename = "agent.unarchive")]
     AgentUnarchive(AgentUnarchiveParams),
+    #[serde(rename = "agent.forget")]
+    AgentForget(AgentForgetParams),
     #[serde(rename = "agent.view.set")]
     AgentViewSet(AgentViewSetParams),
     #[serde(rename = "agent.view.clear")]

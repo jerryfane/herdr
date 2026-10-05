@@ -1648,6 +1648,7 @@ impl App {
             Method::AgentUnarchive(params) => {
                 return self.handle_agent_unarchive(request.id, params)
             }
+            Method::AgentForget(params) => return self.handle_agent_forget(request.id, params),
             Method::AgentViewSet(params) => return self.handle_agent_view_set(request.id, params),
             Method::AgentViewClear(params) => {
                 return self.handle_agent_view_clear(request.id, params);

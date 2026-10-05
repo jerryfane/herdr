@@ -3,9 +3,9 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentArchiveParams, AgentListParams, AgentPromptDelivery, AgentPromptParams, AgentRenameParams,
-    AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentUnarchiveParams,
-    PaneReadResult, ResponseResult,
+    AgentArchiveParams, AgentForgetParams, AgentListParams, AgentPromptDelivery, AgentPromptParams,
+    AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
+    AgentUnarchiveParams, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -188,6 +188,14 @@ impl App {
         match self.unarchive_agent_target(&params.target, params.fresh) {
             Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
             Err(err) => encode_error_body(id, self.agent_unarchive_error_body(err)),
+        }
+    }
+
+    /// `agent.forget` — drop an archived agent's record (issue #291).
+    pub(super) fn handle_agent_forget(&mut self, id: String, params: AgentForgetParams) -> String {
+        match self.forget_archived_agent(&params.target) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+            Err(err) => encode_error_body(id, self.agent_forget_error_body(err)),
         }
     }
 
@@ -4698,6 +4706,197 @@ mod tests {
                 origin_tab_id: None,
                 pane_label: None,
             });
+    }
+
+    /// Names of the agents `agent.list` reports, split into (live, archived).
+    fn listed_agent_names(app: &mut App) -> (Vec<String>, Vec<String>) {
+        let success: SuccessResponse = serde_json::from_str(
+            &app.handle_agent_list("list".into(), AgentListParams { local_only: true }),
+        )
+        .expect("agent.list response");
+        let ResponseResult::AgentList { agents, .. } = success.result else {
+            panic!("expected agent list");
+        };
+        let (archived, live): (Vec<_>, Vec<_>) = agents
+            .into_iter()
+            .partition(|agent| agent.archived.is_some());
+        let names = |agents: Vec<crate::api::schema::AgentInfo>| {
+            agents
+                .into_iter()
+                .filter_map(|agent| agent.name)
+                .collect::<Vec<_>>()
+        };
+        (names(live), names(archived))
+    }
+
+    fn push_archived_claude(app: &mut App, name: &str) {
+        push_archived(
+            app,
+            name,
+            "claude",
+            "herdr:claude",
+            "claude",
+            crate::agent_resume::AgentSessionRefKind::Id,
+            &format!("sess-{name}"),
+            "/tmp",
+        );
+    }
+
+    fn forget(app: &mut App, target: &str) -> String {
+        app.handle_agent_forget(
+            "req".into(),
+            AgentForgetParams {
+                target: target.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn agent_forget_removes_only_the_matching_record() {
+        let mut app = app_with_agent();
+        push_archived_claude(&mut app, "alpha");
+        push_archived_claude(&mut app, "beta");
+        push_archived_claude(&mut app, "gamma");
+        app.state.session_dirty = false;
+
+        let success: SuccessResponse = serde_json::from_str(&forget(&mut app, "beta"))
+            .expect("forgetting an archived agent succeeds");
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info");
+        };
+        // The response is the record exactly as `agent.list` rendered it.
+        assert_eq!(agent.name.as_deref(), Some("beta"));
+        assert_eq!(agent.terminal_id, "term-beta");
+        assert_eq!(
+            agent.archived.as_ref().map(|archived| archived.by.as_str()),
+            Some("tester")
+        );
+        assert_eq!(
+            agent
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("sess-beta")
+        );
+
+        let remaining: Vec<_> = app
+            .state
+            .archived_agents
+            .iter()
+            .map(|record| record.name.clone().unwrap())
+            .collect();
+        assert_eq!(remaining, ["alpha", "gamma"]);
+        let (_, archived) = listed_agent_names(&mut app);
+        assert_eq!(archived, ["alpha", "gamma"]);
+        assert!(
+            app.state.session_dirty,
+            "forgetting must schedule a session save, or it is lost on restart"
+        );
+
+        // Terminal id addresses a record too, exactly like unarchive.
+        let success: SuccessResponse = serde_json::from_str(&forget(&mut app, "term-gamma"))
+            .expect("forgetting by terminal id succeeds");
+        assert!(matches!(success.result, ResponseResult::AgentInfo { .. }));
+        let (_, archived) = listed_agent_names(&mut app);
+        assert_eq!(archived, ["alpha"]);
+    }
+
+    #[test]
+    fn agent_forget_stays_gone_after_persist_and_reload() {
+        let mut app = app_with_agent();
+        push_archived_claude(&mut app, "alpha");
+        push_archived_claude(&mut app, "beta");
+        forget(&mut app, "alpha");
+
+        // Capture exactly what the session save writes, round-trip it through
+        // JSON, and rehydrate a fresh app from it the way `App::new` does.
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            &app.state.archived_agents,
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: crate::persist::SessionSnapshot = serde_json::from_str(&json).unwrap();
+
+        let mut restarted = app_with_agent();
+        restarted.state.archived_agents = reloaded.archived_agents.clone();
+        let (_, archived) = listed_agent_names(&mut restarted);
+        assert_eq!(
+            archived,
+            ["beta"],
+            "the forgotten record must not come back"
+        );
+
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&forget(&mut restarted, "alpha")).unwrap();
+        assert_eq!(error.error.code, "agent_not_found");
+    }
+
+    #[test]
+    fn agent_forget_unknown_target_is_agent_not_found() {
+        let mut app = app_with_agent();
+        push_archived_claude(&mut app, "alpha");
+        app.state.session_dirty = false;
+
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&forget(&mut app, "ghost")).unwrap();
+        assert_eq!(error.error.code, "agent_not_found");
+        assert_eq!(app.state.archived_agents.len(), 1);
+        assert!(
+            !app.state.session_dirty,
+            "a miss must not touch the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_forget_refuses_a_live_agent() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        push_archived_claude(&mut app, "alpha");
+        app.state.session_dirty = false;
+
+        for target in ["reviewer", terminal_id.as_str()] {
+            let error: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&forget(&mut app, target)).unwrap();
+            assert_eq!(
+                error.error.code, "archived_agent_not_found",
+                "target {target}"
+            );
+            assert!(
+                error.error.message.contains("live"),
+                "the refusal must say why: {}",
+                error.error.message
+            );
+        }
+
+        // Still live, still not archived, and the unrelated record is untouched.
+        let (live, archived) = listed_agent_names(&mut app);
+        assert_eq!(live, ["reviewer"]);
+        assert_eq!(archived, ["alpha"]);
+        assert!(app.resolve_agent_target("reviewer").is_ok());
+        assert!(!app.state.session_dirty);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    /// Several records answering to one name: forget takes the first, the same
+    /// record `agent.unarchive` would resume, and leaves the rest.
+    #[test]
+    fn agent_forget_with_duplicate_names_takes_the_record_unarchive_would() {
+        let mut app = app_with_agent();
+        push_archived_claude(&mut app, "twin");
+        push_archived_claude(&mut app, "twin");
+        app.state.archived_agents[1].terminal_id = "term-twin-2".into();
+
+        let success: SuccessResponse = serde_json::from_str(&forget(&mut app, "twin")).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info");
+        };
+        assert_eq!(agent.terminal_id, "term-twin");
+        assert_eq!(app.state.archived_agents.len(), 1);
+        assert_eq!(app.state.archived_agents[0].terminal_id, "term-twin-2");
     }
 
     #[cfg(unix)]

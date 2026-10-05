@@ -1707,6 +1707,19 @@
           ],
           "type": "object"
         },
+        "AgentForgetParams": {
+          "description": "`agent.forget` — permanently drop an archived agent's record (issue #291).\nOnly herdr's resume pointer is removed; the harness transcript and session\nfiles on disk are left untouched. Live agents are refused.",
+          "properties": {
+            "target": {
+              "description": "The archived agent's name or terminal id.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentListParams": {
           "description": "Controls whether `agent.list` returns the coordinator's cached remote agents.\n\nOrdinary callers get the aggregate view. Federation pollers request the\nlocal-only view so peers never re-export an already aggregated directory.",
           "properties": {
@@ -7121,6 +7134,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentUnarchiveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.forget",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentForgetParams"
             }
           },
           "required": [
