@@ -51,6 +51,7 @@ with the installed binary. Use `--json` for the full JSON Schema document, or
 
 ```bash
 herdr machine list
+herdr machine add workbox
 herdr machine add workbox --label "Build machine"
 herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
@@ -58,13 +59,13 @@ herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-By default, `machine add` uses the remote default session. Add `--remote-session <name>` only for a named session. `machine list` accepts optional `--json` for scripts. See [Connecting machines](/docs/connecting-machines/) for the full setup and connection guide.
+In an interactive terminal, `machine add` discovers running sessions and lets you choose when several are running. No running sessions, or no Herdr installation, uses `default`; failed queries against an installed binary require an explicit choice. Add `--remote-session <name>` to skip discovery. Non-interactive commands use `default` unless that flag is supplied. `machine list` accepts optional `--json` for scripts. See [Connecting machines](/docs/connecting-machines/) for the full setup and connection guide.
 
 `machine add` checks the remote installation's capabilities, installs or updates with approval only when needed, and starts the requested session's background server before saving. Compatible release versions do not need to match. Run setup in an interactive terminal when installation or restart approval is required; failed or cancelled setup does not save a profile. Replacing a running server requires explicit approval with a default answer of No, and stops its pane processes. `machine add` never enables experimental handoff implicitly.
 
 Changes apply automatically to open local Herdr clients, normally within a second. Added or enabled machines connect in the background; renaming does not reconnect. Removing or disabling disconnects only that machine and leaves its remote sessions running. Removing the machine you are viewing returns to Local, or shows Local as unavailable until it reconnects. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials. When federation trust policy exists for a profile, `machine list --json` also reports its non-secret `federation_expected_machine_id`; labels remain display-only and never select that policy.
 
-Automatic connections and reconnects are non-interactive. If a host key, password, key passphrase, MFA step, install, update, or restart needs approval, the machine shows Attention instead of opening a hidden prompt. Run the standalone command printed by Herdr, such as `herdr --remote workbox`, to complete that setup in the foreground, then restart the client. Include `--session <name>` only when the profile targets a named session.
+Use `herdr machine status [<label-or-id>] [--json]` for fresh, noninteractive SSH and remote Herdr checks. `reachable` describes this check, not a TUI's current connection. Use `herdr machine reconnect <label-or-id>` in a terminal for SSH authentication and verification; it does not install or update Herdr. Open clients retry failed connections within 30 seconds. Clicking `! auth` or `! error` shows the latest error and CLI guidance; collapsed sidebars show `!`. See [Recovering SSH authentication](/docs/connecting-machines/#recovering-ssh-authentication) for platform limits. For remote setup, use `herdr --remote workbox`, adding `--session <name>` only for a named session.
 
 Workspace, tab, pane IDs, and agent names belong to a single server. Selecting a machine in the UI does not retarget CLI commands. Use the global **prefix** `--machine <label-or-id>` to route API commands to a saved SSH machine:
 
@@ -163,13 +164,16 @@ An agent's identity comes from `HERDR_PANE_ID` and resolves to its agent name (o
 Share one named, running agent with one outside person, who uses it from the HerdrUp app with no SSH access and no open ports. The guest's app reaches this machine through the HerdrUp guest relay (`[guest] relay_url`), and the connection is end-to-end encrypted with Noise IK, so the relay only forwards ciphertext. Unix only.
 
 ```bash
-herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS]
+herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram]
 herdr guest list                                  # guests, invites and relay link state (no secrets or keys)
+herdr guest share-gram <guest-id> on|off          # share the agent's Gram with an accepted guest, or stop
 herdr guest revoke <guest-or-invite-id>           # closes the guest's live sessions immediately
 herdr guest log [<guest-id>] [--limit N]          # activity, newest first
 ```
 
-Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal. The guest cannot type into the terminal, resize it, or reach any other pane. Access pauses while the agent is not the pane's foreground process, and comes back when an agent with the same name and kind runs in that terminal again, for example after a restart. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications.
+Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal, including up to 1,000 lines of its scrollback. While watching, the guest can also resize the terminal. Everyone watching it, including you, sees that size until the guest stops watching; the guest's app renews the size while it is open, and a size that is not renewed lapses within a minute. The guest cannot type into the terminal or reach any other pane. Access pauses while the agent is not the pane's foreground process, and comes back when an agent with the same name and kind runs in that terminal again, for example after a restart. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications. Watching the agent, reading its scrollback, resizing its terminal and reading the shared Gram are not recorded.
+
+With `--share-gram`, or `herdr guest share-gram <guest-id> on` for a guest who already accepted, the guest also gets a Gram tab for the agent. It shows every Gram the agent sends you from its own terminal from the moment the guest accepted, with its files, plus the guest's own posts to the agent. It never shows your posts to the agent, older Grams, other agents' Grams, or Grams that only carry the agent's name, such as ones sent from another pane or relayed from another machine. The guest keeps separate read marks and cannot claim, delete or mark your messages read. Sharing is off by default and takes effect at once, even for a guest who is connected. `herdr guest list` shows it per guest and invite, and file opens are audited. Any guest can also register their phone for the agent's push notifications: needs you, finished and died, plus its new Grams while sharing is on. These notifications go through the same direct APNs or HerdrUp push relay path as yours, and a revoke deletes the guest's registrations.
 
 While at least one guest or unexpired invite exists, the server keeps one outbound TLS WebSocket to the relay, reconnecting with backoff from 2 to 60 seconds, and closes it once no guests or invites remain. It is the only TLS connection Herdr opens in-process; update checks and push delivery run `curl` instead. `herdr guest list` shows its state (`off`, `connecting`, `up` or `retrying`) and last error.
 
@@ -231,6 +235,8 @@ herdr tab close <tab_id>
 ```
 
 A tab is another terminal layout inside a workspace. Without `--workspace`, `tab create` uses the active workspace and fails if none exists. Its JSON response exposes `.result.tab.tab_id` and `.result.root_pane.pane_id`. Closing a workspace's last tab also closes the workspace, matching the TUI close-tab action. If `confirm_close` is enabled and closing the tab would also close a whole worktree group, `tab close` returns a `confirmation_required` error instead.
+
+With `ui.confirm_close` enabled, the TUI asks for confirmation before closing a workspace's last tab from a keybinding or the tab menu. Ordinary CLI/API tab closes remain immediate.
 
 Workspace and tab creation, and pane splitting, leave focus unchanged by default. `--focus` selects the new layout; `--no-focus` states the default explicitly. Without `--cwd`, new terminals follow the configured `terminal.new_cwd` policy, which follows the source pane or workspace by default. Each `--env KEY=VALUE` adds or replaces that variable in the new root shell.
 
@@ -310,7 +316,8 @@ herdr pane report-agent <pane_id> \
   [--message TEXT] \
   [--seq N] \
   [--agent-session-id ID] \
-  [--agent-session-path PATH]
+  [--agent-session-path PATH] \
+  [-- RESUME_COMMAND...]
 
 herdr pane report-agent-session <pane_id> \
   --source ID \
@@ -320,7 +327,8 @@ herdr pane report-agent-session <pane_id> \
   [--agent-session-path PATH] \
   [--agent-session-cursor ID] \
   [--agent-process-pid PID] \
-  [--session-start-source SOURCE]
+  [--session-start-source SOURCE] \
+  [-- RESUME_COMMAND...]
 
 herdr pane release-agent <pane_id> \
   --source ID \
@@ -329,6 +337,8 @@ herdr pane release-agent <pane_id> \
 ```
 
 `report-agent-session` updates native session identity without reporting lifecycle state. Integrations for tree-shaped session logs can also report the selected leaf with `--agent-session-cursor`; `--agent-process-pid` binds that report to the exact harness process. `release-agent` ends that source's lifecycle authority when its agent process exits.
+
+Arguments after `--` are the command Herdr runs to resume this session after a server restart. The first argument must be a plain command name on `PATH`, and no argument may contain an apostrophe.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
@@ -421,8 +431,17 @@ Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ct
 terminal, or agent target. It prints the same newline-delimited
 `terminal.frame` and `terminal.closed` records as observe mode. It reads
 newline-delimited JSON commands on stdin: `terminal.input`, `terminal.resize`,
-`terminal.scroll`, and `terminal.release`. One controller can own a terminal at
-a time; use `--takeover` to replace it.
+`terminal.scroll`, `terminal.mouse`, and `terminal.release`. One controller can
+own a terminal at a time; use `--takeover` to replace it.
+`terminal.mouse` sends one mouse event at a zero-based cell of the controller's
+viewport, for example
+`{"type":"terminal.mouse","action":"down","button":"left","column":12,"row":5}`.
+`action` is `down`, `up`, `drag`, or `move`; `button` is `left` (default),
+`right`, or `middle`; `modifiers` is optional and combines Shift = 1, Ctrl = 2,
+and Alt = 4 (default 0). A click is `down` followed by `up`. Herdr encodes the
+event for the application's mouse mode and drops it when the application has
+not enabled mouse reporting, so a plain shell never receives stray input.
+`move` reaches only applications that track all mouse motion.
 `terminal session observe` opens a read-only live terminal stream for a pane,
 terminal, or agent target. It prints newline-delimited JSON `terminal.frame`
 records with base64-encoded ANSI bytes, then a `terminal.closed` record when
@@ -561,6 +580,17 @@ cells or percentages such as `80%`; omitted dimensions default to half the
 terminal size, and values smaller than the popup minimum are clamped. A popup
 is not a Herdr pane, does not export `HERDR_PANE_ID`, and does not participate
 in pane or agent APIs. Native non-terminal plugin panes are outside plugin v1.
+
+New panes identify as `TERM_PROGRAM=herdr`, with `TERM_PROGRAM_VERSION` set to
+Herdr's version. They keep `TERM=xterm-256color` and `COLORTERM=truecolor`.
+Herdr removes inherited outer-terminal session markers (iTerm2, WezTerm, Kitty,
+Windows Terminal, tmux, screen, and Zellij), iTerm2's `LC_TERMINAL` identity,
+and known Claude Code, Codex, and OMP session markers before applying explicit
+launch environment values. This prevents new panes from claiming the terminal
+or agent session that originally started the server. Ordinary environment
+variables, including API keys and display settings, remain inherited rather than
+being replaced with the attaching client's environment. SSH-agent forwarding has
+its own reconnect handling. Existing pane processes are unchanged by this cleanup.
 
 `--env KEY=VALUE` can be repeated on process-launching commands. It applies to the newly launched process only. Herdr-managed variables such as `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_ENTRYPOINT_ID`, and `HERDR_PLUGIN_CONTEXT_JSON` stay authoritative when they conflict with caller-provided env.
 
