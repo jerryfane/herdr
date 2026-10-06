@@ -166,6 +166,16 @@ expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 
 The table key is the saved machine's immutable profile ID. Saved profiles are reconciled only when `federation.coordinator = true`; the default remote role never federates its own catalog back, so enabling this on one machine does not create a cycle. The endpoint catalog remains authoritative for each trusted profile's label, SSH target, remote session, and enabled state. Add, enable, disable, remove, target/session changes, and trust-policy changes are applied without restarting the daemon. A label-only rename changes display data without reconnecting or changing qualified routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
 
+Every named session (`herdr --session <name>`) reads this same config, so federation runs only in the default session's server unless a session is listed in `federation.named_sessions`. In any other named session, `coordinator`, explicit peers with an `endpoint`, and `listen` are ignored: it polls no saved machines or outbound peers and leaves `listen_addr` to the default session. Its `herdr machine status` reports saved machines as coordinator-disabled. A named session can still be the target a coordinator on another machine reaches through a saved profile's session.
+
+```toml
+[federation]
+coordinator = true
+named_sessions = ["agents"]
+```
+
+List a session only when it should federate alongside the default session; two sessions that both coordinate each poll every saved machine, and two with `listen = true` contend for the same `listen_addr`. `"default"` is accepted and redundant. Names follow the `--session` naming rules.
+
 Capability tiers are ordered, each including the one below it:
 
 - `observe` — read-only: list, read, and inspect panes, agents, events, and layout.
@@ -174,9 +184,13 @@ Capability tiers are ordered, each including the one below it:
 
 
 Each outbound transport has a monotonically increasing peer generation and learns the remote daemon's opaque boot ID from `agent.list`. Ordinary replies and every `pane.stream` frame are checked against the generation and boot observed when the request started. A target/session reload, disconnect replacement, or remote restart therefore ends the old route and returns `stale_peer_generation` instead of forwarding stale data. The home never retries automatically: `peer_unreachable` means the connection was not established, while `delivery_unknown` means a write or response failed after connection and the peer may have acted. `forbidden` and other peer errors pass through unchanged.
-Federation exposes only a deliberate, read-and-drive subset of the API. Anything not in a tier — server lifecycle, plugin, integration, gram, notification, window-title, agent/pane/workspace/tab/worktree/layout mutation, and graphics — is denied to every federated peer regardless of tier. Inbound connections are also capped so a peer cannot exhaust the daemon's threads or file descriptors.
+Federation exposes only a deliberate, read-and-drive subset of the API. Anything not in a tier — server lifecycle, plugin, integration, gram, notification, window-title, and agent/pane/workspace/tab/worktree/layout mutation — is denied to every federated peer regardless of tier. Inbound connections are also capped so a peer cannot exhaust the daemon's threads or file descriptors.
 
 `agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
+
+The coordinator also caches each reachable peer's `workspace.list` (requested with `local_only: true`, with re-exported entries discarded the same way). It is fetched on the first successful agent poll, then every 30 seconds, and once early when a polled agent names a workspace the cache does not have; the 5-second agent poll adds no other request. The cache is kept while a peer is degraded or unreachable, so its workspaces stay listed with the peer's reachability.
+
+The coordinator also keeps one `events.subscribe` stream open to each identity-validated peer that advertises `events_v2`, so remote status changes, completed turns, and pane, workspace and tab lifecycle events reach its local subscribers in about a second instead of on the next poll (see [Remote events on a coordinator](/docs/socket-api/#remote-events-on-a-coordinator)). The stream uses the same route as the poll: a saved machine's existing `remote-api-bridge`, or the TCP endpoint and token, where the `observe` tier suffices. A failed stream reconnects with the poll's backoff, a changed peer boot ID restarts it, and each reconnect resynchronizes from `agent.list`. The 5-second poll keeps running as the backstop, but a poll answer older than a relayed event never overwrites that event's status. Peers without the capability are only polled.
 
 Use `herdr machine status` (or `herdr machine status --json`) on the coordinator to inspect saved-profile, endpoint/TUI, and federation health separately. An untrusted profile prints `herdr machine federate <profile-id>` as its next action (`next_action` in JSON). Federation reachability, validated remote machine ID, last successful poll, bounded error class, negotiated version/capabilities, and stale data are reported independently. Errors do not expose SSH commands, tokens, or remote stderr.
 
@@ -206,7 +220,7 @@ A TCP federation token grants exactly its peer's capability tier and nothing mor
 
 ### Gram files across trusted machines
 
-Gram remains in the coordinator's canonical store. A saved, identity-pinned SSH peer can use a separate, default-off reverse Unix socket for remote `gram send --file`, list, file download, and delete. The owner posts to a remote agent by its machine-qualified name (`herdr gram post "message" --to <profile-id>/<agent>`). This does **not** add `gram.*` to the ordinary TCP federation allowlist or forward the coordinator's unrestricted local API.
+Gram remains in the coordinator's canonical store. A saved, identity-pinned SSH peer can use a separate, default-off reverse Unix socket for remote `gram send --file`, list, file download, and delete. The owner posts to a remote agent by its machine-qualified name (`herdr gram post "message" --to <profile-id>/<agent>`). This does **not** add `gram.*` to the ordinary TCP federation allowlist or forward the coordinator's unrestricted local API. On the remote, a HerdrUp guest's post to its shared agent, with its attachment, also goes to the coordinator, where that agent reads its Gram; the coordinator accepts a relayed post only from a guest to one of that machine's own agents, and addresses it to that agent's machine-qualified name, as an owner's post to it would be. The remote keeps a copy of the shared agent's Grams and the guest's own posts for guests with Gram sharing on, so they can list them, open their files and be notified. The owner's Gram and notifications stay on the coordinator, and the copies are dropped when no sharing guest can see them. A Gram deleted through the relay drops its copy at once; one deleted on the coordinator drops it the next time the guest lists its Gram (checked at most every 30 seconds, while the shared agent runs). The same check brings back the guest's Grams this remote relayed while sharing was off, so turning sharing on shows the shared agent's Grams and the guest's posts since the guest accepted; Grams it did not relay itself are never taken on the coordinator's word.
 
 Relay consent is durable Herdr configuration and is off by default. Both sides need the updated binary; the coordinator's saved SSH profile must already pin the remote install ID (`herdr machine federate`). OpenSSH must permit reverse stream-local forwarding. No private SSH key is copied to the remote machine.
 
@@ -256,6 +270,15 @@ navigate_workspace_down = "j"
 navigate_pane_down = "ctrl+j"
 split_horizontal = "prefix+minus"
 ```
+
+`keys.prefix` also accepts an array when you need to enter prefix mode from more than one key, for example to share one config between macOS and a remote Linux machine:
+
+```toml
+[keys]
+prefix = ["ctrl+space", "ctrl+s"]
+```
+
+Every configured prefix enters the same prefix mode and starts every `prefix+...` action. The first entry is the primary prefix shown in the status bar; the in-app help panel at `prefix+?` lists all of them.
 
 The default keymap is prefix-first so Herdr does not steal input from shells, editors, tmux, or terminal apps. Search `keys.` in the [Config reference](/docs/config-reference/) to see every action and default binding. The in-app help panel at `prefix+?` shows the active bindings.
 
@@ -362,6 +385,8 @@ name = "catppuccin"
 ```
 
 Search `theme.name` in the [Config reference](/docs/config-reference/) for every built-in theme. Use `terminal` when you want Herdr UI colors to follow your host terminal's ANSI palette.
+
+On Unix, Herdr also re-reads the host terminal's colors when redrawing after a resize or `SIGWINCH`. If your theme switcher changes terminal colors through OSC without a light/dark notification, send `kill -WINCH <client-pid>` after applying the new palette. Target the attached Herdr client, not the server; existing panes stay running. Direct `herdr terminal attach` sessions leave palette queries to the attached application.
 
 To let Herdr switch its own UI theme when the host terminal reports a light/dark appearance change, enable theme auto-switching:
 
@@ -600,6 +625,8 @@ Choose `herdr` for an in-app toast, `terminal` for an outer-terminal notificatio
 
 On macOS, `system` tries `terminal-notifier` first and falls back to `/usr/bin/osascript` when it is unavailable or fails. The fallback appears as Script Editor in Notification Center and cannot activate the hosting terminal. Install `terminal-notifier` with `brew install terminal-notifier`. For a supported, detected terminal, it can activate the terminal app when you click the notification. Alternatively, choose `terminal` to let a supported outer terminal own the notification.
 
+On Windows, `system` notifications remain in Notification Center. Clicking one selects its originating pane in the running Herdr client and brings its terminal window forward when Windows exposes that window. A click cannot reopen a closed client or select a pane from a restarted server. Windows Terminal can bring the owning window forward, but cannot reliably select a different outer terminal tab.
+
 ## Sound
 
 Sound notifications play through the local Herdr client. Custom sounds must be mp3 files; Herdr resolves relative paths from the config file's directory.
@@ -627,9 +654,19 @@ Search the [Config reference](/docs/config-reference/) for scrollback limits, ne
 
 ## Kitty graphics
 
-Herdr renders pane images by default in compatible outer terminals. Popups, menus, and notifications temporarily hide only the image placements they overlap. Uncovered images stay visible, and hidden placements return when uncovered. Images do not dim with dialog backgrounds.
+Applications and plugins integrate through the standard Kitty graphics protocol emitted in pane terminal output. Herdr renders these images by default in compatible outer terminals. The external socket pane-overlay API has been removed; there is no replacement socket image API.
 
-To disable graphics rendering and the pane graphics API:
+Popups, menus, and notifications crop images around the area they cover; the rest of each image stays visible and the covered part returns when the overlay closes. Images do not dim with dialog backgrounds.
+
+Herdr automatically chooses eligible file transports, with no application changes or environment switches. On local Unix Ghostty clients, it can send image data through temporary files instead of encoding it into terminal output. A small file-consumption probe checks support first. Other terminals, SSH-launched clients, and nested multiplexers retain inline output for this last-hop optimization.
+
+For eligible local clients, native RGBA images travel from server to client as paths to Herdr-owned snapshots rather than pixel bytes. Unsupported clients and failed transfers fall back to inline delivery. Remote server paths are never forwarded to the local terminal. Herdr keeps image placement, clipping, and visibility under its control.
+
+On Linux, whole-file, uncompressed RGBA uploads can use copy-on-write snapshots before Herdr reads their pixels. This requires filesystem support for cloning into Herdr's private `/var/tmp` store. Unsupported filesystems, temporary-file uploads, shared memory, and other formats use the normal loader. Snapshots are limited to 16 MiB each and 64 MiB total; animation and unsupported clients read their pixels when needed. Herdr never relies on a mutable producer path after accepting an image.
+
+PNG uploads retain full decoding and validation. Herdr does not defer corrupt-image validation to the outer terminal.
+
+To disable Kitty graphics rendering:
 
 ```toml
 [terminal]
@@ -638,7 +675,7 @@ kitty_graphics = false
 
 The legacy `experimental.kitty_graphics` setting remains accepted for existing configurations. `terminal.kitty_graphics` takes precedence when both are set.
 
-Changing this setting requires restarting the affected Herdr server or reattaching the client. In remote sessions, the server's setting controls pane graphics parsing and API availability, while the local client's setting controls output to the outer terminal.
+Changing this setting requires restarting the affected Herdr server or reattaching the client. In remote sessions, the server's setting controls Kitty graphics parsing, while the local client's setting controls output to the outer terminal.
 
 ## Agent session restore
 
@@ -647,7 +684,10 @@ Herdr resumes supported Agent conversations after a server restart by default:
 ```toml
 [session]
 resume_agents_on_restore = true
+startup_per_agent_delay_ms = 100
 ```
+
+Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 

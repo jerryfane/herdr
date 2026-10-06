@@ -69,7 +69,7 @@ Host workbox
 herdr --remote workbox
 ```
 
-远程连接和已保存的 SSH 机器支持 Linux、macOS 和 Windows 客户端，目标可以是 x86_64 或 aarch64 的 Linux/macOS 主机，也可以是 x86_64 的 Windows 主机。只要两端支持稳定端点代数，版本就不必一致。Linux/macOS 上优先使用远程 `PATH` 中兼容的 `herdr`，再检查常见的直接安装、Homebrew、mise 和 Nix profile 路径。Windows 上检查 `PATH` 和当前有效的托管版本。如果没有兼容的二进制文件，交互式运行会询问是否安装或更新；非交互式运行直接失败，不修改主机。Linux/macOS 安装到 `~/.local/bin/herdr`，Windows 安装包含应用本地 ConPTY 运行时的完整软件包。如果 `~/.local/bin` 不在远程 `PATH` 中，Herdr 会发出警告。
+远程连接和已保存的 SSH 机器支持 Linux、macOS 和 Windows 客户端，目标可以是 x86_64 或 aarch64 的 Linux/macOS 主机，也可以是 x86_64 的 Windows 主机。Windows ARM64 主机通过 Windows 的 x64 模拟运行 x64 构建，仅提供尽力而为的支持，可能存在错误和其他问题。当主机报告 ARM64 时，显式远程连接和已保存机器的设置过程会显示模拟运行提示。只要两端支持稳定端点代数，版本就不必一致。Linux/macOS 上优先使用远程 `PATH` 中兼容的 `herdr`，再检查常见的直接安装、Homebrew、mise 和 Nix profile 路径。Windows 上检查 `PATH` 和当前有效的托管版本。如果没有兼容的二进制文件，交互式运行会询问是否安装或更新；非交互式运行直接失败，不修改主机。Linux/macOS 安装到 `~/.local/bin/herdr`，Windows 安装包含应用本地 ConPTY 运行时的完整软件包。如果 `~/.local/bin` 不在远程 `PATH` 中，Herdr 会发出警告。
 
 默认情况下,`herdr --remote` 通过一个临时 SSH 配置运行远程设置和桥接: 先包含你的 SSH 配置,再补充兜底的保活设置。已有的用户保活设置优先。Linux 和 macOS 客户端还会添加一个私有的单次连接 control socket 来复用连接;Windows OpenSSH 不使用此方式。设置 `[remote].manage_ssh_config = false` 可以不用 Herdr 生成的配置或 control socket,而使用普通 `ssh`。
 
@@ -148,4 +148,4 @@ herdr terminal session observe w1:p1 --cols 120 --rows 40
 herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 ```
 
-控制模式输出相同的帧，并从标准输入读取逐行 JSON 命令。`terminal.input` 发送文本或 base64 数据，`terminal.resize` 更改视口尺寸，`terminal.scroll` 滚动视口，`terminal.release` 关闭控制器。同一时间只有一个控制器能拥有输入和调整尺寸的权限。
+控制模式输出相同的帧，并从标准输入读取逐行 JSON 命令。`terminal.input` 发送文本或 base64 数据，`terminal.resize` 更改视口尺寸，`terminal.scroll` 滚动视口，`terminal.mouse` 向已开启鼠标报告的应用发送单元格位置的鼠标事件，`terminal.release` 关闭控制器。同一时间只有一个控制器能拥有输入和调整尺寸的权限。

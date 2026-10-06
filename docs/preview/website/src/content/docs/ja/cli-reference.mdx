@@ -49,6 +49,7 @@ herdr api schema --output herdr-api.schema.json
 
 ```bash
 herdr machine list
+herdr machine add workbox
 herdr machine add workbox --label "Build machine"
 herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
@@ -56,13 +57,13 @@ herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-`machine add` はリモートのデフォルトセッションを使います。名前付きセッションを使う場合だけ `--remote-session <name>` を追加します。スクリプトでは `machine list` に `--json` を追加できます。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。
+対話型ターミナルでは、`machine add` は実行中のセッションを検出し、複数あれば選択できます。実行中のセッションがない場合や Herdr がインストールされていない場合は `default` を使います。インストール済みバイナリへの問い合わせに失敗した場合は、明示的な選択が必要です。検出を省略するには `--remote-session <name>` を追加します。非対話型コマンドでは、このフラグがない限り `default` を使います。スクリプトでは `machine list` に `--json` を追加できます。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。
 
 `machine add` はリモート側の Herdr が必要な機能を備えているか確認し、必要な場合だけ承認を得てインストールまたは更新します。指定したセッションのバックグラウンドサーバーを起動してからプロファイルを保存します。互換性があればリリースバージョンは一致しなくてもかまいません。インストールや再起動の承認が必要な場合は、対話型ターミナルで実行してください。セットアップが失敗またはキャンセルされた場合、プロファイルは保存されません。実行中サーバーの置き換えには明示的な承認が必要で、デフォルトの回答は No です。停止するとペインのプロセスも終了します。`machine add` は実験的なハンドオフを暗黙に有効にしません。
 
 変更は、開いているローカルの Herdr クライアントに通常 1 秒以内に自動反映されます。追加または有効化したマシンにはバックグラウンドで接続し、名前の変更では再接続しません。削除または無効化すると、そのマシンだけが切断され、リモートセッションは動き続けます。表示中のマシンを削除すると Local に戻ります。Local に接続できない場合は、再接続するまで利用不可と表示します。各プロファイルは、不透明な ID、ラベル、SSH 接続先、明示的なリモートセッション名、有効状態をクライアントの状態ファイルに保存します。パスワード、秘密鍵、その他の SSH 認証情報は保存しません。
 
-自動接続と再接続は非対話型です。ホスト鍵、パスワード、鍵のパスフレーズ、MFA、インストール、更新、再起動に承認が必要な場合、隠れたプロンプトを開くのではなく Attention と表示します。`herdr --remote workbox` など、Herdr が表示する単独接続用のコマンドを実行してフォアグラウンドでセットアップを完了し、クライアントを再起動してください。名前付きセッションを選んだプロファイルにだけ `--session <name>` を追加します。
+`herdr machine status [<label-or-id>] [--json]` は SSH とリモート Herdr を非対話式で確認します。`reachable` は今回の確認結果で、TUI の接続状態ではありません。ターミナルで `herdr machine reconnect <label-or-id>` を実行すると認証と検証を行いますが、インストールや更新は行いません。開いているクライアントは 30 秒以内に再試行します。`! auth` または `! error` をクリックすると最新のエラーと CLI コマンドを表示します。折りたたみ時は `!` です。対応環境は [SSH 認証の復旧](/ja/docs/connecting-machines/#ssh-認証の復旧)を参照してください。セットアップには `herdr --remote workbox` を使い、名前付きセッションの場合だけ `--session <name>` を追加します。
 
 ワークスペース、タブ、ペインの ID とエージェント名はサーバーごとに独立しています。UI での選択は CLI の接続先を変えません。保存済み SSH マシンへ API コマンドを送るには、グローバルな**プレフィックス** `--machine <label-or-id>` を指定します。
 
@@ -160,13 +161,16 @@ herdr gram relay-status [--json]                # リレーの同意・出所・
 名前付きで実行中のエージェント 1 つを外部の 1 人と共有します。相手は SSH アクセスもポート開放もなしに、HerdrUp アプリから利用できます。ゲストのアプリは HerdrUp ゲストリレー(`[guest] relay_url`)経由でこのマシンに接続し、通信は Noise IK でエンドツーエンド暗号化されるため、リレーは暗号文を中継するだけです。Unix のみ対応です。
 
 ```bash
-herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS]
+herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram]
 herdr guest list                                  # ゲスト・招待・リレー接続の状態(秘密情報や鍵は含まない)
+herdr guest share-gram <guest-id> on|off          # 承認済みゲストとエージェントの Gram を共有する/やめる
 herdr guest revoke <guest-or-invite-id>           # ゲストのライブセッションを即座に閉じる
 herdr guest log [<guest-id>] [--limit N]          # アクティビティ(新しい順)
 ```
 
-どのコマンドも `--machine ALIAS` で保存済み SSH マシン上で実行できます。エージェントには名前と安定したハーネスセッションが必要です。招待は 1 回だけ有効で、既定では 24 時間で失効し、1 つのゲスト名とそのエージェントに紐付きます。ゲストはエージェントにプロンプトを送り(`<name> (via HerdrUp): ` のラベル付き)、ファイルを添付し、ターミナルを閲覧できます。ターミナルへの入力、サイズ変更、他のペインへのアクセスはできません。エージェントがペインのフォアグラウンドプロセスでない間はアクセスが一時停止し、再起動などで同じ名前と種類のエージェントがそのターミナルで再び動くと再開します。アクティビティは通知ではなく、設定ディレクトリの `guest/audit.jsonl` に記録されます。
+どのコマンドも `--machine ALIAS` で保存済み SSH マシン上で実行できます。エージェントには名前と安定したハーネスセッションが必要です。招待は 1 回だけ有効で、既定では 24 時間で失効し、1 つのゲスト名とそのエージェントに紐付きます。ゲストはエージェントにプロンプトを送り(`<name> (via HerdrUp): ` のラベル付き)、ファイルを添付し、最大 1,000 行のスクロールバックを含めてターミナルを閲覧できます。ゲストは閲覧中にターミナルのサイズも変更できます。ゲストが閲覧をやめるまで、あなたを含む閲覧中の全員にそのサイズが適用されます。サイズはゲストのアプリが開いている間更新され、更新されないサイズは 1 分以内に解除されます。ターミナルへの入力と他のペインへのアクセスはできません。エージェントがペインのフォアグラウンドプロセスでない間はアクセスが一時停止し、再起動などで同じ名前と種類のエージェントがそのターミナルで再び動くと再開します。アクティビティは通知ではなく、設定ディレクトリの `guest/audit.jsonl` に記録されます。エージェントの視聴、スクロールバックの読み取り、ターミナルのサイズ変更、共有 Gram の閲覧は記録されません。
+
+`--share-gram` を付けて招待するか、承認済みのゲストに `herdr guest share-gram <guest-id> on` を実行すると、ゲストにもそのエージェントの Gram タブが表示されます。ゲストが承認した時点以降にエージェントが自分のターミナルからあなたへ送ったすべての Gram(ファイルを含む)と、ゲスト自身がエージェントへ送った投稿が見えます。あなたがエージェントへ送った投稿、それより古い Gram、他のエージェントの Gram、そしてエージェントの名前だけを持つ Gram(別のペインから送られたものや別のマシンから中継されたものなど)は見えません。ゲストの既読状態はあなたとは別に管理され、ゲストがあなたのメッセージを取得・削除・既読にすることはできません。共有は既定でオフで、変更は接続中のゲストにもすぐ反映されます。`herdr guest list` にゲストと招待ごとに表示されます。ファイルを開いた記録は監査ログに残ります。また、どのゲストも自分のスマートフォンを登録して、そのエージェントのプッシュ通知(入力待ち・完了・終了、共有中は新しい Gram も)を受け取れます。配信はあなたの通知と同じく APNs 直接送信または HerdrUp プッシュリレーを経由し、取り消すとゲストの登録は削除されます。
 
 ゲストまたは有効期限内の招待が 1 つ以上ある間、サーバーはリレーへの送信方向の TLS WebSocket 接続を 1 本維持し、切断時は 2〜60 秒のバックオフで再接続します。ゲストも招待もなくなると接続を閉じます。これは Herdr がプロセス内で開く唯一の TLS 接続で、アップデート確認やプッシュ配信は代わりに `curl` を実行します。`herdr guest list` で接続状態(`off`・`connecting`・`up`・`retrying`)と直近のエラーを確認できます。
 
@@ -227,7 +231,9 @@ herdr tab rename <tab_id> <label>
 herdr tab close <tab_id>
 ```
 
-タブはワークスペース内の別のターミナルレイアウトです。`--workspace` を省略すると、`tab create` はアクティブなワークスペースを使い、存在しなければ失敗します。JSON レスポンスの `.result.tab.tab_id` と `.result.root_pane.pane_id` から ID を取得できます。
+タブはワークスペース内の別のターミナルレイアウトです。`--workspace` を省略すると、`tab create` はアクティブなワークスペースを使い、存在しなければ失敗します。JSON レスポンスの `.result.tab.tab_id` と `.result.root_pane.pane_id` から ID を取得できます。ワークスペースの最後のタブを閉じると、そのワークスペースも閉じられます。`ui.confirm_close` が有効で、親ワークツリーの最後のタブを閉じるとワークツリーグループ全体が閉じられる場合、`tab close` は `confirmation_required` エラーを返します。
+
+`ui.confirm_close` が有効な場合、キーバインドやタブメニューからワークスペースの最後のタブを閉じる前に、TUI が確認を求めます。通常の CLI/API によるタブの終了は引き続き即座に実行されます。
 
 ワークスペースとタブの作成、およびペインの分割は、デフォルトではフォーカスを変えません。`--focus` は新しいレイアウトを選択し、`--no-focus` はデフォルトを明示します。`--cwd` がない場合、新しいターミナルは `terminal.new_cwd` の設定に従い、デフォルトでは元のペインまたはワークスペースを引き継ぎます。各 `--env KEY=VALUE` は新しいルートシェルの環境変数を追加または置換します。
 
@@ -292,7 +298,8 @@ herdr pane report-agent <pane_id> \
   [--message TEXT] \
   [--seq N] \
   [--agent-session-id ID] \
-  [--agent-session-path PATH]
+  [--agent-session-path PATH] \
+  [-- RESUME_COMMAND...]
 
 herdr pane report-agent-session <pane_id> \
   --source ID \
@@ -302,7 +309,8 @@ herdr pane report-agent-session <pane_id> \
   [--agent-session-path PATH] \
   [--agent-session-cursor ID] \
   [--agent-process-pid PID] \
-  [--session-start-source SOURCE]
+  [--session-start-source SOURCE] \
+  [-- RESUME_COMMAND...]
 
 herdr pane release-agent <pane_id> \
   --source ID \
@@ -311,6 +319,8 @@ herdr pane release-agent <pane_id> \
 ```
 
 `report-agent-session` はライフサイクル状態を報告せずにネイティブセッション識別子を更新します。ツリー形式のセッションログを使うインテグレーションは、`--agent-session-cursor` で選択中のリーフを、`--agent-process-pid` でその報告に対応する正確なハーネスプロセスを指定できます。`release-agent` は、そのエージェントプロセスが終了したときに、そのソースのライフサイクル権限を終了します。
+
+`--` の後の引数は、サーバー再起動後にこのセッションを再開するために Herdr が実行するコマンドです。最初の引数は `PATH` 上の単純なコマンド名でなければならず、どの引数にもアポストロフィを含めることはできません。
 
 公式インテグレーションがネイティブセッション参照を報告している場合、`pane get`、`pane list`、`agent get`、`agent list` は読み取り専用の `agent_session` オブジェクトを含みます。ネイティブセッション参照が保存されていない場合、このフィールドは省略されます。
 
@@ -392,7 +402,7 @@ herdr terminal title clear
 ```
 
 ダイレクトアタッチからは `ctrl+b q` でデタッチします。リテラルの `ctrl+b` は `ctrl+b ctrl+b` で送ります。
-`terminal session control` は、ペイン、ターミナル、エージェントを対象に書き込み可能なライブストリームを開きます。observe と同じ改行区切り JSON の `terminal.frame` と `terminal.closed` を出力し、標準入力から `terminal.input`、`terminal.resize`、`terminal.scroll`、`terminal.release` を受け取ります。制御クライアントは同時に 1 つだけで、`--takeover` で置き換えられます。
+`terminal session control` は、ペイン、ターミナル、エージェントを対象に書き込み可能なライブストリームを開きます。observe と同じ改行区切り JSON の `terminal.frame` と `terminal.closed` を出力し、標準入力から `terminal.input`、`terminal.resize`、`terminal.scroll`、`terminal.mouse`、`terminal.release` を受け取ります。制御クライアントは同時に 1 つだけで、`--takeover` で置き換えられます。`terminal.mouse` は 0 始まりのセル位置にマウスイベントを 1 つ送ります(例: `{"type":"terminal.mouse","action":"down","button":"left","column":12,"row":5}`)。`action` は `down`、`up`、`drag`、`move` のいずれかで、`button` は `left`(既定)、`right`、`middle`、`modifiers` は省略可能で Shift = 1、Ctrl = 2、Alt = 4 の組み合わせです(既定 0)。クリックは `down` の後に `up` を送ります。Herdr はアプリのマウスモードに合わせてエンコードし、マウス報告を有効にしていないアプリには送らないため、通常のシェルに余計な入力が届くことはありません。`move` はすべてのマウス移動を追跡するアプリにのみ届きます。
 
 `terminal session observe` は同じ対象の読み取り専用ストリームを開きます。base64 の ANSI バイト列を含む `terminal.frame` と、サーバー終了時の `terminal.closed` を改行区切り JSON で出力します。複数の観測クライアントは入力、リサイズ、スクロール、制御権を取得せずに同じターミナルを監視できます。Linux/macOS ではソケットへの書き込みが 30 秒間進まない観測クライアントを切断します。その場合は最後の `terminal.closed` が届かないことがありますが、ペインや他のクライアントは動き続けます。出力のない静かなペインはこのタイムアウトの対象ではありません。
 
@@ -509,6 +519,8 @@ herdr plugin pane close <pane_id>
 ```
 
 `plugin pane open` は、プラグインがリンクされ、有効で、現在のプラットフォームと互換であることを要求します。マニフェストで宣言された `[[panes]]` コマンドを Herdr 管理のターミナルペインとして起動します。マニフェストのデフォルトは `overlay` で、アクティブなペインの上に一時的なズームオーバーレイを開きます。分割、新しいタブ、ズームされたペイン、またはタブレイアウトを変更しないセッションモーダルな `popup` として開くこともできます。`--width` と `--height` は、外側のポップアップ寸法をターミナルセル数または `80%` のような割合で指定します。省略した寸法はデフォルトでターミナルの半分になり、小さすぎる値はポップアップの最小サイズに制限されます。ポップアップは Herdr ペインではなく、`HERDR_PANE_ID` を受け取らず、pane API やエージェント API に参加しません。ターミナル以外のネイティブなプラグインペインは今後の対応面です。
+
+新しいペインでは `TERM_PROGRAM=herdr` として識別され、`TERM_PROGRAM_VERSION` には Herdr のバージョンが設定されます。`TERM=xterm-256color` と `COLORTERM=truecolor` は維持されます。Herdr は、明示的な起動環境の値を適用する前に、継承した外側のターミナルのセッションマーカー（iTerm2、WezTerm、Kitty、Windows Terminal、tmux、screen、Zellij）、iTerm2 の `LC_TERMINAL` 識別子、既知の Claude Code、Codex、OMP セッションマーカーを削除します。これにより、新しいペインがサーバーを最初に起動したターミナルやエージェントのセッションを名乗ることを防ぎます。API キーやディスプレイ設定を含む通常の環境変数は、アタッチ中クライアントの環境に置き換えられず、引き続き継承されます。SSH エージェント転送には独自の再接続処理があります。このクリーンアップによって既存ペインのプロセスは変更されません。
 
 `--env KEY=VALUE` はプロセスを起動するコマンドで繰り返し指定できます。新しく起動されるプロセスにのみ適用されます。`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV`、`HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID`、`HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、`HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_ENTRYPOINT_ID`、`HERDR_PLUGIN_CONTEXT_JSON` のような Herdr 管理の変数は、呼び出し側が与えた環境変数と衝突した場合も権威を保ちます。
 

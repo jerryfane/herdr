@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.transfer_session` |
@@ -107,7 +107,11 @@ herdr pane read w1:p2 --source recent --lines 50
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
+在联邦协调端上，`workspace.list` 先返回本地工作区，再按各出站对等方自身的侧边栏顺序返回其拥有的工作区。远端工作区保留对等方的 `number`、`label` 和 `focused`，而 `workspace_id` 与 `active_tab_id` 会加上 `<alias>/` 前缀。`machine_id`（路由别名）、`machine_label`、`machine_profile_id` 和 `reachability` 标识其所属机器；不可达或降级的对等方会保留最后已知的工作区，`agent_status` 显示为 `"unknown"`，真实值保存在 `last_known_status` 中。设置 `local_only: true` 可排除远端工作区。带 `<alias>/…` 工作区或标签页 ID 的 `workspace.get`、`tab.get` 和 `tab.list` 会转发到该对等方，回复中的 ID 也以同样方式限定。前缀不是已配置别名的 ID 会在本地解析，并返回 `workspace_not_found` 或 `tab_not_found`。
+
 `gram.*` 是所有者与智能体之间的消息通道。`gram.grab` 认领共享队列中的一项,并在存储层先到先得且原子,因此无论身份如何,两个智能体都无法认领同一项。发送者与认领者的身份是从 `caller_pane_id` 解析出的智能体名称(没有名称则为窗格 id),它在重启或实时交接后仍然保持,但带有名称语义:重命名、清除或复用名称会改变 `gram.list` 中显示为“我的”的项。省略 `caller_pane_id` 时 `gram.list` 返回所有者视图,指定时返回该窗格的智能体视图。`gram.list` 支持分页:可选的 `limit`(最新 N 条,上限钳制为 500)与 `before_id`(游标,只返回严格早于该 id 的消息;该 id 必须存在于同一过滤后的列表中,否则返回 `invalid_params`)。响应新增 `has_more`,以及在整个过滤后列表(而非当前页)上统计的 `unread_count`。条件请求只作用于首页:存在 `before_id` 时忽略 `if_unchanged_digest`,而摘要始终基于完整的过滤后列表计算。归属信息仅供参考,并非经过认证。
+
+联邦机器上的智能体通过 Gram 中继发送的 Gram,其 `from` 为 `<alias>/<name>`。若该机器有显示标签,`gram.list`(所有者视图与智能体视图)和 `gram.send` 响应中的消息对象还会带有 `machine_label`,与 `agent.list` 中该机器的智能体所带的标签相同,因此客户端可以显示为 `<machine_label>/<name>`。标签在读取消息时解析,因此会跟随重命名,也覆盖较早的 Gram。本地 Gram 以及来自无标签 alias 的 Gram 不带该字段。此类 Gram 的所有者推送会像远程智能体提醒一样注明机器:“llm-opt on Jerry's Mac Studio”。
 
 一条消息可以携带一个文件。由于单个请求有大小上限(应用的 SSH 路径约 65 KiB,本地套接字为 1 MiB),文件通过 `gram.upload_chunk`(`{upload_id, offset, data_base64}`;`offset` 为该分块的起始字节位置,`offset: 0` 表示重新开始上传)分块上传,再把该 `upload_id` 传入 `gram.send`/`gram.post` 的 `file` 完成附加。`gram.get_file` 在一次响应中以 base64 内联返回全部字节(响应路径没有大小上限)。`gram.delete` 会彻底删除消息及其附件字节。所有者(无 `caller_pane_id`)可删除任意消息;智能体在提供 caller pane 时,只能删除或下载自己可见的消息(与 `gram.list` 相同的范围)。该范围检查是扁平本地信任域内的协作式过滤,并非经过认证的边界(本地进程本就能直接读取存储)。对短期机密(临时 API 密钥)而言,其价值在于删除会真正清除字节,删除后秘密不再留存于持久化存储。
 
@@ -121,7 +125,7 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 
-`session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅。为避免引导期间漏掉事件,应先在另一个连接上打开 `events.subscribe` 并等待确认,在调用 `session.snapshot` 时缓冲该事件流,然后安装快照、按顺序应用缓冲的事件并继续接收事件。重新连接后或本地缓存可能已过期时,再次调用 `session.snapshot`。工作区记录也包含关联 worktree 的来源信息。完整的仓库 worktree 发现仍使用 `worktree.list`。
+`session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅。初始化或恢复缓存时,应先建立订阅,再按下文事件订阅部分的说明读取服务器当前状态并核对、更新缓存。事件表示缓存可能过期,不能无条件重放到快照上。重新连接后或本地缓存可能已过期时,再次调用 `session.snapshot`。工作区记录也包含关联 worktree 的来源信息。完整的仓库 worktree 发现仍使用 `worktree.list`。
 
 CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSON,让客户端和智能体可以简单地完成引导。
 
@@ -157,20 +161,9 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 ### 窗格图形
 
-窗格图形允许插件在窗格上放置图像数据。该功能默认可用；当服务器设置 `[terminal].kitty_graphics = false` 时，所有窗格图形方法都返回 `feature_disabled`。更改此设置需要重启服务器。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。
+应用和插件应通过窗格的终端输出发送标准 Kitty 图形协议。Herdr 在兼容的外层终端中管理图像的位置、裁剪和可见性。
 
-```json
-{"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
-{"id":"graphics_set","method":"pane.graphics.set","params":{"pane_id":"w1:p1","format":"png","image_width":800,"image_height":600,"data_base64":"...","placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}}
-{"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
-```
-
-要重复发送帧,用 `pane.graphics.stream` 打开专用 socket。Herdr 回复 `ok` 后,每一帧发送一个 JSON 头,再发送恰好 `data_length` 字节的原始数据。socket 关闭前,该流拥有对应窗格的图形层;并发 set、clear 或 stream 请求返回 `stream_conflict`。
-
-```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
-{"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
-```
+外部 socket 窗格图像叠加 API 已移除:`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear` 和 `pane.graphics.stream` 不再可用,也没有替代的 socket 图像 API。与旧服务器的内部传输协议兼容性不会恢复这些公开方法。
 
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
@@ -503,6 +496,8 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
+对于已进入 JSON 解码的请求行,错误响应也会回显请求的 `id`,包括方法或参数无效的情况。如果 JSON 无效或顶层没有明确的字符串 `id`,错误响应会使用空 `id`。无效 UTF-8 等传输错误可能直接关闭连接而不返回响应。
+
 事件订阅在初始响应之后保持连接打开。
 
 ## Socket 路径
@@ -558,6 +553,22 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
     "source": "herdr:codex",
     "agent": "codex",
     "agent_session_id": "..."
+  }
+}
+```
+
+两个方法都接受可选的 `resume_argv` 数组,内容是 Herdr 服务器重启后恢复上报者当前会话的命令。第一个元素必须是普通命令名而不是路径。该数组最多允许 64 个元素,总大小不超过 8 KiB,并且任何元素都不能包含撇号或控制字符;无效值会以 `invalid_resume_argv` 失败,该次上报不会生效。自定义智能体必须先通过 `pane.report_agent` 持有窗格才能附加命令,否则请求会以 `resume_not_accepted` 失败。Herdr 只在同一 `source` 和 `agent` 持有窗格时保留该命令,并且它优先于 Herdr 为该智能体内置的恢复命令。旧版 Herdr 会忽略这个字段。
+
+```json
+{
+  "id": "req_3",
+  "method": "pane.report_agent_session",
+  "params": {
+    "pane_id": "w1:p1",
+    "source": "custom:my-agent",
+    "agent": "my-agent",
+    "agent_session_id": "...",
+    "resume_argv": ["my-agent", "--resume", "..."]
   }
 }
 ```
@@ -643,16 +654,48 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 }
 ```
 
-第一个响应确认订阅。之后的行是推送的事件。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
+第一个响应确认订阅。之后的行是推送的事件。所有条目都必须有效:如果引用的任何窗格不存在,Herdr 会拒绝整个请求,返回错误并关闭连接。请刷新窗格列表后重试,不要假定其他条目已经订阅。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
+
+生命周期和智能体状态事件按有界批次发送,每个订阅内保持事件顺序,因此突发事件也会完整送达。事件历史不是持久日志。如果未使用 `events_v2` 的订阅者落后到保留范围之外,包括订阅初始化期间,服务器会发送包含原请求 `id` 和 `error.code: "events_lost"` 的错误响应,然后关闭该订阅连接,而不是静默跳过缺失事件后继续发送。其他客户端的连接不受影响。各类事件共享历史缓冲,因此即使被淘汰的事件可能不匹配此订阅的过滤条件,仍会报告溢出。请求了 `events_v2` 的订阅者则会收到 `lagged` 控制行,流保持打开(见下文)。
+
+收到 `events_lost` 后,将缓存状态视为过期。建立新订阅并等待 `subscription_started`,然后持续读取,同时在另一条连接上请求 `session.snapshot`。通过服务器返回的当前状态重新核对缓存：用快照整体替换缓存,将收到的事件作为缓存失效通知并触发再次读取。串行执行刷新；如果读取期间又收到事件,完成后再次刷新。
+
+快照和事件没有共同的序列边界。顺序仅在每个订阅条目内保证,不保证跨条目或相对于快照的顺序,因此不要把缓冲的事件载荷无条件重放到快照上。恢复得到的是当前状态,无法补回丢失的事件历史。再次收到 `events_lost` 时,需要重新订阅并核对状态。读取过慢的客户端可能需要提高读取速度或减少事件负载。
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
 窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。
-布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 引导的客户端应替换具有相同 `workspace_id` 和 `tab_id` 的缓存布局。
+布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 维护缓存的客户端应将该事件作为重新读取受影响布局的通知；延迟到达的载荷可能早于最新快照。
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。
 
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
+
+### 序列号、全部窗格状态和 events v2
+
+每个事件行都带有 `seq`,即服务器的事件序列号。它在一个流中不会减小,服务器重启后重新开始。来自事件中心的事件行带有该事件的序列号;Herdr 根据窗格状态推导出的行(初始状态、快照状态变化、`pane.output_matched`、`pane.scroll_changed`)带有该流已读到的序列号,因此多行可能共享同一个序列号。每次轮询都会按服务器顺序投递请求中所有条目匹配的全部事件。
+
+`pane.agent_status_changed` 和 `pane.turn_completed` 可以省略 `pane_id`,此时会监视所有窗格,包括订阅开始后创建的窗格。`agent_status` 过滤仍然有效。全部窗格的状态订阅也会在约 1 秒内报告没有独立服务器事件的状态变化,例如窗格被查看后 `done` 变为 `idle`;之后出现的窗格会报告其后续变化,但不会报告其初始状态。
+
+在 `ping` 中声明 `capabilities.events_v2` 的服务器还接受与 `subscriptions` 并列的 `"events_v2": true`。旧服务器会忽略该字段。它只对该请求改变以下三点:
+
+- 引用不存在窗格的条目会被跳过,而不会让整个请求失败。确认响应会以 `"rejected": [{ "index": 1, "error": { "code": "pane_not_found", "message": "…" } }]` 列出这些条目。
+- 如果流落后太多,服务器丢弃了尚未投递的事件,Herdr 会写入 `{ "control": "lagged", "seq": 904, "first_missed_seq": 1, "last_missed_seq": 904 }`,并保持流打开,而不是以 `events_lost` 让其失败。请通过 `session.snapshot` 或 `agent.list` 重新同步。
+- 连续 15 秒没有可投递内容的流会写入 `{ "control": "heartbeat", "seq": 904 }`。
+
+不使用 `events_v2` 时,流中不会出现 `control` 行,不存在的窗格仍会让请求失败,落后到保留范围之外的流会如上文所述以 `events_lost` 结束。
+
+### 协调端上的远程事件
+
+联邦协调端会把每个出站对等方的事件中继到自己的流中,因此本地订阅者接收远程变化的方式与接收本地变化相同,通常在 1 秒内到达。中继事件中的每个 ID 都会加上对等方的 `<alias>/` 前缀:包括窗格、终端、工作区和标签页 ID,也包括窗格、工作区、标签页、worktree 和布局快照中的 ID。工作区和标签页快照带有协调端的 `machine_id`、`machine_label` 和 `machine_profile_id`。中继事件使用协调端的 `seq` 编号,而不是对等方的。
+
+全部窗格的 `pane.agent_status_changed` 和 `pane.turn_completed` 条目会自动包含远程窗格。条目也可以指定单个远程窗格,例如 `"pane_id": "build/w1:p2"`。其初始状态来自协调端缓存的该窗格的 `agent.list` 条目。未知的别名或窗格会以 `pane_not_found` 失败,使用 `events_v2` 时则列在 `rejected` 中。
+
+中继要求对等方声明 `capabilities.events_v2`;如果固定了对等方的机器 ID,还要求身份已通过验证。其他对等方只保留每 5 秒一次的 `agent.list` 轮询:它们的变化会出现在 `agent.list` 中,但不会产生事件。重新连接后,或收到对等方的 `lagged` 行后,协调端会把新的 `agent.list` 与已经中继的内容比较,并对每个错过的状态变化各输出一次。对等方重启后,会输出该对等方所有窗格的当前状态。
+
+设置 `"local_only": true` 可以排除服务器从自己的对等方中继来的事件。协调端会在自己的中继流上设置它,因此本身也是协调端的对等方永远不会再次导出第三台机器的事件。旧服务器会忽略该字段;它们没有需要排除的中继事件。
+
+通过 `notifications.register_device` 注册的设备也会收到远程代理的推送通知,并按各设备的“需要你”“已完成”“已退出”偏好发送。标题会写明机器,例如 `llm-opt on Jerry's Mac Studio needs attention`;通知携带带 `<alias>/` 前缀的窗格 ID,因此在 `muted_panes` 中写入该 ID 即可静音远程窗格。每次状态变化只推送一次:重复中继的事件、重新同步,或重复已知状态的轮询都不会再发送。没有 `events_v2` 的对等方通过每 5 秒一次的轮询通知。可达对等方不再列出的代理窗格视为已退出,因此对等方离线期间丢失的退出事件仍会通知一次。Live Activity 会把可达对等方上的代理与本地代理一起计数。
 
 ## 读取窗格
 

@@ -439,7 +439,7 @@
           "key": "terminal.kitty_graphics",
           "type": "boolean",
           "default": "true",
-          "description": "Render pane images in Kitty graphics-compatible outer terminals. Set false to disable graphics rendering and the pane graphics API. Restart the server or reattach the client after changing it. In remote sessions, server configuration controls parsing and API availability while local client configuration controls outer-terminal output."
+          "description": "Render pane images in Kitty graphics-compatible outer terminals. Applications use the standard Kitty graphics protocol through pane terminal output; the external socket pane-overlay API is no longer available. Set false to disable graphics rendering. Restart the server or reattach the client after changing it. In remote sessions, server configuration controls Kitty graphics parsing while local client configuration controls outer-terminal output."
         }
       ]
     },
@@ -477,9 +477,9 @@
       "keys": [
         {
           "key": "keys.prefix",
-          "type": "string",
+          "type": "keybinding",
           "default": "\"ctrl+b\"",
-          "description": "Prefix key to enter prefix mode (e.g. \"ctrl+b\", \"f12\", \"esc\")."
+          "description": "Prefix key(s) to enter prefix mode (e.g. \"ctrl+b\", \"f12\", \"esc\", or an array to accept several)."
         },
         {
           "key": "keys.help",
@@ -696,6 +696,12 @@
           "type": "keybinding",
           "default": "\"prefix+e\"",
           "description": "Open the focused pane scrollback in $EDITOR."
+        },
+        {
+          "key": "keys.clear_pane",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Clear the focused pane screen and scrollback, keeping the current cursor line and its visible soft-wrapped rows. Sends no input to the running program and does nothing on the alternate screen (for example, Vim). Unset by default; for example, clear_pane = \"prefix+ctrl+k\"."
         },
         {
           "key": "keys.copy_mode",
@@ -1423,6 +1429,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Resume supported AI-agent panes into their native conversation sessions when restoring a Herdr session."
+        },
+        {
+          "key": "session.startup_per_agent_delay_ms",
+          "type": "integer",
+          "default": "100",
+          "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
         }
       ]
     },
@@ -1483,6 +1495,12 @@
           "type": "table keyed by saved profile ID",
           "default": "{}",
           "description": "Opt saved SSH profiles into federation trust policy by immutable profile ID. Each entry requires expected_machine_id. Labels, targets, sessions, and enabled state remain owned by the saved-machine catalog; OpenSSH remains the credential authority."
+        },
+        {
+          "key": "federation.named_sessions",
+          "type": "array of session names",
+          "default": "[]",
+          "description": "Named sessions (`herdr --session <name>`) that federate like the default session. Every other named session ignores `coordinator`, outbound peers, and `listen`, so only the default session polls saved machines and binds `listen_addr`. Named sessions stay reachable as a remote coordinator's SSH target either way."
         }
       ]
     },
