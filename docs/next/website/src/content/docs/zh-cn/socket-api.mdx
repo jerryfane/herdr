@@ -500,6 +500,22 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 
 事件订阅在初始响应之后保持连接打开。
 
+### 用一个进程转发多个请求
+
+Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远程客户端,可以使用 `herdr api-bridge --multi`,
+避免为每个请求启动一个进程(仅限 Unix;支持该模式的服务器会在 `ping` 中返回
+`capabilities.api_bridge_multi: true`):
+
+- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个;16 个都在处理时,
+  桥接进程会暂停读取 stdin,直到其中一个完成。
+- 每个响应行都会完整、原样地写入 stdout。响应可能乱序到达,请按 `id` 匹配。
+- `events.subscribe`、`pane.stream`、`pane.input.stream`、`gram.upload.stream` 和
+  `server.ssh_agent.register` 会保持连接打开,因此桥接进程会对它们返回 `unsupported_method` 错误。
+  请为它们打开专用通道。
+- 不是带字符串 `method` 的 JSON 对象的行,或超过 1 MiB 的行,会得到 `invalid_request` 错误。
+  如果无法连接 socket,该请求会得到 `transport_error`。两种情况下桥接进程都会继续运行。
+- stdin 关闭后,桥接进程会在处理中的请求完成后退出。如果 stdout 的读取方先断开,处理中的请求会被取消。
+
 ## Socket 路径
 
 默认 socket 位于你的 Herdr 配置目录下。
