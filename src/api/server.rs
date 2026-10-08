@@ -205,6 +205,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         events_v2: true,
         ssh_agent_registration: false,
         agent_forget: true,
+        api_bridge_multi: cfg!(unix),
     })
 }
 
@@ -3423,6 +3424,7 @@ mod tests {
                 events_v2: false,
                 ssh_agent_registration: false,
                 agent_forget: false,
+                api_bridge_multi: false,
             }),
             None,
             None,
@@ -4205,6 +4207,26 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["capabilities"]["events_v2"], true);
+    }
+
+    #[test]
+    fn ping_advertises_api_bridge_multi_on_unix() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["capabilities"]["api_bridge_multi"],
+            cfg!(unix)
+        );
     }
 
     #[test]

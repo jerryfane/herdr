@@ -563,6 +563,9 @@ fn main() -> io::Result<()> {
     // this with herdr's own SSH federation, but the app is an out-of-repo
     // consumer that had not migrated, so every upgraded host stopped answering
     // it. Keep it until the app ships on `remote-api-bridge`; see #206.
+    // `api-bridge --multi` keeps one bridge process per app session and
+    // forwards newline-delimited requests (#294; advertised as the
+    // `api_bridge_multi` ping capability).
     if args.get(1).map(String::as_str) == Some("api-bridge") {
         return remote::run_api_client_bridge(&args[2..]);
     }

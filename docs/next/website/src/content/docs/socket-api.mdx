@@ -654,6 +654,28 @@ Transport errors, such as invalid UTF-8, can close the connection without a resp
 
 Event subscriptions keep the connection open after the initial response.
 
+### Bridging many requests over one process
+
+The socket answers one request per connection. A remote client that reaches it
+through an SSH exec channel can avoid starting a process per request with
+`herdr api-bridge --multi` (Unix only; servers that support it report
+`capabilities.api_bridge_multi: true` from `ping`):
+
+- Write one request per line to the bridge's stdin. Each runs on its own socket
+  connection, up to 16 at a time; with all 16 busy, the bridge stops reading
+  stdin until one finishes.
+- Every response line is written to stdout whole and unchanged. Responses can
+  arrive out of order, so match them by `id`.
+- `events.subscribe`, `pane.stream`, `pane.input.stream`, `gram.upload.stream`
+  and `server.ssh_agent.register` keep their connection open, so the bridge
+  answers them with an `unsupported_method` error. Open a dedicated channel for
+  them.
+- A line that is not a JSON object with a string `method`, or that is longer
+  than 1 MiB, gets an `invalid_request` error. If the socket cannot be reached,
+  that request gets a `transport_error`. The bridge keeps running either way.
+- When stdin closes, the bridge exits after in-flight requests finish. If
+  stdout's reader goes away first, in-flight requests are cancelled.
+
 ## Socket paths
 
 The default socket lives under your Herdr config directory.

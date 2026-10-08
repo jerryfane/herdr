@@ -63,4 +63,8 @@ pub struct ServerCapabilities {
     /// Supports `agent.forget` (remove an archived agent's record).
     #[serde(default)]
     pub agent_forget: bool,
+    /// `herdr api-bridge --multi` forwards newline-delimited requests over one
+    /// long-lived bridge process instead of one process per request.
+    #[serde(default)]
+    pub api_bridge_multi: bool,
 }
