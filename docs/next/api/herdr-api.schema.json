@@ -17171,6 +17171,11 @@
               },
               "type": "array"
             },
+            "api_bridge_multi": {
+              "default": false,
+              "description": "`herdr api-bridge --multi` forwards newline-delimited requests over one\nlong-lived bridge process instead of one process per request.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
