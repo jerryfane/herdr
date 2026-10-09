@@ -2306,9 +2306,20 @@ fn live_activity_content_state(agents: &[crate::api::schema::AgentInfo]) -> serd
     let lead = agents.iter().min_by_key(|agent| rank(agent.agent_status));
     let (headline, status) = match lead {
         Some(agent) => (
+            // A remote agent's name is stored "<machine-id>/<name>" for addressing; the
+            // headline is read on a lock screen, so it shows the agent's own name.
             agent
                 .name
-                .clone()
+                .as_deref()
+                .map(|name| {
+                    agent
+                        .machine_id
+                        .as_deref()
+                        .and_then(|id| name.strip_prefix(id))
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .unwrap_or(name)
+                        .to_string()
+                })
                 .or_else(|| agent.terminal_title_stripped.clone())
                 .or_else(|| agent.agent.clone())
                 .unwrap_or_else(|| "agent".to_string()),
