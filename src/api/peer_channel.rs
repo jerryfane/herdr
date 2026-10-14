@@ -369,9 +369,10 @@ struct BridgeError {
 
 /// The message of an `api-bridge` `transport_error` envelope. The bridge
 /// emits one when its own connection to the peer's API socket fails, before
-/// or after the request reached it; the per-connection path saw the same
-/// failure as the channel ending, so it stays delivery-unknown. The API server
-/// never uses this code.
+/// or after the request reached it, so whether the peer acted is unknown: it is
+/// reported as delivery-unknown. (The per-connection path passed this envelope
+/// through to the caller verbatim; the classification is deliberate.) The API
+/// server never uses this code.
 fn bridge_transport_error(line: &[u8]) -> Option<String> {
     const CODE: &[u8] = b"\"transport_error\"";
     if !line.windows(CODE.len()).any(|window| window == CODE) {
