@@ -13,27 +13,11 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{mpsc, Mutex, MutexGuard, PoisonError};
 
-/// Requests one `--multi` bridge forwards at once. Each holds a worker thread
-/// and a local socket connection; with every worker busy the bridge stops
-/// reading stdin, so a burst back-pressures the SSH channel instead of growing
-/// threads or buffers.
-const MULTI_MAX_IN_FLIGHT: usize = 16;
-
-/// Longest request line `--multi` accepts, excluding its newline. It matches
-/// the server's own initial-request cap, which would refuse anything longer.
-/// Longer lines are drained and answered with `invalid_request`.
-const MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
-
-/// Methods that keep their connection open after the first response line.
-/// `--multi` gives each request one connection and answers it from that
-/// connection alone, so these keep their own SSH channel.
-const MULTI_UNSUPPORTED_METHODS: &[&str] = &[
-    "events.subscribe",
-    "pane.stream",
-    "pane.input.stream",
-    "gram.upload.stream",
-    "server.ssh_agent.register",
-];
+use crate::remote::{
+    API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT,
+    API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES as MULTI_MAX_REQUEST_LINE_BYTES,
+    API_BRIDGE_MULTI_STREAMING_METHODS as MULTI_UNSUPPORTED_METHODS,
+};
 
 pub(crate) fn run_api_client_bridge(args: &[String]) -> io::Result<()> {
     let encoded_request = match args {

@@ -41,9 +41,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info};
 
-use crate::api::client::ConnectionTarget;
+use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::federation_relay::{PeerRelay, RelayTiming};
 use crate::api::federation_store::FederationStore;
+use crate::api::peer_channel::PeerChannel;
 use crate::api::schema::{CoordinatorMachineStatus, MachineEndpointStatus, SavedMachineState};
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::api::EventHub;
@@ -105,6 +106,9 @@ pub(crate) struct PeerRoute {
     /// stamp routed replies (`workspace.get`, `tab.*`) the same way polled
     /// entries are. `None` for routes without a poll thread.
     presentation: Option<Arc<RwLock<PeerPresentation>>>,
+    /// Persistent `api-bridge --multi` channel for an SSH-bridged peer's
+    /// one-shot requests; `None` for direct targets.
+    peer_channel: Option<Arc<PeerChannel>>,
 }
 
 #[derive(Debug)]
@@ -136,6 +140,7 @@ impl PeerRoute {
                 identity_validation_required: requires_identity_validation,
             }),
             presentation: None,
+            peer_channel: None,
         }
     }
 
@@ -144,6 +149,30 @@ impl PeerRoute {
     pub(crate) fn with_presentation(mut self, presentation: Arc<RwLock<PeerPresentation>>) -> Self {
         self.presentation = Some(presentation);
         self
+    }
+
+    /// Carry one-shot requests over `channel` while the peer advertises
+    /// `api_bridge_multi`; the route's retirement closes it.
+    pub(crate) fn with_peer_channel(mut self, channel: Arc<PeerChannel>) -> Self {
+        self.peer_channel = Some(channel);
+        self
+    }
+
+    pub(crate) fn peer_channel(&self) -> Option<&Arc<PeerChannel>> {
+        self.peer_channel.as_ref()
+    }
+
+    /// A client for this route: one-shot requests use the peer channel when
+    /// it is usable, everything else connects to the route's target.
+    pub(crate) fn client(&self) -> ApiClient {
+        ApiClient::for_target(self.target.clone()).with_peer_channel(self.peer_channel.clone())
+    }
+
+    /// Record whether the peer's latest poll advertised `api_bridge_multi`.
+    pub(crate) fn observe_api_bridge_multi(&self, advertised: bool) {
+        if let Some(channel) = &self.peer_channel {
+            channel.set_advertised(advertised);
+        }
     }
 
     /// The peer's current presentation, or the bare alias as its label when the
@@ -261,12 +290,17 @@ impl PeerRoute {
     }
 
     pub(crate) fn retire(&self) {
-        let _lifecycle = self
-            .state
-            .lifecycle
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.state.retired.store(true, Ordering::Release);
+        {
+            let _lifecycle = self
+                .state
+                .lifecycle
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.state.retired.store(true, Ordering::Release);
+        }
+        if let Some(channel) = &self.peer_channel {
+            channel.close();
+        }
     }
 }
 
@@ -941,7 +975,7 @@ impl FederationPeerManager {
                 return None;
             }
         };
-        let (route, ssh_bridge) = match parsed {
+        let (route, ssh_bridge, peer_channel) = match parsed {
             crate::api::client::FederationEndpoint::Ssh { destination } => {
                 let Some(profile_id) = peer.profile_id.as_deref() else {
                     tracing::warn!(alias = %peer.alias, "SSH federation peer requires profile_id");
@@ -970,17 +1004,24 @@ impl FederationPeerManager {
                         return None;
                     }
                 };
-                (route, Some(bridge))
+                (
+                    route,
+                    Some(bridge),
+                    Some(saved_peer_channel(profile_id, &target, session)),
+                )
             }
-            crate::api::client::FederationEndpoint::Target(target) => (target, None),
+            crate::api::client::FederationEndpoint::Target(target) => (target, None, None),
         };
         let presentation = Arc::new(RwLock::new(PeerPresentation::from_peer(&peer)));
-        let route = PeerRoute::new(
+        let mut route = PeerRoute::new(
             route,
             Arc::clone(&self.generation_clock),
             peer.expected_node_id.is_some(),
         )
         .with_presentation(Arc::clone(&presentation));
+        if let Some(channel) = peer_channel {
+            route = route.with_peer_channel(channel);
+        }
         // The gateway itself is supervised by `sync_gram_relays`, independently
         // of this bridge, so a failed attempt is retried without a respawn.
         #[cfg(unix)]
@@ -1323,6 +1364,17 @@ fn spec_differs(handle: &PeerHandle, peer: &FederationPeer) -> bool {
         || handle.expected_node_id != peer.expected_node_id
         || handle.profile_id != peer.profile_id
         || handle.remote_session != peer.remote_session
+}
+
+/// The persistent `api-bridge --multi` channel for a saved peer, launched
+/// through the same managed SSH transport as its bridge.
+fn saved_peer_channel(profile_id: &str, target: &str, session: &str) -> Arc<PeerChannel> {
+    let profile_id = profile_id.to_owned();
+    let target = target.to_owned();
+    let session = session.to_owned();
+    PeerChannel::new(Arc::new(move || {
+        crate::remote::saved_peer_api_channel_command(&profile_id, &target, &session)
+    }))
 }
 
 fn start_saved_peer_bridge(

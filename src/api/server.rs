@@ -53,6 +53,8 @@ mod guest_owner;
 pub(crate) use guest_gate::serve_guest_stream;
 mod pane_input_stream;
 mod pane_output_stream;
+#[cfg(all(test, unix))]
+mod peer_channel_tests;
 mod stream_read;
 #[cfg(test)]
 mod subscription_socket_tests;
@@ -599,7 +601,7 @@ pub(crate) fn run_federation_peer_poll(
     running: Arc<AtomicBool>,
     peer_stop: Arc<AtomicBool>,
 ) {
-    let client = ApiClient::for_target(route.target().clone());
+    let client = route.client();
     let mut tracker = ReachabilityTracker::default();
     let mut workspace_refresh = WorkspaceRefresh::default();
 
@@ -801,6 +803,13 @@ fn poll_once_into_cache(
         Ok(snapshot) => {
             if let Some(route) = route {
                 route.observe_remote_boot(snapshot.remote_boot_id.as_deref());
+                route.observe_api_bridge_multi(
+                    snapshot
+                        .observation
+                        .remote_capabilities
+                        .as_ref()
+                        .is_some_and(|capabilities| capabilities.api_bridge_multi),
+                );
             }
             let mut rejected = 0usize;
             let presentation = presentation
@@ -2001,24 +2010,46 @@ fn maybe_route_to_peer(
 /// - a response-read failure AFTER the write (EOF, timeout, oversized, empty) →
 ///   `delivery_unknown`, because the peer may or may not have acted — and the home
 ///   NEVER auto-retries, so a write that did land is not duplicated.
+///
+/// An SSH-bridged peer whose persistent channel is usable carries the request
+/// over it (see [`crate::api::peer_channel`]) with the same fence, bounds and
+/// classification: a request no byte of which reached the channel is
+/// `peer_unreachable`, anything after that is `delivery_unknown`.
 fn proxy_federated_response(
     route: &PeerRoute,
     stamp: &PeerRouteStamp,
     request: &Request,
     running: &Arc<AtomicBool>,
 ) -> String {
-    let client = ApiClient::for_target(route.target().clone());
-    let Some(opened) = route.with_current(stamp, || client.open_proxy_request(request)) else {
-        return stale_peer_generation_response(request.id.clone(), stamp);
+    let lease = route
+        .peer_channel()
+        .and_then(|channel| channel.lease(&request.method, Some(running)));
+    let result = if let Some(lease) = lease {
+        let Some(sent) = route.with_current(stamp, || lease.send(request)) else {
+            return stale_peer_generation_response(request.id.clone(), stamp);
+        };
+        sent.and_then(|pending| {
+            pending.wait(
+                &request.id,
+                FEDERATION_MAX_RESPONSE_BYTES,
+                FEDERATION_PROXY_REQUEST_TIMEOUT,
+                Some(running),
+            )
+        })
+    } else {
+        let client = ApiClient::for_target(route.target().clone());
+        let Some(opened) = route.with_current(stamp, || client.open_proxy_request(request)) else {
+            return stale_peer_generation_response(request.id.clone(), stamp);
+        };
+        opened.and_then(|stream| {
+            ApiClient::read_proxy_response_bounded(
+                stream,
+                FEDERATION_MAX_RESPONSE_BYTES,
+                FEDERATION_PROXY_REQUEST_TIMEOUT,
+                Some(running),
+            )
+        })
     };
-    let result = opened.and_then(|stream| {
-        ApiClient::read_proxy_response_bounded(
-            stream,
-            FEDERATION_MAX_RESPONSE_BYTES,
-            FEDERATION_PROXY_REQUEST_TIMEOUT,
-            Some(running),
-        )
-    });
     match result {
         Ok(line) if route.is_current(stamp) => line,
         Ok(_) => stale_peer_generation_response(request.id.clone(), stamp),

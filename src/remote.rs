@@ -16,6 +16,30 @@ pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
 pub(crate) use saved::*;
 
+/// Requests one `api-bridge --multi` bridge forwards at once. Each holds a
+/// worker thread and a local socket connection; with every worker busy the
+/// bridge stops reading stdin, so a burst back-pressures the SSH channel
+/// instead of growing threads or buffers. A coordinator's persistent peer
+/// channel keeps no more than this many requests outstanding on one channel.
+pub(crate) const API_BRIDGE_MULTI_MAX_IN_FLIGHT: usize = 16;
+
+/// Longest request line `api-bridge --multi` accepts, excluding its newline.
+/// It matches the server's own initial-request cap, which would refuse
+/// anything longer. Longer lines are drained and answered with
+/// `invalid_request`.
+pub(crate) const API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+/// Methods that keep their connection open after the first response line.
+/// `api-bridge --multi` gives each request one connection and answers it from
+/// that connection alone, so these keep their own SSH channel.
+pub(crate) const API_BRIDGE_MULTI_STREAMING_METHODS: &[&str] = &[
+    "events.subscribe",
+    "pane.stream",
+    "pane.input.stream",
+    "gram.upload.stream",
+    "server.ssh_agent.register",
+];
+
 #[cfg(windows)]
 pub(crate) fn run_api_client_bridge(_args: &[String]) -> std::io::Result<()> {
     Err(std::io::Error::new(

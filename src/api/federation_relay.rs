@@ -135,7 +135,7 @@ impl PeerRelay {
     /// Relay this peer's events until the daemon stops or the peer is retired.
     /// Holds at most one upstream stream at a time.
     pub(crate) fn run(self) {
-        let client = ApiClient::for_target(self.route.target().clone());
+        let client = self.route.client();
         let mut state = RelayState {
             next_sync: RelayResync::Seed,
             boot: None,

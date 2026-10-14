@@ -158,6 +158,56 @@ impl SavedSshApiBridge {
     }
 }
 
+/// SSH command for a saved peer's persistent `api-bridge --multi` channel: the
+/// same managed transport (and so the same ControlMaster) and cached remote
+/// executable as [`SavedSshApiBridge`], for the same session.
+pub(crate) fn saved_peer_api_channel_command(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+) -> io::Result<std::process::Command> {
+    let metadata = crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?
+        .load()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "saved machine API metadata is not cached",
+            )
+        })?;
+    let remote_command = super::attach::cached_remote_api_multi_command(&metadata, session)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "saved machine has no api-bridge --multi",
+            )
+        })?;
+    Ok(super::attach::ssh_exec_command(
+        target,
+        &remote_command,
+        saved_federation_ssh_options(),
+        true,
+    ))
+}
+
+/// A per-connection bridge running `remote_command` through `ssh` from `PATH`,
+/// as a saved peer's bridge does, for tests with a fake `ssh`.
+#[cfg(test)]
+pub(crate) fn start_test_ssh_bridge(
+    target: &str,
+    remote_command: &str,
+    local_socket: PathBuf,
+) -> io::Result<SavedSshBridge> {
+    Ok(SavedSshBridge {
+        _bridge: SshStdioBridge::start_command(
+            target.to_owned(),
+            remote_command.to_owned(),
+            local_socket,
+            None,
+            true,
+        )?,
+    })
+}
+
 /// Dedicated reverse stream-local forward; NEVER point this at the unrestricted
 /// coordinator API socket. The caller provides its restricted per-peer gateway.
 #[cfg(unix)]

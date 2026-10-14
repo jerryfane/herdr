@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- A coordinator sends one-shot requests to a saved SSH machine over one persistent `api-bridge --multi` channel per machine instead of starting a new SSH channel and remote bridge for each, once the machine advertises `api_bridge_multi`. Relayed requests to a distant machine no longer pay several round trips before they are sent. Streams keep their own channel, and machines without `api-bridge --multi` keep the per-request bridge.
+
 ## [0.9.3] - 2026-09-29
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2

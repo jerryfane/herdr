@@ -350,7 +350,7 @@ fn handle_request(
         return error("reverse protocol mismatch or missing caller identity");
     }
     let stamp = route.stamp();
-    let remote_client = ApiClient::for_target(route.target().clone());
+    let remote_client = route.client();
     let remote_list = match agent_list(&remote_client, true, stop) {
         Ok(list) => list,
         Err(cause) => return error(format!("source machine unreachable: {cause}")),

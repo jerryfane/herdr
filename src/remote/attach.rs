@@ -2643,6 +2643,27 @@ pub(super) fn cached_remote_api_command(
     format!("/bin/sh -c {}", shell_quote(&script))
 }
 
+/// The persistent `api-bridge --multi` for a saved machine's cached API
+/// executable, selecting `session` exactly as [`cached_remote_api_command`]
+/// does for `remote-api-bridge`. `None` for Windows, which has no
+/// `api-bridge --multi`.
+pub(super) fn cached_remote_api_multi_command(
+    metadata: &crate::client::endpoint::SshMachineMetadata,
+    session: &str,
+) -> Option<String> {
+    if metadata.os == "windows" {
+        return None;
+    }
+    let path = shell_quote(&metadata.executable);
+    let session = shell_quote(session);
+    Some(format!(
+        "/bin/sh -c {}",
+        shell_quote(&posix_remote_output_command(&format!(
+            "exec {path} --session {session} api-bridge --multi"
+        )))
+    ))
+}
+
 pub(super) fn remote_api_bridge_command(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -3050,6 +3071,23 @@ pub(crate) fn bridge_upload_cancellation_for_test(
     }
 }
 
+/// `ssh -T <target> <remote_command>` through the managed transport options;
+/// every bridge channel to a remote API starts this way.
+pub(super) fn ssh_exec_command(
+    target: &str,
+    remote_command: &str,
+    ssh_options: Option<&ManagedSshOptions>,
+    noninteractive: bool,
+) -> Command {
+    let mut command = Command::new("ssh");
+    apply_managed_ssh_options(&mut command, ssh_options);
+    if noninteractive {
+        apply_noninteractive_ssh_options(&mut command);
+    }
+    command.arg("-T").arg(target).arg(remote_command);
+    command
+}
+
 fn bridge_connection(
     mut stream: crate::ipc::LocalStream,
     target: &str,
@@ -3059,15 +3097,8 @@ fn bridge_connection(
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
-    let mut command = Command::new("ssh");
-    apply_managed_ssh_options(&mut command, ssh_options);
-    if noninteractive {
-        apply_noninteractive_ssh_options(&mut command);
-    }
+    let mut command = ssh_exec_command(target, remote_command, ssh_options, noninteractive);
     command
-        .arg("-T")
-        .arg(target)
-        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if noninteractive {
@@ -3247,7 +3278,8 @@ fn capture_ssh_stderr(mut stderr: impl io::Read) -> io::Result<Vec<u8>> {
     }
 }
 
-fn discard_remote_output_preamble(reader: &mut impl io::BufRead) -> io::Result<()> {
+/// Skip a POSIX remote command's output up to its ready marker.
+pub(crate) fn discard_remote_output_preamble(reader: &mut impl io::BufRead) -> io::Result<()> {
     let marker = REMOTE_OUTPUT_READY_MARKER.as_bytes();
     let mut matched = 0;
     let mut matching = true;
@@ -5069,6 +5101,36 @@ function Get-Process {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn peer_channel_multi_bridge_selects_the_saved_session_like_remote_api_bridge() {
+        let posix = crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: "/opt/herdr bin/herdr".into(),
+        };
+        for session in ["default", "agents"] {
+            let multi = cached_remote_api_multi_command(&posix, session).unwrap();
+            assert_eq!(
+                multi,
+                format!(
+                    "/bin/sh -c {}",
+                    shell_quote(&posix_remote_output_command(&format!(
+                        "exec '/opt/herdr bin/herdr' --session {session} api-bridge --multi"
+                    )))
+                )
+            );
+            // The per-connection bridge passes the same executable and session.
+            let selected = format!("exec '\\''/opt/herdr bin/herdr'\\'' --session {session} ");
+            assert!(cached_remote_api_command(&posix, session)
+                .contains(&format!("{selected}remote-api-bridge")));
+            assert!(multi.contains(&format!("{selected}api-bridge --multi")));
+        }
+        let windows = crate::client::endpoint::SshMachineMetadata {
+            os: "windows".into(),
+            executable: "C:\\herdr.exe".into(),
+        };
+        assert_eq!(cached_remote_api_multi_command(&windows, "default"), None);
     }
 
     #[test]

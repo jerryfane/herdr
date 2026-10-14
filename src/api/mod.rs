@@ -8,6 +8,7 @@ pub mod federation_store;
 pub(crate) mod gram_gateway;
 pub(crate) mod gram_relay;
 pub(crate) mod output_registry;
+pub(crate) mod peer_channel;
 #[cfg(unix)]
 pub(crate) mod reverse;
 pub(crate) mod reverse_agents;

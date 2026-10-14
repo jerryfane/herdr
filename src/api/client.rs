@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
+use crate::api::peer_channel::PeerChannel;
 use crate::api::schema::{
     ErrorResponse, Method, PingParams, Request, ResponseResult, SuccessResponse,
 };
@@ -48,6 +49,8 @@ impl ConnectionTarget {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    /// Carries one-shot bounded requests for an SSH-bridged peer route.
+    peer_channel: Option<Arc<PeerChannel>>,
 }
 
 impl ApiClient {
@@ -56,7 +59,15 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            peer_channel: None,
+        }
+    }
+
+    pub(crate) fn with_peer_channel(mut self, peer_channel: Option<Arc<PeerChannel>>) -> Self {
+        self.peer_channel = peer_channel;
+        self
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -132,7 +143,8 @@ impl ApiClient {
 
     /// Send `request` and read the first NDJSON reply line, bounded by BOTH a
     /// byte cap (`max_bytes`) and a wall-clock `total_timeout` deadline, aborting
-    /// early if `running` clears.
+    /// early if `running` clears. A peer route's client sends it over the
+    /// route's persistent peer channel when that channel is usable.
     ///
     /// Unlike [`Self::request_value_with_timeout`] — whose `SO_RCVTIMEO` only
     /// bounds each individual read, this method bounds the whole response read.
@@ -143,6 +155,15 @@ impl ApiClient {
         total_timeout: Duration,
         running: Option<&Arc<AtomicBool>>,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if let Some(reply) = self.peer_channel.as_ref().and_then(|channel| {
+            channel.request(request, max_bytes, total_timeout, running.map(Arc::as_ref))
+        }) {
+            let line =
+                reply.map_err(|(ProxyError::Connect(error) | ProxyError::Read(error))| {
+                    ApiClientError::Io(error)
+                })?;
+            return serde_json::from_str(&line).map_err(ApiClientError::Json);
+        }
         let mut stream = self.connect_and_write(request)?;
         let deadline = Instant::now() + total_timeout;
         let line = read_bounded_response_line(&mut stream, max_bytes, deadline, running)?;
