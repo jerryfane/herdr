@@ -12838,6 +12838,17 @@
             "direction": {
               "$ref": "#/schemas/success_response/$defs/GramDirection"
             },
+            "expired_file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/GramFileInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The attachment this message had before the store's attachment budget expired\nit: show what was there; there are no bytes to fetch. Absent otherwise."
+            },
             "file": {
               "anyOf": [
                 {
