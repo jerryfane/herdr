@@ -1149,13 +1149,17 @@ fn apply_reconcile(
                 _ => false,
             }
             && message.text == item.text
+            // The same attachment, whether it is still there or expired since on either
+            // side: an expired file is the same message, just without bytes.
             && message
                 .file
                 .as_ref()
+                .or(message.expired_file.as_ref())
                 .map(|file| (&file.name, file.size, &file.sha256))
                 == item
                     .file
                     .as_ref()
+                    .or(item.expired_file.as_ref())
                     .map(|file| (&file.name, file.size, &file.sha256))
     };
     let back = missing.iter().filter(|item| {
@@ -1164,6 +1168,15 @@ fn apply_reconcile(
             .is_some_and(|message| unchanged(item, message))
     });
     for item in back.take(RECONCILE_MAX_IMPORTS) {
+        let mut item = (*item).clone();
+        // Expired on the coordinator since it was witnessed: there are no bytes to pull,
+        // so the copy comes back with the attachment's metadata only.
+        if present
+            .get(&item.id)
+            .is_some_and(|message| message.file.is_none() && message.expired_file.is_some())
+        {
+            item.expired_file = item.file.take().or(item.expired_file);
+        }
         let bytes = match &item.file {
             Some(file) => match pull_relayed_file(&item.id, file.size, pane) {
                 Some(bytes) => Some(bytes),
@@ -1171,7 +1184,7 @@ fn apply_reconcile(
             },
             None => None,
         };
-        if let Err(err) = crate::guest::mirror::add(&guest.dir, (*item).clone(), bytes.as_deref()) {
+        if let Err(err) = crate::guest::mirror::add(&guest.dir, item, bytes.as_deref()) {
             tracing::warn!(err = %err, "guest gram copy failed");
         }
     }
@@ -1252,7 +1265,14 @@ fn mirror_relayed(
         }
     };
     let item = GramItem {
-        expired_file: None,
+        expired_file: message
+            .expired_file
+            .map(|file| crate::persist::gram::GramFile {
+                name: file.name,
+                size: file.size,
+                mime: file.mime,
+                sha256: file.sha256,
+            }),
         id: message.id,
         direction,
         from,
@@ -3589,6 +3609,22 @@ mod tests {
             state.messages.retain(|(stored, _)| stored["id"] != id);
             assert_eq!(state.messages.len() + 1, before, "{id} was stored");
         }
+
+        /// The coordinator's attachment budget expired `id`'s file: its bytes are gone
+        /// and the message carries the metadata as `expired_file` instead of `file`.
+        fn expires_file(&self, id: &str) {
+            let mut state = self.state.lock().unwrap();
+            let (stored, bytes) = state
+                .messages
+                .iter_mut()
+                .find(|(stored, _)| stored["id"] == id)
+                .unwrap_or_else(|| panic!("{id} was stored"));
+            let file = stored["file"].take();
+            assert!(file.is_object(), "{id} had a file");
+            stored["expired_file"] = file;
+            stored.as_object_mut().unwrap().remove("file");
+            bytes.clear();
+        }
     }
 
     /// One request on this machine's own API, as a local client (`herdr` in
@@ -3946,5 +3982,29 @@ mod tests {
         let listed = guest_list(&harness, &guest, json!({}));
         assert_eq!(texts(&listed), ["report"], "{listed}");
         assert_eq!(guest_file(&harness, &guest, &sent), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn a_copy_whose_file_expired_on_the_coordinator_comes_back_without_bytes() {
+        // The coordinator's attachment budget expires old files but keeps their messages
+        // (herdr#298). A guest copy dropped meanwhile must come back as the same message,
+        // with the file's metadata as `expired_file`, not be lost for want of bytes.
+        let (_config, harness, coordinator) = relay_remote("relay-expired");
+        let guest = harness.admit_with(0, true);
+        let sent = agent_sends_file(&harness, "old report", "report.txt");
+        crate::guest::update_at(&guest.dir, &guest.guest_id, false)
+            .unwrap()
+            .unwrap();
+        assert!(copy_ids(&guest).is_empty());
+        coordinator.expires_file(&sent);
+
+        crate::guest::update_at(&guest.dir, &guest.guest_id, true)
+            .unwrap()
+            .unwrap();
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["old report"], "{listed}");
+        let message = &listed["messages"][0];
+        assert!(message.get("file").is_none(), "{message}");
+        assert_eq!(message["expired_file"]["name"], "report.txt", "{message}");
     }
 }

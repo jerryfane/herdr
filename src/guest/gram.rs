@@ -128,6 +128,14 @@ fn view(item: &GramItem, read: &BTreeSet<String>) -> serde_json::Value {
             "sha256": file.sha256,
         });
     }
+    if let Some(file) = &item.expired_file {
+        view["expired_file"] = serde_json::json!({
+            "name": file.name,
+            "size": file.size,
+            "mime": file.mime,
+            "sha256": file.sha256,
+        });
+    }
     view
 }
 
