@@ -42,9 +42,13 @@ const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Budget for the sum of all stored attachment BYTES on disk. Without it, up to
 /// [`MAX_ITEMS`] messages each holding a max-size file could pin gigabytes in the
-/// blob store; once exceeded, the oldest messages (and their files) are evicted.
-/// This is an aggregate disk bound, separate from the per-file cap the blob store
-/// enforces at upload time.
+/// blob store. Once exceeded, the oldest ATTACHMENTS are expired (their bytes are
+/// deleted and their metadata moves to [`GramItem::expired_file`]); the messages
+/// themselves stay. Evicting whole messages here once wiped a fortnight of text-only
+/// history when an agent posted ~1 GB of video zips: a message without a file frees
+/// no file bytes, so the old loop dropped everything older than the zips. This is an
+/// aggregate disk bound, separate from the per-file cap the blob store enforces at
+/// upload time.
 const MAX_TOTAL_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Maximum bytes of a single message's text. Enforced by the API handler before
@@ -122,6 +126,11 @@ pub struct GramItem {
     /// keyed by this message's id; this is only the metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<GramFile>,
+    /// The attachment this message had before the file budget expired it: the bytes
+    /// are gone, the metadata stays so a reader can show what was there. `None` when the
+    /// message never had a file, or still has it in [`Self::file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_file: Option<GramFile>,
     /// Install-stable identity of the daemon/store this message was written to
     /// (`crate::persist::machine::get_or_create`). Unlike the pid embedded in `id`,
     /// it survives daemon restarts, so every message in one store shares it and a
@@ -238,11 +247,11 @@ fn update_in_checked<T>(
         let mut items = load_from_path_strict(&path)?;
         let (result, changed) = mutation(&mut items);
         if changed {
-            let dropped_ids = normalize(&mut items);
+            let files_to_remove = normalize(&mut items);
             save_json_to_path(&path, &items)?;
-            // Only after the record eviction is durable do we remove the bytes,
-            // so a failed save never leaves a message pointing at a deleted file.
-            for id in &dropped_ids {
+            // Only after the dropped or expired records are durable do we remove the
+            // bytes, so a failed save never leaves a message pointing at a deleted file.
+            for id in &files_to_remove {
                 crate::persist::gram_files::remove_message_files_in(dir, id);
             }
         }
@@ -267,12 +276,13 @@ pub fn update_if_changed<T>(
     update_in_checked(&config_base(), mutation)
 }
 
-/// Sort oldest-first, then drop the oldest until the count cap, the total-text
-/// budget, and the total-attachment-bytes budget are all satisfied. Dropping an
-/// unclaimed shared item or an unread owner message is surprising, so those are
-/// logged. Returns the ids of the dropped messages so the caller can remove their
-/// file bytes from the blob store (the caps count metadata here; an attachment
-/// must not outlive its record, and the on-disk bytes need bounding too).
+/// Sort oldest-first, then drop the oldest messages until the count cap and the
+/// total-text budget are satisfied, then expire the oldest attachments until the
+/// total-attachment-bytes budget is. Dropping an unclaimed shared item or an unread
+/// owner message is surprising, so those are logged, as is any expiry. Returns the
+/// ids whose file bytes must be removed from the blob store: dropped messages and
+/// expired attachments (the caps count metadata here; an attachment must not
+/// outlive its record, and the on-disk bytes need bounding too).
 #[must_use]
 fn normalize(items: &mut Vec<GramItem>) -> Vec<String> {
     items.sort_by(|left, right| {
@@ -285,11 +295,8 @@ fn normalize(items: &mut Vec<GramItem>) -> Vec<String> {
         .iter()
         .filter_map(|item| item.file.as_ref().map(|file| file.size))
         .sum();
-    let mut dropped_ids = Vec::new();
-    while items.len() > MAX_ITEMS
-        || (items.len() > 1 && total_text > MAX_TOTAL_TEXT_BYTES)
-        || (items.len() > 1 && total_file > MAX_TOTAL_FILE_BYTES)
-    {
+    let mut files_to_remove = Vec::new();
+    while items.len() > MAX_ITEMS || (items.len() > 1 && total_text > MAX_TOTAL_TEXT_BYTES) {
         let dropped = items.remove(0);
         total_text = total_text.saturating_sub(dropped.text.len());
         if let Some(file) = &dropped.file {
@@ -300,9 +307,30 @@ fn normalize(items: &mut Vec<GramItem>) -> Vec<String> {
         } else if dropped.direction == GramDirection::AgentToOwner && !dropped.read_by_owner {
             warn!(id = %dropped.id, "gram store dropped an unread owner message at the cap");
         }
-        dropped_ids.push(dropped.id);
+        files_to_remove.push(dropped.id);
     }
-    dropped_ids
+    // The attachment budget only ever removes attachments: oldest first, each one's
+    // message kept with the file's metadata in `expired_file`. A single file is at most
+    // the blob store's per-file cap, far below this budget, so the newest survive.
+    let mut expired = 0usize;
+    for item in items.iter_mut() {
+        if total_file <= MAX_TOTAL_FILE_BYTES {
+            break;
+        }
+        if let Some(file) = item.file.take() {
+            total_file = total_file.saturating_sub(file.size);
+            item.expired_file = Some(file);
+            files_to_remove.push(item.id.clone());
+            expired += 1;
+        }
+    }
+    if expired > 0 {
+        warn!(
+            expired,
+            "gram store expired the oldest attachments at the file budget; their messages stay"
+        );
+    }
+    files_to_remove
 }
 
 fn append_in(dir: &Path, item: GramItem) -> std::io::Result<Vec<GramItem>> {
@@ -372,6 +400,7 @@ mod tests {
 
     fn item(id: &str, created: u64) -> GramItem {
         GramItem {
+            expired_file: None,
             id: id.to_string(),
             direction: GramDirection::OwnerToAgent,
             from: "owner".to_string(),
@@ -456,24 +485,29 @@ mod tests {
         assert_eq!(items.last().unwrap().id, "id-299");
     }
 
+    fn file_of(size: u64) -> GramFile {
+        GramFile {
+            name: "f.bin".to_string(),
+            size,
+            mime: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+        }
+    }
+
     #[test]
-    fn normalize_enforces_total_file_budget() {
-        // Six messages each holding a quarter-cap file = 1.5x the aggregate budget;
-        // the oldest are evicted (with their files) until the total is under it.
+    fn normalize_expires_oldest_attachments_at_the_file_budget_and_keeps_messages() {
+        // Six messages each holding a quarter-cap file = 1.5x the aggregate budget:
+        // the two oldest files expire, every message stays.
         let quarter = MAX_TOTAL_FILE_BYTES / 4;
         let mut items: Vec<GramItem> = (0..6u64)
             .map(|n| {
                 let mut it = item(&format!("id-{n}"), n);
-                it.file = Some(GramFile {
-                    name: "f.bin".to_string(),
-                    size: quarter,
-                    mime: "application/octet-stream".to_string(),
-                    sha256: "0".repeat(64),
-                });
+                it.file = Some(file_of(quarter));
                 it
             })
             .collect();
-        let dropped = normalize(&mut items);
+        let removed = normalize(&mut items);
+        assert_eq!(items.len(), 6, "the file budget never drops a message");
         let total: u64 = items
             .iter()
             .filter_map(|i| i.file.as_ref().map(|f| f.size))
@@ -482,9 +516,78 @@ mod tests {
             total <= MAX_TOTAL_FILE_BYTES,
             "total {total} over file budget"
         );
-        assert!(!dropped.is_empty(), "some messages must be evicted");
-        // Newest survive.
-        assert_eq!(items.last().unwrap().id, "id-5");
+        assert_eq!(
+            removed,
+            vec!["id-0".to_string(), "id-1".to_string()],
+            "oldest files go first"
+        );
+        for expired in &items[..2] {
+            assert!(expired.file.is_none());
+            assert_eq!(
+                expired.expired_file,
+                Some(file_of(quarter)),
+                "{} keeps its metadata",
+                expired.id
+            );
+        }
+        for kept in &items[2..] {
+            assert_eq!(
+                kept.file,
+                Some(file_of(quarter)),
+                "{} keeps its file",
+                kept.id
+            );
+            assert!(kept.expired_file.is_none());
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_text_history_when_large_uploads_fill_the_file_budget() {
+        // 2026-10-14: a fortnight of text-only Grams, then an agent posted ~1 GB of zips.
+        // Evicting whole messages dropped all the text before the zips (each frees no
+        // file bytes). Now only the oldest zips expire.
+        let mut items: Vec<GramItem> = (0..200u64).map(|n| item(&format!("text-{n}"), n)).collect();
+        let zip = 60 * 1024 * 1024;
+        items.extend((0..18u64).map(|n| {
+            let mut it = item(&format!("zip-{n}"), 1_000 + n);
+            it.file = Some(file_of(zip));
+            it
+        }));
+        let removed = normalize(&mut items);
+        assert_eq!(items.len(), 218, "no message is dropped");
+        assert!(
+            items.iter().filter(|i| i.id.starts_with("text-")).count() == 200,
+            "the text history survives"
+        );
+        assert_eq!(
+            removed,
+            vec!["zip-0".to_string()],
+            "only the oldest zip expires (18 x 60 MiB > 1 GiB)"
+        );
+        assert!(items
+            .iter()
+            .find(|i| i.id == "zip-0")
+            .unwrap()
+            .expired_file
+            .is_some());
+        assert!(items
+            .iter()
+            .find(|i| i.id == "zip-17")
+            .unwrap()
+            .file
+            .is_some());
+    }
+
+    #[test]
+    fn a_store_written_before_expired_file_loads_and_round_trips() {
+        // Older builds never wrote `expired_file`; a record without it must load strictly,
+        // and one with it must not be emitted by a store that never expired anything.
+        let legacy = r#"[{"id":"a","direction":"agent_to_owner","from":"x","text":"hi","created_unix_ms":1}]"#;
+        let items: Vec<GramItem> = serde_json::from_str(legacy).unwrap();
+        assert!(items[0].expired_file.is_none());
+        assert!(!serde_json::to_string(&items)
+            .unwrap()
+            .contains("expired_file"));
     }
 
     #[test]

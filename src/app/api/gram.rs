@@ -217,6 +217,7 @@ impl App {
                     Err(error) => return error,
                 };
                 let item = GramItem {
+                    expired_file: None,
                     id: message_id,
                     direction: StoredDirection::AgentToOwner,
                     from: from.clone(),
@@ -360,6 +361,7 @@ impl App {
             .as_deref()
             .and_then(|pane| self.caller_sender(pane));
         let item = GramItem {
+            expired_file: None,
             id: message_id,
             direction: StoredDirection::AgentToOwner,
             from: from.clone(),
@@ -440,6 +442,7 @@ impl App {
             Err(err) => return err,
         };
         let item = GramItem {
+            expired_file: None,
             id: message_id,
             direction: StoredDirection::OwnerToAgent,
             from: params.from.unwrap_or_else(|| "owner".to_string()),
@@ -1300,6 +1303,12 @@ fn gram_item_to_info(item: GramItem, labels: &MachineLabels) -> GramMessageInfo 
             mime: file.mime,
             sha256: file.sha256,
         }),
+        expired_file: item.expired_file.map(|file| GramFileInfo {
+            name: file.name,
+            size: file.size,
+            mime: file.mime,
+            sha256: file.sha256,
+        }),
         origin_id: item.origin_id,
         machine_label,
     }
@@ -1431,6 +1440,7 @@ mod tests {
 
     fn owner_shared(id: &str) -> GramItem {
         GramItem {
+            expired_file: None,
             id: id.to_string(),
             direction: StoredDirection::OwnerToAgent,
             from: "owner".to_string(),

@@ -1252,6 +1252,7 @@ fn mirror_relayed(
         }
     };
     let item = GramItem {
+        expired_file: None,
         id: message.id,
         direction,
         from,
@@ -2939,6 +2940,7 @@ mod tests {
         let no_pane = send_gram_as(&harness, None, "llm-opt", "same name, no pane");
         // What a Gram relayed from another machine's `llm-opt` stores.
         crate::persist::gram::append(crate::persist::gram::GramItem {
+            expired_file: None,
             id: "relay-remote".into(),
             direction: crate::persist::gram::GramDirection::AgentToOwner,
             from: "llm-opt".into(),

@@ -340,6 +340,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         GramItem {
+            expired_file: None,
             id: "relay-1".into(),
             direction: GramDirection::AgentToOwner,
             from: "llm-opt".into(),
