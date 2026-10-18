@@ -277,8 +277,9 @@ impl PaneTerminal {
     pub(super) fn output_snapshot(
         &self,
         ring: &super::output_ring::OutputRing,
+        history_lines: usize,
     ) -> Option<super::output_ring::OutputSnapshot> {
-        self.ghostty.output_snapshot(ring)
+        self.ghostty.output_snapshot(ring, history_lines)
     }
 
     pub fn scroll_up(&self, lines: usize) {
@@ -1890,15 +1891,21 @@ impl GhosttyPaneTerminal {
     /// Capture a full-screen ANSI seed paired atomically with the ring offset it
     /// reflects. Rendered under the core lock and reading the ring offset in the
     /// same critical section, so the pair is a consistent, gap/overlap-free cut.
+    /// With `history_lines > 0` the scrollback above that screen is captured in
+    /// the same critical section, so seed and history can never disagree.
     pub(super) fn output_snapshot(
         &self,
         ring: &super::output_ring::OutputRing,
+        history_lines: usize,
     ) -> Option<super::output_ring::OutputSnapshot> {
         let core = self.core.lock().ok()?;
         let ansi = ghostty_visible_ansi(&core).ok()?;
+        let history = (history_lines > 0)
+            .then(|| ghostty_scrollback_ansi(&core.terminal, history_lines).unwrap_or_default());
         let (cursor, resize_id, cols, rows) = ring.capture_offsets();
         Some(super::output_ring::OutputSnapshot {
             ansi,
+            history,
             cursor,
             resize_id,
             cols,
@@ -2991,6 +2998,32 @@ fn ghostty_visible_ansi(core: &GhosttyPaneCore) -> Result<String, crate::ghostty
     core.terminal.read_ansi_viewport(
         (0, 0),
         (cols.saturating_sub(1), u32::from(rows.saturating_sub(1))),
+        false,
+    )
+}
+
+/// Up to `lines` normal-screen scrollback rows directly above the viewport the
+/// seed renders, oldest first, as ANSI at the terminal's current width. Anchored
+/// to the viewport (not the bottom) so history and seed meet exactly even when a
+/// local client has scrolled the pane back. Empty on the alternate screen, which
+/// has no scrollback of its own.
+fn ghostty_scrollback_ansi(
+    terminal: &crate::ghostty::Terminal,
+    lines: usize,
+) -> Result<String, crate::ghostty::Error> {
+    if lines == 0 || terminal.active_screen()? != crate::ghostty::ActiveScreen::Primary {
+        return Ok(String::new());
+    }
+    let cols = terminal.cols()?;
+    let viewport_start = terminal.scrollbar()?.offset;
+    if cols == 0 || viewport_start == 0 {
+        return Ok(String::new());
+    }
+    let start = viewport_start.saturating_sub(lines);
+    terminal.read_ansi_screen(
+        (0, start as u32),
+        (cols.saturating_sub(1), (viewport_start - 1) as u32),
+        false,
         false,
     )
 }
@@ -5234,6 +5267,91 @@ mod tests {
             crossterm::event::KeyModifiers::empty(),
         );
         assert_eq!(encoded.as_deref(), Some(&b"\x1b[<64;12;10M"[..]));
+    }
+
+    #[test]
+    fn ghostty_output_snapshot_carries_scrollback_above_the_screen() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 4, 1024 * 1024).unwrap();
+        for line in 1..=12 {
+            terminal.write(format!("line {line:02}\r\n").as_bytes());
+        }
+        terminal.write(b"prompt");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let ring =
+            super::super::output_ring::OutputRing::new(1, 1024, 20, 4, std::sync::Weak::new());
+
+        let plain = |ansi: &str| -> Vec<String> {
+            // Drop CSI/OSC sequences; the assertions are about which rows came back.
+            let mut text = String::new();
+            let mut chars = ansi.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch != '\x1b' {
+                    text.push(ch);
+                    continue;
+                }
+                match chars.next() {
+                    Some('[') => {
+                        for next in chars.by_ref() {
+                            if ('@'..='~').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        while let Some(next) = chars.next() {
+                            if next == '\x07'
+                                || (next == '\x1b' && chars.next_if_eq(&'\\').is_some())
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            text.split('\n')
+                .map(|row| row.trim_end_matches(['\r', ' ']).to_string())
+                .collect()
+        };
+
+        let seed = pane.output_snapshot(&ring, 5).unwrap();
+        assert_eq!(
+            plain(&seed.ansi),
+            ["line 10", "line 11", "line 12", "prompt"]
+        );
+        // The five rows directly above the screen, oldest first: nothing the
+        // screen already shows, nothing skipped between history and screen.
+        assert_eq!(
+            plain(seed.history.as_deref().unwrap()),
+            ["line 05", "line 06", "line 07", "line 08", "line 09"]
+        );
+
+        // Asking for more than exists returns all of it.
+        let seed = pane.output_snapshot(&ring, 1000).unwrap();
+        let history = plain(seed.history.as_deref().unwrap());
+        assert_eq!(history.first().map(String::as_str), Some("line 01"));
+        assert_eq!(history.last().map(String::as_str), Some("line 09"));
+
+        // Screen-only keyframes stay exactly as before.
+        assert!(pane.output_snapshot(&ring, 0).unwrap().history.is_none());
+    }
+
+    #[test]
+    fn ghostty_output_snapshot_has_no_history_on_the_alternate_screen() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 4, 1024 * 1024).unwrap();
+        for line in 1..=12 {
+            terminal.write(format!("shell {line:02}\r\n").as_bytes());
+        }
+        terminal.write(b"\x1b[?1049hfull screen app");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let ring =
+            super::super::output_ring::OutputRing::new(1, 1024, 20, 4, std::sync::Weak::new());
+
+        let seed = pane.output_snapshot(&ring, 100).unwrap();
+        // Shell history under a full-screen app must not be pasted above it.
+        assert_eq!(seed.history.as_deref(), Some(""));
     }
 
     #[test]

@@ -431,8 +431,8 @@ fn default_include_history() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneStreamParams {
     pub pane_id: String,
-    /// Whether the initial reset seed should include windowed scrollback history
-    /// (v1 seeds the visible screen; reserved for a later history-aware seed).
+    /// Whether `reset` keyframes carry `scrollback_lines` of history. Set it to
+    /// `false` to opt out without dropping `scrollback_lines`.
     #[serde(default = "default_include_history")]
     pub include_history: bool,
     /// Absolute byte offset to resume from. Carried on the wire for a later
@@ -446,7 +446,9 @@ pub struct PaneStreamParams {
     /// frames. Defaults to a server-chosen chunk size when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_frame_bytes: Option<usize>,
-    /// Number of scrollback lines to window into the reset seed (reserved).
+    /// Number of normal-screen scrollback rows (at most 1000) every `reset`
+    /// keyframe carries in `history_b64`, captured atomically with its screen.
+    /// Omitted or `0` sends screen-only keyframes, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback_lines: Option<usize>,
     /// Stable identity of this viewer, echoed on its `pane.set_pty_size` so the

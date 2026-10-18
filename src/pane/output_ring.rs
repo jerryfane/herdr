@@ -88,6 +88,9 @@ pub(crate) enum OutputWait {
 /// An atomically captured full-screen seed and the exact offset it reflects.
 pub(crate) struct OutputSnapshot {
     pub ansi: String,
+    /// Normal-screen scrollback rows ABOVE the screen in `ansi`, oldest first, at
+    /// the same width. `None` when the stream did not ask for history.
+    pub history: Option<String>,
     pub cursor: u64,
     pub resize_id: u64,
     pub cols: u16,
@@ -408,10 +411,11 @@ impl OutputRing {
     }
 
     /// Render a fresh full-screen seed atomically paired with the offset it
-    /// reflects. Returns `None` if the owning terminal is gone.
-    pub(crate) fn snapshot(&self) -> Option<OutputSnapshot> {
+    /// reflects, plus up to `history_lines` scrollback rows when non-zero.
+    /// Returns `None` if the owning terminal is gone.
+    pub(crate) fn snapshot(&self, history_lines: usize) -> Option<OutputSnapshot> {
         let terminal = self.terminal.upgrade()?;
-        terminal.output_snapshot(self)
+        terminal.output_snapshot(self, history_lines)
     }
 }
 

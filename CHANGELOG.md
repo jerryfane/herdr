@@ -5,6 +5,9 @@
 ### Changed
 - A coordinator sends one-shot requests to a saved SSH machine over one persistent `api-bridge --multi` channel per machine instead of starting a new SSH channel and remote bridge for each, once the machine advertises `api_bridge_multi`. Relayed requests to a distant machine no longer pay several round trips before they are sent. Streams keep their own channel, and machines without `api-bridge --multi` keep the per-request bridge.
 
+### Fixed
+- A remote app that reconnects to a pane, or falls behind its output, gets the pane's scrollback back instead of only the visible screen. `pane.stream` now honours `scrollback_lines`: every `reset` keyframe carries up to 1000 history rows in `history_b64`, read together with the screen so the two meet exactly. Clients that don't ask get the same keyframes as before.
+
 ## [0.9.3] - 2026-09-29
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2

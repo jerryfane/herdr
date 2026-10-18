@@ -22,7 +22,7 @@ use crate::api::schema::{
 };
 use crate::api::{ApiRequestSender, ApiStream};
 use crate::ipc::is_connection_closed_error;
-use crate::pane::{clamp_max_frame_bytes, OutputDrain, OutputWait};
+use crate::pane::{clamp_max_frame_bytes, OutputDrain, OutputSnapshot, OutputWait};
 
 use super::{
     api_response_outcome, dispatch_to_app_with_timeout, should_stop_connection, write_json_line,
@@ -33,6 +33,22 @@ use super::{
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 const STREAM_TAG: &str = "pane.bytes";
+
+/// Most scrollback rows one keyframe carries; the same ceiling `pane.read`
+/// applies to `recent`, so a keyframe stays a bounded single line.
+const MAX_KEYFRAME_HISTORY_LINES: usize = 1000;
+
+/// Scrollback rows each `reset` keyframe should carry: `scrollback_lines`,
+/// clamped, unless the client opted out with `include_history: false`.
+fn keyframe_history_lines(params: &PaneStreamParams) -> usize {
+    if !params.include_history {
+        return 0;
+    }
+    params
+        .scrollback_lines
+        .unwrap_or(0)
+        .min(MAX_KEYFRAME_HISTORY_LINES)
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -53,6 +69,11 @@ struct StreamFrameLine {
     data_b64: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     lagged: bool,
+    /// Base64 ANSI scrollback rows above a `reset` keyframe's screen, oldest
+    /// first, captured atomically with it. Present only when the stream asked
+    /// for `scrollback_lines`; empty when the pane has no history to give.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_b64: Option<String>,
 }
 
 impl StreamFrameLine {
@@ -66,14 +87,19 @@ impl StreamFrameLine {
             rows: None,
             data_b64: None,
             lagged: false,
+            history_b64: None,
         }
     }
 
-    fn reset(seq: u64, epoch: u64, cols: u16, rows: u16, data_b64: String, lagged: bool) -> Self {
+    fn reset(seq: u64, epoch: u64, seed: &OutputSnapshot, lagged: bool) -> Self {
         Self {
-            cols: Some(cols),
-            rows: Some(rows),
-            data_b64: Some(data_b64),
+            cols: Some(seed.cols),
+            rows: Some(seed.rows),
+            data_b64: Some(encode_bytes(seed.ansi.as_bytes())),
+            history_b64: seed
+                .history
+                .as_deref()
+                .map(|history| encode_bytes(history.as_bytes())),
             lagged,
             ..Self::base("reset", seq, epoch)
         }
@@ -141,6 +167,7 @@ pub(super) fn serve_watched(
     // carry no viewer id.
     let viewer_id = params.viewer_id.clone();
     let max_frame_bytes = clamp_max_frame_bytes(params.max_frame_bytes);
+    let history_lines = keyframe_history_lines(&params);
 
     // Validate + attach + publish the ring on the app loop.
     let open_response = dispatch_to_app_with_timeout(
@@ -165,6 +192,7 @@ pub(super) fn serve_watched(
             &request_id,
             &pane_id,
             max_frame_bytes,
+            history_lines,
             running,
             watch,
         )
@@ -180,6 +208,7 @@ fn serve_attached(
     request_id: &str,
     pane_id: &str,
     max_frame_bytes: usize,
+    history_lines: usize,
     running: &Arc<AtomicBool>,
     mut watch: Option<StreamWatch<'_>>,
 ) -> std::io::Result<()> {
@@ -200,7 +229,7 @@ fn serve_attached(
     };
 
     let epoch = ring.epoch();
-    let Some(seed) = ring.snapshot() else {
+    let Some(seed) = ring.snapshot(history_lines) else {
         // The runtime is already gone; tell the client and close.
         return finish_exited(stream, &mut watch, 0, epoch);
     };
@@ -224,18 +253,12 @@ fn serve_attached(
         return Ok(());
     }
 
-    // reset seed: base64 full-screen ANSI at exactly `base_seq`.
+    // reset seed: base64 full-screen ANSI at exactly `base_seq`, with the
+    // requested scrollback captured in the same critical section.
     if !emit_watched(
         stream,
         &mut watch,
-        &StreamFrameLine::reset(
-            seed.cursor,
-            epoch,
-            seed.cols,
-            seed.rows,
-            encode_bytes(seed.ansi.as_bytes()),
-            false,
-        ),
+        &StreamFrameLine::reset(seed.cursor, epoch, &seed, false),
     )? {
         return Ok(());
     }
@@ -277,20 +300,15 @@ fn serve_attached(
                 OutputDrain::Lagged => {
                     // Snapshot-collapse resync: discard the backlog, re-seed one
                     // full-screen keyframe, and jump the cursor to the live edge.
-                    let Some(seed) = ring.snapshot() else {
+                    // It carries history too: the bytes dropped from the backlog
+                    // may have scrolled into it.
+                    let Some(seed) = ring.snapshot(history_lines) else {
                         return finish_exited(stream, &mut watch, cursor, epoch);
                     };
                     if !emit_watched(
                         stream,
                         &mut watch,
-                        &StreamFrameLine::reset(
-                            seed.cursor,
-                            epoch,
-                            seed.cols,
-                            seed.rows,
-                            encode_bytes(seed.ansi.as_bytes()),
-                            true,
-                        ),
+                        &StreamFrameLine::reset(seed.cursor, epoch, &seed, true),
                     )? {
                         return Ok(());
                     }
@@ -410,9 +428,20 @@ fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestS
 mod tests {
     use super::*;
 
+    fn seed(history: Option<&str>) -> OutputSnapshot {
+        OutputSnapshot {
+            ansi: "seed".into(),
+            history: history.map(str::to_string),
+            cursor: 918_273,
+            resize_id: 0,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
     #[test]
     fn reset_frame_shape_includes_geometry_and_omits_lagged_when_false() {
-        let frame = StreamFrameLine::reset(918_273, 7, 80, 24, "c2VlZA==".into(), false);
+        let frame = StreamFrameLine::reset(918_273, 7, &seed(None), false);
         let value = serde_json::to_value(&frame).unwrap();
         assert_eq!(value["stream"], "pane.bytes");
         assert_eq!(value["frame"], "reset");
@@ -422,11 +451,46 @@ mod tests {
         assert_eq!(value["rows"], 24);
         assert_eq!(value["data_b64"], "c2VlZA==");
         assert!(value.get("lagged").is_none());
+        // No history requested: the frame is byte-for-byte what old clients parse.
+        assert!(value.get("history_b64").is_none());
+    }
+
+    #[test]
+    fn reset_frame_carries_requested_history_even_when_empty() {
+        let value =
+            serde_json::to_value(StreamFrameLine::reset(1, 7, &seed(Some("old")), false)).unwrap();
+        assert_eq!(value["history_b64"], "b2xk");
+        let value =
+            serde_json::to_value(StreamFrameLine::reset(1, 7, &seed(Some("")), false)).unwrap();
+        assert_eq!(
+            value["history_b64"], "",
+            "asked-for-but-empty must stay distinguishable from not-sent"
+        );
+    }
+
+    #[test]
+    fn keyframe_history_lines_follow_the_request_and_are_bounded() {
+        let params = |include_history, scrollback_lines| PaneStreamParams {
+            pane_id: "p".into(),
+            include_history,
+            resume_from: None,
+            epoch: None,
+            max_frame_bytes: None,
+            scrollback_lines,
+            viewer_id: None,
+        };
+        assert_eq!(keyframe_history_lines(&params(true, None)), 0);
+        assert_eq!(keyframe_history_lines(&params(true, Some(400))), 400);
+        assert_eq!(
+            keyframe_history_lines(&params(true, Some(50_000))),
+            MAX_KEYFRAME_HISTORY_LINES
+        );
+        assert_eq!(keyframe_history_lines(&params(false, Some(400))), 0);
     }
 
     #[test]
     fn lagged_reset_sets_flag() {
-        let frame = StreamFrameLine::reset(1, 7, 80, 24, String::new(), true);
+        let frame = StreamFrameLine::reset(1, 7, &seed(None), true);
         let value = serde_json::to_value(&frame).unwrap();
         assert_eq!(value["lagged"], true);
     }

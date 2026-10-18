@@ -35,7 +35,8 @@ mod terminal;
 mod xtgettcap;
 
 pub(crate) use output_ring::{
-    clamp_max_frame_bytes, OutputDrain, OutputRing, OutputWait, OUTPUT_RING_CAPACITY_BYTES,
+    clamp_max_frame_bytes, OutputDrain, OutputRing, OutputSnapshot, OutputWait,
+    OUTPUT_RING_CAPACITY_BYTES,
 };
 
 use self::agent_detection::{
