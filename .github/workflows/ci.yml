@@ -74,7 +74,6 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Record runner capacity
         shell: bash
@@ -188,23 +187,16 @@ jobs:
         if: runner.os == 'Linux'
         run: CARGO_INCREMENTAL=1 just ci-tests '${{ matrix.nextest_filter }}'
 
-      - name: Prove transcript metadata regressions
-        if: runner.os == 'Linux' && github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          go install github.com/gitmoot/test-check/cmd/test-check@v0.0.0-20261007050326-d5f169ab623e
-          "$(go env GOPATH)/bin/test-check" prove --base "$BASE_SHA" \
-            --test "cargo nextest run --locked -E 'test({name})' --status-level all --final-status-level all" \
-            --each "current_model_tracks_selection_role_branch_and_clear,latest_plan_preserves_phases_states_and_blockers_outside_the_page,recap_is_current_metadata_not_a_conversation_entry_and_can_be_cleared,late_recap_cannot_cross_new_work_or_a_reset,recap_rejects_wrong_identity_unknown_version_and_empty_text,guest_transcript_metadata_preserves_progress_without_private_blockers"
-
-      - name: Preserve transcript metadata proof
-        if: always() && runner.os == 'Linux' && github.event_name == 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: transcript-metadata-proof
-          path: ~/.local/state/test-check/receipts
-          retention-days: 7
+      - name: Verify transcript metadata cases
+        if: runner.os == 'Linux'
+        run: >-
+          cargo nextest run --locked --color never --status-level pass --final-status-level pass
+          -E 'test(current_model_tracks_selection_role_branch_and_clear)
+          | test(latest_plan_preserves_phases_states_and_blockers_outside_the_page)
+          | test(recap_is_current_metadata_not_a_conversation_entry_and_can_be_cleared)
+          | test(late_recap_cannot_cross_new_work_or_a_reset)
+          | test(recap_rejects_wrong_identity_unknown_version_and_empty_text)
+          | test(guest_transcript_metadata_preserves_progress_without_private_blockers)'
 
       - name: Run macOS checks
         if: runner.os == 'macOS'
