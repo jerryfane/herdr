@@ -75,6 +75,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record runner capacity
+        shell: bash
+        run: |
+          printf 'Runner: %s; environment: %s; OS: %s\n' "${RUNNER_NAME:-unknown}" "${RUNNER_ENVIRONMENT:-unknown}" "${RUNNER_OS:-unknown}"
+          df -Pk .
+
       - name: Install Rust
         if: matrix.kind == 'unix'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
