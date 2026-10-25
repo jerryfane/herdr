@@ -709,7 +709,9 @@ mod tests {
 
         // Idempotent, and the discarded id can no longer be attached.
         assert!(!discard_staged_in(&dir, "abandoned").unwrap());
-        let err = finalize_in(&dir, "gram-msg-d", "abandoned", "a.bin").unwrap_err();
+        let Err(err) = finalize_in(&dir, "gram-msg-d", "abandoned", "a.bin") else {
+            panic!("a discarded upload must not finalize");
+        };
         assert!(err.to_string().contains("no staged upload"), "got: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
