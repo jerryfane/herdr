@@ -961,6 +961,8 @@ fn malformed_and_unfinished_lines_are_skipped() {
     ));
     let page = session.newest();
     assert_eq!(kinds(&page.entries), vec!["user", "reply", "turn_end"]);
+    let index = cached_index(&session.path);
+    assert_eq!(index.lock().unwrap().malformed, 2);
     // The line completes: the next read picks it up.
     session.raw(&format!("lf\",\"timestamp\":{T0_MS}}}}}\n"));
     let page = session.page(None, Some(&page.after), None);
@@ -1209,6 +1211,20 @@ fn a_missing_file_is_unavailable() {
         "transcript_unavailable"
     );
     assert!(pending_ask(&session.path).is_err());
+}
+
+#[test]
+fn appends_extend_the_index_instead_of_rescanning() {
+    let mut session = numbered_session("incremental", 2);
+    session.newest();
+    let index = cached_index(&session.path);
+    let first_offset = index.lock().unwrap().records[0].offset;
+    session.user("question 3");
+    let page = session.newest();
+    assert_eq!(user_texts(&page.entries).last(), Some(&"question 3"));
+    let index = index.lock().unwrap();
+    assert_eq!(index.records[0].offset, first_offset);
+    assert_eq!(index.records.len(), 9);
 }
 
 #[test]
