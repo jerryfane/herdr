@@ -1120,6 +1120,7 @@ mod tests {
             archived: None,
             parked_work: Vec::new(),
             session_transfer: None,
+            avatar: None,
         }
     }
 

@@ -72,6 +72,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         Operation::Archive(params) => agent_archive(params),
         Operation::Unarchive(params) => agent_unarchive(params),
         Operation::Forget(params) => agent_forget(params),
+        Operation::AvatarSet(params) => agent_avatar_set(params),
+        Operation::AvatarGet(params) => agent_avatar_get(params),
         Operation::Wait(params) => agent_wait(params),
         Operation::Prompt(params) => agent_prompt(params),
         Operation::Start(params) => agent_start(params),
@@ -903,6 +905,69 @@ fn agent_forget(params: AgentForgetParams) -> std::io::Result<i32> {
         id: "cli:agent:forget".into(),
         method: Method::AgentForget(params),
     })?)
+}
+
+fn agent_avatar_set(params: bindings::AvatarSet) -> std::io::Result<i32> {
+    use crate::api::schema::{AgentAvatarChoice, AgentAvatarSetParams};
+    use base64::Engine as _;
+
+    let (avatar, image_base64, mime) = match (params.mascot, params.image) {
+        (Some(mascot), _) => (Some(AgentAvatarChoice::Mascot { mascot }), None, None),
+        (None, Some(path)) => {
+            let bytes = std::fs::read(&path)?;
+            let Some(mime) = crate::persist::agent_avatars::image_mime(&bytes) else {
+                eprintln!("{}: not a JPEG or PNG image", path.display());
+                return Ok(2);
+            };
+            (
+                Some(AgentAvatarChoice::Image),
+                Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                Some(mime.to_string()),
+            )
+        }
+        (None, None) => (None, None, None),
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:avatar:set".into(),
+        method: Method::AgentAvatarSet(AgentAvatarSetParams {
+            target: params.target,
+            avatar,
+            image_base64,
+            mime,
+        }),
+    })?)
+}
+
+fn agent_avatar_get(params: bindings::AvatarGet) -> std::io::Result<i32> {
+    use base64::Engine as _;
+
+    let response = super::send_request(&Request {
+        id: "cli:agent:avatar:get".into(),
+        method: Method::AgentAvatarGet(crate::api::schema::AgentAvatarGetParams {
+            target: params.target,
+            sha256: params.sha256,
+        }),
+    })?;
+    let Some(data) = response
+        .pointer("/result/data_base64")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return super::print_response(&response);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(&params.output, &bytes)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "agent_avatar_image",
+            "mime": response.pointer("/result/mime"),
+            "bytes": bytes.len(),
+            "path": params.output.display().to_string(),
+        })
+    );
+    Ok(0)
 }
 
 fn agent_prompt(params: AgentPromptParams) -> std::io::Result<i32> {

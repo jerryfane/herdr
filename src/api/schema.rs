@@ -130,6 +130,8 @@ operations::define_operations! {
     AgentExplain(AgentTarget) => "agent.explain", false, false;
     AgentSendKeys(AgentSendKeysParams) => "agent.send_keys", true, false;
     AgentRename(AgentRenameParams) => "agent.rename", true, false;
+    AgentAvatarSet(AgentAvatarSetParams) => "agent.avatar.set", false, false;
+    AgentAvatarGet(AgentAvatarGetParams) => "agent.avatar.get", false, false;
     AgentArchive(AgentArchiveParams) => "agent.archive", false, false;
     AgentUnarchive(AgentUnarchiveParams) => "agent.unarchive", false, false;
     AgentForget(AgentForgetParams) => "agent.forget", false, false;

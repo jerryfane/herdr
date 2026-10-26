@@ -374,3 +374,35 @@ fn transfer_session_args_reject_implicit_or_double_confirmation() {
         );
     }
 }
+
+#[test]
+fn agent_avatar_set_takes_exactly_one_choice_and_get_needs_an_output() {
+    match parse(&["avatar", "set", "main", "--mascot", "bot"]).unwrap() {
+        Operation::AvatarSet(set) => {
+            assert_eq!(set.target, "main");
+            assert_eq!(set.mascot.as_deref(), Some("bot"));
+            assert_eq!(set.image, None);
+        }
+        _ => panic!("expected avatar set"),
+    }
+    match parse(&["avatar", "set", "main", "--clear"]).unwrap() {
+        Operation::AvatarSet(set) => assert_eq!((set.mascot, set.image), (None, None)),
+        _ => panic!("expected avatar set"),
+    }
+    match parse(&["avatar", "set", "main", "--image", "me.png"]).unwrap() {
+        Operation::AvatarSet(set) => assert_eq!(set.image, Some("me.png".into())),
+        _ => panic!("expected avatar set"),
+    }
+    assert!(parse(&["avatar", "set", "main"]).is_err());
+    assert!(parse(&["avatar", "set", "main", "--mascot", "bot", "--clear"]).is_err());
+
+    match parse(&["avatar", "get", "main", "abc", "-o", "out.jpg"]).unwrap() {
+        Operation::AvatarGet(get) => {
+            assert_eq!(get.target, "main");
+            assert_eq!(get.sha256, "abc");
+            assert_eq!(get.output, std::path::PathBuf::from("out.jpg"));
+        }
+        _ => panic!("expected avatar get"),
+    }
+    assert!(parse(&["avatar", "get", "main", "abc"]).is_err());
+}

@@ -1730,6 +1730,95 @@
           ],
           "type": "object"
         },
+        "AgentAvatarChoice": {
+          "description": "The picture `agent.avatar.set` applies.",
+          "oneOf": [
+            {
+              "properties": {
+                "mascot": {
+                  "type": "string"
+                },
+                "style": {
+                  "const": "mascot",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "style",
+                "mascot"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The bytes travel in `image_base64`.",
+              "properties": {
+                "style": {
+                  "const": "image",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "style"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentAvatarGetParams": {
+          "description": "`agent.avatar.get` — the bytes of an agent's current image picture.",
+          "properties": {
+            "sha256": {
+              "description": "The `avatar.sha256` the agent currently carries.",
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        "AgentAvatarSetParams": {
+          "description": "`agent.avatar.set` — choose, replace or clear an agent's profile picture.\nOwner only. The picture is shared with every client of this server,\nfederation peers, and the agent's guests.",
+          "properties": {
+            "avatar": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentAvatarChoice"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`null` clears the picture, back to the client's default."
+            },
+            "image_base64": {
+              "description": "Style `image` only: the JPEG or PNG bytes, at most 64 KiB decoded.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mime": {
+              "description": "`image/jpeg` or `image/png`. Optional; the stored type is read from the\nbytes.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "description": "The agent as for `agent.rename`, its terminal id, or an archived agent's\nname or terminal id.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "AgentForgetParams": {
           "description": "`agent.forget` — permanently drop an archived agent's record (issue #291).\nOnly herdr's resume pointer is removed; the harness transcript and session\nfiles on disk are left untouched. Live agents are refused.",
           "properties": {
@@ -7259,6 +7348,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.avatar.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentAvatarSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.avatar.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentAvatarGetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.archive",
               "type": "string"
             },
@@ -11274,6 +11395,56 @@
           ],
           "type": "object"
         },
+        "AgentAvatar": {
+          "description": "An agent's chosen profile picture, keyed by its stable terminal id. Absent\nwhen the agent has none, so clients show their default.",
+          "properties": {
+            "mascot": {
+              "default": null,
+              "description": "The bundled mascot id for style `mascot` (e.g. `herdy`, `bot`); `null`\notherwise. Any `^[a-z0-9-]{1,32}$` id is accepted so new mascots need no\nserver change; clients fall back for an id they do not ship.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sha256": {
+              "default": null,
+              "description": "Lowercase hex SHA-256 of the image bytes for style `image`; `null`\notherwise. Content-addressed, so a client cache never goes stale.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style": {
+              "$ref": "#/schemas/success_response/$defs/AgentAvatarStyle"
+            },
+            "updated_unix_ms": {
+              "description": "Wall-clock ms of the last change.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "style",
+            "updated_unix_ms"
+          ],
+          "type": "object"
+        },
+        "AgentAvatarStyle": {
+          "description": "How an agent's profile picture is drawn. Clients that do not know a style\nfall back to their default picture.",
+          "oneOf": [
+            {
+              "const": "mascot",
+              "description": "One of the mascots bundled in the app, named by `mascot`.",
+              "type": "string"
+            },
+            {
+              "const": "image",
+              "description": "An uploaded JPEG/PNG, fetched by `sha256` with `agent.avatar.get`.",
+              "type": "string"
+            }
+          ]
+        },
         "AgentInfo": {
           "properties": {
             "account": {
@@ -11323,6 +11494,17 @@
                 }
               ],
               "description": "Present only for archived agents (issue #173). Its presence is the\nload-bearing signal that this agent is archived; absent means active, so\nolder clients that ignore the field see a normal (active) agent list."
+            },
+            "avatar": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentAvatar"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The agent's chosen profile picture; absent when it has none and the\nclient shows its default. A descriptor this build cannot read (a newer\npeer's style) decodes as absent rather than failing the whole agent."
             },
             "completion_seq": {
               "description": "The current idle transition completed work, independently of who has viewed it.",
@@ -15880,6 +16062,50 @@
               "type": "object"
             },
             {
+              "description": "`agent.avatar.set`: the agent's picture now, `null` once cleared.",
+              "properties": {
+                "avatar": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentAvatar"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "agent_avatar_set",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.avatar.get`: the image bytes, base64, and their type.",
+              "properties": {
+                "data_base64": {
+                  "type": "string"
+                },
+                "mime": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_avatar_image",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "mime",
+                "data_base64"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agents": {
                   "items": {
@@ -17583,6 +17809,11 @@
             "agent_answer": {
               "default": false,
               "description": "Supports `agent.answer` (pick an option of an omp agent's pending ask).",
+              "type": "boolean"
+            },
+            "agent_avatar": {
+              "default": false,
+              "description": "Supports `agent.avatar.set`/`agent.avatar.get` and `AgentInfo.avatar`.",
               "type": "boolean"
             },
             "agent_forget": {

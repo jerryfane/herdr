@@ -114,6 +114,15 @@ pub enum ResponseResult {
     AgentAnswer {
         status: AgentAnswerStatus,
     },
+    /// `agent.avatar.set`: the agent's picture now, `null` once cleared.
+    AgentAvatarSet {
+        avatar: Option<super::agents::AgentAvatar>,
+    },
+    /// `agent.avatar.get`: the image bytes, base64, and their type.
+    AgentAvatarImage {
+        mime: String,
+        data_base64: String,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
         /// Install-stable identity of the daemon that produced this response.
@@ -325,6 +334,10 @@ pub enum ResponseResult {
         /// `None` when the pane no longer hosts an agent.
         agent: Option<AgentInfo>,
         running: bool,
+        /// The terminal's picture, also while it hosts no agent, so a paused
+        /// grant still shows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<super::agents::AgentAvatar>,
     },
     /// Effective Gram relay policy for both roles. Never includes secrets.
     GramRelayStatus {

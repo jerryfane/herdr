@@ -37,7 +37,12 @@ impl App {
                         .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
                 })
             })
-            .chain(self.state.archived_agents.iter().map(archived_agent_info))
+            .chain(
+                self.state
+                    .archived_agents
+                    .iter()
+                    .map(|record| archived_agent_info(record, &self.agent_avatars)),
+            )
             .collect()
     }
 
@@ -147,6 +152,37 @@ impl App {
             })
     }
 
+    /// The terminal id an `agent.avatar.*` target names: a live agent (as for
+    /// `agent.rename`), an archived agent's name or terminal id, or the id of
+    /// any terminal this server holds. The last keeps a paused guest grant,
+    /// pinned by terminal id, able to fetch its picture.
+    pub(super) fn avatar_terminal_id(
+        &self,
+        target: &str,
+    ) -> Result<String, crate::api::schema::ErrorBody> {
+        match self.resolve_agent_target(target) {
+            Ok(resolved) => return Ok(resolved.terminal_id),
+            Err(err @ TerminalTargetError::Ambiguous { .. }) => {
+                return Err(self.agent_target_error_body(err))
+            }
+            Err(TerminalTargetError::NotFound { .. }) => {}
+        }
+        if let Some(record) = self
+            .state
+            .archived_agents
+            .iter()
+            .find(|record| archived_matches_target(record, target))
+        {
+            return Ok(record.terminal_id.clone());
+        }
+        if self.state.terminals.contains_key(target) {
+            return Ok(target.to_string());
+        }
+        Err(self.agent_target_error_body(TerminalTargetError::NotFound {
+            target: target.to_string(),
+        }))
+    }
+
     /// Archive an agent (issue #173): release its pane but preserve the session
     /// so it can be resumed later. Record-then-release — the resume identity is
     /// captured into `AppState.archived_agents` FIRST, then the process is
@@ -168,7 +204,7 @@ impl App {
             .iter()
             .find(|record| archived_matches_target(record, target))
         {
-            return Ok(archived_agent_info(existing));
+            return Ok(archived_agent_info(existing, &self.agent_avatars));
         }
 
         let resolved = self
@@ -266,7 +302,7 @@ impl App {
             .archived_agents
             .last()
             .ok_or(AgentArchiveError::NotAgent)?;
-        Ok(archived_agent_info(record))
+        Ok(archived_agent_info(record, &self.agent_avatars))
     }
 
     /// Unarchive an agent (issue #173): resume the stored session into a fresh
@@ -499,7 +535,12 @@ impl App {
         self.state.mark_session_dirty();
         self.schedule_session_save();
 
-        Ok(archived_agent_info(&record))
+        let info = archived_agent_info(&record, &self.agent_avatars);
+        // The picture goes with the record; its image too once unreferenced.
+        if let Err(err) = self.agent_avatars.remove(&record.terminal_id) {
+            tracing::warn!(terminal_id = %record.terminal_id, err = %err, "failed to drop a forgotten agent's avatar");
+        }
+        Ok(info)
     }
 
     /// The public id of a LIVE pane already running the given session, if any.
@@ -1065,6 +1106,7 @@ impl App {
         });
         let account_unresolved = account.is_some() && resolved_account.is_none();
         let account_config_dir = resolved_account.map(|entry| entry.config_dir.clone());
+        let avatar = self.agent_avatars.get(&pane.terminal_id).cloned();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -1114,6 +1156,7 @@ impl App {
                 .session_transfer
                 .as_ref()
                 .map(|transfer| transfer.info()),
+            avatar,
         })
     }
 
@@ -1341,6 +1384,7 @@ fn archived_matches_target(record: &crate::persist::ArchivedAgentSnapshot, targe
 /// the status is idle; the `archived` block is the load-bearing signal.
 fn archived_agent_info(
     record: &crate::persist::ArchivedAgentSnapshot,
+    avatars: &crate::persist::agent_avatars::AgentAvatarStore,
 ) -> crate::api::schema::AgentInfo {
     crate::api::schema::AgentInfo {
         terminal_id: record.terminal_id.clone(),
@@ -1396,6 +1440,7 @@ fn archived_agent_info(
         account_config_dir: None,
         account_unresolved: false,
         session_transfer: None,
+        avatar: avatars.get(&record.terminal_id).cloned(),
     }
 }
 

@@ -399,6 +399,8 @@ pub(crate) enum Operation {
     Transcript(AgentTranscriptParams),
     SendKeys(AgentSendKeysParams),
     Rename(AgentRenameParams),
+    AvatarSet(AvatarSet),
+    AvatarGet(AvatarGet),
     Archive(AgentArchiveParams),
     Unarchive(AgentUnarchiveParams),
     Forget(AgentForgetParams),
@@ -449,6 +451,7 @@ pub(crate) fn command() -> Command {
         .subcommand(leaf("wait", AgentWaitProjection::arguments(), "Wait until an agent reaches one of the requested states")
             .override_usage("herdr agent wait <TARGET> [OPTIONS]")
             .after_help("Without --until, matches idle, done, or blocked. Use --until unknown explicitly when needed. Without --timeout, waits indefinitely."))
+        .subcommand(avatar_command())
         .subcommand(leaf("prompt", AgentPromptProjection::arguments(), "Submit a prompt to an agent")
             .args(AgentPromptWaitProjection::arguments().into_iter().map(|arg| arg.requires("wait")))
             .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
@@ -506,6 +509,7 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Operation, ParseError
         "archive" => Operation::Archive(ArchiveProjection::from_matches(matches)?),
         "unarchive" => Operation::Unarchive(UnarchiveProjection::from_matches(matches)?),
         "forget" => Operation::Forget(ForgetProjection::from_matches(matches)?),
+        "avatar" => avatar_from_matches(matches)?,
         "wait" => Operation::Wait(AgentWaitProjection::from_matches(matches)?),
         "prompt" => {
             let mut params = AgentPromptProjection::from_matches(matches)?;
@@ -523,6 +527,81 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Operation, ParseError
         "explain" => Operation::Explain(ExplainProjection::from_matches(matches)?),
         _ => return Err(ParseError::Usage(format!("unknown agent command: {name}"))),
     })
+}
+
+/// `agent avatar set`: exactly one of a mascot, an image file, or `--clear`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AvatarSet {
+    pub(crate) target: String,
+    pub(crate) mascot: Option<String>,
+    pub(crate) image: Option<std::path::PathBuf>,
+}
+
+/// `agent avatar get`: write the image bytes to `output`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AvatarGet {
+    pub(crate) target: String,
+    pub(crate) sha256: String,
+    pub(crate) output: std::path::PathBuf,
+}
+
+fn avatar_command() -> Command {
+    use clap::Arg;
+    let target = || Arg::new("target").value_name("TARGET").required(true);
+    Command::new("avatar")
+        .about("Show or change an agent's profile picture")
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("set")
+                .about("Pick a bundled mascot, upload a JPEG/PNG (at most 64 KiB), or clear")
+                .override_usage(
+                    "herdr agent avatar set <TARGET> --mascot <ID>|--image <FILE>|--clear",
+                )
+                .arg(target())
+                .arg(Arg::new("mascot").long("mascot").value_name("ID"))
+                .arg(Arg::new("image").long("image").value_name("FILE"))
+                .arg(
+                    Arg::new("clear")
+                        .long("clear")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .group(
+                    ArgGroup::new("avatar")
+                        .args(["mascot", "image", "clear"])
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("get")
+                .about("Save an agent's current image picture to a file")
+                .override_usage("herdr agent avatar get <TARGET> <SHA256> -o <FILE>")
+                .arg(target())
+                .arg(Arg::new("sha256").value_name("SHA256").required(true))
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .required(true),
+                ),
+        )
+}
+
+fn avatar_from_matches(matches: &ArgMatches) -> Result<Operation, ParseError> {
+    let text = |matches: &ArgMatches, id: &str| matches.get_one::<String>(id).cloned();
+    match matches.subcommand() {
+        Some(("set", matches)) => Ok(Operation::AvatarSet(AvatarSet {
+            target: text(matches, "target").unwrap_or_default(),
+            mascot: text(matches, "mascot"),
+            image: text(matches, "image").map(Into::into),
+        })),
+        Some(("get", matches)) => Ok(Operation::AvatarGet(AvatarGet {
+            target: text(matches, "target").unwrap_or_default(),
+            sha256: text(matches, "sha256").unwrap_or_default(),
+            output: text(matches, "output").unwrap_or_default().into(),
+        })),
+        _ => Err(ParseError::Usage("missing agent avatar command".into())),
+    }
 }
 
 #[cfg(test)]

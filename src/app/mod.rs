@@ -140,6 +140,10 @@ pub struct App {
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) policy: AppPolicy,
+    /// Agent profile pictures by terminal id (`agent.avatar.*`). Under the
+    /// config dir when the session persists; a throwaway temp root otherwise
+    /// (tests), so a test never touches the real store.
+    pub(crate) agent_avatars: crate::persist::agent_avatars::AgentAvatarStore,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
@@ -739,6 +743,13 @@ impl App {
             api_rx,
             event_hub,
             last_focus,
+            agent_avatars: crate::persist::agent_avatars::AgentAvatarStore::open(
+                if policy.persist_session {
+                    crate::persist::agent_avatars::AgentAvatarStore::default_root()
+                } else {
+                    crate::persist::agent_avatars::AgentAvatarStore::ephemeral_root()
+                },
+            ),
             policy,
             render_notify,
             render_dirty,

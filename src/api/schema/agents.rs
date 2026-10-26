@@ -122,6 +122,73 @@ pub struct AgentForgetParams {
     pub target: String,
 }
 
+/// How an agent's profile picture is drawn. Clients that do not know a style
+/// fall back to their default picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAvatarStyle {
+    /// One of the mascots bundled in the app, named by `mascot`.
+    Mascot,
+    /// An uploaded JPEG/PNG, fetched by `sha256` with `agent.avatar.get`.
+    Image,
+}
+
+/// An agent's chosen profile picture, keyed by its stable terminal id. Absent
+/// when the agent has none, so clients show their default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAvatar {
+    pub style: AgentAvatarStyle,
+    /// The bundled mascot id for style `mascot` (e.g. `herdy`, `bot`); `null`
+    /// otherwise. Any `^[a-z0-9-]{1,32}$` id is accepted so new mascots need no
+    /// server change; clients fall back for an id they do not ship.
+    #[serde(default)]
+    pub mascot: Option<String>,
+    /// Lowercase hex SHA-256 of the image bytes for style `image`; `null`
+    /// otherwise. Content-addressed, so a client cache never goes stale.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Wall-clock ms of the last change.
+    pub updated_unix_ms: u64,
+}
+
+/// The picture `agent.avatar.set` applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "style", rename_all = "snake_case")]
+pub enum AgentAvatarChoice {
+    Mascot {
+        mascot: String,
+    },
+    /// The bytes travel in `image_base64`.
+    Image,
+}
+
+/// `agent.avatar.set` — choose, replace or clear an agent's profile picture.
+/// Owner only. The picture is shared with every client of this server,
+/// federation peers, and the agent's guests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAvatarSetParams {
+    /// The agent as for `agent.rename`, its terminal id, or an archived agent's
+    /// name or terminal id.
+    pub target: String,
+    /// `null` clears the picture, back to the client's default.
+    pub avatar: Option<AgentAvatarChoice>,
+    /// Style `image` only: the JPEG or PNG bytes, at most 64 KiB decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    /// `image/jpeg` or `image/png`. Optional; the stored type is read from the
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+}
+
+/// `agent.avatar.get` — the bytes of an agent's current image picture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAvatarGetParams {
+    pub target: String,
+    /// The `avatar.sha256` the agent currently carries.
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentViewSetParams {
     pub source: String,
@@ -506,6 +573,23 @@ pub struct AgentInfo {
     /// later transfer replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_transfer: Option<AgentSessionTransferInfo>,
+    /// The agent's chosen profile picture; absent when it has none and the
+    /// client shows its default. A descriptor this build cannot read (a newer
+    /// peer's style) decodes as absent rather than failing the whole agent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_avatar"
+    )]
+    pub avatar: Option<AgentAvatar>,
+}
+
+fn lenient_avatar<'de, D>(deserializer: D) -> Result<Option<AgentAvatar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// The `archived { at, by, reason }` provenance surfaced on an archived

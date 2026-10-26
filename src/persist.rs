@@ -5,6 +5,7 @@
 //! Installed plugins are persisted separately at `plugins.json`.
 
 pub mod activities;
+pub mod agent_avatars;
 pub mod devices;
 pub mod gram;
 pub mod gram_files;
