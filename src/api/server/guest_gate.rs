@@ -246,7 +246,11 @@ fn grant_state(guest: &GuestPrincipal, api_tx: &ApiRequestSender) -> GrantState 
         return GrantState::Gone;
     };
     match probe.agent {
-        Some(agent) if probe.running && grant_matches(&guest.grant, &agent) => {
+        Some(agent)
+            if probe.running
+                && (grant_matches(&guest.grant, &agent)
+                    || renamed_since_admitted(guest, &agent)) =>
+        {
             if let Some(session) = &agent.agent_session {
                 note_resumed_session(guest, session);
             }
@@ -256,6 +260,16 @@ fn grant_state(guest: &GuestPrincipal, api_tx: &ApiRequestSender) -> GrantState 
             pane_id: probe.pane_id,
         },
     }
+}
+
+/// The owner renamed the granted agent after this connection was admitted:
+/// the stored grant followed it (see [`crate::guest::follow_rename`]). Read
+/// only when the admitted grant no longer matches, so a long stream keeps
+/// running across the rename.
+fn renamed_since_admitted(guest: &GuestPrincipal, agent: &AgentInfo) -> bool {
+    crate::guest::store::active_grant(&guest.dir, &guest.guest_id).is_some_and(|grant| {
+        grant.agent_name != guest.grant.agent_name && grant_matches(&grant, agent)
+    })
 }
 
 /// Follow the granted agent onto a new harness session, auditing `resumed`
@@ -876,8 +890,14 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = grant_state(guest, api_tx) else {
                 return paused(&mut stream);
             };
-            if params.to.is_some() && params.to != agent.name {
-                return forbidden(&mut stream);
+            // A client from before a rename may still address the agent by a
+            // name it had; the post always goes to the agent's name now.
+            if let Some(to) = params.to.as_deref() {
+                let names_agent = agent.name.as_deref() == Some(to)
+                    || guest.former_names.iter().any(|former| former.name == to);
+                if !names_agent {
+                    return forbidden(&mut stream);
+                }
             }
             let text = params.text.clone();
             let file = params.file.map(|mut file| {
