@@ -3560,6 +3560,229 @@ mod tests {
         assert_eq!(code(&stale), "invalid_params");
     }
 
+    /// A harness whose app follows renames in the guest store it serves.
+    fn start_renaming(tag: &str) -> Harness {
+        let mut harness = start(tag);
+        harness.dir = TempDir(crate::guest::store::guest_dir());
+        harness
+    }
+
+    /// The owner renames agent `index`, as `herdr agent rename` would.
+    fn rename(harness: &Harness, index: usize, name: &str) {
+        let renamed = owner(
+            harness,
+            json!({"id": "r", "method": "agent.rename", "params": {"target": harness.pane_ids[index], "name": name}}),
+        );
+        assert_eq!(renamed["result"]["agent"]["name"], name, "{renamed}");
+    }
+
+    /// Admit the guest's device again, as the relay link does for every
+    /// request; returns the principal and the admission reply.
+    fn readmit(harness: &Harness, guest: &GuestPrincipal) -> (GuestPrincipal, Value) {
+        let hello = json!({"v": 1, "guest_id": guest.guest_id});
+        match admit_in(harness.dir.0.clone(), [4; 32], &hello) {
+            Admission::Admitted { principal, reply } => (principal, reply),
+            Admission::Refused(error) => panic!("refused: {error}"),
+        }
+    }
+
+    fn prompt_request(target: &str, text: &str) -> Value {
+        json!({"id": "p", "method": "agent.prompt", "params": {"target": target, "text": text}})
+    }
+
+    #[test]
+    fn an_owner_rename_keeps_the_guest_on_the_agent_under_its_new_name() {
+        let _config = ConfigHome::new("rename-access");
+        let harness = start_renaming("rename-access");
+        let _sessions = omp_sessions(&harness);
+        let admitted = harness.admit();
+        let terminal_id = admitted.grant.terminal_id.clone();
+        rename(&harness, 0, "llm-renamed");
+
+        let (guest, reply) = readmit(&harness, &admitted);
+        assert_eq!(reply["agent"]["name"], "llm-renamed", "{reply}");
+        assert_eq!(reply["agent"]["target"], terminal_id.as_str(), "{reply}");
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let agents = list[0]["result"]["agents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{list:?}"));
+        assert_eq!(agents.len(), 1, "{list:?}");
+        assert_eq!(agents[0]["name"], "llm-renamed", "{list:?}");
+        assert_eq!(agents[0]["guest_running"], true, "{list:?}");
+        for target in [
+            "llm-renamed",
+            terminal_id.as_str(),
+            harness.pane_ids[0].as_str(),
+        ] {
+            let get = harness.call(
+                &guest,
+                json!({"id": "g", "method": "agent.get", "params": {"target": target}}),
+            );
+            assert_eq!(
+                get[0]["result"]["agent"]["name"], "llm-renamed",
+                "{target} -> {get:?}"
+            );
+            let lines = harness.call(&guest, transcript(target));
+            assert_eq!(code(&lines), "<success>", "{target} -> {lines:?}");
+        }
+        let lines = harness.call(&guest, prompt_request("llm-renamed", "after the rename"));
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        let written = harness.pty_text(0, Duration::from_millis(600));
+        assert!(
+            written.contains("plotarmordev (via HerdrUp): after the rename"),
+            "{written:?}"
+        );
+        // A connection admitted before the rename follows it too.
+        let lines = harness.call(&admitted, prompt_request(&terminal_id, "same connection"));
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        // The old name no longer names the grant.
+        let old = harness.call(
+            &guest,
+            json!({"id": "g", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        assert_eq!(code(&old), "guest_forbidden", "{old:?}");
+
+        let stored = crate::guest::store::load_store(&harness.dir.0).unwrap();
+        let record = stored
+            .guests
+            .iter()
+            .find(|record| record.guest_id == guest.guest_id)
+            .unwrap();
+        assert!(!record.revoked);
+        assert_eq!(record.grant.terminal_id, terminal_id);
+        assert_eq!(record.grant.agent_name.as_deref(), Some("llm-renamed"));
+
+        // Paused, the agent is described from the grant under its new name.
+        harness.agent_exits();
+        let (guest, _) = readmit(&harness, &admitted);
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let agent = &list[0]["result"]["agents"][0];
+        assert_eq!(agent["guest_running"], false, "{list:?}");
+        assert_eq!(agent["name"], "llm-renamed", "{list:?}");
+    }
+
+    #[test]
+    fn a_guests_live_stream_runs_on_across_a_rename() {
+        let _config = ConfigHome::new("rename-stream");
+        let harness = start_renaming("rename-stream");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_stream(&harness, &guest);
+        rename(&harness, 0, "llm-renamed");
+        // A stream that lost the grant pauses within a second.
+        std::thread::sleep(Duration::from_millis(1500));
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        let end = stream_end(&mut reader);
+        assert_eq!(end["error"]["code"], "guest_revoked", "{end}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_renamed_agents_grams_from_before_and_after_the_rename_stay_with_its_guest() {
+        let _config = ConfigHome::new("rename-gram");
+        let harness = start_renaming("rename-gram");
+        let tick = || std::thread::sleep(Duration::from_millis(5));
+        let admitted = harness.admit_with(0, true);
+        let post = |guest: &GuestPrincipal, params: Value| {
+            let lines = harness.call(
+                guest,
+                json!({"id": "g", "method": "gram.post", "params": params}),
+            );
+            assert_eq!(code(&lines), "<success>", "{lines:?}");
+        };
+        send_gram(&harness, "llm-opt", "agent before");
+        tick();
+        post(&admitted, json!({"text": "guest before"}));
+        tick();
+        rename(&harness, 0, "llm-renamed");
+        tick();
+
+        let (guest, _) = readmit(&harness, &admitted);
+        let granted = Some(harness.pane_ids[0].clone());
+        send_gram_as(&harness, granted, "llm-renamed", "agent after");
+        tick();
+        post(&guest, json!({"text": "guest after"}));
+        tick();
+        // A client from before the rename still addresses the old name.
+        post(
+            &guest,
+            json!({"text": "guest by old name", "to": "llm-opt"}),
+        );
+        tick();
+        let other = harness.call(
+            &guest,
+            json!({"id": "g", "method": "gram.post", "params": {"text": "x", "to": "other-agent"}}),
+        );
+        assert_eq!(code(&other), "guest_forbidden", "{other:?}");
+
+        // Another agent takes the old name: it gets nothing of the grant.
+        rename(&harness, 1, "llm-opt");
+        tick();
+        let impostor = Some(harness.pane_ids[1].clone());
+        let taken = send_gram_as(&harness, impostor, "llm-opt", "impostor");
+
+        let result = guest_list(&harness, &guest, json!({}));
+        assert_eq!(
+            texts(&result),
+            [
+                "guest by old name",
+                "guest after",
+                "agent after",
+                "guest before",
+                "agent before"
+            ]
+        );
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["from"], "llm-renamed");
+        assert_eq!(messages[4]["from"], "llm-opt");
+        let mark = harness.call(
+            &guest,
+            json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [taken]}}),
+        );
+        assert_eq!(code(&mark), "guest_forbidden");
+        for target in ["llm-opt", harness.pane_ids[1].as_str()] {
+            let lines = harness.call(&guest, prompt_request(target, "x"));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let agents = list[0]["result"]["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1, "{list:?}");
+        assert_eq!(agents[0]["name"], "llm-renamed");
+    }
+
+    #[test]
+    fn an_invite_accepted_after_a_rename_binds_the_terminal_under_the_new_name() {
+        let _config = ConfigHome::new("rename-invite");
+        let harness = start_renaming("rename-invite");
+        let invite = harness.invite(0, "friend");
+        rename(&harness, 0, "llm-renamed");
+        let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPad"});
+        let (guest, reply) = match admit_in(harness.dir.0.clone(), [5; 32], &hello) {
+            Admission::Admitted { principal, reply } => (principal, reply),
+            Admission::Refused(error) => panic!("refused: {error}"),
+        };
+        assert_eq!(guest.grant.terminal_id, invite.record.grant.terminal_id);
+        assert_eq!(guest.grant.agent_name.as_deref(), Some("llm-renamed"));
+        assert_eq!(reply["agent"]["name"], "llm-renamed", "{reply}");
+        let lines = harness.call(&guest, prompt_request("llm-renamed", "hello"));
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        let written = harness.pty_text(0, Duration::from_millis(600));
+        assert!(
+            written.contains("friend (via HerdrUp): hello"),
+            "{written:?}"
+        );
+    }
+
     #[test]
     fn gram_methods_need_share_gram() {
         let _config = ConfigHome::new("gram-share");
