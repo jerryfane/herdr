@@ -132,6 +132,8 @@ impl App {
         if terminal.effective_agent_label().is_none() {
             return Err(AgentRenameError::NotAgent);
         }
+        #[cfg(unix)]
+        let previous_name = terminal.agent_name.clone();
         match normalized_name {
             Some(name) => terminal.set_agent_name(name),
             None => terminal.clear_agent_name(),
@@ -139,12 +141,24 @@ impl App {
         self.state.mark_session_dirty();
         self.schedule_session_save();
         self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
-        self.agent_info(resolved.ws_idx, resolved.pane_id)
+        let agent = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(|| {
                 AgentRenameError::Target(TerminalTargetError::NotFound {
                     target: target.to_string(),
                 })
-            })
+            })?;
+        // A guest's grant is this terminal's agent: it keeps the agent under
+        // its new name.
+        #[cfg(unix)]
+        if let (Some(old), Some(new), Some(kind)) = (
+            previous_name.as_deref(),
+            agent.name.as_deref(),
+            agent.agent.as_deref(),
+        ) {
+            crate::guest::follow_rename(&agent.terminal_id, old, new, kind);
+        }
+        Ok(agent)
     }
 
     /// Archive an agent (issue #173): release its pane but preserve the session

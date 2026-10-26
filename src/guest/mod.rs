@@ -65,6 +65,8 @@ pub struct GuestPrincipal {
     pub(crate) dir: PathBuf,
     /// When the guest accepted: it sees the agent's Grams from here on.
     pub(crate) created_ms: u64,
+    /// Names the agent had before the owner renamed it.
+    pub(crate) former_names: Vec<store::FormerName>,
 }
 
 impl GuestPrincipal {
@@ -76,6 +78,7 @@ impl GuestPrincipal {
             grant: record.grant.clone(),
             dir,
             created_ms: record.created_ms,
+            former_names: record.former_names.clone(),
         }
     }
 
@@ -136,17 +139,22 @@ pub(crate) fn post_from(name: &str) -> String {
 }
 
 /// The grant names the agent with this name and kind in this terminal. The
-/// harness session may change: a restarted agent keeps its guest.
+/// harness session may change: a restarted agent keeps its guest. The name
+/// follows the owner's renames (see [`follow_rename`]).
 pub(crate) fn grant_names(
     grant: &GuestGrantInfo,
     terminal_id: &str,
     name: Option<&str>,
     kind: &str,
 ) -> bool {
-    grant.terminal_id == terminal_id
-        && grant.agent_name.is_some()
+    grant.agent_name.is_some()
         && grant.agent_name.as_deref() == name
-        && same_kind(kind, grant.kind())
+        && grant_holds(grant, terminal_id, kind)
+}
+
+/// The grant's terminal and agent kind, whatever the agent is called.
+fn grant_holds(grant: &GuestGrantInfo, terminal_id: &str, kind: &str) -> bool {
+    grant.terminal_id == terminal_id && same_kind(kind, grant.kind())
 }
 
 /// A Gram to the owner came from the granted agent: sent from its terminal,
@@ -158,12 +166,37 @@ pub(crate) fn grant_sent(
     from: &str,
     sender: Option<&crate::persist::gram::GramSender>,
 ) -> bool {
+    grant.agent_name.as_deref() == Some(from) && sent_from_grant(grant, sender)
+}
+
+/// The recorded sender is the grant's terminal and agent kind.
+pub(crate) fn sent_from_grant(
+    grant: &GuestGrantInfo,
+    sender: Option<&crate::persist::gram::GramSender>,
+) -> bool {
     sender.is_some_and(|sender| {
         sender
             .agent
             .as_deref()
-            .is_some_and(|kind| grant_names(grant, &sender.terminal_id, Some(from), kind))
+            .is_some_and(|kind| grant_holds(grant, &sender.terminal_id, kind))
     })
+}
+
+/// The owner renamed the agent in `terminal_id` from `old` to `new`. Its
+/// guests and pending invites follow it: the grant is the terminal's agent,
+/// not the name, so a guest keeps access without a new invite, and another
+/// agent that takes `old` later gets nothing.
+pub(crate) fn follow_rename(terminal_id: &str, old: &str, new: &str, kind: &str) {
+    let dir = store::guest_dir();
+    // No guest was ever invited here: leave the guest directory alone.
+    if old == new || !dir.join("guests.json").exists() {
+        return;
+    }
+    match store::rename_grants(&dir, terminal_id, old, new, kind, store::now_ms()) {
+        Ok(true) => notify_changes(),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "guest grant rename failed"),
+    }
 }
 
 // Short-lived per-connection value; the contract shape stays unboxed.
