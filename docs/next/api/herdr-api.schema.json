@@ -1972,6 +1972,12 @@
                 "null"
               ]
             },
+            "subagent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "target": {
               "type": "string"
             }
@@ -16430,6 +16436,16 @@
                 "session_id": {
                   "type": "string"
                 },
+                "subagents": {
+                  "description": "Running subagents, then those that finished in the newest turn;\nnewest first, at most 20.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/TranscriptSubagent"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "agent_transcript",
                   "type": "string"
@@ -18152,6 +18168,17 @@
             },
             "provider": {
               "type": "string"
+            },
+            "thinking_auto": {
+              "description": "omp picks the level per turn (`/thinking auto`).",
+              "type": "boolean"
+            },
+            "thinking_level": {
+              "description": "The effort omp runs the model at: minimal, low, medium, high, xhigh or\nmax. Absent when thinking is off or the level is unknown.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -18220,6 +18247,94 @@
             "running",
             "ok",
             "error"
+          ],
+          "type": "string"
+        },
+        "TranscriptSubagent": {
+          "description": "A subagent the agent spawned with omp's `task` tool.",
+          "properties": {
+            "agent": {
+              "description": "The agent type, e.g. `reviewer`; may be empty.",
+              "type": "string"
+            },
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "finished_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "has_transcript": {
+              "description": "`agent.transcript` with `subagent` set to `id` pages its conversation.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "The omp agent id, also its job id.",
+              "type": "string"
+            },
+            "label": {
+              "description": "The spawn's description, else its name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_intent": {
+              "description": "The newest tool intent in the subagent's own session file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptSubagentStatus"
+            },
+            "task": {
+              "description": "The assignment, at most 300 characters; owner only.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "agent",
+            "status",
+            "started_ms",
+            "has_transcript"
+          ],
+          "type": "object"
+        },
+        "TranscriptSubagentStatus": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "aborted",
+            "unknown"
           ],
           "type": "string"
         },

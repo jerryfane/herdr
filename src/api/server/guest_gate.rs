@@ -443,7 +443,7 @@ fn project_history(result: ResponseResult) -> Option<serde_json::Value> {
 
 /// The granted agent's conversation without the owner's private parts: no
 /// notes (the owner's fleet traffic), no step details (commands and paths),
-/// and asks only the owner may answer.
+/// no subagent assignments, and asks only the owner may answer.
 fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
     let ResponseResult::AgentTranscript {
         agent,
@@ -457,6 +457,7 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         model,
         plan,
         recap: _,
+        subagents,
     } = result
     else {
         return None;
@@ -503,7 +504,15 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         }
         items
     });
-    Some(serde_json::json!({
+    // A subagent's assignment and its conversation are the owner's.
+    let subagents = subagents.map(|mut subagents| {
+        for subagent in &mut subagents {
+            subagent.task = None;
+            subagent.has_transcript = false;
+        }
+        subagents
+    });
+    let mut projected = serde_json::json!({
         "type": "agent_transcript",
         "agent": agent,
         "pane_id": pane_id,
@@ -517,7 +526,11 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         "plan": serde_json::to_value(plan).ok()?,
         // A recap can summarize owner-only notes or step details; do not expose it to guests.
         "recap": serde_json::Value::Null,
-    }))
+    });
+    if let Some(subagents) = subagents {
+        projected["subagents"] = serde_json::to_value(subagents).ok()?;
+    }
+    Some(projected)
 }
 
 /// The size in effect, the same fields the owner's `pane.set_pty_size` returns.
@@ -680,7 +693,10 @@ pub(super) fn serve_request(
         }
         Method::AgentTranscript(params) => {
             let state = grant_state(guest, api_tx);
-            if !names_grant(&params.target, guest, state.pane_id()) {
+            // A subagent's conversation is the owner's (`project_transcript`
+            // would have to strip every part of it), so asking for one is
+            // refused like any target outside the grant.
+            if params.subagent.is_some() || !names_grant(&params.target, guest, state.pane_id()) {
                 return forbidden(&mut stream);
             }
             let GrantState::Live(agent) = state else {
@@ -2419,6 +2435,7 @@ mod tests {
                     before: None,
                     after: None,
                     limit: None,
+                    subagent: None,
                 }),
             },
             &harness.api_tx,
@@ -2535,6 +2552,69 @@ mod tests {
         ] {
             let lines = harness.call(&guest, transcript(&target));
             assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_guest_sees_subagents_without_assignments_and_cannot_page_one() {
+        use crate::agent_transcript::tests::{call, child_file, spawn_details};
+        let harness = start("transcript-subagents");
+        let mut sessions = omp_sessions(&harness);
+        sessions[0].user("Review it");
+        sessions[0].assistant(
+            vec![call(
+                "t1",
+                "task",
+                Some("Dispatching the review"),
+                json!({"name": "Rev", "agent": "reviewer", "task": "private-assignment-text"}),
+            )],
+            "toolUse",
+        );
+        sessions[0].result(
+            "t1",
+            "task",
+            false,
+            spawn_details(&[("Rev", "private-assignment-text", None)]),
+        );
+        let parent = sessions[0].path.to_string_lossy().into_owned();
+        child_file(&sessions[0].path, "Rev", &parent);
+
+        let owner = dispatch_to_app_with_timeout(
+            serde_json::from_value(transcript("llm-opt")).unwrap(),
+            &harness.api_tx,
+            None,
+        );
+        let owner: Value = serde_json::from_str(&owner).unwrap();
+        let subagent = &owner["result"]["subagents"][0];
+        assert_eq!(subagent["task"], "private-assignment-text", "{owner}");
+        assert_eq!(subagent["has_transcript"], true, "{owner}");
+        let owner_child = dispatch_to_app_with_timeout(
+            serde_json::from_value(json!({"id": "c", "method": "agent.transcript", "params": {"target": "llm-opt", "subagent": "Rev"}})).unwrap(),
+            &harness.api_tx,
+            None,
+        );
+        let owner_child: Value = serde_json::from_str(&owner_child).unwrap();
+        assert_eq!(
+            owner_child["result"]["session_id"], "child-Rev",
+            "{owner_child}"
+        );
+
+        let guest = harness.admit();
+        let lines = harness.call(&guest, transcript("llm-opt"));
+        let subagent = &lines[0]["result"]["subagents"][0];
+        assert_eq!(subagent["id"], "Rev", "{lines:?}");
+        assert_eq!(subagent["status"], "running");
+        assert_eq!(subagent["agent"], "reviewer");
+        assert!(subagent["task"].is_null());
+        assert_eq!(subagent["has_transcript"], false);
+        assert!(!lines[0].to_string().contains("private-assignment-text"));
+
+        for subagent in ["Rev", "../Rev", "Missing"] {
+            let lines = harness.call(
+                &guest,
+                json!({"id": "t", "method": "agent.transcript", "params": {"target": "llm-opt", "subagent": subagent}}),
+            );
+            assert_eq!(code(&lines), "guest_forbidden", "{subagent} -> {lines:?}");
         }
     }
 
