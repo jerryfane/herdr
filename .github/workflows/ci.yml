@@ -196,7 +196,15 @@ jobs:
           | test(recap_is_current_metadata_not_a_conversation_entry_and_can_be_cleared)
           | test(late_recap_cannot_cross_new_work_or_a_reset)
           | test(recap_rejects_wrong_identity_unknown_version_and_empty_text)
-          | test(guest_transcript_metadata_preserves_progress_without_private_blockers)'
+          | test(guest_transcript_metadata_preserves_progress_without_private_blockers)
+          | test(current_model_carries_the_newest_thinking_level)
+          | test(a_background_task_is_a_running_subagent_until_its_async_result)
+          | test(an_exit_or_a_clear_settles_running_subagents)
+          | test(a_subagent_reports_its_own_files_newest_intent_and_end)
+          | test(the_subagent_param_pages_only_a_real_child_of_the_session)
+          | test(task_step_details_and_results_name_the_subagents)
+          | test(a_guest_sees_subagents_without_assignments_and_cannot_page_one)
+          | test(agent_transcript_projection_maps_cursors_and_limit)'
 
       - name: Run macOS checks
         if: runner.os == 'macOS'
