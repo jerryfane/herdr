@@ -124,6 +124,7 @@ impl AgentAvatarStore {
         Self { root, agents }
     }
 
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }

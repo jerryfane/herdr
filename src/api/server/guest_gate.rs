@@ -2135,6 +2135,7 @@ mod tests {
         let (sha_tx, sha_rx) = std_mpsc::channel();
         let other = harness.pane_ids[1].clone();
         let png = encoded.clone();
+        let other_pane = other.clone();
         harness
             .control
             .send(Box::new(move |app: &mut App| {
@@ -2152,7 +2153,7 @@ mod tests {
                 };
                 let granted = set(app, "llm-opt", None).expect("granted image");
                 // The other agent carries the very same image bytes.
-                let other_sha = set(app, &other, None).expect("other image");
+                let other_sha = set(app, &other_pane, None).expect("other image");
                 let _ = sha_tx.send((granted, other_sha));
             }))
             .unwrap();
