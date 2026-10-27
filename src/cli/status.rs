@@ -433,6 +433,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_forget: false,
+                agent_avatar: false,
                 api_bridge_multi: false,
                 pane_history: false,
                 agent_answer: false,

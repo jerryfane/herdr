@@ -96,12 +96,14 @@ impl App {
         let agent = self.agent_info(resolved.ws_idx, resolved.pane_id);
         let running =
             agent.is_some() && self.agent_pane_runs_agent(resolved.ws_idx, resolved.pane_id);
+        let avatar = self.agent_avatars.get(&resolved.terminal_id).cloned();
         encode_success(
             id,
             ResponseResult::GuestAgentProbed {
                 pane_id,
                 agent,
                 running,
+                avatar,
             },
         )
     }
@@ -155,6 +157,146 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentInfo { agent })
+    }
+
+    /// `agent.avatar.set` — choose, replace or clear an agent's picture, then
+    /// announce the live agent's change like a rename does.
+    pub(super) fn handle_agent_avatar_set(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAvatarSetParams,
+    ) -> String {
+        use crate::api::schema::AgentAvatarChoice;
+        use crate::persist::agent_avatars::{AvatarError, MAX_IMAGE_BYTES};
+
+        let terminal_id = match self.avatar_terminal_id(&params.target) {
+            Ok(terminal_id) => terminal_id,
+            Err(body) => return encode_error_body(id, body),
+        };
+        let is_image = matches!(params.avatar, Some(AgentAvatarChoice::Image));
+        if !is_image && (params.image_base64.is_some() || params.mime.is_some()) {
+            return encode_error(
+                id,
+                "invalid_avatar",
+                "image_base64 and mime are only valid with style image",
+            );
+        }
+        let now = crate::app::actions::current_unix_ms();
+        let result = match params.avatar {
+            None => self
+                .agent_avatars
+                .remove(&terminal_id)
+                .map(|_| None)
+                .map_err(AvatarError::Io),
+            Some(AgentAvatarChoice::Mascot { mascot }) => self
+                .agent_avatars
+                .set_mascot(&terminal_id, &mascot, now)
+                .map(Some),
+            Some(AgentAvatarChoice::Image) => {
+                if let Some(mime) = params
+                    .mime
+                    .as_deref()
+                    .filter(|mime| !matches!(*mime, "image/jpeg" | "image/png"))
+                {
+                    return encode_error(
+                        id,
+                        "invalid_avatar",
+                        format!("mime must be image/jpeg or image/png, got {mime:?}"),
+                    );
+                }
+                let Some(encoded) = params.image_base64.as_deref() else {
+                    return encode_error(id, "invalid_avatar", "style image requires image_base64");
+                };
+                // Refuse an oversized payload before allocating its bytes.
+                if encoded.len() / 4 * 3 > MAX_IMAGE_BYTES + 2 {
+                    return encode_error(
+                        id,
+                        "avatar_too_large",
+                        format!("image exceeds {MAX_IMAGE_BYTES} bytes"),
+                    );
+                }
+                use base64::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    Ok(bytes) => self
+                        .agent_avatars
+                        .set_image(&terminal_id, &bytes, now)
+                        .map(Some),
+                    Err(err) => {
+                        return encode_error(
+                            id,
+                            "invalid_avatar",
+                            format!("image_base64 is not valid base64: {err}"),
+                        )
+                    }
+                }
+            }
+        };
+        let avatar = match result {
+            Ok(avatar) => avatar,
+            Err(AvatarError::Invalid(message)) => {
+                return encode_error(id, "invalid_avatar", message)
+            }
+            Err(AvatarError::TooLarge(len)) => {
+                return encode_error(
+                    id,
+                    "avatar_too_large",
+                    format!("image is {len} bytes; the limit is {MAX_IMAGE_BYTES}"),
+                )
+            }
+            Err(AvatarError::Io(err)) => {
+                return encode_error(id, "avatar_save_failed", err.to_string())
+            }
+        };
+        if let Some(target) = self.terminal_target_for_terminal_id(&terminal_id) {
+            self.emit_pane_updated(target.ws_idx, target.pane_id);
+        }
+        encode_success(id, ResponseResult::AgentAvatarSet { avatar })
+    }
+
+    /// `agent.avatar.get` — the bytes of the target's CURRENT image. Any
+    /// other hash is `avatar_not_found`, so a caller allowed one agent cannot
+    /// read another agent's picture by its hash.
+    pub(super) fn handle_agent_avatar_get(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAvatarGetParams,
+    ) -> String {
+        let terminal_id = match self.avatar_terminal_id(&params.target) {
+            Ok(terminal_id) => terminal_id,
+            Err(body) => return encode_error_body(id, body),
+        };
+        let not_found = |id| {
+            encode_error(
+                id,
+                "avatar_not_found",
+                format!(
+                    "agent target {} has no image {}",
+                    params.target, params.sha256
+                ),
+            )
+        };
+        if self
+            .agent_avatars
+            .get(&terminal_id)
+            .and_then(|avatar| avatar.sha256.as_deref())
+            != Some(params.sha256.as_str())
+        {
+            return not_found(id);
+        }
+        match self.agent_avatars.image(&params.sha256) {
+            Ok(Some((mime, bytes))) => {
+                use base64::Engine as _;
+                encode_success(
+                    id,
+                    ResponseResult::AgentAvatarImage {
+                        mime: mime.to_string(),
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    },
+                )
+            }
+            Ok(None) => not_found(id),
+            Err(err) => encode_error(id, "avatar_read_failed", err.to_string()),
+        }
     }
 
     /// `agent.archive` — take an agent out of active rotation, preserving its
@@ -5256,5 +5398,296 @@ mod tests {
         assert_eq!(archived.parked_work, vec![serde_json::json!({"task": "x"})]);
         // Paneless: no live pane ids.
         assert!(archived.pane_id.is_empty());
+    }
+
+    fn avatar_set(app: &mut App, target: &str, params: serde_json::Value) -> serde_json::Value {
+        let mut params = params;
+        params["target"] = serde_json::json!(target);
+        let response = app.handle_agent_avatar_set(
+            "req".into(),
+            serde_json::from_value(params).expect("avatar.set params"),
+        );
+        serde_json::from_str(&response).unwrap()
+    }
+
+    fn avatar_get(app: &mut App, target: &str, sha256: &str) -> serde_json::Value {
+        let response = app.handle_agent_avatar_get(
+            "req".into(),
+            crate::api::schema::AgentAvatarGetParams {
+                target: target.into(),
+                sha256: sha256.into(),
+            },
+        );
+        serde_json::from_str(&response).unwrap()
+    }
+
+    fn listed_avatar(app: &App, terminal_id: &str) -> Option<crate::api::schema::AgentAvatar> {
+        app.collect_agent_infos()
+            .into_iter()
+            .find(|agent| agent.terminal_id == terminal_id)
+            .expect("agent listed")
+            .avatar
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn agent_avatar_mascot_and_image_round_trip_and_clear() {
+        use crate::persist::agent_avatars::tests::{JPEG, PNG};
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        assert_eq!(listed_avatar(&app, &terminal_id), None);
+        let unset = serde_json::to_value(app.agent_info_for_target("reviewer").unwrap()).unwrap();
+        assert!(
+            unset.get("avatar").is_none(),
+            "unset avatar is omitted: {unset}"
+        );
+
+        let set = avatar_set(
+            &mut app,
+            "reviewer",
+            serde_json::json!({"avatar": {"style": "mascot", "mascot": "bot"}}),
+        );
+        assert_eq!(set["result"]["type"], "agent_avatar_set");
+        assert_eq!(set["result"]["avatar"]["style"], "mascot");
+        assert_eq!(set["result"]["avatar"]["mascot"], "bot");
+        let listed = listed_avatar(&app, &terminal_id).expect("mascot listed");
+        assert_eq!(listed.mascot.as_deref(), Some("bot"));
+        let wire = serde_json::to_value(app.agent_info_for_target("reviewer").unwrap()).unwrap();
+        assert_eq!(wire["avatar"]["style"], "mascot");
+        assert_eq!(wire["avatar"]["sha256"], serde_json::Value::Null);
+
+        let set = avatar_set(
+            &mut app,
+            &terminal_id,
+            serde_json::json!({"avatar": {"style": "image"}, "image_base64": b64(PNG), "mime": "image/png"}),
+        );
+        let sha = set["result"]["avatar"]["sha256"]
+            .as_str()
+            .expect("sha256")
+            .to_string();
+        assert_eq!(sha.len(), 64);
+        let got = avatar_get(&mut app, "reviewer", &sha);
+        assert_eq!(got["result"]["type"], "agent_avatar_image");
+        assert_eq!(got["result"]["mime"], "image/png");
+        assert_eq!(got["result"]["data_base64"], b64(PNG));
+
+        // Replacing the image deletes the old blob.
+        let set = avatar_set(
+            &mut app,
+            "reviewer",
+            serde_json::json!({"avatar": {"style": "image"}, "image_base64": b64(JPEG)}),
+        );
+        let jpeg_sha = set["result"]["avatar"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !app.agent_avatars.root().join(&sha).exists(),
+            "old blob collected"
+        );
+        assert_eq!(
+            avatar_get(&mut app, "reviewer", &sha)["error"]["code"],
+            "avatar_not_found"
+        );
+        assert_eq!(
+            avatar_get(&mut app, "reviewer", &jpeg_sha)["result"]["mime"],
+            "image/jpeg"
+        );
+
+        // null clears back to the default and collects the blob.
+        let cleared = avatar_set(&mut app, "reviewer", serde_json::json!({"avatar": null}));
+        assert_eq!(cleared["result"]["avatar"], serde_json::Value::Null);
+        assert_eq!(listed_avatar(&app, &terminal_id), None);
+        assert!(!app.agent_avatars.root().join(&jpeg_sha).exists());
+    }
+
+    #[tokio::test]
+    async fn agent_avatar_set_rejects_bad_input() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let code = |value: serde_json::Value| {
+            value["error"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let mut big = vec![0xFF, 0xD8, 0xFF];
+        big.resize(64 * 1024 + 1, 0);
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "image"}, "image_base64": b64(&big)})
+            )),
+            "avatar_too_large"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "image"}, "image_base64": b64(b"GIF89a not a picture")})
+            )),
+            "invalid_avatar"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "image"}})
+            )),
+            "invalid_avatar"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "image"}, "image_base64": "!!!"})
+            )),
+            "invalid_avatar"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "mascot", "mascot": "Not/OK"}})
+            )),
+            "invalid_avatar"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "reviewer",
+                serde_json::json!({"avatar": {"style": "mascot", "mascot": "bot"}, "image_base64": "AAAA"})
+            )),
+            "invalid_avatar"
+        );
+        assert_eq!(
+            code(avatar_set(
+                &mut app,
+                "nobody",
+                serde_json::json!({"avatar": {"style": "mascot", "mascot": "bot"}})
+            )),
+            "agent_not_found"
+        );
+        assert_eq!(
+            listed_avatar(&app, &terminal_id),
+            None,
+            "nothing was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_avatar_survives_rename_archive_unarchive_and_reload_then_forget_drops_it() {
+        use crate::persist::agent_avatars::{tests::PNG, AgentAvatarStore};
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let set = avatar_set(
+            &mut app,
+            "reviewer",
+            serde_json::json!({"avatar": {"style": "image"}, "image_base64": b64(PNG)}),
+        );
+        let sha = set["result"]["avatar"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let blob = app.agent_avatars.root().join(&sha);
+
+        app.handle_agent_rename(
+            "req".into(),
+            AgentRenameParams {
+                target: "reviewer".into(),
+                name: Some("critic".into()),
+            },
+        );
+        assert_eq!(
+            listed_avatar(&app, &terminal_id).and_then(|a| a.sha256),
+            Some(sha.clone())
+        );
+        app.handle_agent_rename(
+            "req".into(),
+            AgentRenameParams {
+                target: "critic".into(),
+                name: Some("reviewer".into()),
+            },
+        );
+
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: None,
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        assert_eq!(app.state.archived_agents.len(), 1);
+        assert_eq!(
+            listed_avatar(&app, &terminal_id).and_then(|a| a.sha256),
+            Some(sha.clone())
+        );
+        // An archived agent's picture can still be fetched and changed.
+        assert_eq!(
+            avatar_get(&mut app, "reviewer", &sha)["result"]["mime"],
+            "image/png"
+        );
+
+        // A daemon restart reads the same index.
+        let reloaded = AgentAvatarStore::open(app.agent_avatars.root().to_path_buf());
+        assert_eq!(
+            reloaded.get(&terminal_id).and_then(|a| a.sha256.clone()),
+            Some(sha.clone())
+        );
+
+        let forgot = app.handle_agent_forget(
+            "req".into(),
+            AgentForgetParams {
+                target: "reviewer".into(),
+            },
+        );
+        assert!(forgot.contains("\"result\""), "{forgot}");
+        assert!(app.agent_avatars.get(&terminal_id).is_none());
+        assert!(!blob.exists(), "forget collects the unreferenced blob");
+        let reloaded = AgentAvatarStore::open(app.agent_avatars.root().to_path_buf());
+        assert!(reloaded.get(&terminal_id).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_avatar_survives_unarchive() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        avatar_set(
+            &mut app,
+            "reviewer",
+            serde_json::json!({"avatar": {"style": "mascot", "mascot": "cub"}}),
+        );
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: None,
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+        assert!(app.state.archived_agents.is_empty());
+        assert_eq!(
+            listed_avatar(&app, &terminal_id).and_then(|avatar| avatar.mascot),
+            Some("cub".to_string())
+        );
     }
 }

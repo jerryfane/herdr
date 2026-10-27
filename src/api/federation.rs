@@ -142,9 +142,9 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         // Observe methods whose target can be owned by a remote peer.
         // `workspace.get`/`tab.get`/`tab.list` route an `<alias>/…` workspace or
         // tab id to its owning peer; a bare `tab.list` stays local.
-        "agent.get" | "agent.read" | "agent.transcript" | "agent.explain" | "pane.read"
-        | "pane.history" | "pane.turns" | "pane.stream" | "workspace.get" | "tab.list"
-        | "tab.get" => (AllowedAt(Observe), true),
+        "agent.get" | "agent.read" | "agent.transcript" | "agent.explain" | "agent.avatar.get"
+        | "pane.read" | "pane.history" | "pane.turns" | "pane.stream" | "workspace.get"
+        | "tab.list" | "tab.get" => (AllowedAt(Observe), true),
         // Other read-only inspection stays local when called at the home.
         "ping"
         | "agent.list"
@@ -169,8 +169,10 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
             (AllowedAt(Interact), true)
         }
         // Admin methods with an explicit remote-owned target.
-        "agent.focus" | "agent.rename" | "agent.restart" | "agent.answer" | "pane.send_input"
-        | "pane.input.set" | "pane.rename" | "pane.set_pty_size" => (AllowedAt(Admin), true),
+        "agent.focus" | "agent.rename" | "agent.avatar.set" | "agent.restart" | "agent.answer"
+        | "pane.send_input" | "pane.input.set" | "pane.rename" | "pane.set_pty_size" => {
+            (AllowedAt(Admin), true)
+        }
         // Admin methods whose payload has no remote ownership target.
         "agent.view.set" | "agent.view.clear" => (AllowedAt(Admin), false),
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
@@ -346,6 +348,15 @@ mod tests {
             federation_access("agent.rename"),
             AllowedAt(CapabilityTier::Admin)
         );
+        // Agent pictures: anyone who may look at an agent may fetch its
+        // picture; changing it is admin, like a rename. Both route to the
+        // agent's origin daemon.
+        let avatar_get = federation_method_policy("agent.avatar.get");
+        assert_eq!(avatar_get.access, AllowedAt(CapabilityTier::Observe));
+        assert!(avatar_get.outbound_routable);
+        let avatar_set = federation_method_policy("agent.avatar.set");
+        assert_eq!(avatar_set.access, AllowedAt(CapabilityTier::Admin));
+        assert!(avatar_set.outbound_routable);
         // Default-deny for anything unlisted, including an unknown/new name.
         assert_eq!(federation_access("server.stop"), Denied);
         assert_eq!(federation_access("agent.start"), Denied);

@@ -168,6 +168,8 @@ pub(super) struct Probe {
     pub pane_id: String,
     pub agent: Option<AgentInfo>,
     pub running: bool,
+    /// The terminal's picture, agent or not.
+    pub avatar: Option<crate::api::schema::AgentAvatar>,
 }
 
 /// Probe by terminal id (any pane) or by agent target (agent panes only).
@@ -195,12 +197,14 @@ pub(super) fn probe_target(
                     pane_id,
                     agent,
                     running,
+                    avatar,
                 },
             ..
         }) => Ok(Probe {
             pane_id,
             agent,
             running,
+            avatar,
         }),
         _ => Err(response),
     }
@@ -221,7 +225,10 @@ enum GrantState {
     /// The granted agent is running.
     Live(Box<AgentInfo>),
     /// The granted terminal exists but does not run the granted agent now.
-    Paused { pane_id: String },
+    Paused {
+        pane_id: String,
+        avatar: Option<crate::api::schema::AgentAvatar>,
+    },
     /// The granted terminal is gone.
     Gone,
 }
@@ -235,7 +242,7 @@ impl GrantState {
     fn pane_id(&self) -> Option<&str> {
         match self {
             Self::Live(agent) => Some(&agent.pane_id),
-            Self::Paused { pane_id } => Some(pane_id),
+            Self::Paused { pane_id, .. } => Some(pane_id),
             Self::Gone => None,
         }
     }
@@ -258,6 +265,7 @@ fn grant_state(guest: &GuestPrincipal, api_tx: &ApiRequestSender) -> GrantState 
         }
         _ => GrantState::Paused {
             pane_id: probe.pane_id,
+            avatar: probe.avatar,
         },
     }
 }
@@ -305,6 +313,9 @@ struct GuestAgentView<'a> {
     display_agent: Option<&'a str>,
     agent_status: crate::api::schema::AgentStatus,
     guest_running: bool,
+    /// The owner's chosen picture; guests always see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar: Option<&'a crate::api::schema::AgentAvatar>,
 }
 
 fn guest_view(agent: &AgentInfo, running: bool) -> serde_json::Value {
@@ -316,12 +327,18 @@ fn guest_view(agent: &AgentInfo, running: bool) -> serde_json::Value {
         display_agent: agent.display_agent.as_deref(),
         agent_status: agent.agent_status,
         guest_running: running,
+        avatar: agent.avatar.as_ref(),
     })
     .unwrap_or_default()
 }
 
-/// The granted agent while paused, described from the grant alone.
-fn paused_view(guest: &GuestPrincipal, pane_id: &str) -> serde_json::Value {
+/// The granted agent while paused, described from the grant alone plus the
+/// picture stored for the granted terminal.
+fn paused_view(
+    guest: &GuestPrincipal,
+    pane_id: &str,
+    avatar: Option<&crate::api::schema::AgentAvatar>,
+) -> serde_json::Value {
     serde_json::to_value(GuestAgentView {
         terminal_id: &guest.grant.terminal_id,
         pane_id,
@@ -330,6 +347,7 @@ fn paused_view(guest: &GuestPrincipal, pane_id: &str) -> serde_json::Value {
         display_agent: None,
         agent_status: crate::api::schema::AgentStatus::Unknown,
         guest_running: false,
+        avatar,
     })
     .unwrap_or_default()
 }
@@ -338,7 +356,9 @@ fn paused_view(guest: &GuestPrincipal, pane_id: &str) -> serde_json::Value {
 fn state_view(guest: &GuestPrincipal, state: &GrantState) -> Option<serde_json::Value> {
     match state {
         GrantState::Live(agent) => Some(guest_view(agent, true)),
-        GrantState::Paused { pane_id } => Some(paused_view(guest, pane_id)),
+        GrantState::Paused { pane_id, avatar } => {
+            Some(paused_view(guest, pane_id, avatar.as_ref()))
+        }
         GrantState::Gone => None,
     }
 }
@@ -396,8 +416,17 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true},
     }))
+}
+
+fn project_avatar_image(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::AgentAvatarImage { mime, data_base64 } = result else {
+        return None;
+    };
+    Some(
+        serde_json::json!({"type": "agent_avatar_image", "mime": mime, "data_base64": data_base64}),
+    )
 }
 
 fn project_prompted(result: ResponseResult) -> Option<serde_json::Value> {
@@ -652,6 +681,29 @@ pub(super) fn serve_request(
             };
             let result = serde_json::json!({"type": "agent_info", "agent": agent});
             write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
+        }
+        Method::AgentAvatarGet(params) => {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.target, guest, state.pane_id()) {
+                return forbidden(&mut stream);
+            }
+            if state.pane_id().is_none() {
+                return paused(&mut stream);
+            }
+            // Only the granted terminal's current image: the app refuses any
+            // hash that terminal does not carry.
+            let request = Request {
+                id: id.clone(),
+                method: Method::AgentAvatarGet(crate::api::schema::AgentAvatarGetParams {
+                    target: guest.grant.terminal_id.clone(),
+                    sha256: params.sha256,
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_avatar_image),
+            )
         }
         Method::AgentRead(params) => {
             let state = grant_state(guest, api_tx);
@@ -2091,6 +2143,84 @@ mod tests {
         ));
     }
 
+    /// The owner's picture reaches the guest (live and paused); the guest
+    /// may fetch only the granted terminal's image and never change one.
+    #[test]
+    fn guest_sees_and_fetches_only_the_granted_agents_avatar() {
+        use base64::Engine as _;
+        let harness = start("avatar");
+        let guest = harness.admit();
+        let image = crate::persist::agent_avatars::tests::PNG.to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&image);
+        let (sha_tx, sha_rx) = std_mpsc::channel();
+        let other = harness.pane_ids[1].clone();
+        let png = encoded.clone();
+        let other_pane = other.clone();
+        harness
+            .control
+            .send(Box::new(move |app: &mut App| {
+                let set = |app: &mut App, target: &str, mascot: Option<&str>| {
+                    let params = match mascot {
+                        Some(mascot) => json!({"target": target, "avatar": {"style": "mascot", "mascot": mascot}}),
+                        None => json!({"target": target, "avatar": {"style": "image"}, "image_base64": png}),
+                    };
+                    let response: Value = serde_json::from_str(&app.handle_api_request(Request {
+                        id: "owner".into(),
+                        method: Method::AgentAvatarSet(serde_json::from_value(params).unwrap()),
+                    }))
+                    .unwrap();
+                    response["result"]["avatar"]["sha256"].as_str().map(str::to_string)
+                };
+                let granted = set(app, "llm-opt", None).expect("granted image");
+                // The other agent carries the very same image bytes.
+                let other_sha = set(app, &other_pane, None).expect("other image");
+                let _ = sha_tx.send((granted, other_sha));
+            }))
+            .unwrap();
+        let (sha, other_sha) = sha_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(sha, other_sha, "content-addressed");
+
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let agents = list[0]["result"]["agents"].as_array().unwrap();
+        assert_eq!(agents[0]["avatar"]["style"], "image", "{list:?}");
+        assert_eq!(agents[0]["avatar"]["sha256"], sha.as_str());
+
+        let get = |target: &str| {
+            harness.call(
+                &guest,
+                json!({"id": "a", "method": "agent.avatar.get", "params": {"target": target, "sha256": sha}}),
+            )
+        };
+        let got = get("llm-opt");
+        assert_eq!(got[0]["result"]["type"], "agent_avatar_image", "{got:?}");
+        assert_eq!(got[0]["result"]["mime"], "image/png");
+        assert_eq!(got[0]["result"]["data_base64"], encoded.as_str());
+        assert_eq!(code(&get(&other)), "guest_forbidden");
+        assert_eq!(code(&get("other-agent")), "guest_forbidden");
+
+        let set = harness.call(
+            &guest,
+            json!({"id": "s", "method": "agent.avatar.set", "params": {"target": "llm-opt", "avatar": null}}),
+        );
+        assert_eq!(code(&set), "guest_forbidden");
+
+        // Paused: the grant still shows and serves its picture.
+        harness.agent_exits();
+        std::thread::sleep(Duration::from_millis(50));
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let agents = list[0]["result"]["agents"].as_array().unwrap();
+        assert_eq!(agents[0]["guest_running"], false, "{list:?}");
+        assert_eq!(agents[0]["avatar"]["sha256"], sha.as_str(), "{list:?}");
+        let got = get(&guest.grant.terminal_id);
+        assert_eq!(got[0]["result"]["mime"], "image/png", "{got:?}");
+    }
+
     #[test]
     fn agent_list_shows_only_the_grant_and_pauses_when_the_agent_exits() {
         let harness = start("list");
@@ -3084,7 +3214,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true}),
+            json!({"agent_transcript": true, "agent_avatar": true}),
             "only what the gate serves"
         );
 

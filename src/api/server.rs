@@ -209,6 +209,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         events_v2: true,
         ssh_agent_registration: false,
         agent_forget: true,
+        agent_avatar: true,
         api_bridge_multi: cfg!(unix),
         pane_history: true,
         agent_answer: true,
@@ -1938,6 +1939,9 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // the SAME target string worked (#181), because the read methods above are routed
         // and these were not. The tier table and this table must agree; they did not.
         Method::AgentRename(params) => Some(&mut params.target),
+        // A federated agent's picture lives on its origin daemon.
+        Method::AgentAvatarSet(params) => Some(&mut params.target),
+        Method::AgentAvatarGet(params) => Some(&mut params.target),
         Method::AgentFocus(params) => Some(&mut params.target),
         Method::PaneRename(params) => Some(&mut params.pane_id),
         Method::PaneInputSet(params) => Some(&mut params.pane_id),
@@ -3402,6 +3406,7 @@ mod tests {
                 events_v2: false,
                 ssh_agent_registration: false,
                 agent_forget: false,
+                agent_avatar: false,
                 api_bridge_multi: false,
                 pane_history: false,
                 agent_answer: false,
@@ -4786,6 +4791,8 @@ mod federation_tests {
             ("agent.explain", AllowedAt(Observe)),
             ("agent.send_keys", AllowedAt(Interact)),
             ("agent.rename", AllowedAt(Admin)),
+            ("agent.avatar.set", AllowedAt(Admin)),
+            ("agent.avatar.get", AllowedAt(Observe)),
             ("agent.archive", Denied),
             ("agent.unarchive", Denied),
             ("agent.forget", Denied),
@@ -6723,6 +6730,14 @@ mod federation_tests {
             (
                 "agent.rename",
                 serde_json::json!({ "target": "remote/w1:p1", "name": "x" }),
+            ),
+            (
+                "agent.avatar.set",
+                serde_json::json!({ "target": "remote/w1:p1", "avatar": { "style": "mascot", "mascot": "bot" } }),
+            ),
+            (
+                "agent.avatar.get",
+                serde_json::json!({ "target": "remote/w1:p1", "sha256": "0".repeat(64) }),
             ),
             (
                 "agent.focus",

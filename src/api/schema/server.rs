@@ -82,6 +82,9 @@ pub struct ServerCapabilities {
     /// Supports `agent.forget` (remove an archived agent's record).
     #[serde(default)]
     pub agent_forget: bool,
+    /// Supports `agent.avatar.set`/`agent.avatar.get` and `AgentInfo.avatar`.
+    #[serde(default)]
+    pub agent_avatar: bool,
     /// `herdr api-bridge --multi` forwards newline-delimited requests over one
     /// long-lived bridge process instead of one process per request.
     #[serde(default)]
