@@ -3726,6 +3726,16 @@ mod tests {
         assert_eq!(renamed["result"]["agent"]["name"], name, "{renamed}");
     }
 
+    /// The owner clears agent `index`'s name, as `herdr agent rename --clear`.
+    fn clear_name(harness: &Harness, index: usize) {
+        let cleared = owner(
+            harness,
+            json!({"id": "r", "method": "agent.rename", "params": {"target": harness.pane_ids[index]}}),
+        );
+        assert!(cleared["result"]["agent"].is_object(), "{cleared}");
+        assert!(cleared["result"]["agent"]["name"].is_null(), "{cleared}");
+    }
+
     /// Admit the guest's device again, as the relay link does for every
     /// request; returns the principal and the admission reply.
     fn readmit(harness: &Harness, guest: &GuestPrincipal) -> (GuestPrincipal, Value) {
@@ -3738,6 +3748,73 @@ mod tests {
 
     fn prompt_request(target: &str, text: &str) -> Value {
         json!({"id": "p", "method": "agent.prompt", "params": {"target": target, "text": text}})
+    }
+
+    /// #327: the grant is the terminal's agent, so it follows the agent when
+    /// the owner names it again after clearing its name.
+    #[test]
+    fn a_guest_keeps_its_agent_named_again_after_a_clear() {
+        let _config = ConfigHome::new("rename-clear");
+        let harness = start_renaming("rename-clear");
+        let admitted = harness.admit();
+        let terminal_id = admitted.grant.terminal_id.clone();
+        let get = |guest: &GuestPrincipal, target: &str| {
+            harness.call(
+                guest,
+                json!({"id": "g", "method": "agent.get", "params": {"target": target}}),
+            )
+        };
+
+        // While it has no name the guest is paused and sees the agent under
+        // the last name it had.
+        clear_name(&harness, 0);
+        let (guest, _) = readmit(&harness, &admitted);
+        let lines = harness.call(&guest, prompt_request(&terminal_id, "unnamed"));
+        assert_eq!(code(&lines), "guest_paused", "{lines:?}");
+        let lines = get(&guest, &terminal_id);
+        let agent = &lines[0]["result"]["agent"];
+        assert_eq!(agent["guest_running"], false, "{lines:?}");
+        assert_eq!(agent["name"], "llm-opt", "{lines:?}");
+
+        // Another terminal takes the free name: it gets nothing.
+        rename(&harness, 1, "llm-opt");
+        let lines = harness.call(&guest, prompt_request("llm-opt", "impostor"));
+        assert_eq!(code(&lines), "guest_paused", "{lines:?}");
+        let lines = harness.call(&guest, prompt_request(&harness.pane_ids[1], "impostor"));
+        assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+        assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+
+        // Named again, the agent is the guest's under its new name.
+        rename(&harness, 0, "llm-back");
+        let (guest, reply) = readmit(&harness, &admitted);
+        assert_eq!(reply["agent"]["name"], "llm-back", "{reply}");
+        for target in ["llm-back", terminal_id.as_str()] {
+            let lines = get(&guest, target);
+            let agent = &lines[0]["result"]["agent"];
+            assert_eq!(agent["name"], "llm-back", "{target} -> {lines:?}");
+            assert_eq!(agent["guest_running"], true, "{target} -> {lines:?}");
+        }
+        let lines = harness.call(&guest, prompt_request("llm-back", "named again"));
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        // A connection admitted before the clear follows it too.
+        let lines = harness.call(&admitted, prompt_request(&terminal_id, "same connection"));
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        let written = harness.pty_text(0, Duration::from_millis(600));
+        assert!(
+            written.contains("plotarmordev (via HerdrUp): named again")
+                && written.contains("plotarmordev (via HerdrUp): same connection"),
+            "{written:?}"
+        );
+
+        // The old name, now another terminal's, no longer names the grant.
+        for target in ["llm-opt", harness.pane_ids[1].as_str()] {
+            let lines = harness.call(&guest, prompt_request(target, "impostor"));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+        let stored = crate::guest::store::active_grant(&harness.dir.0, &guest.guest_id).unwrap();
+        assert_eq!(stored.terminal_id, terminal_id);
+        assert_eq!(stored.agent_name.as_deref(), Some("llm-back"));
     }
 
     #[test]

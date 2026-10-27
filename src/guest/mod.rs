@@ -185,11 +185,13 @@ pub(crate) fn sent_from_grant(
 /// The owner renamed the agent in `terminal_id` from `old` to `new`. Its
 /// guests and pending invites follow it: the grant is the terminal's agent,
 /// not the name, so a guest keeps access without a new invite, and another
-/// agent that takes `old` later gets nothing.
-pub(crate) fn follow_rename(terminal_id: &str, old: &str, new: &str, kind: &str) {
+/// agent that takes `old` later gets nothing. With no `old` (the name was
+/// cleared, or the agent lost it when it exited), the terminal's grants
+/// follow from the last name they knew it by.
+pub(crate) fn follow_rename(terminal_id: &str, old: Option<&str>, new: &str, kind: &str) {
     let dir = store::guest_dir();
     // No guest was ever invited here: leave the guest directory alone.
-    if old == new || !dir.join("guests.json").exists() {
+    if old == Some(new) || !dir.join("guests.json").exists() {
         return;
     }
     match store::rename_grants(&dir, terminal_id, old, new, kind, store::now_ms()) {

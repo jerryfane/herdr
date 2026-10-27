@@ -154,14 +154,10 @@ impl App {
                 })
             })?;
         // A guest's grant is this terminal's agent: it keeps the agent under
-        // its new name.
+        // its new name, also when the agent had no name before (#327).
         #[cfg(unix)]
-        if let (Some(old), Some(new), Some(kind)) = (
-            previous_name.as_deref(),
-            agent.name.as_deref(),
-            agent.agent.as_deref(),
-        ) {
-            crate::guest::follow_rename(&agent.terminal_id, old, new, kind);
+        if let (Some(new), Some(kind)) = (agent.name.as_deref(), agent.agent.as_deref()) {
+            crate::guest::follow_rename(&agent.terminal_id, previous_name.as_deref(), new, kind);
         }
         Ok(agent)
     }
