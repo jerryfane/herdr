@@ -432,31 +432,45 @@ pub(crate) fn active_grant(dir: &Path, guest_id: &str) -> Option<GuestGrantInfo>
 
 /// The owner renamed the agent in `terminal_id` from `old` to `new`: every
 /// active guest and pending invite granted that agent (this terminal, the
-/// old name, this kind) now names it `new`, and each guest remembers `old`
-/// for its Gram from before `now`. Returns whether anything changed.
+/// old name, this kind) now names it `new`, and each guest remembers the
+/// name it had for its Gram from before `now`. With no `old` the agent had
+/// no name, and the grants of this terminal and kind follow from whatever
+/// name they last knew it by. Returns whether anything changed.
 pub(crate) fn rename_grants(
     dir: &Path,
     terminal_id: &str,
-    old: &str,
+    old: Option<&str>,
     new: &str,
     kind: &str,
     now: u64,
 ) -> io::Result<bool> {
+    let follows = |grant: &GuestGrantInfo| match old {
+        Some(old) => super::grant_names(grant, terminal_id, Some(old), kind),
+        None => {
+            grant.agent_name.as_deref().is_some_and(|name| name != new)
+                && super::grant_holds(grant, terminal_id, kind)
+        }
+    };
     update_store(dir, |store| {
         let mut changed = false;
-        for guest in store.guests.iter_mut().filter(|guest| {
-            !guest.revoked && super::grant_names(&guest.grant, terminal_id, Some(old), kind)
-        }) {
-            guest.grant.agent_name = Some(new.to_string());
-            guest.former_names.push(FormerName {
-                name: old.to_string(),
-                until_ms: now,
-            });
+        for guest in store
+            .guests
+            .iter_mut()
+            .filter(|guest| !guest.revoked && follows(&guest.grant))
+        {
+            if let Some(name) = guest.grant.agent_name.replace(new.to_string()) {
+                guest.former_names.push(FormerName {
+                    name,
+                    until_ms: now,
+                });
+            }
             changed = true;
         }
-        for invite in store.invites.iter_mut().filter(|invite| {
-            invite.pending(now) && super::grant_names(&invite.grant, terminal_id, Some(old), kind)
-        }) {
+        for invite in store
+            .invites
+            .iter_mut()
+            .filter(|invite| invite.pending(now) && follows(&invite.grant))
+        {
             invite.grant.agent_name = Some(new.to_string());
             changed = true;
         }
@@ -1289,11 +1303,19 @@ pub(crate) mod tests {
         .unwrap();
 
         // Another kind or another name in the terminal is not the grant.
-        assert!(!rename_grants(&dir.0, "term_1", "llm-opt", "x", "claude", at(4_000)).unwrap());
-        assert!(!rename_grants(&dir.0, "term_1", "other", "x", "pi", at(4_000)).unwrap());
         assert!(
-            rename_grants(&dir.0, "term_1", "llm-opt", "llm-renamed", "pi", at(5_000)).unwrap()
+            !rename_grants(&dir.0, "term_1", Some("llm-opt"), "x", "claude", at(4_000)).unwrap()
         );
+        assert!(!rename_grants(&dir.0, "term_1", Some("other"), "x", "pi", at(4_000)).unwrap());
+        assert!(rename_grants(
+            &dir.0,
+            "term_1",
+            Some("llm-opt"),
+            "llm-renamed",
+            "pi",
+            at(5_000)
+        )
+        .unwrap());
 
         // A fresh load: what the next admission reads.
         let store = load_store(&dir.0).unwrap();
@@ -1352,20 +1374,54 @@ pub(crate) mod tests {
         assert!(late.former_names.is_empty());
 
         // Renaming back keeps both former names, oldest first.
-        assert!(
-            rename_grants(&dir.0, "term_1", "llm-renamed", "llm-opt", "pi", at(7_000)).unwrap()
+        assert!(rename_grants(
+            &dir.0,
+            "term_1",
+            Some("llm-renamed"),
+            "llm-opt",
+            "pi",
+            at(7_000)
+        )
+        .unwrap());
+        let names = || -> Vec<String> {
+            load_store(&dir.0)
+                .unwrap()
+                .guests
+                .iter()
+                .find(|record| record.guest_id == guest.guest_id)
+                .unwrap()
+                .former_names
+                .iter()
+                .map(|former| former.name.clone())
+                .collect()
+        };
+        assert_eq!(names(), ["llm-opt", "llm-renamed"]);
+
+        // Named again after its name was cleared, the agent in the
+        // terminal keeps its grants: they follow from their last name. Only
+        // that terminal's agent of that kind.
+        assert!(!rename_grants(&dir.0, "term_1", None, "x", "claude", at(8_000)).unwrap());
+        assert!(!rename_grants(&dir.0, "term_9", None, "x", "pi", at(8_000)).unwrap());
+        assert!(!rename_grants(&dir.0, "term_1", None, "llm-opt", "pi", at(8_000)).unwrap());
+        assert!(rename_grants(&dir.0, "term_1", None, "llm-named", "pi", at(9_000)).unwrap());
+        assert_eq!(
+            active_grant(&dir.0, &guest.guest_id)
+                .unwrap()
+                .agent_name
+                .as_deref(),
+            Some("llm-named")
         );
-        let names: Vec<String> = load_store(&dir.0)
-            .unwrap()
-            .guests
-            .iter()
-            .find(|record| record.guest_id == guest.guest_id)
-            .unwrap()
-            .former_names
-            .iter()
-            .map(|former| former.name.clone())
-            .collect();
-        assert_eq!(names, ["llm-opt", "llm-renamed"]);
+        assert_eq!(names(), ["llm-opt", "llm-renamed", "llm-opt"]);
+        let store = load_store(&dir.0).unwrap();
+        assert_eq!(
+            store
+                .invites
+                .iter()
+                .find(|invite| invite.invite_id == elsewhere.record.invite_id)
+                .and_then(|invite| invite.grant.agent_name.as_deref()),
+            Some("llm-opt"),
+            "another terminal's grant stays where it was"
+        );
     }
 
     #[test]
