@@ -1696,6 +1696,10 @@ impl App {
             Method::AgentAvatarGet(params) => {
                 return self.handle_agent_avatar_get(request.id, params)
             }
+            Method::AgentGroupsGet(_) => return self.handle_agent_groups_get(request.id),
+            Method::AgentGroupsSet(params) => {
+                return self.handle_agent_groups_set(request.id, params)
+            }
             Method::AgentArchive(params) => return self.handle_agent_archive(request.id, params),
             Method::AgentUnarchive(params) => {
                 return self.handle_agent_unarchive(request.id, params)

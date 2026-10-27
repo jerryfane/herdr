@@ -132,6 +132,8 @@ operations::define_operations! {
     AgentRename(AgentRenameParams) => "agent.rename", true, false;
     AgentAvatarSet(AgentAvatarSetParams) => "agent.avatar.set", false, false;
     AgentAvatarGet(AgentAvatarGetParams) => "agent.avatar.get", false, false;
+    AgentGroupsGet(EmptyParams) => "agent.groups.get", false, false;
+    AgentGroupsSet(AgentGroupsSetParams) => "agent.groups.set", false, false;
     AgentArchive(AgentArchiveParams) => "agent.archive", false, false;
     AgentUnarchive(AgentUnarchiveParams) => "agent.unarchive", false, false;
     AgentForget(AgentForgetParams) => "agent.forget", false, false;

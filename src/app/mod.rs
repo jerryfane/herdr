@@ -144,6 +144,9 @@ pub struct App {
     /// config dir when the session persists; a throwaway temp root otherwise
     /// (tests), so a test never touches the real store.
     pub(crate) agent_avatars: crate::persist::agent_avatars::AgentAvatarStore,
+    /// The owner's agent folders and stars (`agent.groups.*`), rooted like
+    /// `agent_avatars`.
+    pub(crate) agent_groups: crate::persist::agent_groups::AgentGroupsStore,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
@@ -748,6 +751,13 @@ impl App {
                     crate::persist::agent_avatars::AgentAvatarStore::default_root()
                 } else {
                     crate::persist::agent_avatars::AgentAvatarStore::ephemeral_root()
+                },
+            ),
+            agent_groups: crate::persist::agent_groups::AgentGroupsStore::open(
+                if policy.persist_session {
+                    crate::persist::agent_groups::AgentGroupsStore::default_root()
+                } else {
+                    crate::persist::agent_groups::AgentGroupsStore::ephemeral_root()
                 },
             ),
             policy,

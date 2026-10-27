@@ -189,6 +189,48 @@ pub struct AgentAvatarGetParams {
     pub sha256: String,
 }
 
+/// One of the owner's agent folders. Members are agent names, so a folder
+/// keeps its agents across restarts and follows `agent.rename`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentGroupFolder {
+    /// Client-chosen id, unique within the document; 1-64 characters.
+    pub id: String,
+    /// Display name; 1-64 characters.
+    pub name: String,
+    /// Client-defined sort position; folders are listed by it.
+    pub order: i64,
+    /// Agent names, each in at most one folder; 1-64 characters each.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+/// The owner's agent folders and stars (`agent.groups.get`). Owner only;
+/// guests never see it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentGroups {
+    /// Bumped by every change; 0 before the first `agent.groups.set`.
+    pub revision: u64,
+    pub folders: Vec<AgentGroupFolder>,
+    /// Starred agent names.
+    pub stars: Vec<String>,
+}
+
+/// `agent.groups.set` — replace the whole folders-and-stars document. Owner
+/// only. Answers `groups_conflict`, with the stored document in
+/// `error.current`, when `revision` is not the stored revision, and
+/// `invalid_groups` when the document breaks a limit: at most 64 folders, 256
+/// members in total and 256 stars, no duplicate folder ids, an agent in at
+/// most one folder and starred at most once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentGroupsSetParams {
+    /// The revision the client last read.
+    pub revision: u64,
+    /// Every folder; the whole list is replaced.
+    pub folders: Vec<AgentGroupFolder>,
+    /// Every starred agent name; the whole list is replaced.
+    pub stars: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentViewSetParams {
     pub source: String,

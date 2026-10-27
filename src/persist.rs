@@ -6,6 +6,7 @@
 
 pub mod activities;
 pub mod agent_avatars;
+pub mod agent_groups;
 pub mod devices;
 pub mod gram;
 pub mod gram_files;
