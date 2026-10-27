@@ -123,6 +123,12 @@ pub enum ResponseResult {
         mime: String,
         data_base64: String,
     },
+    /// `agent.groups.get`/`agent.groups.set`: the owner's folders and stars.
+    AgentGroups {
+        revision: u64,
+        folders: Vec<super::agents::AgentGroupFolder>,
+        stars: Vec<String>,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
         /// Install-stable identity of the daemon that produced this response.

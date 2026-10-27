@@ -137,14 +137,26 @@ impl App {
         if terminal.effective_agent_label().is_none() {
             return Err(AgentRenameError::NotAgent);
         }
-        #[cfg(unix)]
         let previous_name = terminal.agent_name.clone();
         match normalized_name {
             Some(name) => terminal.set_agent_name(name),
             None => terminal.clear_agent_name(),
         }
+        let new_name = terminal.agent_name.clone();
         self.state.mark_session_dirty();
         self.schedule_session_save();
+        // The owner's folders and stars hold names: they move to the new
+        // name, also when the agent is named again after a clear (#329). A
+        // clear alone keeps them under the old name.
+        let terminals = self.agent_groups_terminals();
+        if let Err(err) = self.agent_groups.follow_rename(
+            &resolved.terminal_id,
+            previous_name.as_deref(),
+            new_name.as_deref(),
+            |terminal_id| terminals.contains(terminal_id),
+        ) {
+            tracing::warn!(err = %err, "agent groups did not follow the rename");
+        }
         self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
         let agent = self
             .agent_info(resolved.ws_idx, resolved.pane_id)
@@ -160,6 +172,35 @@ impl App {
             crate::guest::follow_rename(&agent.terminal_id, previous_name.as_deref(), new, kind);
         }
         Ok(agent)
+    }
+
+    /// Terminal ids the agent groups store may remember a cleared name for:
+    /// every live terminal and every archived agent's (unarchive keeps it).
+    pub(super) fn agent_groups_terminals(&self) -> std::collections::HashSet<String> {
+        self.state
+            .terminals
+            .keys()
+            .map(ToString::to_string)
+            .chain(
+                self.state
+                    .archived_agents
+                    .iter()
+                    .map(|record| record.terminal_id.clone()),
+            )
+            .collect()
+    }
+
+    /// The agent in `terminal_id` took `name` without a rename (started or
+    /// unarchived with it): a clear another terminal remembered for that name
+    /// must not carry this agent's folder and star away.
+    fn agent_groups_name_taken(&self, terminal_id: &str, name: &str) {
+        let terminals = self.agent_groups_terminals();
+        if let Err(err) = self
+            .agent_groups
+            .name_taken(terminal_id, name, |id| terminals.contains(id))
+        {
+            tracing::warn!(err = %err, "agent groups did not record the new name");
+        }
     }
 
     /// The terminal id an `agent.avatar.*` target names: a live agent (as for
@@ -446,6 +487,9 @@ impl App {
             );
         }
         self.state.terminals.insert(terminal_id.clone(), terminal);
+        if let Some(name) = record.name.as_deref() {
+            self.agent_groups_name_taken(&record.terminal_id, name);
+        }
 
         // Re-apply the pane label BEFORE the pane is placed, so whichever branch below
         // takes it, the restored pane is addressable by the name it had. Fleet tooling
@@ -938,6 +982,7 @@ impl App {
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
+        self.agent_groups_name_taken(&terminal_id.to_string(), &name);
 
         let agent = self
             .agent_info(ws_idx, pane_id)

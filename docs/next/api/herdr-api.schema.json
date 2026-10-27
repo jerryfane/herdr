@@ -1832,6 +1832,69 @@
           ],
           "type": "object"
         },
+        "AgentGroupFolder": {
+          "description": "One of the owner's agent folders. Members are agent names, so a folder\nkeeps its agents across restarts and follows `agent.rename`.",
+          "properties": {
+            "id": {
+              "description": "Client-chosen id, unique within the document; 1-64 characters.",
+              "type": "string"
+            },
+            "members": {
+              "default": [],
+              "description": "Agent names, each in at most one folder; 1-64 characters each.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "Display name; 1-64 characters.",
+              "type": "string"
+            },
+            "order": {
+              "description": "Client-defined sort position; folders are listed by it.",
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "order"
+          ],
+          "type": "object"
+        },
+        "AgentGroupsSetParams": {
+          "description": "`agent.groups.set` — replace the whole folders-and-stars document. Owner\nonly. Answers `groups_conflict`, with the stored document in\n`error.current`, when `revision` is not the stored revision, and\n`invalid_groups` when the document breaks a limit: at most 64 folders, 256\nmembers in total and 256 stars, no duplicate folder ids, an agent in at\nmost one folder and starred at most once.",
+          "properties": {
+            "folders": {
+              "description": "Every folder; the whole list is replaced.",
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentGroupFolder"
+              },
+              "type": "array"
+            },
+            "revision": {
+              "description": "The revision the client last read.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stars": {
+              "description": "Every starred agent name; the whole list is replaced.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "revision",
+            "folders",
+            "stars"
+          ],
+          "type": "object"
+        },
         "AgentListParams": {
           "description": "Controls whether `agent.list` returns the coordinator's cached remote agents.\n\nOrdinary callers get the aggregate view. Federation pollers request the\nlocal-only view so peers never re-export an already aggregated directory.",
           "properties": {
@@ -7380,6 +7443,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.groups.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.groups.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentGroupsSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.archive",
               "type": "string"
             },
@@ -11444,6 +11539,38 @@
               "type": "string"
             }
           ]
+        },
+        "AgentGroupFolder": {
+          "description": "One of the owner's agent folders. Members are agent names, so a folder\nkeeps its agents across restarts and follows `agent.rename`.",
+          "properties": {
+            "id": {
+              "description": "Client-chosen id, unique within the document; 1-64 characters.",
+              "type": "string"
+            },
+            "members": {
+              "default": [],
+              "description": "Agent names, each in at most one folder; 1-64 characters each.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "Display name; 1-64 characters.",
+              "type": "string"
+            },
+            "order": {
+              "description": "Client-defined sort position; folders are listed by it.",
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "order"
+          ],
+          "type": "object"
         },
         "AgentInfo": {
           "properties": {
@@ -16106,6 +16233,39 @@
               "type": "object"
             },
             {
+              "description": "`agent.groups.get`/`agent.groups.set`: the owner's folders and stars.",
+              "properties": {
+                "folders": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentGroupFolder"
+                  },
+                  "type": "array"
+                },
+                "revision": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "stars": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_groups",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "revision",
+                "folders",
+                "stars"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agents": {
                   "items": {
@@ -17819,6 +17979,11 @@
             "agent_forget": {
               "default": false,
               "description": "Supports `agent.forget` (remove an archived agent's record).",
+              "type": "boolean"
+            },
+            "agent_groups": {
+              "default": false,
+              "description": "Supports `agent.groups.get`/`agent.groups.set` (owner folders and stars).",
               "type": "boolean"
             },
             "agent_session_transfer": {

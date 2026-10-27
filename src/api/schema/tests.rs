@@ -1187,6 +1187,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 agent_forget: false,
                 agent_avatar: false,
+                agent_groups: false,
                 api_bridge_multi: false,
                 pane_history: false,
                 agent_answer: false,

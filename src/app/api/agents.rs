@@ -299,6 +299,46 @@ impl App {
         }
     }
 
+    /// `agent.groups.get` — the owner's folders and stars.
+    pub(super) fn handle_agent_groups_get(&mut self, id: String) -> String {
+        encode_success(id, groups_result(self.agent_groups.get()))
+    }
+
+    /// `agent.groups.set` — replace the folders and stars when the caller read
+    /// the stored revision. A conflict carries the stored document in
+    /// `error.current` so the client can merge and retry without a round trip.
+    pub(super) fn handle_agent_groups_set(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentGroupsSetParams,
+    ) -> String {
+        use crate::persist::agent_groups::GroupsError;
+
+        let terminals = self.agent_groups_terminals();
+        match self.agent_groups.set(
+            params.revision,
+            params.folders,
+            params.stars,
+            |terminal_id| terminals.contains(terminal_id),
+        ) {
+            Ok(groups) => encode_success(id, groups_result(groups)),
+            Err(GroupsError::Invalid(message)) => encode_error(id, "invalid_groups", message),
+            Err(GroupsError::Conflict(current)) => serde_json::json!({
+                "id": id,
+                "error": {
+                    "code": "groups_conflict",
+                    "message": format!(
+                        "agent groups changed: revision {} is stored, not {}",
+                        current.revision, params.revision
+                    ),
+                    "current": current,
+                },
+            })
+            .to_string(),
+            Err(GroupsError::Io(err)) => encode_error(id, "groups_write_failed", err.to_string()),
+        }
+    }
+
     /// `agent.archive` — take an agent out of active rotation, preserving its
     /// session (issue #173).
     pub(super) fn handle_agent_archive(
@@ -1182,6 +1222,14 @@ fn migrate_session_for_account_swap(
     std::fs::copy(&source, &target_file)
         .map_err(|err| format!("couldn't copy the session file: {err}"))?;
     Ok(())
+}
+
+fn groups_result(groups: crate::api::schema::AgentGroups) -> ResponseResult {
+    ResponseResult::AgentGroups {
+        revision: groups.revision,
+        folders: groups.folders,
+        stars: groups.stars,
+    }
 }
 
 #[cfg(test)]
@@ -5579,6 +5627,197 @@ mod tests {
             None,
             "nothing was stored"
         );
+    }
+
+    fn groups_set(
+        app: &mut App,
+        revision: u64,
+        folders: serde_json::Value,
+        stars: serde_json::Value,
+    ) -> serde_json::Value {
+        let params = serde_json::from_value(
+            serde_json::json!({"revision": revision, "folders": folders, "stars": stars}),
+        )
+        .unwrap();
+        serde_json::from_str(&app.handle_agent_groups_set("req".into(), params)).unwrap()
+    }
+
+    fn groups_get(app: &mut App) -> serde_json::Value {
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_agent_groups_get("req".into())).unwrap();
+        response["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn agent_groups_set_get_conflict_and_invalid_on_the_wire() {
+        let mut app = app_with_agent();
+        assert_eq!(
+            groups_get(&mut app),
+            serde_json::json!({"type": "agent_groups", "revision": 0, "folders": [], "stars": []})
+        );
+        let folders = serde_json::json!([
+            {"id": "f1", "name": "Reviews", "order": 0, "members": ["enyo-review", "enyo-efm"]},
+        ]);
+        let set = groups_set(&mut app, 0, folders.clone(), serde_json::json!(["llm-opt"]));
+        let expected = serde_json::json!({
+            "type": "agent_groups",
+            "revision": 1,
+            "folders": folders,
+            "stars": ["llm-opt"],
+        });
+        assert_eq!(set["result"], expected);
+        assert_eq!(groups_get(&mut app), expected);
+
+        // Another device still at revision 0 loses, and learns the current
+        // document from the error.
+        let stale = groups_set(&mut app, 0, serde_json::json!([]), serde_json::json!([]));
+        assert_eq!(stale["error"]["code"], "groups_conflict", "{stale}");
+        assert_eq!(stale["error"]["current"]["revision"], 1);
+        assert_eq!(stale["error"]["current"]["folders"], expected["folders"]);
+        assert_eq!(stale["error"]["current"]["stars"], expected["stars"]);
+
+        let invalid = groups_set(
+            &mut app,
+            1,
+            serde_json::json!([
+                {"id": "f1", "name": "A", "order": 0, "members": ["x"]},
+                {"id": "f2", "name": "B", "order": 1, "members": ["x"]},
+            ]),
+            serde_json::json!([]),
+        );
+        assert_eq!(invalid["error"]["code"], "invalid_groups", "{invalid}");
+        assert_eq!(groups_get(&mut app), expected, "refusals change nothing");
+    }
+
+    #[tokio::test]
+    async fn agent_groups_follow_a_rename_and_a_rename_after_a_clear() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        groups_set(
+            &mut app,
+            0,
+            serde_json::json!([{"id": "f1", "name": "Reviews", "order": 0, "members": ["reviewer", "other"]}]),
+            serde_json::json!(["reviewer"]),
+        );
+        let rename = |app: &mut App, target: &str, name: Option<&str>| -> serde_json::Value {
+            serde_json::from_str(&app.handle_agent_rename(
+                "req".into(),
+                AgentRenameParams {
+                    target: target.into(),
+                    name: name.map(str::to_string),
+                },
+            ))
+            .unwrap()
+        };
+
+        let renamed = rename(&mut app, "reviewer", Some("critic"));
+        let pane_id = renamed["result"]["agent"]["pane_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{renamed}"))
+            .to_string();
+        let groups = groups_get(&mut app);
+        assert_eq!(groups["revision"], 2);
+        assert_eq!(
+            groups["folders"][0]["members"],
+            serde_json::json!(["critic", "other"])
+        );
+        assert_eq!(groups["stars"], serde_json::json!(["critic"]));
+
+        let cleared = rename(&mut app, &pane_id, None);
+        assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+        assert_eq!(
+            groups_get(&mut app),
+            groups,
+            "a clear keeps folder and star"
+        );
+
+        rename(&mut app, &pane_id, Some("auditor"));
+        let groups = groups_get(&mut app);
+        assert_eq!(groups["revision"], 3);
+        assert_eq!(
+            groups["folders"][0]["members"],
+            serde_json::json!(["auditor", "other"])
+        );
+        assert_eq!(groups["stars"], serde_json::json!(["auditor"]));
+    }
+
+    /// t1 ("old", filed and starred) is cleared; t2 then takes "old", by
+    /// `agent.rename` or by `agent.start --name`. Naming t1 again must leave
+    /// "old"'s folder and star with t2.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_groups_stay_with_the_agent_that_took_a_cleared_name() {
+        for by_start in [false, true] {
+            let mut app = app_with_agent();
+            app.state.workspaces.push(Workspace::test_new("second"));
+            app.state.ensure_test_terminals();
+            arm_resumable_claude_in(&mut app, 0, "old");
+            let t1_pane = app
+                .pane_info(0, app.state.workspaces[0].tabs[0].root_pane)
+                .unwrap()
+                .pane_id;
+            groups_set(
+                &mut app,
+                0,
+                serde_json::json!([{"id": "f1", "name": "Reviews", "order": 0, "members": ["old"]}]),
+                serde_json::json!(["old"]),
+            );
+            let rename = |app: &mut App, target: &str, name: Option<&str>| -> serde_json::Value {
+                serde_json::from_str(&app.handle_agent_rename(
+                    "req".into(),
+                    AgentRenameParams {
+                        target: target.into(),
+                        name: name.map(str::to_string),
+                    },
+                ))
+                .unwrap()
+            };
+            let cleared = rename(&mut app, &t1_pane, None);
+            assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+
+            // Keep the channel open so the start's typed command is accepted.
+            let mut _t2_input = None;
+            if by_start {
+                let t2_root = app.state.workspaces[1].tabs[0].root_pane;
+                let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+                _t2_input = Some(rx);
+                let t2_terminal = app.state.workspaces[1].tabs[0].panes[&t2_root]
+                    .attached_terminal_id
+                    .clone();
+                app.terminal_runtimes.insert(t2_terminal, runtime);
+                let started: serde_json::Value = serde_json::from_str(&app.handle_agent_start(
+                    "req".into(),
+                    AgentStartParams {
+                        name: "old".into(),
+                        kind: "pi".into(),
+                        pane_id: app.pane_info(1, t2_root).unwrap().pane_id,
+                        args: Vec::new(),
+                        timeout_ms: Some(4_000),
+                        account: None,
+                    },
+                ))
+                .unwrap();
+                assert_eq!(started["result"]["type"], "agent_started", "{started}");
+            } else {
+                arm_resumable_claude_in(&mut app, 1, "x");
+                let took = rename(&mut app, "x", Some("old"));
+                assert_eq!(took["result"]["agent"]["name"], "old", "{took}");
+            }
+
+            let named = rename(&mut app, &t1_pane, Some("new"));
+            assert_eq!(named["result"]["agent"]["name"], "new", "{named}");
+            let groups = groups_get(&mut app);
+            assert_eq!(
+                groups["folders"][0]["members"],
+                serde_json::json!(["old"]),
+                "by_start={by_start}"
+            );
+            assert_eq!(
+                groups["stars"],
+                serde_json::json!(["old"]),
+                "by_start={by_start}"
+            );
+        }
     }
 
     #[tokio::test]

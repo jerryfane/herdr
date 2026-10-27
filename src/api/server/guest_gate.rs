@@ -2143,6 +2143,51 @@ mod tests {
         ));
     }
 
+    /// Folders and stars are the owner's: a guest can neither read nor change
+    /// them, and the granted agent's folder and star never reach it.
+    #[test]
+    fn guests_cannot_read_or_change_agent_groups() {
+        let harness = start("groups");
+        let guest = harness.admit();
+        let stored = owner(
+            &harness,
+            json!({"id": "o", "method": "agent.groups.set", "params": {
+                "revision": 0,
+                "folders": [{"id": "f1", "name": "Private folder", "order": 0, "members": ["llm-opt"]}],
+                "stars": ["llm-opt"],
+            }}),
+        );
+        assert_eq!(stored["result"]["revision"], 1, "{stored}");
+
+        for request in [
+            json!({"id": "g", "method": "agent.groups.get", "params": {}}),
+            json!({"id": "s", "method": "agent.groups.set", "params": {"revision": 1, "folders": [], "stars": []}}),
+        ] {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+        }
+        let after = owner(
+            &harness,
+            json!({"id": "o", "method": "agent.groups.get", "params": {}}),
+        );
+        assert_eq!(
+            after["result"], stored["result"],
+            "the guest changed nothing"
+        );
+
+        for request in [
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+            json!({"id": "p", "method": "ping", "params": {}}),
+        ] {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "<success>", "{request} -> {lines:?}");
+            let text = serde_json::to_string(&lines).unwrap();
+            for owner_only in ["Private folder", "folders", "stars", "agent_groups"] {
+                assert!(!text.contains(owner_only), "{owner_only} in {text}");
+            }
+        }
+    }
+
     /// The owner's picture reaches the guest (live and paused); the guest
     /// may fetch only the granted terminal's image and never change one.
     #[test]
