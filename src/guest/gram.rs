@@ -22,32 +22,52 @@ type ReadMarks = BTreeMap<String, BTreeSet<String>>;
 /// itself sent (see [`super::grant_sent`]), or the guest's own post to it,
 /// created since the guest accepted. It does not depend on the agent running
 /// now: what qualifies is fixed by who sent it, so history stays readable
-/// while the grant is paused and nothing new can qualify meanwhile.
+/// while the grant is paused and nothing new can qualify meanwhile. A Gram
+/// from before the owner renamed the agent names it by the name it had then.
 pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
-    visible_in(&guest.grant, guest.created_ms, &guest.name, item)
+    visible_in(
+        &guest.grant,
+        &guest.former_names,
+        guest.created_ms,
+        &guest.name,
+        item,
+    )
 }
 
 /// [`visible`] for a stored guest record.
 pub(crate) fn visible_to(guest: &store::GuestRecord, item: &GramItem) -> bool {
-    visible_in(&guest.grant, guest.created_ms, &guest.name, item)
+    visible_in(
+        &guest.grant,
+        &guest.former_names,
+        guest.created_ms,
+        &guest.name,
+        item,
+    )
 }
 
 fn visible_in(
     grant: &crate::api::schema::GuestGrantInfo,
+    former_names: &[store::FormerName],
     created_ms: u64,
     name: &str,
     item: &GramItem,
 ) -> bool {
-    let Some(agent) = grant.agent_name.as_deref() else {
-        return false;
-    };
-    if item.created_unix_ms < created_ms {
+    if grant.agent_name.is_none() || item.created_unix_ms < created_ms {
         return false;
     }
+    // The agent's name now, or a name it had when the Gram was created.
+    let names_agent = |agent: &str| {
+        grant.agent_name.as_deref() == Some(agent)
+            || former_names
+                .iter()
+                .any(|former| former.name == agent && item.created_unix_ms < former.until_ms)
+    };
     match item.direction {
-        GramDirection::AgentToOwner => super::grant_sent(grant, &item.from, item.sender.as_ref()),
+        GramDirection::AgentToOwner => {
+            names_agent(&item.from) && super::sent_from_grant(grant, item.sender.as_ref())
+        }
         GramDirection::OwnerToAgent => {
-            item.to.as_deref() == Some(agent) && item.from == super::post_from(name)
+            item.to.as_deref().is_some_and(names_agent) && item.from == super::post_from(name)
         }
     }
 }
