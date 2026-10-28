@@ -584,7 +584,7 @@ mod tests {
             format!("{EXPECTED_RELEASE_ROOT}preview-2026-01-01-000000000000/herdr-{key}").into();
         let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
 
-        let err = platform_asset(&manifest).err().expect("wrong release tag");
+        let err = platform_asset(&manifest).expect_err("wrong release tag");
         assert_eq!(err.code(), "update_manifest_invalid");
     }
 
@@ -600,7 +600,7 @@ mod tests {
                 serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
             value["assets"][&key]["sha256"] = sha.clone();
             let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
-            let err = platform_asset(&manifest).err().expect("sha256 required");
+            let err = platform_asset(&manifest).expect_err("sha256 required");
             assert_eq!(err.code(), "update_manifest_invalid", "{sha}");
         }
     }
@@ -617,7 +617,7 @@ mod tests {
                 serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
             value["assets"][&key]["size"] = size.clone();
             let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
-            let err = platform_asset(&manifest).err().expect("size required");
+            let err = platform_asset(&manifest).expect_err("size required");
             assert_eq!(err.code(), "update_manifest_invalid", "{size}");
         }
         let manifest = manifest(BUILD_ID, COMMIT, 1_800_000_000);
