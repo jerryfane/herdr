@@ -25,6 +25,7 @@ use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
 mod keys;
+pub(crate) mod server_update;
 #[cfg(all(test, unix))]
 mod test_signing;
 pub(crate) mod verify;

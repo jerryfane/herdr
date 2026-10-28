@@ -175,6 +175,11 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         }
         // Admin methods whose payload has no remote ownership target.
         "agent.view.set" | "agent.view.clear" => (AllowedAt(Admin), false),
+        // Updating the server is the owner's call alone: a peer, at any tier,
+        // must never make this daemon replace its own binary.
+        "server.update_check" | "server.update_apply" | "server.update_status" => {
+            (FederationAccess::Denied, false)
+        }
         // Everything else (all server.*, plugin.*, integration.*, gram.*,
         // notification(s).*, client.window_title.*, agent.start,
         // agent.transfer_session, pane.close, popup.close, and other mutations)
@@ -242,6 +247,15 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn server_update_methods_are_explicitly_denied_to_every_peer() {
+        for method in ["server.update_check", "server.update_apply", "server.update_status"] {
+            let policy = federation_method_policy(method);
+            assert_eq!(policy.access, FederationAccess::Denied, "{method}");
+            assert!(!policy.outbound_routable, "{method}");
+        }
     }
 
     #[test]

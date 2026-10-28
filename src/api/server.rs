@@ -2436,6 +2436,20 @@ fn handle_request(
         });
     }
 
+    // Network-bound (manifest + signature fetch), so it is answered on this
+    // connection's thread and never reaches the app loop. Guests and federated
+    // peers are refused before this point.
+    if matches!(&request.method, Method::ServerUpdateCheck(_)) {
+        return match crate::update::server_update::update_check() {
+            Ok(result) => serde_json::to_string(&SuccessResponse {
+                id: request.id,
+                result,
+            })
+            .unwrap_or_else(|_| "{}".to_string()),
+            Err(err) => error_response_json(request.id, err.code(), err.to_string()),
+        };
+    }
+
     if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
         return error_response_json(
             request.id,
@@ -4736,6 +4750,7 @@ mod federation_tests {
             ("server.reload_config", Denied),
             ("server.staged_update", Denied),
             ("server.apply_staged_update", Denied),
+            ("server.update_check", Denied),
             ("server.agent_manifests", Denied),
             ("server.reload_agent_manifests", Denied),
             ("server.ssh_agent.register", Denied),
@@ -5021,6 +5036,7 @@ mod federation_tests {
                 }),
             ),
             ("stop", Method::ServerStop(EmptyParams {})),
+            ("update_check", Method::ServerUpdateCheck(EmptyParams {})),
             (
                 "close",
                 Method::PaneClose(PaneTarget {

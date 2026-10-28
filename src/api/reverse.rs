@@ -440,6 +440,28 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    #[test]
+    fn gram_gateway_refuses_server_update_check() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = std::env::temp_dir().join(format!("herdr-rev-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("gw.sock");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let _gateway = serve_test_gateway(&socket, "peer", tx);
+
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream
+            .write_all(b"{\"id\":\"u\",\"method\":\"server.update_check\",\"params\":{}}\n")
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["error"]["code"], "forbidden", "{line}");
+        assert!(rx.try_recv().is_err(), "the refused call reached the app");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn sleeper() -> (ChildGuard, libc::pid_t) {
         let child = Command::new("sleep")
             .arg("30")
