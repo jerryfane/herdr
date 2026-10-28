@@ -5514,6 +5514,24 @@
           ],
           "type": "object"
         },
+        "ServerUpdateApplyParams": {
+          "description": "`server.update_apply`: switch this server to the signed preview build the\nowner confirmed from `server.update_check`.",
+          "properties": {
+            "build_id": {
+              "description": "`latest.build_id` from `server.update_check`. A manifest that names a\ndifferent build by the time of the apply is refused\n(`update_build_mismatch`).",
+              "type": "string"
+            },
+            "restart_later": {
+              "default": false,
+              "description": "Download, verify and install the build on disk without touching the\nrunning server; it takes over on the next restart. Required when\n`mode` is `restart_required`.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "build_id"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -6449,6 +6467,38 @@
           "properties": {
             "method": {
               "const": "server.update_check",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.update_apply",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerUpdateApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.update_status",
               "type": "string"
             },
             "params": {
@@ -18004,6 +18054,46 @@
               "type": "object"
             },
             {
+              "description": "`server.update_apply` — preflight passed and the update guard is\nrunning. Download, verification, the switch and the on-disk install\nfollow in the background; poll `server.update_status`.",
+              "properties": {
+                "attempt_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "update_apply",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "attempt_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`server.update_status` — the newest update attempt on this machine, or\n`null` when there has been none. Any server answers it from the state\nfile, so it survives the switch and a rollback.",
+              "properties": {
+                "attempt": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/UpdateAttempt"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "update_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -18855,6 +18945,80 @@
             }
           ]
         },
+        "UpdateAttempt": {
+          "description": "The newest update attempt on this machine, as `server.update_status` reports it.",
+          "properties": {
+            "attempt_id": {
+              "type": "string"
+            },
+            "build_id": {
+              "type": "string"
+            },
+            "bytes_done": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "bytes_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "from": {
+              "description": "Version that was running when the attempt started.",
+              "type": "string"
+            },
+            "message": {
+              "description": "Why the attempt failed, or what to inspect.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/UpdateOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present once the attempt has ended."
+            },
+            "panes": {
+              "description": "Panes open before the switch, once the guard has counted them.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "phase": {
+              "$ref": "#/schemas/success_response/$defs/UpdatePhase",
+              "description": "The last phase reached; it stays set once `outcome` is present."
+            },
+            "restart_later": {
+              "type": "boolean"
+            },
+            "to": {
+              "description": "`<base_version>-preview.<build_id>`, as `update_check` reports it.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt_id",
+            "build_id",
+            "from",
+            "to",
+            "phase",
+            "bytes_done",
+            "bytes_total",
+            "restart_later"
+          ],
+          "type": "object"
+        },
         "UpdateLatestBuild": {
           "description": "The newest signed preview build published for this server's platform.",
           "properties": {
@@ -18943,6 +19107,77 @@
             "install_dir_not_writable"
           ],
           "type": "string"
+        },
+        "UpdateOutcome": {
+          "description": "How an update attempt ended.",
+          "oneOf": [
+            {
+              "const": "updated",
+              "description": "The new build serves and is installed on disk.",
+              "type": "string"
+            },
+            {
+              "const": "updated_disk_stale",
+              "description": "The new build serves, but the on-disk binary could not be replaced, so\na restart would run the previous build.",
+              "type": "string"
+            },
+            {
+              "const": "rolled_back",
+              "description": "The new build failed its checks; one live handoff back restored the\nprevious build, which passed the same checks.",
+              "type": "string"
+            },
+            {
+              "const": "failed_no_change",
+              "description": "Nothing changed: the attempt stopped before the switch, or the switch\nnever took effect.",
+              "type": "string"
+            },
+            {
+              "const": "needs_attention",
+              "description": "The server's state could not be confirmed; nothing was killed or\nrestarted. See `message`.",
+              "type": "string"
+            },
+            {
+              "const": "downloaded_restart_required",
+              "description": "`restart_later`: the build is installed on disk and takes over on the\nnext restart.",
+              "type": "string"
+            }
+          ]
+        },
+        "UpdatePhase": {
+          "description": "Where an update attempt is.",
+          "oneOf": [
+            {
+              "enum": [
+                "downloading"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "verifying",
+              "description": "Checking the download's size and sha256.",
+              "type": "string"
+            },
+            {
+              "const": "testing",
+              "description": "Running the new binary's `--version`.",
+              "type": "string"
+            },
+            {
+              "const": "switching",
+              "description": "Live handoff to the new build.",
+              "type": "string"
+            },
+            {
+              "const": "confirming",
+              "description": "Watching the new server (up to 180 s).",
+              "type": "string"
+            },
+            {
+              "const": "installing",
+              "description": "Replacing the binary on disk.",
+              "type": "string"
+            }
+          ]
         },
         "UpdateRunningBuild": {
           "description": "The build this server is running, as `server.update_check` reports it.",
