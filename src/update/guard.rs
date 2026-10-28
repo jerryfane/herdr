@@ -787,7 +787,7 @@ fn check_serving(
     if guests(client)? != before.guests {
         return Err("guest grants changed".into());
     }
-    bridge_round_trip(expect.bridge_exe)?;
+    bridge_round_trip(expect.bridge_exe, socket)?;
     if serving_pid(socket) != Some(pid) {
         return Err(format!("pid {pid} stopped serving during the checks"));
     }
@@ -898,10 +898,12 @@ fn healthy_routes(client: &ApiClient) -> Result<BTreeSet<String>, String> {
 }
 
 /// One `api-bridge --multi` session with two requests, as the app's SSH
-/// route uses it.
-fn bridge_round_trip(exe: &Path) -> Result<(), String> {
+/// route uses it, pointed at `socket` whatever session the server was
+/// started with.
+fn bridge_round_trip(exe: &Path, socket: &Path) -> Result<(), String> {
     let mut child = std::process::Command::new(exe)
         .args(["api-bridge", "--multi"])
+        .env(crate::api::SOCKET_PATH_ENV_VAR, socket)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
