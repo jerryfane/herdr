@@ -517,22 +517,26 @@ mod tests {
     }
 
     #[test]
-    fn primary_release_key_is_the_keyrings_herdr_release_key() {
+    fn release_keys_are_the_keyring_primary_then_the_offline_backup() {
         use base64::Engine as _;
-        let primary = super::super::keys::RELEASE_PUBLIC_KEYS[0];
-        let bin = base64::engine::general_purpose::STANDARD
-            .decode(primary)
-            .unwrap();
-        assert_eq!(bin.len(), 42);
-        assert_eq!(&bin[..2], b"Ed");
-        // minisign prints the little-endian key number as hex.
-        let key_id: String = bin[2..10]
+        let ids: Vec<String> = super::super::keys::RELEASE_PUBLIC_KEYS
             .iter()
-            .rev()
-            .map(|b| format!("{b:02X}"))
+            .map(|key| {
+                let bin = base64::engine::general_purpose::STANDARD
+                    .decode(key)
+                    .unwrap();
+                assert_eq!(bin.len(), 42, "{key}");
+                assert_eq!(&bin[..2], b"Ed", "{key}");
+                minisign_verify::PublicKey::from_base64(key).unwrap();
+                // minisign prints the little-endian key number as hex.
+                bin[2..10]
+                    .iter()
+                    .rev()
+                    .map(|b| format!("{b:02X}"))
+                    .collect()
+            })
             .collect();
-        assert_eq!(key_id, "1909BF13AB4A7686");
-        minisign_verify::PublicKey::from_base64(primary).unwrap();
+        assert_eq!(ids, ["1909BF13AB4A7686", "4EC2A8E66B478CBA"]);
     }
 
     #[test]

@@ -6,8 +6,10 @@
 //!
 //! The primary key lives in the owner's keyring and is never exported; release
 //! signing goes through the keyring's `minisign/herdr-release` route. The
-//! offline backup key is still to be made.
+//! backup key is kept offline by the owner and signs only during a rotation.
 pub(super) const RELEASE_PUBLIC_KEYS: &[&str] = &[
     // herdr-release, minisign key id 1909BF13AB4A7686.
     "RWSGdkqrE78JGWTn7MjyejRu2MVri68/C2eM+3OMvY0Sh+WV1QH+tr4f",
+    // herdr-release backup (offline), minisign key id 4EC2A8E66B478CBA.
+    "RWS6jEdr5qjCTpeiTt4iNnIcgKUwz9q+o5NvIj36ZfR/0XUY0vAwDUpO",
 ];
