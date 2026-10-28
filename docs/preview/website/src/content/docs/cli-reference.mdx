@@ -7,6 +7,8 @@ Herdr’s CLI talks to the running server over the same local socket API used by
 
 Most commands print JSON responses for deterministic automation in scripts.
 
+API-backed commands use the same argument definitions for parsing, `--help`, and shell completion. Value options accept both `--label text` and `--label=text`. Invalid arguments are rejected before connecting to the server.
+
 ## Launch and status
 
 ```bash
@@ -65,7 +67,7 @@ In an interactive terminal, `machine add` discovers running sessions and lets yo
 
 Changes apply automatically to open local Herdr clients, normally within a second. Added or enabled machines connect in the background; renaming does not reconnect. Removing or disabling disconnects only that machine and leaves its remote sessions running. Removing the machine you are viewing returns to Local, or shows Local as unavailable until it reconnects. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials. When federation trust policy exists for a profile, `machine list --json` also reports its non-secret `federation_expected_machine_id`; labels remain display-only and never select that policy.
 
-Use `herdr machine status [<label-or-id>] [--json]` for fresh, noninteractive SSH and remote Herdr checks. `reachable` describes this check, not a TUI's current connection. Use `herdr machine reconnect <label-or-id>` in a terminal for SSH authentication and verification; it does not install or update Herdr. Open clients retry failed connections within 30 seconds. Clicking `! auth` or `! error` shows the latest error and CLI guidance; collapsed sidebars show `!`. See [Recovering SSH authentication](/docs/connecting-machines/#recovering-ssh-authentication) for platform limits. For remote setup, use `herdr --remote workbox`, adding `--session <name>` only for a named session.
+Use `herdr machine status [<label-or-id>] [--json]` for fresh, noninteractive SSH and remote Herdr checks. `reachable` describes this check, not a TUI's current connection. Use `herdr machine reconnect <label-or-id>` in a terminal for SSH authentication and verification; it does not install or update Herdr. Open clients retry failed connections within 30 seconds. Clicking `! auth` or `! error` retries the connection; a failed attempt shows the latest error and CLI guidance; collapsed sidebars show `!`. See [Recovering SSH authentication](/docs/connecting-machines/#recovering-ssh-authentication) for platform limits. For remote setup, use `herdr --remote workbox`, adding `--session <name>` only for a named session.
 
 Workspace, tab, pane IDs, and agent names belong to a single server. Selecting a machine in the UI does not retarget CLI commands. Use the global **prefix** `--machine <label-or-id>` to route API commands to a saved SSH machine:
 
@@ -171,7 +173,7 @@ herdr guest revoke <guest-or-invite-id>           # closes the guest's live sess
 herdr guest log [<guest-id>] [--limit N]          # activity, newest first
 ```
 
-Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal, including up to 1,000 lines of its scrollback. While watching, the guest can also resize the terminal. Everyone watching it, including you, sees that size until the guest stops watching; the guest's app renews the size while it is open, and a size that is not renewed lapses within a minute. The guest cannot type into the terminal or reach any other pane. Access pauses while the agent is not the pane's foreground process, and comes back when an agent with the same name and kind runs in that terminal again, for example after a restart. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications. Watching the agent, reading its scrollback, resizing its terminal and reading the shared Gram are not recorded.
+Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal, including up to 1,000 lines of its scrollback. While watching, the guest can also resize the terminal. Everyone watching it, including you, sees that size until the guest stops watching; the guest's app renews the size while it is open, and a size that is not renewed lapses within a minute. The guest cannot type into the terminal or reach any other pane. Access pauses while the agent is not the pane's foreground process, and comes back when an agent with the same name and kind runs in that terminal again, for example after a restart. Renaming the agent with `herdr agent rename` keeps its guests and pending invites on it under the new name, also when you name it again after `--clear`; another agent that later takes the old name gets nothing. While the agent has no name, access pauses and the guest sees it under its last name. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications. Watching the agent, reading its scrollback, resizing its terminal and reading the shared Gram are not recorded.
 
 With `--share-gram`, or `herdr guest share-gram <guest-id> on` for a guest who already accepted, the guest also gets a Gram tab for the agent. It shows every Gram the agent sends you from its own terminal from the moment the guest accepted, with its files, plus the guest's own posts to the agent. It never shows your posts to the agent, older Grams, other agents' Grams, or Grams that only carry the agent's name, such as ones sent from another pane or relayed from another machine. The guest keeps separate read marks and cannot claim, delete or mark your messages read. Sharing is off by default and takes effect at once, even for a guest who is connected. `herdr guest list` shows it per guest and invite, and file opens are audited. Any guest can also register their phone for the agent's push notifications: needs you, finished and died, plus its new Grams while sharing is on. These notifications go through the same direct APNs or HerdrUp push relay path as yours, and a revoke deletes the guest's registrations.
 
@@ -236,7 +238,7 @@ herdr tab close <tab_id>
 
 A tab is another terminal layout inside a workspace. Without `--workspace`, `tab create` uses the active workspace and fails if none exists. Its JSON response exposes `.result.tab.tab_id` and `.result.root_pane.pane_id`. Closing a workspace's last tab also closes the workspace, matching the TUI close-tab action. If `confirm_close` is enabled and closing the tab would also close a whole worktree group, `tab close` returns a `confirmation_required` error instead.
 
-With `ui.confirm_close` enabled, the TUI asks for confirmation before closing a workspace's last tab from a keybinding or the tab menu. Ordinary CLI/API tab closes remain immediate.
+With `ui.confirm_close` enabled, the TUI asks for confirmation before closing a workspace's last tab or its only pane from a keybinding or the tab/pane menu. Ordinary pane closes and CLI/API closes remain immediate.
 
 Workspace and tab creation, and pane splitting, leave focus unchanged by default. `--focus` selects the new layout; `--no-focus` states the default explicitly. Without `--cwd`, new terminals follow the configured `terminal.new_cwd` policy, which follows the source pane or workspace by default. Each `--env KEY=VALUE` adds or replaces that variable in the new root shell.
 
@@ -384,6 +386,8 @@ herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [
 herdr agent send-keys <target> <key> [key ...]
 herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
+herdr agent avatar set <target> --mascot <id>|--image <file>|--clear
+herdr agent avatar get <target> <sha256> -o <file>
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
@@ -410,7 +414,7 @@ After confirmed submission, a requested status may still miss the deadline. That
 
 `idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 
-`agent send-keys` sends logical terminal keys such as `enter`, `up`, `esc`, or `ctrl+c`. Herdr validates every key before writing any bytes. `agent read` reads the resolved terminal stream, and `agent rename` names an already detected agent.
+`agent send-keys` sends logical terminal keys such as `enter`, `up`, `esc`, or `ctrl+c`. Herdr validates every key before writing any bytes. `agent read` reads the resolved terminal stream, and `agent rename` names an already detected agent. `agent avatar set` gives an agent a profile picture shown by the app on every device and to the agent's guests: a bundled mascot id (`herdy`, `bot`, `blip`, …), a JPEG or PNG image of at most 64 KiB, or `--clear` for the default. The target may also be an archived agent's name or terminal id. `agent avatar get` saves the agent's current image, named by the `avatar.sha256` in `agent get`, to a file.
 
 `agent explain` asks the running server to classify the same bottom-buffer detection snapshot used by screen detection, so live output reflects the server's active manifest cache. Because this uses the `agent.explain` socket method, restart or hand off to an updated server after upgrading Herdr before using live explain. Use `--file PATH --agent LABEL` to explain a saved fixture locally instead. The default output shows the agent, final state, manifest source and version, matched rule with its region evidence, and any fallback, skip, or warning reasons. Add `--verbose` for visible evidence flags, cached remote version, local override shadowing, remote update status, and the full evaluated-rules list with matcher and region evidence. Add `--json` for issue reports or tests.
 
@@ -516,13 +520,14 @@ Install, list, and remove plugins:
 
 ```bash
 herdr plugin install <owner>/<repo>[/subdir...] [--ref REF] [--yes]
+herdr plugin update [<plugin_id|owner/repo[/subdir...]>...] [--yes]
 herdr plugin list [--plugin ID] [--json]
 herdr plugin uninstall <plugin_id|owner/repo[/subdir...]>
 herdr plugin enable <plugin_id>
 herdr plugin disable <plugin_id>
 ```
 
-`plugin install` accepts GitHub shorthand only, such as `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`. It uses `git`, shows a trust preview in interactive terminals, runs supported manifest build commands, and stores GitHub installs in a Herdr-managed directory. Use `--yes` for noninteractive installs. Reinstalling a GitHub-managed plugin replaces that managed checkout. Installing over a locally linked plugin is refused. Plugin manifests must declare `min_herdr_version`; install and link fail when the plugin requires a newer Herdr binary. `plugin list` is human-readable by default; pass `--json` for the raw API response.
+`plugin install` accepts GitHub shorthand only, such as `ogulcancelik/herdr-plugin-examples/worktree-bootstrap`. It uses `git`, shows a trust preview in interactive terminals, runs supported manifest build commands, and stores GitHub installs in a Herdr-managed directory. Use `--yes` for noninteractive installs. `plugin update` refreshes every GitHub-managed plugin when no targets are given, or only the listed plugin ids or GitHub sources. It preserves each install's requested ref, skips unchanged commits and ignores locally linked plugins during bulk updates. Reinstalling a GitHub-managed plugin creates a new installation directory. Running plugins keep their original files; new invocations use the new installation. Installing over a locally linked plugin is refused. Plugin manifests must declare `min_herdr_version`; install and link fail when the plugin requires a newer Herdr binary. `plugin list` is human-readable by default; pass `--json` for the raw API response.
 
 Plugin installation and enabled state are global to the current user. A plugin installed, linked, enabled, or disabled through one Herdr session is immediately available with the same state in every session.
 
@@ -533,7 +538,7 @@ herdr plugin link <path> [--disabled]
 herdr plugin unlink <plugin_id>
 ```
 
-`plugin link` accepts a plugin directory containing `herdr-plugin.toml` or a direct manifest path. Use it while authoring or testing a plugin from a local checkout. `plugin unlink` unregisters the plugin and leaves files alone. `plugin uninstall` unregisters a plugin and also removes Herdr-managed GitHub checkout files. For GitHub installs, uninstall accepts either the plugin id or the same `owner/repo[/subdir...]` shorthand used by install. Actions, event hooks, panes, and link handlers are declared in the manifest; runtime action registration is not part of v1.
+`plugin link` accepts a plugin directory containing `herdr-plugin.toml` or a direct manifest path. Use it while authoring or testing a plugin from a local checkout. `plugin unlink` and `plugin uninstall` unregister the plugin and leave files in place so running plugins can finish. Updates and reinstalls also retain previous installations; new invocations use the replacement without a config reload. A later successful installation/update or server startup removes obsolete managed installations after the servers using them have exited. Config reload does not release old installations. Plugins must stop detached background processes before their parent command or pane exits; processes surviving server exit are not protected from cleanup. Legacy installations without cleanup tracking and locally linked files are retained. For GitHub installs, uninstall accepts either the plugin id or the same `owner/repo[/subdir...]` shorthand used by install. Actions, event hooks, panes, and link handlers are declared in the manifest; runtime action registration is not part of v1.
 
 Config directory:
 
@@ -583,6 +588,8 @@ in pane or agent APIs. Native non-terminal plugin panes are outside plugin v1.
 
 New panes identify as `TERM_PROGRAM=herdr`, with `TERM_PROGRAM_VERSION` set to
 Herdr's version. They keep `TERM=xterm-256color` and `COLORTERM=truecolor`.
+They also get `fish_handle_reflow=0`, because Herdr reflows text on resize;
+an inherited or explicit `fish_handle_reflow` value is kept.
 Herdr removes inherited outer-terminal session markers (iTerm2, WezTerm, Kitty,
 Windows Terminal, tmux, screen, and Zellij), iTerm2's `LC_TERMINAL` identity,
 and known Claude Code, Codex, and OMP session markers before applying explicit
