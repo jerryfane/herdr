@@ -678,7 +678,7 @@ mod tests {
         let running = dirs.build_dir("2026-10-28-0123456789ab").join(BINARY_NAME);
         assert!(install_path_for(running.clone(), &dirs).is_err());
         dirs.store(&UpdateState {
-            attempt: Some(record(Some(UpdateOutcome::Updated), None)),
+            attempt: Some(record(Some(UpdateOutcome::Updated))),
             rolled_back: Vec::new(),
         })
         .unwrap();
