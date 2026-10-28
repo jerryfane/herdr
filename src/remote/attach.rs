@@ -8,8 +8,8 @@ use super::{
     restart_policy::*,
     shell_quote,
 };
+use crate::update::verify::ReleaseAsset;
 use base64::Engine as _;
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -609,46 +609,6 @@ fn windows_powershell_encoded_script(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum RemoteAssetRef {
-    Url(String),
-    Object { url: String, sha256: Option<String> },
-}
-
-impl RemoteAssetRef {
-    fn url(&self) -> &str {
-        match self {
-            Self::Url(url) => url,
-            Self::Object { url, .. } => url,
-        }
-    }
-
-    fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Url(_) => None,
-            Self::Object { sha256, .. } => {
-                sha256.as_deref().filter(|value| !value.trim().is_empty())
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct RemotePreviewManifest {
-    build_id: String,
-    protocol: u32,
-    assets: BTreeMap<String, RemoteAssetRef>,
-    #[serde(default)]
-    builds: BTreeMap<String, RemotePreviewBuildMetadata>,
-}
-
-#[derive(Deserialize)]
-struct RemotePreviewBuildMetadata {
-    protocol: u32,
-    assets: BTreeMap<String, RemoteAssetRef>,
-}
-
 fn current_version() -> String {
     crate::build_info::version()
 }
@@ -660,11 +620,6 @@ fn current_channel() -> &'static str {
 struct InstallSource {
     path: PathBuf,
     temporary_dir: Option<PathBuf>,
-}
-
-struct RemoteReleaseAsset {
-    url: String,
-    sha256: Option<String>,
 }
 
 pub(super) struct PreparedRemoteHerdr {
@@ -2637,79 +2592,53 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
 
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("herdr.tmp");
-    let status = crate::noninteractive_process::curl_command()
-        .args(["-sfL", "--max-time", "120", "-o"])
-        .arg(&path)
-        .arg(&asset.url)
-        .status()
-        .map_err(|err| io::Error::new(err.kind(), format!("download failed: {err}")))?;
-    if !status.success() {
+    if let Err(err) = download_verified_asset(&asset, &path) {
         let _ = fs::remove_dir_all(&dir);
-        return Err(io::Error::other("download failed"));
-    }
-    if let Some(expected) = &asset.sha256 {
-        if let Err(err) = crate::checksum::verify_sha256(&path, expected) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(io::Error::new(
-                err.kind(),
-                format!("downloaded remote asset checksum verification failed: {err}"),
-            ));
-        }
+        return Err(err);
     }
 
     Ok(InstallSource::temporary(path, dir))
 }
 
-fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
-    let output = crate::noninteractive_process::curl_command()
-        .args([
-            "-sfL",
-            "--retry",
-            "3",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "20",
-            url,
-        ])
-        .output()
-        .map_err(|err| io::Error::new(err.kind(), format!("curl failed: {err}")))?;
-    if !output.status.success() {
-        return Err(command_failed("failed to fetch update manifest", &output));
+/// Download `asset` over HTTPS only, refusing more bytes than the signed
+/// manifest states, then check its size and sha256.
+fn download_verified_asset(asset: &ReleaseAsset, path: &Path) -> io::Result<()> {
+    let protocols = crate::update::verify::allowed_protocols();
+    let status = crate::noninteractive_process::curl_command()
+        .args(["-sfL", "--proto", protocols, "--proto-redir", protocols])
+        .args(["--connect-timeout", "10", "--max-time", "120"])
+        .args(["--max-filesize", &asset.size.to_string(), "-o"])
+        .arg(path)
+        .arg(crate::update::verify::fetch_url(&asset.url))
+        .status()
+        .map_err(|err| io::Error::new(err.kind(), format!("download failed: {err}")))?;
+    if !status.success() {
+        return Err(io::Error::other("download failed"));
     }
-    Ok(output.stdout)
+    let len = fs::metadata(path)?.len();
+    if len != asset.size {
+        return Err(io::Error::other(format!(
+            "downloaded remote asset is {len} bytes, but the signed manifest says {}",
+            asset.size
+        )));
+    }
+    crate::checksum::verify_sha256(path, &asset.sha256).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("downloaded remote asset checksum verification failed: {err}"),
+        )
+    })
 }
 
-fn remote_asset_info(asset: &RemoteAssetRef) -> RemoteReleaseAsset {
-    RemoteReleaseAsset {
-        url: asset.url().to_string(),
-        sha256: asset.sha256().map(str::to_string),
-    }
-}
-
-fn preview_assets_for_build<'a>(
-    manifest: &'a RemotePreviewManifest,
-    build_id: &str,
-) -> io::Result<(u32, &'a BTreeMap<String, RemoteAssetRef>)> {
-    if manifest.build_id == build_id {
-        return Ok((manifest.protocol, &manifest.assets));
-    }
-    let build = manifest.builds.get(build_id).ok_or_else(|| {
-        io::Error::other(format!(
-            "preview manifest no longer includes build {build_id}; run `herdr update` locally or set {REMOTE_BINARY_ENV_VAR}=target/release/herdr"
-        ))
-    })?;
-    Ok((build.protocol, &build.assets))
-}
-
-/// The published asset that installs this exact build on a remote host.
+/// The published asset that installs this exact build on a remote host, from
+/// the signed preview manifest.
 ///
 /// Only HerdrUp preview builds have one. A stable-stamped build used to resolve
 /// upstream's `herdr.dev/latest.json`, whose release for the same version number
 /// is a herdrdev binary, so connecting to a host this binary could not seed itself
 /// (another OS or architecture, or a package-managed local install) silently
 /// installed upstream Herdr there.
-fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
+fn remote_release_asset(asset_key: &str) -> io::Result<ReleaseAsset> {
     if !crate::build_info::is_preview() {
         return Err(io::Error::other(format!(
             "HerdrUp publishes no stable release of herdr {} for {asset_key}, and upstream's would replace HerdrUp on the remote; set {REMOTE_BINARY_ENV_VAR} to a HerdrUp binary for {asset_key}, or install HerdrUp on the remote with `{}`",
@@ -2717,28 +2646,12 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
             crate::update::FORK_INSTALL_COMMAND
         )));
     }
-    let build_id = crate::build_info::build_id().ok_or_else(|| {
-        io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
-    })?;
-    let manifest_bytes = fetch_remote_manifest(crate::update::PREVIEW_UPDATE_MANIFEST_URL)?;
-    let manifest: RemotePreviewManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|err| io::Error::other(format!("failed to parse preview manifest JSON: {err}")))?;
-    let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
-    if protocol != CURRENT_PROTOCOL {
-        return Err(io::Error::other(format!(
-            "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
-        )));
-    }
-    let asset = assets
-        .get(asset_key)
-        .map(remote_asset_info)
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "no {asset_key} binary in the preview manifest for build {build_id}"
-            ))
-        })?;
-    crate::update::ensure_fork_release_asset(&asset.url).map_err(io::Error::other)?;
-    Ok(asset)
+    crate::update::verify::remote_seed_asset(asset_key, CURRENT_PROTOCOL).map_err(|err| {
+        io::Error::other(format!(
+            "can't install this build's {asset_key} binary on the remote: {err}; run `herdr update` locally, set {REMOTE_BINARY_ENV_VAR} to a HerdrUp binary for {asset_key}, or install HerdrUp on the remote with `{}`",
+            crate::update::FORK_INSTALL_COMMAND
+        ))
+    })
 }
 
 fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
@@ -6237,41 +6150,6 @@ function Get-Process {
             error.contains(crate::update::FORK_INSTALL_COMMAND),
             "refusal does not name the fork installer: {error}"
         );
-    }
-
-    #[test]
-    fn remote_preview_manifest_falls_back_to_archived_exact_build_assets() {
-        let manifest: RemotePreviewManifest = serde_json::from_str(
-            r#"{
-                "build_id": "2026-06-06-new",
-                "protocol": 12,
-                "assets": {
-                    "linux-x86_64": {
-                        "url": "https://example.com/new",
-                        "sha256": "new"
-                    }
-                },
-                "builds": {
-                    "2026-06-02-old": {
-                        "protocol": 11,
-                        "assets": {
-                            "linux-x86_64": {
-                                "url": "https://example.com/old",
-                                "sha256": "old"
-                            }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let (protocol, assets) =
-            preview_assets_for_build(&manifest, "2026-06-02-old").expect("archived build");
-        let asset = assets.get("linux-x86_64").expect("asset");
-        assert_eq!(protocol, 11);
-        assert_eq!(asset.url(), "https://example.com/old");
-        assert_eq!(asset.sha256(), Some("old"));
     }
 
     #[test]

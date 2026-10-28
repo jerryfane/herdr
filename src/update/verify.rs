@@ -13,7 +13,7 @@
 //! a manifest from a loopback origin and sign it with a throwaway key. Release
 //! builds compile both out.
 
-use super::{PreviewManifest, EXPECTED_RELEASE_ROOT};
+use super::{PreviewManifest, EXPECTED_RELEASE_ROOT, PREVIEW_UPDATE_MANIFEST_URL};
 
 const TRUSTED_COMMENT_PREFIX: &str = "herdr-preview ";
 const MANIFEST_SCHEMA_VERSION: u32 = 2;
@@ -105,6 +105,14 @@ impl RunningBuild {
     }
 }
 
+/// A manifest asset that passed [`release_asset`]'s checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseAsset {
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+}
+
 /// The verified asset for this platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlatformAsset {
@@ -121,13 +129,33 @@ pub(super) fn platform_asset_key() -> String {
 }
 
 /// The manifest's asset for this platform, or `None` when it publishes none.
-/// The URL must sit under this build's own release tag, and the sha256 and a
-/// size within [`MAX_ASSET_BYTES`] are required.
+/// It must pass [`release_asset`]'s checks.
 pub(super) fn platform_asset(
     manifest: &PreviewManifest,
 ) -> Result<Option<PlatformAsset>, VerifyError> {
     let key = platform_asset_key();
-    let Some(asset) = manifest.assets.get(&key) else {
+    let Some(asset) = release_asset(manifest, &key)? else {
+        return Ok(None);
+    };
+    Ok(Some(PlatformAsset {
+        url: asset.url,
+        sha256: asset.sha256,
+        size: asset.size,
+        #[cfg(windows)]
+        package_format: manifest.assets[&key]
+            .package_format()
+            .map_err(VerifyError::ManifestInvalid)?,
+    }))
+}
+
+/// The manifest's asset under `key` (`<os>-<arch>`), or `None` when it
+/// publishes none. The URL must sit under the manifest build's own release
+/// tag, and the sha256 and a size within [`MAX_ASSET_BYTES`] are required.
+fn release_asset(
+    manifest: &PreviewManifest,
+    key: &str,
+) -> Result<Option<ReleaseAsset>, VerifyError> {
+    let Some(asset) = manifest.assets.get(key) else {
         return Ok(None);
     };
     super::ensure_fork_release_asset(&asset.url).map_err(VerifyError::ManifestInvalid)?;
@@ -152,15 +180,65 @@ pub(super) fn platform_asset(
                 "asset {key} needs a size between 1 and {MAX_ASSET_BYTES} bytes"
             ))
         })?;
-    Ok(Some(PlatformAsset {
+    Ok(Some(ReleaseAsset {
         url: asset.url.clone(),
         sha256,
         size,
-        #[cfg(windows)]
-        package_format: asset
-            .package_format()
-            .map_err(VerifyError::ManifestInvalid)?,
     }))
+}
+
+/// The signed manifest's `asset_key` binary of the running build, which
+/// seeding installs on a remote host. Only the manifest's own build is used:
+/// its archived `builds` are unsigned-era entries without a size.
+pub(crate) fn remote_seed_asset(
+    asset_key: &str,
+    protocol: u32,
+) -> Result<ReleaseAsset, VerifyError> {
+    let (bytes, minisig) = fetch_signed(PREVIEW_UPDATE_MANIFEST_URL)?;
+    seed_asset(
+        &bytes,
+        &minisig,
+        &trusted_public_keys(),
+        asset_key,
+        protocol,
+        &RunningBuild::current(),
+    )
+}
+
+/// Verify the manifest, then pick `running`'s `asset_key` asset from it.
+fn seed_asset(
+    bytes: &[u8],
+    minisig: &str,
+    keys: &[String],
+    asset_key: &str,
+    protocol: u32,
+    running: &RunningBuild,
+) -> Result<ReleaseAsset, VerifyError> {
+    let manifest = verify_signed_manifest(bytes, minisig, keys)?;
+    if !running.is_build(&manifest) {
+        return Err(VerifyError::ManifestInvalid(format!(
+            "it publishes build {} ({}), not this build {}, and a remote only gets the build running here",
+            manifest.build_id,
+            manifest.commit,
+            running
+                .build_id
+                .as_deref()
+                .or(running.commit.as_deref())
+                .unwrap_or("(unstamped)")
+        )));
+    }
+    if manifest.protocol != protocol {
+        return Err(VerifyError::ManifestInvalid(format!(
+            "build {} speaks protocol {}, but this build speaks {protocol}",
+            manifest.build_id, manifest.protocol
+        )));
+    }
+    release_asset(&manifest, asset_key)?.ok_or_else(|| {
+        VerifyError::ManifestInvalid(format!(
+            "no {asset_key} binary for build {}",
+            manifest.build_id
+        ))
+    })
 }
 
 fn is_hex(value: &str, len: usize) -> bool {
@@ -169,6 +247,12 @@ fn is_hex(value: &str, len: usize) -> bool {
 
 /// Fetch `manifest_url` and `<manifest_url>.minisig`, and verify them.
 pub(super) fn fetch_signed_manifest(manifest_url: &str) -> Result<PreviewManifest, VerifyError> {
+    let (bytes, minisig) = fetch_signed(manifest_url)?;
+    verify_signed_manifest(&bytes, &minisig, &trusted_public_keys())
+}
+
+/// Fetch `manifest_url` and its `.minisig`, unverified.
+fn fetch_signed(manifest_url: &str) -> Result<(Vec<u8>, String), VerifyError> {
     let bytes = match fetch(manifest_url, MAX_MANIFEST_BYTES)? {
         Fetched::Body(bytes) => bytes,
         Fetched::NotFound => {
@@ -182,7 +266,7 @@ pub(super) fn fetch_signed_manifest(manifest_url: &str) -> Result<PreviewManifes
             .map_err(|_| VerifyError::SignatureInvalid("the signature is not UTF-8".into()))?,
         Fetched::NotFound => return Err(VerifyError::NotReady),
     };
-    verify_signed_manifest(&bytes, &minisig, &trusted_public_keys())
+    Ok((bytes, minisig))
 }
 
 /// Verify `minisig` over `bytes` against `keys`, then the manifest itself.
@@ -263,6 +347,9 @@ fn validate_manifest(manifest: &PreviewManifest) -> Result<(), VerifyError> {
     if super::Version::parse(&manifest.base_version).is_none() {
         return invalid(format!("base_version {}", manifest.base_version));
     }
+    if manifest.notes.trim().is_empty() {
+        return invalid("notes are empty".into());
+    }
     Ok(())
 }
 
@@ -299,7 +386,7 @@ fn test_origin() -> Option<String> {
 
 /// The URL actually fetched for a pinned URL: itself, except under a debug
 /// build's test origin.
-pub(super) fn fetch_url(url: &str) -> String {
+pub(crate) fn fetch_url(url: &str) -> String {
     #[cfg(debug_assertions)]
     if let Some(origin) = test_origin() {
         for (root, local) in [
@@ -316,7 +403,7 @@ pub(super) fn fetch_url(url: &str) -> String {
 
 /// curl `--proto`/`--proto-redir` value: HTTPS only, plus HTTP under a debug
 /// build's loopback test origin.
-pub(super) fn allowed_protocols() -> &'static str {
+pub(crate) fn allowed_protocols() -> &'static str {
     #[cfg(debug_assertions)]
     if test_origin().is_some() {
         return "=http,https";
@@ -628,5 +715,214 @@ mod tests {
         let asset = platform_asset(&manifest).unwrap().unwrap();
         assert_eq!(asset.size, 4096);
         assert_eq!(asset.sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn manifest_with_empty_notes_is_refused() {
+        let primary = TestSigner::new(1);
+        for notes in ["", " \n"] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
+            value["notes"] = notes.into();
+            let json = value.to_string();
+            let minisig = primary.sign(json.as_bytes(), &comment(BUILD_ID, COMMIT));
+
+            let err = verify_signed_manifest(json.as_bytes(), &minisig, &keys(&[&primary]))
+                .err()
+                .expect("notes are required");
+            assert_eq!(err.code(), "update_manifest_invalid", "{notes:?}");
+        }
+    }
+
+    const PROTOCOL: u32 = 22;
+
+    /// Another platform than this one, as a remote host would be.
+    fn remote_key() -> &'static str {
+        if platform_asset_key() == "linux-aarch64" {
+            "linux-x86_64"
+        } else {
+            "linux-aarch64"
+        }
+    }
+
+    fn seed_manifest(build_id: &str) -> serde_json::Value {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest_json(build_id, COMMIT, 1_800_000_000)).unwrap();
+        let key = remote_key();
+        value["assets"][key] = serde_json::json!({
+            "url": format!("{EXPECTED_RELEASE_ROOT}preview-{build_id}/herdr-{key}"),
+            "sha256": "b".repeat(64),
+            "size": 8192
+        });
+        value
+    }
+
+    fn running(build_id: &str) -> RunningBuild {
+        RunningBuild {
+            commit: None,
+            build_id: Some(build_id.into()),
+            commit_time: Some(1_800_000_000),
+        }
+    }
+
+    /// Sign `value` correctly and seed `remote_key()` from it.
+    fn seed(
+        value: &serde_json::Value,
+        signer: &TestSigner,
+        running: &RunningBuild,
+    ) -> Result<ReleaseAsset, VerifyError> {
+        let json = value.to_string();
+        let minisig = signer.sign(
+            json.as_bytes(),
+            &comment(
+                value["build_id"].as_str().unwrap(),
+                value["commit"].as_str().unwrap(),
+            ),
+        );
+        seed_asset(
+            json.as_bytes(),
+            &minisig,
+            &keys(&[signer]),
+            remote_key(),
+            PROTOCOL,
+            running,
+        )
+    }
+
+    #[test]
+    fn seeding_picks_the_remote_platforms_asset_of_the_running_build() {
+        let signer = TestSigner::new(1);
+        let key = remote_key();
+
+        let asset = seed(&seed_manifest(BUILD_ID), &signer, &running(BUILD_ID))
+            .expect("the signed manifest of the running build");
+
+        assert_eq!(
+            asset,
+            ReleaseAsset {
+                url: format!("{EXPECTED_RELEASE_ROOT}preview-{BUILD_ID}/herdr-{key}"),
+                sha256: "b".repeat(64),
+                size: 8192,
+            }
+        );
+        // A build stamped with only its commit is matched by the commit.
+        let by_commit = RunningBuild {
+            commit: Some(COMMIT[..12].into()),
+            build_id: None,
+            commit_time: None,
+        };
+        assert_eq!(
+            seed(&seed_manifest(BUILD_ID), &signer, &by_commit)
+                .unwrap()
+                .url,
+            asset.url
+        );
+    }
+
+    #[test]
+    fn seeding_refuses_a_tampered_manifest() {
+        let signer = TestSigner::new(1);
+        let json = seed_manifest(BUILD_ID).to_string();
+        let minisig = signer.sign(json.as_bytes(), &comment(BUILD_ID, COMMIT));
+        let tampered = json.replacen("8192", "8193", 1);
+        assert_ne!(tampered, json);
+
+        let err = seed_asset(
+            tampered.as_bytes(),
+            &minisig,
+            &keys(&[&signer]),
+            remote_key(),
+            PROTOCOL,
+            &running(BUILD_ID),
+        )
+        .expect_err("a changed manifest must not seed a remote");
+        assert_eq!(err.code(), "update_signature_invalid");
+    }
+
+    #[test]
+    fn seeding_refuses_an_unsigned_manifest() {
+        let signer = TestSigner::new(1);
+        let json = seed_manifest(BUILD_ID).to_string();
+        let garbage = format!(
+            "untrusted comment: x\nRWQ=\ntrusted comment: {}\nRWQ=\n",
+            comment(BUILD_ID, COMMIT)
+        );
+        for minisig in ["", "not a signature", garbage.as_str()] {
+            let err = seed_asset(
+                json.as_bytes(),
+                minisig,
+                &keys(&[&signer]),
+                remote_key(),
+                PROTOCOL,
+                &running(BUILD_ID),
+            )
+            .expect_err("an unsigned manifest must not seed a remote");
+            assert_eq!(err.code(), "update_signature_invalid", "{minisig:?}");
+        }
+    }
+
+    #[test]
+    fn seeding_refuses_an_asset_in_another_release() {
+        let signer = TestSigner::new(1);
+        let key = remote_key();
+        let mut value = seed_manifest(BUILD_ID);
+        value["assets"][key]["url"] =
+            format!("{EXPECTED_RELEASE_ROOT}preview-2026-01-01-000000000000/herdr-{key}").into();
+
+        let err = seed(&value, &signer, &running(BUILD_ID)).expect_err("wrong release tag");
+        assert_eq!(err.code(), "update_manifest_invalid");
+    }
+
+    #[test]
+    fn seeding_refuses_an_asset_without_sha256_or_size() {
+        let signer = TestSigner::new(1);
+        for field in ["sha256", "size"] {
+            let mut value = seed_manifest(BUILD_ID);
+            value["assets"][remote_key()]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+
+            let err = seed(&value, &signer, &running(BUILD_ID)).expect_err(field);
+            assert_eq!(err.code(), "update_manifest_invalid", "{field}");
+        }
+    }
+
+    #[test]
+    fn seeding_refuses_a_manifest_of_another_build() {
+        let signer = TestSigner::new(1);
+        let key = remote_key();
+        // The running build survives only in the unsigned-era `builds` archive.
+        let archived = "2026-10-01-fedcba987654";
+        let mut value = seed_manifest(BUILD_ID);
+        value["builds"][archived] = serde_json::json!({
+            "protocol": PROTOCOL,
+            "assets": {
+                key: {
+                    "url": format!("{EXPECTED_RELEASE_ROOT}preview-{archived}/herdr-{key}"),
+                    "sha256": "c".repeat(64)
+                }
+            }
+        });
+
+        let err = seed(&value, &signer, &running(archived)).expect_err("archived build");
+        assert_eq!(err.code(), "update_manifest_invalid");
+        let unstamped = RunningBuild {
+            commit: None,
+            build_id: None,
+            commit_time: None,
+        };
+        let err = seed(&value, &signer, &unstamped).expect_err("unstamped build");
+        assert_eq!(err.code(), "update_manifest_invalid");
+    }
+
+    #[test]
+    fn seeding_refuses_a_build_of_another_protocol() {
+        let signer = TestSigner::new(1);
+        let mut value = seed_manifest(BUILD_ID);
+        value["protocol"] = (PROTOCOL + 1).into();
+
+        let err = seed(&value, &signer, &running(BUILD_ID)).expect_err("protocol mismatch");
+        assert_eq!(err.code(), "update_manifest_invalid");
     }
 }

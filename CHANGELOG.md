@@ -22,6 +22,7 @@
 ### Fixed
 - A remote app that reconnects to a pane, or falls behind its output, gets the pane's scrollback back instead of only the visible screen. `pane.stream` now honours `scrollback_lines`: every `reset` keyframe carries up to 1000 history rows in `history_b64`, read together with the screen so the two meet exactly. Clients that don't ask get the same keyframes as before.
 - A damaged agent avatar index (`agent-avatars/index.json`) no longer makes every later `agent.avatar.set` and clear fail with `avatar_save_failed`. Like the agent folders index, a corrupt or unreadable file reads as empty and the next change replaces it; the lost pictures' images are deleted by that change, except one the new index uses. (#328)
+- Installing herdr on a remote host from this machine's preview build now uses only the signed preview manifest, under the same checks as `herdr update`: a valid signature, the manifest naming this exact build, and an asset in that build's own release with a sha256 and size. The download is HTTPS-only, capped at that size, and checked against both. A manifest for another build, or the archived `builds` entries it used to fall back to, is refused; set `HERDR_REMOTE_BINARY` or run `herdr update` locally instead. A signed manifest with empty `notes` is now refused everywhere, not only by `herdr update`. (#340)
 
 ## [0.9.5] - 2026-10-14
 
