@@ -454,7 +454,9 @@ mod tests {
             .write_all(b"{\"id\":\"u\",\"method\":\"server.update_check\",\"params\":{}}\n")
             .unwrap();
         let mut line = String::new();
-        std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .unwrap();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(value["error"]["code"], "forbidden", "{line}");

@@ -4,8 +4,10 @@
 //! line, `RW…`). Order is primary first, then the offline backup used for a
 //! rotation. A manifest signed by any listed key is accepted; nothing else is.
 //!
-//! The production key is generated in the owner's keyring and has not been
-//! published yet. Until its line is added here, every manifest is refused with
-//! `update_signature_invalid`, so neither `herdr update` nor the in-app update
-//! installs anything.
-pub(super) const RELEASE_PUBLIC_KEYS: &[&str] = &[];
+//! The primary key lives in the owner's keyring and is never exported; release
+//! signing goes through the keyring's `minisign/herdr-release` route. The
+//! offline backup key is still to be made.
+pub(super) const RELEASE_PUBLIC_KEYS: &[&str] = &[
+    // herdr-release, minisign key id 1909BF13AB4A7686.
+    "RWSGdkqrE78JGWTn7MjyejRu2MVri68/C2eM+3OMvY0Sh+WV1QH+tr4f",
+];

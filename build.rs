@@ -35,11 +35,9 @@ fn emit_build_commit_time(commit: Option<&str>) {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let time = from_env.or_else(|| {
-        git_output(&["show", "-s", "--format=%ct", commit.unwrap_or("HEAD")])
-    });
-    if let Some(time) = time.filter(|value| value.parse::<i64>().is_ok_and(|seconds| seconds > 0))
-    {
+    let time =
+        from_env.or_else(|| git_output(&["show", "-s", "--format=%ct", commit.unwrap_or("HEAD")]));
+    if let Some(time) = time.filter(|value| value.parse::<i64>().is_ok_and(|seconds| seconds > 0)) {
         println!("cargo:rustc-env=HERDR_BUILD_COMMIT_TIME={time}");
     }
 }

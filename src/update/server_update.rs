@@ -32,13 +32,19 @@ impl InstallFacts {
             package_managed: super::is_package_manager_managed_install(),
             install_dir_writable: install_dir_writable(),
             live_handoff: crate::platform::capabilities().live_handoff,
+            #[cfg(unix)]
             systemd_main_process: crate::server::supervision::detect().forbids_process_handoff(),
+            #[cfg(not(unix))]
+            systemd_main_process: false,
         }
     }
 
     /// Unsupported reasons win over restart-required ones: there is nothing to
     /// download into an install the server can't replace.
-    pub(super) fn mode(&self, manifest: Option<&PreviewManifest>) -> (UpdateMode, Option<UpdateModeReason>) {
+    pub(super) fn mode(
+        &self,
+        manifest: Option<&PreviewManifest>,
+    ) -> (UpdateMode, Option<UpdateModeReason>) {
         let unsupported = if self.windows {
             Some(UpdateModeReason::Windows)
         } else if self.package_managed {
@@ -138,7 +144,11 @@ mod tests {
         systemd_main_process: false,
     };
 
-    fn manifest(commit_time: i64, endpoint_generation: Option<u32>, with_asset: bool) -> PreviewManifest {
+    fn manifest(
+        commit_time: i64,
+        endpoint_generation: Option<u32>,
+        with_asset: bool,
+    ) -> PreviewManifest {
         let key = verify::platform_asset_key();
         let build_id = "2026-10-28-0123456789ab";
         let mut value = serde_json::json!({
@@ -179,8 +189,12 @@ mod tests {
     #[test]
     fn newer_signed_build_is_offered_live_with_the_agreed_shape() {
         let result = json(
-            update_check_from(&manifest(1_761_638_400, Some(1), true), &running(1_761_580_000), &LIVE)
-                .unwrap(),
+            update_check_from(
+                &manifest(1_761_638_400, Some(1), true),
+                &running(1_761_580_000),
+                &LIVE,
+            )
+            .unwrap(),
         );
 
         assert_eq!(result["type"], "update_check");
@@ -189,7 +203,10 @@ mod tests {
         assert!(result.get("reason").is_none(), "{result}");
         assert_eq!(result["running"]["commit"], "8a02b834abcd");
         assert_eq!(result["running"]["commit_time"], 1_761_580_000);
-        assert_eq!(result["latest"]["version"], "0.9.6-preview.2026-10-28-0123456789ab");
+        assert_eq!(
+            result["latest"]["version"],
+            "0.9.6-preview.2026-10-28-0123456789ab"
+        );
         assert_eq!(result["latest"]["commit_time"], 1_761_638_400);
         assert_eq!(result["latest"]["size"], 41_943_040);
         assert_eq!(result["latest"]["protocol"], 22);
@@ -199,8 +216,12 @@ mod tests {
     fn older_or_equal_signed_build_is_not_offered() {
         for commit_time in [1_761_580_000, 1_700_000_000] {
             let result = json(
-                update_check_from(&manifest(commit_time, Some(1), true), &running(1_761_580_000), &LIVE)
-                    .unwrap(),
+                update_check_from(
+                    &manifest(commit_time, Some(1), true),
+                    &running(1_761_580_000),
+                    &LIVE,
+                )
+                .unwrap(),
             );
             assert_eq!(result["update_available"], false, "{commit_time}");
             assert_eq!(result["latest"]["commit_time"], commit_time);
@@ -210,8 +231,12 @@ mod tests {
     #[test]
     fn manifest_without_this_platform_reports_latest_null() {
         let result = json(
-            update_check_from(&manifest(1_761_638_400, Some(1), false), &running(1_761_580_000), &LIVE)
-                .unwrap(),
+            update_check_from(
+                &manifest(1_761_638_400, Some(1), false),
+                &running(1_761_580_000),
+                &LIVE,
+            )
+            .unwrap(),
         );
         assert!(result["latest"].is_null(), "{result}");
         assert_eq!(result["update_available"], false);
@@ -221,11 +246,46 @@ mod tests {
     fn each_install_fact_selects_its_mode_and_reason() {
         let newer = manifest(1_761_638_400, Some(1), true);
         let cases = [
-            (InstallFacts { windows: true, ..LIVE }, "unsupported", "windows"),
-            (InstallFacts { package_managed: true, ..LIVE }, "unsupported", "package_managed"),
-            (InstallFacts { install_dir_writable: false, ..LIVE }, "unsupported", "install_dir_not_writable"),
-            (InstallFacts { live_handoff: false, ..LIVE }, "restart_required", "no_live_handoff"),
-            (InstallFacts { systemd_main_process: true, ..LIVE }, "restart_required", "systemd_main_process"),
+            (
+                InstallFacts {
+                    windows: true,
+                    ..LIVE
+                },
+                "unsupported",
+                "windows",
+            ),
+            (
+                InstallFacts {
+                    package_managed: true,
+                    ..LIVE
+                },
+                "unsupported",
+                "package_managed",
+            ),
+            (
+                InstallFacts {
+                    install_dir_writable: false,
+                    ..LIVE
+                },
+                "unsupported",
+                "install_dir_not_writable",
+            ),
+            (
+                InstallFacts {
+                    live_handoff: false,
+                    ..LIVE
+                },
+                "restart_required",
+                "no_live_handoff",
+            ),
+            (
+                InstallFacts {
+                    systemd_main_process: true,
+                    ..LIVE
+                },
+                "restart_required",
+                "systemd_main_process",
+            ),
         ];
         for (facts, mode, reason) in cases {
             let result = json(update_check_from(&newer, &running(1_761_580_000), &facts).unwrap());
@@ -233,7 +293,8 @@ mod tests {
             assert_eq!(result["reason"], reason, "{facts:?}");
         }
         let next_generation = manifest(1_761_638_400, Some(2), true);
-        let result = json(update_check_from(&next_generation, &running(1_761_580_000), &LIVE).unwrap());
+        let result =
+            json(update_check_from(&next_generation, &running(1_761_580_000), &LIVE).unwrap());
         assert_eq!(result["mode"], "restart_required");
         assert_eq!(result["reason"], "endpoint_generation_changed");
     }

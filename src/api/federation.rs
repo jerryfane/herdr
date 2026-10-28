@@ -251,7 +251,11 @@ mod tests {
 
     #[test]
     fn server_update_methods_are_explicitly_denied_to_every_peer() {
-        for method in ["server.update_check", "server.update_apply", "server.update_status"] {
+        for method in [
+            "server.update_check",
+            "server.update_apply",
+            "server.update_status",
+        ] {
             let policy = federation_method_policy(method);
             assert_eq!(policy.access, FederationAccess::Denied, "{method}");
             assert!(!policy.outbound_routable, "{method}");

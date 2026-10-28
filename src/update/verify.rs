@@ -22,7 +22,8 @@ pub(super) const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 #[cfg(debug_assertions)]
-const DISTRIBUTION_ROOT: &str = "https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/";
+const DISTRIBUTION_ROOT: &str =
+    "https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/";
 
 /// Debug builds only: a `http://127.0.0.1:<port>` origin that stands in for
 /// both `raw.githubusercontent.com/…/distribution/` and the release root.
@@ -142,9 +143,7 @@ pub(super) fn platform_asset(
         .as_deref()
         .map(str::to_ascii_lowercase)
         .filter(|sha| is_hex(sha, 64))
-        .ok_or_else(|| {
-            VerifyError::ManifestInvalid(format!("asset {key} has no valid sha256"))
-        })?;
+        .ok_or_else(|| VerifyError::ManifestInvalid(format!("asset {key} has no valid sha256")))?;
     let size = asset
         .size
         .filter(|size| (1..=MAX_ASSET_BYTES).contains(size))
@@ -238,9 +237,8 @@ pub(super) fn verify_signed_manifest(
 }
 
 fn validate_manifest(manifest: &PreviewManifest) -> Result<(), VerifyError> {
-    let invalid = |detail: String| -> Result<(), VerifyError> {
-        Err(VerifyError::ManifestInvalid(detail))
-    };
+    let invalid =
+        |detail: String| -> Result<(), VerifyError> { Err(VerifyError::ManifestInvalid(detail)) };
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
         return invalid(format!(
             "schema_version {} (this build reads {MANIFEST_SCHEMA_VERSION})",
@@ -254,7 +252,10 @@ fn validate_manifest(manifest: &PreviewManifest) -> Result<(), VerifyError> {
         return invalid(format!("build_id {:?}", manifest.build_id));
     }
     if !is_hex(&manifest.commit, 40) {
-        return invalid(format!("commit {:?} is not a full commit id", manifest.commit));
+        return invalid(format!(
+            "commit {:?} is not a full commit id",
+            manifest.commit
+        ));
     }
     if manifest.commit_time.is_none_or(|time| time <= 0) {
         return invalid("commit_time is missing".into());
@@ -332,7 +333,14 @@ fn fetch(url: &str, limit: usize) -> Result<Fetched, VerifyError> {
     let protocols = allowed_protocols();
     let output = crate::noninteractive_process::curl_command()
         .args(["-sL", "--proto", protocols, "--proto-redir", protocols])
-        .args(["--retry", "3", "--connect-timeout", "10", "--max-time", "30"])
+        .args([
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+        ])
         .args(["--max-filesize", &limit.to_string()])
         .args(["-w", "%{stderr}%{http_code}"])
         .arg(fetch_url(url))
@@ -350,7 +358,9 @@ fn fetch(url: &str, limit: usize) -> Result<Fetched, VerifyError> {
             "{url} is larger than {limit} bytes"
         ))),
         "404" => Ok(Fetched::NotFound),
-        status => Err(VerifyError::Unreachable(format!("{url} answered HTTP {status}"))),
+        status => Err(VerifyError::Unreachable(format!(
+            "{url} answered HTTP {status}"
+        ))),
     }
 }
 
@@ -507,6 +517,25 @@ mod tests {
     }
 
     #[test]
+    fn primary_release_key_is_the_keyrings_herdr_release_key() {
+        use base64::Engine as _;
+        let primary = super::super::keys::RELEASE_PUBLIC_KEYS[0];
+        let bin = base64::engine::general_purpose::STANDARD
+            .decode(primary)
+            .unwrap();
+        assert_eq!(bin.len(), 42);
+        assert_eq!(&bin[..2], b"Ed");
+        // minisign prints the little-endian key number as hex.
+        let key_id: String = bin[2..10]
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        assert_eq!(key_id, "1909BF13AB4A7686");
+        minisign_verify::PublicKey::from_base64(primary).unwrap();
+    }
+
+    #[test]
     fn embedded_release_keys_are_minisign_public_keys() {
         for key in super::super::keys::RELEASE_PUBLIC_KEYS {
             minisign_verify::PublicKey::from_base64(key)
@@ -551,10 +580,8 @@ mod tests {
         let key = platform_asset_key();
         let mut value: serde_json::Value =
             serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
-        value["assets"][&key]["url"] = format!(
-            "{EXPECTED_RELEASE_ROOT}preview-2026-01-01-000000000000/herdr-{key}"
-        )
-        .into();
+        value["assets"][&key]["url"] =
+            format!("{EXPECTED_RELEASE_ROOT}preview-2026-01-01-000000000000/herdr-{key}").into();
         let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
 
         let err = platform_asset(&manifest).err().expect("wrong release tag");
@@ -564,7 +591,11 @@ mod tests {
     #[test]
     fn asset_without_a_valid_sha256_is_refused() {
         let key = platform_asset_key();
-        for sha in [serde_json::Value::Null, "deadbeef".into(), "g".repeat(64).into()] {
+        for sha in [
+            serde_json::Value::Null,
+            "deadbeef".into(),
+            "g".repeat(64).into(),
+        ] {
             let mut value: serde_json::Value =
                 serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
             value["assets"][&key]["sha256"] = sha.clone();

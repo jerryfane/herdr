@@ -18,12 +18,12 @@ use super::plugins::{
 };
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
-use super::update::{UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild};
 use super::tabs::TabInfo;
 use super::transcript::{
     PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
     TranscriptSubagent, TranscriptWorking,
 };
+use super::update::{UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
 
