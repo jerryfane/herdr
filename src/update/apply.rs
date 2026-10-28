@@ -16,7 +16,7 @@ use crate::api::schema::{
 };
 
 use super::server_update::InstallFacts;
-use super::state::{AttemptRecord, UpdateDirs, UpdateState, BINARY_NAME};
+use super::state::{AttemptLock, AttemptRecord, UpdateDirs, UpdateState, BINARY_NAME};
 use super::verify::{self, PlatformAsset, RunningBuild, VerifyError};
 use super::{preview_display_version, PreviewManifest, PREVIEW_UPDATE_MANIFEST_URL};
 
@@ -109,7 +109,8 @@ pub(super) struct Preflight<'a> {
 }
 
 /// The refusals that leave everything untouched, in the order the owner
-/// should hear about them. The attempt lock is taken after these pass.
+/// should hear about them. They run under the attempt lock, so a busy lock
+/// (`update_in_progress`) is reported first.
 pub(super) fn preflight(
     params: &ServerUpdateApplyParams,
     checks: Preflight<'_>,
@@ -172,9 +173,18 @@ pub(crate) fn update_apply(params: &ServerUpdateApplyParams) -> Result<ResponseR
     let manifest = &signed.manifest;
     let asset = verify::platform_asset(manifest)?;
     let dirs = UpdateDirs::current();
+    // Taken before the state is read, so the rolled-back builds preflight
+    // checks are the ones the last attempt left.
+    let lock = match dirs.acquire_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Err(ApplyError::InProgress),
+        Err(err) => {
+            return Err(ApplyError::PreflightFailed(format!(
+                "can't take the update lock: {err}"
+            )))
+        }
+    };
     let state = dirs.load();
-    std::fs::create_dir_all(dirs.root())
-        .map_err(|err| ApplyError::PreflightFailed(format!("can't create updates dir: {err}")))?;
     preflight(
         params,
         Preflight {
@@ -187,25 +197,11 @@ pub(crate) fn update_apply(params: &ServerUpdateApplyParams) -> Result<ResponseR
         },
     )?;
     let asset = asset.expect("preflight requires an asset");
-
     let attempt_id = new_attempt_id();
-    dirs.clear_stale_lock(&state, super::state::process_alive);
-    match dirs.acquire_lock(&attempt_id) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(ApplyError::InProgress)
-        }
-        Err(err) => {
-            return Err(ApplyError::PreflightFailed(format!(
-                "can't take the update lock: {err}"
-            )))
-        }
-    }
-    let started = start_attempt(&dirs, params, &signed, &asset, &attempt_id);
-    if let Err(err) = started {
-        dirs.release_lock(&attempt_id);
-        return Err(ApplyError::PreflightFailed(err.to_string()));
-    }
+    // On success the guard holds the lock; this server's copy closes here
+    // either way, so a failed start leaves no lock behind.
+    start_attempt(&dirs, params, &signed, &asset, &attempt_id, &lock)
+        .map_err(|err| ApplyError::PreflightFailed(err.to_string()))?;
     Ok(ResponseResult::UpdateApply { attempt_id })
 }
 
@@ -224,6 +220,7 @@ fn start_attempt(
     signed: &verify::SignedManifest,
     asset: &PlatformAsset,
     attempt_id: &str,
+    lock: &AttemptLock,
 ) -> io::Result<()> {
     let manifest = &signed.manifest;
     let install_path = super::state::install_path()?;
@@ -260,11 +257,10 @@ fn start_attempt(
         install_path,
         running_exe: super::state::current_exe()?,
         previous_sha256,
-        guard_pid: None,
     };
     dirs.update(|state| state.attempt = Some(record))?;
 
-    if let Err(err) = spawn_guard(&previous, attempt_id) {
+    if let Err(err) = spawn_guard(&previous, attempt_id, lock) {
         let message = format!("the update guard did not start: {err}");
         let _ = dirs.update(|state| {
             if let Some(attempt) = state.attempt.as_mut() {
@@ -297,18 +293,21 @@ fn copy_running_image(dest: &Path) -> io::Result<()> {
     std::fs::rename(&tmp, dest)
 }
 
-/// Start `<previous> server update-guard --attempt <id>` in its own session
-/// with null stdio, so neither this server's exit nor its terminal stops it.
-/// The environment is inherited, so the guard resolves the same socket and
+/// Start `<previous> server update-guard --attempt <id> --lock-fd <fd>` in its
+/// own session with null stdio, so neither this server's exit nor its
+/// terminal stops it. It inherits the attempt lock as descriptor `<fd>`. The
+/// environment is inherited, so the guard resolves the same socket and
 /// config directory.
-fn spawn_guard(exe: &Path, attempt_id: &str) -> io::Result<()> {
+fn spawn_guard(exe: &Path, attempt_id: &str, lock: &AttemptLock) -> io::Result<()> {
     use std::os::unix::process::CommandExt as _;
     let mut command = std::process::Command::new(exe);
     command
         .args(["server", "update-guard", "--attempt", attempt_id])
+        .args(["--lock-fd", &lock.fd().to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    lock.pass_to(&mut command);
     // SAFETY: setsid is async-signal-safe and touches no Rust state.
     unsafe {
         command.pre_exec(|| {

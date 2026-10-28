@@ -21,6 +21,8 @@ const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub(super) const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
+/// Longest accepted `build_id`; real ones are `YYYY-MM-DD-<12 hex>`.
+const MAX_BUILD_ID_LEN: usize = 64;
 #[cfg(debug_assertions)]
 const DISTRIBUTION_ROOT: &str =
     "https://raw.githubusercontent.com/jerryfane/herdr/master/distribution/";
@@ -260,6 +262,19 @@ fn is_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A `build_id` names a directory under `updates/` that every apply removes
+/// and recreates, so it must be a plain name of its own there: at most
+/// `MAX_BUILD_ID_LEN` of `[A-Za-z0-9._-]`, starting with a letter or digit
+/// (so never `.`, `..` or a temp file), and not one of the layout's names.
+fn is_build_id(value: &str) -> bool {
+    (1..=MAX_BUILD_ID_LEN).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !super::state::LAYOUT_NAMES.contains(&value)
+}
+
 /// Fetch `manifest_url` and `<manifest_url>.minisig`, and verify them.
 pub(super) fn fetch_signed_manifest(manifest_url: &str) -> Result<PreviewManifest, VerifyError> {
     fetch_signed_manifest_files(manifest_url).map(|signed| signed.manifest)
@@ -379,7 +394,7 @@ fn validate_manifest(manifest: &PreviewManifest) -> Result<(), VerifyError> {
     if manifest.channel != "preview" {
         return invalid(format!("channel {}", manifest.channel));
     }
-    if manifest.build_id.trim().is_empty() || manifest.build_id.contains(['/', '\\', ' ']) {
+    if !is_build_id(&manifest.build_id) {
         return invalid(format!("build_id {:?}", manifest.build_id));
     }
     if !is_hex(&manifest.commit, 40) {
@@ -779,6 +794,47 @@ mod tests {
                 .expect("notes are required");
             assert_eq!(err.code(), "update_manifest_invalid", "{notes:?}");
         }
+    }
+
+    #[test]
+    fn manifest_with_a_build_id_that_is_not_a_plain_name_is_refused() {
+        // The build id names a directory under `updates/` that an apply
+        // removes and recreates, so it must not leave that directory or
+        // name anything else there.
+        let primary = TestSigner::new(1);
+        let too_long = "a".repeat(MAX_BUILD_ID_LEN + 1);
+        let refused = [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "-flag",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a:b",
+            "é",
+            too_long.as_str(),
+            "previous",
+            "state.json",
+            "lock",
+            "guard.log",
+        ];
+        for build_id in refused {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&manifest_json(BUILD_ID, COMMIT, 1_800_000_000)).unwrap();
+            value["build_id"] = build_id.into();
+            let json = value.to_string();
+            let minisig = primary.sign(json.as_bytes(), &comment(build_id, COMMIT));
+
+            let err = verify_signed_manifest(json.as_bytes(), &minisig, &keys(&[&primary]))
+                .err()
+                .expect("the build id must be refused");
+            assert_eq!(err.code(), "update_manifest_invalid", "{build_id:?}");
+        }
+        assert!(is_build_id("2026-10-28-8a02b8342805"));
+        assert!(is_build_id(&"a".repeat(MAX_BUILD_ID_LEN)));
+        assert!(is_build_id("v1.2_rc-3"));
     }
 
     const PROTOCOL: u32 = 22;

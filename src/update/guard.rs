@@ -1,5 +1,6 @@
-//! `herdr server update-guard --attempt <id>`: carries out one in-app update
-//! after `server.update_apply` has answered.
+//! `herdr server update-guard --attempt <id> --lock-fd <fd>`: carries out one
+//! in-app update after `server.update_apply` has answered. It holds the
+//! attempt lock it inherited as `<fd>` until the outcome is recorded.
 //!
 //! It runs from `updates/previous/herdr`, a copy of the build that was serving,
 //! as an API client of the local socket, in its own session. In order it
@@ -29,7 +30,9 @@ use crate::api::schema::{
 };
 
 use super::apply::{MANIFEST_FILE, SIGNATURE_FILE};
-use super::state::{process_alive, AttemptRecord, UpdateDirs, BINARY_NAME, PREVIOUS_DIR};
+use super::state::{
+    process_alive, AttemptLock, AttemptRecord, UpdateDirs, BINARY_NAME, PREVIOUS_DIR,
+};
 use super::verify;
 
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,14 +54,26 @@ const BEFORE_FILE: &str = "before.json";
 const TEST_FAULT_ENV: &str = "HERDR_UPDATE_TEST_GUARD_FAULT";
 
 pub(crate) fn run(args: &[String]) -> io::Result<i32> {
-    let attempt_id = match args {
-        [flag, id] if flag == "--attempt" && !id.is_empty() => id.clone(),
-        _ => {
-            eprintln!("usage: herdr server update-guard --attempt <id>");
+    let (attempt_id, lock_fd) = match args {
+        [attempt_flag, id, fd_flag, fd]
+            if attempt_flag == "--attempt" && !id.is_empty() && fd_flag == "--lock-fd" =>
+        {
+            match fd.parse::<std::os::fd::RawFd>() {
+                Ok(fd) if fd >= 0 => (id.clone(), fd),
+                _ => return Ok(usage()),
+            }
+        }
+        _ => return Ok(usage()),
+    };
+    let dirs = UpdateDirs::current();
+    // Held until this process exits, so the lock outlives the outcome write.
+    let _lock = match AttemptLock::inherited(&dirs, lock_fd) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("update attempt {attempt_id}: no update lock: {err}");
             return Ok(2);
         }
     };
-    let dirs = UpdateDirs::current();
     let Some(record) = dirs
         .load()
         .attempt
@@ -71,6 +86,11 @@ pub(crate) fn run(args: &[String]) -> io::Result<i32> {
     let (outcome, message) = guard.carry_out();
     guard.finish(outcome, message);
     Ok(0)
+}
+
+fn usage() -> i32 {
+    eprintln!("usage: herdr server update-guard --attempt <id> --lock-fd <fd>");
+    2
 }
 
 struct Guard {
@@ -118,8 +138,6 @@ impl Guard {
     }
 
     fn carry_out(&mut self) -> (UpdateOutcome, String) {
-        let pid = std::process::id();
-        self.save(|record| record.guard_pid = Some(pid));
         match self.prepare() {
             Ok(prepared) => {
                 if self.record.public.restart_later {
@@ -289,8 +307,6 @@ impl Guard {
             record.public.outcome = Some(outcome);
             record.public.message = Some(message);
         });
-        let attempt_id = self.record.public.attempt_id.clone();
-        self.dirs.release_lock(&attempt_id);
     }
 }
 

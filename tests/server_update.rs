@@ -285,10 +285,22 @@ impl Fixture {
         fs::read_to_string(self.updates().join("guard.log")).unwrap_or_default()
     }
 
-    /// Wait until the lock is gone, so the guard has finished writing.
+    /// Whether an attempt holds the update lock (an exclusive `flock` on
+    /// `updates/lock`; the file itself stays).
+    fn lock_held(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let Ok(file) = fs::File::open(self.updates().join("lock")) else {
+            return false;
+        };
+        // SAFETY: `file` owns an open descriptor; the shared lock is dropped
+        // with it.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+    }
+
+    /// Wait until the guard has given up the lock, so it has finished writing.
     fn wait_for_guard_exit(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.updates().join("lock").exists() {
+        while self.lock_held() {
             assert!(Instant::now() < deadline, "the guard kept the update lock");
             thread::sleep(Duration::from_millis(100));
         }
@@ -674,5 +686,5 @@ fn update_apply_refuses_a_build_the_owner_did_not_confirm() {
     );
     let status = fixture.request("server.update_status", serde_json::json!({}));
     assert!(status["result"]["attempt"].is_null(), "{status}");
-    assert!(!fixture.updates().join("lock").exists());
+    assert!(!fixture.lock_held());
 }

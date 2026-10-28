@@ -5,7 +5,9 @@
 //!
 //! Layout:
 //! - `state.json`: the newest attempt plus the builds that rolled back here;
-//! - `lock`: held from a passing preflight until the guard finishes (O_EXCL);
+//! - `lock`: an exclusive `flock` held from a passing preflight until the
+//!   guard has recorded the outcome (see `AttemptLock`). The file stays;
+//!   only the kernel lock on it matters;
 //! - `previous/herdr`: a copy of the build that was serving, the rollback target
 //!   and the binary the guard itself runs from;
 //! - `<build_id>/`: the signed manifest, the download and the guard's
@@ -26,6 +28,9 @@ const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = "lock";
 pub(crate) const PREVIOUS_DIR: &str = "previous";
 pub(crate) const BINARY_NAME: &str = "herdr";
+const GUARD_LOG: &str = "guard.log";
+/// The names under `updates/` that are not build directories.
+pub(crate) const LAYOUT_NAMES: [&str; 4] = [STATE_FILE, LOCK_FILE, PREVIOUS_DIR, GUARD_LOG];
 
 /// The paths under one config directory's `updates/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,7 @@ impl UpdateDirs {
         self.root.join(STATE_FILE)
     }
 
+    #[cfg(unix)]
     pub(crate) fn lock_file(&self) -> PathBuf {
         self.root.join(LOCK_FILE)
     }
@@ -67,7 +73,7 @@ impl UpdateDirs {
     }
 
     pub(crate) fn guard_log(&self) -> PathBuf {
-        self.root.join("guard.log")
+        self.root.join(GUARD_LOG)
     }
 
     /// Read the state file. A missing or damaged file reads as empty: a
@@ -102,45 +108,157 @@ impl UpdateDirs {
         Ok(state)
     }
 
-    /// Take the attempt lock. Fails with `AlreadyExists` while another
-    /// attempt holds it.
-    pub(crate) fn acquire_lock(&self, attempt_id: &str) -> io::Result<()> {
+    /// Take the attempt lock, or `None` while another attempt holds it.
+    #[cfg(unix)]
+    pub(crate) fn acquire_lock(&self) -> io::Result<Option<AttemptLock>> {
+        use std::os::fd::AsRawFd as _;
         std::fs::create_dir_all(&self.root)?;
         let mut file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(self.lock_file())?;
-        file.write_all(attempt_id.as_bytes())
+        // The guard's stdio replaces descriptors 0-2 before it inherits this
+        // one, so keep it above them (`try_clone` dups to 3 or higher).
+        if file.as_raw_fd() <= 2 {
+            file = file.try_clone()?;
+        }
+        // `load_settled` holds the lock shared for the length of one state
+        // read, so a busy lock is retried briefly before it counts as held.
+        for _ in 0..LOCK_TRIES {
+            if try_flock(&file, libc::LOCK_EX)? {
+                return Ok(Some(AttemptLock(file)));
+            }
+            std::thread::sleep(LOCK_RETRY);
+        }
+        Ok(None)
     }
 
-    #[cfg(test)]
-    fn lock_held(&self) -> bool {
-        self.lock_file().exists()
-    }
-
-    /// Remove a lock that its attempt can no longer release: the attempt
-    /// has an outcome, or its guard exited without one. A lock whose holder
-    /// the state file does not name is left alone.
-    pub(crate) fn clear_stale_lock(&self, state: &UpdateState, alive: impl Fn(u32) -> bool) {
-        let Ok(holder) = std::fs::read_to_string(self.lock_file()) else {
-            return;
+    /// The state, and whether an attempt holds the lock, read consistently:
+    /// when the lock is free the state is read under a shared lock, which no
+    /// attempt can take or give up meanwhile, because apply and the guard
+    /// write the state only while they hold it exclusively.
+    #[cfg(unix)]
+    pub(crate) fn load_settled(&self) -> (UpdateState, bool) {
+        let file = match std::fs::File::open(self.lock_file()) {
+            Ok(file) => file,
+            // No attempt has ever taken the lock here.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return (self.load(), false),
+            Err(_) => return (self.load(), true),
         };
-        let stale = state.attempt.as_ref().is_some_and(|record| {
-            record.public.attempt_id == holder
-                && (record.public.outcome.is_some()
-                    || record.guard_pid.is_some_and(|pid| !alive(pid)))
-        });
-        if stale {
-            let _ = std::fs::remove_file(self.lock_file());
+        match try_flock(&file, libc::LOCK_SH) {
+            Ok(true) => (self.load(), false),
+            // Held, or unknown: never report an attempt dead without proof.
+            Ok(false) | Err(_) => (self.load(), true),
         }
     }
 
-    /// Release the lock, but only the one `attempt_id` took.
-    pub(crate) fn release_lock(&self, attempt_id: &str) {
-        let path = self.lock_file();
-        if std::fs::read_to_string(&path).is_ok_and(|holder| holder == attempt_id) {
-            let _ = std::fs::remove_file(path);
+    /// Windows starts no attempts; nothing proves one dead.
+    #[cfg(not(unix))]
+    pub(crate) fn load_settled(&self) -> (UpdateState, bool) {
+        (self.load(), true)
+    }
+}
+
+#[cfg(unix)]
+const LOCK_TRIES: u32 = 10;
+#[cfg(unix)]
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// `flock(operation | LOCK_NB)`: `Ok(false)` when another open file holds a
+/// conflicting lock.
+#[cfg(unix)]
+fn try_flock(file: &std::fs::File, operation: libc::c_int) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        // SAFETY: `file` owns an open descriptor for the whole call.
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+            return Ok(true);
         }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(err),
+        }
+    }
+}
+
+/// The attempt lock: an exclusive `flock` on `updates/lock`, held from a
+/// passing preflight until the guard has recorded the outcome. The server
+/// that accepts the apply takes it, the guard inherits the same open file
+/// (`pass_to`, then `inherited`), and the server closes its copy. The
+/// kernel drops the lock when the last copy closes, so a server that dies
+/// before the guard starts, or a guard that dies at any point, leaves no
+/// lock behind, and nothing ever decides a lock is stale. The file is never
+/// removed: a removed file would let a second attempt lock a new file while
+/// the first still holds the old one.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct AttemptLock(std::fs::File);
+
+#[cfg(unix)]
+impl AttemptLock {
+    /// The descriptor number the guard is told to take over.
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.0.as_raw_fd()
+    }
+
+    /// Let `command`'s process inherit this lock: the descriptor stays open
+    /// across its exec (every other descriptor of this process closes on
+    /// exec).
+    pub(crate) fn pass_to(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+        let fd = self.fd();
+        // SAFETY: runs in the forked child before exec; fcntl is
+        // async-signal-safe and touches only the child's descriptor table.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Take over the lock `pass_to` handed this process as descriptor `fd`.
+    /// Refused unless `fd` is open on `dirs`' lock file and holds its lock;
+    /// it is closed on exec again, so the guard's own children don't keep it.
+    pub(crate) fn inherited(dirs: &UpdateDirs, fd: std::os::fd::RawFd) -> io::Result<Self> {
+        use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: F_GETFD only reads the flags of `fd`, if it is open.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is open, and nothing else in this process owns it: it
+        // was inherited for exactly this. If it is not the lock file it is
+        // handed back below without being closed.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let same_file = match (file.metadata(), std::fs::metadata(dirs.lock_file())) {
+            (Ok(held), Ok(lock)) => held.dev() == lock.dev() && held.ino() == lock.ino(),
+            _ => false,
+        };
+        if !same_file {
+            let _ = file.into_raw_fd();
+            return Err(io::Error::other(format!(
+                "descriptor {fd} is not {}",
+                dirs.lock_file().display()
+            )));
+        }
+        // SAFETY: `file` owns the open descriptor `fd`.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Already held through this open file, this succeeds at once;
+        // otherwise another attempt holds it and this process must not run.
+        if !try_flock(&file, libc::LOCK_EX)? {
+            return Err(io::Error::other("another attempt holds the update lock"));
+        }
+        Ok(Self(file))
     }
 }
 
@@ -175,27 +293,27 @@ pub(crate) struct AttemptRecord {
     pub(crate) running_exe: PathBuf,
     /// sha256 of `previous/herdr`, the build that was serving.
     pub(crate) previous_sha256: String,
-    /// Recorded by the guard when it starts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) guard_pid: Option<u32>,
 }
 
 /// `server.update_status`: the newest attempt, as any server reads it.
 pub(crate) fn update_status() -> crate::api::schema::ResponseResult {
+    let (state, running) = UpdateDirs::current().load_settled();
     crate::api::schema::ResponseResult::UpdateStatus {
-        attempt: status_from(&UpdateDirs::current().load(), process_alive),
+        attempt: status_from(&state, running),
     }
 }
 
-fn status_from(state: &UpdateState, alive: impl Fn(u32) -> bool) -> Option<UpdateAttempt> {
+/// `running`: an attempt holds the lock (see `UpdateDirs::load_settled`).
+fn status_from(state: &UpdateState, running: bool) -> Option<UpdateAttempt> {
     let record = state.attempt.as_ref()?;
     let mut attempt = record.public.clone();
-    // A guard that died without recording an outcome left the server in an
-    // unconfirmed state: report it as such rather than as still running.
-    if attempt.outcome.is_none() && record.guard_pid.is_some_and(|pid| !alive(pid)) {
+    // An attempt without an outcome whose lock is free was cut short: the
+    // server died before the guard started, or the guard died. The server's
+    // state is unconfirmed: report it as such rather than as still running.
+    if attempt.outcome.is_none() && !running {
         attempt.outcome = Some(UpdateOutcome::NeedsAttention);
         attempt.message = Some(format!(
-            "the update guard exited before finishing ({}); run `herdr status server` and check {}",
+            "the update attempt stopped before finishing ({}); run `herdr status server` and check {}",
             attempt.message.as_deref().unwrap_or("no detail recorded"),
             UpdateDirs::current().guard_log().display()
         ));
@@ -236,11 +354,6 @@ fn is_zombie(pid: libc::pid_t) -> bool {
                 .trim()
                 .starts_with('Z')
         })
-}
-
-#[cfg(not(unix))]
-pub(crate) fn process_alive(_pid: u32) -> bool {
-    true
 }
 
 /// The on-disk binary an update replaces. After a live switch the server runs
@@ -297,7 +410,7 @@ mod tests {
         UpdateDirs::at(root.join(UPDATES_DIR))
     }
 
-    fn record(outcome: Option<UpdateOutcome>, guard_pid: Option<u32>) -> AttemptRecord {
+    fn record(outcome: Option<UpdateOutcome>) -> AttemptRecord {
         AttemptRecord {
             public: UpdateAttempt {
                 attempt_id: "upd-1".into(),
@@ -316,7 +429,6 @@ mod tests {
             install_path: PathBuf::from("/opt/herdr/bin/herdr"),
             running_exe: PathBuf::from("/opt/herdr/bin/herdr"),
             previous_sha256: "a".repeat(64),
-            guard_pid,
         }
     }
 
@@ -324,13 +436,13 @@ mod tests {
     fn state_file_round_trips_and_status_hides_internal_fields() {
         let dirs = temp_dirs("round-trip");
         let state = UpdateState {
-            attempt: Some(record(Some(UpdateOutcome::RolledBack), Some(7))),
+            attempt: Some(record(Some(UpdateOutcome::RolledBack))),
             rolled_back: vec!["2026-10-28-0123456789ab".into()],
         };
         dirs.store(&state).unwrap();
 
         assert_eq!(dirs.load(), state);
-        let status = serde_json::to_value(status_from(&dirs.load(), |_| true)).unwrap();
+        let status = serde_json::to_value(status_from(&dirs.load(), false)).unwrap();
         assert_eq!(status["outcome"], "rolled_back");
         assert_eq!(status["phase"], "confirming");
         assert_eq!(status["panes"], 3);
@@ -343,7 +455,7 @@ mod tests {
     #[test]
     fn damaged_or_missing_state_reads_as_no_attempt() {
         let dirs = temp_dirs("damaged");
-        assert_eq!(status_from(&dirs.load(), |_| true), None);
+        assert_eq!(status_from(&dirs.load(), false), None);
         std::fs::create_dir_all(dirs.root()).unwrap();
         std::fs::write(dirs.state_file(), b"{not json").unwrap();
         assert_eq!(dirs.load(), UpdateState::default());
@@ -351,58 +463,202 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_guard_without_an_outcome_reports_needs_attention() {
+    fn an_unfinished_attempt_whose_lock_is_free_reports_needs_attention() {
         let state = UpdateState {
-            attempt: Some(record(None, Some(4242))),
+            attempt: Some(record(None)),
             rolled_back: Vec::new(),
         };
-        let running = status_from(&state, |_| true).unwrap();
+        let running = status_from(&state, true).unwrap();
         assert_eq!(running.outcome, None);
-        let dead = status_from(&state, |_| false).unwrap();
+        let dead = status_from(&state, false).unwrap();
         assert_eq!(dead.outcome, Some(UpdateOutcome::NeedsAttention));
-        assert!(dead.message.unwrap().contains("guard exited"));
+        assert!(dead.message.unwrap().contains("stopped before finishing"));
+
+        let finished = UpdateState {
+            attempt: Some(record(Some(UpdateOutcome::Updated))),
+            rolled_back: Vec::new(),
+        };
+        let done = status_from(&finished, false).unwrap();
+        assert_eq!(done.outcome, Some(UpdateOutcome::Updated));
     }
 
-    #[test]
-    fn the_lock_admits_one_attempt_and_only_its_holder_releases_it() {
-        let dirs = temp_dirs("lock");
-        dirs.acquire_lock("upd-a").unwrap();
-        let second = dirs.acquire_lock("upd-b").unwrap_err();
-        assert_eq!(second.kind(), io::ErrorKind::AlreadyExists);
+    /// Hand `lock` to a child process the way the server hands it to the
+    /// guard, then close this process's copy: the child is the only holder.
+    #[cfg(unix)]
+    fn hold_in_child(lock: AttemptLock) -> std::process::Child {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        lock.pass_to(&mut command);
+        let child = command.spawn().unwrap();
+        drop(lock);
+        child
+    }
 
-        dirs.release_lock("upd-b");
-        assert!(dirs.lock_held(), "another attempt released the lock");
-        dirs.release_lock("upd-a");
-        assert!(!dirs.lock_held());
-        dirs.acquire_lock("upd-b").unwrap();
+    #[cfg(unix)]
+    fn kill(mut child: std::process::Child) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_admits_one_attempt_until_its_holder_closes_it() {
+        let dirs = temp_dirs("lock");
+        assert!(!dirs.load_settled().1, "no attempt ever ran here");
+        let first = dirs.acquire_lock().unwrap().expect("a free lock is taken");
+        assert!(dirs.acquire_lock().unwrap().is_none());
+        assert!(dirs.load_settled().1);
+
+        drop(first);
+        assert!(!dirs.load_settled().1);
+        let _second = dirs.acquire_lock().unwrap().expect("a closed lock is free");
+        assert!(dirs.lock_file().exists(), "the lock file is never removed");
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
     }
 
+    /// (a) The server dies after taking the lock, before it records the attempt.
+    #[cfg(unix)]
     #[test]
-    fn a_lock_left_by_a_finished_or_dead_attempt_is_cleared() {
-        let dirs = temp_dirs("stale-lock");
-        let mut state = UpdateState {
-            attempt: Some(record(None, Some(4242))),
+    fn a_server_that_dies_before_recording_the_attempt_leaves_no_lock() {
+        let dirs = temp_dirs("dead-before-record");
+        let earlier = UpdateState {
+            attempt: Some(record(Some(UpdateOutcome::Updated))),
             rolled_back: Vec::new(),
         };
-        dirs.acquire_lock("upd-1").unwrap();
+        dirs.store(&earlier).unwrap();
+        let server = hold_in_child(dirs.acquire_lock().unwrap().unwrap());
+        assert!(dirs.acquire_lock().unwrap().is_none());
 
-        dirs.clear_stale_lock(&state, |_| true);
-        assert!(dirs.lock_held(), "a running guard's lock was cleared");
-        dirs.clear_stale_lock(&state, |_| false);
-        assert!(!dirs.lock_held(), "a dead guard's lock was kept");
+        kill(server);
 
-        dirs.acquire_lock("upd-1").unwrap();
-        state.attempt = Some(record(Some(UpdateOutcome::Updated), None));
-        dirs.clear_stale_lock(&state, |_| true);
-        assert!(!dirs.lock_held(), "a finished attempt's lock was kept");
-
-        dirs.acquire_lock("upd-other").unwrap();
-        dirs.clear_stale_lock(&state, |_| false);
-        assert!(
-            dirs.lock_held(),
-            "a lock the state does not name was cleared"
+        let (state, running) = dirs.load_settled();
+        assert!(!running);
+        assert_eq!(
+            status_from(&state, running).unwrap().outcome,
+            Some(UpdateOutcome::Updated),
+            "the earlier attempt is reported unchanged"
         );
+        assert!(
+            dirs.acquire_lock().unwrap().is_some(),
+            "a later apply takes the lock"
+        );
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// (b) The server dies after recording the attempt, before it spawns the guard.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_dies_before_spawning_the_guard_leaves_no_lock() {
+        let dirs = temp_dirs("dead-before-spawn");
+        let lock = dirs.acquire_lock().unwrap().unwrap();
+        dirs.update(|state| state.attempt = Some(record(None)))
+            .unwrap();
+        let server = hold_in_child(lock);
+        let (state, running) = dirs.load_settled();
+        assert!(running);
+        assert_eq!(status_from(&state, running).unwrap().outcome, None);
+
+        kill(server);
+
+        let (state, running) = dirs.load_settled();
+        assert_eq!(
+            status_from(&state, running).unwrap().outcome,
+            Some(UpdateOutcome::NeedsAttention)
+        );
+        assert!(
+            dirs.acquire_lock().unwrap().is_some(),
+            "a later apply takes the lock"
+        );
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// (c) The guard inherits the lock and dies before it writes anything;
+    /// the server already closed its copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_that_dies_before_writing_anything_leaves_no_lock() {
+        let dirs = temp_dirs("dead-guard");
+        let lock = dirs.acquire_lock().unwrap().unwrap();
+        dirs.update(|state| state.attempt = Some(record(None)))
+            .unwrap();
+        let guard = hold_in_child(lock);
+        assert!(
+            dirs.acquire_lock().unwrap().is_none(),
+            "the guard holds the lock once the server closed its copy"
+        );
+
+        kill(guard);
+
+        let (state, running) = dirs.load_settled();
+        assert_eq!(
+            status_from(&state, running).unwrap().outcome,
+            Some(UpdateOutcome::NeedsAttention)
+        );
+        assert!(
+            dirs.acquire_lock().unwrap().is_some(),
+            "a later apply takes the lock"
+        );
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// Holders that close while new attempts and status reads race them: no
+    /// two attempts ever hold the lock at once, and the lock file stays put,
+    /// so a new holder's lock can't be removed from under it.
+    #[cfg(unix)]
+    #[test]
+    fn racing_attempts_and_status_reads_never_share_the_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dirs = temp_dirs("race");
+        let holders = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        if let Some(lock) = dirs.acquire_lock().unwrap() {
+                            assert_eq!(
+                                holders.fetch_add(1, Ordering::SeqCst),
+                                0,
+                                "two attempts held the lock"
+                            );
+                            taken.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            holders.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
+                        }
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    let _ = dirs.load_settled();
+                }
+            });
+        });
+        assert!(taken.load(Ordering::SeqCst) > 0);
+        assert!(dirs.lock_file().exists());
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_takes_over_only_the_lock_it_inherited() {
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+        let dirs = temp_dirs("inherit");
+        let lock = dirs.acquire_lock().unwrap().unwrap();
+
+        let other = std::fs::File::open("/dev/null").unwrap();
+        assert!(AttemptLock::inherited(&dirs, other.as_raw_fd()).is_err());
+        assert!(other.metadata().is_ok(), "a refused descriptor stays open");
+
+        let taken = AttemptLock::inherited(&dirs, lock.0.into_raw_fd()).unwrap();
+        assert!(dirs.acquire_lock().unwrap().is_none());
+        drop(taken);
+
+        // An open lock file that is not the holder's is refused.
+        let _holder = dirs.acquire_lock().unwrap().unwrap();
+        let stray = std::fs::File::open(dirs.lock_file()).unwrap();
+        assert!(AttemptLock::inherited(&dirs, stray.into_raw_fd()).is_err());
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
     }
 
