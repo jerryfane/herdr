@@ -1192,6 +1192,7 @@ fn success_response_round_trips() {
                 pane_history: false,
                 agent_answer: false,
                 agent_transcript: false,
+                server_update: false,
             }),
         },
     };

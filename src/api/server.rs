@@ -215,6 +215,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_history: true,
         agent_answer: true,
         agent_transcript: true,
+        server_update: true,
     })
 }
 
@@ -3413,6 +3414,7 @@ mod tests {
                 pane_history: false,
                 agent_answer: false,
                 agent_transcript: false,
+                server_update: false,
             }),
             None,
             None,

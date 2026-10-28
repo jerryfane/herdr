@@ -10,6 +10,12 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Committer time (unix seconds) of the commit this binary was built from, stamped by
+/// `build.rs`. The in-app updater refuses any manifest that is not strictly newer.
+pub fn commit_time() -> Option<i64> {
+    non_empty(option_env!("HERDR_BUILD_COMMIT_TIME")).and_then(|value| value.parse().ok())
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),

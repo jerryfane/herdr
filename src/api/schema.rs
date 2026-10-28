@@ -18,6 +18,7 @@ pub mod server;
 pub mod session;
 pub mod tabs;
 pub mod transcript;
+pub mod update;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -38,6 +39,7 @@ pub use server::*;
 pub use session::*;
 pub use tabs::*;
 pub use transcript::*;
+pub use update::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -62,6 +64,7 @@ operations::define_operations! {
     MachineStatus(EmptyParams) => "machine.status", false, false;
     ServerStagedUpdate(EmptyParams) => "server.staged_update", false, false;
     ServerApplyStagedUpdate(EmptyParams) => "server.apply_staged_update", false, false;
+    ServerUpdateCheck(EmptyParams) => "server.update_check", false, false;
     ServerSshAgentRegister(ServerSshAgentRegisterParams) => "server.ssh_agent.register", false, false;
     ServerAgentManifests(EmptyParams) => "server.agent_manifests", false, false;
     ServerReloadAgentManifests(EmptyParams) => "server.reload_agent_manifests", true, false;

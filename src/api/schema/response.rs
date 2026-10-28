@@ -18,6 +18,7 @@ use super::plugins::{
 };
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
+use super::update::{UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild};
 use super::tabs::TabInfo;
 use super::transcript::{
     PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
@@ -510,6 +511,18 @@ pub enum ResponseResult {
         running_sha: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         staged: Option<StagedBuildInfo>,
+    },
+    /// `server.update_check` — the running build, the newest signed preview
+    /// build for this platform (`null` when none is published for it), whether
+    /// it is newer than the running one, and how this server would switch to it.
+    UpdateCheck {
+        running: UpdateRunningBuild,
+        latest: Option<UpdateLatestBuild>,
+        update_available: bool,
+        mode: UpdateMode,
+        /// Present when `mode` is not `live`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<UpdateModeReason>,
     },
     Ok {},
 }

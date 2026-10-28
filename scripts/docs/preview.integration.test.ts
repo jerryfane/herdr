@@ -66,7 +66,7 @@ async function writeManifest(root: string, commit: string) {
     root,
     'distribution/preview.json',
     `${JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       channel: 'preview',
       build_id: 'test-build',
       commit,

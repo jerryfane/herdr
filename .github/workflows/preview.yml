@@ -334,12 +334,15 @@ jobs:
             --output PREVIEW_NOTES.md
           python3 - <<'PY'
           import json, pathlib
-          result = {}
+          shas = {}
+          sizes = {}
           for path in pathlib.Path('artifacts').glob('herdr-*/*.sha256'):
               digest, name = path.read_text().split()[:2]
               target = name.removeprefix('herdr-').removesuffix('.exe').removesuffix('.zip')
-              result[target] = digest
-          pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
+              shas[target] = digest
+              sizes[target] = (path.parent / name).stat().st_size
+          pathlib.Path('preview-sha256.json').write_text(json.dumps(shas, indent=2) + '\n')
+          pathlib.Path('preview-size.json').write_text(json.dumps(sizes, indent=2) + '\n')
           PY
 
       - name: Check for an immutable preview from an earlier run
@@ -415,18 +418,22 @@ jobs:
 
       - name: Update preview documentation and manifest
         run: |
+          set -euo pipefail
           node scripts/docs/preview.mjs snapshot '${{ needs.preflight.outputs.commit }}'
+          commit_time="$(git show -s --format=%ct '${{ needs.preflight.outputs.commit }}')"
           python3 scripts/preview.py manifest \
             --output distribution/preview.json \
             --tag '${{ needs.preflight.outputs.tag }}' \
             --build-id '${{ needs.preflight.outputs.build_id }}' \
             --commit '${{ needs.preflight.outputs.commit }}' \
+            --commit-time "$commit_time" \
             --built-at '${{ needs.preflight.outputs.built_at }}' \
             --base-version '${{ needs.preflight.outputs.base_version }}' \
             --protocol '${{ needs.preflight.outputs.protocol }}' \
             --endpoint-generation '${{ needs.preflight.outputs.endpoint_generation }}' \
             --notes PREVIEW_NOTES.md \
             --sha-file preview-sha256.json \
+            --size-file preview-size.json \
             --retain 30
 
       - name: Commit preview publication
@@ -436,10 +443,22 @@ jobs:
           git config user.name "kangal-bot"
           git config user.email "285672167+kangal-bot@users.noreply.github.com"
           git add -A docs/preview distribution/preview.json
+          # A .minisig covers exact manifest bytes. When this run replaces the manifest, the old
+          # signature goes in the same commit; the owner signs the new manifest off GitHub.
+          manifest_replaced=false
+          if ! git diff --cached --quiet -- distribution/preview.json; then
+            manifest_replaced=true
+            git rm --quiet --ignore-unmatch distribution/preview.json.minisig
+          fi
           git diff --cached --quiet || git commit -m "docs: publish preview documentation"
           remote="https://x-access-token:${KANGAL_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           for attempt in 1 2 3; do
             git pull --rebase "$remote" master
+            if [ "$manifest_replaced" = true ] && [ -e distribution/preview.json.minisig ]; then
+              # Signed on master while this run was publishing, so it covers the replaced manifest.
+              git rm --quiet distribution/preview.json.minisig
+              git commit --quiet -m "chore(preview): drop signature of replaced manifest"
+            fi
             node scripts/docs/preview.mjs check
             node scripts/docs/versions.mjs check
             if git push "$remote" HEAD:master; then

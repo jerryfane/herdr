@@ -33,7 +33,9 @@ export async function snapshotPreview(ref) {
 
 export async function checkPreview() {
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-  if (manifest.schema_version !== 1 || manifest.channel !== 'preview') {
+  // Schema 2 (signed, commit_time + size) is written by scripts/preview.py; schema 1 stays valid
+  // until the committed manifest is next republished.
+  if (![1, 2].includes(manifest.schema_version) || manifest.channel !== 'preview') {
     throw new Error(`${manifestPath} has an unsupported schema`);
   }
   if (typeof manifest.commit !== 'string' || !fullShaPattern.test(manifest.commit)) {

@@ -110,11 +110,12 @@ fi
         asset_url = url or self._asset_url(target)
         digest = sha256 or hashlib.sha256(self.binary_content).hexdigest()
         data = {
-            "schema_version": 1,
+            "schema_version": 2,
             "channel": "preview",
             "base_version": "0.8.2",
             "build_id": build_id,
             "commit": "3" * 40,
+            "commit_time": 1785542400,
             "assets": [target],
             "builds": {
                 "2026-08-01-archived": {
@@ -131,7 +132,15 @@ fi
                 },
                 build_id: {
                     "tag": tag,
-                    "assets": {target: {"url": asset_url, "sha256": digest}},
+                    "commit": "3" * 40,
+                    "commit_time": 1785542400,
+                    "assets": {
+                        target: {
+                            "url": asset_url,
+                            "sha256": digest,
+                            "size": len(self.binary_content),
+                        }
+                    },
                 },
             },
         }

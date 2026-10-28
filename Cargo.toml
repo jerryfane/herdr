@@ -66,6 +66,9 @@ getrandom = "0.2"
 # that has deliberately avoided pulling in rand/uuid/hex.
 qrcodegen = "1.8.0"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+# Verifies the minisign signature on the preview update manifest (`src/update/verify.rs`).
+# Zero dependencies; legacy (non-prehashed) signatures are refused by the caller.
+minisign-verify = "0.3"
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
@@ -118,3 +121,9 @@ snow = { version = "0.10", default-features = false, features = ["use-chacha20po
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 webpki-roots = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
+# Tests sign throwaway update manifests in the minisign format: Ed25519 from ring
+# (already in the tree through rustls) over a BLAKE2b-512 prehash.
+ring = "0.17"
+blake2 = "0.10"
