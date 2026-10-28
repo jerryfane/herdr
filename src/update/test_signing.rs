@@ -4,7 +4,11 @@
 //! over the signature and trusted comment. The seed is the test's secret key;
 //! it never leaves test code.
 //!
-//! Used by the unit tests in `src/update/verify.rs`.
+//! Shared by the unit tests (`src/update/verify.rs`) and the integration tests
+//! (`tests/server_update.rs`, through `#[path]`), so it uses no `crate::` paths.
+
+// Each including test crate uses only part of this file.
+#![allow(dead_code)]
 
 use base64::Engine as _;
 use blake2::Digest as _;

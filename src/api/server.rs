@@ -215,9 +215,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_history: true,
         agent_answer: true,
         agent_transcript: true,
-        // Only `server.update_check` ships so far; the app shows its Update
-        // button for this flag, so it waits for update_apply/update_status.
-        server_update: false,
+        server_update: true,
     })
 }
 
@@ -4281,9 +4279,9 @@ mod tests {
     }
 
     #[test]
-    fn ping_does_not_advertise_server_update_before_apply_ships() {
-        // The app offers its Update button for this flag, and this server
-        // can't apply an update yet: `server.update_apply` is unknown here.
+    fn ping_advertises_server_update_with_apply_and_status() {
+        // The app offers its Update button for this flag, so it is true
+        // exactly when this server answers apply and status too.
         let (tx, _rx) = mpsc::unbounded_channel();
         let ping: serde_json::Value = serde_json::from_str(&handle_request(
             Request {
@@ -4297,13 +4295,15 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(ping["result"]["capabilities"]["server_update"], false);
+        assert_eq!(ping["result"]["capabilities"]["server_update"], true);
         let served = |name: &str| Method::OPERATIONS.iter().any(|op| op.name == name);
-        assert!(served("server.update_check"));
-        assert!(
-            !served("server.update_apply"),
-            "server_update must turn true together with server.update_apply"
-        );
+        for method in [
+            "server.update_check",
+            "server.update_apply",
+            "server.update_status",
+        ] {
+            assert!(served(method), "server_update advertises {method}");
+        }
     }
 
     #[test]
