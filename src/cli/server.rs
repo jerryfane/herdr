@@ -16,6 +16,10 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
         "stop" => server_stop(&args[1..]).map(Some),
         "live-handoff" => server_live_handoff(&args[1..]).map(Some),
         "--handoff-import" => Ok(None),
+        // Started by `server.update_apply`, never by hand: it carries out one
+        // in-app update against the local server.
+        #[cfg(unix)]
+        "update-guard" => crate::update::guard::run(&args[1..]).map(Some),
         "reload-config" => server_reload_config(&args[1..]).map(Some),
         "agent-manifests" => server_agent_manifests(&args[1..]).map(Some),
         "update-agent-manifests" => server_update_agent_manifests(&args[1..]).map(Some),

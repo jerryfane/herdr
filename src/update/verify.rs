@@ -9,9 +9,9 @@
 //! `commit_time` is what stops a replayed old manifest from downgrading a
 //! server ([`RunningBuild::is_older_than`]).
 //!
-//! Debug builds accept two environment overrides so integration tests can serve
-//! a manifest from a loopback origin and sign it with a throwaway key. Release
-//! builds compile both out.
+//! Debug builds accept three environment overrides so integration tests can
+//! serve a manifest from a loopback origin, sign it with a throwaway key, and
+//! offer the test binary to itself. Release builds compile all of them out.
 
 use super::{PreviewManifest, EXPECTED_RELEASE_ROOT, PREVIEW_UPDATE_MANIFEST_URL};
 
@@ -32,6 +32,10 @@ pub(crate) const TEST_ORIGIN_ENV: &str = "HERDR_UPDATE_TEST_ORIGIN";
 /// Debug builds only: one more trusted public key, for a test's own key pair.
 #[cfg(debug_assertions)]
 pub(crate) const TEST_PUBLIC_KEY_ENV: &str = "HERDR_UPDATE_TEST_PUBLIC_KEY";
+/// Debug builds only: the short commit the running server reports to the
+/// downgrade guard, so a test can offer a copy of its own binary as newer.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_RUNNING_COMMIT_ENV: &str = "HERDR_UPDATE_TEST_RUNNING_COMMIT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyError {
@@ -79,6 +83,17 @@ pub(super) struct RunningBuild {
 
 impl RunningBuild {
     pub(super) fn current() -> Self {
+        #[cfg(debug_assertions)]
+        if let Some(commit) = std::env::var(TEST_RUNNING_COMMIT_ENV)
+            .ok()
+            .filter(|commit| !commit.trim().is_empty())
+        {
+            return Self {
+                commit: Some(commit.trim().to_string()),
+                build_id: None,
+                commit_time: crate::build_info::commit_time(),
+            };
+        }
         Self {
             commit: crate::build_info::commit().map(str::to_string),
             build_id: crate::build_info::build_id().map(str::to_string),
@@ -247,8 +262,40 @@ fn is_hex(value: &str, len: usize) -> bool {
 
 /// Fetch `manifest_url` and `<manifest_url>.minisig`, and verify them.
 pub(super) fn fetch_signed_manifest(manifest_url: &str) -> Result<PreviewManifest, VerifyError> {
+    fetch_signed_manifest_files(manifest_url).map(|signed| signed.manifest)
+}
+
+/// A verified manifest with the exact bytes and signature it came from, so
+/// the update guard can verify the same files again from disk.
+#[cfg(unix)]
+pub(super) struct SignedManifest {
+    pub(super) manifest: PreviewManifest,
+    pub(super) bytes: Vec<u8>,
+    pub(super) minisig: String,
+}
+
+#[cfg(not(unix))]
+pub(super) struct SignedManifest {
+    pub(super) manifest: PreviewManifest,
+}
+
+pub(super) fn fetch_signed_manifest_files(
+    manifest_url: &str,
+) -> Result<SignedManifest, VerifyError> {
     let (bytes, minisig) = fetch_signed(manifest_url)?;
-    verify_signed_manifest(&bytes, &minisig, &trusted_public_keys())
+    let manifest = verify_trusted(&bytes, &minisig)?;
+    Ok(SignedManifest {
+        manifest,
+        #[cfg(unix)]
+        bytes,
+        #[cfg(unix)]
+        minisig,
+    })
+}
+
+/// Verify `minisig` over `bytes` against the keys this build trusts.
+pub(super) fn verify_trusted(bytes: &[u8], minisig: &str) -> Result<PreviewManifest, VerifyError> {
+    verify_signed_manifest(bytes, minisig, &trusted_public_keys())
 }
 
 /// Fetch `manifest_url` and its `.minisig`, unverified.

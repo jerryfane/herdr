@@ -65,6 +65,8 @@ operations::define_operations! {
     ServerStagedUpdate(EmptyParams) => "server.staged_update", false, false;
     ServerApplyStagedUpdate(EmptyParams) => "server.apply_staged_update", false, false;
     ServerUpdateCheck(EmptyParams) => "server.update_check", false, false;
+    ServerUpdateApply(ServerUpdateApplyParams) => "server.update_apply", false, false;
+    ServerUpdateStatus(EmptyParams) => "server.update_status", false, false;
     ServerSshAgentRegister(ServerSshAgentRegisterParams) => "server.ssh_agent.register", false, false;
     ServerAgentManifests(EmptyParams) => "server.agent_manifests", false, false;
     ServerReloadAgentManifests(EmptyParams) => "server.reload_agent_manifests", true, false;

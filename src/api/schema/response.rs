@@ -23,7 +23,9 @@ use super::transcript::{
     PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
     TranscriptSubagent, TranscriptWorking,
 };
-use super::update::{UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild};
+use super::update::{
+    UpdateAttempt, UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild,
+};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
 
@@ -523,6 +525,18 @@ pub enum ResponseResult {
         /// Present when `mode` is not `live`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<UpdateModeReason>,
+    },
+    /// `server.update_apply` — preflight passed and the update guard is
+    /// running. Download, verification, the switch and the on-disk install
+    /// follow in the background; poll `server.update_status`.
+    UpdateApply {
+        attempt_id: String,
+    },
+    /// `server.update_status` — the newest update attempt on this machine, or
+    /// `null` when there has been none. Any server answers it from the state
+    /// file, so it survives the switch and a rollback.
+    UpdateStatus {
+        attempt: Option<UpdateAttempt>,
     },
     Ok {},
 }
