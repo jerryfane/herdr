@@ -10,8 +10,11 @@
 //! read-modify-write under `.index.lock`, so a live-handoff daemon sharing the
 //! directory never loses the other's change, and ends by deleting every blob no
 //! entry references: a replaced or cleared image, a forgotten agent's image, and
-//! a blob left behind by a crash before its index write. Files are owner-only
-//! (`0600`, directory `0700`), like the rest of the config dir's private stores.
+//! a blob left behind by a crash before its index write. A missing, corrupt or
+//! unreadable index reads as empty and the next mutation replaces it: a damaged
+//! file costs the pictures (its now-unreferenced blobs go in that mutation's
+//! sweep), never the daemon or later changes. Files are owner-only (`0600`,
+//! directory `0700`), like the rest of the config dir's private stores.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -110,17 +113,11 @@ impl AgentAvatarStore {
         ))
     }
 
-    /// Load the index under `root`. Lenient: a missing or unreadable index is
-    /// empty (the next mutation rewrites it), so a damaged file costs pictures,
-    /// never the daemon. Nothing is created until the first mutation.
+    /// Load the index under `root`. Lenient: a missing, corrupt or unreadable
+    /// index is empty (the next mutation rewrites it), so a damaged file costs
+    /// pictures, never the daemon. Nothing is created until the first mutation.
     pub fn open(root: PathBuf) -> Self {
-        let agents = match read_index(&root) {
-            Ok(index) => index.agents,
-            Err(err) => {
-                tracing::warn!(root = %root.display(), err = %err, "agent avatar index unreadable; starting empty");
-                BTreeMap::new()
-            }
-        };
+        let agents = read_index(&root).agents;
         Self { root, agents }
     }
 
@@ -220,7 +217,8 @@ impl AgentAvatarStore {
     }
 
     /// Read-modify-write the on-disk index under the lock, then sweep
-    /// unreferenced blobs and adopt the result in memory.
+    /// unreferenced blobs and adopt the result in memory. A damaged index is
+    /// read as empty and replaced by this write.
     fn mutate(
         &mut self,
         change: impl FnOnce(&mut BTreeMap<String, AgentAvatar>) -> io::Result<()>,
@@ -233,7 +231,7 @@ impl AgentAvatarStore {
             .write(true)
             .open(self.root.join(LOCK_FILE))?;
         lock.lock()?;
-        let mut index = read_index(&self.root)?;
+        let mut index = read_index(&self.root);
         change(&mut index.agents)?;
         super::devices::save_owner_only_json(&self.root.join(INDEX_FILE), &index)?;
         sweep_unreferenced(&self.root, &index.agents);
@@ -242,12 +240,18 @@ impl AgentAvatarStore {
     }
 }
 
-fn read_index(root: &Path) -> io::Result<IndexFile> {
-    match fs::read(root.join(INDEX_FILE)) {
+/// The stored index; empty when missing, corrupt or unreadable.
+fn read_index(root: &Path) -> IndexFile {
+    let path = root.join(INDEX_FILE);
+    let parsed = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(IndexFile::default()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return IndexFile::default(),
         Err(err) => Err(err),
-    }
+    };
+    parsed.unwrap_or_else(|err| {
+        tracing::warn!(path = %path.display(), err = %err, "agent avatar index unreadable; reading it as empty");
+        IndexFile::default()
+    })
 }
 
 /// Delete every blob (a 64-hex file name) no entry names. Best-effort: a
@@ -477,5 +481,71 @@ pub(crate) mod tests {
         assert!(reopened.get("term_1").is_some());
         assert!(reopened.get("term_2").is_some());
         let _ = fs::remove_dir_all(root);
+    }
+
+    const DAMAGE: [&[u8]; 3] = [
+        b"{\"agents\": {\"term_1\": {\"style\"",
+        b"\xff\xfe",
+        b"{\"agents\": 7}",
+    ];
+
+    fn stored_ids(root: &Path) -> Vec<String> {
+        let bytes = fs::read(root.join(INDEX_FILE)).unwrap();
+        let index: IndexFile = serde_json::from_slice(&bytes).expect("the index is valid JSON");
+        index.agents.into_keys().collect()
+    }
+
+    #[test]
+    fn a_corrupt_index_reads_as_empty_and_the_next_set_rewrites_it() {
+        for damage in DAMAGE {
+            let root = temp_root("corrupt-set");
+            let mut store = AgentAvatarStore::open(root.clone());
+            let png = store.set_image("term_1", PNG, 1).unwrap().sha256.unwrap();
+            store.set_image("term_2", JPEG, 1).unwrap();
+            fs::write(root.join(INDEX_FILE), damage).unwrap();
+            assert!(AgentAvatarStore::open(root.clone()).get("term_1").is_none());
+
+            // The same PNG again: the lost index's blob is reused and kept.
+            let avatar = store
+                .set_image("term_3", PNG, 2)
+                .expect("a set replaces the damaged index");
+            assert_eq!(store.get("term_3"), Some(&avatar));
+            assert!(store.get("term_1").is_none());
+            assert_eq!(stored_ids(&root), vec!["term_3".to_string()]);
+            let reopened = AgentAvatarStore::open(root.clone());
+            assert_eq!(reopened.get("term_3"), Some(&avatar));
+            // The JPEG nothing names any more is swept.
+            assert_eq!(blobs(&root), vec![png.clone()]);
+            assert_eq!(
+                reopened.image(&png).unwrap(),
+                Some(("image/png", PNG.to_vec()))
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_index_does_not_block_remove_or_a_mascot() {
+        for damage in DAMAGE {
+            let root = temp_root("corrupt-remove");
+            let mut store = AgentAvatarStore::open(root.clone());
+            store.set_image("term_1", PNG, 1).unwrap();
+            fs::write(root.join(INDEX_FILE), damage).unwrap();
+
+            let mut reopened = AgentAvatarStore::open(root.clone());
+            assert!(!reopened
+                .remove("term_1")
+                .expect("a remove replaces the damaged index"));
+            assert!(stored_ids(&root).is_empty());
+            assert!(blobs(&root).is_empty());
+
+            fs::write(root.join(INDEX_FILE), damage).unwrap();
+            let avatar = reopened
+                .set_mascot("term_2", "bot", 2)
+                .expect("a mascot set replaces the damaged index");
+            assert_eq!(reopened.get("term_2"), Some(&avatar));
+            assert_eq!(stored_ids(&root), vec!["term_2".to_string()]);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
