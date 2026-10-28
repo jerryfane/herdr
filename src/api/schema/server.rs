@@ -102,9 +102,9 @@ pub struct ServerCapabilities {
     /// Serves `agent.transcript`: an omp agent's conversation as chat entries.
     #[serde(default)]
     pub agent_transcript: bool,
-    /// Serves `server.update_check`: the owner's check for a newer signed
-    /// preview build. `server.update_apply` and `server.update_status` join it
-    /// under this flag later.
+    /// The owner's in-app update to a signed preview build. False for now:
+    /// this server answers only `server.update_check`, and the flag turns
+    /// true once `server.update_apply` and `server.update_status` ship.
     #[serde(default)]
     pub server_update: bool,
 }

@@ -215,7 +215,9 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_history: true,
         agent_answer: true,
         agent_transcript: true,
-        server_update: true,
+        // Only `server.update_check` ships so far; the app shows its Update
+        // button for this flag, so it waits for update_apply/update_status.
+        server_update: false,
     })
 }
 
@@ -4242,6 +4244,32 @@ mod tests {
         assert_eq!(
             value["result"]["capabilities"]["api_bridge_multi"],
             cfg!(unix)
+        );
+    }
+
+    #[test]
+    fn ping_does_not_advertise_server_update_before_apply_ships() {
+        // The app offers its Update button for this flag, and this server
+        // can't apply an update yet: `server.update_apply` is unknown here.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ping: serde_json::Value = serde_json::from_str(&handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(ping["result"]["capabilities"]["server_update"], false);
+        let served = |name: &str| Method::OPERATIONS.iter().any(|op| op.name == name);
+        assert!(served("server.update_check"));
+        assert!(
+            !served("server.update_apply"),
+            "server_update must turn true together with server.update_apply"
         );
     }
 

@@ -18113,7 +18113,7 @@
             },
             "server_update": {
               "default": false,
-              "description": "Serves `server.update_check`: the owner's check for a newer signed\npreview build. `server.update_apply` and `server.update_status` join it\nunder this flag later.",
+              "description": "The owner's in-app update to a signed preview build. False for now:\nthis server answers only `server.update_check`, and the flag turns\ntrue once `server.update_apply` and `server.update_status` ship.",
               "type": "boolean"
             },
             "ssh_agent_registration": {
