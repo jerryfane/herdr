@@ -439,6 +439,7 @@ mod tests {
                 pane_history: false,
                 agent_answer: false,
                 agent_transcript: false,
+                server_update: false,
             }),
         }
     }

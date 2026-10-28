@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
+mod keys;
+pub(crate) mod server_update;
+#[cfg(all(test, unix))]
+mod test_signing;
+pub(crate) mod verify;
+
 /// The only release stream HerdrUp publishes: the manifest `install.sh:12` reads.
 /// Remote seeding (`remote/attach.rs`) resolves the same constant, so a fork build
 /// has exactly one manifest URL to keep pointed at itself; the pin test in this
@@ -140,6 +146,7 @@ impl UpdateChannel {
 struct AssetRef {
     url: String,
     sha256: Option<String>,
+    size: Option<u64>,
     #[cfg(windows)]
     format: Option<String>,
 }
@@ -154,6 +161,7 @@ impl<'de> Deserialize<'de> for AssetRef {
             serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
                 url: url.trim().to_string(),
                 sha256: None,
+                size: None,
                 #[cfg(windows)]
                 format: None,
             }),
@@ -165,6 +173,7 @@ impl<'de> Deserialize<'de> for AssetRef {
                 let sha256 = object
                     .remove("sha256")
                     .and_then(|value| value.as_str().map(str::to_string));
+                let size = object.remove("size").and_then(|value| value.as_u64());
                 #[cfg(windows)]
                 let format = object
                     .remove("format")
@@ -175,6 +184,7 @@ impl<'de> Deserialize<'de> for AssetRef {
                 Ok(Self {
                     url: url.trim().to_string(),
                     sha256: sha256.filter(|value| !value.trim().is_empty()),
+                    size,
                     #[cfg(windows)]
                     format: format.filter(|value| !value.trim().is_empty()),
                 })
@@ -212,26 +222,20 @@ impl AssetRef {
 
 #[derive(Deserialize)]
 struct PreviewManifest {
+    /// 2 for signed manifests; a missing field reads as 0 and is refused.
+    #[serde(default)]
+    schema_version: u32,
     channel: String,
     base_version: String,
     build_id: String,
     commit: String,
+    /// Committer time (unix seconds) of `commit`; the downgrade guard compares it.
+    #[serde(default)]
+    commit_time: Option<i64>,
     built_at: String,
     protocol: u32,
     endpoint_generation: Option<u32>,
     notes: String,
-    assets: BTreeMap<String, AssetRef>,
-    #[serde(default)]
-    builds: BTreeMap<String, PreviewBuildMetadata>,
-}
-
-#[derive(Deserialize)]
-struct PreviewBuildMetadata {
-    base_version: String,
-    commit: String,
-    built_at: String,
-    protocol: u32,
-    endpoint_generation: Option<u32>,
     assets: BTreeMap<String, AssetRef>,
 }
 
@@ -252,7 +256,8 @@ struct ReleaseInfo {
     #[cfg(not(windows))]
     target_endpoint_generation: Option<u32>,
     download_url: String,
-    sha256: Option<String>,
+    sha256: String,
+    size: u64,
     #[cfg(windows)]
     package_format: String,
     notes_body: String,
@@ -287,32 +292,6 @@ pub(crate) fn stable_channel_refusal() -> String {
     )
 }
 
-fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let output = crate::noninteractive_process::curl_command()
-        .args([
-            "-sfL",
-            "--retry",
-            "3",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "20",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("curl failed: {e}"))?;
-
-    if !output.status.success() {
-        return Err("failed to fetch update manifest".into());
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
-}
-
 /// Refuse any asset this fork did not publish. Remote seeding applies the same
 /// check before installing on another host.
 pub(crate) fn ensure_fork_release_asset(url: &str) -> Result<(), String> {
@@ -334,111 +313,96 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
-/// Preview assets in this fork have historically been built with a stable version
-/// stamp. Compare the git commit as well as a preview build id, or those installed
-/// assets advertise themselves as an update forever. Neither comparison substitutes
-/// for checking the manifest asset's origin before reporting "up to date".
-fn matches_installed_preview(
-    manifest: &PreviewManifest,
-    installed_version: &str,
-    installed_build_id: Option<&str>,
-    installed_commit: Option<&str>,
-) -> bool {
-    if manifest.base_version.trim_start_matches('v') != installed_version {
-        return false;
-    }
-    installed_build_id.is_some_and(|id| id == manifest.build_id)
-        || installed_commit
-            .is_some_and(|commit| commit.len() >= 7 && manifest.commit.starts_with(commit))
-}
-
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
-) -> Result<Option<ReleaseInfo>, String> {
-    if manifest.channel != "preview" {
-        return Err(format!(
-            "invalid preview manifest channel: {}",
-            manifest.channel
-        ));
-    }
-    let build_id = manifest.build_id.trim();
-    if build_id.is_empty() {
-        return Err("preview manifest build_id is empty".into());
-    }
-
+) -> Result<ReleaseInfo, verify::VerifyError> {
+    let asset = verify::platform_asset(manifest)?.ok_or_else(|| {
+        verify::VerifyError::ManifestInvalid(format!(
+            "no binary for {} in preview manifest",
+            verify::platform_asset_key()
+        ))
+    })?;
     let version = Version::parse(&manifest.base_version).ok_or_else(|| {
-        format!(
+        verify::VerifyError::ManifestInvalid(format!(
             "invalid base_version in preview manifest: {}",
             manifest.base_version
-        )
+        ))
     })?;
     let notes_body = manifest.notes.trim().to_string();
     if notes_body.is_empty() {
-        return Err("preview manifest notes are empty".into());
+        return Err(verify::VerifyError::ManifestInvalid(
+            "preview manifest notes are empty".into(),
+        ));
     }
-    let (os, arch) = platform_target();
-    let asset_key = format!("{os}-{arch}");
-    if let Some(archived) = manifest.builds.get(build_id) {
-        if archived.base_version != manifest.base_version
-            || archived.commit != manifest.commit
-            || archived.built_at != manifest.built_at
-            || archived.protocol != manifest.protocol
-            || archived.endpoint_generation != manifest.endpoint_generation
-        {
-            tracing::warn!(
-                build_id,
-                "preview manifest archived build metadata differs from top-level metadata"
-            );
-        }
-    }
-    let asset = manifest
-        .assets
-        .get(&asset_key)
-        .or_else(|| {
-            manifest
-                .builds
-                .get(build_id)
-                .and_then(|build| build.assets.get(&asset_key))
-        })
-        .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
-    let download_url = asset.url.clone();
-    ensure_fork_release_asset(&download_url)?;
-    if matches_installed_preview(
-        manifest,
-        crate::build_info::BASE_VERSION,
-        crate::build_info::build_id(),
-        crate::build_info::commit(),
-    ) {
-        return Ok(None);
-    }
-
-    Ok(Some(ReleaseInfo {
-        identity: preview_display_version(&manifest.base_version, build_id),
+    Ok(ReleaseInfo {
+        identity: preview_display_version(&manifest.base_version, &manifest.build_id),
         version,
         channel: UpdateChannel::Preview,
-        build_id: Some(build_id.to_string()),
+        build_id: Some(manifest.build_id.clone()),
         commit: Some(manifest.commit.clone()),
         #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
         #[cfg(not(windows))]
         target_endpoint_generation: manifest.endpoint_generation,
-        download_url,
-        sha256: asset.sha256.clone(),
+        download_url: asset.url,
+        sha256: asset.sha256,
+        size: asset.size,
         #[cfg(windows)]
-        package_format: asset.package_format()?,
+        package_format: asset.package_format,
         notes_body,
-    }))
+    })
 }
 
-/// Check this fork's manifest for the configured channel. Returns release info if newer.
+/// Check this fork's signed manifest for the configured channel. Returns the
+/// release only when it is a different, newer commit than this build.
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
     let url = update_manifest_url(UpdateChannel::configured())?;
-    release_info_from_preview_manifest(&fetch_json_manifest(url)?)
+    let manifest = verify::fetch_signed_manifest(url).map_err(|err| err.to_string())?;
+    let release = release_info_from_preview_manifest(&manifest).map_err(|err| err.to_string())?;
+    let running = verify::RunningBuild::current();
+    if running.commit_time.is_none() {
+        return Err(format!(
+            "this build carries no commit time, so herdr can't tell whether {} is newer. \
+             Install HerdrUp with `{FORK_INSTALL_COMMAND}`",
+            release.label()
+        ));
+    }
+    Ok(running.is_older_than(&manifest).then_some(release))
 }
 
 // ---------------------------------------------------------------------------
 // Download + install
 // ---------------------------------------------------------------------------
+
+/// Download `release`'s asset to `path` over HTTPS only, refusing more bytes
+/// than the signed manifest states, then check its size and sha256.
+fn download_release_asset(release: &ReleaseInfo, path: &Path) -> Result<(), String> {
+    let protocols = verify::allowed_protocols();
+    let status = crate::noninteractive_process::curl_command()
+        .args(["-sfL", "--proto", protocols, "--proto-redir", protocols])
+        .args(["--connect-timeout", "10", "--max-time", "300"])
+        .args(["--max-filesize", &release.size.to_string(), "-o"])
+        .arg(path)
+        .arg(verify::fetch_url(&release.download_url))
+        .status()
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !status.success() {
+        return Err("download failed".into());
+    }
+    let len = fs::metadata(path)
+        .map_err(|e| format!("download failed: {e}"))?
+        .len();
+    if len != release.size {
+        return Err(format!(
+            "downloaded update is {len} bytes, but the manifest says {}",
+            release.size
+        ));
+    }
+    crate::checksum::verify_sha256(path, &release.sha256)
+        .map_err(|e| format!("downloaded update checksum verification failed: {e}"))?;
+    tracing::info!(sha256 = %release.sha256, "downloaded update checksum verified");
+    Ok(())
+}
 
 #[cfg(not(windows))]
 struct DownloadedUpdate {
@@ -478,26 +442,9 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
 
     // Download the exact asset URL (pinned to the release we checked)
-    let status = crate::noninteractive_process::curl_command()
-        .args(["-sfL", "--max-time", "120", "-o"])
-        .arg(&tmp_path)
-        .arg(&release.download_url)
-        .status()
-        .map_err(|e| format!("download failed: {e}"))?;
-
-    if !status.success() {
+    if let Err(e) = download_release_asset(release, &tmp_path) {
         let _ = fs::remove_file(&tmp_path);
-        return Err("download failed".into());
-    }
-
-    if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
-        tracing::info!(sha256 = %expected, "downloaded update checksum verified");
+        return Err(e);
     }
 
     // Make executable
@@ -552,10 +499,6 @@ impl Drop for DownloadedWindowsUpdate {
 
 #[cfg(windows)]
 fn download_windows_update(release: &ReleaseInfo) -> Result<DownloadedWindowsUpdate, String> {
-    let expected_sha256 = release
-        .sha256
-        .as_deref()
-        .ok_or("Windows update asset is missing a SHA-256 checksum")?;
     let stem = format!("herdr-update-{}", std::process::id());
     let update = DownloadedWindowsUpdate {
         package_path: env::temp_dir().join(format!("{stem}.{}", release.package_format)),
@@ -563,20 +506,7 @@ fn download_windows_update(release: &ReleaseInfo) -> Result<DownloadedWindowsUpd
     };
     fs::write(&update.installer_path, WINDOWS_INSTALLER)
         .map_err(|err| format!("failed to prepare Windows installer: {err}"))?;
-
-    let status = crate::noninteractive_process::curl_command()
-        .args(["-sfL", "--max-time", "120", "-o"])
-        .arg(&update.package_path)
-        .arg(&release.download_url)
-        .status()
-        .map_err(|err| format!("download failed: {err}"))?;
-    if !status.success() {
-        return Err("download failed".into());
-    }
-    crate::checksum::verify_sha256(&update.package_path, expected_sha256)
-        .map_err(|err| format!("downloaded update checksum verification failed: {err}"))?;
-    tracing::info!(sha256 = %expected_sha256, "downloaded update checksum verified");
-
+    download_release_asset(release, &update.package_path)?;
     Ok(update)
 }
 
@@ -585,10 +515,6 @@ fn install_windows_update_with_installer(
     release: &ReleaseInfo,
     update: &DownloadedWindowsUpdate,
 ) -> Result<(), String> {
-    let expected_sha256 = release
-        .sha256
-        .as_deref()
-        .ok_or("Windows update asset is missing a SHA-256 checksum")?;
     let mut command = Command::new("powershell");
     command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
@@ -601,7 +527,7 @@ fn install_windows_update_with_installer(
             "-LocalPackageIdentity",
             release.label(),
             "-LocalPackageSha256",
-            expected_sha256,
+            &release.sha256,
         ])
         // Drop any inherited PSModulePath. When herdr is launched from
         // PowerShell 7, its Core module paths come first and Windows
@@ -1958,9 +1884,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
             "installing {} with the Windows installer...",
             release.label()
         );
-        if let Some(sha256) = &release.sha256 {
-            tracing::debug!(sha256 = %sha256, "selected Windows update asset has checksum");
-        }
+        tracing::debug!(sha256 = %release.sha256, "selected Windows update asset has checksum");
         eprintln!("downloading {}...", release.label());
         let downloaded_update = download_windows_update(&release)?;
         eprintln!("downloaded {}", release.label());
@@ -2402,7 +2326,8 @@ mod tests {
             download_url:
                 "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
                     .to_string(),
-            sha256: None,
+            sha256: "0".repeat(64),
+            size: 1,
             notes_body: "### Changed\n- One".to_string(),
         }
     }
@@ -2712,6 +2637,7 @@ mod tests {
                 pane_history: false,
                 agent_answer: false,
                 agent_transcript: false,
+                server_update: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2799,6 +2725,7 @@ mod tests {
                     pane_history: false,
                     agent_answer: false,
                     agent_transcript: false,
+                    server_update: false,
                 }),
             },
         };
@@ -2998,7 +2925,8 @@ mod tests {
             download_url:
                 "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
                     .to_string(),
-            sha256: None,
+            sha256: "0".repeat(64),
+            size: 1,
             notes_body: "### Changed\n- One".to_string(),
         };
         let plan = RunningServerUpdatePlan {
@@ -3072,6 +3000,7 @@ mod tests {
                     pane_history: false,
                     agent_answer: false,
                     agent_transcript: false,
+                    server_update: false,
                 }),
             },
         };
@@ -3197,7 +3126,8 @@ mod tests {
             download_url:
                 "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
                     .to_string(),
-            sha256: None,
+            sha256: "0".repeat(64),
+            size: 1,
             notes_body: "### Changed\n- One".to_string(),
         };
 
@@ -3301,89 +3231,45 @@ mod tests {
         assert!(arch == "x86_64" || arch == "aarch64", "arch: {arch}");
     }
 
-    #[test]
-    fn preview_manifest_reports_update_when_build_id_differs() {
+    fn v2_manifest_json(asset_url: &str) -> String {
         let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "channel": "preview",
-                "base_version": "9.9.9",
-                "build_id": "2026-06-02-abcdef123456",
-                "commit": "abcdef1234567890",
-                "built_at": "2026-06-02T03:00:00Z",
-                "protocol": 77,
-                "notes": "### Fixed\n- One",
-                "assets": {{
-                    "{asset_key}": {{
-                        "url": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
-                        "sha256": "deadbeef"
-                    }}
-                }},
-                "builds": {{
-                    "2026-06-02-abcdef123456": {{
-                        "base_version": "9.9.9",
-                        "commit": "abcdef1234567890",
-                        "built_at": "2026-06-02T03:00:00Z",
-                        "protocol": 77,
-                        "assets": {{
-                            "{asset_key}": {{
-                                "url": "https://github.com/jerryfane/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
-                                "sha256": "deadbeef"
-                            }}
-                        }}
-                    }}
-                }}
-            }}"####
-        );
-        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
+        serde_json::json!({
+            "schema_version": 2,
+            "channel": "preview",
+            "base_version": "9.9.9",
+            "build_id": "2026-06-02-abcdef123456",
+            "commit": "abcdef1234567890abcdef1234567890abcdef12",
+            "commit_time": 1_780_000_000,
+            "built_at": "2026-06-02T03:00:00Z",
+            "protocol": 77,
+            "notes": "### Fixed\n- One",
+            "assets": {
+                format!("{os}-{arch}"): {
+                    "url": asset_url,
+                    "sha256": "D".repeat(64),
+                    "size": 1234
+                }
+            }
+        })
+        .to_string()
+    }
 
-        let release = release_info_from_preview_manifest(&manifest)
-            .unwrap()
-            .expect("preview update");
+    #[test]
+    fn preview_manifest_release_carries_the_verified_platform_asset() {
+        let (os, arch) = platform_target();
+        let url = format!(
+            "https://github.com/jerryfane/herdr/releases/download/preview-2026-06-02-abcdef123456/herdr-{os}-{arch}"
+        );
+        let manifest: PreviewManifest = serde_json::from_str(&v2_manifest_json(&url)).unwrap();
+
+        let release = release_info_from_preview_manifest(&manifest).expect("preview update");
 
         assert_eq!(release.channel, UpdateChannel::Preview);
         assert_eq!(release.identity, "9.9.9-preview.2026-06-02-abcdef123456");
         assert_eq!(release.target_protocol, Some(77));
-        assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
-    }
-
-    #[test]
-    fn stable_stamped_fork_build_does_not_reoffer_its_own_preview_asset() {
-        let manifest: PreviewManifest = serde_json::from_str(
-            r#"{
-                "channel": "preview",
-                "base_version": "0.9.1",
-                "build_id": "2026-09-20-d79b0216a175",
-                "commit": "d79b0216a175d4707c8b3a18cbf50f362dcc2325",
-                "built_at": "2026-09-20T20:40:00Z",
-                "protocol": 22,
-                "notes": "Preview build",
-                "assets": {}
-            }"#,
-        )
-        .unwrap();
-
-        // Published fork assets have a stable channel stamp but carry the commit
-        // in `herdr --version`; matching only the preview build id loops forever.
-        assert!(matches_installed_preview(
-            &manifest,
-            "0.9.1",
-            None,
-            Some("d79b021")
-        ));
-        assert!(!matches_installed_preview(
-            &manifest,
-            "0.9.0",
-            None,
-            Some("d79b021")
-        ));
-        assert!(!matches_installed_preview(
-            &manifest,
-            "0.9.1",
-            None,
-            Some("f15e5ddb")
-        ));
+        assert_eq!(release.download_url, url);
+        assert_eq!(release.sha256, "d".repeat(64));
+        assert_eq!(release.size, 1234);
     }
 
     #[test]
@@ -3393,28 +3279,14 @@ mod tests {
         // asset origin is the only thing that tells the two apart, and the refusal
         // has to name the path that does install a fork build.
         let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "channel": "preview",
-                "base_version": "9.9.9",
-                "build_id": "2026-09-16-2c29fb29e302",
-                "commit": "2c29fb29e302",
-                "built_at": "2026-09-16T16:38:38Z",
-                "protocol": 22,
-                "notes": "Preview build",
-                "assets": {{
-                    "{asset_key}": {{
-                        "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-09-16-2c29fb29e302/herdr-{asset_key}",
-                        "sha256": "deadbeef"
-                    }}
-                }}
-            }}"####
-        );
-        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
+        let manifest: PreviewManifest = serde_json::from_str(&v2_manifest_json(&format!(
+            "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-02-abcdef123456/herdr-{os}-{arch}"
+        )))
+        .unwrap();
 
         let error = release_info_from_preview_manifest(&manifest)
-            .expect_err("an upstream-hosted asset must not be installable over a fork build");
+            .expect_err("an upstream-hosted asset must not be installable over a fork build")
+            .to_string();
         assert!(
             error.contains("not published by jerryfane/herdr")
                 && error.contains(FORK_INSTALL_COMMAND),
