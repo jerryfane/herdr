@@ -107,7 +107,7 @@ Raw socket method names use dot notation:
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
 | Notification | `notification.show`, `notifications.register_device`, `notifications.unregister_device`, `notifications.status` |
-| Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read`, `gram.delete`, `gram.upload_chunk`, `gram.get_file`, `gram.relay_status` |
+| Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read`, `gram.delete`, `gram.upload_chunk`, `gram.upload.discard`, `gram.get_file`, `gram.relay_status` |
 | Guest | `guest.invite.create`, `guest.list`, `guest.update`, `guest.revoke`, `guest.audit` (owner only; denied to federation peers and guests) |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
@@ -117,7 +117,7 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.transfer_session`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.avatar.set`, `agent.avatar.get`, `agent.groups.get`, `agent.groups.set`, `agent.focus`, `agent.start`, `agent.transfer_session`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -131,6 +131,12 @@ On a federation coordinator, `workspace.list` returns local workspaces first, th
 A Gram an agent on a federated machine sends through the Gram relay has `from` set to `<alias>/<name>`. When that machine has a display label, its message objects in `gram.list` (owner and agent views) and in `gram.send` replies also carry `machine_label`, the same label its agents carry in `agent.list`, so a client can show `<machine_label>/<name>`. The label is resolved when the message is read, so it follows a rename and covers older Grams. Local Grams and Grams from an alias with no label omit it. The owner's push for such a Gram names the machine the way remote agent alerts do: "llm-opt on Jerry's Mac Studio".
 
 A message may carry one file. Because a single request is size-capped (near 65 KiB over the app's SSH path, 1 MiB on the local socket), a file is uploaded in chunks with `gram.upload_chunk` (`{upload_id, offset, data_base64}`; `offset` is the byte position this chunk starts at, and `offset: 0` restarts the upload) and then attached by passing that `upload_id` in a `gram.send`/`gram.post` `file` object. `gram.get_file` returns the bytes inline as base64 in one reply (the response path is not size-capped). `gram.delete` removes a message and its file bytes for good. The owner (no `caller_pane_id`) may delete any message; an agent that supplies its caller pane may delete or download only a message it can see (the same audience as `gram.list`). That audience check is **cooperative filtering within the flat local trust domain, not an authenticated boundary** — every local process can already read the store directly, and "owner" is just the absence of a caller pane. Its value for a short-lived secret (a temporary API key) is that deletion genuinely purges the bytes, keeping the secret out of the persistent store once you delete it.
+
+`gram.upload.discard` (`{upload_id}`) deletes a staged upload that will never be attached, such as a file removed from a draft, so its bytes stop counting against the shared staging budget instead of waiting for the 24-hour staging sweep. It returns `{"type": "gram_upload_discarded", "discarded": true}` when a staged upload was deleted and `"discarded": false` when no staged upload has that id (never uploaded, already discarded, or already attached by a `gram.send`/`gram.post`, which leaves the posted message and its file untouched). While another writer holds the id it answers `upload_in_progress`. A guest's `upload_id` is scoped to that guest, so a guest can discard only its own uploads. A daemon that predates the method answers `invalid_request` (`unknown variant`); clients then rely on the sweep.
+
+Agent profile pictures: `AgentInfo.avatar` (omitted when unset) is `{ style: "mascot" | "image", mascot, sha256, updated_unix_ms }`, keyed by the agent's stable terminal id, so it survives restart, rename and archive/unarchive; `agent.forget` removes it. `agent.avatar.set` takes `{ target, avatar: null | { style: "mascot", mascot } | { style: "image" }, image_base64?, mime? }` and returns `{ type: "agent_avatar_set", avatar }`. A mascot id matches `^[a-z0-9-]{1,32}$`; an image must be a JPEG or PNG of at most 64 KiB decoded (`invalid_avatar`, `avatar_too_large`) and is stored by its SHA-256. `agent.avatar.get` takes `{ target, sha256 }` and returns `{ type: "agent_avatar_image", mime, data_base64 }` for the agent's current image only (`avatar_not_found` otherwise). Guests see their granted agent's picture in `agent.list`/`agent.get`, also while it is paused, and may fetch only that agent's image; `agent.avatar.set` is owner only. Federation peers need Observe to fetch and Admin to change a picture, and both route to the agent's machine. Servers advertise this as the `agent_avatar` capability.
+
+Agent folders and stars (owner only, capability `agent_groups`): `agent.groups.get` (`{}`) returns `{ type: "agent_groups", revision, folders: [{ id, name, order, members }], stars }`, where `members` and `stars` are agent names and `revision` is 0 before the first set. `agent.groups.set` takes `{ revision, folders, stars }`, replaces the whole document when `revision` is the stored one, and returns it at `revision + 1`. Otherwise it answers `groups_conflict` with the stored document in `error.current`, so the client can merge and retry. A document with more than 64 folders, 256 members in total or 256 stars, an empty id, name or agent name or one over 64 characters, a duplicate folder id, an agent in two folders, or a duplicate star answers `invalid_groups`. The document lives in `agent-groups/index.json` in the config directory, written atomically; a damaged file reads as empty and the next set replaces it. `agent.rename` moves the agent's folder membership and star to its new name, also when it is named again after a clear, unless another agent took the old name meanwhile (by rename, `agent.start` or unarchive); a clear alone keeps them. Guests get `guest_forbidden` and never see folders or stars; federation peers are denied.
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this combines a prompt write with submission observation and, only after verified submission, a status wait. If the resolved agent is already `blocked`, it returns `agent_blocked` before writing. Successful prompts include `delivery: "written_to_pty"` after a complete text+Enter PTY write, or `delivery: "submitted"` after an attributable lifecycle advance from a settled agent or an observed same-attempt composer clear. A successful `written_to_pty` with `wait` means submission was not verified; the request does not continue waiting for status, and callers must inspect the pane before resending. A persistent same-attempt draft returns `agent_prompt_unsubmitted`; a visible modal returns `agent_input_pending` before any write. Bracketed paste relies on writer provenance rather than rendered token text.
 
@@ -164,6 +170,8 @@ plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `f1`, and named punctuation like `minus` and `plus`. They do not accept
 `prefix+` binding strings.
+
+On macOS, `pane.send_input` (used by `pane run`) and `agent.start` check the terminal's current canonical input limit before accepting a command into the input queue. An oversized encoded line, including Enter, is rejected in full; wait for the shell prompt and retry. Multiple short lines and raw-mode input remain supported. Successful responses still acknowledge queue admission, not command execution. This check covers the current submission only: it cannot inspect an earlier incomplete line or guarantee the terminal mode will remain unchanged while input is queued.
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -653,6 +661,28 @@ or has no unambiguous top-level string `id`, the error response uses an empty `i
 Transport errors, such as invalid UTF-8, can close the connection without a response.
 
 Event subscriptions keep the connection open after the initial response.
+
+### Bridging many requests over one process
+
+The socket answers one request per connection. A remote client that reaches it
+through an SSH exec channel can avoid starting a process per request with
+`herdr api-bridge --multi` (Unix only; servers that support it report
+`capabilities.api_bridge_multi: true` from `ping`):
+
+- Write one request per line to the bridge's stdin. Each runs on its own socket
+  connection, up to 16 at a time; with all 16 busy, the bridge stops reading
+  stdin until one finishes.
+- Every response line is written to stdout whole and unchanged. Responses can
+  arrive out of order, so match them by `id`.
+- `events.subscribe`, `pane.stream`, `pane.input.stream`, `gram.upload.stream`
+  and `server.ssh_agent.register` keep their connection open, so the bridge
+  answers them with an `unsupported_method` error. Open a dedicated channel for
+  them.
+- A line that is not a JSON object with a string `method`, or that is longer
+  than 1 MiB, gets an `invalid_request` error. If the socket cannot be reached,
+  that request gets a `transport_error`. The bridge keeps running either way.
+- When stdin closes, the bridge exits after in-flight requests finish. If
+  stdout's reader goes away first, in-flight requests are cancelled.
 
 ## Socket paths
 
