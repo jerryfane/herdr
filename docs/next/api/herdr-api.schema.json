@@ -6448,6 +6448,22 @@
         {
           "properties": {
             "method": {
+              "const": "server.update_check",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.ssh_agent.register",
               "type": "string"
             },
@@ -17942,6 +17958,52 @@
               "type": "object"
             },
             {
+              "description": "`server.update_check` — the running build, the newest signed preview\nbuild for this platform (`null` when none is published for it), whether\nit is newer than the running one, and how this server would switch to it.",
+              "properties": {
+                "latest": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/UpdateLatestBuild"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "mode": {
+                  "$ref": "#/schemas/success_response/$defs/UpdateMode"
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/UpdateModeReason"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Present when `mode` is not `live`."
+                },
+                "running": {
+                  "$ref": "#/schemas/success_response/$defs/UpdateRunningBuild"
+                },
+                "type": {
+                  "const": "update_check",
+                  "type": "string"
+                },
+                "update_available": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "type",
+                "running",
+                "update_available",
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -18047,6 +18109,11 @@
             "pane_input_stream": {
               "default": false,
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
+              "type": "boolean"
+            },
+            "server_update": {
+              "default": false,
+              "description": "Serves `server.update_check`, `server.update_apply` and\n`server.update_status`: the owner's in-app update to a signed preview build.",
               "type": "boolean"
             },
             "ssh_agent_registration": {
@@ -18787,6 +18854,142 @@
               "type": "string"
             }
           ]
+        },
+        "UpdateLatestBuild": {
+          "description": "The newest signed preview build published for this server's platform.",
+          "properties": {
+            "build_id": {
+              "type": "string"
+            },
+            "built_at": {
+              "type": "string"
+            },
+            "commit": {
+              "description": "Full git commit.",
+              "type": "string"
+            },
+            "commit_time": {
+              "description": "Committer time of `commit`, unix seconds, covered by the signature.",
+              "format": "int64",
+              "type": "integer"
+            },
+            "endpoint_generation": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notes": {
+              "type": "string"
+            },
+            "protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "size": {
+              "description": "Size of this platform's binary in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "description": "`<base_version>-preview.<build_id>`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "commit",
+            "build_id",
+            "built_at",
+            "commit_time",
+            "notes",
+            "size",
+            "protocol"
+          ],
+          "type": "object"
+        },
+        "UpdateMode": {
+          "description": "How this server can switch to a new build.",
+          "oneOf": [
+            {
+              "const": "live",
+              "description": "A live handoff: panes and connections carry over.",
+              "type": "string"
+            },
+            {
+              "const": "restart_required",
+              "description": "The new build can be downloaded now but only takes over on a restart.",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "This install can't be updated from the app.",
+              "type": "string"
+            }
+          ]
+        },
+        "UpdateModeReason": {
+          "description": "Why `mode` is not `live`.",
+          "enum": [
+            "windows",
+            "systemd_main_process",
+            "package_managed",
+            "endpoint_generation_changed",
+            "no_live_handoff",
+            "install_dir_not_writable"
+          ],
+          "type": "string"
+        },
+        "UpdateRunningBuild": {
+          "description": "The build this server is running, as `server.update_check` reports it.",
+          "properties": {
+            "build_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commit": {
+              "description": "Short git commit; absent on a build with no git context.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commit_time": {
+              "description": "Committer time of `commit`, unix seconds. A build without it is never\noffered an update, because it can't tell a newer build from an older one.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "endpoint_generation": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "protocol"
+          ],
+          "type": "object"
         },
         "UsageWindow": {
           "description": "One rate-limit window for an account (e.g. a 5-hour or weekly bucket).",
