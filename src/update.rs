@@ -31,7 +31,7 @@ mod test_signing;
 pub(crate) mod verify;
 
 /// The only release stream HerdrUp publishes: the manifest `install.sh:12` reads.
-/// Remote seeding (`remote/attach.rs`) resolves the same constant, so a fork build
+/// Remote seeding (`verify::remote_seed_asset`) resolves the same constant, so a fork build
 /// has exactly one manifest URL to keep pointed at itself; the pin test in this
 /// module fails if an upstream sync repoints it.
 pub(crate) const PREVIEW_UPDATE_MANIFEST_URL: &str =
@@ -328,12 +328,8 @@ fn release_info_from_preview_manifest(
             manifest.base_version
         ))
     })?;
+    // validate_manifest already refused empty notes.
     let notes_body = manifest.notes.trim().to_string();
-    if notes_body.is_empty() {
-        return Err(verify::VerifyError::ManifestInvalid(
-            "preview manifest notes are empty".into(),
-        ));
-    }
     Ok(ReleaseInfo {
         identity: preview_display_version(&manifest.base_version, &manifest.build_id),
         version,
