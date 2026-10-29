@@ -177,16 +177,40 @@ pub(crate) struct GuestLink {
 }
 
 impl GuestLink {
-    /// Starts the daemon's link over the guest store. Guest access is optional:
-    /// a failure is logged and the daemon carries on without it.
+    /// Starts the daemon's link over the guest store, in the default session
+    /// only ([`crate::guest::session_serves_guests`]). Guest access is
+    /// optional: a failure is logged and the daemon carries on without it.
     pub(crate) fn start_for_daemon() -> Option<Self> {
-        Self::start(Arc::new(DaemonGuestHost))
-            .inspect_err(|err| warn!(err = %err, "guest link failed to start"))
-            .ok()
+        Self::start_in_session(
+            crate::session::active_name().as_deref(),
+            Arc::new(DaemonGuestHost),
+            Timing::default(),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn start<H: GuestHost>(host: Arc<H>) -> io::Result<Self> {
         Self::start_with(host, Timing::default())
+    }
+
+    /// `None` for a named session (`session` is `None` for the default one):
+    /// it shares the default session's guest store and relay identity, so its
+    /// socket would replace the default session's at the relay.
+    fn start_in_session<H: GuestHost>(
+        session: Option<&str>,
+        host: Arc<H>,
+        timing: Timing,
+    ) -> Option<Self> {
+        if !crate::guest::session_serves_guests(session) {
+            info!(
+                session = session.unwrap_or_default(),
+                "guest link is off in this named session; the default session serves guests"
+            );
+            return None;
+        }
+        Self::start_with(host, timing)
+            .inspect_err(|err| warn!(err = %err, "guest link failed to start"))
+            .ok()
     }
 
     fn start_with<H: GuestHost>(host: Arc<H>, timing: Timing) -> io::Result<Self> {

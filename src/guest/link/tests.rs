@@ -712,6 +712,38 @@ fn link_runs_only_while_guests_or_invites_exist() {
     assert_eq!(host.last_status(), Some((LinkState::Off, None)));
 }
 
+/// #345: a named session on the same host reads the same guest store, so it
+/// wants a link whenever the default session does and dials the same host id,
+/// and the relay keeps one socket per host id. It must not dial: its socket
+/// would replace the default session's and cut that session's guests off.
+#[test]
+fn a_named_session_does_not_evict_the_default_sessions_link() {
+    let stub = StubRelay::new();
+    let (default_host, served) = FakeHost::new(stub.url.clone());
+    let _default = GuestLink::start_in_session(None, Arc::clone(&default_host), timing())
+        .expect("the default session links");
+    let mut relay = stub.accept();
+    default_host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    let (named_host, _named_served) = FakeHost::new(stub.url.clone());
+    assert!(named_host.link_wanted() && named_host.host_info().is_ok());
+    let named = GuestLink::start_in_session(Some("hd-engine-smoke"), named_host, timing());
+    assert!(
+        stub.tcp(Duration::from_millis(500)).is_none(),
+        "the named session dialled the relay as the default session's host"
+    );
+    assert!(named.is_none(), "a named session runs no guest link");
+
+    // The default session's socket is still the live one: it serves a guest.
+    assert_eq!(default_host.last_status(), Some((LinkState::Up, None)));
+    let mut guest = admitted(&mut relay, 7);
+    guest.send(&mut relay, "hello\n");
+    assert_eq!(guest.recv(&mut relay), "plotarmordev: hello\n");
+    guest.send(&mut relay, "bye\n");
+    assert_eq!(guest.recv(&mut relay), "bye plotarmordev\n");
+    assert_eq!(served.recv_timeout(WAIT).unwrap(), "plotarmordev");
+}
+
 #[test]
 fn replaced_socket_reconnects_only_after_backoff() {
     let stub = StubRelay::new();
