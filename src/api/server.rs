@@ -3149,14 +3149,11 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// herdrup#573: a ~1 MB request line (a 512 KiB `gram.upload_chunk`) used to
-    /// be read one byte per syscall with a 100 ms sleep whenever the reader caught
-    /// up with the writer — about one second of daemon CPU per uploaded megabyte,
-    /// which capped every per-chunk upload near 1 MB/s. Read in pieces 25 ms
-    /// apart, the whole line must land well inside a budget that the old reader
-    /// overran on its sleeps alone.
+    /// A ~1 MB request line (a 512 KiB `gram.upload_chunk`) that arrives in pieces
+    /// is assembled whole, however small the socket buffer (macOS: 8 KiB).
+    /// The deadline is the production one, not a speed claim.
     #[test]
-    fn large_initial_request_line_in_pieces_is_read_as_it_arrives() {
+    fn large_initial_request_line_in_pieces_is_read_whole() {
         const PIECES: usize = 20;
         const PIECE: usize = 50_000;
         let (mut client, server, path) = local_stream_pair("initial-line-large");
@@ -3169,7 +3166,7 @@ mod tests {
                     client.write_all(b"\n").unwrap();
                 }
                 client.flush().unwrap();
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(10));
             }
             client
         });
@@ -3177,17 +3174,51 @@ mod tests {
         let started = Instant::now();
         let line = read_initial_request_line_with_limits(
             &mut server,
-            Duration::from_millis(1500),
+            INITIAL_REQUEST_TIMEOUT,
+            MAX_INITIAL_REQUEST_BYTES,
+        )
+        .unwrap_or_else(|err| panic!("after {:?}: {err}", started.elapsed()))
+        .unwrap();
+        assert_eq!(line.len(), PIECES * PIECE + 1);
+        assert!(line.ends_with('\n'));
+        drop(writer.join().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    /// herdrup#573: the reader made one `read(2)` per byte — about one second of
+    /// daemon CPU per uploaded megabyte, which capped every per-chunk upload near
+    /// 1 MB/s. A 1 MB line handed over as fast as the socket takes it must cost a
+    /// small fraction of that: a million one-byte reads cannot finish in 250 ms,
+    /// while ~16 peeks of 64 KiB take a few. Linux only: its unix sockets queue
+    /// hundreds of KiB, so the reader, not the 8 KiB macOS buffer handoff, is
+    /// what gets timed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn large_initial_request_line_costs_reads_per_64k_not_per_byte() {
+        const LINE: usize = 1_000_000;
+        let (mut client, server, path) = local_stream_pair("initial-line-cost");
+        let mut server = ApiStream::Local(server);
+        let writer = std::thread::spawn(move || {
+            let mut line = vec![b'A'; LINE];
+            line.push(b'\n');
+            client.write_all(&line).unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        let started = Instant::now();
+        let line = read_initial_request_line_with_limits(
+            &mut server,
+            INITIAL_REQUEST_TIMEOUT,
             MAX_INITIAL_REQUEST_BYTES,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(line.len(), PIECES * PIECE + 1);
-        assert!(line.ends_with('\n'));
+        let elapsed = started.elapsed();
+        assert_eq!(line.len(), LINE + 1);
         assert!(
-            started.elapsed() < Duration::from_millis(1500),
-            "read took {:?}",
-            started.elapsed()
+            elapsed < Duration::from_millis(250),
+            "read took {elapsed:?}"
         );
         drop(writer.join().unwrap());
         let _ = fs::remove_file(path);
