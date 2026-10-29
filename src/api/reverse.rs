@@ -442,8 +442,30 @@ mod tests {
 
     #[test]
     fn gram_gateway_refuses_server_update_check() {
+        assert_gram_gateway_refuses("server.update_check", "{}");
+    }
+
+    #[test]
+    fn gram_gateway_refuses_server_update_apply() {
+        assert_gram_gateway_refuses(
+            "server.update_apply",
+            r#"{"build_id":"2026-10-28-0123456789ab","restart_later":true}"#,
+        );
+    }
+
+    #[test]
+    fn gram_gateway_refuses_server_update_status() {
+        assert_gram_gateway_refuses("server.update_status", "{}");
+    }
+
+    /// The gateway answers `forbidden` and never forwards the call to the app.
+    fn assert_gram_gateway_refuses(method: &str, params: &str) {
         use std::io::{BufRead as _, Write as _};
-        let dir = std::env::temp_dir().join(format!("herdr-rev-upd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-rev-{}-{}",
+            method.replace('.', "-"),
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("gw.sock");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
@@ -451,7 +473,10 @@ mod tests {
 
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         stream
-            .write_all(b"{\"id\":\"u\",\"method\":\"server.update_check\",\"params\":{}}\n")
+            .write_all(
+                format!("{{\"id\":\"u\",\"method\":\"{method}\",\"params\":{params}}}\n")
+                    .as_bytes(),
+            )
             .unwrap();
         let mut line = String::new();
         std::io::BufReader::new(&stream)
@@ -459,8 +484,11 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
 
-        assert_eq!(value["error"]["code"], "forbidden", "{line}");
-        assert!(rx.try_recv().is_err(), "the refused call reached the app");
+        assert_eq!(value["error"]["code"], "forbidden", "{method}: {line}");
+        assert!(
+            rx.try_recv().is_err(),
+            "the refused {method} reached the app"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

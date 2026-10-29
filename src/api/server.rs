@@ -215,9 +215,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_history: true,
         agent_answer: true,
         agent_transcript: true,
-        // Only `server.update_check` ships so far; the app shows its Update
-        // button for this flag, so it waits for update_apply/update_status.
-        server_update: false,
+        server_update: true,
     })
 }
 
@@ -2452,6 +2450,39 @@ fn handle_request(
         };
     }
 
+    // Also network-bound, and it must answer before the guard it starts
+    // switches the server, so it stays off the app loop too.
+    if let Method::ServerUpdateApply(params) = &request.method {
+        #[cfg(unix)]
+        let result =
+            crate::update::apply::update_apply(params).map_err(|err| (err.code(), err.to_string()));
+        #[cfg(not(unix))]
+        let result: Result<crate::api::schema::ResponseResult, (&str, String)> = {
+            let _ = params;
+            Err((
+                "update_unsupported_install",
+                "this install can't be updated from the app (windows)".to_string(),
+            ))
+        };
+        return match result {
+            Ok(result) => serde_json::to_string(&SuccessResponse {
+                id: request.id,
+                result,
+            })
+            .unwrap_or_else(|_| "{}".to_string()),
+            Err((code, message)) => error_response_json(request.id, code, message),
+        };
+    }
+
+    // Read from the state file, so any server answers for the newest attempt.
+    if matches!(&request.method, Method::ServerUpdateStatus(_)) {
+        return serde_json::to_string(&SuccessResponse {
+            id: request.id,
+            result: crate::update::state::update_status(),
+        })
+        .unwrap_or_else(|_| "{}".to_string());
+    }
+
     if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
         return error_response_json(
             request.id,
@@ -4248,9 +4279,9 @@ mod tests {
     }
 
     #[test]
-    fn ping_does_not_advertise_server_update_before_apply_ships() {
-        // The app offers its Update button for this flag, and this server
-        // can't apply an update yet: `server.update_apply` is unknown here.
+    fn ping_advertises_server_update_with_apply_and_status() {
+        // The app offers its Update button for this flag, so it is true
+        // exactly when this server answers apply and status too.
         let (tx, _rx) = mpsc::unbounded_channel();
         let ping: serde_json::Value = serde_json::from_str(&handle_request(
             Request {
@@ -4264,13 +4295,15 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(ping["result"]["capabilities"]["server_update"], false);
+        assert_eq!(ping["result"]["capabilities"]["server_update"], true);
         let served = |name: &str| Method::OPERATIONS.iter().any(|op| op.name == name);
-        assert!(served("server.update_check"));
-        assert!(
-            !served("server.update_apply"),
-            "server_update must turn true together with server.update_apply"
-        );
+        for method in [
+            "server.update_check",
+            "server.update_apply",
+            "server.update_status",
+        ] {
+            assert!(served(method), "server_update advertises {method}");
+        }
     }
 
     #[test]
@@ -4779,6 +4812,8 @@ mod federation_tests {
             ("server.staged_update", Denied),
             ("server.apply_staged_update", Denied),
             ("server.update_check", Denied),
+            ("server.update_apply", Denied),
+            ("server.update_status", Denied),
             ("server.agent_manifests", Denied),
             ("server.reload_agent_manifests", Denied),
             ("server.ssh_agent.register", Denied),
@@ -5065,6 +5100,14 @@ mod federation_tests {
             ),
             ("stop", Method::ServerStop(EmptyParams {})),
             ("update_check", Method::ServerUpdateCheck(EmptyParams {})),
+            (
+                "update_apply",
+                Method::ServerUpdateApply(crate::api::schema::ServerUpdateApplyParams {
+                    build_id: "2026-10-28-0123456789ab".into(),
+                    restart_later: false,
+                }),
+            ),
+            ("update_status", Method::ServerUpdateStatus(EmptyParams {})),
             (
                 "close",
                 Method::PaneClose(PaneTarget {

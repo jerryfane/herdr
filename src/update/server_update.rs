@@ -12,7 +12,13 @@ use super::{preview_display_version, PreviewManifest, PREVIEW_UPDATE_MANIFEST_UR
 /// Fetch and verify the signed manifest and describe the update it offers.
 pub(crate) fn update_check() -> Result<ResponseResult, VerifyError> {
     let manifest = verify::fetch_signed_manifest(PREVIEW_UPDATE_MANIFEST_URL)?;
-    update_check_from(&manifest, &RunningBuild::current(), &InstallFacts::detect())
+    let state = super::state::UpdateDirs::current().load();
+    update_check_from(
+        &manifest,
+        &RunningBuild::current(),
+        &InstallFacts::detect(),
+        &state,
+    )
 }
 
 /// What the switch to a new build depends on, apart from the manifest.
@@ -76,9 +82,10 @@ impl InstallFacts {
     }
 }
 
-/// The running executable's directory takes a new file.
+/// The install's directory takes a new file. After a live switch the server
+/// runs from `updates/`, so this checks the recorded install, not itself.
 fn install_dir_writable() -> bool {
-    let Some(dir) = std::env::current_exe()
+    let Some(dir) = super::state::install_path()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
     else {
@@ -98,10 +105,13 @@ fn install_dir_writable() -> bool {
     }
 }
 
+/// `state` holds the builds that rolled back here: they are never offered
+/// again, so the app does not loop on a build this machine already refused.
 pub(super) fn update_check_from(
     manifest: &PreviewManifest,
     running: &RunningBuild,
     facts: &InstallFacts,
+    state: &super::state::UpdateState,
 ) -> Result<ResponseResult, VerifyError> {
     let latest = verify::platform_asset(manifest)?.map(|asset| UpdateLatestBuild {
         version: preview_display_version(&manifest.base_version, &manifest.build_id),
@@ -114,7 +124,9 @@ pub(super) fn update_check_from(
         protocol: manifest.protocol,
         endpoint_generation: manifest.endpoint_generation,
     });
-    let update_available = latest.is_some() && running.is_older_than(manifest);
+    let update_available = latest.is_some()
+        && running.is_older_than(manifest)
+        && !state.has_rolled_back(&manifest.build_id);
     let (mode, reason) = facts.mode(latest.as_ref().map(|_| manifest));
     Ok(ResponseResult::UpdateCheck {
         running: UpdateRunningBuild {
@@ -186,10 +198,36 @@ mod tests {
         serde_json::to_value(result).unwrap()
     }
 
+    fn check(
+        manifest: &PreviewManifest,
+        running: &RunningBuild,
+        facts: &InstallFacts,
+    ) -> Result<ResponseResult, VerifyError> {
+        update_check_from(
+            manifest,
+            running,
+            facts,
+            &super::super::state::UpdateState::default(),
+        )
+    }
+
+    #[test]
+    fn a_build_that_rolled_back_here_is_not_offered_again() {
+        let newer = manifest(1_761_638_400, Some(1), true);
+        let state = super::super::state::UpdateState {
+            attempt: None,
+            rolled_back: vec![newer.build_id.clone()],
+        };
+        let result =
+            json(update_check_from(&newer, &running(1_761_580_000), &LIVE, &state).unwrap());
+        assert_eq!(result["update_available"], false, "{result}");
+        assert_eq!(result["latest"]["build_id"], newer.build_id);
+    }
+
     #[test]
     fn newer_signed_build_is_offered_live_with_the_agreed_shape() {
         let result = json(
-            update_check_from(
+            check(
                 &manifest(1_761_638_400, Some(1), true),
                 &running(1_761_580_000),
                 &LIVE,
@@ -216,7 +254,7 @@ mod tests {
     fn older_or_equal_signed_build_is_not_offered() {
         for commit_time in [1_761_580_000, 1_700_000_000] {
             let result = json(
-                update_check_from(
+                check(
                     &manifest(commit_time, Some(1), true),
                     &running(1_761_580_000),
                     &LIVE,
@@ -231,7 +269,7 @@ mod tests {
     #[test]
     fn manifest_without_this_platform_reports_latest_null() {
         let result = json(
-            update_check_from(
+            check(
                 &manifest(1_761_638_400, Some(1), false),
                 &running(1_761_580_000),
                 &LIVE,
@@ -288,13 +326,12 @@ mod tests {
             ),
         ];
         for (facts, mode, reason) in cases {
-            let result = json(update_check_from(&newer, &running(1_761_580_000), &facts).unwrap());
+            let result = json(check(&newer, &running(1_761_580_000), &facts).unwrap());
             assert_eq!(result["mode"], mode, "{facts:?}");
             assert_eq!(result["reason"], reason, "{facts:?}");
         }
         let next_generation = manifest(1_761_638_400, Some(2), true);
-        let result =
-            json(update_check_from(&next_generation, &running(1_761_580_000), &LIVE).unwrap());
+        let result = json(check(&next_generation, &running(1_761_580_000), &LIVE).unwrap());
         assert_eq!(result["mode"], "restart_required");
         assert_eq!(result["reason"], "endpoint_generation_changed");
     }

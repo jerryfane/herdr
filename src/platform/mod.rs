@@ -394,6 +394,14 @@ pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<b
     Ok(false)
 }
 
+/// The pid of the process that serves the other end of a connected Unix
+/// socket (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS).
+#[cfg(unix)]
+pub(crate) fn unix_stream_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    socket_peer_pid(stream.as_raw_fd())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;

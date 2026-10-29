@@ -2120,6 +2120,28 @@ mod tests {
     }
 
     #[test]
+    fn guests_cannot_apply_server_updates() {
+        let harness = start("denied");
+        let guest = harness.admit();
+        let request = json!({
+            "id": "u",
+            "method": "server.update_apply",
+            "params": {"build_id": "2026-10-28-0123456789ab", "restart_later": true}
+        });
+        let lines = harness.call(&guest, request.clone());
+        assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+    }
+
+    #[test]
+    fn guests_cannot_read_server_update_status() {
+        let harness = start("denied");
+        let guest = harness.admit();
+        let request = json!({"id": "u", "method": "server.update_status", "params": {}});
+        let lines = harness.call(&guest, request.clone());
+        assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+    }
+
+    #[test]
     fn guests_cannot_type_resize_or_reach_gram_listing_files_or_guest_rpcs() {
         let harness = start("denied");
         let guest = harness.admit();

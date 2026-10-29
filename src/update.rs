@@ -24,8 +24,13 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
+#[cfg(unix)]
+pub(crate) mod apply;
+#[cfg(unix)]
+pub(crate) mod guard;
 mod keys;
 pub(crate) mod server_update;
+pub(crate) mod state;
 #[cfg(all(test, unix))]
 mod test_signing;
 pub(crate) mod verify;
@@ -373,30 +378,62 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
 /// Download `release`'s asset to `path` over HTTPS only, refusing more bytes
 /// than the signed manifest states, then check its size and sha256.
 fn download_release_asset(release: &ReleaseInfo, path: &Path) -> Result<(), String> {
+    fetch_asset(&release.download_url, release.size, path, |_| {})?;
+    check_asset(path, release.size, &release.sha256)
+}
+
+/// Download `url` to `path` over HTTPS only, refusing more than `size` bytes.
+/// `progress` sees the bytes written so far while curl runs.
+fn fetch_asset(
+    url: &str,
+    size: u64,
+    path: &Path,
+    mut progress: impl FnMut(u64),
+) -> Result<(), String> {
     let protocols = verify::allowed_protocols();
-    let status = crate::noninteractive_process::curl_command()
+    let mut child = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--proto", protocols, "--proto-redir", protocols])
         .args(["--connect-timeout", "10", "--max-time", "300"])
-        .args(["--max-filesize", &release.size.to_string(), "-o"])
+        .args(["--max-filesize", &size.to_string(), "-o"])
         .arg(path)
-        .arg(verify::fetch_url(&release.download_url))
-        .status()
+        .arg(verify::fetch_url(url))
+        .spawn()
         .map_err(|e| format!("download failed: {e}"))?;
+    let written = || fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                progress(written());
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("download failed: {e}"));
+            }
+        }
+    };
+    progress(written());
     if !status.success() {
         return Err("download failed".into());
     }
+    Ok(())
+}
+
+/// The downloaded file must be exactly `size` bytes with the signed sha256.
+fn check_asset(path: &Path, size: u64, sha256: &str) -> Result<(), String> {
     let len = fs::metadata(path)
         .map_err(|e| format!("download failed: {e}"))?
         .len();
-    if len != release.size {
+    if len != size {
         return Err(format!(
-            "downloaded update is {len} bytes, but the manifest says {}",
-            release.size
+            "downloaded update is {len} bytes, but the manifest says {size}"
         ));
     }
-    crate::checksum::verify_sha256(path, &release.sha256)
+    crate::checksum::verify_sha256(path, sha256)
         .map_err(|e| format!("downloaded update checksum verification failed: {e}"))?;
-    tracing::info!(sha256 = %release.sha256, "downloaded update checksum verified");
+    tracing::info!(sha256 = %sha256, "downloaded update checksum verified");
     Ok(())
 }
 
