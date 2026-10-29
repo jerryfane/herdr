@@ -55,6 +55,32 @@ pub(crate) fn link_wanted() -> bool {
     store::link_wanted_in(&store::guest_dir(), store::now_ms())
 }
 
+/// Guest access belongs to the default session (`session` is `None`). Every
+/// session reads the same guest store in the config directory, so the same
+/// relay identity, and the relay keeps one socket per host id: a link from a
+/// named session replaces the default session's link and the two evict each
+/// other (#345). The server holding the link serves every guest, so only the
+/// default session links and only it creates invites.
+pub(crate) fn session_serves_guests(session: Option<&str>) -> bool {
+    session.is_none()
+}
+
+/// An invite from a named session would be admitted by the default session's
+/// link and served by its server, which does not have the agent.
+fn invite_session_check(session: Option<&str>) -> Result<(), OwnerError> {
+    if session_serves_guests(session) {
+        return Ok(());
+    }
+    Err((
+        "unsupported",
+        format!(
+            "guest access is served by the default session only; share an agent from the \
+             default session, not named session {:?}",
+            session.unwrap_or_default()
+        ),
+    ))
+}
+
 /// An admitted guest, bound to one agent grant for one API connection.
 #[derive(Debug, Clone)]
 pub struct GuestPrincipal {
@@ -373,6 +399,7 @@ pub(crate) fn create_invite(
     ttl_secs: Option<u64>,
     share_gram: bool,
 ) -> Result<(GuestInviteInfo, String, String), OwnerError> {
+    invite_session_check(crate::session::active_name().as_deref())?;
     if !store::valid_guest_name(name) {
         return Err((
             "guest_invalid_name",
@@ -614,6 +641,15 @@ mod tests {
             invite_grant(&archived, true).unwrap_err().0,
             "agent_not_ready"
         );
+    }
+
+    #[test]
+    fn only_the_default_session_creates_invites() {
+        assert!(invite_session_check(None).is_ok());
+        let (code, message) = invite_session_check(Some("hd-engine-smoke")).unwrap_err();
+        assert_eq!(code, "unsupported");
+        assert!(message.contains("default session"), "{message}");
+        assert!(message.contains("\"hd-engine-smoke\""), "{message}");
     }
 
     #[test]
