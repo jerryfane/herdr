@@ -712,6 +712,25 @@ fn link_runs_only_while_guests_or_invites_exist() {
     assert_eq!(host.last_status(), Some((LinkState::Off, None)));
 }
 
+/// Red proof for #345 against master: `start_for_daemon` starts the link in
+/// every session (no session check), so a named session runs `start_with`
+/// exactly like the default one and dials the same host id.
+#[test]
+fn a_named_session_does_not_evict_the_default_sessions_link() {
+    let stub = StubRelay::new();
+    let (default_host, _served) = FakeHost::new(stub.url.clone());
+    let _default = GuestLink::start_with(Arc::clone(&default_host), timing()).unwrap();
+    let _relay = stub.accept();
+    default_host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    let (named_host, _named_served) = FakeHost::new(stub.url.clone());
+    let _named = GuestLink::start_with(named_host, timing()).ok();
+    assert!(
+        stub.tcp(Duration::from_millis(500)).is_none(),
+        "the named session dialled the relay as the default session's host"
+    );
+}
+
 #[test]
 fn replaced_socket_reconnects_only_after_backoff() {
     let stub = StubRelay::new();
