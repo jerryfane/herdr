@@ -113,6 +113,95 @@ impl ApiStream {
         }
     }
 
+    /// Copy bytes that are already readable into `buf` WITHOUT consuming them, so a
+    /// reader can find a frame boundary and then consume exactly up to it. `None`
+    /// where the transport cannot peek (Windows named pipes); the caller then reads
+    /// one byte at a time. The caller must have enabled polling first, and `buf`
+    /// must not be empty (an empty peek is indistinguishable from a close).
+    pub(crate) fn poll_peek(&mut self, buf: &mut [u8]) -> io::Result<Option<ApiStreamRead>> {
+        debug_assert!(!buf.is_empty());
+        match self {
+            #[cfg(unix)]
+            ApiStream::Local(stream) => {
+                use std::os::fd::{AsFd as _, AsRawFd as _};
+                let LocalStream::UdSocket(socket) = &*stream;
+                let fd = socket.as_fd().as_raw_fd();
+                loop {
+                    // SAFETY: `buf` is a live, writable slice of `buf.len()` bytes,
+                    // and `fd` is borrowed from `stream` for the whole call.
+                    let read = unsafe {
+                        libc::recv(
+                            fd,
+                            buf.as_mut_ptr().cast(),
+                            buf.len(),
+                            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if read > 0 {
+                        return Ok(Some(ApiStreamRead::Data(read as usize)));
+                    }
+                    if read == 0 {
+                        return Ok(Some(ApiStreamRead::Closed));
+                    }
+                    // Same mapping as `poll_read` on this variant.
+                    let err = io::Error::last_os_error();
+                    match err.kind() {
+                        io::ErrorKind::Interrupted => continue,
+                        io::ErrorKind::WouldBlock => return Ok(Some(ApiStreamRead::Pending)),
+                        _ => return Err(err),
+                    }
+                }
+            }
+            #[cfg(windows)]
+            ApiStream::Local(_) => Ok(None),
+            ApiStream::Tcp(stream) => match stream.peek(buf) {
+                Ok(0) => Ok(Some(ApiStreamRead::Closed)),
+                Ok(read) => Ok(Some(ApiStreamRead::Data(read))),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(Some(ApiStreamRead::Pending))
+                }
+                Err(err) if is_connection_closed_error(&err) => Ok(Some(ApiStreamRead::Closed)),
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    /// Park until the stream has bytes (or a hangup) to read, or `timeout` passes.
+    /// `false` where the transport cannot wait on readiness; the caller sleeps
+    /// instead. Waking early is fine: the caller re-polls either way.
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+            let fd = match self {
+                ApiStream::Local(stream) => {
+                    let LocalStream::UdSocket(socket) = stream;
+                    socket.as_fd().as_raw_fd()
+                }
+                ApiStream::Tcp(stream) => stream.as_raw_fd(),
+            };
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let wait_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: one valid `pollfd`, borrowed from `self` for the call.
+            if unsafe { libc::poll(&mut descriptor, 1, wait_ms) } < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+            Ok(true)
+        }
+        #[cfg(windows)]
+        {
+            let _ = (self, timeout);
+            Ok(false)
+        }
+    }
+
     /// Non-destructively check whether the peer has closed the connection.
     pub(crate) fn peer_closed(&mut self) -> io::Result<bool> {
         match self {
