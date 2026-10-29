@@ -2544,50 +2544,96 @@ fn read_initial_request_line_with_timeout(
     read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
 }
 
+/// Bytes the initial request reader peeks at once. A 512 KiB upload chunk is a
+/// ~700 KB line, so this is a dozen reads instead of 700,000.
+const INITIAL_REQUEST_PEEK_BYTES: usize = 64 * 1024;
+
+/// Reads the first request line WITHOUT consuming a byte past its newline: a
+/// streaming method (`gram.upload.stream`, `pane.input.stream`, `pane.stream`)
+/// keeps reading frames from the same connection after it, and a binary body
+/// may follow too. It peeks at what is already readable, then consumes exactly
+/// through the newline (or all of it, when no newline is there yet), so a large
+/// line costs a few syscalls per 64 KiB, not one per byte. While nothing is
+/// readable it parks in `poll(2)` and wakes on the next byte, instead of sleeping
+/// a whole poll interval between the pieces a large line arrives in.
+///
+/// Where the transport cannot peek (Windows named pipes) it falls back to one
+/// byte per read, and where it cannot wait on readiness to sleeping
+/// [`CONNECTION_POLL_INTERVAL`].
 fn read_initial_request_line_with_limits(
     stream: &mut ApiStream,
     timeout: Duration,
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
     stream.set_polling(true)?;
+    let result = read_initial_request_line_polling(stream, timeout, max_bytes);
+    stream.set_polling(false)?;
+    result
+}
+
+fn read_initial_request_line_polling(
+    stream: &mut ApiStream,
+    timeout: Duration,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-
-    let result = loop {
-        let read = match stream.poll_read(&mut byte) {
-            Ok(read) => read,
-            Err(err) => break Err(err),
+    let mut scratch = vec![0u8; INITIAL_REQUEST_PEEK_BYTES.min(max_bytes.saturating_add(1))];
+    loop {
+        // Never look past the byte that makes the line too long.
+        let window = scratch
+            .len()
+            .min(max_bytes.saturating_add(1).saturating_sub(bytes.len()))
+            .max(1);
+        let take = match stream.poll_peek(&mut scratch[..window])? {
+            Some(ApiStreamRead::Data(peeked)) => {
+                let peeked = &scratch[..peeked];
+                peeked
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(peeked.len(), |newline| newline + 1)
+            }
+            Some(ApiStreamRead::Closed) => return Ok(None),
+            Some(ApiStreamRead::Pending) => 0,
+            // No peek on this transport: one byte, which can never overshoot.
+            None => 1,
+        };
+        let read = if take == 0 {
+            ApiStreamRead::Pending
+        } else {
+            stream.poll_read(&mut scratch[..take])?
         };
         match read {
-            ApiStreamRead::Closed => break Ok(None),
-            ApiStreamRead::Data(_) => {
-                bytes.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break String::from_utf8(bytes)
+            ApiStreamRead::Closed => return Ok(None),
+            ApiStreamRead::Data(read) => {
+                bytes.extend_from_slice(&scratch[..read]);
+                if bytes.last() == Some(&b'\n') {
+                    return String::from_utf8(bytes)
                         .map(Some)
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
                 if bytes.len() > max_bytes {
-                    break Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "api request line is too large",
                     ));
                 }
             }
             ApiStreamRead::Pending => {
-                if Instant::now() >= deadline {
-                    break Err(io::Error::new(
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                let wait = (deadline - now).min(CONNECTION_POLL_INTERVAL);
+                if !stream.wait_readable(wait)? {
+                    std::thread::sleep(wait);
+                }
             }
         }
-    };
-    stream.set_polling(false)?;
-    result
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -3077,6 +3123,103 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    /// A streaming method keeps reading frames off the connection after its open
+    /// line, so the initial read must leave every byte past the newline unread,
+    /// even when the open line and the first frames arrive in one write.
+    #[test]
+    fn initial_request_line_leaves_the_bytes_after_its_newline_unread() {
+        let (mut client, server, path) = local_stream_pair("initial-line-boundary");
+        let mut server = ApiStream::Local(server);
+        client
+            .write_all(b"{\"id\":\"open\"}\n{\"seq\":0}\n{\"seq\":1}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        let line = read_initial_request_line_with_limits(&mut server, Duration::from_secs(2), 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "{\"id\":\"open\"}\n");
+
+        drop(client);
+        let mut rest = String::new();
+        server.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "{\"seq\":0}\n{\"seq\":1}\n");
+        let _ = fs::remove_file(path);
+    }
+
+    /// herdrup#573: a ~1 MB request line (a 512 KiB `gram.upload_chunk`) used to
+    /// be read one byte per syscall with a 100 ms sleep whenever the reader caught
+    /// up with the writer — about one second of daemon CPU per uploaded megabyte,
+    /// which capped every per-chunk upload near 1 MB/s. Read in pieces 25 ms
+    /// apart, the whole line must land well inside a budget that the old reader
+    /// overran on its sleeps alone.
+    #[test]
+    fn large_initial_request_line_in_pieces_is_read_as_it_arrives() {
+        const PIECES: usize = 20;
+        const PIECE: usize = 50_000;
+        let (mut client, server, path) = local_stream_pair("initial-line-large");
+        let mut server = ApiStream::Local(server);
+        let writer = std::thread::spawn(move || {
+            let piece = vec![b'A'; PIECE];
+            for index in 0..PIECES {
+                client.write_all(&piece).unwrap();
+                if index + 1 == PIECES {
+                    client.write_all(b"\n").unwrap();
+                }
+                client.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            client
+        });
+
+        let started = Instant::now();
+        let line = read_initial_request_line_with_limits(
+            &mut server,
+            Duration::from_millis(1500),
+            MAX_INITIAL_REQUEST_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(line.len(), PIECES * PIECE + 1);
+        assert!(line.ends_with('\n'));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "read took {:?}",
+            started.elapsed()
+        );
+        drop(writer.join().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn initial_request_line_over_the_limit_is_rejected() {
+        let (mut client, server, path) = local_stream_pair("initial-line-limit");
+        let mut server = ApiStream::Local(server);
+        client.write_all(&[b'A'; 5000]).unwrap();
+        client.flush().unwrap();
+
+        let error =
+            read_initial_request_line_with_limits(&mut server, Duration::from_secs(2), 1000)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(path);
+    }
+
+    /// The readiness wait must not outlive the request deadline on a silent peer.
+    #[test]
+    fn idle_initial_request_still_times_out() {
+        let (client, server, path) = local_stream_pair("initial-line-idle");
+        let mut server = ApiStream::Local(server);
+        let started = Instant::now();
+        let error =
+            read_initial_request_line_with_limits(&mut server, Duration::from_millis(250), 1024)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(client);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
