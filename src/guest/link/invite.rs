@@ -1,7 +1,9 @@
 //! Short invite links. The v1 invite JSON is sealed with AES-128-GCM under a
-//! fresh key and stored on the guest relay (`PUT /v1/invite/{id}`); the link
-//! carries the id and the key, so the relay holds only ciphertext it cannot
-//! open. Requests are one-shot HTTP/1.1 over the same rustls setup as the host
+//! fresh key and stored encrypted on the guest relay (`PUT /v1/invite/{id}`).
+//! The key is in the link's path (`/i/{id}{key}`, not a fragment, which some
+//! messengers cut off), so the relay sees it whenever the link is opened
+//! through it: the stored copy is encrypted, the link is not end-to-end.
+//! Requests are one-shot HTTP/1.1 over the same rustls setup as the host
 //! socket, bounded by [`TIMEOUT`] from DNS to the status line.
 
 use std::io::{self, Read, Write};

@@ -118,6 +118,7 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
                     &params.machine_label,
                     params.ttl_secs,
                     params.share_gram,
+                    &crate::guest::InviteRelay::configured(),
                 )
                 .map(
                     |(invite, url, web_url)| ResponseResult::GuestInviteCreated {

@@ -426,6 +426,23 @@ fn io_error(err: std::io::Error) -> OwnerError {
     ("guest_store_failed", err.to_string())
 }
 
+/// The relay a new invite's links point at, and how long its short link
+/// waits for the relay link to come up.
+pub(crate) struct InviteRelay {
+    pub url: String,
+    pub link_wait: Duration,
+}
+
+impl InviteRelay {
+    /// `[guest] relay_url`, waiting [`SHORT_INVITE_LINK_WAIT`].
+    pub(crate) fn configured() -> Self {
+        Self {
+            url: crate::config::Config::load().config.guest.relay_url,
+            link_wait: SHORT_INVITE_LINK_WAIT,
+        }
+    }
+}
+
 /// `guest.invite.create` after the app resolved `agent` and its live check.
 pub(crate) fn create_invite(
     agent: &AgentInfo,
@@ -435,6 +452,7 @@ pub(crate) fn create_invite(
     machine_label: &str,
     ttl_secs: Option<u64>,
     share_gram: bool,
+    relay: &InviteRelay,
 ) -> Result<(GuestInviteInfo, String, String), OwnerError> {
     invite_session_check(crate::session::active_name().as_deref())?;
     if !store::valid_guest_name(name) {
@@ -480,14 +498,13 @@ pub(crate) fn create_invite(
     )
     .map_err(io_error)?;
     notify_changes();
-    let relay_url = crate::config::Config::load().config.guest.relay_url;
     let (url, web_url) = share_links(
         &dir,
-        &relay_url,
+        &relay.url,
         &host,
         &node_secret,
         &invite,
-        SHORT_INVITE_LINK_WAIT,
+        relay.link_wait,
     );
     Ok((invite.record.info(), url, web_url))
 }
@@ -793,14 +810,40 @@ mod tests {
         let config_home = root.0.parent().unwrap().to_path_buf();
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        let (invite, url, _) =
-            create_invite(&agent(), true, "plotarmordev", "Jerry", "Mac", None, false).unwrap();
+        // A local stub relay and no link wait: the test never reaches the
+        // production relay.
+        let stub = link::invite::tests::StubInviteRelay::start(201);
+        let relay = InviteRelay {
+            url: stub.url.clone(),
+            link_wait: Duration::ZERO,
+        };
+        let (invite, url, _) = create_invite(
+            &agent(),
+            true,
+            "plotarmordev",
+            "Jerry",
+            "Mac",
+            None,
+            false,
+            &relay,
+        )
+        .unwrap();
         let secret = url.rsplit('#').next().unwrap().to_string();
         let payload: serde_json::Value =
             serde_json::from_slice(&store::b64url_decode(&secret).unwrap()).unwrap();
         let hello = json!({"v": 1, "invite_id": invite.invite_id, "secret": payload["secret"], "device": "iPhone"});
         assert!(matches!(admit([6; 32], &hello), Admission::Admitted { .. }));
-        let pending = create_invite(&agent(), true, "second", "Jerry", "Mac", None, false).unwrap();
+        let pending = create_invite(
+            &agent(),
+            true,
+            "second",
+            "Jerry",
+            "Mac",
+            None,
+            false,
+            &relay,
+        )
+        .unwrap();
         let (guests, invites, link) = list().unwrap();
         let rendered = serde_json::to_string(&(guests, invites, link)).unwrap();
         let dir = store::guest_dir();

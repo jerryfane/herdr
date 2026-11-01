@@ -2,8 +2,9 @@
 //! Everything else answers `guest_forbidden`. Prompts are labeled, and a guest
 //! answers the agent's questions as the owner can: `agent.answer` for an ask,
 //! and menu keys (arrows, Enter, Tab, Escape, Space, 1-9, y, n) through
-//! `pane.send_keys` only while the agent awaits menu input. The terminal takes
-//! no other input: no text, no other keys, nothing while the agent is not
+//! `pane.send_keys` only while the agent awaits menu input; a choosing key ends
+//! its batch, and no more keys are taken until a new menu is seen. The terminal
+//! takes no other input: no text, no other keys, nothing while the agent is not
 //! awaiting a menu, so a guest can never type into a shell. A guest may watch
 //! the terminal, read its scrollback and, while watching, resize it for
 //! everyone viewing. Streams close with `guest_paused` when the agent leaves
@@ -479,11 +480,48 @@ fn guest_menu_key(key: &str) -> Option<&'static str> {
         .or_else(|| CHARS.into_iter().find(|ch| *ch == key))
 }
 
-/// The granted agent is waiting on a menu: an ask, a plan approval or a
-/// permission prompt.
-fn awaits_menu_input(agent: &AgentInfo) -> bool {
-    agent.agent_status == crate::api::schema::AgentStatus::Blocked || agent.input_pending
+/// A key that acts on the menu (chooses, confirms or dismisses it), after
+/// which the menu may be gone; the others only move within it.
+fn commits_menu(key: &str) -> bool {
+    !matches!(key, "up" | "down" | "left" | "right" | "tab" | "space")
 }
+
+/// A guest `pane.send_keys` batch in the form the app parses: 1 to
+/// [`SEND_KEYS_MAX`] menu keys, at most one of them committing, and that one
+/// last, so no key can land after the menu closes. `None` refuses the batch.
+fn guest_menu_batch(keys: &[String]) -> Option<Vec<&'static str>> {
+    if !(1..=SEND_KEYS_MAX).contains(&keys.len()) {
+        return None;
+    }
+    let keys = keys
+        .iter()
+        .map(|key| guest_menu_key(key))
+        .collect::<Option<Vec<_>>>()?;
+    let (_, before_last) = keys.split_last()?;
+    if before_last.iter().any(|key| commits_menu(key)) {
+        return None;
+    }
+    Some(keys)
+}
+
+/// The granted agent is waiting on a menu: an ask, a plan approval or a
+/// permission prompt. A free-text prompt is no menu.
+fn awaits_menu_input(agent: &AgentInfo) -> bool {
+    use crate::detect::InputPromptKind;
+    match agent.input_prompt_kind {
+        Some(InputPromptKind::Confirm | InputPromptKind::Select) => true,
+        Some(InputPromptKind::FreeText) => false,
+        Some(InputPromptKind::Unknown) | None => {
+            agent.agent_status == crate::api::schema::AgentStatus::Blocked
+        }
+    }
+}
+
+/// Per guest store and granted terminal, the agent's `state_change_seq` when
+/// a guest batch last committed a menu choice. Until detection has seen the
+/// agent change state since, the menu on record may already be gone, so no
+/// guest keys are accepted.
+static MENU_COMMITS: Mutex<Option<HashMap<(std::path::PathBuf, String), u64>>> = Mutex::new(None);
 
 /// The rendered scrollback and the fields the app decodes; the workspace,
 /// tab and revision stay with the owner.
@@ -954,9 +992,7 @@ pub(super) fn serve_request(
         Method::PaneSendKeys(params) => {
             // Menu keys only, and only while the agent awaits a menu: a guest
             // must never be able to type into a shell.
-            let keys: Option<Vec<&str>> =
-                params.keys.iter().map(|key| guest_menu_key(key)).collect();
-            let Some(keys) = keys.filter(|keys| (1..=SEND_KEYS_MAX).contains(&keys.len())) else {
+            let Some(keys) = guest_menu_batch(&params.keys) else {
                 return forbidden(&mut stream);
             };
             let state = grant_state(guest, api_tx);
@@ -966,15 +1002,27 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
-            if !awaits_menu_input(&agent) {
+            // Held through the write, so a concurrent guest batch sees this
+            // one's commit.
+            let mut commits = MENU_COMMITS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let commits = commits.get_or_insert_with(HashMap::new);
+            let marker = (guest.dir.clone(), guest.grant.terminal_id.clone());
+            let stale = commits
+                .get(&marker)
+                .is_some_and(|committed_at| agent.state_change_seq <= *committed_at);
+            if stale || !awaits_menu_input(&agent) {
                 return forbidden(&mut stream);
             }
+            commits.remove(&marker);
             guest.audit(
                 GuestAuditEvent::Prompt,
                 Some(method),
                 Some(keys.join(" ")),
                 None,
             );
+            let commits_choice = keys.last().is_some_and(|key| commits_menu(key));
             let request = Request {
                 id: id.clone(),
                 method: Method::PaneSendKeys(PaneSendKeysParams {
@@ -983,6 +1031,9 @@ pub(super) fn serve_request(
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            if commits_choice {
+                commits.insert(marker, agent.state_change_seq);
+            }
             write_text_line_allow_disconnect(&mut stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramUploadChunk(params) => {
@@ -2275,6 +2326,14 @@ mod tests {
         });
     }
 
+    /// Detection saw the agent change state (`state_change_seq` is now `seq`)
+    /// and a menu is up again.
+    fn new_menu_observed(harness: &Harness, seq: u64) {
+        harness.with_granted_terminal(move |terminal| {
+            terminal.last_agent_state_change_seq = Some(seq);
+        });
+    }
+
     fn send_keys(pane: &str, keys: Value) -> Value {
         json!({"id": "k", "method": "pane.send_keys", "params": {"pane_id": pane, "keys": keys}})
     }
@@ -2295,7 +2354,8 @@ mod tests {
             json!({"id": "l", "method": "agent.list", "params": {}}),
         );
         assert_eq!(listed[0]["result"]["agents"][0]["agent_status"], "blocked");
-        for target in [pane.as_str(), guest.grant.terminal_id.as_str(), "llm-opt"] {
+        let targets = [pane.as_str(), guest.grant.terminal_id.as_str(), "llm-opt"];
+        for (seq, target) in (1..).zip(targets) {
             let lines = harness.call(&guest, send_keys(target, json!(["Down", "Enter"])));
             assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
             let written = harness.pty_text(0, Duration::from_millis(300));
@@ -2304,7 +2364,12 @@ mod tests {
                 written.contains("[B") || written.contains("OB"),
                 "{written:?}"
             );
+            new_menu_observed(&harness, seq);
         }
+        // Navigation alone does not commit: the next batch needs no new menu.
+        let lines = harness.call(&guest, send_keys(&pane, json!(["Tab"])));
+        assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
+        assert_eq!(harness.pty_text(0, Duration::from_millis(300)), "\t");
         let lines = harness.call(&guest, send_keys(&pane, json!(["enter"])));
         assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
         assert_eq!(harness.pty_text(0, Duration::from_millis(300)), "\r");
@@ -2313,6 +2378,74 @@ mod tests {
         assert_eq!(audit[0].event, GuestAuditEvent::Prompt);
         assert_eq!(audit[0].method.as_deref(), Some("pane.send_keys"));
         assert_eq!(audit[0].text.as_deref(), Some("enter"));
+    }
+
+    /// A committing key may close the menu, so it must end the batch, and
+    /// nothing more is accepted until detection has seen a new menu.
+    #[test]
+    fn no_guest_key_lands_after_a_menu_choice_until_a_new_menu_is_seen() {
+        let harness = start("menu-commit");
+        let guest = harness.admit();
+        let pane = harness.pane_ids[0].clone();
+        block_granted_agent(&harness);
+
+        for keys in [
+            json!(["Escape", "Up", "Enter"]),
+            json!(["Enter", "Down"]),
+            json!(["y", "n"]),
+            json!(["1", "Enter"]),
+            json!(["Down", "Escape", "Enter"]),
+        ] {
+            let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
+            assert_eq!(code(&lines), "guest_forbidden", "{keys} -> {lines:?}");
+        }
+        assert!(
+            harness.pty_text(0, Duration::from_millis(200)).is_empty(),
+            "a refused batch writes nothing"
+        );
+
+        let lines = harness.call(&guest, send_keys(&pane, json!(["Enter"])));
+        assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
+        assert_eq!(harness.pty_text(0, Duration::from_millis(300)), "\r");
+        for keys in [json!(["Enter"]), json!(["Down"])] {
+            let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
+            assert_eq!(code(&lines), "guest_forbidden", "{keys} -> {lines:?}");
+        }
+        assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
+
+        // A new state with the menu gone still refuses.
+        harness.with_granted_terminal(|terminal| {
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Working,
+            );
+            terminal.last_agent_state_change_seq = Some(1);
+        });
+        let lines = harness.call(&guest, send_keys(&pane, json!(["Enter"])));
+        assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+
+        block_granted_agent(&harness);
+        new_menu_observed(&harness, 2);
+        let lines = harness.call(&guest, send_keys(&pane, json!(["Enter"])));
+        assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
+        assert_eq!(harness.pty_text(0, Duration::from_millis(300)), "\r");
+    }
+
+    #[test]
+    fn a_free_text_prompt_takes_no_guest_keys() {
+        let harness = start("menu-keys-free-text");
+        let guest = harness.admit();
+        let pane = harness.pane_ids[0].clone();
+        harness.with_granted_terminal(|terminal| {
+            terminal.set_input_prompt_kind(Some(crate::detect::InputPromptKind::FreeText));
+        });
+        let lines = harness.call(&guest, send_keys(&pane, json!(["y"])));
+        assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+        // Not even while the agent also shows as blocked.
+        block_granted_agent(&harness);
+        let lines = harness.call(&guest, send_keys(&pane, json!(["Enter"])));
+        assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+        assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
     }
 
     #[test]
