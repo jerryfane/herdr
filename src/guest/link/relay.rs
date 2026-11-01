@@ -66,7 +66,8 @@ pub(super) fn host_socket_url(relay_url: &str, host_id: &str) -> Result<String, 
     Ok(format!("{socket}/v1/host/{host_id}"))
 }
 
-fn tls_connector() -> Result<Connector, String> {
+/// rustls on ring with the webpki roots, for every request to the relay.
+pub(super) fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -76,7 +77,11 @@ fn tls_connector() -> Result<Connector, String> {
         .map_err(|error| format!("tls setup: {error}"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Connector::Rustls(Arc::new(config)))
+    Ok(Arc::new(config))
+}
+
+fn tls_connector() -> Result<Connector, String> {
+    tls_config().map(Connector::Rustls)
 }
 
 /// Relay-supplied text made safe for logs and `guest.list`: control
@@ -215,7 +220,7 @@ fn connect(host: &str, port: u16, dial: &Dial) -> Result<TcpStream, Ended> {
 }
 
 /// Tries each resolved address within what is left of `deadline`.
-fn connect_blocking(host: &str, port: u16, deadline: Instant) -> io::Result<TcpStream> {
+pub(super) fn connect_blocking(host: &str, port: u16, deadline: Instant) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "relay host has no address");
     for address in (host, port).to_socket_addrs()? {
         let Some(left) = deadline

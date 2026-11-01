@@ -299,6 +299,21 @@ pub(crate) struct InviteRecord {
     pub used_by: Option<String>,
     #[serde(default)]
     pub share_gram: bool,
+    /// The sealed copy published on the relay for the short link, deleted on
+    /// revoke and once the invite is redeemed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<ShortInvite>,
+}
+
+/// Where a short invite's sealed blob lives. Its key is never stored: it
+/// exists only in the link handed to the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ShortInvite {
+    /// The blob id on the relay, 12 base64url characters.
+    pub id: String,
+    /// The relay holding the blob: the owner may change `relay_url` before
+    /// the invite is redeemed or revoked.
+    pub relay: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -528,6 +543,7 @@ pub(crate) fn create_invite(
         expires_ms: now.saturating_add(ttl_secs.saturating_mul(1000)),
         used_by: None,
         share_gram,
+        short: None,
     };
     let stored = record.clone();
     update_store(dir, move |store| {
@@ -561,17 +577,17 @@ pub(crate) fn update_share_gram(
     })
 }
 
-/// The invite payload (JSON, then b64url) and its app and web links.
-pub(crate) fn invite_links(
+/// The v1 invite JSON: the long links carry it b64url-encoded and the short
+/// link's relay blob carries these exact bytes sealed.
+pub(crate) fn invite_payload(
     relay_url: &str,
     host: &HostIdentity,
     host_pub: &[u8; 32],
     invite: &NewInvite,
-) -> (String, String) {
-    let relay = relay_url.trim_end_matches('/');
-    let payload = serde_json::json!({
+) -> String {
+    serde_json::json!({
         "v": 1,
-        "relay": relay,
+        "relay": relay_url.trim_end_matches('/'),
         "host_id": host.host_id,
         "host_pub": b64url(host_pub),
         "invite_id": invite.record.invite_id,
@@ -581,12 +597,38 @@ pub(crate) fn invite_links(
         "agent_name": invite.record.grant.agent_name,
         "guest_name": invite.record.name,
         "expires_unix": invite.record.expires_ms / 1000,
-    });
-    let encoded = b64url(payload.to_string().as_bytes());
+    })
+    .to_string()
+}
+
+/// The app link and the long web link, each carrying `payload` b64url-encoded.
+pub(crate) fn invite_links(relay_url: &str, payload: &str) -> (String, String) {
+    let relay = relay_url.trim_end_matches('/');
+    let encoded = b64url(payload.as_bytes());
     (
         format!("herdrup://guest-invite#{encoded}"),
         format!("{relay}/i/{encoded}"),
     )
+}
+
+/// Record where an invite's short-link blob was published. `false` when the
+/// invite is gone or already redeemed, so the caller deletes the blob.
+pub(crate) fn set_invite_short(
+    dir: &Path,
+    invite_id: &str,
+    short: ShortInvite,
+) -> io::Result<bool> {
+    update_store(dir, |store| {
+        let Some(invite) = store
+            .invites
+            .iter_mut()
+            .find(|invite| invite.invite_id == invite_id && invite.used_by.is_none())
+        else {
+            return (false, false);
+        };
+        invite.short = Some(short);
+        (true, true)
+    })
 }
 
 /// Outcome of a Noise message-1 payload.
@@ -599,9 +641,11 @@ pub(crate) enum AdmitOutcome {
         connected: bool,
     },
     /// `replaced` lists this device's earlier guest ids, now revoked.
+    /// `short` is the redeemed invite's relay blob, now to be deleted.
     Accepted {
         guest: GuestRecord,
         replaced: Vec<String>,
+        short: Option<ShortInvite>,
     },
     Refused(&'static str),
 }
@@ -705,8 +749,16 @@ pub(crate) fn admit_in(
             former_names: Vec::new(),
         };
         store.invites[index].used_by = Some(guest_id);
+        let short = store.invites[index].short.take();
         store.guests.push(guest.clone());
-        (AdmitOutcome::Accepted { guest, replaced }, true)
+        (
+            AdmitOutcome::Accepted {
+                guest,
+                replaced,
+                short,
+            },
+            true,
+        )
     })
 }
 
@@ -769,13 +821,20 @@ pub(crate) enum RevokeTarget<'a> {
     Invite(&'a str),
 }
 
-/// Revoke a guest (kept, marked revoked) or delete an invite. Returns the
-/// revoked guest record, or `None` when the id is unknown.
+/// What a revoke removed: the revoked guest record (kept, marked revoked) or
+/// the deleted invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Revoked {
+    Guest(GuestRecord),
+    Invite(InviteRecord),
+}
+
+/// Revoke a guest or delete an invite. `None` when the id is unknown.
 pub(crate) fn revoke_in(
     dir: &Path,
     target: RevokeTarget<'_>,
     now: u64,
-) -> io::Result<Option<Option<GuestRecord>>> {
+) -> io::Result<Option<Revoked>> {
     update_store(dir, |store| match target {
         RevokeTarget::Guest(guest_id) => {
             match store
@@ -788,16 +847,20 @@ pub(crate) fn revoke_in(
                         guest.revoked = true;
                         guest.revoked_ms = Some(now);
                     }
-                    (Some(Some(guest.clone())), true)
+                    (Some(Revoked::Guest(guest.clone())), true)
                 }
                 None => (None, false),
             }
         }
         RevokeTarget::Invite(invite_id) => {
-            let before = store.invites.len();
-            store.invites.retain(|invite| invite.invite_id != invite_id);
-            let removed = store.invites.len() != before;
-            (removed.then_some(None), removed)
+            match store
+                .invites
+                .iter()
+                .position(|invite| invite.invite_id == invite_id)
+            {
+                Some(index) => (Some(Revoked::Invite(store.invites.remove(index))), true),
+                None => (None, false),
+            }
         }
     })
 }
@@ -936,7 +999,8 @@ pub(crate) mod tests {
             host_id: "h".repeat(22),
             relay_secret: String::new(),
         };
-        let (app, web) = invite_links("https://relay.test/", &host, &[9; 32], &invite);
+        let json = invite_payload("https://relay.test/", &host, &[9; 32], &invite);
+        let (app, web) = invite_links("https://relay.test/", &json);
         assert!(
             !web.contains('#'),
             "web link must not use a fragment: {web}"
@@ -949,6 +1013,43 @@ pub(crate) mod tests {
             serde_json::from_slice(&b64url_decode(payload).expect("b64url")).unwrap();
         assert_eq!(decoded["secret"], json!(invite.secret));
         assert_eq!(decoded["relay"], json!("https://relay.test"));
+        assert_eq!(b64url_decode(payload).unwrap(), json.as_bytes());
+    }
+
+    /// The short-link blob is recorded only on a pending invite, and handed
+    /// back once for deletion when the invite is redeemed or revoked.
+    #[test]
+    fn the_short_blob_is_handed_back_on_redeem_and_revoke() {
+        let dir = TempDir::new("short");
+        let short = ShortInvite {
+            id: "AAAAAAAAAAAA".into(),
+            relay: "https://relay.test".into(),
+        };
+        let redeemed = invite(&dir.0, at(1_000));
+        assert!(set_invite_short(&dir.0, &redeemed.record.invite_id, short.clone()).unwrap());
+        let AdmitOutcome::Accepted { short: handed, .. } =
+            accept(&redeemed, &[3; 32], at(2_000), &dir.0)
+        else {
+            panic!("accepts");
+        };
+        assert_eq!(handed, Some(short.clone()));
+        assert!(
+            !set_invite_short(&dir.0, &redeemed.record.invite_id, short.clone()).unwrap(),
+            "a redeemed invite takes no new blob"
+        );
+        assert!(!set_invite_short(&dir.0, "nope", short.clone()).unwrap());
+
+        let revoked = invite(&dir.0, at(1_000));
+        assert!(set_invite_short(&dir.0, &revoked.record.invite_id, short.clone()).unwrap());
+        let Some(Revoked::Invite(record)) = revoke_in(
+            &dir.0,
+            RevokeTarget::Invite(&revoked.record.invite_id),
+            at(3_000),
+        )
+        .unwrap() else {
+            panic!("the invite is deleted");
+        };
+        assert_eq!(record.short, Some(short));
     }
 
     #[test]
@@ -1000,6 +1101,7 @@ pub(crate) mod tests {
         let AdmitOutcome::Accepted {
             guest: second,
             replaced,
+            ..
         } = accept(&second_invite, &[7; 32], at(4_000), &dir.0)
         else {
             panic!("second share accepts")
@@ -1221,6 +1323,7 @@ pub(crate) mod tests {
         let AdmitOutcome::Accepted {
             guest: new,
             replaced,
+            ..
         } = accept(&second, &[5; 32], at(4_000), &dir.0)
         else {
             panic!("accepts");
@@ -1234,15 +1337,15 @@ pub(crate) mod tests {
     fn revoking_an_invite_deletes_it_and_unknown_ids_are_reported() {
         let dir = TempDir::new("revoke-invite");
         let invite = invite(&dir.0, at(1_000));
-        assert_eq!(
+        assert!(matches!(
             revoke_in(
                 &dir.0,
                 RevokeTarget::Invite(&invite.record.invite_id),
                 at(3_500)
             )
             .unwrap(),
-            Some(None)
-        );
+            Some(Revoked::Invite(record)) if record.invite_id == invite.record.invite_id
+        ));
         assert_eq!(
             accept(&invite, &[7; 32], at(2_000), &dir.0),
             AdmitOutcome::Refused("invite_invalid")

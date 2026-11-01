@@ -12,9 +12,14 @@
 //! One socket carries every session as `OPEN`/`DATA`/`CLOSE` frames
 //! ([`frame`]). Each session runs a Noise responder ([`noise`]); an admitted
 //! guest is served over a `UnixStream::pair()` by [`GuestHost::serve`].
+//!
+//! Short invite links ([`invite`]) make one-shot HTTPS requests to the same
+//! relay with the same TLS setup: the invite sealed with AES-128-GCM is stored
+//! there, and deleted on revoke or redemption.
 
 mod frame;
 pub(crate) mod host;
+pub(crate) mod invite;
 mod noise;
 mod relay;
 mod session;

@@ -25,7 +25,7 @@ use crate::api::schema::{
     AgentInfo, GuestAuditEntry, GuestAuditEvent, GuestAuditFile, GuestGrantInfo, GuestInfo,
     GuestInviteInfo, GuestLinkInfo, GuestLinkState,
 };
-use store::{AdmitOutcome, RevokeTarget};
+use store::{AdmitOutcome, RevokeTarget, Revoked, ShortInvite};
 
 pub struct GuestHostInfo {
     pub host_id: String,
@@ -252,12 +252,19 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
     };
     let (record, event) = match outcome {
         AdmitOutcome::Refused(error) => return Admission::Refused(error),
-        AdmitOutcome::Accepted { guest, replaced } => {
+        AdmitOutcome::Accepted {
+            guest,
+            replaced,
+            short,
+        } => {
             // Close the replaced grants' live sessions now, not at their next
             // request, and stop pushing to them.
             for guest_id in &replaced {
                 revoke_live(guest_id);
                 forget_guest(&dir, guest_id);
+            }
+            if let Some(short) = short {
+                delete_short_invite(&dir, short);
             }
             notify_changes();
             (guest, Some(GuestAuditEvent::Accepted))
@@ -444,13 +451,88 @@ pub(crate) fn create_invite(
     .map_err(io_error)?;
     notify_changes();
     let relay_url = crate::config::Config::load().config.guest.relay_url;
-    let (url, web_url) = store::invite_links(
-        &relay_url,
-        &host,
-        &store::x25519_public(&node_secret),
-        &invite,
-    );
+    let (url, web_url) = share_links(&dir, &relay_url, &host, &node_secret, &invite);
     Ok((invite.record.info(), url, web_url))
+}
+
+/// The app link and the web link for a new invite: the short web link when
+/// the relay stored the sealed invite, else the long one.
+fn share_links(
+    dir: &std::path::Path,
+    relay_url: &str,
+    host: &store::HostIdentity,
+    node_secret: &[u8; 32],
+    invite: &store::NewInvite,
+) -> (String, String) {
+    let payload =
+        store::invite_payload(relay_url, host, &store::x25519_public(node_secret), invite);
+    let (url, long_web_url) = store::invite_links(relay_url, &payload);
+    let web_url = publish_short_invite(dir, relay_url, host, &invite.record, &payload)
+        .unwrap_or(long_web_url);
+    (url, web_url)
+}
+
+/// Store the sealed invite on the relay for a short web link. `None`, after a
+/// warning, when the relay refuses or is unreachable: the long link always
+/// works, and an old relay has no invite store.
+fn publish_short_invite(
+    dir: &std::path::Path,
+    relay_url: &str,
+    host: &store::HostIdentity,
+    record: &store::InviteRecord,
+    payload: &str,
+) -> Option<String> {
+    let relay = relay_url.trim_end_matches('/');
+    let published = match link::invite::publish(
+        relay,
+        host,
+        record.expires_ms / 1000,
+        payload.as_bytes(),
+    ) {
+        Ok(published) => published,
+        Err(error) => {
+            tracing::warn!(error = %error, "short invite link unavailable; sharing the long link");
+            return None;
+        }
+    };
+    let short = ShortInvite {
+        id: published.id,
+        relay: relay.to_owned(),
+    };
+    match store::set_invite_short(dir, &record.invite_id, short.clone()) {
+        Ok(true) => Some(published.web_url),
+        // Revoked before its link was even handed out.
+        Ok(false) => {
+            delete_short_invite(dir, short);
+            None
+        }
+        Err(err) => {
+            tracing::warn!(err = %err, "short invite not recorded; sharing the long link");
+            delete_short_invite(dir, short);
+            None
+        }
+    }
+}
+
+/// Drop a short invite's relay blob, best effort, off the caller's thread.
+fn delete_short_invite(dir: &std::path::Path, short: ShortInvite) {
+    let host = match store::load_host(dir) {
+        Ok((host, _)) => host,
+        Err(err) => {
+            tracing::warn!(err = %err, "guest keys unavailable; short invite blob kept until it expires");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("herdr-guest-invite-delete".into())
+        .spawn(move || {
+            if let Err(error) = link::invite::delete(&short.relay, &host, &short.id) {
+                tracing::warn!(error = %error, "short invite blob deletion failed; it expires on the relay");
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(err = %err, "short invite blob deletion not started");
+    }
 }
 
 /// The grant for a live, named, local agent with a stable harness session,
@@ -523,8 +605,14 @@ pub(crate) fn revoke_at(
         return Ok(None);
     };
     notify_changes();
-    let Some(record) = revoked else {
-        return Ok(Some(0));
+    let record = match revoked {
+        Revoked::Guest(record) => record,
+        Revoked::Invite(invite) => {
+            if let Some(short) = invite.short {
+                delete_short_invite(&dir, short);
+            }
+            return Ok(Some(0));
+        }
     };
     let closed = revoke_live(&record.guest_id);
     forget_guest(&dir, &record.guest_id);
@@ -828,5 +916,105 @@ mod tests {
         let replacement = accept_in(&dir.0, &invite_in(&dir.0, true), 2);
         assert_ne!(replacement["guest_id"], second.as_str());
         assert!(device_owners(&dir.0).is_empty());
+    }
+
+    /// The links `create_invite` hands out for `invite`, with the relay at `relay_url`.
+    fn links_in(
+        dir: &std::path::Path,
+        relay_url: &str,
+        invite: &store::NewInvite,
+    ) -> (String, String) {
+        let (host, node_secret) = store::load_host(dir).unwrap();
+        share_links(dir, relay_url, &host, &node_secret, invite)
+    }
+
+    fn stored_invite(dir: &std::path::Path, invite_id: &str) -> store::InviteRecord {
+        store::load_store(dir)
+            .unwrap()
+            .invites
+            .into_iter()
+            .find(|invite| invite.invite_id == invite_id)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_short_link_opens_to_the_long_links_payload_and_is_deleted_on_redemption() {
+        let dir = store::tests::TempDir::new("short-link");
+        let relay = link::invite::tests::StubInviteRelay::start(201);
+        let invite = invite_in(&dir.0, false);
+        let (url, web_url) = links_in(&dir.0, &relay.url, &invite);
+        let put = relay.next();
+        assert_eq!(put.method, "PUT");
+
+        // The app link stays the long v1 form; the blob holds its exact bytes.
+        let payload =
+            store::b64url_decode(url.strip_prefix("herdrup://guest-invite#").unwrap()).unwrap();
+        let segment = web_url.strip_prefix(&format!("{}/i/", relay.url)).unwrap();
+        let (id, key) = segment.split_at(12);
+        let key = store::b64url_decode(key).unwrap();
+        assert_eq!(
+            link::invite::tests::open(&key, id, &put.body).as_deref(),
+            Some(&payload[..])
+        );
+        let (host, _) = store::load_host(&dir.0).unwrap();
+        assert_eq!(put.headers["x-herdr-host"], host.host_id);
+        assert_eq!(
+            put.headers["x-herdr-expires"],
+            (invite.record.expires_ms / 1000).to_string()
+        );
+        assert_eq!(
+            stored_invite(&dir.0, &invite.record.invite_id).short,
+            Some(ShortInvite {
+                id: id.to_string(),
+                relay: relay.url.clone(),
+            })
+        );
+
+        accept_in(&dir.0, &invite, 1);
+        let delete = relay.next();
+        assert_eq!(delete.method, "DELETE");
+        assert_eq!(delete.path, format!("/v1/invite/{id}"));
+        assert_eq!(
+            delete.headers["authorization"],
+            format!("Bearer {}", host.relay_secret)
+        );
+        assert_eq!(stored_invite(&dir.0, &invite.record.invite_id).short, None);
+    }
+
+    #[test]
+    fn a_relay_that_refuses_the_blob_gets_the_long_link() {
+        let dir = store::tests::TempDir::new("short-fallback");
+        for status in [404, 500] {
+            let relay = link::invite::tests::StubInviteRelay::start(status);
+            let invite = invite_in(&dir.0, false);
+            let (url, web_url) = links_in(&dir.0, &relay.url, &invite);
+            relay.next();
+            let payload = url.strip_prefix("herdrup://guest-invite#").unwrap();
+            assert_eq!(web_url, format!("{}/i/{payload}", relay.url));
+            assert_eq!(stored_invite(&dir.0, &invite.record.invite_id).short, None);
+        }
+    }
+
+    #[test]
+    fn revoking_a_short_invite_deletes_its_blob_on_the_relay_it_went_to() {
+        let dir = store::tests::TempDir::new("short-revoke");
+        let relay = link::invite::tests::StubInviteRelay::start(201);
+        let invite = invite_in(&dir.0, false);
+        let (_, web_url) = links_in(&dir.0, &format!("{}/", relay.url), &invite);
+        relay.next();
+        let id = &web_url[web_url.len() - 34..][..12];
+        assert_eq!(
+            revoke_at(
+                dir.0.clone(),
+                RevokeTarget::Invite(&invite.record.invite_id)
+            )
+            .unwrap(),
+            Some(0)
+        );
+        let delete = relay.next();
+        assert_eq!(delete.method, "DELETE");
+        assert_eq!(delete.path, format!("/v1/invite/{id}"));
+        let (host, _) = store::load_host(&dir.0).unwrap();
+        assert_eq!(delete.headers["x-herdr-host"], host.host_id);
     }
 }

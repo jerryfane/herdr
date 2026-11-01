@@ -116,14 +116,16 @@ windows-sys = { version = "0.61.2", features = [
 # keeping TLS and internet traffic out of process: while guests exist, the daemon
 # keeps one outbound WSS socket to the HerdrUp guest relay, and each guest session
 # through it is end-to-end encrypted with Noise IK (snow). TLS uses rustls on
-# ring with the webpki root set.
+# ring with the webpki root set. Short invite links seal the invite with
+# AES-128-GCM from ring (already in the tree through rustls) before storing it
+# on the same relay.
 snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 webpki-roots = "1"
+ring = "0.17"
 
 [target.'cfg(unix)'.dev-dependencies]
 # Tests sign throwaway update manifests in the minisign format: Ed25519 from ring
-# (already in the tree through rustls) over a BLAKE2b-512 prehash.
-ring = "0.17"
+# (a unix dependency above) over a BLAKE2b-512 prehash.
 blake2 = "0.10"
