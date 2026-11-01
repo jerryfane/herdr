@@ -334,7 +334,7 @@ pub(crate) mod tests {
         pub body: Vec<u8>,
     }
 
-    /// A plain-HTTP relay stub answering every request with `status`.
+    /// A plain-HTTP relay stub; each request gets the status `respond` picks.
     pub(crate) struct StubInviteRelay {
         pub url: String,
         pub received: mpsc::Receiver<Received>,
@@ -342,6 +342,10 @@ pub(crate) mod tests {
 
     impl StubInviteRelay {
         pub(crate) fn start(status: u16) -> Self {
+            Self::start_with(move || status)
+        }
+
+        pub(crate) fn start_with(respond: impl Fn() -> u16 + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let (sender, received) = mpsc::channel();
@@ -354,7 +358,8 @@ pub(crate) mod tests {
                     let mut stream = stream;
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 {status} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        respond()
                     );
                     if sender.send(request).is_err() {
                         return;

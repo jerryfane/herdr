@@ -17,7 +17,8 @@ pub(crate) mod store;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -302,11 +303,40 @@ pub struct LinkStatus {
 }
 
 static LINK_STATUS: Mutex<Option<LinkStatus>> = Mutex::new(None);
+/// Signalled on every [`LINK_STATUS`] change.
+static LINK_CHANGED: Condvar = Condvar::new();
+/// How long a new invite waits for the relay link before storing its short
+/// link: the relay accepts invites only from a host that has connected.
+const SHORT_INVITE_LINK_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) fn set_link_status(status: LinkStatus) {
     *LINK_STATUS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
+    LINK_CHANGED.notify_all();
+}
+
+/// Whether the relay link is up, waiting up to `timeout` for it to come up.
+fn wait_link_up(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut status = LINK_STATUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if status.as_ref().is_some_and(|status| status.state == "up") {
+            return true;
+        }
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            return false;
+        };
+        status = LINK_CHANGED
+            .wait_timeout(status, left)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
 }
 
 fn link_info() -> GuestLinkInfo {
@@ -451,22 +481,36 @@ pub(crate) fn create_invite(
     .map_err(io_error)?;
     notify_changes();
     let relay_url = crate::config::Config::load().config.guest.relay_url;
-    let (url, web_url) = share_links(&dir, &relay_url, &host, &node_secret, &invite);
+    let (url, web_url) = share_links(
+        &dir,
+        &relay_url,
+        &host,
+        &node_secret,
+        &invite,
+        SHORT_INVITE_LINK_WAIT,
+    );
     Ok((invite.record.info(), url, web_url))
 }
 
 /// The app link and the web link for a new invite: the short web link when
-/// the relay stored the sealed invite, else the long one.
+/// the relay stored the sealed invite, else the long one. The relay stores
+/// invites only for a host that has connected, and the link may have started
+/// dialling just now for this invite, so the request waits up to `link_wait`
+/// for the link to come up.
 fn share_links(
     dir: &std::path::Path,
     relay_url: &str,
     host: &store::HostIdentity,
     node_secret: &[u8; 32],
     invite: &store::NewInvite,
+    link_wait: Duration,
 ) -> (String, String) {
     let payload =
         store::invite_payload(relay_url, host, &store::x25519_public(node_secret), invite);
     let (url, long_web_url) = store::invite_links(relay_url, &payload);
+    if !wait_link_up(link_wait) {
+        tracing::warn!("guest relay link is not up; trying the short invite link anyway");
+    }
     let web_url = publish_short_invite(dir, relay_url, host, &invite.record, &payload)
         .unwrap_or(long_web_url);
     (url, web_url)
@@ -918,14 +962,83 @@ mod tests {
         assert!(device_owners(&dir.0).is_empty());
     }
 
-    /// The links `create_invite` hands out for `invite`, with the relay at `relay_url`.
+    /// The links `create_invite` hands out for `invite`, with the relay at
+    /// `relay_url`, not waiting for the relay link.
     fn links_in(
         dir: &std::path::Path,
         relay_url: &str,
         invite: &store::NewInvite,
     ) -> (String, String) {
+        links_waiting(dir, relay_url, invite, Duration::ZERO)
+    }
+
+    fn links_waiting(
+        dir: &std::path::Path,
+        relay_url: &str,
+        invite: &store::NewInvite,
+        link_wait: Duration,
+    ) -> (String, String) {
         let (host, node_secret) = store::load_host(dir).unwrap();
-        share_links(dir, relay_url, &host, &node_secret, invite)
+        share_links(dir, relay_url, &host, &node_secret, invite, link_wait)
+    }
+
+    fn link_status(state: &'static str) {
+        set_link_status(LinkStatus {
+            state,
+            last_error: None,
+        });
+    }
+
+    /// The relay stores invites only for a host whose link has connected: a
+    /// new invite waits for a connecting link, and past the bound still tries
+    /// once and shares the long link.
+    #[test]
+    fn a_new_invite_waits_for_the_relay_link_before_storing_its_short_link() {
+        let dir = store::tests::TempDir::new("short-link-wait");
+        let relay = link::invite::tests::StubInviteRelay::start_with(|| {
+            let up = LINK_STATUS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_some_and(|status| status.state == "up");
+            if up {
+                201
+            } else {
+                401
+            }
+        });
+
+        link_status("connecting");
+        let invite = invite_in(&dir.0, false);
+        let comes_up = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            link_status("up");
+        });
+        let (_, web_url) = links_waiting(&dir.0, &relay.url, &invite, Duration::from_secs(5));
+        comes_up.join().unwrap();
+        assert_eq!(relay.next().method, "PUT");
+        assert_eq!(
+            web_url.len(),
+            relay.url.len() + "/i/".len() + 34,
+            "{web_url}"
+        );
+
+        link_status("connecting");
+        let invite = invite_in(&dir.0, false);
+        let started = Instant::now();
+        let (url, web_url) = links_waiting(&dir.0, &relay.url, &invite, Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(relay.next().method, "PUT", "one attempt past the bound");
+        let payload = url.strip_prefix("herdrup://guest-invite#").unwrap();
+        assert_eq!(web_url, format!("{}/i/{payload}", relay.url));
+        assert!(
+            relay
+                .received
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "no retry"
+        );
+        link_status("off");
     }
 
     fn stored_invite(dir: &std::path::Path, invite_id: &str) -> store::InviteRecord {
