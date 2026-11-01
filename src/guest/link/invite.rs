@@ -52,10 +52,19 @@ fn is_b64url(text: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// `nonce || ciphertext || tag`, with the blob id as associated data so a
-/// blob cannot be served under another id.
+/// `nonce || ciphertext || tag` under a fresh random nonce, with the blob id
+/// as associated data so a blob cannot be served under another id.
 fn seal(key: &[u8; KEY_BYTES], id: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let nonce = random_bytes::<NONCE_LEN>().map_err(|error| format!("randomness: {error}"))?;
+    seal_with_nonce(key, id, nonce, plaintext)
+}
+
+fn seal_with_nonce(
+    key: &[u8; KEY_BYTES],
+    id: &str,
+    nonce: [u8; NONCE_LEN],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
     let key = LessSafeKey::new(
         UnboundKey::new(&AES_128_GCM, key).map_err(|_| "invite key rejected".to_string())?,
     );
@@ -434,6 +443,41 @@ pub(crate) mod tests {
         // Fresh nonces: the same plaintext never seals to the same blob.
         assert_ne!(seal(&key, "AAAAAAAAAAAA", b"{\"v\":1}").unwrap(), blob);
         assert!(seal(&key, "AAAAAAAAAAAA", &[0; MAX_BLOB]).is_err());
+    }
+
+    /// Known-answer vector shared with the relay page and the iOS app
+    /// (produced independently with Python `cryptography`; synthetic ids).
+    #[test]
+    fn the_shared_known_answer_vector_seals_opens_and_links_identically() {
+        use base64::Engine as _;
+        const ID: &str = "AQIDBAUGBwgJ";
+        const KEY: &str = "EBESExQVFhcYGRobHB0eHw";
+        const LINK: &str =
+            "https://guest.herdrup.themartian.app/i/AQIDBAUGBwgJEBESExQVFhcYGRobHB0eHw";
+        const NONCE_HEX: &str = "303132333435363738393a3b";
+        const BLOB_B64: &str = "MDEyMzQ1Njc4OTo76HmMcTjDzE3OdSaDaK9beuTqzPLVVEUBKIa8OWJbqs8XDxQL0uQJSTWFeZvgkikIe1wxOA3sk7Hb4x6wjfHjOvVi3zfizc3/SM6+90bB9XIi6BXSmuiq8Z6OGZXR7UrLkh6Inxwh/qbAALuB4Rutr24iIC1sU1lG5r7/RWTqMxLRqqDKR32zUCL9iDYu8gaErdUgZeTfpeik9cwTC2mS9pAAakSI/hIczZymbpBb/IrgIv1W3sHDAfC08BLtejXbbxeRGf9jCWTISaVmJu0US2YeF36Re83O9PTtHSl952NNjZtz9hsOMylQomFWeNSDDtRe9oRVNidH/AW4KZnvLpFPC8I0/kZw6IIj18rkR0tEUuZ6ftnsFbrAvQs7hsQn4o6LtYtbJsZ6qhrglLQsb2yiyz5ilcqpXIOl+XaAEjfijL7c8KyX2hbUvWFDH6GS2VWqnlXnKt0SW0rQEaZ4ZBTtBAhU9uehul9N9CJXoQq1";
+        const PLAINTEXT: &str = r#"{"agent_name":"demo","expires_unix":4102444800,"guest_name":"guest","host_id":"QUFBQUFBQUFBQUFBQUFBQQ","host_pub":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI","invite_id":"Q0NDQ0NDQ0NDQ0NDQ0NDQw","machine_label":"test-box","owner_name":"Owner","relay":"https://guest.herdrup.themartian.app","secret":"REREREREREREREREREREREREREREREREREREREREREQ","v":1}"#;
+
+        let key: [u8; KEY_BYTES] = b64url_decode(KEY).unwrap().try_into().unwrap();
+        let nonce: [u8; NONCE_LEN] = (0..NONCE_LEN)
+            .map(|i| u8::from_str_radix(&NONCE_HEX[2 * i..2 * i + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(BLOB_B64)
+            .unwrap();
+
+        assert_eq!(open(&key, ID, &blob).as_deref(), Some(PLAINTEXT.as_bytes()));
+        assert_eq!(
+            seal_with_nonce(&key, ID, nonce, PLAINTEXT.as_bytes()).unwrap(),
+            blob
+        );
+        assert_eq!(
+            short_web_url("https://guest.herdrup.themartian.app", ID, KEY),
+            LINK
+        );
+        assert!(valid_id(ID));
     }
 
     #[test]
