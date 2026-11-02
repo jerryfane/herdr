@@ -53,8 +53,7 @@ const EXPECTED_RELEASE_ROOT: &str = "https://github.com/jerryfane/herdr/releases
 /// The one path that always lands a HerdrUp build (the installer the README
 /// documents). Every refusal to update names it, so a user who hits one knows
 /// what to run instead of reaching for upstream's installer.
-pub(crate) const FORK_INSTALL_COMMAND: &str =
-    "curl -fsSL https://herdrup.themartian.app/install.sh | sh";
+pub(crate) const FORK_INSTALL_COMMAND: &str = "curl -fsSL https://herdrup.app/install.sh | sh";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
@@ -1727,7 +1726,7 @@ pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static
 pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> Option<&'static str>
 {
     if is_package_manager_managed_install() {
-        Some("A package-manager upgrade may install upstream Herdr, not this fork; install HerdrUp directly with `curl -fsSL https://herdrup.themartian.app/install.sh | sh`.")
+        Some("A package-manager upgrade may install upstream Herdr, not this fork; install HerdrUp directly with `curl -fsSL https://herdrup.app/install.sh | sh`.")
     } else {
         None
     }
@@ -1738,7 +1737,7 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
         || is_mise_managed_exe_path_following_links(path)
         || is_nix_store_exe_path_following_links(path)
     {
-        Some("Preview updates require a direct HerdrUp install; a package-manager upgrade may install upstream Herdr. Use `curl -fsSL https://herdrup.themartian.app/install.sh | sh` instead")
+        Some("Preview updates require a direct HerdrUp install; a package-manager upgrade may install upstream Herdr. Use `curl -fsSL https://herdrup.app/install.sh | sh` instead")
     } else {
         None
     }

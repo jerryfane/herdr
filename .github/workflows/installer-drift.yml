@@ -1,6 +1,6 @@
 # Does the PUBLISHED installer still match this repository?
 #
-# `https://herdrup.themartian.app/install.sh` is what the README and the app's
+# `https://herdrup.app/install.sh` is what the README and the app's
 # first-run card tell people to pipe into `sh`. It is served by a Cloudflare
 # Worker that fetches `install.sh` from master at request time, so the two should
 # be byte-identical.
@@ -49,7 +49,7 @@ jobs:
 
       - name: Compare the served installer against this commit
         env:
-          INSTALLER_URL: https://herdrup.themartian.app/install.sh
+          INSTALLER_URL: https://herdrup.app/install.sh
         run: |
           set -euo pipefail
 

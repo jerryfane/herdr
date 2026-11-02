@@ -57,10 +57,10 @@ run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches
 
 ## the Herdrup fork
 
-This fork adds the daemon features the [Herdrup](https://herdrup.themartian.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. The Herdrup installer downloads the matching prebuilt fork binary and verifies its checksum, so normal users do not need Rust, Cargo, or Zig.
+This fork adds the daemon features the [Herdrup](https://herdrup.app) iOS app uses: **Gram** (owner and agent messaging), **push notifications**, and the **live streaming terminal**. The upstream install above is the base daemon, without those. The Herdrup installer downloads the matching prebuilt fork binary and verifies its checksum, so normal users do not need Rust, Cargo, or Zig.
 
 ```bash
-curl -fsSL https://herdrup.themartian.app/install.sh | sh
+curl -fsSL https://herdrup.app/install.sh | sh
 ```
 
 Then run herdr where your agents live:

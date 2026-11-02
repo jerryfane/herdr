@@ -15,7 +15,7 @@ pub(crate) struct HostInfo {
     pub(crate) relay_secret: String,
     /// X25519 static secret the Noise responder proves.
     pub(crate) node_secret: [u8; 32],
-    /// Base relay URL, for example `https://guest.herdrup.themartian.app`.
+    /// Base relay URL, for example `https://guest.herdrup.app`.
     pub(crate) relay_url: String,
 }
 
