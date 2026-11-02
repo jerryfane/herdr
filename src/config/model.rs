@@ -1318,7 +1318,7 @@ pub struct PushConfig {
     pub sandbox: bool,
 }
 
-pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.themartian.app";
+pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.app";
 
 /// `[guest]`: guest access through the HerdrUp guest relay (unix only).
 #[derive(Debug, Clone, Deserialize)]
@@ -1330,7 +1330,7 @@ pub struct GuestConfig {
     pub relay_url: String,
 }
 
-pub const DEFAULT_GUEST_RELAY_URL: &str = "https://guest.herdrup.themartian.app";
+pub const DEFAULT_GUEST_RELAY_URL: &str = "https://guest.herdrup.app";
 
 impl Default for GuestConfig {
     fn default() -> Self {
