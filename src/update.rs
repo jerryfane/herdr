@@ -53,8 +53,7 @@ const EXPECTED_RELEASE_ROOT: &str = "https://github.com/jerryfane/herdr/releases
 /// The one path that always lands a HerdrUp build (the installer the README
 /// documents). Every refusal to update names it, so a user who hits one knows
 /// what to run instead of reaching for upstream's installer.
-pub(crate) const FORK_INSTALL_COMMAND: &str =
-    "curl -fsSL https://herdrup.app/install.sh | sh";
+pub(crate) const FORK_INSTALL_COMMAND: &str = "curl -fsSL https://herdrup.app/install.sh | sh";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";

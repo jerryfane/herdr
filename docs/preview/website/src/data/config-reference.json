@@ -1535,7 +1535,7 @@
         {
           "key": "guest.relay_url",
           "type": "string",
-          "default": "\"https://guest.herdrup.app\"",
+          "default": "\"https://guest.herdrup.themartian.app\"",
           "description": "Base URL of the HerdrUp guest relay. Invites created with `herdr guest invite` carry it, and the daemon keeps a relay connection open only while at least one active guest or unexpired invite exists. The relay pipes end-to-end encrypted (Noise IK) traffic and cannot read it. Unix only."
         }
       ]
@@ -1627,7 +1627,7 @@
         {
           "key": "push.relay_url",
           "type": "string",
-          "default": "\"https://push.herdrup.app\"",
+          "default": "\"https://push.herdrup.themartian.app\"",
           "description": "Base URL of the HerdrUp push relay used by relay mode, and by auto mode when no APNs key is configured."
         },
         {
