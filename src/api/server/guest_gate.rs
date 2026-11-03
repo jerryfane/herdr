@@ -2166,10 +2166,7 @@ mod tests {
             if let Some(first) = read_reply(&mut reader) {
                 lines.push(first);
             }
-            reader
-                .get_ref()
-                .shutdown(std::net::Shutdown::Write)
-                .unwrap();
+            hang_up_after_reply(reader.get_ref());
             lines.extend(
                 reader
                     .lines()
@@ -2316,6 +2313,18 @@ mod tests {
         "agent_status",
         "guest_running",
     ];
+
+    /// Closes the client's write side after a reply. The server may already
+    /// have ended the connection (a refusal, a stream, a one-shot reply); macOS
+    /// then answers `shutdown` with ENOTCONN, which means the same thing here.
+    fn hang_up_after_reply(client: &UnixStream) {
+        match client.shutdown(std::net::Shutdown::Write) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotConnected => {
+                panic!("shutdown: {err}")
+            }
+            _ => {}
+        }
+    }
 
     /// The next reply line, or `None` once the server closed.
     fn read_reply(reader: &mut BufReader<UnixStream>) -> Option<Value> {
@@ -2966,7 +2975,8 @@ mod tests {
         (reader, handle)
     }
 
-    /// The guest hangs up; the server ends the session.
+    /// The guest hangs up; the server ends the session. The session is still
+    /// open here, so a failed shutdown is a real failure.
     fn hang_up(mut reader: BufReader<UnixStream>, handle: JoinHandle<()>) {
         reader
             .get_ref()
