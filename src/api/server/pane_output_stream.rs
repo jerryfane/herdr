@@ -140,13 +140,13 @@ fn encode_bytes(bytes: &[u8]) -> String {
 }
 
 pub(super) fn serve(
-    stream: ApiStream,
+    mut stream: ApiStream,
     request_id: String,
     params: PaneStreamParams,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    serve_watched(stream, request_id, params, api_tx, running, None)
+    serve_watched(&mut stream, request_id, params, api_tx, running, None)
 }
 
 /// Called before every frame, on idle ticks, and with `closed = true` when the
@@ -158,8 +158,9 @@ pub(super) type StreamWatch<'a> = &'a mut dyn FnMut(bool) -> Option<String>;
 const WATCH_POLL: Duration = Duration::from_millis(250);
 
 /// `pane.stream` with an optional watch (the guest gate's pause/revoke check).
+/// The stream is spent when this returns: the caller closes it.
 pub(super) fn serve_watched(
-    mut stream: ApiStream,
+    stream: &mut ApiStream,
     request_id: String,
     params: PaneStreamParams,
     api_tx: &ApiRequestSender,
@@ -194,7 +195,7 @@ pub(super) fn serve_watched(
     // the close is a harmless no-op.
     let result = if api_response_outcome(&open_response) == "ok" {
         serve_attached(
-            &mut stream,
+            stream,
             &request_id,
             &pane_id,
             max_frame_bytes,
@@ -203,7 +204,7 @@ pub(super) fn serve_watched(
             watch,
         )
     } else {
-        write_text_line_allow_disconnect(&mut stream, &open_response)
+        write_text_line_allow_disconnect(stream, &open_response)
     };
     dispatch_close(&pane_id, viewer_id, api_tx);
     result

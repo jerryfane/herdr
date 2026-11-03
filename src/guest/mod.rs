@@ -285,13 +285,15 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
         "machine_label": record.machine_label,
         "owner_name": record.owner_name,
         "agent": {"name": record.grant.agent_name, "target": record.grant.terminal_id},
-        "features": {"gram": record.share_gram, "push": true},
+        // `multi_request`: the connection serves further requests after a
+        // reply (see `serve_session` in the API's guest gate).
+        "features": {"gram": record.share_gram, "push": true, "multi_request": true},
     });
     Admission::Admitted { principal, reply }
 }
 
-/// Run one API connection as `principal`. Blocks until the request is
-/// answered or the stream ends, then closes the stream.
+/// Run one API connection as `principal`. Blocks until the connection's
+/// session ends (see `features.multi_request`), then closes the stream.
 pub(crate) fn serve(principal: GuestPrincipal, stream: std::os::unix::net::UnixStream) {
     crate::api::serve_guest_stream(principal, stream);
 }
@@ -939,10 +941,16 @@ mod tests {
     fn hello_features_follow_share_gram_from_the_invite_and_updates() {
         let dir = store::tests::TempDir::new("features");
         let shared = accept_in(&dir.0, &invite_in(&dir.0, true), 1);
-        assert_eq!(shared["features"], json!({"gram": true, "push": true}));
+        assert_eq!(
+            shared["features"],
+            json!({"gram": true, "push": true, "multi_request": true})
+        );
 
         let reply = accept_in(&dir.0, &invite_in(&dir.0, false), 2);
-        assert_eq!(reply["features"], json!({"gram": false, "push": true}));
+        assert_eq!(
+            reply["features"],
+            json!({"gram": false, "push": true, "multi_request": true})
+        );
         let guest_id = reply["guest_id"].as_str().unwrap();
         let returning = || match admit_in(dir.0.clone(), [2; 32], &json!({"v": 1})) {
             Admission::Admitted { reply, .. } => reply,
@@ -951,7 +959,10 @@ mod tests {
 
         let updated = update_at(&dir.0, guest_id, true).unwrap().unwrap();
         assert!(updated.share_gram);
-        assert_eq!(returning()["features"], json!({"gram": true, "push": true}));
+        assert_eq!(
+            returning()["features"],
+            json!({"gram": true, "push": true, "multi_request": true})
+        );
 
         update_at(&dir.0, guest_id, false).unwrap().unwrap();
         assert_eq!(returning()["features"]["gram"], false);

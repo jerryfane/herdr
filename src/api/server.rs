@@ -1500,6 +1500,33 @@ fn handle_connection_with_stop(
     )
 }
 
+/// One request line as a typed request, or the `invalid_request` error that
+/// answers it.
+fn parse_request_line(line: &str) -> Result<Request, ErrorResponse> {
+    serde_json::from_str::<Request>(line).map_err(|request_error| {
+        // Recover correlation without relaxing typed request validation or accepting
+        // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
+        #[derive(serde::Deserialize)]
+        struct RequestId {
+            id: String,
+        }
+        let id = if line.starts_with('{') {
+            serde_json::from_str::<RequestId>(line)
+                .map(|request| request.id)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        retired_pane_graphics_method_error(line, &id).unwrap_or_else(|| ErrorResponse {
+            id,
+            error: ErrorBody {
+                code: "invalid_request".into(),
+                message: format!("invalid request: {request_error}"),
+            },
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_principal_connection(
     mut stream: ApiStream,
@@ -1525,30 +1552,9 @@ fn handle_principal_connection(
         return Ok(());
     }
 
-    let mut request = match serde_json::from_str::<Request>(line) {
+    let mut request = match parse_request_line(line) {
         Ok(request) => request,
-        Err(request_error) => {
-            // Recover correlation without relaxing typed request validation or accepting
-            // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
-            #[derive(serde::Deserialize)]
-            struct RequestId {
-                id: String,
-            }
-            let id = if line.starts_with('{') {
-                serde_json::from_str::<RequestId>(line)
-                    .map(|request| request.id)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let response =
-                retired_pane_graphics_method_error(line, &id).unwrap_or_else(|| ErrorResponse {
-                    id,
-                    error: ErrorBody {
-                        code: "invalid_request".into(),
-                        message: format!("invalid request: {request_error}"),
-                    },
-                });
+        Err(response) => {
             write_json_line_allow_disconnect(&mut stream, &response)?;
             return Ok(());
         }
@@ -1562,7 +1568,7 @@ fn handle_principal_connection(
     // an explicit allowlist bound to one agent.
     #[cfg(unix)]
     if let ConnectionPrincipal::Guest(guest) = &principal {
-        return guest_gate::serve_request(stream, request, guest, api_tx, event_hub, running);
+        return guest_gate::serve_session(stream, request, guest, api_tx, event_hub, running);
     }
     let federation = match &principal {
         ConnectionPrincipal::Federation(peer) => Some(peer),

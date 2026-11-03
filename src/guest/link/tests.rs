@@ -267,6 +267,11 @@ impl HostSocket {
         }
     }
 
+    /// The guest left: the relay CLOSEs `session` to the host.
+    pub(crate) fn close_session(&mut self, session: u32) {
+        self.send(frame::close(session, ""));
+    }
+
     /// Expects the link to close `session`, returning the reason.
     pub(crate) fn closed(&mut self, session: u32) -> String {
         match self.frame() {
