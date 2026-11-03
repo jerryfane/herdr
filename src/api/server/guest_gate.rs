@@ -13,14 +13,16 @@
 //! register a phone for the agent's push notifications (see
 //! `crate::guest::push`).
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
     answer_agent, dispatch_to_app_with_timeout, error_response_json, finish_wait_response,
-    handle_request, pane_output_stream, prompt_agent, write_text_line_allow_disconnect,
+    handle_request, pane_output_stream, parse_request_line, prompt_agent,
+    read_initial_request_line, write_json_line_allow_disconnect, write_text_line_allow_disconnect,
     ApiRequestSender, ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
@@ -31,7 +33,7 @@ use crate::api::schema::{
     PaneSendKeysParams, PaneSetPtySizeParams, ReadIntent, ReadSource, Request, ResponseResult,
     SuccessResponse, TranscriptEntry,
 };
-use crate::api::transport::ApiStream;
+use crate::api::transport::{ApiStream, ApiStreamRead};
 use crate::guest::GuestPrincipal;
 use crate::persist::gram::GramItem;
 
@@ -42,6 +44,10 @@ const SEND_KEYS_MAX: usize = 32;
 /// How often a guest stream re-checks revocation and the live-agent check.
 pub(super) const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a guest connection waits for its next request after answering
+/// one. The relay caps a guest's connects per minute, so the app keeps one
+/// connection for its polling and calls instead of reconnecting per request.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most scrollback lines one guest `agent.read` returns.
 const READ_MAX_LINES: u32 = 1000;
 /// A guest's reads and resizes are audited at most once per interval: the app
@@ -700,28 +706,162 @@ fn project_gram_sent(result: ResponseResult) -> Option<serde_json::Value> {
     Some(serde_json::json!({"type": "gram_sent", "message": view}))
 }
 
-pub(super) fn serve_request(
+/// Serves a guest connection's requests in turn, starting with `request`
+/// (advertised to guests as `features.multi_request`). Each request passes
+/// the full gate: revocation, the allowlist, the grant and its audit. The
+/// grant and its rename history are read from the store again for every
+/// request, as a new connection's admission reads them, so a session follows
+/// an owner rename; the authenticated guest and its device stay the admitted
+/// ones. The
+/// guest sends its next request only after the previous reply; bytes that
+/// arrive while a request waits on the agent read as the guest leaving, as
+/// they always have. A `guest_forbidden` reply leaves the session open. It
+/// ends when a request takes the connection over (`pane.stream`) or answers
+/// `guest_paused` or `guest_revoked`, on a line that is not a request, when
+/// the guest is revoked while idle, or after [`SESSION_IDLE_TIMEOUT`] without
+/// a request.
+pub(super) fn serve_session(
     mut stream: ApiStream,
-    request: Request,
+    mut request: Request,
     guest: &GuestPrincipal,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    let live = crate::guest::register_live(&guest.guest_id);
+    loop {
+        // Revoked or removed in the store: the same refusal `serve_request`
+        // gives, before anything reads the stale grant.
+        let Some(current) = guest.current() else {
+            return write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_error(&request.id, "guest_revoked"),
+            );
+        };
+        let ends = Cell::new(false);
+        serve_request(
+            &mut stream,
+            request,
+            &current,
+            &live,
+            api_tx,
+            event_hub,
+            running,
+            &ends,
+        )?;
+        if ends.get() {
+            return Ok(());
+        }
+        let Some(next) = next_request(&mut stream, &live, running, SESSION_IDLE_TIMEOUT)? else {
+            return Ok(());
+        };
+        request = next;
+    }
+}
+
+/// The guest's next request, or `None` when the session ends first. An
+/// unparseable line is answered with `invalid_request` and ends it.
+fn next_request(
+    stream: &mut ApiStream,
+    live: &crate::guest::LiveSession,
+    running: &AtomicBool,
+    idle: Duration,
+) -> std::io::Result<Option<Request>> {
+    if !await_request(stream, live, running, idle)? {
+        return Ok(None);
+    }
+    let Some(line) = read_initial_request_line(stream)? else {
+        return Ok(None);
+    };
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    match parse_request_line(line) {
+        Ok(request) => Ok(Some(request)),
+        Err(response) => {
+            write_json_line_allow_disconnect(stream, &response)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Waits until request bytes arrive (true), or the guest closes, is revoked,
+/// the server stops, or `idle` passes (false). Nothing is consumed.
+fn await_request(
+    stream: &mut ApiStream,
+    live: &crate::guest::LiveSession,
+    running: &AtomicBool,
+    idle: Duration,
+) -> std::io::Result<bool> {
+    stream.set_polling(true)?;
+    let result = poll_for_request(stream, live, running, idle);
+    stream.set_polling(false)?;
+    result
+}
+
+fn poll_for_request(
+    stream: &mut ApiStream,
+    live: &crate::guest::LiveSession,
+    running: &AtomicBool,
+    idle: Duration,
+) -> std::io::Result<bool> {
+    let deadline = Instant::now() + idle;
+    let mut probe = [0u8; 1];
+    loop {
+        match stream.poll_peek(&mut probe)? {
+            // No peek on this transport: let the line reader find out.
+            Some(ApiStreamRead::Data(_)) | None => return Ok(true),
+            Some(ApiStreamRead::Closed) => return Ok(false),
+            Some(ApiStreamRead::Pending) => {}
+        }
+        if live.revoked() || !running.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let wait = (deadline - now).min(WATCH_INTERVAL);
+        if !stream.wait_readable(wait)? {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
+/// Answers one guest request. Sets `ends` when the session must not read
+/// another request after it: the request took the connection over
+/// (`pane.stream`), or was refused as paused or revoked. A forbidden request
+/// is refused on its own; the session goes on.
+#[allow(clippy::too_many_arguments)]
+fn serve_request(
+    stream: &mut ApiStream,
+    request: Request,
+    guest: &GuestPrincipal,
+    live: &crate::guest::LiveSession,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    ends: &Cell<bool>,
+) -> std::io::Result<()> {
     let id = request.id.clone();
     let method = crate::api::api_method_name(&request.method);
-    let live = crate::guest::register_live(&guest.guest_id);
-    if is_revoked(guest, &live) {
-        return write_text_line_allow_disconnect(&mut stream, &guest_error(&id, "guest_revoked"));
-    }
     let forbidden = |stream: &mut ApiStream| {
         guest.audit(GuestAuditEvent::Denied, Some(method), None, None);
         write_text_line_allow_disconnect(stream, &guest_error(&id, "guest_forbidden"))
     };
     let paused = |stream: &mut ApiStream| {
+        ends.set(true);
         guest.audit(GuestAuditEvent::Paused, Some(method), None, None);
         write_text_line_allow_disconnect(stream, &guest_error(&id, "guest_paused"))
     };
+    let revoked = |stream: &mut ApiStream| {
+        ends.set(true);
+        write_text_line_allow_disconnect(stream, &guest_error(&id, "guest_revoked"))
+    };
+    if is_revoked(guest, live) {
+        return revoked(stream);
+    }
     match request.method {
         Method::Ping(params) => {
             let response = handle_request(
@@ -735,35 +875,32 @@ pub(super) fn serve_request(
                 None,
                 None,
             );
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_pong),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_pong))
         }
         Method::AgentList(_) => {
             let state = grant_state(guest, api_tx);
             let agents: Vec<_> = state_view(guest, &state).into_iter().collect();
             let result = serde_json::json!({"type": "agent_list", "agents": agents});
-            write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
+            write_text_line_allow_disconnect(stream, &success_value(&id, result))
         }
         Method::AgentGet(target) => {
             let state = grant_state(guest, api_tx);
             if !names_grant(&target.target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let Some(agent) = state_view(guest, &state) else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             let result = serde_json::json!({"type": "agent_info", "agent": agent});
-            write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
+            write_text_line_allow_disconnect(stream, &success_value(&id, result))
         }
         Method::AgentAvatarGet(params) => {
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             if state.pane_id().is_none() {
-                return paused(&mut stream);
+                return paused(stream);
             }
             // Only the granted terminal's current image: the app refuses any
             // hash that terminal does not carry.
@@ -776,7 +913,7 @@ pub(super) fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             write_text_line_allow_disconnect(
-                &mut stream,
+                stream,
                 &guest_reply(&id, &response, project_avatar_image),
             )
         }
@@ -785,10 +922,10 @@ pub(super) fn serve_request(
             if !names_grant(&params.target, guest, state.pane_id())
                 || !matches!(params.source, ReadSource::Recent | ReadSource::Visible)
             {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // A passive pane read of the grant: the snapshot only, never the
             // idle alternate-screen capture that scrolls the agent's TUI.
@@ -804,18 +941,15 @@ pub(super) fn serve_request(
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_read),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_read))
         }
         Method::PaneHistory(params) => {
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.pane_id, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // Read-only scrollback of the grant, like `agent.read`: the cursor
             // only resolves against the granted pane it was issued for.
@@ -827,10 +961,7 @@ pub(super) fn serve_request(
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_history),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_history))
         }
         Method::AgentTranscript(params) => {
             let state = grant_state(guest, api_tx);
@@ -838,10 +969,10 @@ pub(super) fn serve_request(
             // would have to strip every part of it), so asking for one is
             // refused like any target outside the grant.
             if params.subagent.is_some() || !names_grant(&params.target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // The granted agent's own session file; cursors only resolve
             // against the file they were issued for.
@@ -854,7 +985,7 @@ pub(super) fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             write_text_line_allow_disconnect(
-                &mut stream,
+                stream,
                 &guest_reply(&id, &response, project_transcript),
             )
         }
@@ -862,10 +993,10 @@ pub(super) fn serve_request(
             let state = grant_state(guest, api_tx);
             let target = params.pane_id.as_deref().unwrap_or_default();
             if !names_grant(target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // Only while one of the guest's streams watches the grant: the lease
             // then ends with the guest's last stream, and a revoke closes those.
@@ -888,25 +1019,21 @@ pub(super) fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             // Revoked while the resize was in flight: take its lease back now.
-            if is_revoked(guest, &live) {
+            if is_revoked(guest, live) {
                 release_lease(api_tx, &guest.guest_id);
-                return write_text_line_allow_disconnect(
-                    &mut stream,
-                    &guest_error(&id, "guest_revoked"),
-                );
+                return revoked(stream);
             }
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_pty_size),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_pty_size))
         }
         Method::PaneStream(mut params) => {
+            // The stream takes the connection over until it ends.
+            ends.set(true);
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.pane_id, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // The guest's own viewer, so this stream closing (paused, revoked or
             // gone) drops the width lease its `pane.set_pty_size` took.
@@ -920,7 +1047,7 @@ pub(super) fn serve_request(
                 if store_due {
                     last_store_check = Instant::now();
                 }
-                if live.revoked() || (store_due && is_revoked(guest, &live)) {
+                if live.revoked() || (store_due && is_revoked(guest, live)) {
                     return Some(guest_error(&id, "guest_revoked"));
                 }
                 if closed || !grant_state(guest, api_tx).is_live() {
@@ -941,7 +1068,7 @@ pub(super) fn serve_request(
         Method::AgentPrompt(mut params) => {
             if params.text.len() > PROMPT_MAX_BYTES {
                 return write_text_line_allow_disconnect(
-                    &mut stream,
+                    stream,
                     &error_response_json(
                         id,
                         "invalid_params",
@@ -951,10 +1078,10 @@ pub(super) fn serve_request(
             }
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             guest.audit(
                 GuestAuditEvent::Prompt,
@@ -964,18 +1091,17 @@ pub(super) fn serve_request(
             );
             params.target = agent.pane_id;
             params.text = format!("{}{}", guest.label(), params.text);
-            let response =
-                prompt_agent(id.clone(), params, &mut stream, api_tx, event_hub, running)?
-                    .map(|response| guest_reply(&id, &response, project_prompted));
-            finish_wait_response(&mut stream, response, &id, method, false)
+            let response = prompt_agent(id.clone(), params, stream, api_tx, event_hub, running)?
+                .map(|response| guest_reply(&id, &response, project_prompted));
+            finish_wait_response(stream, response, &id, method, false)
         }
         Method::AgentAnswer(mut params) => {
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.target, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // The chosen option is what the guest said, like a prompt's text.
             guest.audit(
@@ -987,20 +1113,20 @@ pub(super) fn serve_request(
             params.target = agent.pane_id;
             let response = answer_agent(id.clone(), params, api_tx);
             let reply = guest_reply(&id, &response, project_answer);
-            finish_wait_response(&mut stream, Some(reply), &id, method, false)
+            finish_wait_response(stream, Some(reply), &id, method, false)
         }
         Method::PaneSendKeys(params) => {
             // Menu keys only, and only while the agent awaits a menu: a guest
             // must never be able to type into a shell.
             let Some(keys) = guest_menu_batch(&params.keys) else {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             };
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.pane_id, guest, state.pane_id()) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let GrantState::Live(agent) = state else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // Held through the write, so a concurrent guest batch sees this
             // one's commit.
@@ -1013,7 +1139,7 @@ pub(super) fn serve_request(
                 .get(&marker)
                 .is_some_and(|committed_at| agent.state_change_seq <= *committed_at);
             if stale || !awaits_menu_input(&agent) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             commits.remove(&marker);
             guest.audit(
@@ -1034,19 +1160,19 @@ pub(super) fn serve_request(
             if commits_choice {
                 commits.insert(marker, agent.state_change_seq);
             }
-            write_text_line_allow_disconnect(&mut stream, &guest_reply(&id, &response, project_ok))
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramUploadChunk(params) => {
             // The file limits are enforced by the store; this bounds the decode.
             let max_encoded = crate::persist::gram_files::MAX_CHUNK_BYTES.div_ceil(3) * 4;
             if params.data_base64.len() > max_encoded {
                 return write_text_line_allow_disconnect(
-                    &mut stream,
+                    stream,
                     &error_response_json(id, "invalid_params", "upload chunk is too large".into()),
                 );
             }
             if !grant_state(guest, api_tx).is_live() {
-                return paused(&mut stream);
+                return paused(stream);
             }
             let request = Request {
                 id: id.clone(),
@@ -1059,7 +1185,7 @@ pub(super) fn serve_request(
             // the agent reads its Gram, so its upload is staged there too.
             let response = crate::api::reverse::forward_relay(&request)
                 .unwrap_or_else(|| dispatch_to_app_with_timeout(request, api_tx, None));
-            write_text_line_allow_disconnect(&mut stream, &guest_reply(&id, &response, project_ok))
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramUploadDiscard(params) => {
             // No live-agent check: dropping one's own staged bytes only frees
@@ -1076,13 +1202,13 @@ pub(super) fn serve_request(
             let response = crate::api::reverse::forward_relay(&request)
                 .unwrap_or_else(|| dispatch_to_app_with_timeout(request, api_tx, None));
             write_text_line_allow_disconnect(
-                &mut stream,
+                stream,
                 &guest_reply(&id, &response, project_upload_discarded),
             )
         }
         Method::GramPost(params) => {
             let GrantState::Live(agent) = grant_state(guest, api_tx) else {
-                return paused(&mut stream);
+                return paused(stream);
             };
             // A client from before a rename may still address the agent by a
             // name it had; the post always goes to the agent's name now.
@@ -1090,7 +1216,7 @@ pub(super) fn serve_request(
                 let names_agent = agent.name.as_deref() == Some(to)
                     || guest.former_names.iter().any(|former| former.name == to);
                 if !names_agent {
-                    return forbidden(&mut stream);
+                    return forbidden(stream);
                 }
             }
             let text = params.text.clone();
@@ -1133,7 +1259,7 @@ pub(super) fn serve_request(
             };
             audit_post(guest, method, text, &response);
             write_text_line_allow_disconnect(
-                &mut stream,
+                stream,
                 &guest_reply(&id, &response, project_gram_sent),
             )
         }
@@ -1156,13 +1282,13 @@ pub(super) fn serve_request(
                 ),
                 Err(message) => error_response_json(id, "invalid_params", message.into()),
             };
-            write_text_line_allow_disconnect(&mut stream, &reply)
+            write_text_line_allow_disconnect(stream, &reply)
         }
         Method::GramMarkRead(params) if guest.shares_gram() => {
             let ids: Vec<String> = params.targets().map(str::to_string).collect();
             if ids.is_empty() {
                 return write_text_line_allow_disconnect(
-                    &mut stream,
+                    stream,
                     &error_response_json(id, "invalid_params", "pass id or ids".into()),
                 );
             }
@@ -1173,21 +1299,21 @@ pub(super) fn serve_request(
                 .map(|item| item.id.as_str())
                 .collect();
             if !ids.iter().all(|id| visible.contains(id.as_str())) {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             }
             let reply =
                 match crate::guest::gram::mark_read(&guest.dir, &guest.guest_id, &ids, &visible) {
                     Ok(()) => success_value(&id, serde_json::json!({"type": "ok"})),
                     Err(err) => error_response_json(id, "guest_store_failed", err.to_string()),
                 };
-            write_text_line_allow_disconnect(&mut stream, &reply)
+            write_text_line_allow_disconnect(stream, &reply)
         }
         Method::GramGetFile(params) if guest.shares_gram() => {
             let Some(item) = may_fetch(guest, method, &params.id) else {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             };
             if let Some(reply) = mirrored_file(guest, &id, &item, None) {
-                return write_text_line_allow_disconnect(&mut stream, &reply);
+                return write_text_line_allow_disconnect(stream, &reply);
             }
             let request = Request {
                 id: id.clone(),
@@ -1197,17 +1323,14 @@ pub(super) fn serve_request(
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_file),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_file))
         }
         Method::GramGetFileChunk(params) if guest.shares_gram() => {
             let Some(item) = may_fetch(guest, method, &params.id) else {
-                return forbidden(&mut stream);
+                return forbidden(stream);
             };
             if let Some(reply) = mirrored_file(guest, &id, &item, Some(params.offset)) {
-                return write_text_line_allow_disconnect(&mut stream, &reply);
+                return write_text_line_allow_disconnect(stream, &reply);
             }
             let request = Request {
                 id: id.clone(),
@@ -1217,10 +1340,7 @@ pub(super) fn serve_request(
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            write_text_line_allow_disconnect(
-                &mut stream,
-                &guest_reply(&id, &response, project_file),
-            )
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_file))
         }
         Method::NotificationsRegisterDevice(params) => {
             let reply = match crate::app::registered_device(params) {
@@ -1238,16 +1358,13 @@ pub(super) fn serve_request(
             };
             // Revoked while registering: the revoke already removed this
             // guest's devices, so remove the one that landed after it.
-            if is_revoked(guest, &live) {
+            if is_revoked(guest, live) {
                 if let Err(err) = crate::guest::push::remove_guest(&guest.dir, &guest.guest_id) {
                     tracing::warn!(err = %err, "guest push devices removal failed");
                 }
-                return write_text_line_allow_disconnect(
-                    &mut stream,
-                    &guest_error(&id, "guest_revoked"),
-                );
+                return revoked(stream);
             }
-            write_text_line_allow_disconnect(&mut stream, &reply)
+            write_text_line_allow_disconnect(stream, &reply)
         }
         Method::NotificationsUnregisterDevice(params) => {
             let reply = match crate::guest::push::unregister(
@@ -1258,9 +1375,9 @@ pub(super) fn serve_request(
                 Ok(_) => success_value(&id, serde_json::json!({"type": "ok"})),
                 Err(err) => error_response_json(id, "device_registry_save_failed", err.to_string()),
             };
-            write_text_line_allow_disconnect(&mut stream, &reply)
+            write_text_line_allow_disconnect(stream, &reply)
         }
-        _ => forbidden(&mut stream),
+        _ => forbidden(stream),
     }
 }
 
@@ -2040,13 +2157,21 @@ mod tests {
             (BufReader::new(client), handle)
         }
 
-        /// One request; every response line until the server closes.
+        /// One request; every response line until the server closes. The
+        /// connection would serve another request, so after the reply the
+        /// client hangs up, as a guest that has nothing more to ask.
         fn call(&self, guest: &GuestPrincipal, request: Value) -> Vec<Value> {
-            let (reader, handle) = self.open(guest, request);
-            let lines = reader
-                .lines()
-                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
-                .collect();
+            let (mut reader, handle) = self.open(guest, request);
+            let mut lines = Vec::new();
+            if let Some(first) = read_reply(&mut reader) {
+                lines.push(first);
+            }
+            hang_up_after_reply(reader.get_ref());
+            lines.extend(
+                reader
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap()),
+            );
             handle.join().unwrap();
             lines
         }
@@ -2188,6 +2313,35 @@ mod tests {
         "agent_status",
         "guest_running",
     ];
+
+    /// Closes the client's write side after a reply. The server may already
+    /// have ended the connection (a refusal, a stream, a one-shot reply); macOS
+    /// then answers `shutdown` with ENOTCONN, which means the same thing here.
+    fn hang_up_after_reply(client: &UnixStream) {
+        match client.shutdown(std::net::Shutdown::Write) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotConnected => {
+                panic!("shutdown: {err}")
+            }
+            _ => {}
+        }
+    }
+
+    /// The next reply line, or `None` once the server closed.
+    fn read_reply(reader: &mut BufReader<UnixStream>) -> Option<Value> {
+        let mut line = String::new();
+        (reader.read_line(&mut line).unwrap() > 0).then(|| serde_json::from_str(&line).unwrap())
+    }
+
+    /// Sends one more request on an open guest connection and reads its reply.
+    fn ask(reader: &mut BufReader<UnixStream>, request: Value) -> Value {
+        writeln!(reader.get_mut(), "{request}").unwrap();
+        read_reply(reader).unwrap_or_else(|| panic!("closed before answering {request}"))
+    }
+
+    /// The server closes the connection: no further reply line.
+    fn assert_closed(reader: &mut BufReader<UnixStream>) {
+        assert_eq!(read_reply(reader), None, "the session ended");
+    }
 
     fn code(lines: &[Value]) -> &str {
         lines
@@ -2803,6 +2957,213 @@ mod tests {
         handle.join().unwrap();
         let ping = harness.call(&guest, json!({"id": "p", "method": "ping", "params": {}}));
         assert_eq!(code(&ping), "guest_revoked");
+    }
+
+    fn ping(id: &str) -> Value {
+        json!({"id": id, "method": "ping", "params": {}})
+    }
+
+    /// Opens a guest connection with a ping and reads its reply.
+    fn open_session(
+        harness: &Harness,
+        guest: &GuestPrincipal,
+    ) -> (BufReader<UnixStream>, JoinHandle<()>) {
+        let (mut reader, handle) = harness.open(guest, ping("open"));
+        let pong = read_reply(&mut reader).unwrap();
+        assert_eq!(pong["id"], "open", "{pong}");
+        assert!(pong.get("error").is_none(), "{pong}");
+        (reader, handle)
+    }
+
+    /// The guest hangs up; the server ends the session. The session is still
+    /// open here, so a failed shutdown is a real failure.
+    fn hang_up(mut reader: BufReader<UnixStream>, handle: JoinHandle<()>) {
+        reader
+            .get_ref()
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        assert_closed(&mut reader);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn one_connection_answers_requests_in_turn() {
+        let harness = start("session");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let list = ask(
+            &mut reader,
+            json!({"id": "2", "method": "agent.list", "params": {}}),
+        );
+        assert_eq!(list["id"], "2");
+        assert_eq!(list["result"]["type"], "agent_list", "{list}");
+        let get = ask(
+            &mut reader,
+            json!({"id": "3", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        assert_eq!(get["result"]["agent"]["name"], "llm-opt", "{get}");
+        // A request that waits on the agent leaves the session usable.
+        let prompt = ask(
+            &mut reader,
+            json!({"id": "4", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "ship it"}}),
+        );
+        assert_eq!(prompt["result"]["type"], "agent_prompted", "{prompt}");
+        let pong = ask(&mut reader, ping("5"));
+        assert_eq!(pong["id"], "5");
+        assert!(pong.get("error").is_none(), "{pong}");
+        hang_up(reader, handle);
+        assert!(harness
+            .pty_text(0, Duration::from_secs(2))
+            .contains("ship it"));
+    }
+
+    #[test]
+    fn a_forbidden_request_mid_session_is_refused_and_the_session_goes_on() {
+        let harness = start("session-forbidden");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let owner_only = ask(
+            &mut reader,
+            json!({"id": "2", "method": "workspace.list", "params": {}}),
+        );
+        assert_eq!(owner_only["id"], "2");
+        assert_eq!(
+            owner_only["error"]["code"], "guest_forbidden",
+            "{owner_only}"
+        );
+        let other_agent = ask(
+            &mut reader,
+            json!({"id": "3", "method": "agent.get", "params": {"target": "other-agent"}}),
+        );
+        assert_eq!(
+            other_agent["error"]["code"], "guest_forbidden",
+            "{other_agent}"
+        );
+        let get = ask(
+            &mut reader,
+            json!({"id": "4", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        assert_eq!(get["result"]["agent"]["name"], "llm-opt", "{get}");
+        hang_up(reader, handle);
+        let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 10).unwrap();
+        let denied = audit
+            .iter()
+            .filter(|entry| entry.event == GuestAuditEvent::Denied)
+            .count();
+        assert_eq!(denied, 2, "each refusal is audited: {audit:?}");
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_request_ends_the_session() {
+        let harness = start("session-invalid");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        writeln!(reader.get_mut(), "not a request").unwrap();
+        let reply = read_reply(&mut reader).unwrap();
+        assert_eq!(reply["error"]["code"], "invalid_request", "{reply}");
+        assert_closed(&mut reader);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_paused_reply_ends_the_session() {
+        let harness = start("session-paused");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        harness.agent_exits();
+        let paused = ask(
+            &mut reader,
+            json!({"id": "2", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "x"}}),
+        );
+        assert_eq!(paused["error"]["code"], "guest_paused", "{paused}");
+        assert_closed(&mut reader);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn revoke_between_requests_ends_the_idle_session() {
+        let harness = start("session-revoke");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let revoked_at = Instant::now();
+        let closed =
+            crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+                .unwrap();
+        assert_eq!(closed, Some(1), "the idle session is live");
+        assert_closed(&mut reader);
+        assert!(
+            revoked_at.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            revoked_at.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_revoke_by_another_daemon_refuses_the_next_request_and_ends_the_session() {
+        let harness = start("session-store-revoke");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        // Only the shared store changes: this process's live flag stays clear.
+        crate::guest::store::revoke_in(
+            &harness.dir.0,
+            RevokeTarget::Guest(&guest.guest_id),
+            crate::guest::store::now_ms(),
+        )
+        .unwrap();
+        let refused = ask(&mut reader, ping("2"));
+        assert_eq!(refused["error"]["code"], "guest_revoked", "{refused}");
+        assert_closed(&mut reader);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_stream_mid_session_takes_the_connection_over() {
+        let harness = start("session-stream");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let started = ask(
+            &mut reader,
+            json!({"id": "s", "method": "pane.stream", "params": {"pane_id": "llm-opt", "viewer_id": "v"}}),
+        );
+        assert_eq!(started["result"]["type"], "stream_started", "{started}");
+        harness.agent_exits();
+        // The stream's end is the session's end: EOF follows its error line.
+        assert_eq!(stream_end(&mut reader)["error"]["code"], "guest_paused");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_idle_session_ends_after_the_idle_timeout() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut stream = ApiStream::Local(crate::ipc::LocalStream::from(
+            interprocess::os::unix::uds_local_socket::Stream::from(server),
+        ));
+        let live = crate::guest::register_live("idle-guest");
+        let running = AtomicBool::new(true);
+        let idle = Duration::from_millis(300);
+
+        let waited = Instant::now();
+        let next = next_request(&mut stream, &live, &running, idle).unwrap();
+        assert!(next.is_none(), "no request within the idle timeout");
+        assert!(
+            (idle..Duration::from_secs(2)).contains(&waited.elapsed()),
+            "{:?}",
+            waited.elapsed()
+        );
+
+        // A request inside the window is read, however late in it.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writeln!(client, "{}", ping("late")).unwrap();
+            client
+        });
+        let next = next_request(&mut stream, &live, &running, idle).unwrap();
+        assert_eq!(next.map(|request| request.id).as_deref(), Some("late"));
+        drop(writer.join().unwrap());
+        assert!(next_request(&mut stream, &live, &running, idle)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3950,16 +4311,24 @@ mod tests {
         assert_eq!(reply["ok"], true, "{reply}");
         assert_eq!(reply["name"], "plotarmordev");
         assert_eq!(reply["agent"]["name"], "llm-opt");
+        assert_eq!(reply["features"]["multi_request"], true, "{reply}");
         let guest_id = reply["guest_id"].as_str().unwrap().to_owned();
 
-        // One request line in, the response line out, then CLOSE.
+        // Requests in turn on the one session, each answered on it, until the
+        // guest leaves.
         let mut guest = guest.unwrap();
         let prompt = json!({"id": "p1", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "ship it"}});
         guest.send(&mut relay, &format!("{prompt}\n"));
         let (line, _) = guest.recv_line(&mut relay);
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response["result"]["type"], "agent_prompted", "{response}");
-        assert_eq!(relay.closed(41), "");
+        let get = json!({"id": "g1", "method": "agent.get", "params": {"target": "llm-opt"}});
+        guest.send(&mut relay, &format!("{get}\n"));
+        let (line, _) = guest.recv_line(&mut relay);
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], "g1", "{response}");
+        assert_eq!(response["result"]["agent"]["name"], "llm-opt", "{response}");
+        relay.close_session(41);
         let written = harness.pty_text(0, Duration::from_secs(2));
         assert!(
             written.contains("plotarmordev (via HerdrUp): ship it"),
@@ -4446,6 +4815,95 @@ mod tests {
         let agents = list[0]["result"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1, "{list:?}");
         assert_eq!(agents[0]["name"], "llm-renamed");
+    }
+
+    /// A session open across an owner rename serves the agent under its new
+    /// name as a new connection would: the grant is read for every request.
+    #[test]
+    fn an_open_session_follows_an_owner_rename() {
+        let _config = ConfigHome::new("rename-session");
+        let harness = start_renaming("rename-session");
+        let tick = || std::thread::sleep(Duration::from_millis(5));
+        let guest = harness.admit_with(0, true);
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let post = |reader: &mut BufReader<UnixStream>, params: Value| {
+            let sent = ask(
+                reader,
+                json!({"id": "p", "method": "gram.post", "params": params}),
+            );
+            assert!(sent.get("error").is_none(), "{sent}");
+            tick();
+        };
+        post(&mut reader, json!({"text": "guest before"}));
+        rename(&harness, 0, "llm-renamed");
+        tick();
+
+        let granted = Some(harness.pane_ids[0].clone());
+        send_gram_as(&harness, granted.clone(), "llm-renamed", "agent after");
+        tick();
+        let upload = "up-after.txt";
+        let staged = owner(
+            &harness,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
+        );
+        assert_eq!(staged["result"]["type"], "ok", "{staged}");
+        let file = sent_id(&owner(
+            &harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": "a file", "from": "llm-renamed", "caller_pane_id": granted, "file": {"upload_id": upload, "name": "after.txt", "mime": "text/plain"}}}),
+        ));
+        tick();
+        post(&mut reader, json!({"text": "guest after"}));
+        post(
+            &mut reader,
+            json!({"text": "guest by new name", "to": "llm-renamed"}),
+        );
+        // The former name still reaches the agent, as it does after a reconnect.
+        post(
+            &mut reader,
+            json!({"text": "guest by old name", "to": "llm-opt"}),
+        );
+
+        let list = ask(
+            &mut reader,
+            json!({"id": "l", "method": "gram.list", "params": {}}),
+        );
+        assert_eq!(
+            texts(&list["result"]),
+            [
+                "guest by old name",
+                "guest by new name",
+                "guest after",
+                "a file",
+                "agent after",
+                "guest before"
+            ],
+            "{list}"
+        );
+        let fetched = ask(
+            &mut reader,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": file}}),
+        );
+        assert_eq!(fetched["result"]["data_base64"], "aGVsbG8=", "{fetched}");
+        let get = ask(
+            &mut reader,
+            json!({"id": "g", "method": "agent.get", "params": {"target": "llm-renamed"}}),
+        );
+        assert_eq!(get["result"]["agent"]["name"], "llm-renamed", "{get}");
+        let prompted = ask(
+            &mut reader,
+            prompt_request("llm-renamed", "after the rename"),
+        );
+        assert_eq!(prompted["result"]["type"], "agent_prompted", "{prompted}");
+        // The old name no longer names the grant, as on a new connection.
+        let old = ask(
+            &mut reader,
+            json!({"id": "o", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        assert_eq!(old["error"]["code"], "guest_forbidden", "{old}");
+        hang_up(reader, handle);
+        assert!(harness
+            .pty_text(0, Duration::from_secs(2))
+            .contains("plotarmordev (via HerdrUp): after the rename"));
     }
 
     #[test]

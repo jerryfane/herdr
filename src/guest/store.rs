@@ -437,12 +437,17 @@ pub(crate) fn update_grant_session(
 
 /// The active grant of this guest as stored now.
 pub(crate) fn active_grant(dir: &Path, guest_id: &str) -> Option<GuestGrantInfo> {
+    active_record(dir, guest_id).map(|guest| guest.grant)
+}
+
+/// This guest's record as stored now, unless it was revoked or removed (or
+/// the store cannot be read).
+pub(crate) fn active_record(dir: &Path, guest_id: &str) -> Option<GuestRecord> {
     load_store(dir)
         .ok()?
         .guests
         .into_iter()
         .find(|guest| guest.guest_id == guest_id && !guest.revoked)
-        .map(|guest| guest.grant)
 }
 
 /// The owner renamed the agent in `terminal_id` from `old` to `new`: every

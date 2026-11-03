@@ -22,7 +22,7 @@ use super::Waker;
 /// Live sessions per host socket; the relay enforces the same cap.
 pub(super) const MAX_SESSIONS: usize = 32;
 /// Guest messages buffered per session before it is closed as overloaded. A
-/// guest sends one request line, so this only trips on abuse.
+/// guest has one request in flight at a time, so this only trips on abuse.
 const INBOUND_QUEUE: usize = 32;
 
 /// Session output for the connection thread to put on the socket. Each

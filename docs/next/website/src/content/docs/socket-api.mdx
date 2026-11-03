@@ -662,6 +662,24 @@ Transport errors, such as invalid UTF-8, can close the connection without a resp
 
 Event subscriptions keep the connection open after the initial response.
 
+### Guest sessions
+
+A guest connection, one Noise session through the HerdrUp guest relay, serves
+requests in turn instead of one per connection. Hosts that support this send
+`features.multi_request: true` in the handshake reply; without it, open a new
+session per request.
+
+- Send the next request line only after the previous reply. Bytes that arrive
+  while a request is still being answered can read as the guest leaving.
+- Every request passes the guest gate on its own: revocation, the method
+  allowlist, the grant and its audit entry. The grant is read as stored at
+  that request, so an open session follows an owner rename of the agent.
+- A `guest_forbidden` reply leaves the session open.
+- The session ends after a `guest_paused` or `guest_revoked` reply, after an
+  `invalid_request` reply to a line that is not a request, when the guest is
+  revoked while idle, and after 60 seconds without a request.
+- `pane.stream` takes the session over: when the stream ends, the session ends.
+
 ### Bridging many requests over one process
 
 The socket answers one request per connection. A remote client that reaches it
