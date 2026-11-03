@@ -371,6 +371,9 @@ fn guess_mime(name: &str) -> String {
         "md" => "text/markdown",
         "csv" => "text/csv",
         "zip" => "application/zip",
+        // The apps offer their HTML/SVG preview only for these types.
+        "html" | "htm" => "text/html",
+        "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     };
     mime.to_string()
@@ -1488,5 +1491,15 @@ mod tests {
                 .contains("[redacted credential,"),
             "the grabbed/sent body must be redacted"
         );
+    }
+
+    #[test]
+    fn html_and_svg_files_get_the_types_the_apps_preview() {
+        // The apps open their HTML/SVG preview only for these types; a .html sent as
+        // application/octet-stream could not be previewed at all.
+        assert_eq!(guess_mime("proposals.html"), "text/html");
+        assert_eq!(guess_mime("Page.HTM"), "text/html");
+        assert_eq!(guess_mime("diagram.svg"), "image/svg+xml");
+        assert_eq!(guess_mime("notes.unknown"), "application/octet-stream");
     }
 }
