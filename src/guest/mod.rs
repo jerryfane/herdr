@@ -109,6 +109,15 @@ impl GuestPrincipal {
         }
     }
 
+    /// This guest with its grant and rename history as stored now, as a new
+    /// connection's admission would read them; `None` once the guest was
+    /// revoked or removed, or its record holds another device's key.
+    pub(crate) fn current(&self) -> Option<Self> {
+        let record = store::active_record(&self.dir, &self.guest_id)?;
+        (record.fingerprint == self.fingerprint)
+            .then(|| Self::from_record(&record, self.dir.clone()))
+    }
+
     /// Whether the guest shares the agent's Gram now. Read from the store on
     /// every call, so `guest.update` applies to sessions already admitted.
     pub(crate) fn shares_gram(&self) -> bool {

@@ -709,6 +709,10 @@ fn project_gram_sent(result: ResponseResult) -> Option<serde_json::Value> {
 /// Serves a guest connection's requests in turn, starting with `request`
 /// (advertised to guests as `features.multi_request`). Each request passes
 /// the full gate: revocation, the allowlist, the grant and its audit. The
+/// grant and its rename history are read from the store again for every
+/// request, as a new connection's admission reads them, so a session follows
+/// an owner rename; the authenticated guest and its device stay the admitted
+/// ones. The
 /// guest sends its next request only after the previous reply; bytes that
 /// arrive while a request waits on the agent read as the guest leaving, as
 /// they always have. A `guest_forbidden` reply leaves the session open. It
@@ -726,11 +730,19 @@ pub(super) fn serve_session(
 ) -> std::io::Result<()> {
     let live = crate::guest::register_live(&guest.guest_id);
     loop {
+        // Revoked or removed in the store: the same refusal `serve_request`
+        // gives, before anything reads the stale grant.
+        let Some(current) = guest.current() else {
+            return write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_error(&request.id, "guest_revoked"),
+            );
+        };
         let ends = Cell::new(false);
         serve_request(
             &mut stream,
             request,
-            guest,
+            &current,
             &live,
             api_tx,
             event_hub,
@@ -4793,6 +4805,95 @@ mod tests {
         let agents = list[0]["result"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1, "{list:?}");
         assert_eq!(agents[0]["name"], "llm-renamed");
+    }
+
+    /// A session open across an owner rename serves the agent under its new
+    /// name as a new connection would: the grant is read for every request.
+    #[test]
+    fn an_open_session_follows_an_owner_rename() {
+        let _config = ConfigHome::new("rename-session");
+        let harness = start_renaming("rename-session");
+        let tick = || std::thread::sleep(Duration::from_millis(5));
+        let guest = harness.admit_with(0, true);
+        let (mut reader, handle) = open_session(&harness, &guest);
+        let post = |reader: &mut BufReader<UnixStream>, params: Value| {
+            let sent = ask(
+                reader,
+                json!({"id": "p", "method": "gram.post", "params": params}),
+            );
+            assert!(sent.get("error").is_none(), "{sent}");
+            tick();
+        };
+        post(&mut reader, json!({"text": "guest before"}));
+        rename(&harness, 0, "llm-renamed");
+        tick();
+
+        let granted = Some(harness.pane_ids[0].clone());
+        send_gram_as(&harness, granted.clone(), "llm-renamed", "agent after");
+        tick();
+        let upload = "up-after.txt";
+        let staged = owner(
+            &harness,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
+        );
+        assert_eq!(staged["result"]["type"], "ok", "{staged}");
+        let file = sent_id(&owner(
+            &harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": "a file", "from": "llm-renamed", "caller_pane_id": granted, "file": {"upload_id": upload, "name": "after.txt", "mime": "text/plain"}}}),
+        ));
+        tick();
+        post(&mut reader, json!({"text": "guest after"}));
+        post(
+            &mut reader,
+            json!({"text": "guest by new name", "to": "llm-renamed"}),
+        );
+        // The former name still reaches the agent, as it does after a reconnect.
+        post(
+            &mut reader,
+            json!({"text": "guest by old name", "to": "llm-opt"}),
+        );
+
+        let list = ask(
+            &mut reader,
+            json!({"id": "l", "method": "gram.list", "params": {}}),
+        );
+        assert_eq!(
+            texts(&list["result"]),
+            [
+                "guest by old name",
+                "guest by new name",
+                "guest after",
+                "a file",
+                "agent after",
+                "guest before"
+            ],
+            "{list}"
+        );
+        let fetched = ask(
+            &mut reader,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": file}}),
+        );
+        assert_eq!(fetched["result"]["data_base64"], "aGVsbG8=", "{fetched}");
+        let get = ask(
+            &mut reader,
+            json!({"id": "g", "method": "agent.get", "params": {"target": "llm-renamed"}}),
+        );
+        assert_eq!(get["result"]["agent"]["name"], "llm-renamed", "{get}");
+        let prompted = ask(
+            &mut reader,
+            prompt_request("llm-renamed", "after the rename"),
+        );
+        assert_eq!(prompted["result"]["type"], "agent_prompted", "{prompted}");
+        // The old name no longer names the grant, as on a new connection.
+        let old = ask(
+            &mut reader,
+            json!({"id": "o", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        assert_eq!(old["error"]["code"], "guest_forbidden", "{old}");
+        hang_up(reader, handle);
+        assert!(harness
+            .pty_text(0, Duration::from_secs(2))
+            .contains("plotarmordev (via HerdrUp): after the rename"));
     }
 
     #[test]
