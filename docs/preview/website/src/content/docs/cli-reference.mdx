@@ -179,6 +179,8 @@ With `--share-gram`, or `herdr guest share-gram <guest-id> on` for a guest who a
 
 While at least one guest or unexpired invite exists, the server keeps one outbound TLS WebSocket to the relay, reconnecting with backoff from 2 to 60 seconds, and closes it once no guests or invites remain. It and the short-invite requests to the same relay (store on `herdr guest invite`, delete on accept or revoke, each bounded to 5 seconds) are the only TLS connections Herdr opens in-process; update checks and push delivery run `curl` instead. The relay stores invites only for a machine that has connected, so `herdr guest invite` first waits up to 5 seconds for the connection to be `up`. `herdr guest list` shows its state (`off`, `connecting`, `up` or `retrying`) and last error. Only the default session connects: every session on a machine shares one guest store and so one relay identity, and the relay keeps one connection per machine. A named session (`herdr --session NAME`) shows the link as `off` and refuses `herdr guest invite` with `unsupported`; share agents from the default session.
 
+A guest's app can keep one encrypted session for its calls instead of reconnecting for each one, so polling and file transfers stay under the relay's limit on new connections. Each request on it is checked on its own; the session ends when the guest is revoked or the agent stops running, and after 60 seconds without a request.
+
 ## Sessions
 
 ```bash
