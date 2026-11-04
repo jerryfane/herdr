@@ -270,6 +270,7 @@ jobs:
           Invoke-CargoWithZigCacheRecovery "clippy" @("clippy", "--bin", "herdr", "--locked", "--target", "x86_64-pc-windows-msvc", "--", "-D", "warnings")
           Invoke-Checked "test windows_" cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "windows_")
           Invoke-Checked "test client_transport" cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "server::client_transport::tests")
+          Invoke-Checked "test api_bridge" cargo @("test", "--locked", "--target", "x86_64-pc-windows-msvc", "--bin", "herdr", "remote::api_bridge")
           Invoke-Checked "build" cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")
 
           $failed = @()
