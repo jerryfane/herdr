@@ -684,8 +684,8 @@ session per request.
 
 The socket answers one request per connection. A remote client that reaches it
 through an SSH exec channel can avoid starting a process per request with
-`herdr api-bridge --multi` (Unix only; servers that support it report
-`capabilities.api_bridge_multi: true` from `ping`):
+`herdr api-bridge --multi` (on Unix and Windows; servers that support it
+report `capabilities.api_bridge_multi: true` from `ping`):
 
 - Write one request per line to the bridge's stdin. Each runs on its own socket
   connection, up to 16 at a time; with all 16 busy, the bridge stops reading

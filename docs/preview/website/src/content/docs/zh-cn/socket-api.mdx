@@ -518,7 +518,7 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 ### 用一个进程转发多个请求
 
 Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远程客户端,可以使用 `herdr api-bridge --multi`,
-避免为每个请求启动一个进程(仅限 Unix;支持该模式的服务器会在 `ping` 中返回
+避免为每个请求启动一个进程(适用于 Unix 和 Windows;支持该模式的服务器会在 `ping` 中返回
 `capabilities.api_bridge_multi: true`):
 
 - 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个;16 个都在处理时,
