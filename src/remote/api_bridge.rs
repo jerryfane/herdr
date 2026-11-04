@@ -54,24 +54,64 @@ pub(crate) fn run_api_client_bridge(args: &[String]) -> io::Result<()> {
         return Ok(());
     }
 
-    let conn = match transport::connect(&crate::api::socket_path()) {
+    // Not held locked: the Windows hangup probe takes the stdout lock between
+    // lines.
+    forward_single_request(
+        &request_line,
+        &crate::api::socket_path(),
+        &mut io::stdout(),
+        true,
+    )
+}
+
+/// Forwards a single-shot request and streams every reply line to `out`.
+/// With `watch_output`, losing stdout's peer ends the connection.
+fn forward_single_request<W: Write>(
+    request_line: &str,
+    socket_path: &Path,
+    out: &mut W,
+    watch_output: bool,
+) -> io::Result<()> {
+    if let Some(reply) = single_request_error(request_line) {
+        writeln!(out, "{reply}")?;
+        return out.flush();
+    }
+    let conn = match transport::connect(socket_path) {
         Ok(conn) => conn,
-        Err(err) => return emit_transport_error(&mut io::stdout(), &request_line, &err),
+        Err(err) => return emit_transport_error(out, request_line, &err),
     };
 
     // A round-trip client closes the SSH channel after reading its response, not
     // before. Wake subscriptions and other long-lived reads when stdout loses
     // its peer without treating stdin's normal half-close as cancellation.
-    if let Ok(shutdown) = ConnectionShutdown::new(&conn) {
-        std::thread::spawn(move || {
-            transport::wait_for_output_hangup();
-            shutdown.shut_down();
-        });
+    if watch_output {
+        if let Ok(shutdown) = ConnectionShutdown::new(&conn) {
+            std::thread::spawn(move || {
+                transport::wait_for_output_hangup();
+                shutdown.shut_down();
+            });
+        }
     }
 
-    // Not held locked: the Windows hangup probe takes the stdout lock between
-    // lines.
-    send_and_stream(conn, &request_line, &mut io::stdout())
+    send_and_stream(conn, request_line, out)
+}
+
+/// The `invalid_request` reply for a single-shot request that is not one line
+/// within the `--multi` line limit. The API server reads only a connection's
+/// first line, so anything after an embedded newline would never be read, and
+/// writing it could block the bridge on a full socket or pipe.
+fn single_request_error(request_line: &str) -> Option<String> {
+    let message = if request_line.len() > MULTI_MAX_REQUEST_LINE_BYTES {
+        format!("api-bridge: request line exceeds {MULTI_MAX_REQUEST_LINE_BYTES} bytes")
+    } else if request_line.contains('\n') {
+        "api-bridge: request must be a single line".to_owned()
+    } else {
+        return None;
+    };
+    let id = RequestProbe::scan(request_line.as_bytes())
+        .id
+        .unwrap_or_default();
+    Some(error_envelope(&id, "invalid_request", &message))
 }
 
 fn decode_request_arg(encoded: &str) -> io::Result<String> {
@@ -917,6 +957,82 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(output.is_empty(), "{}", String::from_utf8_lossy(&output));
+    }
+
+    #[test]
+    fn single_request_refuses_more_than_one_line_without_connecting() {
+        let server = FakeApiServer::start("single-lines");
+        let embedded_newline = format!(
+            "{}\n{}",
+            request("two", "ping", 0),
+            "A".repeat(4 * 1024 * 1024)
+        );
+        let over_long = format!(
+            r#"{{"id":"two","method":"ping","params":{{"data":"{}"}}}}"#,
+            "A".repeat(MULTI_MAX_REQUEST_LINE_BYTES)
+        );
+
+        for line in [embedded_newline, over_long] {
+            let mut output = Vec::new();
+            forward_single_request(&line, &server.path, &mut output, false).unwrap();
+
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["id"], "two");
+            assert_eq!(response["error"]["code"], "invalid_request", "{response}");
+        }
+        assert_eq!(server.stats.requests.load(Ordering::SeqCst), 0);
+
+        let mut output = Vec::new();
+        forward_single_request(&request("one", "ping", 0), &server.path, &mut output, false)
+            .unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["result"]["method"], "ping");
+    }
+
+    /// A peer that reads one line and then stops reading must not keep the
+    /// rest of a write blocked past a shutdown. On Unix, `shutdown(2)` already
+    /// fails the write. On Windows the shutdown cancels it.
+    #[test]
+    fn shutdown_releases_a_write_the_server_stopped_reading() {
+        let path = unique_socket_path("unread");
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let (release, released) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let conn = listener.incoming().next().unwrap().unwrap();
+            let mut reader = io::BufReader::new(conn);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            // Stop reading, but keep the connection open.
+            let _ = released.recv();
+        });
+        let conn = transport::connect(&path).unwrap();
+        let shutdown = ConnectionShutdown::new(&conn).unwrap();
+        let request_line = format!(
+            "{}\n{}",
+            request("one", "ping", 0),
+            "A".repeat(16 * 1024 * 1024)
+        );
+        let mut output = Vec::new();
+
+        let started = Instant::now();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(200));
+                shutdown.shut_down();
+            });
+            send_and_stream(conn, &request_line, &mut output).unwrap();
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["error"]["code"], "transport_error", "{response}");
+        drop(release);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

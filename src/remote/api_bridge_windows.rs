@@ -1,14 +1,15 @@
 //! Windows transport for `herdr api-bridge` (see `api_bridge`): a named-pipe
 //! connection to the local API endpoint, read by polling `PeekNamedPipe` so
-//! another thread can end it, and a zero-byte write probe on stdout to notice
-//! the SSH channel going away.
+//! another thread can end it, writes that a shutdown cancels with
+//! `CancelSynchronousIo`, and a zero-byte write probe on stdout to notice the
+//! SSH channel going away.
 
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::ipc::{LocalStream, LocalStreamReadCount};
@@ -21,36 +22,100 @@ const READ_POLL_MIN_INTERVAL: Duration = Duration::from_millis(1);
 const READ_POLL_MAX_INTERVAL: Duration = Duration::from_millis(16);
 /// The Unix bridge's back-off between stdout polls.
 const HANGUP_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+/// A shutdown can catch a write after it registered but before it entered the
+/// kernel, when there is nothing to cancel yet. It retries this often, for at
+/// most [`WRITE_CANCEL_ATTEMPTS`] tries (one second).
+const WRITE_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const WRITE_CANCEL_ATTEMPTS: u32 = 1000;
 
-/// A connection to the API pipe. A synchronous named-pipe read cannot be
-/// woken from another thread, so reads poll `PeekNamedPipe` (as herdr's other
-/// Windows pipe readers do) and end at end of file once
-/// [`ConnectionShutdown::shut_down`] runs, like a Unix socket after
-/// `shutdown(2)`.
+/// A connection to the API pipe. Synchronous named-pipe I/O cannot be woken
+/// from another thread by closing the handle. Reads therefore poll
+/// `PeekNamedPipe` (as herdr's other Windows pipe readers do) and end at end of
+/// file once [`ConnectionShutdown::shut_down`] runs. A write or flush blocked
+/// on a peer that stopped reading is cancelled instead. Both behave like a
+/// Unix socket after `shutdown(2)`.
 pub(super) struct Connection {
     stream: LocalStream,
-    shut_down: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     poll_interval: Duration,
+}
+
+#[derive(Default)]
+struct Shared {
+    shut_down: AtomicBool,
+    /// The thread inside a write or flush of the pipe, for `CancelSynchronousIo`.
+    writer: Mutex<Option<OwnedHandle>>,
+}
+
+impl Shared {
+    fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::Acquire)
+    }
+
+    fn writer(&self) -> MutexGuard<'_, Option<OwnedHandle>> {
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub(super) fn connect(socket_path: &Path) -> io::Result<Connection> {
     Ok(Connection {
         stream: crate::ipc::connect_local_stream(socket_path)?,
-        shut_down: Arc::new(AtomicBool::new(false)),
+        shared: Arc::default(),
         poll_interval: READ_POLL_MIN_INTERVAL,
     })
 }
 
 impl Connection {
-    fn is_shut_down(&self) -> bool {
-        self.shut_down.load(Ordering::Acquire)
+    /// Runs one blocking pipe write or flush where a shutdown can cancel it.
+    fn cancellable<T>(
+        &mut self,
+        io: impl FnOnce(&mut LocalStream) -> io::Result<T>,
+    ) -> io::Result<T> {
+        {
+            let mut writer = self.shared.writer();
+            if self.shared.is_shut_down() {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            *writer = Some(current_thread()?);
+        }
+        let result = io(&mut self.stream);
+        *self.shared.writer() = None;
+        match result {
+            Err(_) if self.shared.is_shut_down() => Err(io::ErrorKind::BrokenPipe.into()),
+            result => result,
+        }
     }
+}
+
+/// A real handle to the calling thread (`GetCurrentThread` is only a pseudo
+/// handle, meaningless to another thread).
+fn current_thread() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+
+    let mut handle = std::ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle succeeded, so `handle` is a new handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            if self.is_shut_down() {
+            if self.shared.is_shut_down() {
                 return Ok(0);
             }
             match crate::ipc::poll_local_stream_read_count(&mut self.stream, buf)? {
@@ -70,28 +135,55 @@ impl Read for Connection {
 
 impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.is_shut_down() {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        self.stream.write(buf)
+        self.cancellable(|stream| stream.write(buf))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        self.cancellable(|stream| stream.flush())
     }
 }
 
-/// Ends a [`Connection`] from any thread: its pending or later reads return
-/// end of file and its later writes fail.
-pub(super) struct ConnectionShutdown(Arc<AtomicBool>);
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // interprocess hands a pipe with unflushed writes to a background
+        // thread that flushes it before closing. After a shutdown the peer
+        // may never read again, so close the handle now instead.
+        if self.shared.is_shut_down() {
+            let LocalStream::NamedPipe(stream) = &self.stream;
+            stream.inner().assume_flushed();
+        }
+    }
+}
+
+/// Ends a [`Connection`] from any thread. Its pending or later reads return
+/// end of file, a write or flush blocked in the pipe is cancelled, and later
+/// writes fail.
+pub(super) struct ConnectionShutdown(Arc<Shared>);
 
 impl ConnectionShutdown {
     pub(super) fn new(conn: &Connection) -> io::Result<Self> {
-        Ok(Self(Arc::clone(&conn.shut_down)))
+        Ok(Self(Arc::clone(&conn.shared)))
     }
 
     pub(super) fn shut_down(&self) {
-        self.0.store(true, Ordering::Release);
+        use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+        let mut writer = self.0.writer();
+        self.0.shut_down.store(true, Ordering::Release);
+        for _ in 0..WRITE_CANCEL_ATTEMPTS {
+            let Some(thread) = writer.as_ref() else {
+                return;
+            };
+            // Fails with ERROR_NOT_FOUND while the registered write has not
+            // entered the kernel yet. The writer clears its slot when the
+            // call returns, so a retry never cancels unrelated I/O.
+            if unsafe { CancelSynchronousIo(thread.as_raw_handle()) } != 0 {
+                return;
+            }
+            drop(writer);
+            std::thread::sleep(WRITE_CANCEL_RETRY_INTERVAL);
+            writer = self.0.writer();
+        }
     }
 }
 
