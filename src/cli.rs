@@ -1016,8 +1016,92 @@ fn _print_json<T: Serialize>(value: &T) {
     println!("{}", serde_json::to_string(value).unwrap());
 }
 
+/// The account name this process runs as, read through `env`.
+///
+/// Unix shells set `USER` (`LOGNAME` on some); Windows sets `USERNAME` and `USERPROFILE`
+/// instead, and a Win32-OpenSSH session has no `USER` at all. The profile or home
+/// directory's last component is the last resort. Empty values count as unset.
+fn login_user_from_env(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
+    let named = |name: &str| {
+        env(name)
+            .map(|value| value.to_string_lossy().into_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let home_component = |name: &str| {
+        named(name).and_then(|home| {
+            home.rsplit(['/', '\\'])
+                .find(|component| !component.is_empty() && !component.ends_with(':'))
+                .map(str::to_string)
+        })
+    };
+    named("USER")
+        .or_else(|| named("LOGNAME"))
+        .or_else(|| named("USERNAME"))
+        .or_else(|| home_component("USERPROFILE"))
+        .or_else(|| home_component("HOME"))
+}
+
 #[cfg(test)]
 mod tests {
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(var, _)| var == name)
+                .map(|(_, value)| value.into())
+        }
+    }
+
+    #[test]
+    fn login_user_prefers_user_then_logname_then_username() {
+        let all = [
+            ("USER", "alice"),
+            ("LOGNAME", "bob"),
+            ("USERNAME", "carol"),
+            ("USERPROFILE", r"C:\Users\dave"),
+        ];
+        assert_eq!(
+            super::login_user_from_env(env_of(&all)),
+            Some("alice".into())
+        );
+        assert_eq!(
+            super::login_user_from_env(env_of(&all[1..])),
+            Some("bob".into())
+        );
+        assert_eq!(
+            super::login_user_from_env(env_of(&all[2..])),
+            Some("carol".into())
+        );
+    }
+
+    #[test]
+    fn login_user_falls_back_to_the_profile_directory_name() {
+        assert_eq!(
+            super::login_user_from_env(env_of(&[("USERPROFILE", r"C:\Users\warez\")])),
+            Some("warez".into())
+        );
+        assert_eq!(
+            super::login_user_from_env(env_of(&[("HOME", "/c/Users/warez")])),
+            Some("warez".into())
+        );
+        assert_eq!(
+            super::login_user_from_env(env_of(&[("USER", ""), ("USERPROFILE", r"C:\Users\ann")])),
+            Some("ann".into())
+        );
+    }
+
+    #[test]
+    fn login_user_is_unknown_when_nothing_names_it() {
+        assert_eq!(super::login_user_from_env(env_of(&[])), None);
+        assert_eq!(
+            super::login_user_from_env(env_of(&[("USERPROFILE", r"C:\")])),
+            None
+        );
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(
