@@ -425,7 +425,7 @@ const DEFAULT_HOST_KEY_NAMES: [&str; 2] = ["ssh_host_ed25519_key", "ssh_host_rsa
 /// is skipped: it is not a key the app would be offered for a pin.
 const PINNABLE_HOST_KEY_TYPES: [&str; 3] = ["ED25519", "RSA", "ECDSA"];
 
-/// Why no host-key fingerprint could be read: every `.pub` file tried, and what stopped it.
+/// Why no host-key fingerprint could be read: every file tried, and what stopped it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKeyLookupFailure {
     pub tried: Vec<(PathBuf, String)>,
@@ -447,6 +447,10 @@ impl fmt::Display for HostKeyLookupFailure {
     }
 }
 
+/// A `.pub` file to fingerprint, or the file (key or `sshd_config`) that cannot yield one
+/// and why.
+type HostKeyCandidate = Result<PathBuf, (PathBuf, String)>;
+
 /// This machine's SSH host-key fingerprint, as `ssh-keygen -lf` prints it.
 ///
 /// Read from the host key sshd actually serves, so the app pins the same key it will be
@@ -454,12 +458,26 @@ impl fmt::Display for HostKeyLookupFailure {
 /// every file tried, so the caller can say where it looked rather than pretending.
 pub fn ssh_host_key_fingerprint() -> Result<String, HostKeyLookupFailure> {
     let candidates = match sshd_config_dir() {
-        Some(dir) => ssh_host_key_candidates(&dir, &configured_host_keys(&dir)),
+        Some(dir) => ssh_host_key_candidates(&dir, configured_host_keys(&dir)),
         None => Vec::new(),
     };
+    best_host_key_fingerprint(candidates)
+}
+
+/// The fingerprint of the most preferred pinnable key among `candidates`.
+fn best_host_key_fingerprint(
+    candidates: Vec<HostKeyCandidate>,
+) -> Result<String, HostKeyLookupFailure> {
     let mut tried = Vec::new();
     let mut best: Option<(usize, String)> = None;
-    for path in candidates {
+    for candidate in candidates {
+        let path = match candidate {
+            Ok(path) => path,
+            Err(failure) => {
+                tried.push(failure);
+                continue;
+            }
+        };
         match read_host_key_fingerprint(&path) {
             Ok((0, fingerprint)) => return Ok(fingerprint),
             Ok((rank, fingerprint)) => {
@@ -525,77 +543,172 @@ fn sshd_config_dir() -> Option<PathBuf> {
         .map(|dir| PathBuf::from(dir).join("ssh"))
 }
 
-/// The private host keys `sshd_config` names. Unix keeps probing the default names only.
+/// The host keys `sshd_config` names. Unix keeps probing the default names only.
 #[cfg(not(windows))]
-fn configured_host_keys(_sshd_dir: &Path) -> Vec<PathBuf> {
+fn configured_host_keys(_sshd_dir: &Path) -> Vec<HostKeyCandidate> {
     Vec::new()
 }
 
-/// The private host keys `%ProgramData%\ssh\sshd_config` names with `HostKey`.
+/// The host keys `%ProgramData%\ssh\sshd_config` names with `HostKey`. A missing config
+/// names none; an unreadable one is a failure, since the keys it may name are unknown.
 #[cfg(windows)]
-fn configured_host_keys(sshd_dir: &Path) -> Vec<PathBuf> {
-    let (Some(program_data), Ok(config)) = (
-        sshd_dir.parent(),
-        std::fs::read_to_string(sshd_dir.join("sshd_config")),
-    ) else {
-        return Vec::new();
+fn configured_host_keys(sshd_dir: &Path) -> Vec<HostKeyCandidate> {
+    let config_path = sshd_dir.join("sshd_config");
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => return vec![Err((config_path, format!("could not be read: {err}")))],
     };
-    sshd_config_host_keys(&config, program_data)
+    let program_data = sshd_dir.parent().unwrap_or(sshd_dir);
+    sshd_config_host_keys(&config, &config_path, program_data)
 }
 
-/// The `.pub` files to fingerprint, in order: the `HostKey` files sshd_config names when
-/// it names any (sshd then serves only those), otherwise the default names in `sshd_dir`.
-fn ssh_host_key_candidates(sshd_dir: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
-    if configured.is_empty() {
-        return DEFAULT_HOST_KEY_NAMES
-            .iter()
-            .map(|name| sshd_dir.join(format!("{name}.pub")))
-            .collect();
+/// The `.pub` files to fingerprint, in order. When sshd_config has any `HostKey` directive
+/// sshd serves only those keys, so they are the only candidates even when none of them is
+/// usable; the default names in `sshd_dir` apply only when it has none.
+fn ssh_host_key_candidates(
+    sshd_dir: &Path,
+    configured: Vec<HostKeyCandidate>,
+) -> Vec<HostKeyCandidate> {
+    if !configured.is_empty() {
+        return configured;
     }
-    configured
+    DEFAULT_HOST_KEY_NAMES
         .iter()
-        .map(|key| {
-            let mut public = key.clone().into_os_string();
-            public.push(".pub");
-            PathBuf::from(public)
-        })
+        .map(|name| Ok(sshd_dir.join(format!("{name}.pub"))))
         .collect()
 }
 
-/// The private key paths named by `HostKey` lines in a Win32-OpenSSH `sshd_config`.
+/// One candidate per `HostKey` directive in a Win32-OpenSSH `sshd_config`, read the way
+/// sshd reads it: the key's `.pub` file, or why sshd would reject the directive.
 ///
-/// Win32-OpenSSH writes them as `__PROGRAMDATA__/ssh/ssh_host_rsa_key`, expanded here
-/// against `program_data`. Relative paths are skipped: sshd resolves them against its own
+/// Win32-OpenSSH writes paths as `__PROGRAMDATA__/ssh/ssh_host_rsa_key`, expanded here
+/// against `program_data`. Relative paths fail: sshd resolves them against its own
 /// working directory, which this process cannot know.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn sshd_config_host_keys(config: &str, program_data: &Path) -> Vec<PathBuf> {
-    config
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let (keyword, value) = line.split_once(|c: char| c.is_whitespace() || c == '=')?;
-            if !keyword.eq_ignore_ascii_case("HostKey") {
-                return None;
+fn sshd_config_host_keys(
+    config: &str,
+    config_path: &Path,
+    program_data: &Path,
+) -> Vec<HostKeyCandidate> {
+    let mut keys = Vec::new();
+    for (index, line) in config.lines().enumerate() {
+        let line = line.trim_end_matches([' ', '\t', '\r', '\n', '\x0c']);
+        let Some((keyword, rest)) = sshd_config_keyword(line) else {
+            continue;
+        };
+        if !keyword.eq_ignore_ascii_case("HostKey") {
+            continue;
+        }
+        let rejected = |why: &str| {
+            Err((
+                config_path.to_path_buf(),
+                format!("line {}: HostKey {why}", index + 1),
+            ))
+        };
+        keys.push(match sshd_config_arguments(rest).as_deref() {
+            Ok([value]) if !value.is_empty() => host_key_public_path(value, program_data),
+            Ok([] | [_]) => rejected("names no file"),
+            Ok(_) => rejected("has extra arguments"),
+            Err(why) => rejected(why),
+        });
+    }
+    keys
+}
+
+/// The `.pub` file for a `HostKey` path as sshd_config spells it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn host_key_public_path(value: &str, program_data: &Path) -> HostKeyCandidate {
+    let key = match value.strip_prefix("__PROGRAMDATA__") {
+        Some(rest) => rest
+            .split(['/', '\\'])
+            .filter(|component| !component.is_empty())
+            .fold(program_data.to_path_buf(), |path, component| {
+                path.join(component)
+            }),
+        None => {
+            let key = PathBuf::from(value);
+            if !key.is_absolute() {
+                return Err((
+                    key,
+                    "relative HostKey path; sshd resolves it against its own working directory"
+                        .into(),
+                ));
             }
-            let value = value.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
-            let value = value.trim();
-            let value = value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(value);
-            if let Some(rest) = value.strip_prefix("__PROGRAMDATA__") {
-                return Some(
-                    rest.split(['/', '\\'])
-                        .filter(|component| !component.is_empty())
-                        .fold(program_data.to_path_buf(), |path, component| {
-                            path.join(component)
-                        }),
-                );
+            key
+        }
+    };
+    let mut public = key.into_os_string();
+    public.push(".pub");
+    Ok(PathBuf::from(public))
+}
+
+/// An sshd_config line's keyword and the text after it, split like OpenSSH's `strdelim`:
+/// whitespace or one `=` (with optional whitespace around it) ends the keyword, and a
+/// double-quoted span is part of it. `None` when the keyword's quote never closes, a line
+/// sshd ignores.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sshd_config_keyword(line: &str) -> Option<(String, &str)> {
+    const WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+    let line = line.trim_start_matches(WHITESPACE);
+    let Some(at) = line.find(|c: char| WHITESPACE.contains(&c) || c == '"' || c == '=') else {
+        return Some((line.to_string(), ""));
+    };
+    let mut keyword = line[..at].to_string();
+    let delimiter = line.as_bytes()[at];
+    let rest = &line[at + 1..];
+    if delimiter == b'"' {
+        let close = rest.find('"')?;
+        keyword.push_str(&rest[..close]);
+        return Some((keyword, rest[close + 1..].trim_start_matches(WHITESPACE)));
+    }
+    let mut rest = rest.trim_start_matches(WHITESPACE);
+    if delimiter != b'=' {
+        if let Some(after) = rest.strip_prefix('=') {
+            rest = after.trim_start_matches(WHITESPACE);
+        }
+    }
+    Some((keyword, rest))
+}
+
+/// A directive's arguments, split like OpenSSH's `argv_split` with comments on: spaces and
+/// tabs separate, single or double quotes group, `\` escapes a quote, a backslash or an
+/// unquoted space (any other `\` is kept, so Windows paths survive), and a `#` that starts
+/// an argument begins a comment.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sshd_config_arguments(text: &str) -> Result<Vec<String>, &'static str> {
+    let mut args = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+        if matches!(chars.peek(), None | Some('#')) {
+            return Ok(args);
+        }
+        let mut arg = String::new();
+        let mut quote = None;
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.peek().copied() {
+                    Some(next)
+                        if matches!(next, '\'' | '"' | '\\')
+                            || (quote.is_none() && next == ' ') =>
+                    {
+                        arg.push(next);
+                        chars.next();
+                    }
+                    _ => arg.push('\\'),
+                },
+                ' ' | '\t' if quote.is_none() => break,
+                '"' | '\'' if quote.is_none() => quote = Some(c),
+                c if quote == Some(c) => quote = None,
+                c => arg.push(c),
             }
-            let path = PathBuf::from(value);
-            path.is_absolute().then_some(path)
-        })
-        .collect()
+        }
+        if quote.is_some() {
+            return Err("has unterminated quotes");
+        }
+        args.push(arg);
+    }
 }
 
 /// What the phone sends to redeem a pairing token.
@@ -944,44 +1057,105 @@ mod tests {
     fn host_key_candidates_default_to_ed25519_then_rsa() {
         let dir = Path::new("/etc/ssh");
         assert_eq!(
-            ssh_host_key_candidates(dir, &[]),
+            ssh_host_key_candidates(dir, Vec::new()),
             vec![
-                PathBuf::from("/etc/ssh/ssh_host_ed25519_key.pub"),
-                PathBuf::from("/etc/ssh/ssh_host_rsa_key.pub"),
+                Ok(PathBuf::from("/etc/ssh/ssh_host_ed25519_key.pub")),
+                Ok(PathBuf::from("/etc/ssh/ssh_host_rsa_key.pub")),
             ]
         );
     }
 
     #[test]
-    fn configured_host_keys_replace_the_defaults() {
+    fn configured_host_keys_replace_the_defaults_even_when_unusable() {
         let program_data = Path::new(r"C:\ProgramData");
-        let configured = [program_data.join("ssh").join("ssh_host_ecdsa_key")];
+        let configured = vec![
+            Ok(program_data.join("ssh").join("ssh_host_ecdsa_key.pub")),
+            Err((PathBuf::from("relative_key"), "relative".into())),
+        ];
         assert_eq!(
-            ssh_host_key_candidates(&program_data.join("ssh"), &configured),
-            vec![program_data.join("ssh").join("ssh_host_ecdsa_key.pub")]
+            ssh_host_key_candidates(&program_data.join("ssh"), configured.clone()),
+            configured
+        );
+        let unusable = vec![Err((PathBuf::from("relative_key"), "relative".into()))];
+        assert_eq!(
+            ssh_host_key_candidates(&program_data.join("ssh"), unusable.clone()),
+            unusable
         );
     }
 
+    /// Each line's expected reading was cross-checked against OpenSSH 9.6p1's own parser
+    /// (`sshd -T -f <config>`, with `__PROGRAMDATA__` spelled as an absolute path).
     #[test]
-    fn sshd_config_host_keys_expand_programdata_and_skip_comments() {
+    fn windows_sshd_config_host_keys_follow_sshd_quoting_and_comments() {
         let program_data = Path::new(r"C:\ProgramData");
+        let config_path = program_data.join("ssh").join("sshd_config");
+        let ssh = program_data.join("ssh");
         let absolute = std::env::temp_dir().join("herdr_host_key");
-        let config = format!(
-            "#HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key\n\
-             HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key\n\
-             hostkey=\"__PROGRAMDATA__\\ssh\\ssh_host_ecdsa_key\"\n\
-             HostKey relative_key\n\
-             HostKey {}\n\
-             Port 22\n",
-            absolute.display()
+        let config = [
+            "#HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key",
+            "HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key # active key",
+            "HostKey \"__PROGRAMDATA__/ssh/custom key\" # quoted, then a comment",
+            "HostKey \"__PROGRAMDATA__/ssh/quoted#hash\"",
+            "HostKey __PROGRAMDATA__/ssh/bare#hash",
+            "hostkey=__PROGRAMDATA__\\ssh\\ssh_host_ecdsa_key",
+            "HostKey = '__PROGRAMDATA__/ssh/single quoted'",
+            "HostKey __PROGRAMDATA__/ssh/escaped\\ space",
+            &format!("  HostKey\t\"{}\"\r", absolute.display()),
+            "HostKey relative_key",
+            "HostKey # nothing but a comment",
+            "HostKey \"__PROGRAMDATA__/ssh/unterminated",
+            "HostKey __PROGRAMDATA__/ssh/one __PROGRAMDATA__/ssh/two",
+            "Port 22",
+        ]
+        .join("\n");
+        let rejected = |line: usize, why: &str| {
+            Err((config_path.clone(), format!("line {line}: HostKey {why}")))
+        };
+        assert_eq!(
+            sshd_config_host_keys(&config, &config_path, program_data),
+            vec![
+                Ok(ssh.join("ssh_host_ed25519_key.pub")),
+                Ok(ssh.join("custom key.pub")),
+                Ok(ssh.join("quoted#hash.pub")),
+                Ok(ssh.join("bare#hash.pub")),
+                Ok(ssh.join("ssh_host_ecdsa_key.pub")),
+                Ok(ssh.join("single quoted.pub")),
+                Ok(ssh.join("escaped space.pub")),
+                Ok(PathBuf::from(format!("{}.pub", absolute.display()))),
+                Err((
+                    PathBuf::from("relative_key"),
+                    "relative HostKey path; sshd resolves it against its own working directory"
+                        .into()
+                )),
+                rejected(11, "names no file"),
+                rejected(12, "has unterminated quotes"),
+                rejected(13, "has extra arguments"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_unusable_configured_host_keys_fail_instead_of_pinning_a_default() {
+        let program_data = std::env::temp_dir().join("herdr-no-such-programdata");
+        let ssh = program_data.join("ssh");
+        let config_path = ssh.join("sshd_config");
+        let config = "HostKey relative_key\nHostKey __PROGRAMDATA__/ssh/missing_key # gone\n";
+        let candidates = ssh_host_key_candidates(
+            &ssh,
+            sshd_config_host_keys(config, &config_path, &program_data),
         );
         assert_eq!(
-            sshd_config_host_keys(&config, program_data),
-            vec![
-                program_data.join("ssh").join("ssh_host_ed25519_key"),
-                program_data.join("ssh").join("ssh_host_ecdsa_key"),
-                absolute,
-            ]
+            best_host_key_fingerprint(candidates),
+            Err(HostKeyLookupFailure {
+                tried: vec![
+                    (
+                        PathBuf::from("relative_key"),
+                        "relative HostKey path; sshd resolves it against its own working directory"
+                            .into()
+                    ),
+                    (ssh.join("missing_key.pub"), "not found".into()),
+                ]
+            })
         );
     }
 
