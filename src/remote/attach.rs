@@ -2791,19 +2791,21 @@ pub(super) fn cached_remote_api_command(
 
 /// The persistent `api-bridge --multi` for a saved machine's cached API
 /// executable, selecting `session` exactly as [`cached_remote_api_command`]
-/// does for `remote-api-bridge` and travelling base64-encoded for the same
-/// reason. `None` for Windows, which has no `api-bridge --multi`.
+/// does for `remote-api-bridge` and launched the same way on each platform.
 pub(super) fn cached_remote_api_multi_command(
     metadata: &crate::client::endpoint::SshMachineMetadata,
     session: &str,
-) -> Option<String> {
+) -> String {
     if metadata.os == "windows" {
-        return None;
+        return windows_powershell_streaming_application_command(
+            &metadata.executable,
+            &["--session", session, "api-bridge", "--multi"],
+        );
     }
     let path = shell_quote(&metadata.executable);
     let session = shell_quote(session);
-    Some(posix_base64_command(&posix_remote_output_command(
-        &format!("exec {path} --session {session} api-bridge --multi <&3"),
+    posix_base64_command(&posix_remote_output_command(&format!(
+        "exec {path} --session {session} api-bridge --multi <&3"
     )))
 }
 
@@ -5728,7 +5730,7 @@ function Get-Process {
             .expect("UTF-8 script")
         };
         for session in ["default", "agents"] {
-            let multi = decode(&cached_remote_api_multi_command(&posix, session).unwrap());
+            let multi = decode(&cached_remote_api_multi_command(&posix, session));
             assert_eq!(
                 multi,
                 posix_remote_output_command(&format!(
@@ -5745,7 +5747,21 @@ function Get-Process {
             os: "windows".into(),
             executable: "C:\\herdr.exe".into(),
         };
-        assert_eq!(cached_remote_api_multi_command(&windows, "default"), None);
+        for session in ["default", "agents"] {
+            let multi = decode_windows_command(&cached_remote_api_multi_command(&windows, session));
+            assert!(
+                multi.contains("Start-Process -FilePath 'C:\\herdr.exe'"),
+                "{multi}"
+            );
+            assert!(
+                multi.contains(&format!("--session {session} api-bridge --multi")),
+                "{multi}"
+            );
+            assert!(
+                decode_windows_command(&cached_remote_api_command(&windows, session))
+                    .contains(&format!("--session {session} remote-api-bridge")),
+            );
+        }
     }
 
     #[test]

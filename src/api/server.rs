@@ -211,7 +211,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_forget: true,
         agent_avatar: true,
         agent_groups: true,
-        api_bridge_multi: cfg!(unix),
+        api_bridge_multi: true,
         pane_history: true,
         agent_answer: true,
         agent_transcript: true,
@@ -4438,7 +4438,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_advertises_api_bridge_multi_on_unix() {
+    fn ping_advertises_api_bridge_multi() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
             Request {
@@ -4452,10 +4452,7 @@ mod tests {
             None,
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["capabilities"]["api_bridge_multi"],
-            cfg!(unix)
-        );
+        assert_eq!(value["result"]["capabilities"]["api_bridge_multi"], true);
     }
 
     #[test]

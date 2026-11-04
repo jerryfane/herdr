@@ -215,13 +215,7 @@ pub(crate) fn saved_peer_api_channel_command(
                 "saved machine API metadata is not cached",
             )
         })?;
-    let remote_command = super::attach::cached_remote_api_multi_command(&metadata, session)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "saved machine has no api-bridge --multi",
-            )
-        })?;
+    let remote_command = super::attach::cached_remote_api_multi_command(&metadata, session);
     Ok(super::attach::ssh_exec_command(
         target,
         &remote_command,
