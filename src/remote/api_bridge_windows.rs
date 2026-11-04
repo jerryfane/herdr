@@ -1,12 +1,12 @@
 //! Windows transport for `herdr api-bridge` (see `api_bridge`): a named-pipe
 //! connection to the local API endpoint, read by polling `PeekNamedPipe` so
 //! another thread can end it, writes that a shutdown cancels with
-//! `CancelSynchronousIo`, and a zero-byte write probe on stdout to notice the
-//! SSH channel going away.
+//! `CancelIoEx`, and a zero-byte write probe on stdout to notice the SSH
+//! channel going away.
 
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,18 +22,19 @@ const READ_POLL_MIN_INTERVAL: Duration = Duration::from_millis(1);
 const READ_POLL_MAX_INTERVAL: Duration = Duration::from_millis(16);
 /// The Unix bridge's back-off between stdout polls.
 const HANGUP_PROBE_INTERVAL: Duration = Duration::from_millis(50);
-/// A shutdown can catch a write after it registered but before it entered the
-/// kernel, when there is nothing to cancel yet. It retries this often, for at
+/// A shutdown can catch a write after it registered but before it issued its
+/// I/O, when there is nothing to cancel yet. It retries this often, for at
 /// most [`WRITE_CANCEL_ATTEMPTS`] tries (one second).
 const WRITE_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const WRITE_CANCEL_ATTEMPTS: u32 = 1000;
 
-/// A connection to the API pipe. Synchronous named-pipe I/O cannot be woken
-/// from another thread by closing the handle. Reads therefore poll
-/// `PeekNamedPipe` (as herdr's other Windows pipe readers do) and end at end of
-/// file once [`ConnectionShutdown::shut_down`] runs. A write or flush blocked
-/// on a peer that stopped reading is cancelled instead. Both behave like a
-/// Unix socket after `shutdown(2)`.
+/// A connection to the API pipe. interprocess runs every pipe operation as
+/// overlapped I/O plus an alertable wait, which another thread cannot wake
+/// by closing the handle. Reads therefore poll `PeekNamedPipe` (as herdr's
+/// other Windows pipe readers do) and end at end of file once
+/// [`ConnectionShutdown::shut_down`] runs. A write or flush blocked on a
+/// peer that stopped reading is cancelled instead. Both behave like a Unix
+/// socket after `shutdown(2)`.
 pub(super) struct Connection {
     stream: LocalStream,
     shared: Arc<Shared>,
@@ -43,8 +44,10 @@ pub(super) struct Connection {
 #[derive(Default)]
 struct Shared {
     shut_down: AtomicBool,
-    /// The thread inside a write or flush of the pipe, for `CancelSynchronousIo`.
-    writer: Mutex<Option<OwnedHandle>>,
+    /// The pipe handle while a write or flush is using it, for `CancelIoEx`.
+    /// Set only for the duration of the call, so the handle is open whenever
+    /// a shutdown sees it.
+    writing: Mutex<Option<usize>>,
 }
 
 impl Shared {
@@ -52,8 +55,8 @@ impl Shared {
         self.shut_down.load(Ordering::Acquire)
     }
 
-    fn writer(&self) -> MutexGuard<'_, Option<OwnedHandle>> {
-        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    fn writing(&self) -> MutexGuard<'_, Option<usize>> {
+        self.writing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -72,44 +75,20 @@ impl Connection {
         io: impl FnOnce(&mut LocalStream) -> io::Result<T>,
     ) -> io::Result<T> {
         {
-            let mut writer = self.shared.writer();
+            let mut writing = self.shared.writing();
             if self.shared.is_shut_down() {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
-            *writer = Some(current_thread()?);
+            let LocalStream::NamedPipe(pipe) = &self.stream;
+            *writing = Some(pipe.inner().as_handle().as_raw_handle() as usize);
         }
         let result = io(&mut self.stream);
-        *self.shared.writer() = None;
+        *self.shared.writing() = None;
         match result {
             Err(_) if self.shared.is_shut_down() => Err(io::ErrorKind::BrokenPipe.into()),
             result => result,
         }
     }
-}
-
-/// A real handle to the calling thread (`GetCurrentThread` is only a pseudo
-/// handle, meaningless to another thread).
-fn current_thread() -> io::Result<OwnedHandle> {
-    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
-
-    let mut handle = std::ptr::null_mut();
-    if unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            GetCurrentThread(),
-            GetCurrentProcess(),
-            &mut handle,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: DuplicateHandle succeeded, so `handle` is a new handle we own.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 impl Read for Connection {
@@ -166,23 +145,23 @@ impl ConnectionShutdown {
     }
 
     pub(super) fn shut_down(&self) {
-        use windows_sys::Win32::System::IO::CancelSynchronousIo;
+        use windows_sys::Win32::System::IO::CancelIoEx;
 
-        let mut writer = self.0.writer();
+        let mut writing = self.0.writing();
         self.0.shut_down.store(true, Ordering::Release);
         for _ in 0..WRITE_CANCEL_ATTEMPTS {
-            let Some(thread) = writer.as_ref() else {
+            let Some(pipe) = *writing else {
                 return;
             };
             // Fails with ERROR_NOT_FOUND while the registered write has not
-            // entered the kernel yet. The writer clears its slot when the
-            // call returns, so a retry never cancels unrelated I/O.
-            if unsafe { CancelSynchronousIo(thread.as_raw_handle()) } != 0 {
+            // issued its I/O yet. The connection is used by one thread at a
+            // time, so the only I/O on the handle is the registered call.
+            if unsafe { CancelIoEx(pipe as _, std::ptr::null()) } != 0 {
                 return;
             }
-            drop(writer);
+            drop(writing);
             std::thread::sleep(WRITE_CANCEL_RETRY_INTERVAL);
-            writer = self.0.writer();
+            writing = self.0.writing();
         }
     }
 }
