@@ -133,13 +133,19 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             );
             return Ok(1);
         }
-        Err(SshReadinessError::MissingHostKey { address }) => {
+        Err(SshReadinessError::MissingHostKey { address, failure }) => {
             eprintln!(
-                "herdr pair: SSH is reachable at {address}, but its host-key fingerprint could not be read. Pairing stopped because Herdrup requires a pinned host identity. {}",
+                "herdr pair: SSH is reachable at {address}, but its host-key fingerprint could not be read ({failure}). Pairing stopped because Herdrup requires a pinned host identity. {}",
                 crate::platform::ssh_pairing_setup_hint()
             );
             return Ok(1);
         }
+    };
+    let Some(user) = pair_user_from_env(cfg!(windows), |name| std::env::var_os(name)) else {
+        eprintln!(
+            "herdr pair: could not tell which account the phone should sign in as: USER, LOGNAME, USERNAME, USERPROFILE and HOME are all unset. Set USERNAME to your Windows account name, then run `herdr pair` again."
+        );
+        return Ok(1);
     };
 
     let listener = match std::net::TcpListener::bind((bind_ip, port)) {
@@ -152,9 +158,6 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     let local = listener.local_addr()?;
 
     let token = pairing::PairingToken::generate()?;
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "root".into());
     let payload = pairing::PairingPayload {
         v: pairing::PAIRING_PAYLOAD_VERSION,
         host: bind_ip.to_string(),
@@ -275,10 +278,25 @@ fn home_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/root"))
 }
 
+/// The account the phone signs in as. Unix keeps its historical `root` default; Windows
+/// has no `root` account, so a guess there would only fail later at SSH authentication.
+fn pair_user_from_env(
+    is_windows: bool,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    super::login_user_from_env(env).or_else(|| (!is_windows).then(|| "root".to_string()))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SshReadinessError {
-    NotListening { address: SocketAddr, cause: String },
-    MissingHostKey { address: SocketAddr },
+    NotListening {
+        address: SocketAddr,
+        cause: String,
+    },
+    MissingHostKey {
+        address: SocketAddr,
+        failure: pairing::HostKeyLookupFailure,
+    },
 }
 
 fn ssh_readiness(bind_ip: Ipv4Addr) -> Result<String, SshReadinessError> {
@@ -296,12 +314,12 @@ fn ssh_readiness(bind_ip: Ipv4Addr) -> Result<String, SshReadinessError> {
 fn ssh_readiness_with(
     bind_ip: Ipv4Addr,
     connect: impl FnOnce(SocketAddr, Duration) -> Result<(), String>,
-    fingerprint: impl FnOnce() -> Option<String>,
+    fingerprint: impl FnOnce() -> Result<String, pairing::HostKeyLookupFailure>,
 ) -> Result<String, SshReadinessError> {
     let address = SocketAddr::from((bind_ip, 22));
     connect(address, SSH_READY_TIMEOUT)
         .map_err(|cause| SshReadinessError::NotListening { address, cause })?;
-    fingerprint().ok_or(SshReadinessError::MissingHostKey { address })
+    fingerprint().map_err(|failure| SshReadinessError::MissingHostKey { address, failure })
 }
 
 /// Render the SAME help clap builds for `herdr pair --help`, taken from `spec.rs`.
@@ -335,7 +353,7 @@ mod tests {
             |_address, _timeout| Err("connection refused".into()),
             || {
                 fingerprint_called.set(true);
-                Some("SHA256:should-not-be-read".into())
+                Ok("SHA256:should-not-be-read".into())
             },
         );
         assert!(matches!(
@@ -353,14 +371,24 @@ mod tests {
                 assert_eq!(timeout, SSH_READY_TIMEOUT);
                 Ok(())
             },
-            || None,
+            || Err(missing_key_failure()),
         );
         assert_eq!(
             result,
             Err(SshReadinessError::MissingHostKey {
-                address: "100.64.1.2:22".parse().expect("socket address")
+                address: "100.64.1.2:22".parse().expect("socket address"),
+                failure: missing_key_failure(),
             })
         );
+    }
+
+    fn missing_key_failure() -> pairing::HostKeyLookupFailure {
+        pairing::HostKeyLookupFailure {
+            tried: vec![(
+                PathBuf::from("/etc/ssh/ssh_host_ed25519_key.pub"),
+                "not found".into(),
+            )],
+        }
     }
 
     #[test]
@@ -371,9 +399,26 @@ mod tests {
                 assert_eq!(address, "100.64.1.2:22".parse().expect("socket address"));
                 Ok(())
             },
-            || Some("SHA256:exact".into()),
+            || Ok("SHA256:exact".into()),
         );
         assert_eq!(result, Ok("SHA256:exact".into()));
+    }
+
+    #[test]
+    fn pair_user_defaults_to_root_only_on_unix() {
+        assert_eq!(pair_user_from_env(false, |_| None), Some("root".into()));
+        assert_eq!(pair_user_from_env(true, |_| None), None);
+    }
+
+    #[test]
+    fn pair_user_prefers_the_environment_over_the_default() {
+        let only_username = |name: &str| (name == "USERNAME").then(|| "warez".into());
+        for is_windows in [false, true] {
+            assert_eq!(
+                pair_user_from_env(is_windows, only_username),
+                Some("warez".into())
+            );
+        }
     }
 
     #[test]

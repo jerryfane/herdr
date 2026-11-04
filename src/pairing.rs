@@ -417,34 +417,185 @@ pub fn qr_cells(data: &str) -> Result<Vec<Vec<QrCell>>, String> {
 /// and terminal output has no natural margin at all.
 const QUIET_MODULES: i32 = 4;
 
+/// The host keys sshd uses when its config names none, in the order pairing prefers them.
+const DEFAULT_HOST_KEY_NAMES: [&str; 2] = ["ssh_host_ed25519_key", "ssh_host_rsa_key"];
+
+/// Key types the fingerprint step may pin, most preferred first. Anything else
+/// `ssh-keygen -lf` reports (OpenSSH 10's post-quantum `MLDSA44-ED25519` host keys, say)
+/// is skipped: it is not a key the app would be offered for a pin.
+const PINNABLE_HOST_KEY_TYPES: [&str; 3] = ["ED25519", "RSA", "ECDSA"];
+
+/// Why no host-key fingerprint could be read: every `.pub` file tried, and what stopped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyLookupFailure {
+    pub tried: Vec<(PathBuf, String)>,
+}
+
+impl fmt::Display for HostKeyLookupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.tried.is_empty() {
+            return f.write_str("no sshd config directory is known (PROGRAMDATA is not set)");
+        }
+        f.write_str("tried ")?;
+        for (index, (path, why)) in self.tried.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{} ({why})", path.display())?;
+        }
+        Ok(())
+    }
+}
+
 /// This machine's SSH host-key fingerprint, as `ssh-keygen -lf` prints it.
 ///
 /// Read from the host key sshd actually serves, so the app pins the same key it will be
-/// offered. Returns `None` when no ed25519 host key is readable — pairing then has to fall
-/// back to trust-on-first-use, and the caller says so out loud rather than pretending.
-pub fn ssh_host_key_fingerprint() -> Option<String> {
-    for path in [
-        "/etc/ssh/ssh_host_ed25519_key.pub",
-        "/etc/ssh/ssh_host_rsa_key.pub",
-    ] {
-        if !Path::new(path).exists() {
-            continue;
-        }
-        let out = std::process::Command::new("ssh-keygen")
-            .args(["-lf", path])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            continue;
-        }
-        let text = String::from_utf8(out.stdout).ok()?;
-        if let Some(fp) = text.split_whitespace().nth(1) {
-            if fp.starts_with("SHA256:") {
-                return Some(fp.to_string());
+/// offered. Fails when no ed25519, RSA or ECDSA host key is readable; the failure lists
+/// every file tried, so the caller can say where it looked rather than pretending.
+pub fn ssh_host_key_fingerprint() -> Result<String, HostKeyLookupFailure> {
+    let candidates = match sshd_config_dir() {
+        Some(dir) => ssh_host_key_candidates(&dir, &configured_host_keys(&dir)),
+        None => Vec::new(),
+    };
+    let mut tried = Vec::new();
+    let mut best: Option<(usize, String)> = None;
+    for path in candidates {
+        match read_host_key_fingerprint(&path) {
+            Ok((0, fingerprint)) => return Ok(fingerprint),
+            Ok((rank, fingerprint)) => {
+                if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                    best = Some((rank, fingerprint));
+                }
             }
+            Err(why) => tried.push((path, why)),
         }
     }
-    None
+    best.map(|(_, fingerprint)| fingerprint)
+        .ok_or(HostKeyLookupFailure { tried })
+}
+
+/// One `.pub` file's fingerprint and its rank in [`PINNABLE_HOST_KEY_TYPES`].
+fn read_host_key_fingerprint(path: &Path) -> Result<(usize, String), String> {
+    if !path.exists() {
+        return Err("not found".into());
+    }
+    let out = std::process::Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(path)
+        .output()
+        .map_err(|err| format!("could not run ssh-keygen: {err}"))?;
+    if !out.status.success() {
+        return Err("ssh-keygen -lf could not read it".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_ssh_keygen_fingerprint(&text)
+}
+
+/// Parse `ssh-keygen -lf` output: `256 SHA256:... comment (ED25519)`.
+fn parse_ssh_keygen_fingerprint(text: &str) -> Result<(usize, String), String> {
+    let mut fields = text.split_whitespace();
+    let fingerprint = fields
+        .nth(1)
+        .filter(|fp| fp.starts_with("SHA256:"))
+        .ok_or("ssh-keygen printed no SHA256 fingerprint")?;
+    let key_type = fields
+        .last()
+        .and_then(|last| last.strip_prefix('('))
+        .and_then(|last| last.strip_suffix(')'))
+        .unwrap_or("");
+    let rank = PINNABLE_HOST_KEY_TYPES
+        .iter()
+        .position(|pinnable| *pinnable == key_type)
+        .ok_or_else(|| format!("unsupported key type {key_type:?}"))?;
+    Ok((rank, fingerprint.to_string()))
+}
+
+/// Where sshd keeps its host keys and `sshd_config`.
+#[cfg(not(windows))]
+fn sshd_config_dir() -> Option<PathBuf> {
+    Some(PathBuf::from("/etc/ssh"))
+}
+
+/// Where sshd keeps its host keys and `sshd_config`: Win32-OpenSSH uses
+/// `%ProgramData%\ssh`. `/etc/ssh` would resolve against the current drive's root.
+#[cfg(windows)]
+fn sshd_config_dir() -> Option<PathBuf> {
+    std::env::var_os("PROGRAMDATA")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join("ssh"))
+}
+
+/// The private host keys `sshd_config` names. Unix keeps probing the default names only.
+#[cfg(not(windows))]
+fn configured_host_keys(_sshd_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// The private host keys `%ProgramData%\ssh\sshd_config` names with `HostKey`.
+#[cfg(windows)]
+fn configured_host_keys(sshd_dir: &Path) -> Vec<PathBuf> {
+    let (Some(program_data), Ok(config)) = (
+        sshd_dir.parent(),
+        std::fs::read_to_string(sshd_dir.join("sshd_config")),
+    ) else {
+        return Vec::new();
+    };
+    sshd_config_host_keys(&config, program_data)
+}
+
+/// The `.pub` files to fingerprint, in order: the `HostKey` files sshd_config names when
+/// it names any (sshd then serves only those), otherwise the default names in `sshd_dir`.
+fn ssh_host_key_candidates(sshd_dir: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
+    if configured.is_empty() {
+        return DEFAULT_HOST_KEY_NAMES
+            .iter()
+            .map(|name| sshd_dir.join(format!("{name}.pub")))
+            .collect();
+    }
+    configured
+        .iter()
+        .map(|key| {
+            let mut public = key.clone().into_os_string();
+            public.push(".pub");
+            PathBuf::from(public)
+        })
+        .collect()
+}
+
+/// The private key paths named by `HostKey` lines in a Win32-OpenSSH `sshd_config`.
+///
+/// Win32-OpenSSH writes them as `__PROGRAMDATA__/ssh/ssh_host_rsa_key`, expanded here
+/// against `program_data`. Relative paths are skipped: sshd resolves them against its own
+/// working directory, which this process cannot know.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sshd_config_host_keys(config: &str, program_data: &Path) -> Vec<PathBuf> {
+    config
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (keyword, value) = line.split_once(|c: char| c.is_whitespace() || c == '=')?;
+            if !keyword.eq_ignore_ascii_case("HostKey") {
+                return None;
+            }
+            let value = value.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            if let Some(rest) = value.strip_prefix("__PROGRAMDATA__") {
+                return Some(
+                    rest.split(['/', '\\'])
+                        .filter(|component| !component.is_empty())
+                        .fold(program_data.to_path_buf(), |path, component| {
+                            path.join(component)
+                        }),
+                );
+            }
+            let path = PathBuf::from(value);
+            path.is_absolute().then_some(path)
+        })
+        .collect()
 }
 
 /// What the phone sends to redeem a pairing token.
@@ -778,6 +929,92 @@ pub fn append_authorized_key(path: &Path, line: &str) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_keys_live_under_programdata_not_the_drive_root() {
+        let program_data = std::env::var_os("PROGRAMDATA").expect("PROGRAMDATA is set");
+        assert_eq!(
+            sshd_config_dir(),
+            Some(PathBuf::from(program_data).join("ssh"))
+        );
+    }
+
+    #[test]
+    fn host_key_candidates_default_to_ed25519_then_rsa() {
+        let dir = Path::new("/etc/ssh");
+        assert_eq!(
+            ssh_host_key_candidates(dir, &[]),
+            vec![
+                PathBuf::from("/etc/ssh/ssh_host_ed25519_key.pub"),
+                PathBuf::from("/etc/ssh/ssh_host_rsa_key.pub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_host_keys_replace_the_defaults() {
+        let program_data = Path::new(r"C:\ProgramData");
+        let configured = [program_data.join("ssh").join("ssh_host_ecdsa_key")];
+        assert_eq!(
+            ssh_host_key_candidates(&program_data.join("ssh"), &configured),
+            vec![program_data.join("ssh").join("ssh_host_ecdsa_key.pub")]
+        );
+    }
+
+    #[test]
+    fn sshd_config_host_keys_expand_programdata_and_skip_comments() {
+        let program_data = Path::new(r"C:\ProgramData");
+        let absolute = std::env::temp_dir().join("herdr_host_key");
+        let config = format!(
+            "#HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key\n\
+             HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key\n\
+             hostkey=\"__PROGRAMDATA__\\ssh\\ssh_host_ecdsa_key\"\n\
+             HostKey relative_key\n\
+             HostKey {}\n\
+             Port 22\n",
+            absolute.display()
+        );
+        assert_eq!(
+            sshd_config_host_keys(&config, program_data),
+            vec![
+                program_data.join("ssh").join("ssh_host_ed25519_key"),
+                program_data.join("ssh").join("ssh_host_ecdsa_key"),
+                absolute,
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_keygen_output_yields_the_fingerprint_and_type_rank() {
+        assert_eq!(
+            parse_ssh_keygen_fingerprint("256 SHA256:abc root@box (ED25519)\n"),
+            Ok((0, "SHA256:abc".into()))
+        );
+        assert_eq!(
+            parse_ssh_keygen_fingerprint("3072 SHA256:def a comment with spaces (RSA)\n"),
+            Ok((1, "SHA256:def".into()))
+        );
+        assert!(parse_ssh_keygen_fingerprint("256 SHA256:ghi host (MLDSA44-ED25519)").is_err());
+        assert!(parse_ssh_keygen_fingerprint("256 MD5:aa:bb host (ED25519)").is_err());
+    }
+
+    #[test]
+    fn host_key_lookup_failure_names_every_path_tried() {
+        let failure = HostKeyLookupFailure {
+            tried: vec![
+                (PathBuf::from("/a.pub"), "not found".into()),
+                (
+                    PathBuf::from("/b.pub"),
+                    "ssh-keygen -lf could not read it".into(),
+                ),
+            ],
+        };
+        assert_eq!(
+            failure.to_string(),
+            "tried /a.pub (not found), /b.pub (ssh-keygen -lf could not read it)"
+        );
+    }
 
     #[test]
     fn a_token_is_random_and_not_reused() {

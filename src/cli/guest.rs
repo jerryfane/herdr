@@ -121,8 +121,7 @@ fn invite(args: &[String]) -> Result<i32, String> {
         .transpose()?;
     let owner_name = parsed
         .option("owner-name")
-        .or_else(|| std::env::var("USER").ok())
-        .or_else(|| std::env::var("USERNAME").ok())
+        .or_else(|| super::login_user_from_env(|name| std::env::var_os(name)))
         .unwrap_or_else(|| "owner".into());
     let machine_label = parsed
         .option("machine-label")
