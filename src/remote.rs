@@ -1,5 +1,8 @@
+mod api_bridge;
 #[cfg(unix)]
 mod api_bridge_unix;
+#[cfg(windows)]
+mod api_bridge_windows;
 mod args;
 mod attach;
 mod host;
@@ -9,8 +12,7 @@ mod saved;
 #[cfg(unix)]
 mod ssh_agent;
 
-#[cfg(unix)]
-pub(crate) use api_bridge_unix::run_api_client_bridge;
+pub(crate) use api_bridge::run_api_client_bridge;
 pub(crate) use args::*;
 pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
@@ -27,7 +29,6 @@ pub(crate) const API_BRIDGE_MULTI_MAX_IN_FLIGHT: usize = 16;
 /// It matches the server's own initial-request cap, which would refuse
 /// anything longer. Longer lines are drained and answered with
 /// `invalid_request`.
-#[cfg(unix)]
 pub(crate) const API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 
 /// Methods that keep their connection open after the first response line.
@@ -40,14 +41,6 @@ pub(crate) const API_BRIDGE_MULTI_STREAMING_METHODS: &[&str] = &[
     "gram.upload.stream",
     "server.ssh_agent.register",
 ];
-
-#[cfg(windows)]
-pub(crate) fn run_api_client_bridge(_args: &[String]) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "api-bridge is only supported on Unix remote hosts",
-    ))
-}
 
 pub(crate) fn run_remote_api_bridge(args: &[String]) -> std::io::Result<()> {
     match args {
