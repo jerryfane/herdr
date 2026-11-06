@@ -2891,6 +2891,49 @@ impl TerminalState {
         self.agent_name.is_some() || self.effective_agent_label().is_some()
     }
 
+    /// No agent runs here, but the terminal still holds one's name or session:
+    /// its name, its session pointer, a session a hook reported, or the resume
+    /// command it reported. A pane restored without resuming its agent is one.
+    pub fn holds_inactive_agent_claim(&self) -> bool {
+        self.effective_agent_label().is_none()
+            && (self.agent_name.is_some()
+                || self.persisted_agent_session.is_some()
+                || self
+                    .hook_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.session_ref.is_some())
+                || self.reported_resume.is_some())
+    }
+
+    /// The kind of agent an inactive claim belongs to, when the terminal still
+    /// knows it. Guest grants follow a rename by it, and guests are Unix-only.
+    #[cfg(unix)]
+    pub fn inactive_agent_kind(&self) -> Option<&str> {
+        self.agent_name_owner
+            .as_ref()
+            .map(|owner| owner.agent_label.as_str())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.agent.as_str())
+            })
+            .or_else(|| self.managed_agent_kind().map(crate::detect::agent_label))
+    }
+
+    /// Forget an inactive claim: the name, the session pointer, the reported
+    /// resume command, session path and runtime, the hook authority the agent
+    /// left behind, and the account it ran under. The pane stays a shell that
+    /// no session owns, and no later restore relaunches that agent in it.
+    pub fn forget_inactive_agent_claim(&mut self) {
+        self.clear_agent_name();
+        self.persisted_agent_session = None;
+        self.hook_authority = None;
+        self.set_reported_resume(None);
+        self.reported_agent_session_path = None;
+        self.reported_agent_session_runtime = None;
+        self.agent_account = None;
+    }
+
     fn reconcile_agent_name_owner(
         &mut self,
         agent_label: &str,
@@ -3051,6 +3094,46 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    /// A pane restored without its agent keeps the agent's name and session,
+    /// and that session refuses another source's report. Forgetting the claim
+    /// leaves a shell that nothing owns.
+    #[test]
+    fn forgetting_an_inactive_agent_claim_frees_the_pane() {
+        let mut terminal = test_terminal();
+        assert!(!terminal.holds_inactive_agent_claim());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("omp-session").unwrap(),
+        });
+        terminal.set_agent_name("deimos".into());
+        terminal.agent_account = Some("work".into());
+        assert!(terminal.holds_inactive_agent_claim());
+        #[cfg(unix)]
+        assert_eq!(terminal.inactive_agent_kind(), Some("omp"));
+        let report = |terminal: &mut TerminalState| {
+            terminal.set_hook_authority_at(
+                "forge".into(),
+                "forge-manager".into(),
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                Instant::now(),
+            )
+        };
+        assert!(report(&mut terminal).is_none(), "the session owns the pane");
+        assert_eq!(terminal.effective_agent_label(), None);
+
+        terminal.forget_inactive_agent_claim();
+        assert!(!terminal.holds_inactive_agent_claim());
+        assert_eq!(terminal.agent_name, None);
+        assert_eq!(terminal.persisted_agent_session, None);
+        assert_eq!(terminal.agent_account, None);
+        assert!(report(&mut terminal).is_some());
+        assert_eq!(terminal.effective_agent_label(), Some("forge-manager"));
     }
 
     #[test]

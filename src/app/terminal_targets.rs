@@ -103,6 +103,29 @@ impl App {
         })
     }
 
+    /// An `agent.rename` target: an agent, as for [`Self::resolve_agent_target`],
+    /// or by pane id a pane that hosts no agent but still holds one's session
+    /// without its name, so the owner can name or clear what it holds.
+    pub(crate) fn resolve_agent_rename_target(
+        &self,
+        target: &str,
+    ) -> Result<TerminalTarget, TerminalTargetError> {
+        self.resolve_agent_target(target).or_else(|err| {
+            let TerminalTargetError::NotFound { .. } = err else {
+                return Err(err);
+            };
+            self.parse_current_public_pane_id(target)
+                .and_then(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+                .filter(|resolved| {
+                    self.state
+                        .terminals
+                        .get(resolved.terminal_id.as_str())
+                        .is_some_and(|terminal| terminal.holds_inactive_agent_claim())
+                })
+                .ok_or(err)
+        })
+    }
+
     /// The pane currently attached to `terminal_id`, agent or not. Terminal
     /// ids are never reused, so a guest grant can pin one.
     pub(crate) fn terminal_target_for_terminal_id(

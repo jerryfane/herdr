@@ -4647,6 +4647,45 @@ mod tests {
         assert_eq!(stored.agent_name.as_deref(), Some("llm-back"));
     }
 
+    /// The agent left its pane but the pane still holds its session. An owner
+    /// rename there carries the guest's grant along; a clear forgets the
+    /// pane's claim and grants nothing, to this pane or to whoever takes the
+    /// name.
+    #[test]
+    fn a_guest_follows_a_rename_of_the_pane_its_agent_left() {
+        let _config = ConfigHome::new("rename-inactive");
+        let harness = start_renaming("rename-inactive");
+        let admitted = harness.admit();
+        let terminal_id = admitted.grant.terminal_id.clone();
+        harness.agent_exits();
+
+        rename(&harness, 0, "llm-parked");
+        let (guest, reply) = readmit(&harness, &admitted);
+        assert_eq!(reply["agent"]["name"], "llm-parked", "{reply}");
+        let lines = harness.call(&guest, prompt_request(&terminal_id, "nobody home"));
+        assert_eq!(code(&lines), "guest_paused", "{lines:?}");
+
+        clear_name(&harness, 0);
+        rename(&harness, 1, "llm-parked");
+        let (guest, reply) = readmit(&harness, &admitted);
+        assert_eq!(reply["agent"]["name"], "llm-parked", "{reply}");
+        let lines = harness.call(&guest, prompt_request(&harness.pane_ids[1], "impostor"));
+        assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+        assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+        let again = owner(
+            &harness,
+            json!({"id": "r", "method": "agent.rename", "params": {"target": harness.pane_ids[0], "name": "llm-back"}}),
+        );
+        assert_eq!(again["error"]["code"], "agent_not_found", "{again}");
+        let stored = crate::guest::store::load_store(&harness.dir.0).unwrap();
+        assert_eq!(stored.guests.len(), 1, "no grant was made");
+        assert_eq!(stored.guests[0].grant.terminal_id, terminal_id);
+        assert_eq!(
+            stored.guests[0].grant.agent_name.as_deref(),
+            Some("llm-parked")
+        );
+    }
+
     #[test]
     fn an_owner_rename_keeps_the_guest_on_the_agent_under_its_new_name() {
         let _config = ConfigHome::new("rename-access");
