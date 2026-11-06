@@ -212,25 +212,41 @@ pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
-    let mut keyboard_forwarded = false;
-    apply_client_terminal_input_events(runtime, events, true, &mut keyboard_forwarded)?;
-    Ok(keyboard_forwarded)
+    let mut forwarded = ForwardedInput::default();
+    apply_client_terminal_input_events(runtime, events, true, &mut forwarded)?;
+    Ok(forwarded.keyboard)
 }
 
 pub(super) fn apply_client_popup_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
-    let mut keyboard_forwarded = false;
-    apply_client_terminal_input_events(runtime, events, false, &mut keyboard_forwarded)?;
-    Ok(keyboard_forwarded)
+    let mut forwarded = ForwardedInput::default();
+    apply_client_terminal_input_events(runtime, events, false, &mut forwarded)?;
+    Ok(forwarded.keyboard)
+}
+
+/// What an attached client's input batch delivered to the pane.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ForwardedInput {
+    /// Key presses or typed text reached the PTY.
+    pub(super) keyboard: bool,
+    /// A non-empty paste reached the PTY.
+    pub(super) paste: bool,
+}
+
+impl ForwardedInput {
+    /// The person at the client typed or pasted into the pane.
+    pub(super) fn owner_input(self) -> bool {
+        self.keyboard || self.paste
+    }
 }
 
 pub(super) fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
-    keyboard_forwarded: &mut bool,
+    forwarded: &mut ForwardedInput,
 ) -> Result<(), String> {
     for event in events {
         if let ClientPaneInputEvent::Mouse {
@@ -329,7 +345,7 @@ pub(super) fn apply_client_terminal_input_events(
                     runtime
                         .try_send_bytes(Bytes::from(bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
-                    *keyboard_forwarded |= key_event.kind != KeyEventKind::Release;
+                    forwarded.keyboard |= key_event.kind != KeyEventKind::Release;
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
@@ -337,13 +353,15 @@ pub(super) fn apply_client_terminal_input_events(
                 runtime
                     .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
-                *keyboard_forwarded |= !text.as_str().is_empty();
+                forwarded.keyboard |= !text.as_str().is_empty();
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
+                let pasted = !text.is_empty();
                 runtime
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
+                forwarded.paste |= pasted;
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained

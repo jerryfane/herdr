@@ -290,15 +290,44 @@ impl FederationStore {
 
     /// Record a relayed `pane.turn_completed`: the pane's turn and epoch move
     /// forward (never back) in the cache and in the relay baseline, so an older
-    /// poll cannot rewind them.
-    pub fn relay_turn(
-        &mut self,
-        alias: &str,
-        pane_id: &str,
-        turn: u64,
-        turn_epoch: u64,
-        now: Instant,
-    ) {
+    /// poll cannot rewind them, and the cached agent's `last_completed_turn`
+    /// (with who started the turn) becomes this one.
+    pub fn relay_turn(&mut self, alias: &str, completed: RelayedTurn, now: Instant) {
+        let RelayedTurn {
+            pane_id,
+            turn,
+            turn_epoch,
+            completed_unix_ms,
+            turn_origin,
+        } = completed;
+        let pane_id = pane_id.as_str();
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return;
+        };
+        // The push tracker reads who started the finished turn from here.
+        let mut completed_changed = false;
+        if let Some(agent) = entry
+            .agents
+            .iter_mut()
+            .find(|agent| agent.pane_id == pane_id)
+        {
+            let newer = agent
+                .last_completed_turn
+                .as_ref()
+                .is_none_or(|last| last.turn_epoch != turn_epoch || last.turn < turn);
+            if newer {
+                agent.last_completed_turn = Some(crate::api::schema::LastCompletedTurn {
+                    turn,
+                    turn_epoch,
+                    completed_unix_ms,
+                    turn_origin,
+                });
+                completed_changed = true;
+            }
+        }
+        if completed_changed {
+            self.touch();
+        }
         let Some(entry) = self.peers.get_mut(alias) else {
             return;
         };
@@ -621,6 +650,16 @@ impl PeerCacheEntry {
     }
 }
 
+/// A relayed `pane.turn_completed` for [`FederationStore::relay_turn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayedTurn {
+    pub pane_id: String,
+    pub turn: u64,
+    pub turn_epoch: u64,
+    pub completed_unix_ms: u64,
+    pub turn_origin: Option<crate::terminal::TurnOrigin>,
+}
+
 /// The `pane.agent_status_changed` payload describing `agent`'s current state.
 pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
     PaneAgentStatusChangedEvent {
@@ -677,6 +716,16 @@ fn stamp_agent(agent: &AgentInfo, reachability: Reachability) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relayed_turn(pane_id: &str, turn: u64, turn_epoch: u64) -> RelayedTurn {
+        RelayedTurn {
+            pane_id: pane_id.into(),
+            turn,
+            turn_epoch,
+            completed_unix_ms: 0,
+            turn_origin: None,
+        }
+    }
 
     fn agent(status: AgentStatus, name: &str) -> AgentInfo {
         let value = serde_json::json!({
@@ -1110,7 +1159,7 @@ mod tests {
             "home",
             PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], now),
         );
-        store.relay_turn("home", "home/p1", 5, 2, now);
+        store.relay_turn("home", relayed_turn("home/p1", 5, 2), now);
         // The cached agent's and the relay baseline's turn.
         let turn = |store: &FederationStore| {
             let entry = store.peer("home").unwrap();
@@ -1265,7 +1314,7 @@ mod tests {
         assert_eq!(turns(&store, "home/p1"), [(Some(4), Some(1)); 2]);
 
         // The new boot's next turn and statuses move forward from its own.
-        store.relay_turn("home", "home/p1", 2, 4, reset_at);
+        store.relay_turn("home", relayed_turn("home/p1", 2, 4), reset_at);
         assert_eq!(turns(&store, "home/p1"), [(Some(4), Some(2)); 2]);
         let mut working = status("home/p1", AgentStatus::Working);
         (working.turn_epoch, working.turn) = (Some(4), Some(2));

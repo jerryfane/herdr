@@ -136,12 +136,13 @@ impl App {
     }
 
     /// Remember a brokered prompt that was not the owner's so the transcript
-    /// can mark its user turn, and save it with the pane.
+    /// can mark its user turn once `watch` confirms it was submitted.
     pub(crate) fn record_pane_other_prompt(
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         text: &str,
+        watch: std::sync::Arc<crate::terminal::PromptSubmitWatch>,
     ) {
         let Some(terminal_id) = self
             .state
@@ -153,8 +154,11 @@ impl App {
             return;
         };
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.record_other_prompt(text, crate::app::actions::current_unix_ms());
-            self.state.mark_session_dirty();
+            let settled = terminal.settle_other_prompts();
+            terminal.record_other_prompt(text, crate::app::actions::current_unix_ms(), watch);
+            if settled {
+                self.state.mark_session_dirty();
+            }
         }
     }
 

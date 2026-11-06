@@ -777,6 +777,16 @@ impl App {
                 Some(guard),
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        if params.input_source.is_none() {
+            // Counts only once the Enter is written; a failed submission is
+            // dropped (see `TerminalState::settle_other_prompts`).
+            self.record_pane_other_prompt(
+                ws_idx,
+                pane_id,
+                &params.text,
+                std::sync::Arc::clone(&submit_watch),
+            );
+        }
         self.record_pane_prompt_submit_watch(ws_idx, pane_id, submit_watch);
         self.record_pane_composer_write(
             ws_idx,
@@ -787,9 +797,6 @@ impl App {
             true,
         );
         self.record_pane_input_source(ws_idx, pane_id, params.input_source);
-        if params.input_source.is_none() {
-            self.record_pane_other_prompt(ws_idx, pane_id, &params.text);
-        }
         // Report the agent as it stands after the composer write was recorded;
         // the validated snapshot only covers a pane that vanished meanwhile, so
         // no error is returned once bytes have been queued.
@@ -6386,6 +6393,61 @@ mod tests {
             h.app
                 .record_terminal_input_origin(&terminal_id, TurnOrigin::Mine);
             assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
+        #[tokio::test]
+        async fn a_failed_automation_prompt_leaves_no_record_to_claim_the_owners() {
+            let mut h = harness();
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            // The PTY side is gone, so the delayed write fails.
+            let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            drop(rx);
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let response = run_deferred_agent_prompt(
+                &mut h.app,
+                "prompt",
+                AgentPromptParams {
+                    target: h.pane.clone(),
+                    text: "continue".into(),
+                    wait: None,
+                    input_source: None,
+                },
+            );
+            assert!(response.contains("\"error\""), "{response}");
+            h.report("working");
+            let terminal = &h.app.state.terminals[&h.terminal_id];
+            assert!(terminal.other_prompts.is_empty());
+            assert!(terminal.delivered_other_prompts().is_empty());
+
+            // The owner then sends the same text; its transcript turn stays
+            // unmarked.
+            let mut session = crate::agent_transcript::tests::Fixture::new("failed-automation");
+            session.user("continue");
+            let page = crate::agent_transcript::read_page(
+                &session.path,
+                &crate::agent_transcript::PageRequest {
+                    other_prompts: terminal.delivered_other_prompts(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(page.entries.iter().all(|entry| !matches!(
+                entry,
+                crate::api::schema::TranscriptEntry::User {
+                    origin: Some(_),
+                    ..
+                }
+            )));
+        }
+
+        #[tokio::test]
+        async fn a_delivered_automation_prompt_is_kept_and_saved() {
+            let mut h = harness();
+            h.prompt("continue", None);
+            h.report("working");
+            let terminal = &h.app.state.terminals[&h.terminal_id];
+            assert_eq!(terminal.other_prompts.len(), 1);
+            assert_eq!(terminal.delivered_other_prompts().len(), 1);
         }
 
         #[tokio::test]

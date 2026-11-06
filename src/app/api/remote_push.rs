@@ -19,12 +19,22 @@ use crate::api::federation_store::{FederationStore, Reachability, RemotePaneEven
 use crate::api::schema::{AgentInfo, AgentStatus, WorkspaceInfo};
 use crate::app::App;
 use crate::push::{PushKind, PushNotification};
+use crate::terminal::TurnOrigin;
 
 /// How long a remote agent's finish that came with a release waits for the
 /// pane's exit. A peer sends release, status and exit back to back, so an exit
 /// arrives well within this; locally a dying agent pushes only "exited", and
 /// the wait keeps a remote one from also pushing "finished".
 const RELEASE_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a remote finish waits for the peer's `pane.turn_completed`, which
+/// the peer sends right after the status change and which names who started
+/// the turn. Past it the finish goes out with an unknown origin, which every
+/// device still gets.
+const TURN_ORIGIN_GRACE: Duration = Duration::from_secs(1);
+
+/// A remote pane's turn, as `(turn_epoch, turn)`.
+type TurnKey = (u64, u64);
 
 /// What the app loop last saw of the remote agents.
 #[derive(Debug, Default)]
@@ -56,6 +66,8 @@ struct SeenPane {
     /// status, a poll that predates the exit, a repeated exit) sends nothing.
     exited: bool,
     alert: AlertContext,
+    /// The newest completed turn the peer reported and who started it.
+    completed: Option<(TurnKey, Option<TurnOrigin>)>,
 }
 
 /// Everything an alert about one remote pane names.
@@ -74,6 +86,10 @@ struct RemoteAgent {
     status: AgentStatus,
     agent: Option<String>,
     alert: AlertContext,
+    /// The pane's current turn; after a finish it is the turn that finished.
+    turn: Option<TurnKey>,
+    /// The peer's last completed turn and its origin.
+    completed: Option<(TurnKey, Option<TurnOrigin>)>,
 }
 
 /// The remote state one store revision shows: per peer alias, its agents when
@@ -119,6 +135,11 @@ impl RemoteAgent {
             pane_id: agent.pane_id.clone(),
             status: agent.agent_status,
             agent: agent.agent.clone(),
+            turn: agent.turn_epoch.zip(agent.turn),
+            completed: agent
+                .last_completed_turn
+                .as_ref()
+                .map(|turn| ((turn.turn_epoch, turn.turn), turn.turn_origin)),
             alert: AlertContext {
                 // The poll stores remote names alias-qualified ("<machine-id>/llm-opt")
                 // so they can be addressed; the title names the machine separately, so
@@ -173,9 +194,40 @@ struct RemoteTransition {
     kind: PushKind,
     pane_id: String,
     alert: AlertContext,
+    /// Who started the finished turn; `None` when unknown.
+    turn_origin: Option<TurnOrigin>,
+    /// A finish held until the origin of this turn is known.
+    awaiting_origin: Option<TurnKey>,
+    /// A finish that came with a release, held for a possible exit.
+    awaiting_exit: bool,
 }
 
 impl RemoteTransition {
+    fn new(kind: PushKind, pane_id: String, alert: AlertContext) -> Self {
+        Self {
+            kind,
+            pane_id,
+            alert,
+            turn_origin: None,
+            awaiting_origin: None,
+            awaiting_exit: false,
+        }
+    }
+
+    /// Take the origin from `completed` when it is the awaited turn's.
+    fn resolve_origin(&mut self, completed: Option<&(TurnKey, Option<TurnOrigin>)>) -> bool {
+        let Some(awaited) = self.awaiting_origin else {
+            return false;
+        };
+        match completed {
+            Some((key, origin)) if *key == awaited => {
+                self.turn_origin = *origin;
+                self.awaiting_origin = None;
+                true
+            }
+            _ => false,
+        }
+    }
     /// The same alert shape a local agent produces, with the machine named:
     /// "llm-opt on Jerry's Mac Studio needs attention". `None` for a pane no
     /// agent has held, or a title that sanitizes away, like the local path.
@@ -190,7 +242,7 @@ impl RemoteTransition {
             80,
         )?;
         Some(PushNotification {
-            turn_origin: None,
+            turn_origin: self.turn_origin,
             title,
             body: super::sanitized_notification_text(&self.alert.body, 240).unwrap_or_default(),
             pane_id: self.pane_id,
@@ -213,7 +265,33 @@ impl RemotePushTracker {
             .into_iter()
             .partition(|(deadline, _)| *deadline <= now);
         self.held = held;
-        due.into_iter().map(|(_, transition)| transition).collect()
+        due.into_iter()
+            .map(|(_, mut transition)| {
+                let completed = self
+                    .panes
+                    .get(&transition.pane_id)
+                    .and_then(|seen| seen.completed.as_ref());
+                transition.resolve_origin(completed);
+                transition
+            })
+            .collect()
+    }
+
+    /// Held finishes that waited only for their turn's origin and now have it.
+    fn take_resolved(&mut self) -> Vec<RemoteTransition> {
+        let panes = &self.panes;
+        let mut resolved = Vec::new();
+        self.held.retain_mut(|(_, transition)| {
+            let completed = panes
+                .get(&transition.pane_id)
+                .and_then(|seen| seen.completed.as_ref());
+            if transition.resolve_origin(completed) && !transition.awaiting_exit {
+                resolved.push(transition.clone());
+                return false;
+            }
+            true
+        });
+        resolved
     }
 
     /// Compare one store revision with what was last seen, update the
@@ -235,11 +313,11 @@ impl RemotePushTracker {
                     if let Some(seen) = self.panes.get_mut(&pane_id) {
                         if !std::mem::replace(&mut seen.exited, true) {
                             seen.released = false;
-                            transitions.push(RemoteTransition {
-                                kind: PushKind::Died,
+                            transitions.push(RemoteTransition::new(
+                                PushKind::Died,
                                 pane_id,
-                                alert: seen.alert.clone(),
-                            });
+                                seen.alert.clone(),
+                            ));
                         }
                     }
                 }
@@ -271,11 +349,11 @@ impl RemotePushTracker {
                     return true;
                 }
                 if !seen.exited && !seen.left {
-                    transitions.push(RemoteTransition {
-                        kind: PushKind::Died,
-                        pane_id: pane_id.clone(),
-                        alert: seen.alert.clone(),
-                    });
+                    transitions.push(RemoteTransition::new(
+                        PushKind::Died,
+                        pane_id.clone(),
+                        seen.alert.clone(),
+                    ));
                 }
                 false
             });
@@ -283,6 +361,7 @@ impl RemotePushTracker {
                 self.observe_agent(&alias, seeding, agent, now, &mut transitions);
             }
         }
+        transitions.extend(self.take_resolved());
         transitions
     }
 
@@ -303,11 +382,11 @@ impl RemotePushTracker {
                 transition_kind(AgentStatus::Unknown, &agent)
             };
             if let Some(kind) = kind {
-                transitions.push(RemoteTransition {
+                transitions.push(RemoteTransition::new(
                     kind,
-                    pane_id: agent.pane_id.clone(),
-                    alert: agent.alert.clone(),
-                });
+                    agent.pane_id.clone(),
+                    agent.alert.clone(),
+                ));
             }
             self.panes.insert(
                 agent.pane_id,
@@ -319,6 +398,7 @@ impl RemotePushTracker {
                     left: false,
                     exited: false,
                     alert: agent.alert,
+                    completed: agent.completed,
                 },
             );
             return;
@@ -349,6 +429,17 @@ impl RemotePushTracker {
         }
         seen.status = agent.status;
         seen.agent = agent.agent;
+        // Keep the newest completed turn: a poll that started before the
+        // relayed turn must not rewind it.
+        if let Some(completed) = agent.completed {
+            let newer = seen
+                .completed
+                .as_ref()
+                .is_none_or(|(key, _)| completed.0 .0 != key.0 || completed.0 .1 > key.1);
+            if newer {
+                seen.completed = Some(completed);
+            }
+        }
         // Keep naming the agent after it releases the pane, for its exit.
         let title_agent = agent
             .alert
@@ -361,13 +452,21 @@ impl RemotePushTracker {
         let Some(kind) = kind else {
             return;
         };
-        let transition = RemoteTransition {
-            kind,
-            pane_id: agent.pane_id,
-            alert: seen.alert.clone(),
-        };
-        if hold {
-            self.held.push((now + RELEASE_EXIT_GRACE, transition));
+        let mut transition = RemoteTransition::new(kind, agent.pane_id, seen.alert.clone());
+        transition.awaiting_exit = hold;
+        if kind == PushKind::Finished {
+            // The status change names the turn that finished; its origin
+            // arrives with the turn record, possibly a moment later.
+            transition.awaiting_origin = agent.turn;
+            transition.resolve_origin(seen.completed.as_ref());
+        }
+        if transition.awaiting_exit || transition.awaiting_origin.is_some() {
+            let grace = if transition.awaiting_exit {
+                RELEASE_EXIT_GRACE
+            } else {
+                TURN_ORIGIN_GRACE
+            };
+            self.held.push((now + grace, transition));
         } else {
             transitions.push(transition);
         }
@@ -678,6 +777,78 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, PushKind::Finished);
         assert_eq!(alerts[0].title, "llm-opt on Jerry's Mac Studio finished");
+    }
+
+    /// A relayed finish followed by the peer's turn record, as the peer sends
+    /// them, naming who started the turn.
+    fn relay_finish(app: &App, agent: &AgentInfo, origin: Option<crate::terminal::TurnOrigin>) {
+        let mut finished = agent.clone();
+        finished.turn = Some(3);
+        finished.turn_epoch = Some(7);
+        relay(app, &finished, AgentStatus::Done);
+        app.federation.lock().unwrap().relay_turn(
+            PEER,
+            crate::api::federation_store::RelayedTurn {
+                pane_id: agent.pane_id.clone(),
+                turn: 3,
+                turn_epoch: 7,
+                completed_unix_ms: 0,
+                turn_origin: origin,
+            },
+            Instant::now(),
+        );
+    }
+
+    fn mine_only(token: &str) -> RegisteredDevice {
+        RegisteredDevice {
+            notify_finishes_mine_only: true,
+            ..device(token, &[], None)
+        }
+    }
+
+    #[test]
+    fn a_remote_turn_someone_else_started_skips_a_mine_only_device() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        relay_finish(&app, &agent, Some(crate::terminal::TurnOrigin::Other));
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, PushKind::Finished);
+        assert_eq!(
+            alerts[0].turn_origin,
+            Some(crate::terminal::TurnOrigin::Other)
+        );
+        let devices = [mine_only("mine"), device("all", &[], None)];
+        let planned = plan_alerts(&direct_push(), &alerts, &devices).direct;
+        assert_eq!(planned.len(), 1, "only the device without mine-only");
+    }
+
+    #[test]
+    fn a_remote_turn_the_owner_started_reaches_a_mine_only_device() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        relay_finish(&app, &agent, Some(crate::terminal::TurnOrigin::Mine));
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(
+            alerts[0].turn_origin,
+            Some(crate::terminal::TurnOrigin::Mine)
+        );
+        let devices = [mine_only("mine")];
+        let planned = plan_alerts(&direct_push(), &alerts, &devices).direct;
+        assert_eq!(planned.len(), 1);
+    }
+
+    #[test]
+    fn a_remote_finish_without_its_turn_record_goes_out_unknown_after_the_grace() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        let mut finished = agent.clone();
+        finished.turn = Some(3);
+        finished.turn_epoch = Some(7);
+        relay(&app, &finished, AgentStatus::Done);
+        assert!(sync(&mut app, &capture).is_empty(), "waits for the origin");
+        app.sync_remote_agent_notifications(Instant::now() + super::TURN_ORIGIN_GRACE);
+        let alerts = capture.take().alerts;
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].turn_origin, None);
     }
 
     #[test]

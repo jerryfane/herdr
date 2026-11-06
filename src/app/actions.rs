@@ -1856,6 +1856,11 @@ impl AppState {
                 // "time in current state" badge (#173). Only here, inside the
                 // previous_state != state guard, so a same-status refresh never resets it.
                 terminal.agent_status_since_unix_ms = Some(current_unix_ms());
+                // A submitted non-owner prompt becomes durable here, so the
+                // next session save keeps it.
+                if terminal.settle_other_prompts() {
+                    self.session_dirty = true;
+                }
                 if is_background_completion_transition(change.previous_state, change.state)
                     && (change.previous_agent_label.is_some() || change.agent_label.is_some())
                 {

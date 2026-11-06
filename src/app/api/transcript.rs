@@ -69,7 +69,7 @@ impl App {
             path,
             agent: info.name.clone().unwrap_or_else(|| agent.clone()),
             pane_id: info.pane_id,
-            other_prompts: terminal.other_prompts.iter().cloned().collect(),
+            other_prompts: terminal.delivered_other_prompts(),
         })
     }
 

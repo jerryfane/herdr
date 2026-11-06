@@ -445,9 +445,21 @@ impl PeerRelay {
                     pane,
                     turn,
                     turn_epoch,
+                    completed_unix_ms,
+                    turn_origin,
                     ..
                 } => {
-                    store.relay_turn(&self.alias, &pane.pane_id, *turn, *turn_epoch, now);
+                    store.relay_turn(
+                        &self.alias,
+                        crate::api::federation_store::RelayedTurn {
+                            pane_id: pane.pane_id.clone(),
+                            turn: *turn,
+                            turn_epoch: *turn_epoch,
+                            completed_unix_ms: *completed_unix_ms,
+                            turn_origin: *turn_origin,
+                        },
+                        now,
+                    );
                     true
                 }
                 EventData::PaneClosed { pane_id, .. } => {

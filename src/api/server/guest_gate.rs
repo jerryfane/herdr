@@ -4302,7 +4302,10 @@ mod tests {
                     .attached_terminal_id
                     .clone();
                 let terminal = &app.state.terminals[&terminal_id];
-                let _ = tx.send((terminal.turn_origin, terminal.other_prompts.len()));
+                let _ = tx.send((
+                    terminal.turn_origin,
+                    terminal.delivered_other_prompts().len(),
+                ));
             }))
             .unwrap();
         let (origin, other_prompts) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
