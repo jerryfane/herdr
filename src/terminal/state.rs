@@ -2906,7 +2906,8 @@ impl TerminalState {
     }
 
     /// The kind of agent an inactive claim belongs to, when the terminal still
-    /// knows it.
+    /// knows it. Guest grants follow a rename by it, and guests are Unix-only.
+    #[cfg(unix)]
     pub fn inactive_agent_kind(&self) -> Option<&str> {
         self.agent_name_owner
             .as_ref()
@@ -3110,6 +3111,7 @@ mod tests {
         terminal.set_agent_name("deimos".into());
         terminal.agent_account = Some("work".into());
         assert!(terminal.holds_inactive_agent_claim());
+        #[cfg(unix)]
         assert_eq!(terminal.inactive_agent_kind(), Some("omp"));
         let report = |terminal: &mut TerminalState| {
             terminal.set_hook_authority_at(
