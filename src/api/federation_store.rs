@@ -236,6 +236,20 @@ impl FederationStore {
             entry.workspaces = std::mem::take(&mut previous.workspaces);
             entry.relayed = std::mem::take(&mut previous.relayed);
             entry.vanished = std::mem::take(&mut previous.vanished);
+            // A completion the relay recorded after this poll started (with
+            // who started the turn) must survive the older answer.
+            for agent in &mut entry.agents {
+                let cached = previous
+                    .agents
+                    .iter()
+                    .find(|cached| cached.pane_id == agent.pane_id)
+                    .and_then(|cached| cached.last_completed_turn.as_ref());
+                if let Some(cached) = cached {
+                    if is_newer_completed_turn(cached, agent.last_completed_turn.as_ref()) {
+                        agent.last_completed_turn = Some(*cached);
+                    }
+                }
+            }
         }
         entry
             .vanished
@@ -311,17 +325,14 @@ impl FederationStore {
             .iter_mut()
             .find(|agent| agent.pane_id == pane_id)
         {
-            let newer = agent
-                .last_completed_turn
-                .as_ref()
-                .is_none_or(|last| last.turn_epoch != turn_epoch || last.turn < turn);
-            if newer {
-                agent.last_completed_turn = Some(crate::api::schema::LastCompletedTurn {
-                    turn,
-                    turn_epoch,
-                    completed_unix_ms,
-                    turn_origin,
-                });
+            let completed = crate::api::schema::LastCompletedTurn {
+                turn,
+                turn_epoch,
+                completed_unix_ms,
+                turn_origin,
+            };
+            if is_newer_completed_turn(&completed, agent.last_completed_turn.as_ref()) {
+                agent.last_completed_turn = Some(completed);
                 completed_changed = true;
             }
         }
@@ -386,8 +397,8 @@ impl FederationStore {
         self.pane_events.drain(..).collect()
     }
 
-    /// Compare a fresh `agent.list` from `alias` (as status events, ids
-    /// qualified) with what the relay published, record it as the new
+    /// Compare a fresh `agent.list` from `alias` (ids qualified) with what the
+    /// relay published, record each pane's last completed turn, record it as the new
     /// baseline, and return the events to publish so each missed change is
     /// reported exactly once. The list is authoritative: panes the peer no
     /// longer lists lose their baseline and leave the cached agents, which the
@@ -396,6 +407,24 @@ impl FederationStore {
     /// a peer restart the cache may still hold the previous boot's turns,
     /// which mean nothing for the new one. Recording it overwrites them, so
     /// later clamps ([`PeerCacheEntry::clamp_turn`]) only see this boot.
+    pub fn relay_resync_agents(
+        &mut self,
+        alias: &str,
+        agents: Vec<AgentInfo>,
+        mode: RelayResync,
+        now: Instant,
+    ) -> Vec<PaneAgentStatusChangedEvent> {
+        let current = agents.iter().map(agent_status_event).collect();
+        let missed = self.relay_resync(alias, current, mode, now);
+        // Each pane's last completion, with who started it, so a finish first
+        // seen through the resync is still filtered by origin.
+        for completed in agents.iter().filter_map(RelayedTurn::from_agent) {
+            self.relay_turn(alias, completed, now);
+        }
+        missed
+    }
+
+    /// The status half of [`Self::relay_resync_agents`].
     pub fn relay_resync(
         &mut self,
         alias: &str,
@@ -647,6 +676,32 @@ impl PeerCacheEntry {
         }
         self.relayed
             .insert(event.pane_id.clone(), RelayedStatus { event, at: now });
+    }
+}
+
+/// Whether `candidate` is a later completed turn than `current`, ordered by
+/// `(turn_epoch, turn)`. Epochs come from the peer's clock at each counter
+/// reset, so a later boot's epoch is the larger one.
+fn is_newer_completed_turn(
+    candidate: &crate::api::schema::LastCompletedTurn,
+    current: Option<&crate::api::schema::LastCompletedTurn>,
+) -> bool {
+    current.is_none_or(|current| {
+        (candidate.turn_epoch, candidate.turn) > (current.turn_epoch, current.turn)
+    })
+}
+
+impl RelayedTurn {
+    /// The completed turn an `agent.list` entry reports, if any.
+    pub fn from_agent(agent: &AgentInfo) -> Option<Self> {
+        let completed = agent.last_completed_turn.as_ref()?;
+        Some(Self {
+            pane_id: agent.pane_id.clone(),
+            turn: completed.turn,
+            turn_epoch: completed.turn_epoch,
+            completed_unix_ms: completed.completed_unix_ms,
+            turn_origin: completed.turn_origin,
+        })
     }
 }
 
@@ -1071,6 +1126,103 @@ mod tests {
             Instant::now() + Duration::from_millis(5),
         );
         assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Idle);
+    }
+
+    fn completed_origin(store: &FederationStore, pane_id: &str) -> Option<LastCompletedTurnView> {
+        store
+            .peer("home")?
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)?
+            .last_completed_turn
+            .map(|turn| (turn.turn_epoch, turn.turn, turn.turn_origin))
+    }
+
+    type LastCompletedTurnView = (u64, u64, Option<crate::terminal::TurnOrigin>);
+
+    #[test]
+    fn a_poll_older_than_a_relayed_completion_keeps_its_origin() {
+        use std::time::Duration;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], t0),
+            t0,
+        );
+
+        // The poll goes out; the stream then reports the finish and its
+        // completion record (started by someone else); the older poll lands.
+        let poll_started = Instant::now();
+        let relayed_at = poll_started + Duration::from_millis(1);
+        let mut done = status("home/p1", AgentStatus::Done);
+        done.turn = Some(1);
+        done.turn_epoch = Some(2);
+        assert!(store.relay_status("home", &mut done, relayed_at));
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(crate::terminal::TurnOrigin::Other),
+                ..relayed_turn("home/p1", 1, 2)
+            },
+            relayed_at,
+        );
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], t0),
+            poll_started,
+        );
+
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Done);
+        assert_eq!(store.peer("home").unwrap().agents[0].turn, Some(1));
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((2, 1, Some(crate::terminal::TurnOrigin::Other)))
+        );
+
+        // A newer completion from a later poll replaces it.
+        let mut later = pane_agent("home/p1", AgentStatus::Done);
+        later.last_completed_turn = Some(crate::api::schema::LastCompletedTurn {
+            turn: 2,
+            turn_epoch: 2,
+            completed_unix_ms: 0,
+            turn_origin: Some(crate::terminal::TurnOrigin::Mine),
+        });
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![later], t0),
+            Instant::now() + Duration::from_millis(5),
+        );
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((2, 2, Some(crate::terminal::TurnOrigin::Mine)))
+        );
+    }
+
+    #[test]
+    fn a_relay_resync_carries_each_panes_completion_origin() {
+        let mut store = FederationStore::default();
+        let now = Instant::now();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], now),
+        );
+        let mut listed = pane_agent("home/p1", AgentStatus::Done);
+        listed.turn = Some(3);
+        listed.turn_epoch = Some(2);
+        listed.last_completed_turn = Some(crate::api::schema::LastCompletedTurn {
+            turn: 3,
+            turn_epoch: 2,
+            completed_unix_ms: 0,
+            turn_origin: Some(crate::terminal::TurnOrigin::Other),
+        });
+        let missed = store.relay_resync_agents("home", vec![listed], RelayResync::Diff, now);
+        assert_eq!(missed.len(), 1, "{missed:?}");
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Done);
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((2, 3, Some(crate::terminal::TurnOrigin::Other)))
+        );
     }
 
     #[test]

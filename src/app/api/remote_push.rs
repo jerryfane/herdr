@@ -423,23 +423,40 @@ impl RemotePushTracker {
         if agent.status == AgentStatus::Working {
             seen.left = false;
         }
-        // A held finish no longer stands once the agent is busy again.
-        if matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked) {
-            self.held.retain(|(_, held)| held.pane_id != agent.pane_id);
-        }
-        seen.status = agent.status;
-        seen.agent = agent.agent;
-        // Keep the newest completed turn: a poll that started before the
-        // relayed turn must not rewind it.
+        // Take the completion record before acting on the status: the record
+        // of the turn a held finish waits for can arrive with the next turn's
+        // status. Keep the newest, so an older poll cannot rewind it.
         if let Some(completed) = agent.completed {
-            let newer = seen
+            if seen
                 .completed
                 .as_ref()
-                .is_none_or(|(key, _)| completed.0 .0 != key.0 || completed.0 .1 > key.1);
-            if newer {
+                .is_none_or(|(key, _)| completed.0 > *key)
+            {
                 seen.completed = Some(completed);
             }
         }
+        if matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked) {
+            // A finish held for a possible exit no longer stands once the
+            // agent is busy again. A finish held only for its origin already
+            // happened: it goes out now if the origin is known, else stays
+            // until the grace ends.
+            let completed = seen.completed.as_ref();
+            self.held.retain_mut(|(_, held)| {
+                if held.pane_id != agent.pane_id {
+                    return true;
+                }
+                if held.awaiting_exit {
+                    return false;
+                }
+                if held.resolve_origin(completed) {
+                    transitions.push(held.clone());
+                    return false;
+                }
+                true
+            });
+        }
+        seen.status = agent.status;
+        seen.agent = agent.agent;
         // Keep naming the agent after it releases the pane, for its exit.
         let title_agent = agent
             .alert
@@ -835,6 +852,63 @@ mod tests {
         let devices = [mine_only("mine")];
         let planned = plan_alerts(&direct_push(), &alerts, &devices).direct;
         assert_eq!(planned.len(), 1);
+    }
+
+    /// Working → Done is observed and held for its origin; the completion
+    /// record and the next turn's Working status then land in one batch.
+    fn finish_then_next_turn_in_one_batch(
+        origin: crate::terminal::TurnOrigin,
+    ) -> Vec<PushNotification> {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        let mut finished = agent.clone();
+        finished.turn = Some(3);
+        finished.turn_epoch = Some(7);
+        relay(&app, &finished, AgentStatus::Done);
+        assert!(sync(&mut app, &capture).is_empty(), "waits for the origin");
+
+        app.federation.lock().unwrap().relay_turn(
+            PEER,
+            crate::api::federation_store::RelayedTurn {
+                pane_id: agent.pane_id.clone(),
+                turn: 3,
+                turn_epoch: 7,
+                completed_unix_ms: 0,
+                turn_origin: Some(origin),
+            },
+            Instant::now(),
+        );
+        relay(&app, &finished, AgentStatus::Working);
+        let mut alerts = sync(&mut app, &capture);
+        // Nothing more arrives after the grace.
+        app.sync_remote_agent_notifications(Instant::now() + super::TURN_ORIGIN_GRACE);
+        alerts.extend(capture.take().alerts);
+        alerts
+    }
+
+    #[test]
+    fn an_owner_finish_survives_the_next_turn_starting_in_the_same_batch() {
+        let alerts = finish_then_next_turn_in_one_batch(crate::terminal::TurnOrigin::Mine);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, PushKind::Finished);
+        let devices = [mine_only("mine")];
+        assert_eq!(
+            plan_alerts(&direct_push(), &alerts, &devices).direct.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_others_finish_before_the_next_turn_skips_a_mine_only_device() {
+        let alerts = finish_then_next_turn_in_one_batch(crate::terminal::TurnOrigin::Other);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(
+            alerts[0].turn_origin,
+            Some(crate::terminal::TurnOrigin::Other)
+        );
+        let devices = [mine_only("mine")];
+        assert!(plan_alerts(&direct_push(), &alerts, &devices)
+            .direct
+            .is_empty());
     }
 
     #[test]
