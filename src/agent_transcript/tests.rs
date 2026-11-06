@@ -199,7 +199,7 @@ impl Fixture {
 
 fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> PageRequest {
     PageRequest {
-        other_prompts: OtherPrompts::default(),
+        other_prompts: Vec::new(),
         before: before.map(str::to_owned),
         after: after.map(str::to_owned),
         limit,
@@ -1998,7 +1998,7 @@ fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
     let page = read_page(
         &session.path,
         &PageRequest {
-            other_prompts: OtherPrompts::delivered(prompts.clone()),
+            other_prompts: prompts.clone(),
             ..PageRequest::default()
         },
     )
@@ -2027,7 +2027,7 @@ fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
         &session.path,
         &PageRequest {
             limit: Some(1),
-            other_prompts: OtherPrompts::delivered(prompts),
+            other_prompts: prompts,
             ..PageRequest::default()
         },
     )
@@ -2047,44 +2047,63 @@ fn without_remembered_prompts_no_user_turn_is_marked() {
 }
 
 #[test]
-fn an_origin_confirmed_after_its_entry_was_sent_reaches_the_next_after_page() {
-    use crate::terminal::{PromptSubmitWatch, TurnOrigin};
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
+fn every_user_entry_marked_after_it_was_sent_is_resent_on_the_next_after_page() {
+    use crate::terminal::TurnOrigin;
 
+    // Two automation prompts; the client first read both entries before
+    // either was confirmed delivered.
     let mut session = Fixture::new("origin-late");
-    let brokered_at = session.ms(session.next + 1);
-    session.user("continue");
-    let watch = Arc::new(PromptSubmitWatch::default());
-    let prompts = OtherPrompts::new(
-        Vec::new(),
-        vec![(OtherPrompt::new("continue", brokered_at), watch.clone())],
-    );
-    let request = |after: Option<&str>| PageRequest {
+    let first_at = session.ms(session.next + 1);
+    session.user("first automation");
+    session.assistant(vec![text("ok")], "stop");
+    let second_at = session.ms(session.next + 1);
+    session.user("second automation");
+    let request = |after: Option<&str>, prompts: Vec<OtherPrompt>| PageRequest {
         after: after.map(str::to_owned),
-        other_prompts: prompts.clone(),
+        other_prompts: prompts,
         ..PageRequest::default()
     };
+    let first = read_page(&session.path, &request(None, Vec::new())).unwrap();
+    assert_eq!(
+        user_origins(&first),
+        vec![
+            ("first automation".into(), None),
+            ("second automation".into(), None)
+        ]
+    );
 
-    // The entry is read before the Enter was confirmed: no origin yet.
-    let first = read_page(&session.path, &request(None)).unwrap();
-    assert_eq!(user_origins(&first), vec![("continue".into(), None)]);
-
-    // The submission is confirmed and the agent answers; the next `after`
-    // page re-sends the user entry with its origin.
-    watch.submitted.store(true, Ordering::SeqCst);
+    // Both are confirmed; the next `after` page re-sends both, same ids.
+    let delivered = vec![
+        OtherPrompt::new("first automation", first_at),
+        OtherPrompt::new("second automation", second_at),
+    ];
     session.assistant(vec![text("on it")], "stop");
-    let next = read_page(&session.path, &request(Some(&first.after))).unwrap();
+    let next = read_page(
+        &session.path,
+        &request(Some(&first.after), delivered.clone()),
+    )
+    .unwrap();
     assert_eq!(
         user_origins(&next),
-        vec![("continue".into(), Some(TurnOrigin::Other))]
+        vec![
+            ("first automation".into(), Some(TurnOrigin::Other)),
+            ("second automation".into(), Some(TurnOrigin::Other))
+        ]
     );
-    let wire = serde_json::to_value(&next.entries[0]).unwrap();
-    assert_eq!(wire["origin"], "other");
-    assert_eq!(
-        wire["id"],
-        serde_json::to_value(&first.entries[0]).unwrap()["id"]
-    );
+    let ids = |page: &Page| -> Vec<String> {
+        page.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(ids(&next), ids(&first));
+
+    // Nothing changed since: they are not sent again.
+    let again = read_page(&session.path, &request(Some(&next.after), delivered)).unwrap();
+    assert!(user_origins(&again).is_empty(), "{:?}", again.entries);
 }
 
 #[test]
@@ -2094,7 +2113,7 @@ fn an_after_page_does_not_resend_an_unmarked_user_entry() {
     let first = session.newest();
     session.assistant(vec![text("on it")], "stop");
     // Delivered, but for different text: the user entry is not re-sent.
-    let prompts = OtherPrompts::delivered(vec![OtherPrompt::new("something else", session.ms(1))]);
+    let prompts = vec![OtherPrompt::new("something else", session.ms(1))];
     let next = read_page(
         &session.path,
         &PageRequest {

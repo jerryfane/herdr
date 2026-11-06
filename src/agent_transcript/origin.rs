@@ -6,8 +6,7 @@
 //! marked `origin: "other"`. Nothing is guessed from the text itself.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -47,63 +46,156 @@ impl OtherPrompt {
     }
 }
 
-/// A pane's non-owner prompts as a transcript read sees them: the delivered
-/// ones, plus those still submitting with the watch that will report them.
-/// [`Self::current`] is called after the session file is read, so a prompt
-/// whose Enter landed while the request was on its way still counts.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct OtherPrompts {
-    delivered: Vec<OtherPrompt>,
-    pending: Vec<(OtherPrompt, Arc<crate::terminal::PromptSubmitWatch>)>,
-}
+/// Non-owner prompts whose submission has not reported yet. Each reports
+/// within its submit delay or deadline, so this bound is reached only when a
+/// pane is not taking input; `agent.prompt` then refuses new non-owner prompts
+/// (`too_many_pending_prompts`) rather than send one it cannot track.
+pub(crate) const PENDING_PROMPT_LIMIT: usize = 64;
 
-/// Equal when they hold the same prompts and the same watches.
-impl PartialEq for OtherPrompts {
-    fn eq(&self, other: &Self) -> bool {
-        self.delivered == other.delivered
-            && self.pending.len() == other.pending.len()
-            && self
-                .pending
-                .iter()
-                .zip(&other.pending)
-                .all(|((a, a_watch), (b, b_watch))| a == b && Arc::ptr_eq(a_watch, b_watch))
+/// What one admitted prompt's submission reported: `true` once its Enter was
+/// written, `false` when it failed. Set once, by the submission alone.
+type Outcome = Arc<OnceLock<bool>>;
+
+/// The submission's handle on its record. [`Self::delivered`] reports the
+/// prompt written; dropping it without that reports failure, so every path
+/// that does not deliver (a refused or failed write, a closed actor, an error
+/// before the write) resolves the record.
+#[derive(Debug)]
+pub(crate) struct PromptOutcome(Outcome);
+
+impl PromptOutcome {
+    pub(crate) fn delivered(self) {
+        let _ = self.0.set(true);
     }
 }
 
-impl Eq for OtherPrompts {}
+impl Drop for PromptOutcome {
+    fn drop(&mut self) {
+        let _ = self.0.set(false);
+    }
+}
 
-impl OtherPrompts {
-    pub(crate) fn new(
-        delivered: Vec<OtherPrompt>,
-        pending: Vec<(OtherPrompt, Arc<crate::terminal::PromptSubmitWatch>)>,
-    ) -> Self {
-        Self { delivered, pending }
+/// `agent.prompt` refused a non-owner prompt: too many are still submitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TooManyPendingPrompts;
+
+#[derive(Debug, Clone)]
+struct PromptRecord {
+    prompt: OtherPrompt,
+    outcome: Outcome,
+    /// Seen delivered by [`OtherPromptLog::prune`], so a save keeps it.
+    counted: bool,
+}
+
+/// A pane's brokered non-owner prompts, in admission order: one record each,
+/// created when `agent.prompt` admits the prompt (before anything is written)
+/// and resolved only by that submission's own outcome. Failed records are
+/// dropped; at most [`OTHER_PROMPT_LIMIT`] delivered ones are kept.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtherPromptLog {
+    records: Vec<PromptRecord>,
+}
+
+impl OtherPromptLog {
+    /// Delivered prompts saved with the pane.
+    pub(crate) fn restored(prompts: impl IntoIterator<Item = OtherPrompt>) -> Self {
+        let records = prompts
+            .into_iter()
+            .map(|prompt| PromptRecord {
+                prompt,
+                outcome: Arc::new(OnceLock::from(true)),
+                counted: true,
+            })
+            .collect();
+        Self { records }
+    }
+
+    /// Admit a prompt about to be submitted, or refuse it while
+    /// [`PENDING_PROMPT_LIMIT`] are unresolved.
+    pub(crate) fn admit(
+        &mut self,
+        text: &str,
+        submitted_unix_ms: u64,
+    ) -> Result<PromptOutcome, TooManyPendingPrompts> {
+        self.prune();
+        let pending = self
+            .records
+            .iter()
+            .filter(|record| record.outcome.get().is_none())
+            .count();
+        if pending >= PENDING_PROMPT_LIMIT {
+            return Err(TooManyPendingPrompts);
+        }
+        let outcome = Outcome::default();
+        self.records.push(PromptRecord {
+            prompt: OtherPrompt::new(text, submitted_unix_ms),
+            outcome: Arc::clone(&outcome),
+            counted: false,
+        });
+        Ok(PromptOutcome(outcome))
+    }
+
+    /// Drop failed records and the oldest delivered ones past the limit.
+    /// Returns whether the delivered set (what a save keeps) changed.
+    pub(crate) fn prune(&mut self) -> bool {
+        let mut changed = false;
+        self.records
+            .retain_mut(|record| match record.outcome.get() {
+                Some(false) => false,
+                Some(true) => {
+                    changed |= !record.counted;
+                    record.counted = true;
+                    true
+                }
+                None => true,
+            });
+        let mut excess = self
+            .records
+            .iter()
+            .filter(|record| record.counted)
+            .count()
+            .saturating_sub(OTHER_PROMPT_LIMIT);
+        if excess > 0 {
+            changed = true;
+            self.records.retain(|record| {
+                let drop = record.counted && excess > 0;
+                excess -= usize::from(drop);
+                !drop
+            });
+        }
+        changed
+    }
+
+    /// The delivered prompts, oldest first, at most [`OTHER_PROMPT_LIMIT`]:
+    /// one pass, each record read once.
+    pub(crate) fn delivered(&self) -> Vec<OtherPrompt> {
+        let mut delivered: Vec<_> = self
+            .records
+            .iter()
+            .filter(|record| record.outcome.get() == Some(&true))
+            .map(|record| record.prompt.clone())
+            .collect();
+        let excess = delivered.len().saturating_sub(OTHER_PROMPT_LIMIT);
+        delivered.drain(..excess);
+        delivered
     }
 
     #[cfg(test)]
-    pub(crate) fn delivered(delivered: Vec<OtherPrompt>) -> Self {
-        Self::new(delivered, Vec::new())
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
     }
+}
 
-    /// The prompts delivered by now, oldest first, at most
-    /// [`OTHER_PROMPT_LIMIT`].
-    pub(crate) fn current(&self) -> Vec<OtherPrompt> {
-        let mut prompts: Vec<_> = self
-            .delivered
-            .iter()
-            .cloned()
-            .chain(
-                self.pending
-                    .iter()
-                    .filter(|(_, watch)| watch.submitted.load(Ordering::SeqCst))
-                    .map(|(prompt, _)| prompt.clone()),
-            )
-            .collect();
-        prompts.sort_by_key(|prompt| prompt.submitted_unix_ms);
-        let excess = prompts.len().saturating_sub(OTHER_PROMPT_LIMIT);
-        prompts.drain(..excess);
-        prompts
+/// Identifies a list of delivered prompts, so a transcript cursor can tell
+/// whether the prompts it was served with have changed since.
+pub(super) fn fingerprint(prompts: &[OtherPrompt]) -> u64 {
+    let mut hasher = Sha256::new();
+    for prompt in prompts {
+        hasher.update(prompt.sha256.as_bytes());
+        hasher.update(prompt.submitted_unix_ms.to_le_bytes());
     }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
 }
 
 /// Exact text identity, tolerant only of `\r\n` and surrounding whitespace,
@@ -177,6 +269,59 @@ mod tests {
         let mut ids: Vec<_> = matched.into_iter().collect();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn a_record_counts_once_its_own_submission_reports_delivered() {
+        let mut log = OtherPromptLog::default();
+        let outcome = log.admit("continue", 1).unwrap();
+        assert!(log.delivered().is_empty(), "pending until reported");
+        outcome.delivered();
+        assert_eq!(log.delivered(), [OtherPrompt::new("continue", 1)]);
+        assert!(log.prune(), "now saved");
+        assert_eq!(log.len(), 1, "one record per prompt");
+    }
+
+    #[test]
+    fn a_failed_submission_removes_its_record() {
+        let mut log = OtherPromptLog::default();
+        drop(log.admit("continue", 1).unwrap());
+        assert!(log.delivered().is_empty());
+        assert!(!log.prune());
+        assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn overlapping_prompts_are_all_kept_and_excess_ones_refused() {
+        let mut log = OtherPromptLog::default();
+        let outcomes: Vec<_> = (0..PENDING_PROMPT_LIMIT as u64)
+            .map(|n| log.admit(&format!("prompt-{n}"), n).unwrap())
+            .collect();
+        assert_eq!(
+            log.admit("one more", 99).unwrap_err(),
+            TooManyPendingPrompts
+        );
+        for outcome in outcomes {
+            outcome.delivered();
+        }
+        assert_eq!(log.delivered().len(), PENDING_PROMPT_LIMIT);
+        assert!(log.admit("now room", 100).is_ok());
+    }
+
+    #[test]
+    fn only_the_newest_delivered_prompts_are_kept() {
+        let mut log = OtherPromptLog::restored(
+            (0..OTHER_PROMPT_LIMIT as u64).map(|n| OtherPrompt::new(&format!("old-{n}"), n)),
+        );
+        let pending = log.admit("pending", 500).unwrap();
+        log.admit("newest", 600).unwrap().delivered();
+        assert!(log.prune());
+        let delivered = log.delivered();
+        assert_eq!(delivered.len(), OTHER_PROMPT_LIMIT);
+        assert_eq!(delivered[0], OtherPrompt::new("old-1", 1));
+        assert_eq!(delivered.last(), Some(&OtherPrompt::new("newest", 600)));
+        pending.delivered();
+        assert_eq!(log.delivered().len(), OTHER_PROMPT_LIMIT);
     }
 
     #[test]

@@ -333,6 +333,9 @@ impl PeerRelay {
         stamp: &mut PeerRouteStamp,
         state: &mut RelayState,
     ) -> Option<SessionEnd> {
+        // When the list was asked for, so its completions only replace ones
+        // known before then.
+        let requested_at = Instant::now();
         let snapshot =
             match poll_peer_agent_list(client, &self.running, self.expected_node_id.as_deref()) {
                 Ok(snapshot) => snapshot,
@@ -375,7 +378,8 @@ impl PeerRelay {
             if !self.route.identity_validated() {
                 return None;
             }
-            let missed = store.relay_resync_agents(&self.alias, agents, mode, Instant::now());
+            let missed =
+                store.relay_resync_agents(&self.alias, agents, mode, requested_at, Instant::now());
             let published = missed.len();
             for event in missed {
                 self.event_hub.push_relayed(status_envelope(event));

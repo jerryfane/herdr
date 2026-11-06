@@ -4304,7 +4304,7 @@ mod tests {
                 let terminal = &app.state.terminals[&terminal_id];
                 let _ = tx.send((
                     terminal.turn_origin,
-                    terminal.delivered_other_prompts().len(),
+                    terminal.other_prompts.delivered().len(),
                 ));
             }))
             .unwrap();

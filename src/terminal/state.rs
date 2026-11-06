@@ -13,11 +13,6 @@ use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
 
 pub(crate) const TURN_RECORD_LIMIT: usize = 64;
-/// Non-owner prompts awaiting their submission outcome. Each settles within
-/// its submit delay or deadline, so this is a safety bound against a stuck PTY,
-/// well above any real burst: past it a new non-owner prompt is not tracked
-/// (its user turn shows unmarked) instead of forgetting one already in flight.
-const PENDING_OTHER_PROMPT_LIMIT: usize = 256;
 pub(crate) const TURN_MESSAGE_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const TURN_ABORT_WINDOW: Duration = Duration::from_secs(15);
 
@@ -338,18 +333,10 @@ pub struct TerminalState {
     /// Origin of the current (or next) turn; `None` while unknown. Cleared when
     /// a turn completes and copied onto its `TurnRecord`.
     pub(crate) turn_origin: Option<TurnOrigin>,
-    /// Delivered brokered `agent.prompt` texts that were not the owner's,
-    /// oldest first, so `agent.transcript` can mark their user turns.
-    /// Persisted with the pane.
-    pub(crate) other_prompts: VecDeque<crate::agent_transcript::OtherPrompt>,
-    /// Non-owner prompts still being submitted. Each counts only once its
-    /// watch reports the Enter written, and is dropped when the submission
-    /// failed, so a prompt that never reached the agent can never claim a
-    /// later identical owner message. Not persisted.
-    pending_other_prompts: Vec<(
-        crate::agent_transcript::OtherPrompt,
-        std::sync::Arc<super::PromptSubmitWatch>,
-    )>,
+    /// Brokered `agent.prompt` texts that were not the owner's, so
+    /// `agent.transcript` can mark their user turns. Delivered ones are
+    /// persisted with the pane.
+    pub(crate) other_prompts: crate::agent_transcript::OtherPromptLog,
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -432,8 +419,7 @@ impl TerminalState {
             turn_records: VecDeque::with_capacity(TURN_RECORD_LIMIT),
             turn_abort_pending_at: None,
             turn_origin: None,
-            other_prompts: VecDeque::new(),
-            pending_other_prompts: Vec::new(),
+            other_prompts: Default::default(),
             last_agent_completion_seq: None,
             revision: 0,
             launch_argv: None,
@@ -543,94 +529,6 @@ impl TerminalState {
         }
     }
 
-    /// Remember a brokered prompt that was not the owner's. It counts once
-    /// `watch` reports it submitted; see [`Self::settle_other_prompts`].
-    pub(crate) fn record_other_prompt(
-        &mut self,
-        text: &str,
-        submitted_unix_ms: u64,
-        watch: std::sync::Arc<super::PromptSubmitWatch>,
-    ) {
-        self.settle_other_prompts();
-        if self.pending_other_prompts.len() >= PENDING_OTHER_PROMPT_LIMIT {
-            tracing::warn!(
-                pending = self.pending_other_prompts.len(),
-                "too many unresolved non-owner prompts; not tracking this one"
-            );
-            return;
-        }
-        self.pending_other_prompts.push((
-            crate::agent_transcript::OtherPrompt::new(text, submitted_unix_ms),
-            watch,
-        ));
-    }
-
-    /// Keep submitted pending prompts and forget failed ones, holding the
-    /// newest [`crate::agent_transcript::OTHER_PROMPT_LIMIT`] in submit order.
-    /// Returns whether the persisted list changed.
-    pub(crate) fn settle_other_prompts(&mut self) -> bool {
-        use std::sync::atomic::Ordering;
-        let mut delivered = false;
-        self.pending_other_prompts.retain(|(prompt, watch)| {
-            if watch.submitted.load(Ordering::SeqCst) {
-                self.other_prompts.push_back(prompt.clone());
-                delivered = true;
-                false
-            } else {
-                // Held only here: the submission that would report is gone
-                // without an outcome, so it can never count.
-                !watch.abandoned.load(Ordering::SeqCst) && std::sync::Arc::strong_count(watch) > 1
-            }
-        });
-        if !delivered {
-            return false;
-        }
-        self.other_prompts
-            .make_contiguous()
-            .sort_by_key(|prompt| prompt.submitted_unix_ms);
-        while self.other_prompts.len() > crate::agent_transcript::OTHER_PROMPT_LIMIT {
-            self.other_prompts.pop_front();
-        }
-        true
-    }
-
-    /// The non-owner prompts for a transcript read: those delivered, plus the
-    /// unresolved ones with their watches, re-checked after the file is read.
-    pub(crate) fn other_prompts_for_read(&self) -> crate::agent_transcript::OtherPrompts {
-        use std::sync::atomic::Ordering;
-        let pending = self
-            .pending_other_prompts
-            .iter()
-            .filter(|(_, watch)| {
-                !watch.submitted.load(Ordering::SeqCst) && !watch.abandoned.load(Ordering::SeqCst)
-            })
-            .cloned()
-            .collect();
-        crate::agent_transcript::OtherPrompts::new(self.delivered_other_prompts(), pending)
-    }
-
-    /// The non-owner prompts that reached the agent, oldest first, including
-    /// pending ones whose submission has since been confirmed.
-    pub(crate) fn delivered_other_prompts(&self) -> Vec<crate::agent_transcript::OtherPrompt> {
-        use std::sync::atomic::Ordering;
-        let mut prompts: Vec<_> = self
-            .other_prompts
-            .iter()
-            .cloned()
-            .chain(
-                self.pending_other_prompts
-                    .iter()
-                    .filter(|(_, watch)| watch.submitted.load(Ordering::SeqCst))
-                    .map(|(prompt, _)| prompt.clone()),
-            )
-            .collect();
-        prompts.sort_by_key(|prompt| prompt.submitted_unix_ms);
-        let excess = prompts
-            .len()
-            .saturating_sub(crate::agent_transcript::OTHER_PROMPT_LIMIT);
-        prompts.drain(..excess);
-        prompts
-    }
     pub(crate) fn reset_turn_counter(&mut self, path: TurnCounterResetPath) {
         self.turn = 0;
         self.turn_epoch = fresh_turn_epoch_for(path);
@@ -3205,38 +3103,6 @@ mod tests {
     }
     use super::*;
     use crate::detect::AgentDetection;
-
-    #[test]
-    fn overlapping_non_owner_prompts_all_count_once_submitted() {
-        use std::sync::atomic::Ordering;
-        let mut terminal = test_terminal();
-        let watches: Vec<_> = (0..17u64)
-            .map(|n| {
-                let watch = std::sync::Arc::new(super::super::PromptSubmitWatch::default());
-                terminal.record_other_prompt(&format!("prompt-{n}"), 1_000 + n, watch.clone());
-                watch
-            })
-            .collect();
-        assert!(terminal.delivered_other_prompts().is_empty());
-        for watch in &watches {
-            watch.submitted.store(true, Ordering::SeqCst);
-        }
-        assert!(terminal.settle_other_prompts());
-        assert_eq!(terminal.other_prompts.len(), 17);
-        assert_eq!(terminal.delivered_other_prompts().len(), 17);
-    }
-
-    #[test]
-    fn a_prompt_whose_submission_vanished_without_an_outcome_is_dropped() {
-        let mut terminal = test_terminal();
-        terminal.record_other_prompt(
-            "lost",
-            1_000,
-            std::sync::Arc::new(super::super::PromptSubmitWatch::default()),
-        );
-        assert!(!terminal.settle_other_prompts());
-        assert!(terminal.pending_other_prompts.is_empty());
-    }
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())

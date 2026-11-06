@@ -135,15 +135,19 @@ impl App {
         }
     }
 
-    /// Remember a brokered prompt that was not the owner's so the transcript
-    /// can mark its user turn once `watch` confirms it was submitted.
-    pub(crate) fn record_pane_other_prompt(
+    /// Admit a brokered prompt that is not the owner's, before it is written,
+    /// so the transcript can mark its user turn once the submission reports
+    /// it delivered through the returned handle. `None` when the pane has no
+    /// terminal; an error while too many are still submitting.
+    pub(crate) fn admit_pane_other_prompt(
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         text: &str,
-        watch: std::sync::Arc<crate::terminal::PromptSubmitWatch>,
-    ) {
+    ) -> Result<
+        Option<crate::agent_transcript::PromptOutcome>,
+        crate::agent_transcript::TooManyPendingPrompts,
+    > {
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -151,15 +155,19 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(pane_id))
             .cloned()
         else {
-            return;
+            return Ok(None);
         };
-        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            let settled = terminal.settle_other_prompts();
-            terminal.record_other_prompt(text, crate::app::actions::current_unix_ms(), watch);
-            if settled {
-                self.state.mark_session_dirty();
-            }
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return Ok(None);
+        };
+        let saved_changed = terminal.other_prompts.prune();
+        let outcome = terminal
+            .other_prompts
+            .admit(text, crate::app::actions::current_unix_ms())?;
+        if saved_changed {
+            self.state.mark_session_dirty();
         }
+        Ok(Some(outcome))
     }
 
     pub(crate) fn record_pane_composer_write(

@@ -407,17 +407,21 @@ impl App {
         };
         // Start the completion waiter before submitting, so a refused thread
         // fails the request while nothing has been sent yet.
-        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        )>();
+        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<PromptSubmission>();
         let waiter_respond_to = respond_to.clone();
         let spawned = crate::thread_spawn::spawn_named("herdr-agent-prompt", move || {
-            let Ok((id, agent, completion)) = handoff_rx.recv() else {
+            let Ok((id, agent, completion, outcome)) = handoff_rx.recv() else {
                 return;
             };
-            let response = match completion.recv() {
+            let result = completion.recv();
+            // The completion is the submission's own report: Ok once Enter was
+            // written. Anything else drops the handle, which reports failure.
+            if matches!(result, Ok(Ok(()))) {
+                if let Some(outcome) = outcome {
+                    outcome.delivered();
+                }
+            }
+            let response = match result {
                 Ok(Ok(())) => encode_success(
                     id,
                     ResponseResult::AgentPrompted {
@@ -707,14 +711,7 @@ impl App {
         &mut self,
         validated: ValidatedAgentPrompt,
         params: &AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<PromptSubmission, String> {
         let ValidatedAgentPrompt {
             id,
             ws_idx,
@@ -722,6 +719,23 @@ impl App {
             expected_agent,
             agent,
         } = validated;
+        // A non-owner prompt is recorded before anything is written, and its
+        // record resolves from this submission's own outcome: delivered by the
+        // completion waiter, failed if the handle is dropped on any other path.
+        let outcome = if params.input_source.is_none() {
+            match self.admit_pane_other_prompt(ws_idx, pane_id, &params.text) {
+                Ok(outcome) => outcome,
+                Err(crate::agent_transcript::TooManyPendingPrompts) => {
+                    return Err(encode_error(
+                        id,
+                        "too_many_pending_prompts",
+                        "too many prompts to this agent are still being submitted; retry once they finish",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
@@ -777,16 +791,6 @@ impl App {
                 Some(guard),
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
-        if params.input_source.is_none() {
-            // Counts only once the Enter is written; a failed submission is
-            // dropped (see `TerminalState::settle_other_prompts`).
-            self.record_pane_other_prompt(
-                ws_idx,
-                pane_id,
-                &params.text,
-                std::sync::Arc::clone(&submit_watch),
-            );
-        }
         self.record_pane_prompt_submit_watch(ws_idx, pane_id, submit_watch);
         self.record_pane_composer_write(
             ws_idx,
@@ -801,7 +805,7 @@ impl App {
         // the validated snapshot only covers a pane that vanished meanwhile, so
         // no error is returned once bytes have been queued.
         let agent = self.agent_info(ws_idx, pane_id).unwrap_or(agent);
-        Ok((id, agent, completion))
+        Ok((id, agent, completion, outcome))
     }
 
     pub(super) fn handle_agent_read(
@@ -973,6 +977,16 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 }
+
+/// An accepted `agent.prompt` handed to its completion waiter: the request
+/// id, the agent as reported, the submission's completion, and the handle
+/// that resolves a non-owner prompt's record.
+type PromptSubmission = (
+    String,
+    crate::api::schema::AgentInfo,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+    Option<crate::agent_transcript::PromptOutcome>,
+);
 
 struct ValidatedAgentPrompt {
     id: String,
@@ -6457,8 +6471,7 @@ mod tests {
             assert!(response.contains("\"error\""), "{response}");
             h.report("working");
             let terminal = &h.app.state.terminals[&h.terminal_id];
-            assert!(terminal.other_prompts.is_empty());
-            assert!(terminal.delivered_other_prompts().is_empty());
+            assert_eq!(terminal.other_prompts.len(), 0, "the failed record is gone");
 
             // The owner then sends the same text; its transcript turn stays
             // unmarked.
@@ -6467,7 +6480,7 @@ mod tests {
             let page = crate::agent_transcript::read_page(
                 &session.path,
                 &crate::agent_transcript::PageRequest {
-                    other_prompts: terminal.other_prompts_for_read(),
+                    other_prompts: terminal.other_prompts.delivered(),
                     ..Default::default()
                 },
             )
@@ -6488,7 +6501,40 @@ mod tests {
             h.report("working");
             let terminal = &h.app.state.terminals[&h.terminal_id];
             assert_eq!(terminal.other_prompts.len(), 1);
-            assert_eq!(terminal.delivered_other_prompts().len(), 1);
+            assert_eq!(terminal.other_prompts.delivered().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_non_owner_prompt_is_refused_unwritten_while_too_many_are_pending() {
+            let mut h = harness();
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let terminal = h.app.state.terminals.get_mut(&h.terminal_id).unwrap();
+            let _in_flight: Vec<_> = (0..crate::agent_transcript::PENDING_PROMPT_LIMIT)
+                .map(|n| {
+                    terminal
+                        .other_prompts
+                        .admit(&format!("job {n}"), 1)
+                        .unwrap()
+                })
+                .collect();
+            let response = start_deferred_agent_prompt(
+                &mut h.app,
+                "prompt",
+                AgentPromptParams {
+                    target: h.pane.clone(),
+                    text: "one more".into(),
+                    wait: None,
+                    input_source: None,
+                },
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            assert!(response.contains("too_many_pending_prompts"), "{response}");
+            assert!(rx.try_recv().is_err(), "nothing was written");
+            // The owner's own prompts are not tracked, so they still go out.
+            h.prompt("owner prompt", Some(InputSource::App));
         }
 
         #[tokio::test]

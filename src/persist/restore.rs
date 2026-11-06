@@ -460,7 +460,8 @@ fn unavailable_restored_terminal(
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
         // The transcript stays readable, so keep marking its non-owner turns.
-        terminal.other_prompts = pane.other_prompts.iter().cloned().collect();
+        terminal.other_prompts =
+            crate::agent_transcript::OtherPromptLog::restored(pane.other_prompts.iter().cloned());
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -552,9 +553,11 @@ fn restore_tab(
         // rebuilt from the account registry when the agent is next spawned, so nothing
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
-        let saved_other_prompts: std::collections::VecDeque<_> = saved_pane
-            .map(|p| p.other_prompts.iter().cloned().collect())
-            .unwrap_or_default();
+        let saved_other_prompts = crate::agent_transcript::OtherPromptLog::restored(
+            saved_pane
+                .map(|p| p.other_prompts.clone())
+                .unwrap_or_default(),
+        );
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =

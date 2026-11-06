@@ -532,7 +532,7 @@ fn capture_tab(
                     .unwrap_or(0),
                 agent_account,
                 other_prompts: terminal
-                    .map(crate::terminal::TerminalState::delivered_other_prompts)
+                    .map(|terminal| terminal.other_prompts.delivered())
                     .unwrap_or_default(),
             },
         );
