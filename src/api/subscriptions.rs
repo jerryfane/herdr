@@ -735,6 +735,7 @@ impl ActiveTurnCompletedSubscription {
                 message_truncated,
                 agent_session_path,
                 completed_unix_ms,
+                turn_origin,
             } = &event.data
             else {
                 continue;
@@ -752,6 +753,7 @@ impl ActiveTurnCompletedSubscription {
                     event: SubscriptionEventKind::PaneTurnCompleted,
                     data: SubscriptionEventData::PaneTurnCompleted(Box::new(
                         PaneTurnCompletedEvent {
+                            turn_origin: *turn_origin,
                             pane: pane.clone(),
                             turn: *turn,
                             turn_epoch: *turn_epoch,
@@ -1315,6 +1317,7 @@ mod tests {
         event_hub.push(EventEnvelope {
             event: EventKind::PaneTurnCompleted,
             data: EventData::PaneTurnCompleted {
+                turn_origin: None,
                 pane: pane_info_with_scroll(None),
                 turn: 3,
                 turn_epoch: 9,

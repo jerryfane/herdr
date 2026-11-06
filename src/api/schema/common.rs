@@ -198,6 +198,15 @@ mod notification_cli {
     }
 }
 
+/// Who a write is acting for. `app` is a HerdrUp client acting for the owner;
+/// honoured only from the owner's own connection (never from a guest or a
+/// federation peer). Absent means a script, the CLI or another agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InputSource {
+    App,
+}
+
 /// Register (or update) a mobile device for remote push notifications.
 ///
 /// Field names match the iOS client's `RegisterDeviceParams` contract. The
@@ -213,6 +222,11 @@ pub struct NotificationsRegisterDeviceParams {
     pub notify_dies: bool,
     #[serde(default)]
     pub notify_finishes: bool,
+    /// With `notify_finishes`, push a finished turn only when the owner
+    /// started or joined it (`turn_origin` `mine`, or unknown). Absent on
+    /// older clients, which get every finished turn.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub notify_finishes_mine_only: bool,
     #[serde(default)]
     pub notify_gram: bool,
     /// Public pane ids the owner has muted on this device. Pushes for a muted

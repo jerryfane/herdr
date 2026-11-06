@@ -428,6 +428,7 @@ fn handle_request(
             let request = Request {
                 id: "reverse:agent.prompt".into(),
                 method: Method::AgentPrompt(AgentPromptParams {
+                    input_source: None,
                     target: target_agent.pane_id.clone(),
                     text,
                     wait: None,

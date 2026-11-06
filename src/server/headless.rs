@@ -2211,6 +2211,10 @@ impl HeadlessServer {
                                 true,
                                 false,
                             );
+                            self.app.record_terminal_input_origin(
+                                internal_terminal_id,
+                                crate::terminal::TurnOrigin::Mine,
+                            );
                         }
                     }
                     return true;
@@ -2568,6 +2572,12 @@ impl HeadlessServer {
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
                 if keyboard_forwarded {
                     self.note_interactive_input(runtime_pane_id, Instant::now());
+                    // Typing in an attached herdr client is the owner's.
+                    self.app.record_pane_input_source(
+                        workspace_index,
+                        runtime_pane_id,
+                        Some(crate::api::schema::InputSource::App),
+                    );
                 }
                 if let Err(err) = input_result {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");

@@ -190,6 +190,7 @@ impl RemoteTransition {
             80,
         )?;
         Some(PushNotification {
+            turn_origin: None,
             title,
             body: super::sanitized_notification_text(&self.alert.body, 240).unwrap_or_default(),
             pane_id: self.pane_id,
@@ -549,6 +550,7 @@ mod tests {
 
     fn device(token: &str, muted: &[&str], relay_capability: Option<&str>) -> RegisteredDevice {
         RegisteredDevice {
+            notify_finishes_mine_only: false,
             device_token: token.to_string(),
             platform: "ios".to_string(),
             notify_needs_input: true,

@@ -1264,6 +1264,7 @@ mod tests {
         let response = prompt_agent_with_effect_timeout(
             name.into(),
             crate::api::schema::AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: text.into(),
                 wait: Some(crate::api::schema::AgentPromptWaitOptions {

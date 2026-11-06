@@ -199,6 +199,7 @@ impl Fixture {
 
 fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> PageRequest {
     PageRequest {
+        other_prompts: Vec::new(),
         before: before.map(str::to_owned),
         after: after.map(str::to_owned),
         limit,
@@ -287,6 +288,7 @@ fn a_turn_maps_to_user_thinking_reply_and_turn_end() {
         page.entries,
         vec![
             TranscriptEntry::User {
+                origin: None,
                 id: user,
                 ts_ms: session.ms(1),
                 text: "Fix the flaky test".into(),
@@ -1962,4 +1964,80 @@ fn task_step_details_and_results_name_the_subagents() {
         assert_eq!(status(&text), expected, "{envelope}");
     }
     assert_eq!(status("Background job Rev has completed."), None);
+}
+
+fn user_origins(page: &Page) -> Vec<(String, Option<crate::terminal::TurnOrigin>)> {
+    page.entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::User { text, origin, .. } => Some((text.clone(), *origin)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin");
+    // Typed by the owner before herdr brokered anything with the same text.
+    session.user("review PR 12");
+    session.assistant(vec![text("ok")], "stop");
+    session.user("review PR 12");
+    session.assistant(vec![text("done")], "stop");
+    session.user("check the logs");
+    session.assistant(vec![text("clean")], "stop");
+    session.user("review PR 12");
+    let prompts = vec![OtherPrompt::new("review PR 12\r\n", session.ms(3))];
+
+    let page = read_page(
+        &session.path,
+        &PageRequest {
+            other_prompts: prompts.clone(),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&page),
+        vec![
+            ("review PR 12".into(), None),
+            ("review PR 12".into(), Some(TurnOrigin::Other)),
+            ("check the logs".into(), None),
+            ("review PR 12".into(), None),
+        ]
+    );
+    let wire = serde_json::to_value(&page.entries).unwrap();
+    let users: Vec<_> = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "user")
+        .collect();
+    assert_eq!(users[1]["origin"], "other");
+    assert!(users[0].get("origin").is_none(), "owner turns omit origin");
+
+    // A page that starts after the match still marks it the same way.
+    let older = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            other_prompts: prompts,
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(user_origins(&older), vec![("review PR 12".into(), None)]);
+}
+
+#[test]
+fn without_remembered_prompts_no_user_turn_is_marked() {
+    let mut session = Fixture::new("origin-none");
+    session.user("gitmoot review PR 12");
+    let page = session.newest();
+    assert_eq!(
+        user_origins(&page),
+        vec![("gitmoot review PR 12".into(), None)]
+    );
 }

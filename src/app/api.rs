@@ -1057,6 +1057,7 @@ impl App {
                 self.emit_event(crate::api::schema::EventEnvelope {
                     event: crate::api::schema::EventKind::PaneTurnCompleted,
                     data: crate::api::schema::EventData::PaneTurnCompleted {
+                        turn_origin: completed.turn_origin,
                         pane,
                         turn: completed.turn,
                         turn_epoch: completed.turn_epoch,
@@ -1160,6 +1161,10 @@ impl App {
                 }),
                 ask_source: push_ask_source(push_kind, agent_label, terminal, agent_display),
                 ask: None,
+                turn_origin: update
+                    .completed_turn
+                    .as_ref()
+                    .and_then(|turn| turn.turn_origin),
             });
         }
 
@@ -2242,6 +2247,7 @@ pub(crate) fn registered_device(
         notify_needs_input: params.notify_needs_input,
         notify_dies: params.notify_dies,
         notify_finishes: params.notify_finishes,
+        notify_finishes_mine_only: params.notify_finishes_mine_only,
         notify_gram: params.notify_gram,
         // The client owns the mute set and re-sends it whole on each change;
         // store a normalised copy (trimmed, blanks dropped, sorted,

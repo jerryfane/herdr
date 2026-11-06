@@ -63,6 +63,8 @@ pub(crate) struct PushNotification {
     /// The question this alert lets the owner answer (`herdr_ask`), filled on
     /// the push thread from `ask_source`.
     pub ask: Option<PushAsk>,
+    /// For a finished push: who started the turn (`None` when unknown).
+    pub turn_origin: Option<crate::terminal::TurnOrigin>,
 }
 
 /// True when the push config is complete enough to attempt delivery: the master
@@ -175,6 +177,14 @@ fn device_wants(device: &RegisteredDevice, kind: PushKind) -> bool {
     }
 }
 
+/// A mine-only device skips finished turns someone else started. Unknown
+/// origin counts as the owner's, so missing data never loses a notification.
+fn device_wants_origin(device: &RegisteredDevice, notification: &PushNotification) -> bool {
+    !(notification.kind == PushKind::Finished
+        && device.notify_finishes_mine_only
+        && notification.turn_origin == Some(crate::terminal::TurnOrigin::Other))
+}
+
 /// True when the owner has muted this notification's pane on this device.
 /// A blank `pane_id` (gram pushes carry none) is never muted, so gram alerts
 /// are unaffected by per-agent mutes.
@@ -184,7 +194,9 @@ fn device_muted(device: &RegisteredDevice, pane_id: &str) -> bool {
 
 /// The device opted into this kind and has not muted its pane.
 pub(crate) fn device_accepts(device: &RegisteredDevice, notification: &PushNotification) -> bool {
-    device_wants(device, notification.kind) && !device_muted(device, &notification.pane_id)
+    device_wants(device, notification.kind)
+        && device_wants_origin(device, notification)
+        && !device_muted(device, &notification.pane_id)
 }
 
 fn unix_secs_now() -> u64 {
@@ -711,6 +723,7 @@ mod tests {
 
     fn device(needs_input: bool, dies: bool, finishes: bool) -> RegisteredDevice {
         RegisteredDevice {
+            notify_finishes_mine_only: false,
             device_token: "token".to_string(),
             platform: "ios".to_string(),
             notify_needs_input: needs_input,

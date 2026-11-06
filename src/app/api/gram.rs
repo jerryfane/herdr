@@ -1146,6 +1146,7 @@ pub(crate) fn gram_push_notification(
         };
     }
     crate::push::PushNotification {
+        turn_origin: None,
         title,
         body,
         pane_id: String::new(),

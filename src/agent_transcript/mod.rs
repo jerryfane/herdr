@@ -9,6 +9,7 @@
 mod history;
 mod index;
 mod normalize;
+mod origin;
 mod subagents;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -27,6 +28,7 @@ use crate::api::schema::{
 };
 use index::{read_line, Kind, SessionIndex};
 use normalize::{AssistantLine, NoteLine, ResultLine, StampLine, UserLine, SUMMARY_TEXT};
+pub(crate) use origin::{OtherPrompt, OTHER_PROMPT_LIMIT};
 
 pub(crate) const DEFAULT_TURNS: u32 = 20;
 pub(crate) const MAX_TURNS: u32 = 50;
@@ -43,6 +45,9 @@ pub(crate) struct PageRequest {
     pub(crate) limit: Option<u32>,
     /// Page this subagent's own session file instead of the agent's.
     pub(crate) subagent: Option<String>,
+    /// The pane's remembered non-owner prompts, oldest first; their user
+    /// turns are marked `origin: "other"`. Ignored for subagent pages.
+    pub(crate) other_prompts: Vec<OtherPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,7 +168,11 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
             with_index(&child, |view| view.page(request, limit))
         }
-        None => with_index(path, |view| view.page(request, limit)),
+        None => with_index(path, |view| {
+            let mut page = view.page(request, limit)?;
+            view.mark_other_user_turns(&request.other_prompts, &mut page.entries)?;
+            Ok(page)
+        }),
     }
 }
 
@@ -315,6 +324,59 @@ impl View<'_> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let line = read_line(&mut file, self.index.record(record))?;
         Ok(serde_json::from_slice(&line).ok())
+    }
+
+    /// Set `origin: "other"` on the page's user turns that the remembered
+    /// non-owner prompts produced. Matching runs over the branch's user turns
+    /// since the oldest prompt, so a page sees the same marks whatever its
+    /// window.
+    fn mark_other_user_turns(
+        &self,
+        prompts: &[OtherPrompt],
+        entries: &mut [TranscriptEntry],
+    ) -> Result<(), TranscriptError> {
+        let Some(earliest_ms) = origin::earliest_turn_ms(prompts) else {
+            return Ok(());
+        };
+        if !entries
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::User { .. }))
+        {
+            return Ok(());
+        }
+        let mut turns = Vec::new();
+        for position in (0..self.branch.len()).rev() {
+            if self.kind(position) != Kind::User {
+                continue;
+            }
+            let record = self.branch[position];
+            let Some(line) = self.parse::<UserLine>(record)? else {
+                continue;
+            };
+            let ts_ms = normalize::ts_ms(line.message.timestamp, line.timestamp.as_deref());
+            if ts_ms < earliest_ms {
+                break;
+            }
+            let text = normalize::content_text(&line.message.content);
+            if text.trim().is_empty() {
+                continue;
+            }
+            turns.push(origin::UserTurn {
+                id: self.index.record(record).id.to_string(),
+                ts_ms,
+                sha256: origin::text_digest(&text),
+            });
+        }
+        turns.reverse();
+        let matched = origin::matched_turns(prompts, &turns);
+        for entry in entries {
+            if let TranscriptEntry::User { id, origin, .. } = entry {
+                if matched.contains(id.as_str()) {
+                    *origin = Some(crate::terminal::TurnOrigin::Other);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn page(&self, request: &PageRequest, limit: usize) -> Result<Page, TranscriptError> {
@@ -706,6 +768,7 @@ impl View<'_> {
                             text,
                             author,
                             author_name,
+                            origin: None,
                         });
                     }
                 }

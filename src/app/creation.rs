@@ -102,6 +102,62 @@ pub(super) fn launch_cwd_for_terminal(
 }
 
 impl App {
+    /// Attribute a write to a pane's current or next turn: `mine` for a
+    /// HerdrUp client acting for the owner, `other` for anyone else.
+    pub(crate) fn record_pane_input_source(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        input_source: Option<crate::api::schema::InputSource>,
+    ) {
+        let origin = match input_source {
+            Some(crate::api::schema::InputSource::App) => crate::terminal::TurnOrigin::Mine,
+            None => crate::terminal::TurnOrigin::Other,
+        };
+        if let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        {
+            self.record_terminal_input_origin(&terminal_id, origin);
+        }
+    }
+
+    pub(crate) fn record_terminal_input_origin(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        origin: crate::terminal::TurnOrigin,
+    ) {
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.record_input_origin(origin);
+        }
+    }
+
+    /// Remember a brokered prompt that was not the owner's so the transcript
+    /// can mark its user turn, and save it with the pane.
+    pub(crate) fn record_pane_other_prompt(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        text: &str,
+    ) {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.record_other_prompt(text, crate::app::actions::current_unix_ms());
+            self.state.mark_session_dirty();
+        }
+    }
+
     pub(crate) fn record_pane_composer_write(
         &mut self,
         ws_idx: usize,
@@ -574,6 +630,7 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             last_completed_turn: terminal.last_completed_turn().map(|record| {
                 crate::api::schema::LastCompletedTurn {
+                    turn_origin: record.turn_origin,
                     turn: record.turn,
                     turn_epoch: record.turn_epoch,
                     completed_unix_ms: record.completed_unix_ms,

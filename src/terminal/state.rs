@@ -27,6 +27,18 @@ pub enum TurnOutcome {
     Aborted,
 }
 
+/// Who started a turn: the owner (a HerdrUp client sending `input_source:
+/// "app"`, or typing in an attached herdr terminal), or anyone else (scripts,
+/// the CLI, gitmoot, other agents, guests). Unknown origins are left `None`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    Mine,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnRecord {
     pub turn: u64,
@@ -36,6 +48,7 @@ pub(crate) struct TurnRecord {
     pub message: Option<String>,
     pub message_truncated: bool,
     pub agent_session_path: Option<String>,
+    pub turn_origin: Option<TurnOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +330,12 @@ pub struct TerminalState {
     pub occupant_generation: u64,
     turn_records: VecDeque<TurnRecord>,
     turn_abort_pending_at: Option<Instant>,
+    /// Origin of the current (or next) turn; `None` while unknown. Cleared when
+    /// a turn completes and copied onto its `TurnRecord`.
+    pub(crate) turn_origin: Option<TurnOrigin>,
+    /// Brokered `agent.prompt` texts that were not the owner's, oldest first,
+    /// so `agent.transcript` can mark their user turns. Persisted with the pane.
+    pub(crate) other_prompts: VecDeque<crate::agent_transcript::OtherPrompt>,
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -398,6 +417,8 @@ impl TerminalState {
             occupant_generation: 0,
             turn_records: VecDeque::with_capacity(TURN_RECORD_LIMIT),
             turn_abort_pending_at: None,
+            turn_origin: None,
+            other_prompts: VecDeque::new(),
             last_agent_completion_seq: None,
             revision: 0,
             launch_argv: None,
@@ -496,11 +517,35 @@ impl TerminalState {
         });
         attempt_id
     }
+
+    /// Attribute input written to this terminal. Input while no turn runs
+    /// decides the next turn's origin; during a turn only the owner's input
+    /// counts, and it makes the turn the owner's.
+    pub(crate) fn record_input_origin(&mut self, origin: TurnOrigin) {
+        let in_turn = matches!(self.state, AgentState::Working | AgentState::Blocked);
+        if !in_turn || origin == TurnOrigin::Mine {
+            self.turn_origin = Some(origin);
+        }
+    }
+
+    /// Remember a brokered prompt that was not the owner's, keeping the newest
+    /// [`crate::agent_transcript::OTHER_PROMPT_LIMIT`].
+    pub(crate) fn record_other_prompt(&mut self, text: &str, submitted_unix_ms: u64) {
+        if self.other_prompts.len() >= crate::agent_transcript::OTHER_PROMPT_LIMIT {
+            self.other_prompts.pop_front();
+        }
+        self.other_prompts
+            .push_back(crate::agent_transcript::OtherPrompt::new(
+                text,
+                submitted_unix_ms,
+            ));
+    }
     pub(crate) fn reset_turn_counter(&mut self, path: TurnCounterResetPath) {
         self.turn = 0;
         self.turn_epoch = fresh_turn_epoch_for(path);
         self.turn_records.clear();
         self.turn_abort_pending_at = None;
+        self.turn_origin = None;
     }
 
     pub(crate) fn mark_turn_aborted(&mut self) {
@@ -590,6 +635,7 @@ impl TerminalState {
             agent_session_path: current_context
                 .agent_session_path
                 .or(fallback_context.agent_session_path),
+            turn_origin: self.turn_origin.take(),
         };
         if self.turn_records.len() == TURN_RECORD_LIMIT {
             self.turn_records.pop_front();

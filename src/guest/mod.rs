@@ -983,6 +983,7 @@ mod tests {
 
     fn device(token: &str) -> crate::persist::devices::RegisteredDevice {
         crate::persist::devices::RegisteredDevice {
+            notify_finishes_mine_only: false,
             device_token: token.to_string(),
             platform: "ios".to_string(),
             notify_needs_input: true,

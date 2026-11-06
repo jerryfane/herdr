@@ -338,6 +338,7 @@ mod tests {
 
     fn sample_notification() -> PushNotification {
         PushNotification {
+            turn_origin: None,
             title: "claude finished".to_string(),
             body: "herdr · 1".to_string(),
             pane_id: "w1-1".to_string(),

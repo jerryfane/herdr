@@ -525,6 +525,7 @@ fn hub_envelope(payload: SubscriptionStreamPayload) -> Option<EventEnvelope> {
                 Some(EventEnvelope {
                     event: EventKind::PaneTurnCompleted,
                     data: EventData::PaneTurnCompleted {
+                        turn_origin: event.turn_origin,
                         pane: event.pane,
                         turn: event.turn,
                         turn_epoch: event.turn_epoch,

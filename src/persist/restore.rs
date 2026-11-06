@@ -550,6 +550,9 @@ fn restore_tab(
         // rebuilt from the account registry when the agent is next spawned, so nothing
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
+        let saved_other_prompts: std::collections::VecDeque<_> = saved_pane
+            .map(|p| p.other_prompts.iter().cloned().collect())
+            .unwrap_or_default();
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -617,6 +620,7 @@ fn restore_tab(
             // Restore account routing. Without this the pane comes back on the harness
             // default and writes to the WRONG account's transcript, which reads as lost work.
             terminal.agent_account = saved_agent_account.clone();
+            terminal.other_prompts = saved_other_prompts.clone();
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -731,6 +735,7 @@ fn restore_tab(
                     terminal.set_manual_label(label);
                 }
                 terminal.agent_account = saved_agent_account.clone();
+                terminal.other_prompts = saved_other_prompts.clone();
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1088,6 +1093,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1380,6 +1386,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd: cwd.clone(),
                             label: Some("herdr-app".into()),
                             agent_name: Some("herdr-app".into()),
@@ -1818,6 +1825,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1903,6 +1911,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1991,6 +2000,7 @@ mod tests {
                         (
                             10,
                             super::super::snapshot::PaneSnapshot {
+                                other_prompts: Vec::new(),
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -2006,6 +2016,7 @@ mod tests {
                         (
                             20,
                             super::super::snapshot::PaneSnapshot {
+                                other_prompts: Vec::new(),
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -2064,6 +2075,7 @@ mod tests {
             (
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
+                    other_prompts: Vec::new(),
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -2078,6 +2090,7 @@ mod tests {
             )
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
+            other_prompts: Vec::new(),
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -2242,6 +2255,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2558,6 +2572,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

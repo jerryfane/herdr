@@ -836,7 +836,7 @@ fn poll_for_request(
 #[allow(clippy::too_many_arguments)]
 fn serve_request(
     stream: &mut ApiStream,
-    request: Request,
+    mut request: Request,
     guest: &GuestPrincipal,
     live: &crate::guest::LiveSession,
     api_tx: &ApiRequestSender,
@@ -844,6 +844,8 @@ fn serve_request(
     running: &Arc<AtomicBool>,
     ends: &Cell<bool>,
 ) -> std::io::Result<()> {
+    // A guest never acts for the owner, whatever it claims.
+    request.method.clear_input_source();
     let id = request.id.clone();
     let method = crate::api::api_method_name(&request.method);
     let forbidden = |stream: &mut ApiStream| {
@@ -1154,6 +1156,7 @@ fn serve_request(
                 method: Method::PaneSendKeys(PaneSendKeysParams {
                     pane_id: agent.pane_id,
                     keys: keys.into_iter().map(str::to_owned).collect(),
+                    input_source: None,
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
@@ -4279,6 +4282,35 @@ mod tests {
         fn subscribe_changes(&self) -> std_mpsc::Receiver<()> {
             crate::guest::subscribe_changes()
         }
+    }
+
+    #[test]
+    fn a_guest_prompt_claiming_the_app_source_is_not_the_owners() {
+        let harness = start("guest-input-source");
+        let guest = harness.admit();
+        let prompt = json!({"id": "p1", "method": "agent.prompt", "params": {
+            "target": "llm-opt", "text": "ship it", "input_source": "app"
+        }});
+        let reply = harness.call(&guest, prompt);
+        assert_eq!(reply[0]["result"]["type"], "agent_prompted", "{reply:?}");
+        let (tx, rx) = std_mpsc::channel();
+        harness
+            .control
+            .send(Box::new(move |app: &mut App| {
+                let pane = app.state.workspaces[0].tabs[0].root_pane;
+                let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                let terminal = &app.state.terminals[&terminal_id];
+                let _ = tx.send((terminal.turn_origin, terminal.other_prompts.len()));
+            }))
+            .unwrap();
+        let (origin, other_prompts) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(origin, Some(crate::terminal::TurnOrigin::Other));
+        assert_eq!(
+            other_prompts, 1,
+            "a guest prompt is remembered as not the owner's"
+        );
     }
 
     #[test]

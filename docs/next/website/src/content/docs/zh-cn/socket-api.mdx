@@ -728,6 +728,8 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 设置 `"local_only": true` 可以排除服务器从自己的对等方中继来的事件。协调端会在自己的中继流上设置它,因此本身也是协调端的对等方永远不会再次导出第三台机器的事件。旧服务器会忽略该字段;它们没有需要排除的中继事件。
 
+`agent.prompt`、`agent.send_keys`、`pane.send_text`、`pane.send_input`、`pane.send_keys` 以及 `pane.input.stream` 的打开请求接受可选的 `input_source`。代表所有者操作的 HerdrUp 客户端发送 `"input_source": "app"`;脚本、CLI 和其他代理省略它。Herdr 只在所有者自己的连接上采用该值:访客和联邦对等方的值按省略处理。每个代理窗格会记录当前轮次由谁发起:带 `"input_source": "app"` 的输入或在已连接的 herdr 终端中输入记为 `mine`,其他发起轮次的输入记为 `other`,代理工作期间所有者的输入会把该轮次变为 `mine`。完成的轮次在 `pane.get`、`agent.get` 和 `agent.list` 的 `last_completed_turn`、`pane.turns` 记录以及 `pane.turn_completed` 事件中带有 `turn_origin`(`"mine"` 或 `"other"`,未知时省略,例如重启之后)。`notifications.register_device` 接受 `notify_finishes_mine_only`(默认 `false`):与 `notify_finishes` 一起使用时,设备只收到来源为 `mine` 或未知的轮次完成推送;需要输入和退出推送不变。Herdr 还会按窗格记住最近 200 条非所有者的 `agent.prompt` 文本(随会话保存),`agent.transcript` 按顺序、按完全相同的文本匹配它们产生的用户条目,并标记 `"origin": "other"`;所有者和未知条目省略 `origin`。`ping` 通过 `capabilities.turn_origin` 声明这些功能。
+
 通过 `notifications.register_device` 注册的设备也会收到远程代理的推送通知,并按各设备的“需要你”“已完成”“已退出”偏好发送。标题会写明机器,例如 `llm-opt on Jerry's Mac Studio needs attention`;通知携带带 `<alias>/` 前缀的窗格 ID,因此在 `muted_panes` 中写入该 ID 即可静音远程窗格。每次状态变化只推送一次:重复中继的事件、重新同步,或重复已知状态的轮询都不会再发送。没有 `events_v2` 的对等方通过每 5 秒一次的轮询通知。可达对等方不再列出的代理窗格视为已退出,因此对等方离线期间丢失的退出事件仍会通知一次。Live Activity 会把可达对等方上的代理与本地代理一起计数。
 
 ## 读取窗格
