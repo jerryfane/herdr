@@ -459,6 +459,8 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        // The transcript stays readable, so keep marking its non-owner turns.
+        terminal.other_prompts = pane.other_prompts.iter().cloned().collect();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -1732,14 +1734,20 @@ mod tests {
             };
             snapshot.workspaces[0].worktree_space = Some(membership.clone());
             let failed = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
+            let saved_prompts = vec![crate::agent_transcript::OtherPrompt::new("review PR 12", 1)];
             failed.cwd = missing.clone();
             failed.label = Some("keep my pane".into());
+            failed.other_prompts = saved_prompts.clone();
             failed.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
             });
+            // The other workspace's pane fails to spawn when the shell is missing.
+            for pane in snapshot.workspaces[1].tabs[0].panes.values_mut() {
+                pane.other_prompts = saved_prompts.clone();
+            }
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
                 &snapshot,
@@ -1782,6 +1790,16 @@ mod tests {
                 "fallback cwd must not replace saved intent"
             );
             assert_eq!(pane.label.as_deref(), Some("keep my pane"));
+            assert_eq!(
+                pane.other_prompts, saved_prompts,
+                "an unavailable pane keeps its non-owner prompt digests"
+            );
+            for pane in captured.workspaces[1].tabs[0].panes.values() {
+                assert_eq!(
+                    pane.other_prompts, saved_prompts,
+                    "missing_shell={missing_shell}"
+                );
+            }
             assert_eq!(
                 pane.agent_session.as_ref().unwrap().value,
                 "keep-my-session"

@@ -28,7 +28,7 @@ use crate::api::schema::{
 };
 use index::{read_line, Kind, SessionIndex};
 use normalize::{AssistantLine, NoteLine, ResultLine, StampLine, UserLine, SUMMARY_TEXT};
-pub(crate) use origin::{OtherPrompt, OTHER_PROMPT_LIMIT};
+pub(crate) use origin::{OtherPrompt, OtherPrompts, OTHER_PROMPT_LIMIT};
 
 pub(crate) const DEFAULT_TURNS: u32 = 20;
 pub(crate) const MAX_TURNS: u32 = 50;
@@ -47,7 +47,7 @@ pub(crate) struct PageRequest {
     pub(crate) subagent: Option<String>,
     /// The pane's remembered non-owner prompts, oldest first; their user
     /// turns are marked `origin: "other"`. Ignored for subagent pages.
-    pub(crate) other_prompts: Vec<OtherPrompt>,
+    pub(crate) other_prompts: OtherPrompts,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,12 +166,12 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         Some(id) => {
             let child =
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
-            with_index(&child, |view| view.page(request, limit))
+            with_index(&child, |view| view.page(request, limit, &[]))
         }
+        // Taken after the index refresh, so a prompt confirmed while this
+        // read was queued marks the entry it produced.
         None => with_index(path, |view| {
-            let mut page = view.page(request, limit)?;
-            view.mark_other_user_turns(&request.other_prompts, &mut page.entries)?;
-            Ok(page)
+            view.page(request, limit, &request.other_prompts.current())
         }),
     }
 }
@@ -379,7 +379,12 @@ impl View<'_> {
         Ok(())
     }
 
-    fn page(&self, request: &PageRequest, limit: usize) -> Result<Page, TranscriptError> {
+    fn page(
+        &self,
+        request: &PageRequest,
+        limit: usize,
+        other_prompts: &[OtherPrompt],
+    ) -> Result<Page, TranscriptError> {
         let session_id = self.session_id().to_owned();
         let (start, end, changed_since) = match (&request.before, &request.after) {
             (Some(token), _) => {
@@ -413,10 +418,19 @@ impl View<'_> {
             }
         };
         let mut entries = Vec::new();
+        let mut resent_user = None;
         if let Some(seen) = changed_since {
+            resent_user = self.resend_user(start, other_prompts, &mut entries)?;
             self.resend_changed(seen, start, &mut entries)?;
         }
         self.render(start, end, &mut entries)?;
+        self.mark_other_user_turns(other_prompts, &mut entries)?;
+        // The re-sent user entry stays only when it carries an origin.
+        if let Some(resent) = resent_user {
+            entries.retain(|entry| {
+                !matches!(entry, TranscriptEntry::User { id, origin: None, .. } if *id == resent)
+            });
+        }
         let before = (changed_since.is_none() && start > 0).then(|| {
             let record = self.branch[start];
             Cursor::Before {
@@ -966,6 +980,32 @@ impl View<'_> {
             }));
         }
         Ok(None)
+    }
+
+    /// The newest user entry before an `after` page, re-sent so its `origin`
+    /// reaches a client that got it before its prompt was confirmed delivered
+    /// (the caller drops it again when it is not marked). Returns its id.
+    fn resend_user(
+        &self,
+        start: usize,
+        other_prompts: &[OtherPrompt],
+        entries: &mut Vec<TranscriptEntry>,
+    ) -> Result<Option<String>, TranscriptError> {
+        if other_prompts.is_empty() {
+            return Ok(None);
+        }
+        let Some(position) = (0..start)
+            .rev()
+            .find(|&position| self.kind(position) == Kind::User)
+        else {
+            return Ok(None);
+        };
+        let before = entries.len();
+        self.render(position, position + 1, entries)?;
+        Ok(entries[before..].iter().find_map(|entry| match entry {
+            TranscriptEntry::User { id, .. } => Some(id.clone()),
+            _ => None,
+        }))
     }
 
     /// Entries emitted before the client's `after` cursor whose state moved

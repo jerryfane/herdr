@@ -199,7 +199,7 @@ impl Fixture {
 
 fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> PageRequest {
     PageRequest {
-        other_prompts: Vec::new(),
+        other_prompts: OtherPrompts::default(),
         before: before.map(str::to_owned),
         after: after.map(str::to_owned),
         limit,
@@ -1998,7 +1998,7 @@ fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
     let page = read_page(
         &session.path,
         &PageRequest {
-            other_prompts: prompts.clone(),
+            other_prompts: OtherPrompts::delivered(prompts.clone()),
             ..PageRequest::default()
         },
     )
@@ -2027,7 +2027,7 @@ fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
         &session.path,
         &PageRequest {
             limit: Some(1),
-            other_prompts: prompts,
+            other_prompts: OtherPrompts::delivered(prompts),
             ..PageRequest::default()
         },
     )
@@ -2044,4 +2044,65 @@ fn without_remembered_prompts_no_user_turn_is_marked() {
         user_origins(&page),
         vec![("gitmoot review PR 12".into(), None)]
     );
+}
+
+#[test]
+fn an_origin_confirmed_after_its_entry_was_sent_reaches_the_next_after_page() {
+    use crate::terminal::{PromptSubmitWatch, TurnOrigin};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let mut session = Fixture::new("origin-late");
+    let brokered_at = session.ms(session.next + 1);
+    session.user("continue");
+    let watch = Arc::new(PromptSubmitWatch::default());
+    let prompts = OtherPrompts::new(
+        Vec::new(),
+        vec![(OtherPrompt::new("continue", brokered_at), watch.clone())],
+    );
+    let request = |after: Option<&str>| PageRequest {
+        after: after.map(str::to_owned),
+        other_prompts: prompts.clone(),
+        ..PageRequest::default()
+    };
+
+    // The entry is read before the Enter was confirmed: no origin yet.
+    let first = read_page(&session.path, &request(None)).unwrap();
+    assert_eq!(user_origins(&first), vec![("continue".into(), None)]);
+
+    // The submission is confirmed and the agent answers; the next `after`
+    // page re-sends the user entry with its origin.
+    watch.submitted.store(true, Ordering::SeqCst);
+    session.assistant(vec![text("on it")], "stop");
+    let next = read_page(&session.path, &request(Some(&first.after))).unwrap();
+    assert_eq!(
+        user_origins(&next),
+        vec![("continue".into(), Some(TurnOrigin::Other))]
+    );
+    let wire = serde_json::to_value(&next.entries[0]).unwrap();
+    assert_eq!(wire["origin"], "other");
+    assert_eq!(
+        wire["id"],
+        serde_json::to_value(&first.entries[0]).unwrap()["id"]
+    );
+}
+
+#[test]
+fn an_after_page_does_not_resend_an_unmarked_user_entry() {
+    let mut session = Fixture::new("origin-unmarked");
+    session.user("continue");
+    let first = session.newest();
+    session.assistant(vec![text("on it")], "stop");
+    // Delivered, but for different text: the user entry is not re-sent.
+    let prompts = OtherPrompts::delivered(vec![OtherPrompt::new("something else", session.ms(1))]);
+    let next = read_page(
+        &session.path,
+        &PageRequest {
+            after: Some(first.after.clone()),
+            other_prompts: prompts,
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(user_origins(&next).is_empty(), "{:?}", next.entries);
 }

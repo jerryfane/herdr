@@ -949,6 +949,7 @@ impl App {
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
         let composer_baseline = runtime.detection_content_seq();
+        let wrote_input = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
@@ -960,7 +961,9 @@ impl App {
             false,
             false,
         );
-        self.record_pane_input_source(resolved.ws_idx, resolved.pane_id, params.input_source);
+        if wrote_input {
+            self.record_pane_input_source(resolved.ws_idx, resolved.pane_id, params.input_source);
+        }
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.mark_turn_aborted();
@@ -6395,6 +6398,44 @@ mod tests {
             assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
         }
 
+        fn send_keys(h: &mut Harness, keys: &[&str]) -> String {
+            h.app.handle_pane_send_keys(
+                "keys".into(),
+                crate::api::schema::PaneSendKeysParams {
+                    pane_id: h.pane.clone(),
+                    keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                    input_source: Some(InputSource::App),
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn an_owner_request_that_writes_nothing_leaves_the_origin_alone() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            let response = send_keys(&mut h, &[]);
+            assert!(response.contains("\"result\""), "{response}");
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Other));
+        }
+
+        #[tokio::test]
+        async fn accepted_owner_keys_count_even_when_a_later_key_fails() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            // Room for one write only, so the second key is refused.
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, _rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80, 24, 0, b"", 1,
+                );
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let response = send_keys(&mut h, &["a", "b"]);
+            assert!(response.contains("pane_send_failed"), "{response}");
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
         #[tokio::test]
         async fn a_failed_automation_prompt_leaves_no_record_to_claim_the_owners() {
             let mut h = harness();
@@ -6426,7 +6467,7 @@ mod tests {
             let page = crate::agent_transcript::read_page(
                 &session.path,
                 &crate::agent_transcript::PageRequest {
-                    other_prompts: terminal.delivered_other_prompts(),
+                    other_prompts: terminal.other_prompts_for_read(),
                     ..Default::default()
                 },
             )

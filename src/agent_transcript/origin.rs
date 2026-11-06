@@ -6,6 +6,8 @@
 //! marked `origin: "other"`. Nothing is guessed from the text itself.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -42,6 +44,65 @@ impl OtherPrompt {
             sha256: text_digest(text),
             submitted_unix_ms,
         }
+    }
+}
+
+/// A pane's non-owner prompts as a transcript read sees them: the delivered
+/// ones, plus those still submitting with the watch that will report them.
+/// [`Self::current`] is called after the session file is read, so a prompt
+/// whose Enter landed while the request was on its way still counts.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtherPrompts {
+    delivered: Vec<OtherPrompt>,
+    pending: Vec<(OtherPrompt, Arc<crate::terminal::PromptSubmitWatch>)>,
+}
+
+/// Equal when they hold the same prompts and the same watches.
+impl PartialEq for OtherPrompts {
+    fn eq(&self, other: &Self) -> bool {
+        self.delivered == other.delivered
+            && self.pending.len() == other.pending.len()
+            && self
+                .pending
+                .iter()
+                .zip(&other.pending)
+                .all(|((a, a_watch), (b, b_watch))| a == b && Arc::ptr_eq(a_watch, b_watch))
+    }
+}
+
+impl Eq for OtherPrompts {}
+
+impl OtherPrompts {
+    pub(crate) fn new(
+        delivered: Vec<OtherPrompt>,
+        pending: Vec<(OtherPrompt, Arc<crate::terminal::PromptSubmitWatch>)>,
+    ) -> Self {
+        Self { delivered, pending }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivered(delivered: Vec<OtherPrompt>) -> Self {
+        Self::new(delivered, Vec::new())
+    }
+
+    /// The prompts delivered by now, oldest first, at most
+    /// [`OTHER_PROMPT_LIMIT`].
+    pub(crate) fn current(&self) -> Vec<OtherPrompt> {
+        let mut prompts: Vec<_> = self
+            .delivered
+            .iter()
+            .cloned()
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|(_, watch)| watch.submitted.load(Ordering::SeqCst))
+                    .map(|(prompt, _)| prompt.clone()),
+            )
+            .collect();
+        prompts.sort_by_key(|prompt| prompt.submitted_unix_ms);
+        let excess = prompts.len().saturating_sub(OTHER_PROMPT_LIMIT);
+        prompts.drain(..excess);
+        prompts
     }
 }
 

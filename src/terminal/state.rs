@@ -13,9 +13,11 @@ use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
 
 pub(crate) const TURN_RECORD_LIMIT: usize = 64;
-/// Non-owner prompts awaiting their submission outcome; prompts reach one pane
-/// one at a time, so more than a handful in flight only means failures.
-const PENDING_OTHER_PROMPT_LIMIT: usize = 16;
+/// Non-owner prompts awaiting their submission outcome. Each settles within
+/// its submit delay or deadline, so this is a safety bound against a stuck PTY,
+/// well above any real burst: past it a new non-owner prompt is not tracked
+/// (its user turn shows unmarked) instead of forgetting one already in flight.
+const PENDING_OTHER_PROMPT_LIMIT: usize = 256;
 pub(crate) const TURN_MESSAGE_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const TURN_ABORT_WINDOW: Duration = Duration::from_secs(15);
 
@@ -551,7 +553,11 @@ impl TerminalState {
     ) {
         self.settle_other_prompts();
         if self.pending_other_prompts.len() >= PENDING_OTHER_PROMPT_LIMIT {
-            self.pending_other_prompts.remove(0);
+            tracing::warn!(
+                pending = self.pending_other_prompts.len(),
+                "too many unresolved non-owner prompts; not tracking this one"
+            );
+            return;
         }
         self.pending_other_prompts.push((
             crate::agent_transcript::OtherPrompt::new(text, submitted_unix_ms),
@@ -571,7 +577,9 @@ impl TerminalState {
                 delivered = true;
                 false
             } else {
-                !watch.abandoned.load(Ordering::SeqCst)
+                // Held only here: the submission that would report is gone
+                // without an outcome, so it can never count.
+                !watch.abandoned.load(Ordering::SeqCst) && std::sync::Arc::strong_count(watch) > 1
             }
         });
         if !delivered {
@@ -584,6 +592,21 @@ impl TerminalState {
             self.other_prompts.pop_front();
         }
         true
+    }
+
+    /// The non-owner prompts for a transcript read: those delivered, plus the
+    /// unresolved ones with their watches, re-checked after the file is read.
+    pub(crate) fn other_prompts_for_read(&self) -> crate::agent_transcript::OtherPrompts {
+        use std::sync::atomic::Ordering;
+        let pending = self
+            .pending_other_prompts
+            .iter()
+            .filter(|(_, watch)| {
+                !watch.submitted.load(Ordering::SeqCst) && !watch.abandoned.load(Ordering::SeqCst)
+            })
+            .cloned()
+            .collect();
+        crate::agent_transcript::OtherPrompts::new(self.delivered_other_prompts(), pending)
     }
 
     /// The non-owner prompts that reached the agent, oldest first, including
@@ -3182,6 +3205,38 @@ mod tests {
     }
     use super::*;
     use crate::detect::AgentDetection;
+
+    #[test]
+    fn overlapping_non_owner_prompts_all_count_once_submitted() {
+        use std::sync::atomic::Ordering;
+        let mut terminal = test_terminal();
+        let watches: Vec<_> = (0..17u64)
+            .map(|n| {
+                let watch = std::sync::Arc::new(super::super::PromptSubmitWatch::default());
+                terminal.record_other_prompt(&format!("prompt-{n}"), 1_000 + n, watch.clone());
+                watch
+            })
+            .collect();
+        assert!(terminal.delivered_other_prompts().is_empty());
+        for watch in &watches {
+            watch.submitted.store(true, Ordering::SeqCst);
+        }
+        assert!(terminal.settle_other_prompts());
+        assert_eq!(terminal.other_prompts.len(), 17);
+        assert_eq!(terminal.delivered_other_prompts().len(), 17);
+    }
+
+    #[test]
+    fn a_prompt_whose_submission_vanished_without_an_outcome_is_dropped() {
+        let mut terminal = test_terminal();
+        terminal.record_other_prompt(
+            "lost",
+            1_000,
+            std::sync::Arc::new(super::super::PromptSubmitWatch::default()),
+        );
+        assert!(!terminal.settle_other_prompts());
+        assert!(terminal.pending_other_prompts.is_empty());
+    }
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())

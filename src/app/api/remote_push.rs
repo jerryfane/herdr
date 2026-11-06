@@ -425,15 +425,10 @@ impl RemotePushTracker {
         }
         // Take the completion record before acting on the status: the record
         // of the turn a held finish waits for can arrive with the next turn's
-        // status. Keep the newest, so an older poll cannot rewind it.
-        if let Some(completed) = agent.completed {
-            if seen
-                .completed
-                .as_ref()
-                .is_none_or(|(key, _)| completed.0 > *key)
-            {
-                seen.completed = Some(completed);
-            }
+        // status. The store already keeps an older poll from rewinding it, and
+        // a restarted peer's turns may carry a lower epoch, so take it as is.
+        if agent.completed.is_some() {
+            seen.completed = agent.completed;
         }
         if matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked) {
             // A finish held for a possible exit no longer stands once the
