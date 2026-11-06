@@ -1844,6 +1844,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                input_source: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
