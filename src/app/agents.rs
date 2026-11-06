@@ -103,7 +103,7 @@ impl App {
         name: Option<String>,
     ) -> Result<crate::api::schema::AgentInfo, AgentRenameError> {
         let resolved = self
-            .resolve_agent_target(target)
+            .resolve_agent_rename_target(target)
             .map_err(AgentRenameError::Target)?;
         let normalized_name = match name {
             Some(name) if valid_agent_name(&name) => Some(name),
@@ -134,12 +134,24 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(AgentRenameError::PendingLaunch);
         }
-        if terminal.effective_agent_label().is_none() {
-            return Err(AgentRenameError::NotAgent);
+        // A pane restored without its agent still holds the agent's name and
+        // session. Its owner may move the name or clear it; a clear forgets
+        // the session too. Not while a restart or a session transfer is about
+        // to relaunch the agent into it.
+        let inactive = terminal.holds_inactive_agent_claim();
+        if inactive
+            && (terminal.pending_agent_resume_plan.is_some()
+                || terminal
+                    .session_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.restart_owns_source()))
+        {
+            return Err(AgentRenameError::PendingLaunch);
         }
         let previous_name = terminal.agent_name.clone();
         match normalized_name {
             Some(name) => terminal.set_agent_name(name),
+            None if inactive => terminal.forget_inactive_agent_claim(),
             None => terminal.clear_agent_name(),
         }
         let new_name = terminal.agent_name.clone();
@@ -147,29 +159,55 @@ impl App {
         self.schedule_session_save();
         // The owner's folders and stars hold names: they move to the new
         // name, also when the agent is named again after a clear (#329). A
-        // clear alone keeps them under the old name.
+        // clear alone keeps them under the old name. A clear that forgot an
+        // inactive claim remembers no name for this pane: the agent that
+        // takes the old name next gets its folder and star.
         let terminals = self.agent_groups_terminals();
-        if let Err(err) = self.agent_groups.follow_rename(
-            &resolved.terminal_id,
-            previous_name.as_deref(),
-            new_name.as_deref(),
-            |terminal_id| terminals.contains(terminal_id),
-        ) {
+        let groups = if inactive && new_name.is_none() {
+            self.agent_groups
+                .forget_terminal(&resolved.terminal_id, |terminal_id| {
+                    terminals.contains(terminal_id)
+                })
+        } else {
+            self.agent_groups
+                .follow_rename(
+                    &resolved.terminal_id,
+                    previous_name.as_deref(),
+                    new_name.as_deref(),
+                    |terminal_id| terminals.contains(terminal_id),
+                )
+                .map(drop)
+        };
+        if let Err(err) = groups {
             tracing::warn!(err = %err, "agent groups did not follow the rename");
         }
         self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
         let agent = self
-            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .pane_agent_info(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(|| {
                 AgentRenameError::Target(TerminalTargetError::NotFound {
                     target: target.to_string(),
                 })
             })?;
         // A guest's grant is this terminal's agent: it keeps the agent under
-        // its new name, also when the agent had no name before (#327).
+        // its new name, also when the agent had no name before (#327). An
+        // inactive agent's grants follow under the kind its claim recorded.
         #[cfg(unix)]
-        if let (Some(new), Some(kind)) = (agent.name.as_deref(), agent.agent.as_deref()) {
-            crate::guest::follow_rename(&agent.terminal_id, previous_name.as_deref(), new, kind);
+        if let Some(new) = agent.name.as_deref() {
+            let kind = agent.agent.as_deref().or_else(|| {
+                self.state
+                    .terminals
+                    .get(resolved.terminal_id.as_str())
+                    .and_then(|terminal| terminal.inactive_agent_kind())
+            });
+            if let Some(kind) = kind {
+                crate::guest::follow_rename(
+                    &agent.terminal_id,
+                    previous_name.as_deref(),
+                    new,
+                    kind,
+                );
+            }
         }
         Ok(agent)
     }
@@ -1108,10 +1146,6 @@ impl App {
                 code: "invalid_agent_name".into(),
                 message: INVALID_AGENT_NAME_MESSAGE.into(),
             },
-            AgentRenameError::NotAgent => crate::api::schema::ErrorBody {
-                code: "agent_not_found".into(),
-                message: "agent target does not currently host an agent".into(),
-            },
             AgentRenameError::PendingLaunch => crate::api::schema::ErrorBody {
                 code: "agent_launch_pending".into(),
                 message: "agent name cannot change while startup is pending".into(),
@@ -1149,6 +1183,19 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
+        self.pane_agent_info(ws_idx, pane_id)
+    }
+
+    /// [`Self::agent_info`] for whatever the pane hosts, agent or not. A clear
+    /// that forgot an inactive agent's claim answers with the shell it left.
+    fn pane_agent_info(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let pane_state = ws.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
         let pane = self.pane_metadata(ws_idx, pane_id)?;
         // Account routing, read from the RECORDED account and resolved against the live
         // registry. `account_config_dir` is None either because no account is recorded or
@@ -1395,7 +1442,6 @@ impl AgentStartError {
 pub(super) enum AgentRenameError {
     Target(TerminalTargetError),
     InvalidName,
-    NotAgent,
     PendingLaunch,
     DuplicateName {
         name: String,

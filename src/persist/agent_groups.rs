@@ -257,6 +257,22 @@ impl AgentGroupsStore {
         self.mutate(exists, |index| index.name_taken(terminal_id, name))
     }
 
+    /// The owner cleared an agent that no longer runs in `terminal_id`, and
+    /// with it the pane's claim. Its folder and star stay under the old name
+    /// for whichever agent takes that name next; the pane remembers no name.
+    pub fn forget_terminal(
+        &self,
+        terminal_id: &str,
+        exists: impl Fn(&str) -> bool,
+    ) -> io::Result<()> {
+        if !self.root.join(INDEX_FILE).exists() {
+            return Ok(());
+        }
+        self.mutate(exists, |index| {
+            index.cleared_names.remove(terminal_id).is_some()
+        })
+    }
+
     /// Read-modify-write the index under `.index.lock`, so a daemon sharing
     /// the directory never loses the other's write. `change` returns whether
     /// to write. Remembered clears of terminals `exists` no longer knows are

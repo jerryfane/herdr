@@ -2691,6 +2691,253 @@ mod tests {
         }
     }
 
+    fn rename(app: &mut App, target: &str, name: Option<&str>) -> serde_json::Value {
+        serde_json::from_str(&app.handle_agent_rename(
+            "req".into(),
+            AgentRenameParams {
+                target: target.into(),
+                name: name.map(str::to_string),
+            },
+        ))
+        .unwrap()
+    }
+
+    /// Restart Herdr: capture the session the way a save does, round-trip it
+    /// through JSON and restore it into a fresh app. The receiver keeps the
+    /// restored shells' event channel open.
+    #[cfg(unix)]
+    fn restart(
+        app: &App,
+        resume_agents_on_restore: bool,
+    ) -> (App, tokio::sync::mpsc::Receiver<crate::events::AppEvent>) {
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            &app.state.archived_agents,
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: crate::persist::SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let (events, event_rx) = tokio::sync::mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &reloaded,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            resume_agents_on_restore,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        );
+        let mut restarted = app_with_agent();
+        restarted.state.workspaces = workspaces;
+        restarted.state.terminals = terminals;
+        restarted.terminal_runtimes = runtimes.into();
+        (restarted, event_rx)
+    }
+
+    fn root_terminal(app: &App, ws_idx: usize) -> &crate::terminal::TerminalState {
+        let tab = &app.state.workspaces[ws_idx].tabs[0];
+        &app.state.terminals[&tab.panes[&tab.root_pane].attached_terminal_id]
+    }
+
+    /// Forge's manager `deimos` (OMP) comes back from a restart without
+    /// resume as a shell that still holds its name and session. The owner can
+    /// move that name so a fresh agent takes it, and a clear frees the pane
+    /// for good: a restart with resume does not bring the old agent back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_rename_moves_and_clears_a_name_an_agent_left_behind() {
+        let mut app = app_with_agent();
+        {
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("deimos".into());
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("omp-session").unwrap(),
+            });
+        }
+        let (mut app, _events) = restart(&app, false);
+        let held = root_terminal(&app, 0);
+        assert_eq!(held.agent_name.as_deref(), Some("deimos"));
+        assert!(held.persisted_agent_session.is_some());
+        assert_eq!(held.effective_agent_label(), None, "no agent runs there");
+        {
+            // Unchanged, that pane would resume the old agent.
+            let (resumed, _events) = restart(&app, true);
+            assert!(root_terminal(&resumed, 0)
+                .pending_agent_resume_plan
+                .is_some());
+        }
+        let held_pane = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        app.state.workspaces.push(Workspace::test_new("second"));
+        app.state.ensure_test_terminals();
+        arm_resumable_claude_in(&mut app, 1, "deimos-2");
+        groups_set(
+            &mut app,
+            0,
+            serde_json::json!([{"id": "f1", "name": "Managers", "order": 0, "members": ["deimos"]}]),
+            serde_json::json!(["deimos"]),
+        );
+
+        let taken = rename(&mut app, "deimos-2", Some("deimos"));
+        assert_eq!(taken["error"]["code"], "agent_name_taken", "{taken}");
+        let invalid = rename(&mut app, "deimos", Some("Deimos Old"));
+        assert_eq!(invalid["error"]["code"], "invalid_agent_name", "{invalid}");
+        let duplicate = rename(&mut app, "deimos", Some("deimos-2"));
+        assert_eq!(
+            duplicate["error"]["code"], "agent_name_taken",
+            "{duplicate}"
+        );
+
+        let moved = rename(&mut app, "deimos", Some("deimos-old"));
+        assert_eq!(moved["result"]["agent"]["name"], "deimos-old", "{moved}");
+        assert_eq!(moved["result"]["agent"]["pane_id"], held_pane.as_str());
+        assert_eq!(
+            moved["result"]["agent"]["agent_session"]["value"],
+            "omp-session"
+        );
+        let groups = groups_get(&mut app);
+        assert_eq!(
+            groups["folders"][0]["members"],
+            serde_json::json!(["deimos-old"])
+        );
+        assert_eq!(groups["stars"], serde_json::json!(["deimos-old"]));
+
+        let fresh = rename(&mut app, "deimos-2", Some("deimos"));
+        assert_eq!(fresh["result"]["agent"]["name"], "deimos", "{fresh}");
+
+        let cleared = rename(&mut app, &held_pane, None);
+        assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+        assert!(
+            cleared["result"]["agent"].get("name").is_none(),
+            "{cleared}"
+        );
+        assert!(
+            cleared["result"]["agent"].get("agent_session").is_none(),
+            "{cleared}"
+        );
+        let freed = root_terminal(&app, 0);
+        assert_eq!(freed.agent_name, None);
+        assert_eq!(freed.persisted_agent_session, None);
+        assert!(freed.reported_resume().is_none());
+        assert_eq!(
+            groups_get(&mut app),
+            groups,
+            "a clear keeps folder and star"
+        );
+        let gone = rename(&mut app, &held_pane, Some("deimos-old"));
+        assert_eq!(gone["error"]["code"], "agent_not_found", "{gone}");
+
+        let (resumed, _events) = restart(&app, true);
+        let freed = root_terminal(&resumed, 0);
+        assert!(freed.pending_agent_resume_plan.is_none());
+        assert_eq!(freed.persisted_agent_session, None);
+        assert_eq!(freed.agent_name, None);
+        assert_eq!(
+            root_terminal(&resumed, 1).agent_name.as_deref(),
+            Some("deimos")
+        );
+    }
+
+    /// A pane restored with only a session, no name, can be named by pane id;
+    /// not while a restart is about to relaunch its agent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_rename_names_a_session_an_agent_left_behind() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("omp-session").unwrap(),
+            });
+        let (mut app, _events) = restart(&app, false);
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes
+            [&app.state.workspaces[0].tabs[0].root_pane]
+            .attached_terminal_id
+            .clone();
+
+        let plan = crate::agent_resume::plan(
+            "herdr:omp",
+            "omp",
+            &crate::agent_resume::AgentSessionRef::id("omp-session").unwrap(),
+        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = plan;
+        let pending = rename(&mut app, &pane, Some("deimos-old"));
+        assert_eq!(
+            pending["error"]["code"], "agent_launch_pending",
+            "{pending}"
+        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = None;
+
+        let named = rename(&mut app, &pane, Some("deimos-old"));
+        assert_eq!(named["result"]["agent"]["name"], "deimos-old", "{named}");
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("omp-session"),
+            "naming keeps the session"
+        );
+    }
+
+    #[test]
+    fn agent_rename_refuses_a_pane_that_holds_no_agent() {
+        let mut app = app_with_agent();
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        for name in [Some("deimos"), None] {
+            let refused = rename(&mut app, &pane, name);
+            assert_eq!(refused["error"]["code"], "agent_not_found", "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_rename_clear_of_a_live_agent_keeps_its_session() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+
+        let cleared = rename(&mut app, "reviewer", None);
+        assert_eq!(cleared["result"]["agent"]["agent"], "claude", "{cleared}");
+        let terminal = root_terminal(&app, 0);
+        assert_eq!(terminal.agent_name, None);
+        assert!(terminal.persisted_agent_session.is_some());
+    }
+
     #[tokio::test]
     async fn agent_restart_arms_resume_plan_from_live_session() {
         let mut app = app_with_agent();
