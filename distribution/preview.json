@@ -2,42 +2,79 @@
   "schema_version": 2,
   "channel": "preview",
   "base_version": "0.9.5",
-  "build_id": "2026-11-04-74f6364f480e",
-  "commit": "74f6364f480e0f88a9112e977d6cf3db63775727",
-  "commit_time": 1793825036,
-  "built_at": "2026-11-04T21:09:40Z",
+  "build_id": "2026-11-06-f423a0b22242",
+  "commit": "f423a0b22242f61442e7db4dabdec9cb121a4334",
+  "commit_time": 1793954527,
+  "built_at": "2026-11-06T09:06:42Z",
   "protocol": 22,
   "endpoint_generation": 1,
-  "notes": "Herdr fork preview: Windows pairing and api-bridge, HTML and SVG in Gram\n\nSource: 74f6364f480e0f88a9112e977d6cf3db63775727 (PRs #360, #362 and #361; issue #351).\n\nWindows hosts: `herdr api-bridge` and `herdr api-bridge --multi` now run on Windows, so Herdrup can open live streams and its shared request channel to a Windows machine. Before, Windows answered \"api-bridge is only supported on Unix remote hosts\". `herdr pair` on Windows now reads the SSH host key from Win32-OpenSSH's folder (%ProgramData%\\ssh, including HostKey lines in sshd_config) instead of a path that never existed there. It also takes the login user from USERNAME or USERPROFILE instead of putting \"root\" in the QR code; if it cannot find a user it says so and asks you to set USERNAME.\n\nGram files: `herdr gram send` now labels .html and .htm files as text/html and .svg files as image/svg+xml, so the Herdrup apps offer their HTML and SVG preview for them. The apps still sandbox the preview and run no script unless you turn it on.\n\nIncludes the previous previews' changes: many guest requests on one encrypted connection, the herdrup.app relay addresses, short invite links, guest answers, faster file-transfer request handling, and named sessions no longer replace the default session's guest relay connection.\n\nUpdate through Herdrup's Update herdr card or `herdr update` on the preview channel. The release manifest is signed through the owner's keyring. All five assets are built from the pinned source commit.",
+  "notes": "Herdr fork preview: rename or clear a name an agent left behind\n\nSource: f423a0b22242f61442e7db4dabdec9cb121a4334 (PR #364).\n\nAgent names left behind: when an agent's pane comes back as a plain shell, for example after a restart with resume_agents_on_restore turned off, the pane can still hold the agent's name and session. Before, `agent.rename` refused such a pane, so the name stayed taken and a new agent had to use another name such as \"deimos-2\". Now you can rename that pane, by name or by pane id, or clear it. A clear frees the name and forgets the old session, so the pane is an ordinary shell again and a later restore does not relaunch the old agent. Live agents rename and clear exactly as before.\n\nIncludes the previous previews' changes: Windows api-bridge and pairing fixes, HTML and SVG types in Gram, many guest requests on one encrypted connection, the herdrup.app relay addresses, short invite links, guest answers, faster file-transfer request handling, and named sessions no longer replace the default session's guest relay connection.\n\nUpdate through Herdrup's Update herdr card or `herdr update` on the preview channel. The release manifest is signed through the owner's keyring. All five assets are built from the pinned source commit.",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-04-74f6364f480e/herdr-linux-x86_64",
-      "sha256": "82bbe31eda7b1bf6ef8419ca1260e2fb2c8343d8683a370cb2653a456e3e640c",
-      "size": 43880408
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-linux-x86_64",
+      "sha256": "a7180a007f0a8c5cc1e4c56ff39c2ae3f46dbc8b65d14479a1b8d5a09635da4b",
+      "size": 44032616
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-04-74f6364f480e/herdr-linux-aarch64",
-      "sha256": "811faf9cb816f5809aaaa747563081fbe9ba00a6a74de7204cb0f50d5c01d510",
-      "size": 40323328
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-linux-aarch64",
+      "sha256": "0c1e8cb8a07cfaf6f4e90d03384f2d46ee7f78e7ab89f697a923a46909ef5575",
+      "size": 40266456
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-04-74f6364f480e/herdr-macos-x86_64",
-      "sha256": "b9059dd81939a4146a4909392e8e2182774e3208ba3bc8ecf5a44e55e5cd9a1b",
-      "size": 36970880
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-macos-x86_64",
+      "sha256": "8c174a83c775186eb22b2d28f92b3e65069410bc04a36cffb5bd391b785f57a5",
+      "size": 36979344
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-04-74f6364f480e/herdr-macos-aarch64",
-      "sha256": "3dddba27a6894176c368c77653edf1a29087bab2e999ea25df72b2b9909cbd21",
-      "size": 34106688
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-macos-aarch64",
+      "sha256": "65c61d2c45370db148253cc903188ab203072f5b89f2191e28348f0a5fd6d1d6",
+      "size": 34354592
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-04-74f6364f480e/herdr-windows-x86_64.zip",
-      "sha256": "d738c4900409ee3aba8d2abda0e135f7f972d13e77b1b938f7c231b4ac91fab8",
-      "size": 13499947,
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-windows-x86_64.zip",
+      "sha256": "d9ea86c586b950b9c120c28c76dc53a889dbb6847d06c24699eb6b7bc929cec0",
+      "size": 13501411,
       "format": "zip"
     }
   },
   "builds": {
+    "2026-11-06-f423a0b22242": {
+      "base_version": "0.9.5",
+      "commit": "f423a0b22242f61442e7db4dabdec9cb121a4334",
+      "commit_time": 1793954527,
+      "built_at": "2026-11-06T09:06:42Z",
+      "protocol": 22,
+      "endpoint_generation": 1,
+      "tag": "preview-2026-11-06-f423a0b22242",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-linux-x86_64",
+          "sha256": "a7180a007f0a8c5cc1e4c56ff39c2ae3f46dbc8b65d14479a1b8d5a09635da4b",
+          "size": 44032616
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-linux-aarch64",
+          "sha256": "0c1e8cb8a07cfaf6f4e90d03384f2d46ee7f78e7ab89f697a923a46909ef5575",
+          "size": 40266456
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-macos-x86_64",
+          "sha256": "8c174a83c775186eb22b2d28f92b3e65069410bc04a36cffb5bd391b785f57a5",
+          "size": 36979344
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-macos-aarch64",
+          "sha256": "65c61d2c45370db148253cc903188ab203072f5b89f2191e28348f0a5fd6d1d6",
+          "size": 34354592
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-06-f423a0b22242/herdr-windows-x86_64.zip",
+          "sha256": "d9ea86c586b950b9c120c28c76dc53a889dbb6847d06c24699eb6b7bc929cec0",
+          "size": 13501411,
+          "format": "zip"
+        }
+      }
+    },
     "2026-11-04-74f6364f480e": {
       "base_version": "0.9.5",
       "commit": "74f6364f480e0f88a9112e977d6cf3db63775727",
@@ -952,35 +989,6 @@
         "windows-x86_64": {
           "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-07-06-4dae557eefd9/herdr-windows-x86_64.exe",
           "sha256": "7c2189c218d210fa253e579c3d50b9c501cb16c3d3729e1de3dba366c5773a14"
-        }
-      }
-    },
-    "2026-06-30-3459798b606d": {
-      "base_version": "0.7.1",
-      "commit": "3459798b606d019d4ac404d407af956d7539ef54",
-      "built_at": "2026-06-30T17:57:27Z",
-      "protocol": 15,
-      "tag": "preview-2026-06-30-3459798b606d",
-      "assets": {
-        "linux-x86_64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-30-3459798b606d/herdr-linux-x86_64",
-          "sha256": "0302d856719ccc6e41288d2640db7361e3c2e63047d75c14d4da96177fdd76fe"
-        },
-        "linux-aarch64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-30-3459798b606d/herdr-linux-aarch64",
-          "sha256": "e48a407a4276491ef946f093c5a789adc53b369a78e40e7ef322b9a094db78a4"
-        },
-        "macos-x86_64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-30-3459798b606d/herdr-macos-x86_64",
-          "sha256": "69558cfb8afaef115d0a0a78c3b7424a1f5f2469ae8d19a2fef39af0ee10fffe"
-        },
-        "macos-aarch64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-30-3459798b606d/herdr-macos-aarch64",
-          "sha256": "eaa330fdb016de2130237d353371444561e6027ad19ab4e752546b81ce14c71a"
-        },
-        "windows-x86_64": {
-          "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-30-3459798b606d/herdr-windows-x86_64.exe",
-          "sha256": "9e319d9d7d653fa4cc7d775e1f653886dd4080b64516ea6bf2ef4d64b33cf891"
         }
       }
     }
