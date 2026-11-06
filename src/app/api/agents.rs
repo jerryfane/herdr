@@ -6229,6 +6229,9 @@ mod tests {
             let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
             let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
             app.state.insert_test_runtime(pane_id, runtime);
             let pane = app.public_pane_id(0, pane_id).unwrap();
@@ -6250,13 +6253,19 @@ mod tests {
                 self.seq += 1;
                 let params = serde_json::from_value(serde_json::json!({
                     "pane_id": self.pane,
-                    "source": "herdr:codex",
+                    "source": "custom:worker",
                     "agent": "codex",
                     "state": state,
                     "seq": self.seq,
                 }))
                 .unwrap();
-                self.app.handle_pane_report_agent("report".into(), params);
+                let response = self.app.handle_pane_report_agent("report".into(), params);
+                let terminal = &self.app.state.terminals[&self.terminal_id];
+                assert_eq!(
+                    crate::detect::manifest::agent_state_label(terminal.state),
+                    state,
+                    "{response}"
+                );
             }
 
             fn prompt(&mut self, text: &str, input_source: Option<InputSource>) {
@@ -6331,7 +6340,7 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(
-                turns["result"]["records"][0]["turn_origin"], "mine",
+                turns["result"]["turns"]["records"][0]["turn_origin"], "mine",
                 "{turns}"
             );
         }

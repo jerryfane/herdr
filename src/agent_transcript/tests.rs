@@ -1984,12 +1984,16 @@ fn brokered_non_owner_prompts_mark_their_user_turns_in_order() {
     // Typed by the owner before herdr brokered anything with the same text.
     session.user("review PR 12");
     session.assistant(vec![text("ok")], "stop");
+    for _ in 0..6 {
+        session.push(json!({"type": "model_change", "model": "m"}));
+    }
+    let brokered_at = session.ms(session.next + 1);
     session.user("review PR 12");
     session.assistant(vec![text("done")], "stop");
     session.user("check the logs");
     session.assistant(vec![text("clean")], "stop");
     session.user("review PR 12");
-    let prompts = vec![OtherPrompt::new("review PR 12\r\n", session.ms(3))];
+    let prompts = vec![OtherPrompt::new("review PR 12\r\n", brokered_at)];
 
     let page = read_page(
         &session.path,
