@@ -119,54 +119,40 @@ pub enum CompletionSource {
     Reset,
 }
 
-/// Offer `candidate` for `agent`'s pane, then make the agent mirror what is
-/// known. Returns whether the candidate was taken.
-fn offer_completion(
-    completions: &mut HashMap<String, KnownCompletion>,
-    agent: &mut AgentInfo,
-    candidate: Option<crate::api::schema::LastCompletedTurn>,
-    source: CompletionSource,
-    now: Instant,
-) -> bool {
-    let taken = accepts_completion(completions.get(&agent.pane_id), candidate.as_ref(), source);
-    if taken {
-        completions.insert(
-            agent.pane_id.clone(),
-            KnownCompletion {
-                turn: candidate,
-                accepted_at: now,
-            },
-        );
-    }
-    agent.last_completed_turn = completions.get(&agent.pane_id).and_then(|known| known.turn);
-    taken
-}
-
-/// Whether `candidate` replaces `known`. Within one boot (same epoch) only a
-/// strictly later turn does, whatever its source or timing, so a delayed or
-/// older answer never rolls a pane back. A different epoch (or no completion)
-/// is a different boot, and only an answer about the current boot may say
-/// so: a restart resync, or a list requested after `known` was accepted. A
-/// stream line from another boot is ignored until one of those establishes
-/// it; a stream line is still taken when nothing is known about the pane.
+/// Whether `candidate` replaces `known`, the pane's stored completion.
+///
+/// Within one turn epoch only a strictly later turn does, whatever its source
+/// or timing, so a delayed or older answer never rolls a pane back. A turn
+/// from another epoch (a respawned pane, or a restarted peer) is taken from:
+/// - a restart resync, which describes the new boot;
+/// - a list requested after `known` was accepted;
+/// - a stream line whose epoch is the pane's current one, as the status
+///   events relayed for it established (`current_epoch`). Within a boot the
+///   status baseline only moves forward and a restart resync replaces it, so
+///   a line from an earlier incarnation or boot never matches.
 pub fn accepts_completion(
     known: Option<&KnownCompletion>,
     candidate: Option<&crate::api::schema::LastCompletedTurn>,
     source: CompletionSource,
+    current_epoch: Option<u64>,
 ) -> bool {
-    let Some(known) = known else {
-        return true;
-    };
-    match (known.turn.as_ref(), candidate) {
-        (Some(known_turn), Some(candidate)) if known_turn.turn_epoch == candidate.turn_epoch => {
-            candidate.turn > known_turn.turn
+    let known_turn = known.and_then(|known| known.turn.as_ref());
+    if let (Some(known_turn), Some(candidate)) = (known_turn, candidate) {
+        if known_turn.turn_epoch == candidate.turn_epoch {
+            return candidate.turn > known_turn.turn;
         }
-        (None, Some(_)) if source == CompletionSource::Stream => true,
-        _ => match source {
-            CompletionSource::Stream => false,
-            CompletionSource::Reset => true,
-            CompletionSource::List { requested_at } => requested_at > known.accepted_at,
-        },
+    }
+    match source {
+        CompletionSource::Reset => true,
+        CompletionSource::List { requested_at } => {
+            known.is_none_or(|known| requested_at > known.accepted_at)
+        }
+        CompletionSource::Stream => candidate.is_some_and(|candidate| match current_epoch {
+            Some(epoch) => epoch == candidate.turn_epoch,
+            // Nothing relayed about the pane's epoch: only a pane with no
+            // completion yet takes the line.
+            None => known_turn.is_none(),
+        }),
     }
 }
 
@@ -211,8 +197,9 @@ pub struct PeerCacheEntry {
     /// published. Empty for peers without an event stream.
     pub relayed: HashMap<String, RelayedStatus>,
     /// Per remote pane (qualified id), its last completed turn and who
-    /// started it, from polls, resyncs and the stream alike; the cached
-    /// agents' `last_completed_turn` mirrors it.
+    /// started it, from polls, resyncs and the stream alike, kept whether or
+    /// not the pane is in `agents` yet; a cached agent's `last_completed_turn`
+    /// mirrors it.
     pub completions: HashMap<String, KnownCompletion>,
     /// Per remote pane (qualified id), when a relay resync found the peer no
     /// longer lists it or the relay saw it close. A poll that started earlier
@@ -329,16 +316,14 @@ impl FederationStore {
                 }
             }
         }
-        let PeerCacheEntry {
-            agents,
-            completions,
-            ..
-        } = &mut entry;
-        for agent in agents.iter_mut() {
-            let candidate = agent.last_completed_turn;
-            offer_completion(
-                completions,
-                agent,
+        let listed: Vec<_> = entry
+            .agents
+            .iter()
+            .map(|agent| (agent.pane_id.clone(), agent.last_completed_turn))
+            .collect();
+        for (pane_id, candidate) in listed {
+            entry.offer_completion(
+                &pane_id,
                 candidate,
                 CompletionSource::List {
                     requested_at: poll_started,
@@ -447,6 +432,7 @@ impl FederationStore {
             return;
         };
         entry.relayed.remove(pane_id);
+        entry.completions.remove(pane_id);
         entry.agents.retain(|agent| agent.pane_id != pane_id);
         entry.vanished.insert(pane_id.to_owned(), now);
         self.relay_pane_event(alias, pane_id, RemotePaneEvent::Closed);
@@ -751,8 +737,23 @@ impl PeerCacheEntry {
         }
     }
 
-    /// Offer `candidate` as the pane's last completion; returns whether it was
-    /// taken. The pane's cached agent always mirrors the known completion.
+    /// The pane's current turn epoch as relayed status events (else the
+    /// cached agent) established it.
+    fn current_epoch(&self, pane_id: &str) -> Option<u64> {
+        self.relayed
+            .get(pane_id)
+            .and_then(|relayed| relayed.event.turn_epoch)
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)
+                    .and_then(|agent| agent.turn_epoch)
+            })
+    }
+
+    /// Offer `candidate` as the pane's last completion ([`accepts_completion`])
+    /// and return whether it was taken. The record is kept even before the
+    /// pane is cached; a cached agent always mirrors it.
     fn offer_completion(
         &mut self,
         pane_id: &str,
@@ -760,14 +761,31 @@ impl PeerCacheEntry {
         source: CompletionSource,
         now: Instant,
     ) -> bool {
-        let Some(agent) = self
-            .agents
-            .iter_mut()
-            .find(|agent| agent.pane_id == pane_id)
-        else {
-            return false;
-        };
-        offer_completion(&mut self.completions, agent, candidate, source, now)
+        let taken = accepts_completion(
+            self.completions.get(pane_id),
+            candidate.as_ref(),
+            source,
+            self.current_epoch(pane_id),
+        );
+        if taken {
+            self.completions.insert(
+                pane_id.to_owned(),
+                KnownCompletion {
+                    turn: candidate,
+                    accepted_at: now,
+                },
+            );
+        }
+        if let Some(known) = self.completions.get(pane_id) {
+            if let Some(agent) = self
+                .agents
+                .iter_mut()
+                .find(|agent| agent.pane_id == pane_id)
+            {
+                agent.last_completed_turn = known.turn;
+            }
+        }
+        taken
     }
 
     /// Make `event` the pane's relay baseline and patch its cached agent.
@@ -1391,10 +1409,130 @@ mod tests {
         }
     }
 
+    /// `home/p1` as `agent.list` reports it: done, at the turn it completed.
     fn listed_with(turn: Option<crate::api::schema::LastCompletedTurn>) -> AgentInfo {
         let mut agent = pane_agent("home/p1", AgentStatus::Done);
+        agent.turn = turn.map(|turn| turn.turn);
+        agent.turn_epoch = turn.map(|turn| turn.turn_epoch);
         agent.last_completed_turn = turn;
         agent
+    }
+
+    fn status_at(
+        pane_id: &str,
+        status: AgentStatus,
+        turn_epoch: u64,
+        turn: u64,
+    ) -> PaneAgentStatusChangedEvent {
+        let mut event = self::status(pane_id, status);
+        event.turn_epoch = Some(turn_epoch);
+        event.turn = Some(turn);
+        event
+    }
+
+    #[test]
+    fn a_respawned_panes_completion_is_taken_once_its_status_shows_the_new_epoch() {
+        use crate::terminal::TurnOrigin;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![listed_with(Some(completed(4, 2, TurnOrigin::Mine)))],
+                t0,
+            ),
+            t0,
+        );
+        // The pane respawned (same peer boot, new epoch 8): its status shows
+        // the new epoch, then its first turn completes.
+        let early = RelayedTurn {
+            turn_origin: Some(TurnOrigin::Other),
+            ..relayed_turn("home/p1", 1, 8)
+        };
+        let mut working = status_at("home/p1", AgentStatus::Working, 8, 0);
+        let mut done = status_at("home/p1", AgentStatus::Done, 8, 1);
+        store.relay_status("home", &mut working, Instant::now());
+        store.relay_status("home", &mut done, Instant::now());
+        store.relay_turn("home", early, Instant::now());
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((8, 1, Some(TurnOrigin::Other)))
+        );
+        // The previous incarnation's late line no longer applies.
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Mine),
+                ..relayed_turn("home/p1", 3, 4)
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((8, 1, Some(TurnOrigin::Other)))
+        );
+    }
+
+    #[test]
+    fn a_stream_line_for_an_epoch_no_status_has_shown_is_ignored() {
+        use crate::terminal::TurnOrigin;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![listed_with(Some(completed(4, 2, TurnOrigin::Mine)))],
+                t0,
+            ),
+            t0,
+        );
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Other),
+                ..relayed_turn("home/p1", 1, 8)
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((4, 2, Some(TurnOrigin::Mine)))
+        );
+    }
+
+    #[test]
+    fn a_completion_relayed_before_its_pane_is_cached_survives_the_delayed_poll() {
+        use crate::terminal::TurnOrigin;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer("home", PeerCacheEntry::reachable(Vec::new(), t0), t0);
+        // A poll goes out and captures the new pane p2 working, no completion.
+        let poll_started = Instant::now();
+        let mut polled = pane_agent("home/p2", AgentStatus::Working);
+        polled.turn = Some(0);
+        polled.turn_epoch = Some(9);
+        // Before it lands, the stream reports p2 done and its completion.
+        let relayed_at = poll_started + std::time::Duration::from_millis(1);
+        let mut done = status_at("home/p2", AgentStatus::Done, 9, 1);
+        store.relay_status("home", &mut done, relayed_at);
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Other),
+                ..relayed_turn("home/p2", 1, 9)
+            },
+            relayed_at,
+        );
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![polled], poll_started),
+            poll_started,
+        );
+        assert_eq!(cached_status(&store, "home/p2"), AgentStatus::Done);
+        assert_eq!(
+            completed_origin(&store, "home/p2"),
+            Some((9, 1, Some(TurnOrigin::Other)))
+        );
     }
 
     #[test]
