@@ -126,10 +126,10 @@ pub enum CompletionSource {
 /// from another epoch (a respawned pane, or a restarted peer) is taken from:
 /// - a restart resync, which describes the new boot;
 /// - a list requested after `known` was accepted;
-/// - a stream line whose epoch is the pane's current one, as the status
-///   events relayed for it established (`current_epoch`). Within a boot the
-///   status baseline only moves forward and a restart resync replaces it, so
-///   a line from an earlier incarnation or boot never matches.
+/// - a stream line whose epoch is the pane's current one (`current_epoch`):
+///   the newest any source established, relayed status, poll or resync.
+///   Within a boot that only moves forward and a restart resync replaces it,
+///   so a line from an earlier incarnation or boot never matches.
 pub fn accepts_completion(
     known: Option<&KnownCompletion>,
     candidate: Option<&crate::api::schema::LastCompletedTurn>,
@@ -737,18 +737,19 @@ impl PeerCacheEntry {
         }
     }
 
-    /// The pane's current turn epoch as relayed status events (else the
-    /// cached agent) established it.
+    /// The pane's current turn epoch: the cached agent's, which already holds
+    /// the newest of every source (a poll keeps only relayed statuses newer
+    /// than its request, and relayed statuses and resyncs patch the agent).
+    /// The relay baseline alone may predate a later poll, so it is used only
+    /// for a pane not cached yet.
     fn current_epoch(&self, pane_id: &str) -> Option<u64> {
-        self.relayed
-            .get(pane_id)
-            .and_then(|relayed| relayed.event.turn_epoch)
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.pane_id == pane_id)
-                    .and_then(|agent| agent.turn_epoch)
-            })
+        match self.agents.iter().find(|agent| agent.pane_id == pane_id) {
+            Some(agent) => agent.turn_epoch,
+            None => self
+                .relayed
+                .get(pane_id)
+                .and_then(|relayed| relayed.event.turn_epoch),
+        }
     }
 
     /// Offer `candidate` as the pane's last completion ([`accepts_completion`])
@@ -1470,6 +1471,46 @@ mod tests {
         assert_eq!(
             completed_origin(&store, "home/p1"),
             Some((8, 1, Some(TurnOrigin::Other)))
+        );
+    }
+
+    #[test]
+    fn a_buffered_line_from_before_a_newer_polled_incarnation_is_ignored() {
+        use crate::terminal::TurnOrigin;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![listed_with(Some(completed(4, 2, TurnOrigin::Mine)))],
+                t0,
+            ),
+            t0,
+        );
+        let mut done = status_at("home/p1", AgentStatus::Done, 4, 2);
+        store.relay_status("home", &mut done, Instant::now());
+        // The pane respawned; a poll requested after that reports epoch 8.
+        let poll_started = Instant::now() + std::time::Duration::from_millis(1);
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![listed_with(Some(completed(8, 1, TurnOrigin::Mine)))],
+                poll_started,
+            ),
+            poll_started,
+        );
+        // A buffered line from the previous incarnation drains afterwards.
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Other),
+                ..relayed_turn("home/p1", 3, 4)
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((8, 1, Some(TurnOrigin::Mine)))
         );
     }
 
