@@ -48,7 +48,56 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
 
+  # Docs, the preview manifest and top-level Markdown cannot change what the Rust build or the
+  # Windows package does, so a change touching only those skips the three-OS matrix (about
+  # 30 runner-minutes a run) and runs `docs` instead. scripts/ci_scope.py lists the paths that
+  # stay code (the compiled-in API schema and installer); an unresolved range runs everything.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide scope
+        id: scope
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/ci_scope.py "$BASE" "$HEAD" >> "$GITHUB_OUTPUT"
+
+  docs:
+    needs: scope
+    if: needs.scope.outputs.code != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install just
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: just
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check docs, preview manifest and changelog
+        run: just maintenance-test
+
   check:
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
     name: check (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -313,6 +362,8 @@ jobs:
           key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-${{ github.run_id }}-${{ github.run_attempt }}
 
   windows-conpty-package:
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
     name: Windows ConPTY package
     runs-on: windows-2022
     timeout-minutes: 25
