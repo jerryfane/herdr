@@ -280,11 +280,16 @@ fn streaming_requests_keep_the_per_connection_bridge() {
     assert_eq!(peer.opens(), (0, 1));
 }
 
-/// Per-request overhead with a 300 ms SSH channel open: N requests cost about
-/// N opens on the per-request bridge, one open on the channel.
+/// N requests to a peer whose SSH start takes 300 ms: the per-request bridge
+/// pays N starts, the channel one. Besides the starts, the per-request bridge
+/// does at least the channel's work for each request, so the channel saves
+/// the N - 1 starts it skips however slow the runner is. The bound asks for
+/// half of them, leaving the rest to scheduling noise between the phases; a
+/// channel paying a start per request saves none.
 #[test]
 fn peer_channel_pays_one_channel_open_for_many_requests() {
     const REQUESTS: usize = 6;
+    const OPEN: Duration = Duration::from_millis(300);
     let running = Arc::new(AtomicBool::new(true));
 
     let peer = FakePeer::start("0.3", true);
@@ -309,9 +314,10 @@ fn peer_channel_pays_one_channel_open_for_many_requests() {
     eprintln!(
         "{REQUESTS} requests with a 300 ms channel open: per-request bridge {per_request:?}, peer channel {channel:?}"
     );
-    assert!(per_request >= Duration::from_millis(300) * REQUESTS as u32);
+    assert!(per_request >= OPEN * REQUESTS as u32);
     assert!(
-        channel < Duration::from_millis(300) * 2,
-        "the channel must pay one open, took {channel:?}"
+        channel >= OPEN
+            && per_request.saturating_sub(channel) >= OPEN * (REQUESTS as u32 - 1) / 2,
+        "the channel must pay one open, not one per request: per-request bridge {per_request:?}, peer channel {channel:?}"
     );
 }
