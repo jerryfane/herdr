@@ -106,4 +106,9 @@ pub struct ServerCapabilities {
     /// `server.update_status`: the owner's in-app update to a signed preview build.
     #[serde(default)]
     pub server_update: bool,
+    /// Tracks who started each turn: `input_source` on owner writes,
+    /// `turn_origin` on completed turns, `notify_finishes_mine_only` on
+    /// device registration and `origin` on transcript user entries.
+    #[serde(default)]
+    pub turn_origin: bool,
 }

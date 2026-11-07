@@ -906,6 +906,17 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "turn_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/TurnOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "`mine` when the owner started or joined the turn, `other`\notherwise; omitted when unknown."
+                },
                 "type": {
                   "const": "pane_turn_completed",
                   "type": "string"
@@ -998,6 +1009,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -1422,6 +1444,14 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TurnOrigin": {
+          "description": "Who started a turn: the owner (a HerdrUp client sending `input_source:\n\"app\"`, or typing in an attached herdr terminal), or anyone else (scripts,\nthe CLI, gitmoot, other agents, guests). Unknown origins are left `None`.",
+          "enum": [
+            "mine",
+            "other"
+          ],
+          "type": "string"
         },
         "TurnOutcome": {
           "oneOf": [
@@ -1906,6 +1936,17 @@
         },
         "AgentPromptParams": {
           "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`app` when a HerdrUp client sends for the owner (owner connection\nonly); absent for scripts, the CLI and other agents."
+            },
             "target": {
               "type": "string"
             },
@@ -2016,6 +2057,16 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3547,6 +3598,13 @@
           ],
           "type": "object"
         },
+        "InputSource": {
+          "description": "Who a write is acting for. `app` is a HerdrUp client acting for the owner;\nhonoured only from the owner's own connection (never from a guest or a\nfederation peer). Absent means a script, the CLI or another agent.",
+          "enum": [
+            "app"
+          ],
+          "type": "string"
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -3827,6 +3885,10 @@
             },
             "notify_finishes": {
               "default": false,
+              "type": "boolean"
+            },
+            "notify_finishes_mine_only": {
+              "description": "With `notify_finishes`, push a finished turn only when the owner\nstarted or joined it (`turn_origin` `mine`, or unknown). Absent on\nolder clients, which get every finished turn.",
               "type": "boolean"
             },
             "notify_gram": {
@@ -4689,6 +4751,16 @@
         },
         "PaneSendInputParams": {
           "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -4709,6 +4781,16 @@
         },
         "PaneSendKeysParams": {
           "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -4727,6 +4809,16 @@
         },
         "PaneSendTextParams": {
           "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -9003,6 +9095,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -9414,6 +9517,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -9463,6 +9577,14 @@
             "pane.agent_status_changed",
             "pane.turn_completed",
             "pane.scroll_changed"
+          ],
+          "type": "string"
+        },
+        "TurnOrigin": {
+          "description": "Who started a turn: the owner (a HerdrUp client sending `input_source:\n\"app\"`, or typing in an attached herdr terminal), or anyone else (scripts,\nthe CLI, gitmoot, other agents, guests). Unknown origins are left `None`.",
+          "enum": [
+            "mine",
+            "other"
           ],
           "type": "string"
         },
@@ -10366,6 +10488,17 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "turn_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/TurnOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "`mine` when the owner started or joined the turn, `other`\notherwise; omitted when unknown."
+                },
                 "type": {
                   "const": "pane_turn_completed",
                   "type": "string"
@@ -10473,6 +10606,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -11003,6 +11147,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -11156,6 +11311,14 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TurnOrigin": {
+          "description": "Who started a turn: the owner (a HerdrUp client sending `input_source:\n\"app\"`, or typing in an attached herdr terminal), or anyone else (scripts,\nthe CLI, gitmoot, other agents, guests). Unknown origins are left `None`.",
+          "enum": [
+            "mine",
+            "other"
+          ],
+          "type": "string"
         },
         "TurnOutcome": {
           "oneOf": [
@@ -13226,6 +13389,17 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "turn_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/TurnOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "`mine` when the owner started or joined the turn, `other`\notherwise; omitted when unknown."
+                },
                 "type": {
                   "const": "pane_turn_completed",
                   "type": "string"
@@ -14165,6 +14339,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -15166,6 +15351,17 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "turn_origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/TurnOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`mine` when the owner started or joined the turn, `other` otherwise;\nomitted when unknown."
             }
           },
           "required": [
@@ -18215,6 +18411,11 @@
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
               "type": "boolean"
+            },
+            "turn_origin": {
+              "default": false,
+              "description": "Tracks who started each turn: `input_source` on owner writes,\n`turn_origin` on completed turns, `notify_finishes_mine_only` on\ndevice registration and `origin` on transcript user entries.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -18426,6 +18627,17 @@
                 "kind": {
                   "const": "user",
                   "type": "string"
+                },
+                "origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/TurnOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "`other` when herdr brokered this prompt for someone other than the\nowner (a script, the CLI, gitmoot, another agent or a guest);\nomitted for the owner's turns and when unknown."
                 },
                 "text": {
                   "type": "string"
@@ -18930,6 +19142,14 @@
             "since_ms"
           ],
           "type": "object"
+        },
+        "TurnOrigin": {
+          "description": "Who started a turn: the owner (a HerdrUp client sending `input_source:\n\"app\"`, or typing in an attached herdr terminal), or anyone else (scripts,\nthe CLI, gitmoot, other agents, guests). Unknown origins are left `None`.",
+          "enum": [
+            "mine",
+            "other"
+          ],
+          "type": "string"
         },
         "TurnOutcome": {
           "oneOf": [

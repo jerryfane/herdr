@@ -28,9 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::client::{ApiClient, FederatedStream, FEDERATION_STREAM_IDLE_TIMEOUT};
 use crate::api::federation_manager::{PeerPresentation, PeerRoute, PeerRouteStamp};
-use crate::api::federation_store::{
-    agent_status_event, FederationStore, RelayResync, RemotePaneEvent,
-};
+use crate::api::federation_store::{FederationStore, RelayResync, RemotePaneEvent};
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, EventsSubscribeParams, Method,
     PaneAgentStatusChangedEvent, PaneInfo, PaneLayoutSnapshot, Request, ResponseResult,
@@ -335,6 +333,9 @@ impl PeerRelay {
         stamp: &mut PeerRouteStamp,
         state: &mut RelayState,
     ) -> Option<SessionEnd> {
+        // When the list was asked for, so its completions only replace ones
+        // known before then.
+        let requested_at = Instant::now();
         let snapshot =
             match poll_peer_agent_list(client, &self.running, self.expected_node_id.as_deref()) {
                 Ok(snapshot) => snapshot,
@@ -357,13 +358,13 @@ impl PeerRelay {
             state.next_sync
         };
         let presentation = self.presentation();
-        let current: Vec<PaneAgentStatusChangedEvent> = snapshot
+        let agents: Vec<_> = snapshot
             .agents
             .into_iter()
             .filter_map(|agent| prefix_remote_agent(&self.alias, &presentation, agent))
             .filter(|agent| !agent.pane_id.is_empty())
-            .map(|agent| agent_status_event(&agent))
             .collect();
+
         let published = self.route.with_current(stamp, || {
             let mut store = self
                 .store
@@ -377,7 +378,8 @@ impl PeerRelay {
             if !self.route.identity_validated() {
                 return None;
             }
-            let missed = store.relay_resync(&self.alias, current, mode, Instant::now());
+            let missed =
+                store.relay_resync_agents(&self.alias, agents, mode, requested_at, Instant::now());
             let published = missed.len();
             for event in missed {
                 self.event_hub.push_relayed(status_envelope(event));
@@ -445,9 +447,21 @@ impl PeerRelay {
                     pane,
                     turn,
                     turn_epoch,
+                    completed_unix_ms,
+                    turn_origin,
                     ..
                 } => {
-                    store.relay_turn(&self.alias, &pane.pane_id, *turn, *turn_epoch, now);
+                    store.relay_turn(
+                        &self.alias,
+                        crate::api::federation_store::RelayedTurn {
+                            pane_id: pane.pane_id.clone(),
+                            turn: *turn,
+                            turn_epoch: *turn_epoch,
+                            completed_unix_ms: *completed_unix_ms,
+                            turn_origin: *turn_origin,
+                        },
+                        now,
+                    );
                     true
                 }
                 EventData::PaneClosed { pane_id, .. } => {
@@ -525,6 +539,7 @@ fn hub_envelope(payload: SubscriptionStreamPayload) -> Option<EventEnvelope> {
                 Some(EventEnvelope {
                     event: EventKind::PaneTurnCompleted,
                     data: EventData::PaneTurnCompleted {
+                        turn_origin: event.turn_origin,
                         pane: event.pane,
                         turn: event.turn,
                         turn_epoch: event.turn_epoch,

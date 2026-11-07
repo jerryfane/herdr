@@ -66,7 +66,7 @@ use crate::server::notifications::{
 use crate::server::pane_input::{
     apply_client_pane_input_events, apply_client_popup_input_events,
     apply_client_terminal_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
-    terminal_attach_mouse_position,
+    terminal_attach_mouse_position, ForwardedInput,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 use crate::server::socket_paths::{
@@ -2211,6 +2211,10 @@ impl HeadlessServer {
                                 true,
                                 false,
                             );
+                            self.app.record_terminal_input_origin(
+                                internal_terminal_id,
+                                crate::terminal::TurnOrigin::Mine,
+                            );
                         }
                     }
                     return true;
@@ -2558,16 +2562,20 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                let mut keyboard_forwarded = false;
-                let input_result = apply_client_terminal_input_events(
-                    runtime,
-                    &events,
-                    true,
-                    &mut keyboard_forwarded,
-                );
+                let mut forwarded = ForwardedInput::default();
+                let input_result =
+                    apply_client_terminal_input_events(runtime, &events, true, &mut forwarded);
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
-                if keyboard_forwarded {
+                if forwarded.keyboard {
                     self.note_interactive_input(runtime_pane_id, Instant::now());
+                }
+                // Typing or pasting in an attached herdr client is the owner's.
+                if forwarded.owner_input() {
+                    self.app.record_pane_input_source(
+                        workspace_index,
+                        runtime_pane_id,
+                        Some(crate::api::schema::InputSource::App),
+                    );
                 }
                 if let Err(err) = input_result {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
@@ -2647,15 +2655,11 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                let mut keyboard_forwarded = false;
-                let input_result = apply_client_terminal_input_events(
-                    runtime,
-                    &events,
-                    false,
-                    &mut keyboard_forwarded,
-                );
+                let mut forwarded = ForwardedInput::default();
+                let input_result =
+                    apply_client_terminal_input_events(runtime, &events, false, &mut forwarded);
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
-                if keyboard_forwarded {
+                if forwarded.keyboard {
                     self.note_interactive_input(popup_pane_id, Instant::now());
                 }
                 if let Err(err) = input_result {

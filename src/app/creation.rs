@@ -102,6 +102,74 @@ pub(super) fn launch_cwd_for_terminal(
 }
 
 impl App {
+    /// Attribute a write to a pane's current or next turn: `mine` for a
+    /// HerdrUp client acting for the owner, `other` for anyone else.
+    pub(crate) fn record_pane_input_source(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        input_source: Option<crate::api::schema::InputSource>,
+    ) {
+        let origin = match input_source {
+            Some(crate::api::schema::InputSource::App) => crate::terminal::TurnOrigin::Mine,
+            None => crate::terminal::TurnOrigin::Other,
+        };
+        if let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        {
+            self.record_terminal_input_origin(&terminal_id, origin);
+        }
+    }
+
+    pub(crate) fn record_terminal_input_origin(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        origin: crate::terminal::TurnOrigin,
+    ) {
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.record_input_origin(origin);
+        }
+    }
+
+    /// Admit a brokered prompt that is not the owner's, before it is written,
+    /// so the transcript can mark its user turn once the submission reports
+    /// it delivered through the returned handle. `None` when the pane has no
+    /// terminal; an error while too many are still submitting.
+    pub(crate) fn admit_pane_other_prompt(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        text: &str,
+    ) -> Result<
+        Option<crate::agent_transcript::PromptOutcome>,
+        crate::agent_transcript::TooManyPendingPrompts,
+    > {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return Ok(None);
+        };
+        let saved_changed = terminal.other_prompts.prune();
+        let outcome = terminal
+            .other_prompts
+            .admit(text, crate::app::actions::current_unix_ms())?;
+        if saved_changed {
+            self.state.mark_session_dirty();
+        }
+        Ok(Some(outcome))
+    }
+
     pub(crate) fn record_pane_composer_write(
         &mut self,
         ws_idx: usize,
@@ -574,6 +642,7 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             last_completed_turn: terminal.last_completed_turn().map(|record| {
                 crate::api::schema::LastCompletedTurn {
+                    turn_origin: record.turn_origin,
                     turn: record.turn,
                     turn_epoch: record.turn_epoch,
                     completed_unix_ms: record.completed_unix_ms,

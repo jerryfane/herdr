@@ -272,6 +272,7 @@ impl selector::SelectorPane for AppPane<'_> {
         self.call(
             "keys",
             Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id: self.pane_id.to_owned(),
                 keys: keys.iter().map(|key| (*key).to_owned()).collect(),
             }),

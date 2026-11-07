@@ -36,6 +36,8 @@ cli_params! {
     pub struct AgentSendKeysParams => AgentSendKeysProjection {
         pub target: String => Field::new(String::new()).input(bindings::target()),
         pub keys: Vec<String> => Field::new(Vec::new()).input(bindings::keys()),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
     }
 }
 
@@ -460,6 +462,10 @@ cli_params! {
         pub text: String => Field::new(String::new()).input(bindings::text_position("text", "TEXT", 1).verbatim()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wait: Option<AgentPromptWaitOptions> => Field::new(None).input(bindings::wait_presence()),
+        /// `app` when a HerdrUp client sends for the owner (owner connection
+        /// only); absent for scripts, the CLI and other agents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
     }
 }
 

@@ -459,6 +459,9 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        // The transcript stays readable, so keep marking its non-owner turns.
+        terminal.other_prompts =
+            crate::agent_transcript::OtherPromptLog::restored(pane.other_prompts.iter().cloned());
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -550,6 +553,11 @@ fn restore_tab(
         // rebuilt from the account registry when the agent is next spawned, so nothing
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
+        let saved_other_prompts = crate::agent_transcript::OtherPromptLog::restored(
+            saved_pane
+                .map(|p| p.other_prompts.clone())
+                .unwrap_or_default(),
+        );
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -617,6 +625,7 @@ fn restore_tab(
             // Restore account routing. Without this the pane comes back on the harness
             // default and writes to the WRONG account's transcript, which reads as lost work.
             terminal.agent_account = saved_agent_account.clone();
+            terminal.other_prompts = saved_other_prompts.clone();
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -731,6 +740,7 @@ fn restore_tab(
                     terminal.set_manual_label(label);
                 }
                 terminal.agent_account = saved_agent_account.clone();
+                terminal.other_prompts = saved_other_prompts.clone();
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1088,6 +1098,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1380,6 +1391,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd: cwd.clone(),
                             label: Some("herdr-app".into()),
                             agent_name: Some("herdr-app".into()),
@@ -1725,14 +1737,20 @@ mod tests {
             };
             snapshot.workspaces[0].worktree_space = Some(membership.clone());
             let failed = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
+            let saved_prompts = vec![crate::agent_transcript::OtherPrompt::new("review PR 12", 1)];
             failed.cwd = missing.clone();
             failed.label = Some("keep my pane".into());
+            failed.other_prompts = saved_prompts.clone();
             failed.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
             });
+            // The other workspace's pane fails to spawn when the shell is missing.
+            for pane in snapshot.workspaces[1].tabs[0].panes.values_mut() {
+                pane.other_prompts = saved_prompts.clone();
+            }
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
                 &snapshot,
@@ -1776,6 +1794,16 @@ mod tests {
             );
             assert_eq!(pane.label.as_deref(), Some("keep my pane"));
             assert_eq!(
+                pane.other_prompts, saved_prompts,
+                "an unavailable pane keeps its non-owner prompt digests"
+            );
+            for pane in captured.workspaces[1].tabs[0].panes.values() {
+                assert_eq!(
+                    pane.other_prompts, saved_prompts,
+                    "missing_shell={missing_shell}"
+                );
+            }
+            assert_eq!(
                 pane.agent_session.as_ref().unwrap().value,
                 "keep-my-session"
             );
@@ -1818,6 +1846,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1903,6 +1932,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1991,6 +2021,7 @@ mod tests {
                         (
                             10,
                             super::super::snapshot::PaneSnapshot {
+                                other_prompts: Vec::new(),
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -2006,6 +2037,7 @@ mod tests {
                         (
                             20,
                             super::super::snapshot::PaneSnapshot {
+                                other_prompts: Vec::new(),
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -2064,6 +2096,7 @@ mod tests {
             (
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
+                    other_prompts: Vec::new(),
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -2078,6 +2111,7 @@ mod tests {
             )
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
+            other_prompts: Vec::new(),
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -2242,6 +2276,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            other_prompts: Vec::new(),
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2558,6 +2593,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

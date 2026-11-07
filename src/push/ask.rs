@@ -165,6 +165,7 @@ mod tests {
 
     fn alert(kind: PushKind, source: Option<&TempSession>) -> PushNotification {
         PushNotification {
+            turn_origin: None,
             title: "jarvis needs attention".into(),
             body: "herdr · 1".into(),
             pane_id: "w1-2".into(),

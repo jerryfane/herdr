@@ -407,17 +407,21 @@ impl App {
         };
         // Start the completion waiter before submitting, so a refused thread
         // fails the request while nothing has been sent yet.
-        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        )>();
+        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<PromptSubmission>();
         let waiter_respond_to = respond_to.clone();
         let spawned = crate::thread_spawn::spawn_named("herdr-agent-prompt", move || {
-            let Ok((id, agent, completion)) = handoff_rx.recv() else {
+            let Ok((id, agent, completion, outcome)) = handoff_rx.recv() else {
                 return;
             };
-            let response = match completion.recv() {
+            let result = completion.recv();
+            // The completion is the submission's own report: Ok once Enter was
+            // written. Anything else drops the handle, which reports failure.
+            // Either way the record is resolved before the caller hears back.
+            match (outcome, &result) {
+                (Some(outcome), Ok(Ok(()))) => outcome.delivered(),
+                (outcome, _) => drop(outcome),
+            }
+            let response = match result {
                 Ok(Ok(())) => encode_success(
                     id,
                     ResponseResult::AgentPrompted {
@@ -707,14 +711,7 @@ impl App {
         &mut self,
         validated: ValidatedAgentPrompt,
         params: &AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<PromptSubmission, String> {
         let ValidatedAgentPrompt {
             id,
             ws_idx,
@@ -722,6 +719,23 @@ impl App {
             expected_agent,
             agent,
         } = validated;
+        // A non-owner prompt is recorded before anything is written, and its
+        // record resolves from this submission's own outcome: delivered by the
+        // completion waiter, failed if the handle is dropped on any other path.
+        let outcome = if params.input_source.is_none() {
+            match self.admit_pane_other_prompt(ws_idx, pane_id, &params.text) {
+                Ok(outcome) => outcome,
+                Err(crate::agent_transcript::TooManyPendingPrompts) => {
+                    return Err(encode_error(
+                        id,
+                        "too_many_pending_prompts",
+                        "too many prompts to this agent are still being submitted; retry once they finish",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
@@ -786,11 +800,12 @@ impl App {
             true,
             true,
         );
+        self.record_pane_input_source(ws_idx, pane_id, params.input_source);
         // Report the agent as it stands after the composer write was recorded;
         // the validated snapshot only covers a pane that vanished meanwhile, so
         // no error is returned once bytes have been queued.
         let agent = self.agent_info(ws_idx, pane_id).unwrap_or(agent);
-        Ok((id, agent, completion))
+        Ok((id, agent, completion, outcome))
     }
 
     pub(super) fn handle_agent_read(
@@ -938,6 +953,7 @@ impl App {
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
         let composer_baseline = runtime.detection_content_seq();
+        let wrote_input = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
@@ -949,6 +965,9 @@ impl App {
             false,
             false,
         );
+        if wrote_input {
+            self.record_pane_input_source(resolved.ws_idx, resolved.pane_id, params.input_source);
+        }
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.mark_turn_aborted();
@@ -958,6 +977,16 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 }
+
+/// An accepted `agent.prompt` handed to its completion waiter: the request
+/// id, the agent as reported, the submission's completion, and the handle
+/// that resolves a non-owner prompt's record.
+type PromptSubmission = (
+    String,
+    crate::api::schema::AgentInfo,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+    Option<crate::agent_transcript::PromptOutcome>,
+);
 
 struct ValidatedAgentPrompt {
     id: String,
@@ -1839,6 +1868,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                input_source: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1938,6 +1968,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -1981,6 +2012,7 @@ mod tests {
             &mut app,
             "req-raw",
             AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -2004,6 +2036,7 @@ mod tests {
             &mut app,
             "req-label",
             AgentPromptParams {
+                input_source: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -2190,6 +2223,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target,
                 text: "api prompt".into(),
                 wait: None,
@@ -2269,6 +2303,7 @@ mod tests {
             &mut app,
             "req-a",
             AgentPromptParams {
+                input_source: None,
                 target: target.clone(),
                 text: "prompt a".into(),
                 wait: None,
@@ -2290,6 +2325,7 @@ mod tests {
             &mut app,
             "req-b",
             AgentPromptParams {
+                input_source: None,
                 target,
                 text: "prompt b".into(),
                 wait: None,
@@ -2341,6 +2377,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target,
                 text: "stranded text".into(),
                 wait: None,
@@ -2404,6 +2441,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "hello".into(),
                 wait: None,
@@ -2438,6 +2476,7 @@ mod tests {
                 &mut app,
                 "req",
                 AgentPromptParams {
+                    input_source: None,
                     target: target.into(),
                     text: text.into(),
                     wait: None,
@@ -2471,6 +2510,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -2511,6 +2551,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -2545,6 +2586,7 @@ mod tests {
         let rejected = app.handle_agent_send_keys(
             "req-invalid".into(),
             AgentSendKeysParams {
+                input_source: None,
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
             },
@@ -2556,6 +2598,7 @@ mod tests {
         let sent = app.handle_agent_send_keys(
             "req-valid".into(),
             AgentSendKeysParams {
+                input_source: None,
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
             },
@@ -2590,6 +2633,7 @@ mod tests {
             &mut app,
             "req-pending",
             AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -6175,5 +6219,352 @@ mod tests {
             listed_avatar(&app, &terminal_id).and_then(|avatar| avatar.mascot),
             Some("cub".to_string())
         );
+    }
+
+    /// Turn origin through the real write and hook paths, observed at the push
+    /// sink and filtered the way a registered device filters it.
+    mod turn_origin {
+        use super::*;
+        use crate::api::schema::InputSource;
+        use crate::persist::devices::RegisteredDevice;
+        use crate::push::{test_sink::Capture, PushKind, PushNotification};
+        use crate::terminal::TurnOrigin;
+
+        struct Harness {
+            app: App,
+            pane: String,
+            terminal_id: crate::terminal::TerminalId,
+            capture: Capture,
+            seq: u64,
+            _rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        }
+
+        fn harness() -> Harness {
+            let mut app = app_with_agent();
+            app.state.push_config = crate::config::PushConfig {
+                mode: crate::config::PushMode::Direct,
+                enabled: true,
+                key_path: Some("/tmp/AuthKey.p8".to_string()),
+                key_id: Some("ABC123DEFG".to_string()),
+                team_id: Some("TEAM123456".to_string()),
+                topic: Some("app.herdr.ios".to_string()),
+                ..crate::config::PushConfig::default()
+            };
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+            let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.insert_test_runtime(pane_id, runtime);
+            let pane = app.public_pane_id(0, pane_id).unwrap();
+            let mut harness = Harness {
+                app,
+                pane,
+                terminal_id,
+                capture: Capture::install(),
+                seq: 0,
+                _rx: rx,
+            };
+            harness.report("idle");
+            harness.capture.take();
+            harness
+        }
+
+        impl Harness {
+            fn report(&mut self, state: &str) {
+                self.seq += 1;
+                let params = serde_json::from_value(serde_json::json!({
+                    "pane_id": self.pane,
+                    "source": "custom:worker",
+                    "agent": "codex",
+                    "state": state,
+                    "seq": self.seq,
+                }))
+                .unwrap();
+                let response = self.app.handle_pane_report_agent("report".into(), params);
+                let terminal = &self.app.state.terminals[&self.terminal_id];
+                assert_eq!(
+                    crate::detect::manifest::agent_state_label(terminal.state),
+                    state,
+                    "{response}"
+                );
+            }
+
+            fn prompt(&mut self, text: &str, input_source: Option<InputSource>) {
+                let response = run_deferred_agent_prompt(
+                    &mut self.app,
+                    "prompt",
+                    AgentPromptParams {
+                        target: self.pane.clone(),
+                        text: text.into(),
+                        wait: None,
+                        input_source,
+                    },
+                );
+                assert!(response.contains("\"result\""), "{response}");
+            }
+
+            fn send_text(&mut self, input_source: Option<InputSource>) {
+                let response = self.app.handle_pane_send_text(
+                    "send".into(),
+                    crate::api::schema::PaneSendTextParams {
+                        pane_id: self.pane.clone(),
+                        text: "also this".into(),
+                        input_source,
+                    },
+                );
+                assert!(response.contains("\"result\""), "{response}");
+            }
+
+            /// Runs the turn to completion and returns the finished push.
+            fn finish(&mut self) -> PushNotification {
+                self.report("idle");
+                let mut alerts = self.capture.take().alerts;
+                alerts.retain(|alert| alert.kind == PushKind::Finished);
+                assert_eq!(alerts.len(), 1, "{alerts:?}");
+                alerts.remove(0)
+            }
+        }
+
+        fn device(mine_only: bool) -> RegisteredDevice {
+            RegisteredDevice {
+                device_token: "ab".repeat(32),
+                platform: "ios".into(),
+                notify_needs_input: true,
+                notify_dies: true,
+                notify_finishes: true,
+                notify_finishes_mine_only: mine_only,
+                notify_gram: false,
+                muted_panes: Vec::new(),
+                registered_unix_ms: 0,
+                relay_capability: None,
+            }
+        }
+
+        fn delivered(alert: &PushNotification) -> (bool, bool) {
+            (
+                crate::push::device_accepts(&device(true), alert),
+                crate::push::device_accepts(&device(false), alert),
+            )
+        }
+
+        #[tokio::test]
+        async fn an_app_prompt_turn_pushes_to_a_mine_only_device() {
+            let mut h = harness();
+            h.prompt("fix the build", Some(InputSource::App));
+            h.report("working");
+            let alert = h.finish();
+            assert_eq!(alert.turn_origin, Some(TurnOrigin::Mine));
+            assert_eq!(delivered(&alert), (true, true));
+            let turns: serde_json::Value = serde_json::from_str(&h.app.handle_pane_turns(
+                "turns".into(),
+                serde_json::from_value(serde_json::json!({"pane_id": h.pane})).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(
+                turns["result"]["turns"]["records"][0]["turn_origin"], "mine",
+                "{turns}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_sourceless_prompt_turn_skips_a_mine_only_device_only() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            let alert = h.finish();
+            assert_eq!(alert.turn_origin, Some(TurnOrigin::Other));
+            assert_eq!(delivered(&alert), (false, true));
+            let terminal = &h.app.state.terminals[&h.terminal_id];
+            assert_eq!(terminal.other_prompts.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn the_owner_joining_a_working_turn_makes_it_mine() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            h.send_text(Some(InputSource::App));
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
+        #[tokio::test]
+        async fn other_input_during_an_owner_turn_keeps_it_mine() {
+            let mut h = harness();
+            h.prompt("fix the build", Some(InputSource::App));
+            h.report("working");
+            h.send_text(None);
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
+        #[tokio::test]
+        async fn typing_in_an_attached_terminal_counts_as_mine() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            // What the headless server records for attached-terminal keystrokes.
+            let terminal_id = h.terminal_id.clone();
+            h.app
+                .record_terminal_input_origin(&terminal_id, TurnOrigin::Mine);
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
+        fn send_keys(h: &mut Harness, keys: &[&str]) -> String {
+            h.app.handle_pane_send_keys(
+                "keys".into(),
+                crate::api::schema::PaneSendKeysParams {
+                    pane_id: h.pane.clone(),
+                    keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                    input_source: Some(InputSource::App),
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn an_owner_request_that_writes_nothing_leaves_the_origin_alone() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            let response = send_keys(&mut h, &[]);
+            assert!(response.contains("\"result\""), "{response}");
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Other));
+        }
+
+        #[tokio::test]
+        async fn accepted_owner_keys_count_even_when_a_later_key_fails() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            // Room for one write only, so the second key is refused.
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, _rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80, 24, 0, b"", 1,
+                );
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let response = send_keys(&mut h, &["a", "b"]);
+            assert!(response.contains("pane_send_failed"), "{response}");
+            assert_eq!(h.finish().turn_origin, Some(TurnOrigin::Mine));
+        }
+
+        #[tokio::test]
+        async fn a_failed_automation_prompt_leaves_no_record_to_claim_the_owners() {
+            let mut h = harness();
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            // The PTY side is gone, so the delayed write fails.
+            let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            drop(rx);
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let response = run_deferred_agent_prompt(
+                &mut h.app,
+                "prompt",
+                AgentPromptParams {
+                    target: h.pane.clone(),
+                    text: "continue".into(),
+                    wait: None,
+                    input_source: None,
+                },
+            );
+            assert!(response.contains("\"error\""), "{response}");
+            h.report("working");
+            let terminal = &h.app.state.terminals[&h.terminal_id];
+            assert_eq!(terminal.other_prompts.len(), 0, "the failed record is gone");
+
+            // The owner then sends the same text; its transcript turn stays
+            // unmarked.
+            let mut session = crate::agent_transcript::tests::Fixture::new("failed-automation");
+            session.user("continue");
+            let page = crate::agent_transcript::read_page(
+                &session.path,
+                &crate::agent_transcript::PageRequest {
+                    other_prompts: terminal.other_prompts.delivered(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(page.entries.iter().all(|entry| !matches!(
+                entry,
+                crate::api::schema::TranscriptEntry::User {
+                    origin: Some(_),
+                    ..
+                }
+            )));
+        }
+
+        #[tokio::test]
+        async fn a_delivered_automation_prompt_is_kept_and_saved() {
+            let mut h = harness();
+            h.prompt("continue", None);
+            h.report("working");
+            let terminal = &h.app.state.terminals[&h.terminal_id];
+            assert_eq!(terminal.other_prompts.len(), 1);
+            assert_eq!(terminal.other_prompts.delivered().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_non_owner_prompt_is_refused_unwritten_while_too_many_are_pending() {
+            let mut h = harness();
+            let pane_id = h.app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            h.app.state.insert_test_runtime(pane_id, runtime);
+            let terminal = h.app.state.terminals.get_mut(&h.terminal_id).unwrap();
+            let _in_flight: Vec<_> = (0..crate::agent_transcript::PENDING_PROMPT_LIMIT)
+                .map(|n| {
+                    terminal
+                        .other_prompts
+                        .admit(&format!("job {n}"), 1)
+                        .unwrap()
+                })
+                .collect();
+            let response = start_deferred_agent_prompt(
+                &mut h.app,
+                "prompt",
+                AgentPromptParams {
+                    target: h.pane.clone(),
+                    text: "one more".into(),
+                    wait: None,
+                    input_source: None,
+                },
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            assert!(response.contains("too_many_pending_prompts"), "{response}");
+            assert!(rx.try_recv().is_err(), "nothing was written");
+            // The owner's own prompts are not tracked, so they still go out.
+            h.prompt("owner prompt", Some(InputSource::App));
+        }
+
+        #[tokio::test]
+        async fn an_unknown_origin_still_notifies_a_mine_only_device() {
+            let mut h = harness();
+            // No brokered input: e.g. a pane restored mid-turn.
+            h.report("working");
+            let alert = h.finish();
+            assert_eq!(alert.turn_origin, None);
+            assert_eq!(delivered(&alert), (true, true));
+        }
+
+        #[tokio::test]
+        async fn needs_input_and_exit_pushes_ignore_origin() {
+            let mut h = harness();
+            h.prompt("gitmoot: review PR 12", None);
+            h.report("working");
+            h.report("blocked");
+            let alerts = h.capture.take().alerts;
+            let needs = alerts
+                .iter()
+                .find(|alert| alert.kind == PushKind::NeedsInput)
+                .expect("needs-input push");
+            assert_eq!(delivered(needs), (true, true));
+            let died = PushNotification {
+                kind: PushKind::Died,
+                turn_origin: Some(TurnOrigin::Other),
+                ..needs.clone()
+            };
+            assert_eq!(delivered(&died), (true, true));
+        }
     }
 }

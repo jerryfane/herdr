@@ -100,6 +100,7 @@ fn serve_with_open_timeout(
     open_timeout: Duration,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
+    let input_source = params.input_source;
     let stream_active = Arc::new(AtomicBool::new(true));
 
     // Open handshake: validate the pane exists (and reject an unknown pane) before
@@ -135,6 +136,7 @@ fn serve_with_open_timeout(
         &mut stream,
         &request_id,
         &pane_id,
+        input_source,
         api_tx,
         running,
         &stream_active,
@@ -147,6 +149,7 @@ fn serve_frames(
     stream: &mut ApiStream,
     request_id: &str,
     pane_id: &str,
+    input_source: Option<crate::api::schema::InputSource>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
@@ -216,12 +219,14 @@ fn serve_frames(
             Method::PaneSendText(PaneSendTextParams {
                 pane_id: pane_id.to_string(),
                 text: frame.text,
+                input_source,
             })
         } else {
             Method::PaneSendInput(PaneSendInputParams {
                 pane_id: pane_id.to_string(),
                 text: frame.text,
                 keys: frame.keys,
+                input_source,
             })
         };
         let response = dispatch_to_app_with_timeout(

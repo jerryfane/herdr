@@ -514,6 +514,10 @@ pub struct PaneTurnCompletedEvent {
     pub agent_session_path: Option<String>,
     /// Unix timestamp in milliseconds.
     pub completed_unix_ms: u64,
+    /// `mine` when the owner started or joined the turn, `other` otherwise;
+    /// omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_origin: Option<crate::terminal::TurnOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -681,6 +685,10 @@ pub enum EventData {
         agent_session_path: Option<String>,
         /// Unix timestamp in milliseconds.
         completed_unix_ms: u64,
+        /// `mine` when the owner started or joined the turn, `other`
+        /// otherwise; omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_origin: Option<crate::terminal::TurnOrigin>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

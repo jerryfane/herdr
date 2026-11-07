@@ -243,5 +243,22 @@ operations::define_operations! {
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
 }
 
+impl Method {
+    /// Forget the request's `input_source` claim. Only the owner's own
+    /// connection may say a write acts for the owner; guests and federation
+    /// peers never can.
+    pub(crate) fn clear_input_source(&mut self) {
+        match self {
+            Self::AgentPrompt(params) => params.input_source = None,
+            Self::AgentSendKeys(params) => params.input_source = None,
+            Self::PaneSendText(params) => params.input_source = None,
+            Self::PaneSendInput(params) => params.input_source = None,
+            Self::PaneSendKeys(params) => params.input_source = None,
+            Self::PaneInputStream(params) => params.input_source = None,
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

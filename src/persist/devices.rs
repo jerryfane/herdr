@@ -29,6 +29,10 @@ pub struct RegisteredDevice {
     pub notify_dies: bool,
     /// Deliver a push when an agent finishes a turn.
     pub notify_finishes: bool,
+    /// With `notify_finishes`, push only turns the owner started or joined
+    /// (unknown origin counts as the owner's). False for legacy records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify_finishes_mine_only: bool,
     /// Deliver a push when an agent sends the owner a gram message.
     #[serde(default)]
     pub notify_gram: bool,
@@ -212,6 +216,7 @@ mod tests {
 
     fn sample_device(token: &str) -> RegisteredDevice {
         RegisteredDevice {
+            notify_finishes_mine_only: false,
             device_token: token.to_string(),
             platform: "ios".to_string(),
             notify_needs_input: true,

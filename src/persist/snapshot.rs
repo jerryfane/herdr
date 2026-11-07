@@ -147,6 +147,10 @@ pub struct PaneSnapshot {
     /// simply restores to the default, which is the old behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_account: Option<String>,
+    /// Digests of the last brokered prompts that were not the owner's, oldest
+    /// first, so `agent.transcript` keeps marking their turns after a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_prompts: Vec<crate::agent_transcript::OtherPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -527,6 +531,9 @@ fn capture_tab(
                     .map(|terminal| terminal.occupant_generation)
                     .unwrap_or(0),
                 agent_account,
+                other_prompts: terminal
+                    .map(|terminal| terminal.other_prompts.delivered())
+                    .unwrap_or_default(),
             },
         );
     }
@@ -1003,6 +1010,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -1018,6 +1026,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -1980,6 +1989,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -1995,6 +2005,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                other_prompts: Vec::new(),
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

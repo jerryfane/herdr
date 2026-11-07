@@ -8365,3 +8365,47 @@ fn no_handle_internal_event_bypass_in_module() {
         bypass_lines.join("\n  ")
     );
 }
+
+#[tokio::test]
+async fn pasting_through_an_attached_client_makes_the_turn_the_owners() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("paste-origin");
+    let pane = workspace.tabs[0].root_pane;
+    let (runtime, mut input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"", 4);
+    workspace.insert_test_runtime(pane, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let pane_id = server.app.public_pane_id(0, pane).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane]
+        .attached_terminal_id
+        .clone();
+    {
+        // A script started the turn that is now running.
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.record_input_origin(crate::terminal::TurnOrigin::Other);
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Working,
+        );
+    }
+
+    let (control, _render) = connect_test_shell(&mut server, 31, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 31,
+        pane_id,
+        events: vec![crate::protocol::ClientPaneInputEvent::Paste(
+            "look at this".into(),
+        )],
+    });
+    assert!(input.try_recv().is_ok(), "the paste reached the pane");
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].turn_origin,
+        Some(crate::terminal::TurnOrigin::Mine)
+    );
+    shutdown_test_runtimes(&mut server);
+}

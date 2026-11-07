@@ -9,6 +9,7 @@
 mod history;
 mod index;
 mod normalize;
+mod origin;
 mod subagents;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -27,6 +28,9 @@ use crate::api::schema::{
 };
 use index::{read_line, Kind, SessionIndex};
 use normalize::{AssistantLine, NoteLine, ResultLine, StampLine, UserLine, SUMMARY_TEXT};
+#[cfg(test)]
+pub(crate) use origin::PENDING_PROMPT_LIMIT;
+pub(crate) use origin::{OtherPrompt, OtherPromptLog, PromptOutcome, TooManyPendingPrompts};
 
 pub(crate) const DEFAULT_TURNS: u32 = 20;
 pub(crate) const MAX_TURNS: u32 = 50;
@@ -43,6 +47,9 @@ pub(crate) struct PageRequest {
     pub(crate) limit: Option<u32>,
     /// Page this subagent's own session file instead of the agent's.
     pub(crate) subagent: Option<String>,
+    /// The pane's remembered non-owner prompts, oldest first; their user
+    /// turns are marked `origin: "other"`. Ignored for subagent pages.
+    pub(crate) other_prompts: Vec<OtherPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,9 +168,11 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         Some(id) => {
             let child =
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
-            with_index(&child, |view| view.page(request, limit))
+            with_index(&child, |view| view.page(request, limit, &[]))
         }
-        None => with_index(path, |view| view.page(request, limit)),
+        None => with_index(path, |view| {
+            view.page(request, limit, &request.other_prompts)
+        }),
     }
 }
 
@@ -223,6 +232,9 @@ enum Cursor {
     After {
         seen: u32,
         tip: Option<(u32, String)>,
+        /// [`origin::fingerprint`] of the non-owner prompts the page was
+        /// marked with; `None` in a cursor from before origins existed.
+        origins: Option<u64>,
     },
 }
 
@@ -230,11 +242,16 @@ impl Cursor {
     fn encode(&self, session_id: &str) -> String {
         let raw = match self {
             Self::Before { record, id } => format!("1\nb\n{session_id}\n{record}\n{id}"),
-            Self::After { seen, tip: None } => format!("1\na\n{session_id}\n{seen}\n"),
-            Self::After {
-                seen,
-                tip: Some((tip, id)),
-            } => format!("1\na\n{session_id}\n{seen}\n{tip} {id}"),
+            Self::After { seen, tip, origins } => {
+                let tip = tip
+                    .as_ref()
+                    .map(|(tip, id)| format!("{tip} {id}"))
+                    .unwrap_or_default();
+                let origins = origins
+                    .map(|origins| format!("\n{origins:x}"))
+                    .unwrap_or_default();
+                format!("1\na\n{session_id}\n{seen}\n{tip}{origins}")
+            }
         };
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
     }
@@ -266,16 +283,28 @@ impl Cursor {
                 record: number,
                 id: id.to_owned(),
             }),
-            "a" if id.is_empty() => Ok(Self::After {
-                seen: number,
-                tip: None,
-            }),
             "a" => {
-                let (tip, id) = id.split_once(' ').ok_or(TranscriptError::CursorExpired)?;
-                let tip = tip.parse().map_err(|_| TranscriptError::CursorExpired)?;
+                let (tip, origins) = match id.split_once('\n') {
+                    Some((tip, origins)) => (
+                        tip,
+                        Some(
+                            u64::from_str_radix(origins, 16)
+                                .map_err(|_| TranscriptError::CursorExpired)?,
+                        ),
+                    ),
+                    None => (id, None),
+                };
+                let tip = if tip.is_empty() {
+                    None
+                } else {
+                    let (tip, id) = tip.split_once(' ').ok_or(TranscriptError::CursorExpired)?;
+                    let tip = tip.parse().map_err(|_| TranscriptError::CursorExpired)?;
+                    Some((tip, id.to_owned()))
+                };
                 Ok(Self::After {
                     seen: number,
-                    tip: Some((tip, id.to_owned())),
+                    tip,
+                    origins,
                 })
             }
             _ => Err(TranscriptError::CursorExpired),
@@ -317,9 +346,61 @@ impl View<'_> {
         Ok(serde_json::from_slice(&line).ok())
     }
 
-    fn page(&self, request: &PageRequest, limit: usize) -> Result<Page, TranscriptError> {
+    /// Branch positions and ids of the user turns the remembered non-owner
+    /// prompts produced. Matching runs over the branch's user turns since the
+    /// oldest prompt, so every page sees the same marks whatever its window.
+    fn other_user_turns(
+        &self,
+        prompts: &[OtherPrompt],
+    ) -> Result<Vec<(usize, String)>, TranscriptError> {
+        let Some(earliest_ms) = origin::earliest_turn_ms(prompts) else {
+            return Ok(Vec::new());
+        };
+        let mut positions = Vec::new();
+        let mut turns = Vec::new();
+        for position in (0..self.branch.len()).rev() {
+            if self.kind(position) != Kind::User {
+                continue;
+            }
+            let record = self.branch[position];
+            let Some(line) = self.parse::<UserLine>(record)? else {
+                continue;
+            };
+            let ts_ms = normalize::ts_ms(line.message.timestamp, line.timestamp.as_deref());
+            if ts_ms < earliest_ms {
+                break;
+            }
+            let text = normalize::content_text(&line.message.content);
+            if text.trim().is_empty() {
+                continue;
+            }
+            positions.push(position);
+            turns.push(origin::UserTurn {
+                id: self.index.record(record).id.to_string(),
+                ts_ms,
+                sha256: origin::text_digest(&text),
+            });
+        }
+        positions.reverse();
+        turns.reverse();
+        let matched = origin::matched_turns(prompts, &turns);
+        Ok(positions
+            .into_iter()
+            .zip(turns)
+            .filter(|(_, turn)| matched.contains(&turn.id))
+            .map(|(position, turn)| (position, turn.id))
+            .collect())
+    }
+
+    fn page(
+        &self,
+        request: &PageRequest,
+        limit: usize,
+        other_prompts: &[OtherPrompt],
+    ) -> Result<Page, TranscriptError> {
         let session_id = self.session_id().to_owned();
-        let (start, end, changed_since) = match (&request.before, &request.after) {
+        let origins = origin::fingerprint(other_prompts);
+        let (start, end, changed_since, served_origins) = match (&request.before, &request.after) {
             (Some(token), _) => {
                 let Cursor::Before { record, id } = Cursor::decode(token, &session_id)? else {
                     return Err(TranscriptError::CursorExpired);
@@ -328,10 +409,11 @@ impl View<'_> {
                     .valid_record(record, &id)
                     .and_then(|record| self.position_of(record))
                     .ok_or(TranscriptError::CursorExpired)?;
-                (self.page_start(end, limit), end, None)
+                (self.page_start(end, limit), end, None, None)
             }
             (None, Some(token)) => {
-                let Cursor::After { seen, tip } = Cursor::decode(token, &session_id)? else {
+                let Cursor::After { seen, tip, origins } = Cursor::decode(token, &session_id)?
+                else {
                     return Err(TranscriptError::CursorExpired);
                 };
                 if seen as usize > self.index.records.len() {
@@ -343,18 +425,46 @@ impl View<'_> {
                         .ok_or(TranscriptError::CursorExpired)?;
                 }
                 let start = self.branch.partition_point(|&record| record < seen);
-                (start, self.budget_end(start), Some(seen))
+                (start, self.budget_end(start), Some(seen), origins)
             }
             (None, None) => {
                 let end = self.branch.len();
-                (self.page_start(end, limit), end, None)
+                (self.page_start(end, limit), end, None, None)
             }
         };
         let mut entries = Vec::new();
+        // The prompts this client was served with changed (a prompt was
+        // delivered, or one was forgotten): re-send, under the same ids, every
+        // user entry before its cursor that is now marked, since it may have
+        // gone out unmarked.
+        let resend_origins = changed_since.is_some() && served_origins != Some(origins);
+        let mut others = None;
+        if resend_origins {
+            let matched = self.other_user_turns(other_prompts)?;
+            for (position, _) in matched.iter().filter(|(position, _)| *position < start) {
+                self.render(*position, position + 1, &mut entries)?;
+            }
+            others = Some(matched);
+        }
         if let Some(seen) = changed_since {
             self.resend_changed(seen, start, &mut entries)?;
         }
         self.render(start, end, &mut entries)?;
+        let has_user = entries
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::User { .. }));
+        let others = match others {
+            Some(others) => others,
+            None if has_user => self.other_user_turns(other_prompts)?,
+            None => Vec::new(),
+        };
+        for entry in &mut entries {
+            if let TranscriptEntry::User { id, origin, .. } = entry {
+                if others.iter().any(|(_, other)| other == id) {
+                    *origin = Some(crate::terminal::TurnOrigin::Other);
+                }
+            }
+        }
         let before = (changed_since.is_none() && start > 0).then(|| {
             let record = self.branch[start];
             Cursor::Before {
@@ -371,7 +481,12 @@ impl View<'_> {
         let tip = self.branch[..self.branch.partition_point(|&record| record < seen)]
             .last()
             .map(|&tip| (tip, self.index.record(tip).id.to_string()));
-        let after = Cursor::After { seen, tip }.encode(&session_id);
+        let after = Cursor::After {
+            seen,
+            tip,
+            origins: Some(origins),
+        }
+        .encode(&session_id);
         let (pending_ask, working) = self.live_state()?;
         Ok(Page {
             session_id,
@@ -706,6 +821,7 @@ impl View<'_> {
                             text,
                             author,
                             author_name,
+                            origin: None,
                         });
                     }
                 }

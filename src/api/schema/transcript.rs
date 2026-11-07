@@ -172,6 +172,11 @@ pub enum TranscriptEntry {
         author: TranscriptAuthor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author_name: Option<String>,
+        /// `other` when herdr brokered this prompt for someone other than the
+        /// owner (a script, the CLI, gitmoot, another agent or a guest);
+        /// omitted for the owner's turns and when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::terminal::TurnOrigin>,
     },
     /// Assistant text parts joined with a blank line; `final` marks an answer
     /// that ended the model's turn (stop reason `stop`/`length`).

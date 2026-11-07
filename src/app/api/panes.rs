@@ -214,6 +214,7 @@ impl App {
             .records
             .into_iter()
             .map(|record| PaneTurnRecord {
+                turn_origin: record.turn_origin,
                 turn: record.turn,
                 turn_epoch: record.turn_epoch,
                 outcome: record.outcome,
@@ -2299,6 +2300,7 @@ impl App {
         };
         let composer_baseline = runtime.detection_content_seq();
         let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text);
+        let wrote_input = !params.text.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
@@ -2310,6 +2312,9 @@ impl App {
             true,
             false,
         );
+        if wrote_input {
+            self.record_pane_input_source(ws_idx, pane_id, params.input_source);
+        }
         if aborts_turn {
             let terminal_id = self
                 .state
@@ -2353,6 +2358,7 @@ impl App {
         if let Err(err) = runtime.validate_input_submission(&bytes) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+        let wrote_input = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
@@ -2364,6 +2370,9 @@ impl App {
             !params.text.is_empty(),
             false,
         );
+        if wrote_input {
+            self.record_pane_input_source(ws_idx, pane_id, params.input_source);
+        }
         if aborts_turn {
             let terminal_id = self
                 .state
@@ -2474,10 +2483,17 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        // Attribution follows the keys the pane accepted: none for a request
+        // that wrote nothing, and the accepted ones even when a later key fails.
+        let mut wrote_input = false;
         for bytes in encoded_keys.into_iter().filter(|bytes| !bytes.is_empty()) {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                if wrote_input {
+                    self.record_pane_input_source(ws_idx, pane_id, params.input_source);
+                }
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+            wrote_input = true;
         }
         self.record_pane_composer_write(
             ws_idx,
@@ -2487,6 +2503,9 @@ impl App {
             false,
             false,
         );
+        if wrote_input {
+            self.record_pane_input_source(ws_idx, pane_id, params.input_source);
+        }
         if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
             let terminal_id = self
                 .state
@@ -3547,6 +3566,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec![
                     "ctrl+h".into(),
@@ -3574,6 +3594,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["shift+tab".into()],
             }),
@@ -3937,6 +3958,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
             }),
@@ -3965,6 +3987,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["cmd+c".into()],
             }),
@@ -3994,6 +4017,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["cmd+c".into()],
             }),
@@ -4014,6 +4038,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["+".into()],
             }),
@@ -4043,6 +4068,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["shift+?".into()],
             }),
@@ -4066,6 +4092,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                input_source: None,
                 pane_id,
                 text: "A != B".into(),
                 keys: vec!["Enter".into()],
@@ -4088,6 +4115,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                input_source: None,
                 pane_id,
                 text: String::new(),
                 keys: vec!["ctrl+j".into()],
@@ -4115,6 +4143,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                input_source: None,
                 pane_id,
                 text: "\x03".into(),
                 keys: Vec::new(),
@@ -4138,6 +4167,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                input_source: None,
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
             }),
@@ -4157,6 +4187,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                input_source: None,
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["ctrl+h".into(), raw_key.clone()],

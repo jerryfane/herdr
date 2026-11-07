@@ -216,6 +216,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_answer: true,
         agent_transcript: true,
         server_update: true,
+        turn_origin: true,
     })
 }
 
@@ -1574,6 +1575,11 @@ fn handle_principal_connection(
         ConnectionPrincipal::Federation(peer) => Some(peer),
         _ => None,
     };
+    // `input_source: "app"` speaks for the owner, so only the owner's own
+    // connection may claim it.
+    if federation.is_some() {
+        request.method.clear_input_source();
+    }
 
     // Federation capability gate. Local (unix-socket) connections carry `None`
     // here and are never filtered; only a connection bound to a federation
@@ -3066,6 +3072,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
         Request {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                input_source: None,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
@@ -3642,6 +3649,7 @@ mod tests {
                 agent_answer: false,
                 agent_transcript: false,
                 server_update: false,
+                turn_origin: false,
             }),
             None,
             None,
@@ -4211,6 +4219,7 @@ mod tests {
         event_hub.push(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::PaneTurnCompleted,
             data: crate::api::schema::EventData::PaneTurnCompleted {
+                turn_origin: None,
                 pane: pane_info("pane_3", crate::api::schema::AgentStatus::Done),
                 turn: 1,
                 turn_epoch: 9,
@@ -5253,6 +5262,7 @@ mod federation_tests {
             &mut prompt,
             "prompt",
             Method::AgentPrompt(AgentPromptParams {
+                input_source: None,
                 target: "a".into(),
                 text: "hi".into(),
                 wait: None,
@@ -5315,6 +5325,7 @@ mod federation_tests {
             &mut stream,
             "prompt",
             Method::AgentPrompt(AgentPromptParams {
+                input_source: None,
                 target: "a".into(),
                 text: "hi".into(),
                 wait: None,
@@ -7077,6 +7088,7 @@ mod federation_tests {
     fn routable_target_mut_selects_the_proxyable_target_field() {
         // Agent methods carry the target in `target`; a rewrite is reflected.
         let mut prompt = Method::AgentPrompt(AgentPromptParams {
+            input_source: None,
             target: "remote/a".into(),
             text: "hi".into(),
             wait: None,
@@ -9200,6 +9212,7 @@ mod federation_tests {
         peer.event_hub.push(EventEnvelope {
             event: EventKind::PaneTurnCompleted,
             data: EventData::PaneTurnCompleted {
+                turn_origin: None,
                 pane,
                 turn: 3,
                 turn_epoch: 1,
@@ -9537,6 +9550,7 @@ mod federation_tests {
         peer.event_hub.push(EventEnvelope {
             event: EventKind::PaneTurnCompleted,
             data: EventData::PaneTurnCompleted {
+                turn_origin: None,
                 pane,
                 turn: 5,
                 turn_epoch: 2,

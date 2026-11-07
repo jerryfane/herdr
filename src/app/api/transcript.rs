@@ -17,6 +17,8 @@ pub(crate) struct TranscriptSource {
     pub(crate) path: PathBuf,
     pub(crate) agent: String,
     pub(crate) pane_id: String,
+    /// The pane's remembered non-owner prompts, to mark their user turns.
+    pub(crate) other_prompts: Vec<agent_transcript::OtherPrompt>,
 }
 
 impl App {
@@ -67,6 +69,7 @@ impl App {
             path,
             agent: info.name.clone().unwrap_or_else(|| agent.clone()),
             pane_id: info.pane_id,
+            other_prompts: terminal.other_prompts.delivered(),
         })
     }
 
@@ -111,6 +114,7 @@ fn transcript_response(
     params: AgentTranscriptParams,
 ) -> String {
     let request = PageRequest {
+        other_prompts: source.other_prompts.clone(),
         before: params.before,
         after: params.after,
         limit: params.limit,

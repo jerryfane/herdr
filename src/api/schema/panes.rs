@@ -415,6 +415,8 @@ crate::cli::projection::cli_params! {
     pub struct PaneSendTextParams => PaneSendTextProjection {
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         pub text: String => Field::new(String::new()).input(binding::joined("text", "TEXT")),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
     }
 }
 
@@ -423,6 +425,8 @@ crate::cli::projection::cli_params! {
     pub struct PaneSendKeysParams => PaneSendKeysProjection {
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         pub keys: Vec<String> => Field::new(Vec::new()).input(binding::keys()),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
     }
 }
 
@@ -434,14 +438,19 @@ crate::cli::projection::cli_params! {
         pub text: String => Field::new(String::new()).input(binding::joined("command", "COMMAND")),
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub keys: Vec<String> => Field::new(vec![String::from("Enter")]),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
     }
 }
 
 /// Open params for the persistent `pane.input.stream` write channel. Frames on
-/// the held-open connection are field-compatible with `PaneSendInputParams`.
+/// the held-open connection are field-compatible with `PaneSendInputParams`;
+/// the `input_source` given at open applies to every frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInputStreamParams {
     pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_source: Option<super::InputSource>,
 }
 
 fn default_include_history() -> bool {
@@ -799,6 +808,10 @@ pub struct LastCompletedTurn {
     pub turn_epoch: u64,
     /// Unix timestamp in milliseconds.
     pub completed_unix_ms: u64,
+    /// `mine` when the owner started or joined the turn, `other` otherwise;
+    /// omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_origin: Option<crate::terminal::TurnOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -816,6 +829,10 @@ pub struct PaneTurnRecord {
     pub message_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
+    /// `mine` when the owner started or joined the turn, `other` otherwise;
+    /// omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_origin: Option<crate::terminal::TurnOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
