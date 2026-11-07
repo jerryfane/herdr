@@ -71,10 +71,12 @@ pub fn register_runtime_dir(path: &Path) {
     ensure_cleanup_hooks();
 
     let _ = fs::create_dir_all(path);
-    let _ = fs::write(
-        path.join(RUNTIME_OWNER_MARKER),
-        std::process::id().to_string(),
-    );
+    // Replace the marker in one rename: the cleanup watchdog reads it while
+    // servers run here, and a marker caught truncated mid-write reads as a
+    // dead owner, so the watchdog would stop this test's own server.
+    let staged = path.join(format!("{RUNTIME_OWNER_MARKER}.tmp"));
+    let _ = fs::write(&staged, std::process::id().to_string())
+        .and_then(|()| fs::rename(&staged, path.join(RUNTIME_OWNER_MARKER)));
 
     let mut runtime_dirs = runtime_dir_registry_lock();
     runtime_dirs.insert(path.to_path_buf());
