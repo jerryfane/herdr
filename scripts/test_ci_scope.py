@@ -82,6 +82,18 @@ class ChangedPathsTests(unittest.TestCase):
         self.assertIsNone(self.in_repo(ZERO_SHA, head))
         self.assertIsNone(self.in_repo("f" * 40, head))
 
+    def test_moving_a_compiled_input_into_docs_needs_the_matrix(self) -> None:
+        # #367 review F1: rename detection reported only the docs destination, so moving the
+        # schema that src/cli/api.rs compiles in looked docs-only and skipped the build.
+        self.commit("docs/next/api/herdr-api.schema.json", "{}")
+        base = self.git("rev-parse", "HEAD")
+        self.git("mv", "docs/next/api/herdr-api.schema.json", "docs/next/herdr-api.schema.json")
+        self.git("commit", "-q", "-m", "move schema")
+        head = self.git("rev-parse", "HEAD")
+        paths = self.in_repo(base, head) or []
+        self.assertIn("docs/next/api/herdr-api.schema.json", paths)
+        self.assertTrue(needs_full_ci(paths))
+
 
 if __name__ == "__main__":
     unittest.main()

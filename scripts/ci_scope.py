@@ -41,11 +41,15 @@ def needs_full_ci(paths: list[str]) -> bool:
 
 
 def changed_paths(base: str, head: str) -> list[str] | None:
-    """Files changed from `base` to `head`, or None when the range cannot be resolved."""
+    """Files changed from `base` to `head`, or None when the range cannot be resolved.
+
+    `--no-renames`: a rename lists only its destination otherwise, so moving a compiled input
+    (the API schema) to a docs path would hide that the build lost it.
+    """
     if not base or not head or base == ZERO_SHA:
         return None
     result = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}...{head}"],
+        ["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"],
         capture_output=True,
         text=True,
     )
