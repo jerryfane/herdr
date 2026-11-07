@@ -1051,6 +1051,13 @@ fn serve_request(
                     return Some(guest_error(&id, "guest_revoked"));
                 }
                 if closed || !grant_state(guest, api_tx).is_live() {
+                    // A revoke reaches the store before the live flag (one
+                    // from another process never trips it). A renamed grant
+                    // is read from the store, which a revoked guest leaves:
+                    // report the revoke, not a pause.
+                    if is_revoked(guest, live) {
+                        return Some(guest_error(&id, "guest_revoked"));
+                    }
                     guest.audit(GuestAuditEvent::Paused, Some(method), None, None);
                     return Some(guest_error(&id, "guest_paused"));
                 }
@@ -4763,19 +4770,56 @@ mod tests {
         assert_eq!(agent["name"], "llm-renamed", "{list:?}");
     }
 
+    /// The next stream line that is not a heartbeat.
+    fn next_past_pings(reader: &mut BufReader<UnixStream>) -> Value {
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0, "the stream ended");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value["frame"] != "ping" {
+                return value;
+            }
+        }
+    }
+
     #[test]
     fn a_guests_live_stream_runs_on_across_a_rename() {
         let _config = ConfigHome::new("rename-stream");
         let harness = start_renaming("rename-stream");
         let guest = harness.admit();
-        let (mut reader, handle) = open_stream(&harness, &guest);
+        let (mut reader, handle) = open_stream_past_seed(&harness, &guest);
         rename(&harness, 0, "llm-renamed");
-        // A stream that lost the grant pauses within a second.
-        std::thread::sleep(Duration::from_millis(1500));
+        // Every frame asks the watch first: output written after the rename
+        // reaches the guest only while the stream still holds the grant.
+        write_output(&harness);
+        let frame = next_past_pings(&mut reader);
+        assert_eq!(frame["frame"], "data", "{frame}");
         crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
             .unwrap();
         let end = stream_end(&mut reader);
         assert_eq!(end["error"]["code"], "guest_revoked", "{end}");
+        handle.join().unwrap();
+    }
+
+    /// #359: a revoke reaches the store before it trips the live flag. In
+    /// between, a renamed grant's stream finds no stored grant: it must close
+    /// as revoked, not paused.
+    #[test]
+    fn a_renamed_grants_stream_closes_as_revoked_once_the_store_says_so() {
+        let _config = ConfigHome::new("rename-revoke");
+        let harness = start_renaming("rename-revoke");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_stream_past_seed(&harness, &guest);
+        rename(&harness, 0, "llm-renamed");
+        crate::guest::store::revoke_in(
+            &harness.dir.0,
+            RevokeTarget::Guest(&guest.guest_id),
+            now_ms(),
+        )
+        .unwrap()
+        .expect("an active guest");
+        write_output(&harness);
+        assert_eq!(next_is_close(&mut reader)["error"]["code"], "guest_revoked");
         handle.join().unwrap();
     }
 
