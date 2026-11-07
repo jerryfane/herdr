@@ -416,10 +416,10 @@ impl App {
             let result = completion.recv();
             // The completion is the submission's own report: Ok once Enter was
             // written. Anything else drops the handle, which reports failure.
-            if matches!(result, Ok(Ok(()))) {
-                if let Some(outcome) = outcome {
-                    outcome.delivered();
-                }
+            // Either way the record is resolved before the caller hears back.
+            match (outcome, &result) {
+                (Some(outcome), Ok(Ok(()))) => outcome.delivered(),
+                (outcome, _) => drop(outcome),
             }
             let response = match result {
                 Ok(Ok(())) => encode_success(

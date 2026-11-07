@@ -358,6 +358,11 @@ impl FederationStore {
         let Some(entry) = self.peers.get_mut(alias) else {
             return false;
         };
+        // A status from an older incarnation is dropped whole, before the
+        // clamp could dress it up as the current one.
+        if entry.is_stale_epoch(&event.pane_id, event.turn_epoch) {
+            return false;
+        }
         entry.clamp_turn(event);
         if entry
             .relayed
@@ -366,7 +371,7 @@ impl FederationStore {
         {
             return false;
         }
-        entry.record_relayed(event.clone(), now);
+        entry.record_relayed(event.clone(), now, EpochRule::Forward);
         self.touch();
         true
     }
@@ -374,9 +379,9 @@ impl FederationStore {
     /// Record a relayed `pane.turn_completed`: the pane's turn and epoch move
     /// forward (never back) in the cache and in the relay baseline, so an older
     /// poll cannot rewind them, and the cached agent's `last_completed_turn`
-    /// (with who started the turn) becomes this one. Stream lines arrive in
-    /// order, so only a repeat or an older turn of the same boot is ignored; a
-    /// different epoch is a restarted peer, whose epoch may be lower.
+    /// (with who started the turn) becomes this one ([`accepts_completion`]).
+    /// A line from an incarnation older than the pane's newest is dropped
+    /// whole ([`PeerCacheEntry::is_stale_epoch`]).
     pub fn relay_turn(&mut self, alias: &str, completed: RelayedTurn, now: Instant) {
         let RelayedTurn {
             pane_id,
@@ -389,6 +394,9 @@ impl FederationStore {
         let Some(entry) = self.peers.get_mut(alias) else {
             return;
         };
+        if entry.is_stale_epoch(pane_id, Some(turn_epoch)) {
+            return;
+        }
         // The push tracker reads who started the finished turn from here.
         let completed = crate::api::schema::LastCompletedTurn {
             turn,
@@ -402,17 +410,27 @@ impl FederationStore {
         let Some(entry) = self.peers.get_mut(alias) else {
             return;
         };
-        let current = entry
+        // Advance the newest of the baseline and the cached agent, so a
+        // baseline a later poll overtook is never the one carried forward.
+        let baseline = entry
             .relayed
             .get(pane_id)
-            .map(|relayed| relayed.event.clone())
-            .or_else(|| {
-                entry
-                    .agents
-                    .iter()
-                    .find(|agent| agent.pane_id == pane_id)
-                    .map(agent_status_event)
-            });
+            .map(|relayed| relayed.event.clone());
+        let cached = entry
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)
+            .map(agent_status_event);
+        let current = match (baseline, cached) {
+            (Some(baseline), Some(cached)) => Some(
+                if (cached.turn_epoch, cached.turn) > (baseline.turn_epoch, baseline.turn) {
+                    cached
+                } else {
+                    baseline
+                },
+            ),
+            (baseline, cached) => baseline.or(cached),
+        };
         let Some(mut event) = current else {
             return;
         };
@@ -421,7 +439,7 @@ impl FederationStore {
         }
         event.turn = Some(turn);
         event.turn_epoch = Some(turn_epoch);
-        entry.record_relayed(event, now);
+        entry.record_relayed(event, now, EpochRule::Forward);
     }
 
     /// Forget a closed remote pane: its relay baseline and cached agent go at
@@ -508,9 +526,19 @@ impl FederationStore {
         }
         let mut missed = Vec::new();
         let mut present = HashSet::with_capacity(current.len());
+        // Only a restart resync describes a new boot, whose epochs may be lower.
+        let rule = if mode == RelayResync::Reset {
+            EpochRule::NewBoot
+        } else {
+            EpochRule::Forward
+        };
         for event in current {
             present.insert(event.pane_id.clone());
             entry.vanished.remove(&event.pane_id);
+            if rule == EpochRule::Forward && entry.is_stale_epoch(&event.pane_id, event.turn_epoch)
+            {
+                continue;
+            }
             let changed = entry
                 .relayed
                 .get(&event.pane_id)
@@ -518,7 +546,7 @@ impl FederationStore {
             if mode != RelayResync::Seed && changed {
                 missed.push(event.clone());
             }
-            entry.record_relayed(event, now);
+            entry.record_relayed(event, now, rule);
         }
         entry.relayed.retain(|pane_id, _| present.contains(pane_id));
         entry
@@ -737,19 +765,32 @@ impl PeerCacheEntry {
         }
     }
 
-    /// The pane's current turn epoch: the cached agent's, which already holds
-    /// the newest of every source (a poll keeps only relayed statuses newer
-    /// than its request, and relayed statuses and resyncs patch the agent).
-    /// The relay baseline alone may predate a later poll, so it is used only
-    /// for a pane not cached yet.
-    fn current_epoch(&self, pane_id: &str) -> Option<u64> {
-        match self.agents.iter().find(|agent| agent.pane_id == pane_id) {
-            Some(agent) => agent.turn_epoch,
-            None => self
-                .relayed
-                .get(pane_id)
-                .and_then(|relayed| relayed.event.turn_epoch),
-        }
+    /// The newest turn epoch known for the pane in this boot, from its relay
+    /// baseline or its cached agent (a poll, a resync or a relayed status).
+    /// Within one boot a pane's epoch only moves forward (a respawn takes a
+    /// fresh, later one), so nothing relayed may lower it; only a restart
+    /// resync ([`EpochRule::NewBoot`]) may.
+    fn newest_epoch(&self, pane_id: &str) -> Option<u64> {
+        let baseline = self
+            .relayed
+            .get(pane_id)
+            .and_then(|relayed| relayed.event.turn_epoch);
+        let cached = self
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)
+            .and_then(|agent| agent.turn_epoch);
+        baseline.max(cached)
+    }
+
+    /// Whether an item for `pane_id` at `epoch` comes from an incarnation
+    /// older than the newest known: stale, to be dropped whole. An item
+    /// without an epoch is never stale.
+    fn is_stale_epoch(&self, pane_id: &str, epoch: Option<u64>) -> bool {
+        matches!(
+            (epoch, self.newest_epoch(pane_id)),
+            (Some(epoch), Some(newest)) if epoch < newest
+        )
     }
 
     /// Offer `candidate` as the pane's last completion ([`accepts_completion`])
@@ -766,7 +807,7 @@ impl PeerCacheEntry {
             self.completions.get(pane_id),
             candidate.as_ref(),
             source,
-            self.current_epoch(pane_id),
+            self.newest_epoch(pane_id),
         );
         if taken {
             self.completions.insert(
@@ -790,7 +831,19 @@ impl PeerCacheEntry {
     }
 
     /// Make `event` the pane's relay baseline and patch its cached agent.
-    fn record_relayed(&mut self, event: PaneAgentStatusChangedEvent, now: Instant) {
+    ///
+    /// Every relayed status goes through here; under [`EpochRule::Forward`] a
+    /// stale one is dropped, so the baseline and the cached agent never move
+    /// to an older incarnation.
+    fn record_relayed(
+        &mut self,
+        event: PaneAgentStatusChangedEvent,
+        now: Instant,
+        rule: EpochRule,
+    ) {
+        if rule == EpochRule::Forward && self.is_stale_epoch(&event.pane_id, event.turn_epoch) {
+            return;
+        }
         if let Some(agent) = self
             .agents
             .iter_mut()
@@ -801,6 +854,15 @@ impl PeerCacheEntry {
         self.relayed
             .insert(event.pane_id.clone(), RelayedStatus { event, at: now });
     }
+}
+
+/// Whether a relayed status may lower a pane's turn epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochRule {
+    /// The same boot: an item from an older incarnation is stale.
+    Forward,
+    /// A restart resync: the new boot's epochs replace the old ones.
+    NewBoot,
 }
 
 /// A relayed `pane.turn_completed` for [`FederationStore::relay_turn`].
@@ -1475,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn a_buffered_line_from_before_a_newer_polled_incarnation_is_ignored() {
+    fn buffered_items_from_before_a_newer_polled_incarnation_are_dropped_whole() {
         use crate::terminal::TurnOrigin;
         let mut store = FederationStore::default();
         let t0 = Instant::now();
@@ -1499,7 +1561,8 @@ mod tests {
             ),
             poll_started,
         );
-        // A buffered line from the previous incarnation drains afterwards.
+        // Buffered lines from the previous incarnation drain afterwards: a
+        // completion, then a status and another completion. All are stale.
         store.relay_turn(
             "home",
             RelayedTurn {
@@ -1508,9 +1571,40 @@ mod tests {
             },
             Instant::now(),
         );
+        let mut working = status_at("home/p1", AgentStatus::Working, 4, 3);
+        assert!(
+            !store.relay_status("home", &mut working, Instant::now()),
+            "a stale status is not published"
+        );
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Other),
+                ..relayed_turn("home/p1", 4, 4)
+            },
+            Instant::now(),
+        );
         assert_eq!(
             completed_origin(&store, "home/p1"),
             Some((8, 1, Some(TurnOrigin::Mine)))
+        );
+        let agent = &store.peer("home").unwrap().agents[0];
+        assert_eq!((agent.turn_epoch, agent.turn), (Some(8), Some(1)));
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Done);
+        // The current incarnation's next turn still goes through.
+        let mut next = status_at("home/p1", AgentStatus::Working, 8, 1);
+        assert!(store.relay_status("home", &mut next, Instant::now()));
+        store.relay_turn(
+            "home",
+            RelayedTurn {
+                turn_origin: Some(TurnOrigin::Other),
+                ..relayed_turn("home/p1", 2, 8)
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            completed_origin(&store, "home/p1"),
+            Some((8, 2, Some(TurnOrigin::Other)))
         );
     }
 
