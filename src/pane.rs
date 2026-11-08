@@ -2883,6 +2883,12 @@ impl PaneRuntime {
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
+        // A pane can be laid out with a zero-height or zero-width interior (a deep split
+        // chain, borders and gaps eating the last cells). libghostty-vt refuses a 0-row or
+        // 0-col grid with GHOSTTY_INVALID_VALUE (-2), so the pane would never get a runtime.
+        // Spawn at the same floor `resize` applies; the next layout pass resizes it anyway.
+        let rows = rows.max(MIN_PANE_ROWS);
+        let cols = cols.max(MIN_PANE_COLS);
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);

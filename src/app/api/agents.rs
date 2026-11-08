@@ -683,6 +683,20 @@ impl App {
             ));
         }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            if self.terminal_restore_failed(terminal) {
+                // Listed by `agent.list`, so "not found" alone reads as a transient miss.
+                // Say why nothing can take the prompt; the code stays `agent_not_found`,
+                // which callers already treat as "nothing was sent".
+                return Err(encode_error(
+                    id,
+                    "agent_not_found",
+                    format!(
+                        "agent target {} has no running process: {}",
+                        params.target,
+                        terminal.restore_error.as_deref().unwrap_or_default()
+                    ),
+                ));
+            }
             return Err(agent_not_found(id, &params.target));
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {

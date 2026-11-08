@@ -150,6 +150,7 @@ fn harness(questions: Value) -> Harness {
         account: None,
         account_config_dir: None,
         account_unresolved: false,
+        restore_error: None,
         terminal_id: "term_1".into(),
         name: None,
         agent: Some("omp".into()),

@@ -596,7 +596,10 @@ impl App {
             return encode_error(id, "pane_not_found", "pane not found");
         };
         let Some((runtime, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            // The pane exists — `pane.get`, `pane.list` and `agent.list` all report it — but
+            // no process runs in it, e.g. its restore failed. `pane_not_found` would
+            // contradict those APIs and read as "retry later" to callers.
+            return self.pane_unavailable_error(id, ws_idx, pane_id);
         };
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return encode_error(id, "pane_not_found", "pane not found");
@@ -633,6 +636,34 @@ impl App {
                 },
             },
         )
+    }
+
+    /// `pane_unavailable`: the pane exists but nothing runs in it. The message carries
+    /// the restore failure when there is one, so a caller can tell a pane that will never
+    /// answer from one whose agent is still waiting to resume.
+    fn pane_unavailable_error(
+        &self,
+        id: String,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> String {
+        let public_pane_id = self
+            .public_pane_id(ws_idx, pane_id)
+            .unwrap_or_else(|| pane_id.raw().to_string());
+        let terminal = self.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id));
+        let message = match terminal {
+            Some(terminal) if self.terminal_restore_failed(terminal) => format!(
+                "pane {public_pane_id} has no running process: {}",
+                terminal.restore_error.as_deref().unwrap_or_default()
+            ),
+            Some(terminal) if terminal.pending_agent_resume_plan.is_some() => format!(
+                "pane {public_pane_id} has no running process yet: its agent is waiting to resume"
+            ),
+            _ => format!("pane {public_pane_id} has no running process"),
+        };
+        encode_error(id, "pane_unavailable", message)
     }
 
     pub(super) fn handle_pane_neighbor(

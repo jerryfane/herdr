@@ -1121,6 +1121,7 @@
               "type": "string"
             },
             "restore_error": {
+              "description": "Why this pane could not be brought back after a restore. While it is set and\nnothing runs in the pane, `agent_status` is `unknown` and `pane.process_info`\nfails with `pane_unavailable`.",
               "type": [
                 "string",
                 "null"
@@ -9295,6 +9296,7 @@
               "type": "string"
             },
             "restore_error": {
+              "description": "Why this pane could not be brought back after a restore. While it is set and\nnothing runs in the pane, `agent_status` is `unknown` and `pane.process_info`\nfails with `pane_unavailable`.",
               "type": [
                 "string",
                 "null"
@@ -10806,6 +10808,7 @@
               "type": "string"
             },
             "restore_error": {
+              "description": "Why this pane could not be brought back after a restore. While it is set and\nnothing runs in the pane, `agent_status` is `unknown` and `pane.process_info`\nfails with `pane_unavailable`.",
               "type": [
                 "string",
                 "null"
@@ -12011,6 +12014,13 @@
                 }
               ],
               "description": "Federation: reachability of the remote peer as of the last poll. `None`\nfor a local agent."
+            },
+            "restore_error": {
+              "description": "Why this agent's pane could not be brought back after a restore, such as a saved\ndirectory that no longer exists or a shell that failed to start. The same value as\n`restore_error` on the pane's `PaneInfo`. While it is set and nothing runs in the\npane, `agent_status` is `unknown`, and prompts and process queries fail.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -14698,6 +14708,7 @@
               "type": "string"
             },
             "restore_error": {
+              "description": "Why this pane could not be brought back after a restore. While it is set and\nnothing runs in the pane, `agent_status` is `unknown` and `pane.process_info`\nfails with `pane_unavailable`.",
               "type": [
                 "string",
                 "null"
@@ -15059,6 +15070,7 @@
           "type": "object"
         },
         "PaneProcessInfo": {
+          "description": "`pane.process_info` result. A pane that exists but has no running process (a failed\nrestore, or an agent still waiting to resume) fails with error code\n`pane_unavailable` instead; `pane_not_found` means the pane does not exist.",
           "properties": {
             "foreground_process_group_id": {
               "format": "uint32",

@@ -1306,6 +1306,9 @@ impl App {
             account,
             account_config_dir,
             account_unresolved,
+            restore_error: pane
+                .restore_error
+                .filter(|_| self.terminal_restore_failed(terminal)),
             session_transfer: terminal
                 .session_transfer
                 .as_ref()
@@ -1599,6 +1602,7 @@ fn archived_agent_info(
         account: None,
         account_config_dir: None,
         account_unresolved: false,
+        restore_error: None,
         session_transfer: None,
         avatar: avatars.get(&record.terminal_id).cloned(),
     }

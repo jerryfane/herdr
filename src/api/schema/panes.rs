@@ -647,6 +647,9 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    /// Why this pane could not be brought back after a restore. While it is set and
+    /// nothing runs in the pane, `agent_status` is `unknown` and `pane.process_info`
+    /// fails with `pane_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -853,6 +856,9 @@ pub struct PaneScrollInfo {
     pub viewport_rows: u64,
 }
 
+/// `pane.process_info` result. A pane that exists but has no running process (a failed
+/// restore, or an agent still waiting to resume) fails with error code
+/// `pane_unavailable` instead; `pane_not_found` means the pane does not exist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneProcessInfo {
     pub pane_id: String,
