@@ -3265,6 +3265,8 @@ mod tests {
                 crate::api::schema::AgentRenameParams {
                     target: pane_id,
                     name: Some("replacement".into()),
+                    expected_name: None,
+                    expect_inactive: None,
                 },
             ),
         });

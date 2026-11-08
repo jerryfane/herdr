@@ -5343,6 +5343,8 @@ mod federation_tests {
             Method::AgentRename(AgentRenameParams {
                 target: "a".into(),
                 name: Some("n".into()),
+                expected_name: None,
+                expect_inactive: None,
             }),
         );
         assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
@@ -5401,6 +5403,8 @@ mod federation_tests {
             Method::AgentRename(AgentRenameParams {
                 target: "a".into(),
                 name: Some("n".into()),
+                expected_name: None,
+                expect_inactive: None,
             }),
         );
         let message = recv_dispatched(&mut fed.api_rx);
@@ -5429,6 +5433,8 @@ mod federation_tests {
             Method::AgentRename(AgentRenameParams {
                 target: "a".into(),
                 name: Some("n".into()),
+                expected_name: None,
+                expect_inactive: None,
             }),
         );
         assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
@@ -5441,6 +5447,8 @@ mod federation_tests {
             Method::AgentRename(AgentRenameParams {
                 target: "a".into(),
                 name: Some("n".into()),
+                expected_name: None,
+                expect_inactive: None,
             }),
         );
         let message = recv_dispatched(&mut fed.api_rx);
@@ -7481,6 +7489,50 @@ mod federation_tests {
             "a proxied prompt reached the local app dispatch path"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    /// #377: an `agent.rename` for a peer's agent carries its preconditions to
+    /// the peer, which checks them against its own state, and the peer's
+    /// refusal comes back unchanged.
+    #[test]
+    fn proxy_forwards_rename_preconditions_to_the_peer() {
+        let refusal = serde_json::json!({
+            "id": "r1",
+            "error": {"code": "agent_name_changed", "message": "agent name changed: expected \"deimos\", the current name is \"customer\""},
+        })
+        .to_string();
+        let peer_line = refusal.clone();
+        let peer = start_proxy_peer(move |_, mut sock| {
+            writeln!(sock, "{peer_line}").expect("peer writes response");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "r1",
+                "method": "agent.rename",
+                "params": {"target": "remote/deimos", "expected_name": "deimos", "expect_inactive": true},
+            }),
+        );
+
+        assert_eq!(response, refusal);
+        let seen = peer.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1);
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "deimos", "expected_name": "deimos", "expect_inactive": true})
+        );
+        assert!(home.api_rx.try_recv().is_err());
     }
 
     #[test]

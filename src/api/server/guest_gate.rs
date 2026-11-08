@@ -2447,6 +2447,40 @@ mod tests {
         assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
     }
 
+    /// #377: `agent.rename` stays owner-only. Its preconditions cannot probe an
+    /// agent's name: a right guess, a wrong one and `expect_inactive` all
+    /// answer the same `guest_forbidden`, and the name stays.
+    #[test]
+    fn guests_cannot_rename_or_probe_names_with_rename_preconditions() {
+        let harness = start("denied");
+        let guest = harness.admit();
+        let mut replies = Vec::new();
+        for target in [harness.pane_ids[0].as_str(), harness.pane_ids[1].as_str()] {
+            for params in [
+                json!({"target": target, "name": "mine", "expected_name": "llm-opt"}),
+                json!({"target": target, "name": "mine", "expected_name": "other-agent"}),
+                json!({"target": target, "expected_name": "wrong-guess"}),
+                json!({"target": target, "expected_name": "", "expect_inactive": true}),
+            ] {
+                let request = json!({"id": "x", "method": "agent.rename", "params": params});
+                let lines = harness.call(&guest, request.clone());
+                assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+                replies.push(lines);
+            }
+        }
+        assert!(
+            replies.windows(2).all(|pair| pair[0] == pair[1]),
+            "{replies:?}"
+        );
+        for (index, name) in ["llm-opt", "other-agent"].into_iter().enumerate() {
+            let agent = owner(
+                &harness,
+                json!({"id": "g", "method": "agent.get", "params": {"target": harness.pane_ids[index]}}),
+            );
+            assert_eq!(agent["result"]["agent"]["name"], name, "{agent}");
+        }
+    }
+
     #[test]
     fn guests_cannot_type_resize_or_reach_gram_listing_files_or_guest_rpcs() {
         let harness = start("denied");

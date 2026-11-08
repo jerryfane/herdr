@@ -76,6 +76,14 @@ cli_params! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String> => Field::new(None)
             .input(bindings::rename_name()).input(bindings::clear_name()),
+        /// Apply only while the agent's current name is this one; `""` expects
+        /// no name. Otherwise answers `agent_name_changed` and changes nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expected_name: Option<String> => Field::new(None).input(bindings::expect_name()),
+        /// Apply only while no live agent runs in the pane, such as one restored
+        /// without resuming its agent. Otherwise answers `agent_active`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_inactive: Option<bool> => Field::new(None).input(bindings::expect_inactive()),
     }
 }
 

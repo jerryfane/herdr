@@ -99,12 +99,44 @@ impl App {
 
     pub(super) fn rename_agent_target(
         &mut self,
-        target: &str,
-        name: Option<String>,
+        params: crate::api::schema::AgentRenameParams,
     ) -> Result<crate::api::schema::AgentInfo, AgentRenameError> {
+        let crate::api::schema::AgentRenameParams {
+            target,
+            name,
+            expected_name,
+            expect_inactive,
+        } = params;
+        let target = target.as_str();
         let resolved = self
             .resolve_agent_rename_target(target)
             .map_err(AgentRenameError::Target)?;
+        // The caller's preconditions (#377), read in the same `&mut self` call
+        // that applies the change, so a rename landing between the caller's
+        // `agent.list` and this request is refused rather than overwritten.
+        if expected_name.is_some() || expect_inactive == Some(true) {
+            let terminal = self
+                .state
+                .terminals
+                .get(resolved.terminal_id.as_str())
+                .ok_or_else(|| {
+                    AgentRenameError::Target(TerminalTargetError::NotFound {
+                        target: target.to_string(),
+                    })
+                })?;
+            if let Some(expected) = expected_name {
+                if terminal.agent_name.as_deref().unwrap_or_default() != expected {
+                    return Err(AgentRenameError::NameChanged {
+                        expected,
+                        current: terminal.agent_name.clone(),
+                    });
+                }
+            }
+            // Live is what #364 does not take for an inactive claim.
+            if expect_inactive == Some(true) && !terminal.holds_inactive_agent_claim() {
+                return Err(AgentRenameError::Active);
+            }
+        }
         let normalized_name = match name {
             Some(name) if valid_agent_name(&name) => Some(name),
             Some(_) => return Err(AgentRenameError::InvalidName),
@@ -1169,6 +1201,25 @@ impl App {
                         .join("; ")
                 ),
             },
+            AgentRenameError::NameChanged { expected, current } => {
+                let expected = if expected.is_empty() {
+                    "no name".to_string()
+                } else {
+                    format!("{expected:?}")
+                };
+                let current = match current {
+                    Some(current) => format!("the current name is {current:?}"),
+                    None => "the name is unset".to_string(),
+                };
+                crate::api::schema::ErrorBody {
+                    code: "agent_name_changed".into(),
+                    message: format!("agent name changed: expected {expected}, {current}"),
+                }
+            }
+            AgentRenameError::Active => crate::api::schema::ErrorBody {
+                code: "agent_active".into(),
+                message: "a live agent runs in the target pane".into(),
+            },
         }
     }
 
@@ -1447,6 +1498,13 @@ pub(super) enum AgentRenameError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+    /// `expected_name` did not match; `current` is the name the pane has.
+    NameChanged {
+        expected: String,
+        current: Option<String>,
+    },
+    /// `expect_inactive` found a live agent in the pane.
+    Active,
 }
 
 pub(super) enum AgentArchiveError {

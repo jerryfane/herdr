@@ -1064,6 +1064,155 @@ fn agent_commands_work() {
     cleanup_spawned_herdr(herdr, base);
 }
 
+/// A live pi agent named `customer`; returns the server, its test dir, its
+/// socket and the agent's pane id.
+fn spawn_named_live_agent() -> (SpawnedHerdr, PathBuf, PathBuf, String) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            "custom:test",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+    let named = run_cli_json(&socket_path, &["agent", "rename", &pane_id, "customer"]);
+    assert_eq!(named["result"]["agent"]["name"], "customer", "{named}");
+    (herdr, base, socket_path, pane_id)
+}
+
+fn agent_name(socket_path: &Path, pane_id: &str) -> serde_json::Value {
+    run_cli_json(socket_path, &["agent", "get", pane_id])["result"]["agent"]["name"].clone()
+}
+
+/// #377: Forge reads `agent.list`, then clears or replaces an old name. A
+/// customer rename that lands in between is not overwritten: the request
+/// carries the name it read and is refused with the name the agent has now.
+#[test]
+fn agent_rename_applies_only_while_the_expected_name_holds() {
+    let (herdr, base, socket_path, pane_id) = spawn_named_live_agent();
+
+    for params in [
+        serde_json::json!({"target": pane_id, "expected_name": "deimos"}),
+        serde_json::json!({"target": pane_id, "name": "forge", "expected_name": "deimos"}),
+        serde_json::json!({"target": pane_id, "name": "forge", "expected_name": ""}),
+    ] {
+        let request = serde_json::json!({"id": "r", "method": "agent.rename", "params": params});
+        let refused = send_request(&socket_path, &request.to_string());
+        assert_eq!(
+            refused["error"]["code"], "agent_name_changed",
+            "{params} -> {refused}"
+        );
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains("\"customer\""), "{message}");
+        assert_eq!(agent_name(&socket_path, &pane_id), "customer");
+    }
+    let refused = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "rename",
+            &pane_id,
+            "--clear",
+            "--expect-name",
+            "deimos",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refused["error"]["code"], "agent_name_changed", "{refused}");
+    assert_eq!(agent_name(&socket_path, &pane_id), "customer");
+
+    let renamed = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "rename",
+            &pane_id,
+            "forge",
+            "--expect-name",
+            "customer",
+        ],
+    );
+    assert_eq!(renamed["result"]["agent"]["name"], "forge", "{renamed}");
+    let cleared = send_request(
+        &socket_path,
+        &serde_json::json!({"id": "c", "method": "agent.rename", "params": {"target": pane_id, "expected_name": "forge"}})
+            .to_string(),
+    );
+    assert!(cleared["result"]["agent"]["name"].is_null(), "{cleared}");
+    let unset = send_request(
+        &socket_path,
+        &serde_json::json!({"id": "u", "method": "agent.rename", "params": {"target": pane_id, "name": "late", "expected_name": "forge"}})
+            .to_string(),
+    );
+    assert_eq!(unset["error"]["code"], "agent_name_changed", "{unset}");
+    assert!(
+        unset["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unset"),
+        "{unset}"
+    );
+    let named = run_cli_json(
+        &socket_path,
+        &["agent", "rename", &pane_id, "customer", "--expect-name", ""],
+    );
+    assert_eq!(named["result"]["agent"]["name"], "customer", "{named}");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+/// #377: `expect_inactive` only frees a name an agent left behind; a live
+/// agent's name is refused with `agent_active` and stays. Without it the
+/// live agent renames as before.
+#[test]
+fn agent_rename_expecting_inactive_refuses_a_live_agent() {
+    let (herdr, base, socket_path, pane_id) = spawn_named_live_agent();
+
+    let refused = send_request(
+        &socket_path,
+        &serde_json::json!({"id": "r", "method": "agent.rename", "params": {"target": pane_id, "expected_name": "customer", "expect_inactive": true}})
+            .to_string(),
+    );
+    assert_eq!(refused["error"]["code"], "agent_active", "{refused}");
+    assert_eq!(agent_name(&socket_path, &pane_id), "customer");
+    let refused = run_cli(
+        &socket_path,
+        &["agent", "rename", "customer", "forge", "--expect-inactive"],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refused["error"]["code"], "agent_active", "{refused}");
+    assert_eq!(agent_name(&socket_path, &pane_id), "customer");
+
+    let renamed = run_cli_json(&socket_path, &["agent", "rename", "customer", "forge"]);
+    assert_eq!(renamed["result"]["agent"]["name"], "forge", "{renamed}");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
 #[test]
 fn agent_wait_returns_immediately_for_unseen_done_agent() {
     let base = unique_test_dir();
