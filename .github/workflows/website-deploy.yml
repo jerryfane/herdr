@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   trigger:
+    # herdr.dev's deploy hook exists only upstream; forks have no website to rebuild.
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
