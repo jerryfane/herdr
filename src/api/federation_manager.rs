@@ -45,7 +45,9 @@ use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::federation_relay::{PeerRelay, RelayTiming};
 use crate::api::federation_store::FederationStore;
 use crate::api::peer_channel::PeerChannel;
-use crate::api::schema::{CoordinatorMachineStatus, MachineEndpointStatus, SavedMachineState};
+use crate::api::schema::{
+    CoordinatorMachineStatus, MachineEndpointStatus, SavedMachineState, ServerCapabilities,
+};
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
 use crate::api::EventHub;
 use crate::config::{FederationConfig, FederationPeer, FederationSavedMachinePolicy};
@@ -120,6 +122,8 @@ struct PeerRouteState {
     generation_clock: Arc<AtomicU64>,
     identity_validated: AtomicBool,
     identity_validation_required: bool,
+    /// The peer's latest poll advertised `rename_preconditions`.
+    rename_preconditions: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -138,6 +142,7 @@ impl PeerRoute {
                 generation_clock,
                 identity_validated: AtomicBool::new(!requires_identity_validation),
                 identity_validation_required: requires_identity_validation,
+                rename_preconditions: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -168,11 +173,28 @@ impl PeerRoute {
         ApiClient::for_target(self.target.clone()).with_peer_channel(self.peer_channel.clone())
     }
 
+    /// Record the capabilities the peer's latest poll advertised.
+    pub(crate) fn observe_capabilities(&self, capabilities: Option<&ServerCapabilities>) {
+        self.observe_api_bridge_multi(
+            capabilities.is_some_and(|capabilities| capabilities.api_bridge_multi),
+        );
+        self.state.rename_preconditions.store(
+            capabilities.is_some_and(|capabilities| capabilities.rename_preconditions),
+            Ordering::Release,
+        );
+    }
+
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
     pub(crate) fn observe_api_bridge_multi(&self, advertised: bool) {
         if let Some(channel) = &self.peer_channel {
             channel.set_advertised(advertised);
         }
+    }
+
+    /// Whether the peer is known to enforce `agent.rename` preconditions. An
+    /// unpolled peer, or one whose boot changed since its last poll, is not.
+    pub(crate) fn rename_preconditions(&self) -> bool {
+        self.state.rename_preconditions.load(Ordering::Acquire)
     }
 
     /// The peer's current presentation, or the bare alias as its label when the
@@ -270,6 +292,10 @@ impl PeerRoute {
         if current.is_some() {
             let generation = self.state.generation_clock.fetch_add(1, Ordering::AcqRel) + 1;
             self.state.generation.store(generation, Ordering::Release);
+            // A restarted peer may run another version; wait for its next poll.
+            self.state
+                .rename_preconditions
+                .store(false, Ordering::Release);
         }
         *current = Some(remote_boot_id.to_owned());
     }

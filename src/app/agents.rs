@@ -101,6 +101,7 @@ impl App {
         &mut self,
         params: crate::api::schema::AgentRenameParams,
     ) -> Result<crate::api::schema::AgentInfo, AgentRenameError> {
+        let guarded = params.has_preconditions();
         let crate::api::schema::AgentRenameParams {
             target,
             name,
@@ -114,7 +115,7 @@ impl App {
         // The caller's preconditions (#377), read in the same `&mut self` call
         // that applies the change, so a rename landing between the caller's
         // `agent.list` and this request is refused rather than overwritten.
-        if expected_name.is_some() || expect_inactive == Some(true) {
+        if guarded {
             let terminal = self
                 .state
                 .terminals

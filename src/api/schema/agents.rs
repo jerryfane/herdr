@@ -78,12 +78,24 @@ cli_params! {
             .input(bindings::rename_name()).input(bindings::clear_name()),
         /// Apply only while the agent's current name is this one; `""` expects
         /// no name. Otherwise answers `agent_name_changed` and changes nothing.
+        /// Enforced only by servers whose `ping` advertises
+        /// `capabilities.rename_preconditions`; older ones ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expected_name: Option<String> => Field::new(None).input(bindings::expect_name()),
         /// Apply only while no live agent runs in the pane, such as one restored
         /// without resuming its agent. Otherwise answers `agent_active`.
+        /// Enforced only by servers whose `ping` advertises
+        /// `capabilities.rename_preconditions`; older ones ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expect_inactive: Option<bool> => Field::new(None).input(bindings::expect_inactive()),
+    }
+}
+
+impl AgentRenameParams {
+    /// Whether the rename carries a precondition, which only a server
+    /// advertising `rename_preconditions` enforces.
+    pub fn has_preconditions(&self) -> bool {
+        self.expected_name.is_some() || self.expect_inactive == Some(true)
     }
 }
 

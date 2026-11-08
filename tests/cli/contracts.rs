@@ -771,3 +771,57 @@ fn text_operands_keep_flag_shaped_words_like_the_legacy_cli() {
         assert_eq!(captured.requests.get(1), Some(&expected), "{args:?}");
     }
 }
+
+/// #379-f1: the fake server's ping, like a server older than #377, does not
+/// advertise `rename_preconditions`. It would ignore the preconditions and
+/// rename anyway, so the CLI refuses before sending and exits non-zero. An
+/// unconditional rename still goes through to it.
+#[test]
+fn agent_rename_refuses_preconditions_the_server_does_not_advertise() {
+    for args in [
+        vec![
+            "agent",
+            "rename",
+            "w1:p1",
+            "--clear",
+            "--expect-name",
+            "deimos",
+            "--expect-inactive",
+        ],
+        vec!["agent", "rename", "w1:p1", "forge", "--expect-name", ""],
+        vec!["agent", "rename", "w1:p1", "forge", "--expect-inactive"],
+    ] {
+        let captured = capture(
+            &args,
+            json!({"id": "cli:agent:rename", "result": {"type": "ok"}}),
+        );
+        assert_eq!(
+            captured.output.status.code(),
+            Some(1),
+            "{args:?}: {:?}",
+            captured.output
+        );
+        let methods: Vec<&Value> = captured
+            .requests
+            .iter()
+            .map(|request| &request["method"])
+            .collect();
+        assert_eq!(methods, [&json!("ping")], "{args:?}");
+        assert!(captured.output.stdout.is_empty(), "{args:?}");
+        let refused: Value = serde_json::from_slice(&captured.output.stderr).unwrap();
+        assert_eq!(
+            refused["error"]["code"], "precondition_unsupported",
+            "{refused}"
+        );
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("--expect-name/--expect-inactive"),
+            "{message}"
+        );
+    }
+
+    assert_request(
+        &["agent", "rename", "w1:p1", "forge"],
+        json!({"id":"cli:agent:rename","method":"agent.rename","params":{"target":"w1:p1","name":"forge"}}),
+    );
+}

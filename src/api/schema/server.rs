@@ -111,4 +111,9 @@ pub struct ServerCapabilities {
     /// device registration and `origin` on transcript user entries.
     #[serde(default)]
     pub turn_origin: bool,
+    /// `agent.rename` enforces `expected_name` and `expect_inactive`. Older
+    /// servers ignore both fields and rename unconditionally, so a caller must
+    /// see this before relying on them.
+    #[serde(default)]
+    pub rename_preconditions: bool,
 }

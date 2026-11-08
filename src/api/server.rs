@@ -217,6 +217,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_transcript: true,
         server_update: true,
         turn_origin: true,
+        rename_preconditions: true,
     })
 }
 
@@ -820,13 +821,7 @@ fn poll_once_into_cache(
         Ok(snapshot) => {
             if let Some(route) = route {
                 route.observe_remote_boot(snapshot.remote_boot_id.as_deref());
-                route.observe_api_bridge_multi(
-                    snapshot
-                        .observation
-                        .remote_capabilities
-                        .as_ref()
-                        .is_some_and(|capabilities| capabilities.api_bridge_multi),
-                );
+                route.observe_capabilities(snapshot.observation.remote_capabilities.as_ref());
             }
             let mut rejected = 0usize;
             let presentation = presentation
@@ -1294,6 +1289,18 @@ fn federation_identity_unverified_error(id: String, alias: &str) -> ErrorRespons
         error: ErrorBody {
             code: "federation_identity_unverified".into(),
             message: format!("federation peer {alias:?} has not validated its machine identity"),
+        },
+    }
+}
+
+fn federation_rename_preconditions_unsupported_error(id: String, alias: &str) -> ErrorResponse {
+    ErrorResponse {
+        id,
+        error: ErrorBody {
+            code: "precondition_unsupported".into(),
+            message: format!(
+                "machine {alias} has not advertised rename_preconditions, so it would ignore expected_name and expect_inactive; update Herdr there"
+            ),
         },
     }
 }
@@ -2054,6 +2061,25 @@ fn maybe_route_to_peer(
     let peer_target = peer_route;
     // Federated: strip the `<alias>/` prefix so the peer sees its own local id.
     *target = rest;
+    // A peer that does not advertise `rename_preconditions` ignores them and
+    // renames unconditionally, so a guarded rename never reaches it.
+    if matches!(&request.method, Method::AgentRename(params) if params.has_preconditions())
+        && !peer_target.rename_preconditions()
+    {
+        let response =
+            federation_rename_preconditions_unsupported_error(request_id.to_owned(), &alias);
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "precondition_unsupported",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
 
     let stamp = peer_target.stamp();
     let response = proxy_federated_response(&peer_target, &stamp, request, running);
@@ -3650,6 +3676,7 @@ mod tests {
                 agent_transcript: false,
                 server_update: false,
                 turn_origin: false,
+                rename_preconditions: false,
             }),
             None,
             None,
@@ -4462,6 +4489,29 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["capabilities"]["api_bridge_multi"], true);
+    }
+
+    /// Callers check this before sending `agent.rename` preconditions, which
+    /// older servers ignore.
+    #[test]
+    fn ping_advertises_rename_preconditions() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["capabilities"]["rename_preconditions"],
+            true
+        );
     }
 
     #[test]
@@ -7491,9 +7541,60 @@ mod federation_tests {
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
 
+    /// A route to a peer whose `agent.list` poll reported `capabilities`, and
+    /// the requests the peer saw. The peer answers every other request with
+    /// `reply`.
+    fn polled_rename_peer(
+        capabilities: ServerCapabilities,
+        reply: String,
+    ) -> (ProxyPeer, PeerRoute) {
+        let peer = start_proxy_peer(move |request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            let line = if parsed["method"] == "agent.list" {
+                serde_json::to_string(&SuccessResponse {
+                    id: parsed["id"].as_str().unwrap_or_default().to_owned(),
+                    result: ResponseResult::AgentList {
+                        agents: Vec::new(),
+                        origin_machine_id: None,
+                        origin_boot_id: Some("boot-peer".into()),
+                        origin_version: Some("test".into()),
+                        origin_protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                        origin_capabilities: Some(capabilities.clone()),
+                    },
+                })
+                .expect("encode agent.list response")
+            } else {
+                reply.clone()
+            };
+            writeln!(sock, "{line}").expect("peer writes response");
+            let _ = sock.flush();
+        });
+        let target = ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some("tok".into()),
+        };
+        let route = PeerRoute::for_test(target.clone());
+        assert_eq!(
+            poll_once_into_cache(
+                &ApiClient::for_target(target),
+                "remote",
+                None,
+                Some(&route),
+                &shared_presentation("remote"),
+                &Mutex::new(FederationStore::default()),
+                &mut ReachabilityTracker::default(),
+                &Arc::new(AtomicBool::new(true)),
+                &Arc::new(AtomicBool::new(false)),
+            ),
+            Reachability::Reachable
+        );
+        (peer, route)
+    }
+
     /// #377: an `agent.rename` for a peer's agent carries its preconditions to
-    /// the peer, which checks them against its own state, and the peer's
-    /// refusal comes back unchanged.
+    /// a peer that advertises `rename_preconditions`, which checks them against
+    /// its own state, and the peer's refusal comes back unchanged.
     #[test]
     fn proxy_forwards_rename_preconditions_to_the_peer() {
         let refusal = serde_json::json!({
@@ -7501,19 +7602,11 @@ mod federation_tests {
             "error": {"code": "agent_name_changed", "message": "agent name changed: expected \"deimos\", the current name is \"customer\""},
         })
         .to_string();
-        let peer_line = refusal.clone();
-        let peer = start_proxy_peer(move |_, mut sock| {
-            writeln!(sock, "{peer_line}").expect("peer writes response");
-            let _ = sock.flush();
-        });
-        let registry = HashMap::from([(
-            "remote".to_string(),
-            ConnectionTarget::Tcp {
-                addr: peer.addr,
-                token: Some("tok".into()),
-            },
-        )]);
-        let mut home = drive_home(registry);
+        let (peer, route) = polled_rename_peer(
+            default_capabilities().expect("capabilities"),
+            refusal.clone(),
+        );
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
 
         let response = home_roundtrip(
             &mut home,
@@ -7526,11 +7619,60 @@ mod federation_tests {
 
         assert_eq!(response, refusal);
         let seen = peer.seen.lock().expect("seen lock");
-        assert_eq!(seen.len(), 1);
-        let forwarded: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
         assert_eq!(
             forwarded["params"],
             serde_json::json!({"target": "deimos", "expected_name": "deimos", "expect_inactive": true})
+        );
+        assert!(home.api_rx.try_recv().is_err());
+    }
+
+    /// #379-f1: a peer that does not advertise `rename_preconditions` would
+    /// ignore them and rename anyway, so a guarded rename is refused at home
+    /// and never forwarded. Its unconditional renames still are.
+    #[test]
+    fn proxy_refuses_rename_preconditions_a_peer_does_not_advertise() {
+        let renamed = serde_json::json!({"id": "u1", "result": {"type": "ok"}}).to_string();
+        let old_peer = ServerCapabilities {
+            rename_preconditions: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(old_peer, renamed.clone());
+        let home = || drive_home_routes(HashMap::from([("remote".to_string(), route.clone())]));
+
+        for params in [
+            serde_json::json!({"target": "remote/customer", "expected_name": "deimos", "expect_inactive": true}),
+            serde_json::json!({"target": "remote/customer", "name": "forge", "expected_name": ""}),
+            serde_json::json!({"target": "remote/customer", "expect_inactive": true}),
+        ] {
+            let mut home = home();
+            let response = home_roundtrip(
+                &mut home,
+                serde_json::json!({"id": "r1", "method": "agent.rename", "params": params}),
+            );
+            assert!(home.api_rx.try_recv().is_err());
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], "r1", "{response}");
+            assert_eq!(
+                response["error"]["code"], "precondition_unsupported",
+                "{params} -> {response}"
+            );
+        }
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+
+        let mut home = home();
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({"id": "u1", "method": "agent.rename", "params": {"target": "remote/customer"}}),
+        );
+        assert_eq!(response, renamed);
+        let seen = peer.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "customer"})
         );
         assert!(home.api_rx.try_recv().is_err());
     }

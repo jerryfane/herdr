@@ -880,10 +880,32 @@ fn agent_get_request(target: &str, request_id: &str) -> Request {
 }
 
 fn agent_rename(params: AgentRenameParams) -> std::io::Result<i32> {
-    super::print_response(&super::send_request(&Request {
+    let guarded = params.has_preconditions();
+    let request = Request {
         id: "cli:agent:rename".into(),
         method: Method::AgentRename(params),
-    })?)
+    };
+    if !guarded {
+        return super::print_response(&super::send_request(&request)?);
+    }
+    // A server without the capability ignores the preconditions and would
+    // rename unconditionally, so a guarded rename is never sent to it.
+    if let Some(response) = super::send_request_if_supported(&request, |capabilities| {
+        capabilities.rename_preconditions
+    })? {
+        return super::print_response(&response);
+    }
+    let refused = ErrorResponse {
+        id: request.id,
+        error: ErrorBody {
+            code: "precondition_unsupported".into(),
+            message: format!(
+                "the server at {} does not support --expect-name/--expect-inactive; update it",
+                super::target::socket_label()
+            ),
+        },
+    };
+    super::print_response(&serde_json::to_value(refused).map_err(std::io::Error::other)?)
 }
 
 fn agent_archive(params: AgentArchiveParams) -> std::io::Result<i32> {

@@ -441,6 +441,7 @@ mod tests {
                 agent_transcript: false,
                 server_update: false,
                 turn_origin: false,
+                rename_preconditions: false,
             }),
         }
     }
