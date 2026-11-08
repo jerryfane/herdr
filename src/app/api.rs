@@ -4142,6 +4142,131 @@ mod tests {
         }
     }
 
+    /// `agent.restart` CHANGES NOTHING THE USER SEES, driven in the order a real restart
+    /// runs: the restart arms the resume and kills the agent; its PaneDied relaunches
+    /// the pane (consuming the plan); the new shell is first seen with no agent; the
+    /// resumed agent is then seen again. The name used to be wiped at the "no agent"
+    /// step, because the plan that protected it was already gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restart_keeps_the_seats_identity_through_the_relaunch() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("restart");
+        workspace.tabs[0].custom_name = Some("fleet".into());
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.default_shell = "/bin/sh".into();
+        let cwd = std::env::temp_dir();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.cwd = cwd.clone();
+            // A seat `agent.start` launched: managed, named, its session reported.
+            // droid is not installed here, so the relaunch types a command that fails.
+            terminal.restore_managed_agent("entmoot".into(), crate::detect::Agent::Droid);
+            terminal.set_manual_label("entmoot pane".into());
+            terminal.set_detected_state(Some(crate::detect::Agent::Droid), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:droid".into(),
+                agent: "droid".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-1").unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let seen = |app: &App| {
+            let info = app.agent_info(0, pane_id).expect("agent info");
+            let terminal = &app.state.terminals[&terminal_id];
+            (
+                info.name,
+                info.pane_id,
+                info.tab_id,
+                info.terminal_id,
+                app.state.workspaces[0].tab_display_name(0),
+                terminal.manual_label.clone(),
+                terminal.cwd.clone(),
+                terminal.managed_agent_kind(),
+            )
+        };
+        let before = seen(&app);
+        assert_eq!(before.0.as_deref(), Some("entmoot"));
+
+        let response = app.handle_agent_restart(
+            "restart".into(),
+            crate::api::schema::AgentRestartParams {
+                target: "entmoot".into(),
+                account: None,
+            },
+        );
+        assert!(response.contains("\"result\""), "{response}");
+        // The kill's PaneDied relaunches the pane and consumes the plan.
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            runtime_epoch: None,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "relaunched"
+        );
+
+        let state_changed = |agent| AppEvent::StateChanged {
+            runtime_epoch: None,
+            pane_id,
+            agent,
+            state: if agent.is_some() {
+                AgentState::Idle
+            } else {
+                AgentState::Unknown
+            },
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        };
+        // The new shell, before the resumed agent starts.
+        app.handle_internal_event(state_changed(None));
+        assert_eq!(seen(&app), before, "mid-restart");
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            &app.state.archived_agents,
+        );
+        let saved = &snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()];
+        assert_eq!(saved.agent_name.as_deref(), Some("entmoot"));
+        assert_eq!(saved.managed_agent_kind.as_deref(), Some("droid"));
+        assert_eq!(saved.label.as_deref(), Some("entmoot pane"));
+        assert_eq!(
+            saved.terminal_id.as_deref(),
+            Some(terminal_id.to_string().as_str())
+        );
+        assert_eq!(
+            snapshot.workspaces[0].tabs[0].custom_name.as_deref(),
+            Some("fleet")
+        );
+
+        // The resumed agent is seen running again.
+        app.handle_internal_event(state_changed(Some(crate::detect::Agent::Droid)));
+        assert_eq!(seen(&app), before, "after the restart");
+
+        super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_powershell_exit_after_agent_process_exit_respawns_shell() {
