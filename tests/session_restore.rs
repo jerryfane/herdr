@@ -456,3 +456,47 @@ fn failed_deferred_agent_resume_reports_the_agent_as_unavailable() {
         "{prompt}"
     );
 }
+
+/// A named agent whose saved directory is gone is restored without ever detecting its
+/// agent, so the readiness guards alone would call it "not an active named agent". A
+/// prompt must instead fail the way `agent.list` and `pane.process_info` describe it:
+/// nothing runs there, and here is why.
+#[test]
+fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason() {
+    let (_herdr, socket_path) = start_agent_restore_server(
+        "resume-gone",
+        |project, session| {
+            let gone = project.join("deleted");
+            serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [{"id": "w1", "custom_name": "gone", "identity_cwd": project,
+                    "tabs": [{"layout": {"Pane": 1},
+                              "panes": {"1": omp_agent_pane(&gone, session, "gone")},
+                              "zoomed": false, "focused": 1, "root_pane": 1}]}]
+            })
+        },
+        "/bin/sh",
+    );
+
+    let agent = restored_agent(&socket_path, "gone");
+    assert_eq!(agent["agent_status"], "unknown", "{agent}");
+    let reason = agent["restore_error"].as_str().unwrap();
+    assert!(
+        reason.starts_with("Saved directory is unavailable"),
+        "{agent}"
+    );
+
+    let prompt = restore_request_with_params(
+        &socket_path,
+        "agent.prompt",
+        serde_json::json!({"target": "gone", "text": "hello"}),
+    );
+    assert_eq!(prompt["error"]["code"], "agent_not_found", "{prompt}");
+    assert!(
+        prompt["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(reason),
+        "{prompt}"
+    );
+}
