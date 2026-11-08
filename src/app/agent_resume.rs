@@ -428,7 +428,7 @@ impl App {
             cwd,
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
-            self.state.host_terminal_appearance,
+            self.pane_host_terminal_appearance(),
             shell_config,
             &launch_env,
             self.event_tx.clone(),
