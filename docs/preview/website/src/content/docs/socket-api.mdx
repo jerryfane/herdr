@@ -233,7 +233,10 @@ can make the next decision without private layout state.
 
 `pane.process_info` returns the pane's shell pid, foreground process group id
 when available, and foreground processes with pid, name, argv/cmdline, and cwd
-when the platform exposes them.
+when the platform exposes them. A pane that exists but has no running process,
+such as one whose restore failed or whose agent is still waiting to resume,
+fails with `pane_unavailable`; the message gives the pane's `restore_error`
+when there is one. `pane_not_found` means the pane itself does not exist.
 
 `layout.export` returns a portable tab layout tree. Omit `tab_id` and `pane_id`
 to export the active tab, pass `tab_id` to export that tab, or pass `pane_id` to
@@ -800,6 +803,8 @@ Both methods accept an optional `resume_argv` array with the command that resume
 If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
+
+When a pane cannot be brought back after a restart (its saved directory is gone, or its shell or deferred agent resume fails to start), `pane.get`, `pane.list`, `agent.get`, and `agent.list` keep the pane and its terminal identity and expose the reason as `restore_error`. While nothing runs in that pane, its `agent_status` is `unknown` instead of the state it was saved with, `pane.process_info` fails with `pane_unavailable`, and `agent.prompt` fails with `agent_not_found` and the reason. Restarting the agent clears `restore_error` once it runs again.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
