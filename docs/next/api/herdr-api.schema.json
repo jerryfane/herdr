@@ -2023,14 +2023,14 @@
         "AgentRenameParams": {
           "properties": {
             "expect_inactive": {
-              "description": "Apply only while no live agent runs in the pane, such as one restored\nwithout resuming its agent. Otherwise answers `agent_active`.",
+              "description": "Apply only while no live agent runs in the pane, such as one restored\nwithout resuming its agent. Otherwise answers `agent_active`.\nEnforced only by servers whose `ping` advertises\n`capabilities.rename_preconditions`; older ones ignore it.",
               "type": [
                 "boolean",
                 "null"
               ]
             },
             "expected_name": {
-              "description": "Apply only while the agent's current name is this one; `\"\"` expects\nno name. Otherwise answers `agent_name_changed` and changes nothing.",
+              "description": "Apply only while the agent's current name is this one; `\"\"` expects\nno name. Otherwise answers `agent_name_changed` and changes nothing.\nEnforced only by servers whose `ping` advertises\n`capabilities.rename_preconditions`; older ones ignore it.",
               "type": [
                 "string",
                 "null"
@@ -18409,6 +18409,11 @@
             "pane_input_stream": {
               "default": false,
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
+              "type": "boolean"
+            },
+            "rename_preconditions": {
+              "default": false,
+              "description": "`agent.rename` enforces `expected_name` and `expect_inactive`. Older\nservers ignore both fields and rename unconditionally, so a caller must\nsee this before relying on them.",
               "type": "boolean"
             },
             "server_update": {

@@ -2671,6 +2671,7 @@ mod tests {
                 agent_transcript: false,
                 server_update: false,
                 turn_origin: false,
+                rename_preconditions: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2760,6 +2761,7 @@ mod tests {
                     agent_transcript: false,
                     server_update: false,
                     turn_origin: false,
+                    rename_preconditions: false,
                 }),
             },
         };
@@ -3036,6 +3038,7 @@ mod tests {
                     agent_transcript: false,
                     server_update: false,
                     turn_origin: false,
+                    rename_preconditions: false,
                 }),
             },
         };

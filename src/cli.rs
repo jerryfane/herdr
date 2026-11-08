@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
-use crate::api::schema::{Method, Request};
+use crate::api::schema::{Method, Request, ServerCapabilities};
 
 macro_rules! print {
     ($($arg:tt)*) => {{
@@ -789,6 +789,24 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
+/// Like [`send_request`], but sends nothing and answers `None` unless the
+/// server's `ping` capabilities pass `supported`. For request fields an older
+/// server would silently ignore.
+pub(super) fn send_request_if_supported(
+    request: &Request,
+    supported: impl FnOnce(&ServerCapabilities) -> bool,
+) -> std::io::Result<Option<serde_json::Value>> {
+    let client = target::api_client()?;
+    let status = ensure_server_protocol_compatible(&client, &request.id)?;
+    if !status.capabilities.as_ref().is_some_and(supported) {
+        return Ok(None);
+    }
+    client
+        .request_value(request)
+        .map(Some)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
     let client = target::api_client()?;
     client
@@ -796,7 +814,10 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
-fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
+fn ensure_server_protocol_compatible(
+    client: &ApiClient,
+    request_id: &str,
+) -> std::io::Result<crate::api::RuntimeStatus> {
     let status = target::server_status(client)
         .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
     let server_protocol = status
@@ -805,7 +826,7 @@ fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> st
     let Some(response) =
         protocol_guard::mismatch_response(request_id, server_protocol, &target::restart_guidance())
     else {
-        return Ok(());
+        return Ok(status);
     };
 
     eprintln!(
