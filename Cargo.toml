@@ -113,6 +113,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 # Guest access relay link (src/guest/link), the one documented exception to
 # keeping TLS and internet traffic out of process: while guests exist, the daemon
 # keeps one outbound WSS socket to the HerdrUp guest relay, and each guest session
