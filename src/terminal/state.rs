@@ -344,6 +344,12 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// An `agent.restart` of this pane is in flight: from arming its resume plan
+    /// until the resumed agent is seen running again. The plan alone is not
+    /// enough, because it is consumed when the relaunch starts, before the new
+    /// shell is first observed without an agent. While this holds, the old
+    /// agent's exit and the shell in between are not a release of the seat.
+    restart_in_flight: bool,
     /// Extra `(env_var, value)` pairs to inject into the next deferred
     /// shell spawn for this terminal (the account config-home env selected by an
     /// `agent.restart`). Consumed and cleared at the resume/respawn spawn site so
@@ -427,6 +433,7 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
+            restart_in_flight: false,
             pending_launch_env: Vec::new(),
             account_resume_blocked: None,
             agent_account: None,
@@ -889,6 +896,12 @@ impl TerminalState {
             }
         } else if agent.is_some() {
             self.recent_agent_process_exit = None;
+            // The relaunch has started and an agent runs again: the restart is
+            // over. Before the relaunch, a late observation of the old process
+            // must not end it.
+            if self.pending_agent_resume_plan.is_none() {
+                self.restart_in_flight = false;
+            }
         }
         if process_exited {
             let mut reset_sources = Vec::new();
@@ -1073,12 +1086,7 @@ impl TerminalState {
         // absence, preserve deliberate restart/transfer identity while
         // releasing its old session anchor; all other exits free the name.
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
-            if self.pending_agent_resume_plan.is_some()
-                || self
-                    .session_transfer
-                    .as_ref()
-                    .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit())
-            {
+            if self.deliberate_relaunch_keeps_name() {
                 self.release_agent_name_session_anchor();
             } else {
                 self.clear_agent_name();
@@ -2757,10 +2765,7 @@ impl TerminalState {
         let Some(managed) = self.managed_agent else {
             return false;
         };
-        let transfer_preserves_name = self
-            .session_transfer
-            .as_ref()
-            .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit());
+        let relaunch_keeps_name = self.deliberate_relaunch_keeps_name();
         let known_agent = self.effective_known_agent();
         let observed_expected = match managed.phase {
             ManagedAgentPhase::Pending {
@@ -2768,7 +2773,7 @@ impl TerminalState {
             } => observed_expected || known_agent == Some(managed.kind),
             ManagedAgentPhase::Blocked | ManagedAgentPhase::Active => false,
         };
-        let clear = !transfer_preserves_name
+        let clear = !relaunch_keeps_name
             && (process_exited
                 || known_agent.is_some_and(|agent| agent != managed.kind)
                 || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
@@ -2807,7 +2812,7 @@ impl TerminalState {
                 });
                 return true;
             }
-            if now >= deadline && !transfer_preserves_name {
+            if now >= deadline && !relaunch_keeps_name {
                 self.clear_agent_name();
                 return true;
             }
@@ -2880,6 +2885,38 @@ impl TerminalState {
         }
     }
 
+    /// Arm an `agent.restart`: the next exit relaunches `plan` in this pane, and
+    /// the seat's name, kind and owner survive the whole relaunch.
+    ///
+    /// The name's session anchor is released up front, so the resumed session is
+    /// adopted whichever of its first report or the shell's first observation
+    /// comes first. A launch window still open from `agent.start` is closed: a
+    /// restart needs a session to resume, so that launch already came up, and
+    /// its deadline must not expire the name while the resumed agent loads.
+    pub(crate) fn arm_restart(&mut self, plan: crate::agent_resume::AgentResumePlan) {
+        self.pending_agent_resume_plan = Some(plan);
+        self.restart_in_flight = true;
+        self.release_agent_name_session_anchor();
+        if let Some(managed) = self.managed_agent.as_mut() {
+            if managed.phase != ManagedAgentPhase::Active {
+                managed.phase = ManagedAgentPhase::Active;
+                self.managed_agent_launch_session = None;
+            }
+        }
+    }
+
+    /// Herdr is relaunching this pane's agent on purpose, as an `agent.restart`
+    /// or a session transfer: its exit, a sign-off from the old session and the
+    /// shell in between leave the seat's name in place.
+    fn deliberate_relaunch_keeps_name(&self) -> bool {
+        self.restart_in_flight
+            || self.pending_agent_resume_plan.is_some()
+            || self
+                .session_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.preserves_agent_name_on_process_exit())
+    }
+
     pub fn clear_agent_name(&mut self) {
         self.codex_prompt_ready = false;
         if self
@@ -2919,6 +2956,7 @@ impl TerminalState {
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
+        self.restart_in_flight = false;
         self.clear_agent_name();
     }
 
@@ -6802,13 +6840,16 @@ mod tests {
         assert_eq!(terminal.effective_known_agent(), Some(Agent::Claude));
     }
 
-    /// A DELIBERATE RESTART KEEPS THE SEAT'S NAME (issue #128).
+    /// A DELIBERATE RESTART KEEPS THE SEAT'S NAME (issue #128), in the order it
+    /// really happens.
     ///
     /// `agent.restart` — which is how an account swap is done — arms a resume plan and
-    /// kills the process itself. The resulting exit was being read as "the agent released
-    /// this pane", wiping the name; gitmoot resolves role -> pane by NAME, so the seat
-    /// went quietly unaddressable. The replacement then resumes under a NEW session ref,
-    /// which is the second way the name was lost, so both are exercised here.
+    /// kills the process itself. The PaneDied for that kill starts the relaunch, which
+    /// CONSUMES the plan before the new shell is first observed without an agent. That
+    /// observation was read as "the agent released this pane" and wiped the name;
+    /// gitmoot resolves role -> pane by NAME, so the seat went quietly unaddressable.
+    /// The replacement then resumes under a NEW session ref, which is the second way
+    /// the name was lost, so both are exercised here.
     #[test]
     fn a_deliberate_same_seat_restart_keeps_the_name_across_a_new_session() {
         let mut terminal = test_terminal();
@@ -6820,16 +6861,15 @@ mod tests {
             "pi",
             crate::agent_resume::AgentSessionRef::path(test_session_path("before.jsonl")).unwrap(),
         );
-        terminal.set_agent_name("keephair".into());
+        terminal.restore_managed_agent("keephair".into(), Agent::Pi);
         assert_eq!(terminal.agent_name.as_deref(), Some("keephair"));
 
         // What `agent.restart` does before killing the process.
-        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+        terminal.arm_restart(crate::agent_resume::AgentResumePlan {
             agent: "pi".into(),
             argv: vec!["pi".into(), "--resume".into()],
             dedupe_key: "k".into(),
         });
-
         // The kill we asked for.
         terminal.set_detected_state_with_visible_blocker(
             Some(Agent::Pi),
@@ -6838,7 +6878,9 @@ mod tests {
             false,
             true, // process_exited
         );
-        // The next detection pass confirms the old process is gone.
+        // The relaunch starts and consumes the plan, as `start_pending_agent_resume` does.
+        terminal.pending_agent_resume_plan = None;
+        // The new shell's first observation: no agent yet.
         terminal.set_detected_state_with_visible_blocker(
             None,
             AgentState::Unknown,
@@ -6846,11 +6888,13 @@ mod tests {
             false,
             false,
         );
+        assert!(!terminal.reconcile_managed_agent_at(Instant::now(), false));
         assert_eq!(
             terminal.agent_name.as_deref(),
             Some("keephair"),
             "our own restart must not be read as the agent letting go of the pane"
         );
+        assert_eq!(terminal.managed_agent_kind(), Some(Agent::Pi));
         // The MECHANISM, asserted directly rather than inferred. The replacement resumes
         // under a new session ref, and only an owner holding NO anchor gets adopted
         // instead of being treated as a takeover. Asserting just "the name survived"
@@ -6865,8 +6909,7 @@ mod tests {
         );
 
         // The replacement comes back under a DIFFERENT session ref, via the SessionStart
-        // the resumed harness actually emits. The released anchor must let it be adopted
-        // rather than treated as a takeover.
+        // the resumed harness actually emits, and is then seen running.
         terminal.set_agent_session_ref_for_session_start(
             "herdr:pi".into(),
             "pi".into(),
@@ -6874,12 +6917,73 @@ mod tests {
             Some(40),
             None,
         );
-
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(!terminal.reconcile_managed_agent_at(Instant::now(), false));
         assert_eq!(
             terminal.agent_name.as_deref(),
             Some("keephair"),
             "the name must transfer to the resumed session"
         );
+        assert!(
+            !terminal.restart_in_flight,
+            "the restart ends once the agent is back"
+        );
+
+        // The restart is over: a later exit nobody asked for is a real release again.
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(terminal.agent_name.is_none());
+    }
+
+    /// A restart while `agent.start` is still inside its launch window. That window
+    /// used to clear the name as soon as the expected agent went missing, and again at
+    /// its deadline, which a resumed session can easily outlive.
+    #[test]
+    fn a_restart_during_an_agent_start_launch_window_keeps_the_name() {
+        let mut terminal = test_terminal();
+        let started_at = Instant::now();
+        terminal.begin_managed_agent(
+            "entmoot".into(),
+            Agent::Claude,
+            started_at,
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.reconcile_managed_agent_at(started_at, false);
+        assert!(terminal.managed_agent_launch_pending());
+
+        terminal.arm_restart(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "s".into()],
+            dedupe_key: "k".into(),
+        });
+        assert!(
+            !terminal.managed_agent_launch_pending(),
+            "a restart closes the start's launch window, so rename and snapshots see the seat"
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.pending_agent_resume_plan = None;
+        terminal.set_detected_state(None, AgentState::Unknown);
+        // Well past the original start's deadline.
+        terminal.reconcile_managed_agent_at(started_at + Duration::from_secs(60), false);
+        assert_eq!(terminal.agent_name.as_deref(), Some("entmoot"));
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.reconcile_managed_agent_at(started_at + Duration::from_secs(61), false);
+        assert_eq!(terminal.agent_name.as_deref(), Some("entmoot"));
+        assert_eq!(terminal.managed_agent_kind(), Some(Agent::Claude));
     }
 
     /// A session-transfer resume plan is consumed before the replacement process starts.

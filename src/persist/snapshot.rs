@@ -446,8 +446,9 @@ fn capture_tab(
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
+        // The name and kind are saved during an `agent.start` launch window too:
+        // a daemon restart in that window must not forget which seat this is.
         let (mut agent_name, mut managed_agent_kind) = terminal
-            .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
                 (
                     terminal.agent_name.clone(),
@@ -742,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_agent_snapshot_omits_pending_and_persists_active_ownership() {
+    fn managed_agent_snapshot_keeps_the_name_during_and_after_its_launch() {
         let mut state = state_with_workspaces(&["managed-snapshot"]);
         let root = state.workspaces[0].tabs[0].root_pane;
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
@@ -763,8 +764,8 @@ mod tests {
 
         let pending = capture_from_state(&state);
         let pending_pane = &pending.workspaces[0].tabs[0].panes[&root.raw()];
-        assert_eq!(pending_pane.agent_name, None);
-        assert_eq!(pending_pane.managed_agent_kind, None);
+        assert_eq!(pending_pane.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(pending_pane.managed_agent_kind.as_deref(), Some("pi"));
 
         let terminal = state.terminals.get_mut(&terminal_id).unwrap();
         terminal.set_detected_state(

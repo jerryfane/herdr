@@ -587,7 +587,7 @@ impl App {
         // relaunch's fresh-shell spawn; `agent_account` remembers the choice so a
         // later plain restart keeps it.
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.pending_agent_resume_plan = Some(plan);
+            terminal.arm_restart(plan);
             terminal.respawn_shell_on_exit = true;
             match account_env {
                 Some((account_id, env)) => {
