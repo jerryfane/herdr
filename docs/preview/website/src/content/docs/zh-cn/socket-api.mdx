@@ -117,6 +117,8 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `agent.rename`(`{ target, name }`;省略 `name` 即清除)也可用于智能体已不在、但终端仍保留其名称或会话的窗格，例如以 `resume_agents_on_restore = false` 恢复的窗格。可用名称或窗格 id 指定。新名称会移走保留的名称并保留会话，规则与运行中的智能体相同：返回 `invalid_agent_name`、`agent_name_taken` 和 `agent_launch_pending`;当 `agent.restart` 或会话迁移即将在该窗格重新启动智能体时，也返回 `agent_launch_pending`。旧名称随后可供其他智能体使用。清除会释放名称并忘记窗格的归属：持久化的会话指针、智能体报告的恢复命令、报告的会话路径与运行时、遗留的 hook 权限以及记录的账户。窗格仍是普通 shell,被忘记的会话不再拒绝其他来源的 `pane.report_agent`,之后开启恢复再还原时也不会在其中重新启动该智能体。文件夹和星标会跟随改名，清除后仍留在旧名称下。既无名称也无会话的窗格仍返回 `agent_not_found`。运行中智能体的改名和清除保持不变，清除后会话仍保留。
 
+`agent.rename` 还接受两个可选的前置条件,它们在应用更改的同一步骤中检查,因此调用方读取 `agent.list` 之后才发生的重命名不会被覆盖。`expected_name` 仅在智能体当前名称等于该值时才应用重命名或清除(`""` 表示期望没有名称);否则返回 `agent_name_changed`,其消息给出当前名称或说明名称未设置。`expect_inactive: true` 在窗格中有活动智能体运行时以 `agent_active` 拒绝,因此只会更改智能体留下的名称(如上所述)。两者默认都不设置。只有 `ping` 报告 `capabilities.rename_preconditions: true` 的服务器才会执行这些前置条件;旧服务器会忽略这两个字段并无条件重命名,因此依赖它们之前请先检查该 capability。`herdr agent rename` 会检查;对于联邦对端上的智能体,在对端的轮询报告该 capability 之前,主机会以 `precondition_unsupported` 拒绝带前置条件的重命名,不会转发。访客无法调用 `agent.rename`。
+
 `agent.wait` 由服务器拥有并由事件驱动，且固定到已解析的窗格占用者，因此替换后的智能体不能满足等待。`agent.prompt` 接受包含 `until` 和 `timeout_ms` 的可选 `wait` 对象：它写入 PTY 并观察是否提交，只有确认提交后才等待请求的状态。若智能体已经是 `blocked`，则写入前返回 `agent_blocked`。成功写入完整 text+Enter 批次后返回 `delivery: "written_to_pty"`；最初处于稳定状态的智能体发生可归因的生命周期变化，或观察到同一个 writer-attributed composer attempt 清空后返回 `delivery: "submitted"`。带 `wait` 的 `written_to_pty` 表示未确认提交，不再继续等待状态；重试前请检查窗格。同一个 attempt 的草稿仍存在时返回 `agent_prompt_unsubmitted`；看到模态提示时，在写入前返回 `agent_input_pending`。bracketed paste 不依赖渲染的 token 文本。
 
 确认提交后，如截止时未观察到请求的状态，则返回 `agent_status_unobserved_after_submit`；提示已提交，不应重发。直接进入请求的稳定状态也算成功，不要求先观察到 `working`。
