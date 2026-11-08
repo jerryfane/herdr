@@ -422,14 +422,7 @@ fn failed_deferred_agent_resume_reports_the_agent_as_unavailable() {
     );
 
     let pane_id = &agent["pane_id"];
-    let pane = restore_request_with_params(
-        &socket_path,
-        "pane.get",
-        serde_json::json!({"pane_id": pane_id}),
-    );
-    assert_eq!(pane["result"]["pane"]["terminal_id"], agent["terminal_id"]);
-    assert_eq!(pane["result"]["pane"]["agent_status"], "unknown");
-    assert_eq!(pane["result"]["pane"]["restore_error"], reason);
+    assert_pane_reports_failed_restore(&socket_path, &agent, reason);
 
     let info = restore_request_with_params(
         &socket_path,
@@ -486,6 +479,7 @@ fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason()
         "{agent}"
     );
 
+    assert_pane_reports_failed_restore(&socket_path, &agent, reason);
     let prompt = restore_request_with_params(
         &socket_path,
         "agent.prompt",
@@ -499,4 +493,40 @@ fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason()
             .ends_with(reason),
         "{prompt}"
     );
+}
+
+/// Whenever a pane reports `agent_status: unknown` for a failed restore, every pane view
+/// must carry the same non-empty `restore_error` and terminal identity: gitmoot keys on
+/// the pane's `restore_error` in the session snapshot to fail deliveries visibly.
+fn assert_pane_reports_failed_restore(socket_path: &Path, agent: &serde_json::Value, reason: &str) {
+    assert!(!reason.is_empty());
+    let pane_id = &agent["pane_id"];
+    let get = restore_request_with_params(
+        socket_path,
+        "pane.get",
+        serde_json::json!({"pane_id": pane_id}),
+    );
+    let list = restore_request(socket_path, "pane.list");
+    let snapshot = restore_request(socket_path, "session.snapshot");
+    let find = |panes: &serde_json::Value| {
+        panes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pane| pane["pane_id"] == *pane_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("pane {pane_id} missing: {panes}"))
+    };
+    for (view, pane) in [
+        ("pane.get", get["result"]["pane"].clone()),
+        ("pane.list", find(&list["result"]["panes"])),
+        (
+            "session.snapshot",
+            find(&snapshot["result"]["snapshot"]["panes"]),
+        ),
+    ] {
+        assert_eq!(pane["terminal_id"], agent["terminal_id"], "{view}: {pane}");
+        assert_eq!(pane["agent_status"], "unknown", "{view}: {pane}");
+        assert_eq!(pane["restore_error"], reason, "{view}: {pane}");
+    }
 }
