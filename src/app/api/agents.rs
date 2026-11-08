@@ -151,7 +151,7 @@ impl App {
     }
 
     pub(super) fn handle_agent_rename(&mut self, id: String, params: AgentRenameParams) -> String {
-        let agent = match self.rename_agent_target(&params.target, params.name) {
+        let agent = match self.rename_agent_target(params) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_rename_error_body(err)),
         };
@@ -2724,6 +2724,8 @@ mod tests {
                 AgentRenameParams {
                     target: target.clone(),
                     name,
+                    expected_name: None,
+                    expect_inactive: None,
                 },
             );
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2741,6 +2743,8 @@ mod tests {
             AgentRenameParams {
                 target: target.into(),
                 name: name.map(str::to_string),
+                expected_name: None,
+                expect_inactive: None,
             },
         ))
         .unwrap()
@@ -2980,6 +2984,110 @@ mod tests {
         let terminal = root_terminal(&app, 0);
         assert_eq!(terminal.agent_name, None);
         assert!(terminal.persisted_agent_session.is_some());
+    }
+
+    fn rename_expecting(
+        app: &mut App,
+        target: &str,
+        name: Option<&str>,
+        expected_name: Option<&str>,
+        expect_inactive: Option<bool>,
+    ) -> serde_json::Value {
+        serde_json::from_str(&app.handle_agent_rename(
+            "req".into(),
+            AgentRenameParams {
+                target: target.into(),
+                name: name.map(str::to_string),
+                expected_name: expected_name.map(str::to_string),
+                expect_inactive,
+            },
+        ))
+        .unwrap()
+    }
+
+    /// #377: Forge reads `agent.list`, then clears an old name. A rename that
+    /// landed in between must not be wiped: `expected_name` refuses it, names
+    /// the current name, and changes nothing.
+    #[tokio::test]
+    async fn agent_rename_applies_only_while_the_expected_name_holds() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "customer", AgentState::Idle);
+
+        for (name, expected) in [(None, "deimos"), (Some("worker"), "deimos"), (None, "")] {
+            let refused = rename_expecting(&mut app, "customer", name, Some(expected), None);
+            assert_eq!(refused["error"]["code"], "agent_name_changed", "{refused}");
+            let message = refused["error"]["message"].as_str().unwrap();
+            assert!(message.contains("\"customer\""), "{message}");
+            assert_eq!(
+                root_terminal(&app, 0).agent_name.as_deref(),
+                Some("customer")
+            );
+        }
+
+        let renamed = rename_expecting(
+            &mut app,
+            "customer",
+            Some("customer-2"),
+            Some("customer"),
+            None,
+        );
+        assert_eq!(
+            renamed["result"]["agent"]["name"], "customer-2",
+            "{renamed}"
+        );
+        let cleared = rename_expecting(&mut app, "customer-2", None, Some("customer-2"), None);
+        assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+        assert_eq!(root_terminal(&app, 0).agent_name, None);
+
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        let unset = rename_expecting(&mut app, &pane, Some("late"), Some("customer-2"), None);
+        assert_eq!(unset["error"]["code"], "agent_name_changed", "{unset}");
+        assert!(
+            unset["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unset"),
+            "{unset}"
+        );
+        assert_eq!(root_terminal(&app, 0).agent_name, None);
+        let named = rename_expecting(&mut app, &pane, Some("customer"), Some(""), None);
+        assert_eq!(named["result"]["agent"]["name"], "customer", "{named}");
+    }
+
+    /// #377: `expect_inactive` clears only a name an agent left behind (the
+    /// #364 inactive claim), never a live agent's; without it a live agent
+    /// renames as before.
+    #[tokio::test]
+    async fn agent_rename_expecting_inactive_refuses_a_live_agent() {
+        let mut app = app_with_agent();
+        arm_resumable_claude(&mut app, "customer", AgentState::Idle);
+        for name in [None, Some("deimos")] {
+            let refused = rename_expecting(&mut app, "customer", name, None, Some(true));
+            assert_eq!(refused["error"]["code"], "agent_active", "{refused}");
+            assert_eq!(
+                root_terminal(&app, 0).agent_name.as_deref(),
+                Some("customer")
+            );
+        }
+        let renamed = rename_expecting(&mut app, "customer", Some("worker"), None, Some(false));
+        assert_eq!(renamed["result"]["agent"]["name"], "worker", "{renamed}");
+
+        app.state.workspaces.push(Workspace::test_new("second"));
+        app.state.ensure_test_terminals();
+        let tab = &app.state.workspaces[1].tabs[0];
+        let left = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        app.state
+            .terminals
+            .get_mut(&left)
+            .unwrap()
+            .set_agent_name("deimos".into());
+        assert!(app.state.terminals[&left].holds_inactive_agent_claim());
+
+        let cleared = rename_expecting(&mut app, "deimos", None, Some("deimos"), Some(true));
+        assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+        assert_eq!(app.state.terminals[&left].agent_name, None);
     }
 
     #[tokio::test]
@@ -5996,6 +6104,8 @@ mod tests {
                 AgentRenameParams {
                     target: target.into(),
                     name: name.map(str::to_string),
+                    expected_name: None,
+                    expect_inactive: None,
                 },
             ))
             .unwrap()
@@ -6059,6 +6169,8 @@ mod tests {
                     AgentRenameParams {
                         target: target.into(),
                         name: name.map(str::to_string),
+                        expected_name: None,
+                        expect_inactive: None,
                     },
                 ))
                 .unwrap()
@@ -6132,6 +6244,8 @@ mod tests {
             AgentRenameParams {
                 target: "reviewer".into(),
                 name: Some("critic".into()),
+                expected_name: None,
+                expect_inactive: None,
             },
         );
         assert_eq!(
@@ -6143,6 +6257,8 @@ mod tests {
             AgentRenameParams {
                 target: "critic".into(),
                 name: Some("reviewer".into()),
+                expected_name: None,
+                expect_inactive: None,
             },
         );
 

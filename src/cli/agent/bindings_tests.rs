@@ -193,6 +193,21 @@ fn agent_projection_rename_and_local_adapters() {
         params(&["rename", "opaque", "--clear"]),
         serde_json::json!({"target":"opaque"})
     );
+    assert_eq!(
+        params(&[
+            "rename",
+            "opaque",
+            "--clear",
+            "--expect-name",
+            "deimos",
+            "--expect-inactive"
+        ]),
+        serde_json::json!({"target":"opaque", "expected_name":"deimos", "expect_inactive":true})
+    );
+    assert_eq!(
+        params(&["rename", "opaque", "name", "--expect-name="]),
+        serde_json::json!({"target":"opaque", "name":"name", "expected_name":""})
+    );
     let Operation::Attach(params) = parse(&["attach", "opaque", "--takeover"]).unwrap() else {
         panic!("attach")
     };

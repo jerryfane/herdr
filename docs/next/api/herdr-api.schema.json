@@ -2022,6 +2022,20 @@
         },
         "AgentRenameParams": {
           "properties": {
+            "expect_inactive": {
+              "description": "Apply only while no live agent runs in the pane, such as one restored\nwithout resuming its agent. Otherwise answers `agent_active`.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "expected_name": {
+              "description": "Apply only while the agent's current name is this one; `\"\"` expects\nno name. Otherwise answers `agent_name_changed` and changes nothing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "name": {
               "type": [
                 "string",

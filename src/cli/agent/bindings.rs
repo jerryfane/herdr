@@ -208,6 +208,22 @@ pub(crate) fn clear_name() -> Input<Option<String>> {
     })
 }
 
+pub(crate) fn expect_name() -> Input<Option<String>> {
+    Input::value("expect-name", "NAME", |slot, value| {
+        *slot = Some(value.to_owned());
+        Ok(())
+    })
+    .help("Change the name only while it is still NAME; \"\" expects no name")
+}
+
+pub(crate) fn expect_inactive() -> Input<Option<bool>> {
+    Input::flag("expect-inactive", |slot, _| {
+        *slot = Some(true);
+        Ok(())
+    })
+    .help("Change the name only while no live agent runs in the pane")
+}
+
 pub(crate) fn wait_presence() -> Input<Option<crate::api::schema::AgentPromptWaitOptions>> {
     Input::flag("wait", |slot, _| {
         *slot = Some(crate::api::schema::AgentPromptWaitOptions {
@@ -438,7 +454,7 @@ pub(crate) fn command() -> Command {
         .subcommand(leaf("send-keys", AgentSendKeysProjection::arguments(), "Send key presses to an agent")
             .after_help("Use esc as the canonical Escape key name; escape is also accepted."))
         .subcommand(leaf("rename", AgentRenameProjection::arguments(), "Rename an agent")
-            .override_usage("herdr agent rename <TARGET> <NAME>|--clear")
+            .override_usage("herdr agent rename <TARGET> <NAME>|--clear [--expect-name NAME] [--expect-inactive]")
             .group(ArgGroup::new("rename").args(["name", "clear"]).required(true)))
         .subcommand(leaf("archive", ArchiveProjection::arguments(), "Archive an agent, closing its pane and preserving its session")
             .arg(json_no_op())

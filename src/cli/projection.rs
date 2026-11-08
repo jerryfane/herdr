@@ -268,8 +268,10 @@ fn protect_verbatim_slots(command: &Command, args: &[String]) -> Vec<String> {
         } else {
             slot + 1
         };
-        // A lone flag declared as this operand's alternative (`rename ID --clear`) stays a flag.
-        if end == operands.len() && end == slot + 1 {
+        // The flag declared as this operand's alternative stays a flag when it
+        // fills a one-word slot (`rename ID --clear --expect-name OLD`) or is the
+        // last word of a text rest (`label ID --clear`).
+        if end == slot + 1 {
             let token = operands[slot].as_str();
             if leaf.get_arg_conflicts_with(argument).iter().any(|flag| {
                 flag.get_long()
