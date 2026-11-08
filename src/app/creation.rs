@@ -407,6 +407,30 @@ impl App {
         }
     }
 
+    /// True when `terminal`'s restore or deferred agent resume failed and nothing runs
+    /// in its pane: `restore_error` is set and no runtime exists.
+    pub(crate) fn terminal_restore_failed(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> bool {
+        terminal.restore_error.is_some() && self.terminal_runtimes.get(&terminal.id).is_none()
+    }
+
+    /// The agent state to report for `terminal`. A failed restore leaves the state the
+    /// pane was restored with — `idle` for a deferred agent resume — although no process
+    /// runs there, so callers would keep addressing an agent that can never answer.
+    /// Such a pane reports `unknown` until something starts in it again.
+    pub(crate) fn reported_agent_state(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> crate::detect::AgentState {
+        if self.terminal_restore_failed(terminal) {
+            crate::detect::AgentState::Unknown
+        } else {
+            terminal.state
+        }
+    }
+
     pub(super) fn tab_info(
         &self,
         ws_idx: usize,
@@ -421,7 +445,7 @@ impl App {
                 self.state
                     .terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| (self.reported_agent_state(terminal), pane.seen))
             })
             .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
             .unwrap_or((crate::detect::AgentState::Unknown, true));
@@ -633,7 +657,7 @@ impl App {
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status: pane_agent_status(self.reported_agent_state(terminal), pane.seen),
             input_pending: terminal.input_pending,
             input_prompt_kind: terminal.input_prompt_kind,
             composer,

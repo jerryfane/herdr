@@ -224,3 +224,309 @@ fn server_restores_while_git_metadata_is_blocked() {
         drop(herdr);
     }
 }
+
+/// A scratch server restored from `snapshot`, with a fake `omp` on PATH that stays in the
+/// foreground, so a resumed omp agent is a real process the pane APIs can see.
+fn start_agent_restore_server(
+    name: &str,
+    snapshot: impl FnOnce(&Path, &Path) -> serde_json::Value,
+    default_shell: &str,
+) -> (RestoredServer, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = PathBuf::from(format!("/tmp/herdr-{name}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    let base = fs::canonicalize(base).unwrap();
+    let home = base.join("home");
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let project = base.join("project");
+    let data_dir = config_home.join(if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    });
+    for dir in [&home, &bin, &project, &data_dir] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let omp = bin.join("omp");
+    fs::write(&omp, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    fs::set_permissions(&omp, fs::Permissions::from_mode(0o755)).unwrap();
+    let session = home.join("session.jsonl");
+    fs::write(&session, "{}\n").unwrap();
+
+    fs::write(
+        data_dir.join("session.json"),
+        snapshot(&project, &session).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        data_dir.join("config.toml"),
+        format!("onboarding = false\n[terminal]\ndefault_shell = {default_shell:?}\n"),
+    )
+    .unwrap();
+    support::register_runtime_dir(&runtime_dir);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command
+        .arg("server")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env("SHELL", "/bin/sh")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HERDR_") && key != "HERDR_SOCKET_PATH" {
+            command.env_remove(key);
+        }
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    support::register_spawned_herdr_pid(Some(child.id()));
+    let herdr = RestoredServer { child, base };
+    support::wait_for_socket(&socket_path, Duration::from_secs(5));
+    (herdr, socket_path)
+}
+
+fn omp_agent_pane(project: &Path, session: &Path, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "cwd": project, "agent_name": name, "managed_agent_kind": "omp",
+        "agent_session": {"source": "herdr:omp", "agent": "omp", "kind": "path", "value": session}
+    })
+}
+
+fn restored_agent(socket_path: &Path, name: &str) -> serde_json::Value {
+    let agents = restore_request(socket_path, "agent.list");
+    agents["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["name"] == name)
+        .unwrap_or_else(|| panic!("agent {name} missing from agent.list: {agents}"))
+        .clone()
+}
+
+/// The outage of 2026-11-08: agents in the last pane of a deep split chain never came
+/// back after a cold restore. Their pane's interior was 0 columns (or rows) wide, the
+/// deferred resume spawned the terminal at that size, libghostty-vt refused the 0-wide
+/// grid ("ghostty error -2"), and the agent stayed listed with no process behind it.
+#[test]
+fn deferred_agent_resume_starts_in_a_zero_width_pane() {
+    let (_herdr, socket_path) = start_agent_restore_server(
+        "resume-zero",
+        |project, session| {
+            // Seven nested halvings, as on the affected tab: the innermost pair gets
+            // no columns once borders are drawn.
+            let mut layout = serde_json::json!({"Pane": 1});
+            layout = serde_json::json!({"Split": {
+                "direction": "Horizontal", "ratio": 0.5, "first": layout, "second": {"Pane": 2}
+            }});
+            let mut panes = serde_json::Map::new();
+            panes.insert("1".into(), serde_json::json!({"cwd": project}));
+            panes.insert("2".into(), omp_agent_pane(project, session, "deep"));
+            for pane in 3..=8 {
+                layout = serde_json::json!({"Split": {
+                    "direction": "Horizontal", "ratio": 0.5, "first": layout,
+                    "second": {"Pane": pane}
+                }});
+                panes.insert(pane.to_string(), serde_json::json!({"cwd": project}));
+            }
+            serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [{"id": "w1", "custom_name": "deep", "identity_cwd": project,
+                    "tabs": [{"layout": layout, "panes": panes, "zoomed": false,
+                              "focused": 2, "root_pane": 1}]}]
+            })
+        },
+        "/bin/sh",
+    );
+
+    let pane_id = restored_agent(&socket_path, "deep")["pane_id"].clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let info = restore_request_with_params(
+            &socket_path,
+            "pane.process_info",
+            serde_json::json!({"pane_id": pane_id}),
+        );
+        if info.get("error").is_none() {
+            assert_eq!(info["result"]["process_info"]["pane_id"], pane_id);
+            break;
+        }
+        let agent = restored_agent(&socket_path, "deep");
+        assert!(
+            agent.get("restore_error").is_none() && agent["agent_status"] != "unknown",
+            "deferred resume failed in the zero-width pane: {agent}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent in the zero-width pane never got a process: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// When a deferred resume cannot start its shell, the agent must stop reporting the
+/// `idle` it was restored with: every API that names the pane has to agree that nothing
+/// runs there, so callers stop treating it as a live recipient.
+#[test]
+fn failed_deferred_agent_resume_reports_the_agent_as_unavailable() {
+    let (_herdr, socket_path) = start_agent_restore_server(
+        "resume-fail",
+        |project, session| {
+            serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [{"id": "w1", "custom_name": "ghost", "identity_cwd": project,
+                    "tabs": [{"layout": {"Pane": 1},
+                              "panes": {"1": omp_agent_pane(project, session, "ghost")},
+                              "zoomed": false, "focused": 1, "root_pane": 1}]}]
+            })
+        },
+        "/nonexistent/herdr-test-shell",
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let agent = loop {
+        let agent = restored_agent(&socket_path, "ghost");
+        if agent.get("restore_error").is_some() || agent["agent_status"] == "unknown" {
+            break agent;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a failed resume kept reporting a live agent: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(agent["agent_status"], "unknown", "{agent}");
+    let reason = agent["restore_error"].as_str().unwrap();
+    assert!(
+        reason.starts_with("Could not start the saved shell"),
+        "{agent}"
+    );
+
+    let pane_id = &agent["pane_id"];
+    assert_pane_reports_failed_restore(&socket_path, &agent, reason);
+
+    let info = restore_request_with_params(
+        &socket_path,
+        "pane.process_info",
+        serde_json::json!({"pane_id": pane_id}),
+    );
+    assert_eq!(info["error"]["code"], "pane_unavailable", "{info}");
+    assert!(
+        info["error"]["message"].as_str().unwrap().ends_with(reason),
+        "{info}"
+    );
+
+    let prompt = restore_request_with_params(
+        &socket_path,
+        "agent.prompt",
+        serde_json::json!({"target": "ghost", "text": "hello"}),
+    );
+    assert_eq!(prompt["error"]["code"], "agent_not_found", "{prompt}");
+    assert!(
+        prompt["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no running process"),
+        "{prompt}"
+    );
+}
+
+/// A named agent whose saved directory is gone is restored without ever detecting its
+/// agent, so the readiness guards alone would call it "not an active named agent". A
+/// prompt must instead fail the way `agent.list` and `pane.process_info` describe it:
+/// nothing runs there, and here is why.
+#[test]
+fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason() {
+    let (_herdr, socket_path) = start_agent_restore_server(
+        "resume-gone",
+        |project, session| {
+            let gone = project.join("deleted");
+            serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [{"id": "w1", "custom_name": "gone", "identity_cwd": project,
+                    "tabs": [{"layout": {"Pane": 1},
+                              "panes": {"1": omp_agent_pane(&gone, session, "gone")},
+                              "zoomed": false, "focused": 1, "root_pane": 1}]}]
+            })
+        },
+        "/bin/sh",
+    );
+
+    let agent = restored_agent(&socket_path, "gone");
+    assert_eq!(agent["agent_status"], "unknown", "{agent}");
+    let reason = agent["restore_error"].as_str().unwrap();
+    assert!(
+        reason.starts_with("Saved directory is unavailable"),
+        "{agent}"
+    );
+
+    assert_pane_reports_failed_restore(&socket_path, &agent, reason);
+    let prompt = restore_request_with_params(
+        &socket_path,
+        "agent.prompt",
+        serde_json::json!({"target": "gone", "text": "hello"}),
+    );
+    assert_eq!(prompt["error"]["code"], "agent_not_found", "{prompt}");
+    assert!(
+        prompt["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(reason),
+        "{prompt}"
+    );
+}
+
+/// Whenever a pane reports `agent_status: unknown` for a failed restore, every pane view
+/// must carry the same non-empty `restore_error` and terminal identity: gitmoot keys on
+/// the pane's `restore_error` in the session snapshot to fail deliveries visibly.
+fn assert_pane_reports_failed_restore(socket_path: &Path, agent: &serde_json::Value, reason: &str) {
+    assert!(!reason.is_empty());
+    let pane_id = &agent["pane_id"];
+    let get = restore_request_with_params(
+        socket_path,
+        "pane.get",
+        serde_json::json!({"pane_id": pane_id}),
+    );
+    let list = restore_request(socket_path, "pane.list");
+    let snapshot = restore_request(socket_path, "session.snapshot");
+    let find = |panes: &serde_json::Value| {
+        panes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pane| pane["pane_id"] == *pane_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("pane {pane_id} missing: {panes}"))
+    };
+    for (view, pane) in [
+        ("pane.get", get["result"]["pane"].clone()),
+        ("pane.list", find(&list["result"]["panes"])),
+        (
+            "session.snapshot",
+            find(&snapshot["result"]["snapshot"]["panes"]),
+        ),
+    ] {
+        assert_eq!(pane["terminal_id"], agent["terminal_id"], "{view}: {pane}");
+        assert_eq!(pane["agent_status"], "unknown", "{view}: {pane}");
+        assert_eq!(pane["restore_error"], reason, "{view}: {pane}");
+    }
+}

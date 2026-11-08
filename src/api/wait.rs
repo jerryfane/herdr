@@ -1081,6 +1081,7 @@ mod tests {
             account: None,
             account_config_dir: None,
             account_unresolved: false,
+            restore_error: None,
             terminal_id: "term_1".into(),
             name: Some("reviewer".into()),
             agent: Some("claude".into()),

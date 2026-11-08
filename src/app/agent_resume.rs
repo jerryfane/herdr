@@ -413,11 +413,19 @@ impl App {
         };
 
         if !cwd.is_dir() {
-            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                terminal.pending_agent_resume_plan = None;
-                terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());
-                terminal.revision = terminal.revision.saturating_add(1);
-            }
+            tracing::warn!(
+                pane = pane_id.raw(),
+                terminal = %terminal_id,
+                agent = %plan.agent,
+                cwd = %cwd.display(),
+                "saved directory is unavailable for deferred agent resume"
+            );
+            self.fail_pending_agent_resume(
+                pane_id,
+                &terminal_id,
+                "Saved directory is unavailable. Restore the directory and restart this session."
+                    .into(),
+            );
             return true;
         }
 
@@ -456,11 +464,11 @@ impl App {
                 ) {
                     return false;
                 }
-                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.pending_agent_resume_plan = None;
-                    terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
-                    terminal.revision = terminal.revision.saturating_add(1);
-                }
+                self.fail_pending_agent_resume(
+                    pane_id,
+                    &terminal_id,
+                    format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."),
+                );
                 return true;
             }
         };
@@ -501,6 +509,9 @@ impl App {
             // Ordinary restore/restart resumes retain the historical shell lifetime.
             terminal.respawn_shell_on_exit = transfer_resume;
             terminal.account_resume_blocked = None;
+            // A restart after a failed restore: the pane runs again, so the old reason no
+            // longer describes it.
+            terminal.restore_error = None;
         }
         self.mark_session_transfer_runtime_launched(&terminal_id, &plan.agent);
         // Say which account this pane actually came back on. Emitted AFTER the runtime is
@@ -513,6 +524,52 @@ impl App {
             cleared_conflicting_auth,
         );
         true
+    }
+
+    /// Give up on a deferred resume that cannot start: drop the plan, record why on the
+    /// terminal, and announce the pane so subscribers see it stop reporting its restored
+    /// state. While `restore_error` is set and no runtime exists, the pane reports
+    /// `agent_status: unknown` (see `App::reported_agent_state`).
+    fn fail_pending_agent_resume(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        terminal_id: &crate::terminal::TerminalId,
+        reason: String,
+    ) {
+        let ws_idx = self.find_pane(pane_id).map(|(ws_idx, _)| ws_idx);
+        let previous_status = ws_idx
+            .and_then(|ws_idx| self.pane_info(ws_idx, pane_id))
+            .map(|pane| pane.agent_status);
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.pending_agent_resume_plan = None;
+            terminal.restore_error = Some(reason);
+            terminal.revision = terminal.revision.saturating_add(1);
+        }
+        let Some(ws_idx) = ws_idx else {
+            return;
+        };
+        self.emit_pane_updated(ws_idx, pane_id);
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return;
+        };
+        if previous_status != Some(pane.agent_status) {
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                    pane_id: pane.pane_id,
+                    workspace_id: pane.workspace_id,
+                    agent_status: pane.agent_status,
+                    input_pending: pane.input_pending,
+                    input_prompt_kind: pane.input_prompt_kind,
+                    agent: pane.agent,
+                    title: pane.title,
+                    display_agent: pane.display_agent,
+                    state_labels: pane.state_labels,
+                    turn: pane.turn,
+                    turn_epoch: pane.turn_epoch,
+                },
+            });
+        }
     }
 }
 

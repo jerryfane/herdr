@@ -636,6 +636,12 @@ pub struct AgentInfo {
     /// re-registered.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub account_unresolved: bool,
+    /// Why this agent's pane could not be brought back after a restore, such as a saved
+    /// directory that no longer exists or a shell that failed to start. The same value as
+    /// `restore_error` on the pane's `PaneInfo`. While it is set and nothing runs in the
+    /// pane, `agent_status` is `unknown`, and prompts and process queries fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
     /// Present while an agent session is being moved between Claude Code and
     /// Codex, and retained with the final completed/rolled-back outcome until a
     /// later transfer replaces it.

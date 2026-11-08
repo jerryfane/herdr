@@ -173,7 +173,7 @@ macOS では、`pane.send_input`（`pane run` が使用）と `agent.start` は�
 
 `pane.layout` は、`workspace_id`、`tab_id`、`zoomed`、外側の `area`、`focused_pane_id`、ペインの矩形、分割の矩形/比率を含むタブレイアウトのスナップショットを返します。`pane.neighbor` と `pane.edges` は同じレイアウトスナップショットを含むので、クライアントは非公開のレイアウト状態なしに次の判断を下せます。
 
-`pane.process_info` は、ペインのシェル pid、利用可能な場合はフォアグラウンドプロセスグループ id、そしてプラットフォームが公開している場合は pid、名前、argv/cmdline、cwd を含むフォアグラウンドプロセスを返します。
+`pane.process_info` は、ペインのシェル pid、利用可能な場合はフォアグラウンドプロセスグループ id、そしてプラットフォームが公開している場合は pid、名前、argv/cmdline、cwd を含むフォアグラウンドプロセスを返します。ペインは存在するものの実行中のプロセスがない場合(復元に失敗した、またはエージェントの再開を待っているなど)は `pane_unavailable` で失敗し、`restore_error` があればメッセージにその理由が含まれます。`pane_not_found` はペイン自体が存在しないことを意味します。
 
 `layout.export` は移植可能なタブレイアウトツリーを返します。アクティブなタブをエクスポートするには `tab_id` と `pane_id` の両方を省略し、特定のタブなら `tab_id` を、そのペインを含むタブなら `pane_id` を渡します。
 
@@ -632,6 +632,8 @@ Herdr に保存されたネイティブセッション参照があるとき、`p
 ネイティブセッション参照が保存されていない場合、このフィールドは省略されます。
 
 `pane.get`、`pane.list`、`agent.get`、`agent.list` は、ペインの PTY を現在制御しているプロセスの cwd を解決できるときに `foreground_cwd` も公開します。既存の `cwd` フィールドは、ラベル、follow-cwd 挙動、復元されたセッション状態に使われるペイン/ワークスペースの cwd のままです。
+
+再起動後にペインを復元できない場合(保存されたディレクトリが消えた、シェルや遅延エージェント再開を起動できなかったなど)、`pane.get`、`pane.list`、`agent.get`、`agent.list` はペインとそのターミナル識別子を保持し、理由を `restore_error` として公開します。そのペインで何も実行されていない間、`agent_status` は保存時の状態ではなく `unknown` になり、`pane.process_info` は `pane_unavailable` で、`agent.prompt` は理由付きの `agent_not_found` で失敗します。エージェントを再起動して再び実行されると `restore_error` は消えます。
 
 `PaneInfo` と `AgentInfo` は、任意の `terminal_title` と `terminal_title_stripped` フィールドを公開します。`terminal_title` は、安全性のための正規化を行った最新の OSC 0/2 タイトルです。`terminal_title_stripped` は、先頭にある認識済みのアクティビティまたはスピナーのグリフ 1 つと、それに続く空白を除去します。これらはサーバーが所有する値で、コールドリスタートをまたいで保持されず、メタデータの `title` や意味的なエージェント状態から独立しています。
 

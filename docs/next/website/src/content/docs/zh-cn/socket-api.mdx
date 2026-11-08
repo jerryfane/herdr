@@ -173,7 +173,7 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
-`pane.process_info` 返回窗格的 shell pid、可用时的前台进程组 id,以及平台暴露时带有 pid、名称、argv/cmdline 和 cwd 的前台进程。
+`pane.process_info` 返回窗格的 shell pid、可用时的前台进程组 id,以及平台暴露时带有 pid、名称、argv/cmdline 和 cwd 的前台进程。窗格存在但没有正在运行的进程时(例如恢复失败,或其智能体仍在等待恢复),会以 `pane_unavailable` 失败;如有 `restore_error`,消息中会给出原因。`pane_not_found` 表示窗格本身不存在。
 
 `layout.export` 返回可移植的标签页布局树。省略 `tab_id` 和 `pane_id` 导出活动标签页,传 `tab_id` 导出该标签页,或传 `pane_id` 导出包含该窗格的标签页。
 
@@ -624,6 +624,8 @@ Herdr 存有原生会话引用时,`pane.get`、`pane.list`、`agent.get` 和 `ag
 没有存储原生会话引用时,该字段被省略。
 
 当 Herdr 能解析当前控制窗格 PTY 的进程的 cwd 时,`pane.get`、`pane.list`、`agent.get` 和 `agent.list` 也暴露 `foreground_cwd`。已有的 `cwd` 字段仍然是用于标签、follow-cwd 行为和恢复会话状态的窗格/工作区 cwd。
+
+当窗格在重启后无法恢复时(保存的目录已不存在,或其 shell 或延迟的智能体恢复无法启动),`pane.get`、`pane.list`、`agent.get` 和 `agent.list` 会保留该窗格及其终端标识,并以 `restore_error` 暴露原因。在该窗格中没有任何进程运行期间,其 `agent_status` 为 `unknown` 而不是保存时的状态,`pane.process_info` 以 `pane_unavailable` 失败,`agent.prompt` 以带原因的 `agent_not_found` 失败。重启智能体并再次运行后,`restore_error` 会被清除。
 
 `PaneInfo` 和 `AgentInfo` 暴露可选的 `terminal_title` 和 `terminal_title_stripped` 字段。`terminal_title` 是经过安全规范化的最新 OSC 0/2 标题。`terminal_title_stripped` 会移除开头一个已识别的活动或旋转指示符字形及其后的空白。这些值归服务器所有,冷重启后不会保留,并且独立于元数据 `title` 和语义智能体状态。
 
