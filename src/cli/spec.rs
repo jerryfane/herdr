@@ -194,7 +194,11 @@ fn server_command() -> Command {
     let command = Command::new("server")
         .about("Run or control the headless server")
         .subcommand(super::server::live_handoff_command())
-        .subcommand(Command::new("stop").about("Stop the running server"))
+        .subcommand(
+            Command::new("stop")
+                .about("Stop the running server")
+                .arg(force_stop_flag()),
+        )
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")
@@ -389,7 +393,8 @@ fn session_command() -> Command {
             Command::new("stop")
                 .about("Stop a session")
                 .arg(required("name", "NAME"))
-                .arg(json_flag()),
+                .arg(json_flag())
+                .arg(force_stop_flag()),
         )
         .subcommand(
             Command::new("delete")
@@ -441,6 +446,10 @@ fn integration_target_values() -> Vec<&'static str> {
 
 fn json_flag() -> Arg {
     flag("json")
+}
+
+fn force_stop_flag() -> Arg {
+    flag("force").help("Stop it even when it hosts the pane this runs in")
 }
 
 fn help_flag() -> Arg {

@@ -39,6 +39,7 @@ mod server;
 mod server_not_running;
 mod spec;
 mod status;
+mod stop_guard;
 pub(crate) mod tab;
 mod target;
 mod title;
@@ -501,11 +502,24 @@ fn session_list(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn session_stop(args: &[String]) -> std::io::Result<i32> {
-    let (name, json) =
-        match parse_session_name_and_json(args, "usage: herdr session stop <name> [--json]") {
-            Ok(parsed) => parsed,
-            Err(code) => return Ok(code),
-        };
+    let options_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let force = args[..options_end].iter().any(|arg| arg == "--force");
+    let args: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(index, arg)| *index >= options_end || *arg != "--force")
+        .map(|(_, arg)| arg.clone())
+        .collect();
+    let (name, json) = match parse_session_name_and_json(
+        &args,
+        "usage: herdr session stop <name> [--json] [--force]",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
 
     let target = match crate::session::parse_target_name(&name) {
         Ok(target) => target,
@@ -514,6 +528,19 @@ fn session_stop(args: &[String]) -> std::io::Result<i32> {
             return Ok(1);
         }
     };
+    if let Err(message) = stop_guard::check(
+        &crate::session::api_socket_path_for(target.as_deref()),
+        &format!(
+            "from session name {}",
+            target
+                .as_deref()
+                .unwrap_or(crate::session::DEFAULT_SESSION_NAME)
+        ),
+        force,
+    ) {
+        print_session_error("stop_refused_hosting_server", &message);
+        return Ok(1);
+    }
     match crate::session::stop_session(target.as_deref()) {
         Ok(session) => {
             if json {
@@ -1026,9 +1053,10 @@ fn print_session_help() {
     eprintln!("herdr session commands:");
     eprintln!("  herdr session list [--json]");
     eprintln!("  herdr session attach <name>");
-    eprintln!("  herdr session stop <name> [--json]");
+    eprintln!("  herdr session stop <name> [--json] [--force]");
     eprintln!("  herdr session delete <name> [--json]");
     eprintln!("  use 'default' as <name> to target the default session for stop");
+    eprintln!("  inside a pane, stop refuses the session hosting it unless --force is given");
 }
 
 fn _print_json<T: Serialize>(value: &T) {

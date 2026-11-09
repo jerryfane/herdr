@@ -10,5 +10,6 @@ mod plugins;
 mod protocol;
 mod protocol_guard;
 mod sessions;
+mod stop_guard;
 mod surface;
 mod workspace;

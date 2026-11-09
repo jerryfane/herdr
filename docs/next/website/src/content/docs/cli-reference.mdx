@@ -124,7 +124,7 @@ compinit
 
 ```bash
 herdr server
-herdr server stop
+herdr server stop [--force]
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
@@ -133,6 +133,8 @@ herdr server reload-agent-manifests
 
 `herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
 The `submit-verify` column (and `submission_verification_supported` in `--json`) reports whether each active manifest declares `[composer]`. It does not guarantee that a particular pane is observable at runtime.
+
+Inside a Herdr pane, `server stop` refuses to stop the server that hosts that pane and names the socket it would have stopped and how it chose it (`--session`, an inherited `HERDR_SOCKET_PATH`, `HERDR_SESSION`, or the default). A pane inherits `HERDR_SOCKET_PATH` from its server, so a plain `herdr server stop` in a pane targets the pane's own server. Pass `--force` to stop it anyway. Stopping a different server from a pane, and any stop outside a pane, work as before.
 
 ## Notifications
 
@@ -186,11 +188,11 @@ A guest's app can keep one encrypted session for its calls instead of reconnecti
 ```bash
 herdr session list [--json]
 herdr session attach <name>
-herdr session stop <name> [--json]
+herdr session stop <name> [--json] [--force]
 herdr session delete <name> [--json]
 ```
 
-Use `default` as the session name when you need to stop the default session explicitly.
+Use `default` as the session name when you need to stop the default session explicitly. Like `server stop`, `session stop` run inside a pane refuses to stop the session that hosts that pane unless you pass `--force`.
 
 ## Workspaces
 

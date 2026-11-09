@@ -2086,6 +2086,18 @@ fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &Proces
     false
 }
 
+/// Whether this process is `ancestor_pid` or descends from it. `None` when the
+/// process snapshot does not include this process.
+pub(crate) fn current_process_descends_from(ancestor_pid: u32) -> Option<bool> {
+    let current = std::process::id();
+    if current == ancestor_pid {
+        return Some(true);
+    }
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    snapshot.entry(current)?;
+    Some(process_is_ancestor(ancestor_pid, current, &snapshot))
+}
+
 fn descendant_entries(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<&WindowsProcessEntry> {
     let mut output = Vec::new();
     let mut queue = VecDeque::new();

@@ -36,15 +36,25 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
 }
 
 fn server_stop(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: herdr server stop");
-        return Ok(2);
-    }
+    let force = match args {
+        [] => false,
+        [flag] if flag == "--force" => true,
+        _ => {
+            eprintln!("usage: herdr server stop [--force]");
+            return Ok(2);
+        }
+    };
 
     if super::target::is_remote() {
         return super::send_ok_request(Method::ServerStop(EmptyParams::default()));
     }
 
+    let socket_path = crate::session::active_api_socket_path();
+    let socket_source = crate::session::active_api_socket_source();
+    if let Err(err) = super::stop_guard::check(&socket_path, &socket_source, force) {
+        eprintln!("{err}");
+        return Ok(1);
+    }
     match crate::session::stop_active_server() {
         Ok(()) => Ok(0),
         Err(err) => {
@@ -274,7 +284,7 @@ fn print_server_help() {
     eprintln!("  herdr server                run as headless server");
     #[cfg(windows)]
     eprintln!("  herdr server --allow-unelevated-clients  allow ordinary same-account clients to control an elevated server");
-    eprintln!("  herdr server stop           stop the running server via the API socket");
+    eprintln!("  herdr server stop [--force]  stop the running server via the API socket; --force also stops the server hosting this pane");
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");
     eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
