@@ -261,6 +261,74 @@ impl App {
             .collect()
     }
 
+    /// Runs [`Self::follow_recreated_guest_agents`] once after terminals,
+    /// agents or their sessions changed (and once at startup). The server
+    /// loop calls it on every pass; changes since the last pass share one run.
+    #[cfg(unix)]
+    pub(crate) fn follow_recreated_guest_agents_if_changed(&mut self) {
+        if std::mem::take(&mut self.state.agents_changed) {
+            self.follow_recreated_guest_agents();
+        }
+    }
+
+    /// A guest grant whose terminal is gone follows its agent's harness
+    /// session to the one terminal now holding it, as when the owner recreated
+    /// the agent with `herdr agent start` (see
+    /// [`crate::guest::follow_recreated_agents`]). Every terminal holding a
+    /// session counts, archived ones too; only a live local agent takes the
+    /// grant.
+    #[cfg(unix)]
+    fn follow_recreated_guest_agents(&self) {
+        let mut panes = std::collections::HashMap::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    if let Some(terminal_id) = tab.terminal_id(pane_id) {
+                        panes.insert(terminal_id.as_str(), (ws_idx, pane_id));
+                    }
+                }
+            }
+        }
+        let live = self
+            .state
+            .terminals
+            .iter()
+            .filter_map(|(terminal_id, terminal)| {
+                let session = super::creation::terminal_agent_session_info(terminal)?;
+                let agent = panes
+                    .get(terminal_id.as_str())
+                    .and_then(|&(ws_idx, pane_id)| self.agent_info(ws_idx, pane_id))
+                    .filter(|agent| {
+                        agent.machine_id.is_none()
+                            && agent.archived.is_none()
+                            && agent.session_transfer.is_none()
+                    });
+                Some(crate::guest::SessionHolder {
+                    terminal_id: terminal_id.to_string(),
+                    session,
+                    kind: agent.as_ref().and_then(|agent| agent.agent.clone()),
+                    name: agent.and_then(|agent| agent.name),
+                })
+            });
+        let archived =
+            self.state
+                .archived_agents
+                .iter()
+                .map(|record| crate::guest::SessionHolder {
+                    terminal_id: record.terminal_id.clone(),
+                    session: crate::api::schema::AgentSessionInfo {
+                        source: record.agent_session.source.clone(),
+                        agent: record.agent_session.agent.clone(),
+                        kind: record.agent_session.kind,
+                        value: record.agent_session.value.clone(),
+                    },
+                    kind: None,
+                    name: None,
+                });
+        let holders: Vec<_> = live.chain(archived).collect();
+        crate::guest::follow_recreated_agents(&self.agent_groups_terminals(), &holders);
+    }
+
     /// The agent in `terminal_id` took `name` without a rename (started or
     /// unarchived with it): a clear another terminal remembered for that name
     /// must not carry this agent's folder and star away.

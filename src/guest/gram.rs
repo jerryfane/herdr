@@ -28,6 +28,7 @@ pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
     visible_in(
         &guest.grant,
         &guest.former_names,
+        &guest.former_terminals,
         guest.created_ms,
         &guest.name,
         item,
@@ -39,6 +40,7 @@ pub(crate) fn visible_to(guest: &store::GuestRecord, item: &GramItem) -> bool {
     visible_in(
         &guest.grant,
         &guest.former_names,
+        &guest.former_terminals,
         guest.created_ms,
         &guest.name,
         item,
@@ -48,6 +50,7 @@ pub(crate) fn visible_to(guest: &store::GuestRecord, item: &GramItem) -> bool {
 fn visible_in(
     grant: &crate::api::schema::GuestGrantInfo,
     former_names: &[store::FormerName],
+    former_terminals: &[store::FormerTerminal],
     created_ms: u64,
     name: &str,
     item: &GramItem,
@@ -63,8 +66,17 @@ fn visible_in(
                 .any(|former| former.name == agent && item.created_unix_ms < former.until_ms)
     };
     match item.direction {
+        // Sent from the agent's terminal, or from one it left after this Gram.
         GramDirection::AgentToOwner => {
-            names_agent(&item.from) && super::sent_from_grant(grant, item.sender.as_ref())
+            let sender = item.sender.as_ref();
+            names_agent(&item.from)
+                && (super::sent_from_grant(grant, sender)
+                    || super::sent_from_former_terminal(
+                        grant,
+                        former_terminals,
+                        item.created_unix_ms,
+                        sender,
+                    ))
         }
         GramDirection::OwnerToAgent => {
             item.to.as_deref().is_some_and(names_agent) && item.from == super::post_from(name)

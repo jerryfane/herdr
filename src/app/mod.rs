@@ -634,6 +634,9 @@ impl App {
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
+            // Restored or handed-over agents: grants whose terminal did not
+            // come back follow them on the first scheduled pass.
+            agents_changed: true,
             terminal_runtime_shutdowns: Vec::new(),
             archived_agents: restored_archived_agents,
         };
