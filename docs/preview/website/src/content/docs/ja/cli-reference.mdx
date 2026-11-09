@@ -120,7 +120,7 @@ compinit
 
 ```bash
 herdr server
-herdr server stop
+herdr server stop [--force]
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
@@ -130,6 +130,7 @@ herdr server reload-agent-manifests
 `herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
 `submit-verify` 列（`--json` では `submission_verification_supported`）は、現在有効なマニフェストに `[composer]` があるかを示します。個々のペインで実際に観測できることまでは保証しません。
 
+Herdr のペイン内では、`server stop` はそのペインをホストしているサーバーの停止を拒否し、停止しようとしたソケットと、それをどう選んだか（`--session`、継承した `HERDR_SOCKET_PATH`、`HERDR_SESSION`、またはデフォルト）を表示します。ペインはサーバーから `HERDR_SOCKET_PATH` を継承するので、ペイン内でそのまま `herdr server stop` を実行すると、そのペイン自身のサーバーが対象になります。それでも停止するときは `--force` を渡してください。ペインから別のサーバーを停止する場合や、ペインの外で停止する場合はこれまでどおり動作します。
 
 ## 通知
 
@@ -181,11 +182,11 @@ herdr guest log [<guest-id>] [--limit N]          # アクティビティ(新し
 ```bash
 herdr session list [--json]
 herdr session attach <name>
-herdr session stop <name> [--json]
+herdr session stop <name> [--json] [--force]
 herdr session delete <name> [--json]
 ```
 
-デフォルトセッションを明示的に停止する必要があるときは、セッション名として `default` を使ってください。
+デフォルトセッションを明示的に停止する必要があるときは、セッション名として `default` を使ってください。`server stop` と同様に、ペイン内で実行した `session stop` は、そのペインをホストしているセッションの停止を `--force` なしでは拒否します。
 
 ## ワークスペース
 

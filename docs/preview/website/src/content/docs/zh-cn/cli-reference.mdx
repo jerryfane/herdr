@@ -120,7 +120,7 @@ compinit
 
 ```bash
 herdr server
-herdr server stop
+herdr server stop [--force]
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
@@ -130,6 +130,7 @@ herdr server reload-agent-manifests
 `herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
 `submit-verify` 列（`--json` 中为 `submission_verification_supported`）表示当前生效的清单是否声明了 `[composer]`，但不保证某个窗格在运行时一定可观察。
 
+在 Herdr 窗格内,`server stop` 会拒绝停止托管该窗格的服务器,并给出它本要停止的套接字以及选择方式(`--session`、继承的 `HERDR_SOCKET_PATH`、`HERDR_SESSION` 或默认值)。窗格会从服务器继承 `HERDR_SOCKET_PATH`,所以在窗格里直接运行 `herdr server stop` 会指向该窗格自己的服务器。仍要停止时加 `--force`。从窗格停止另一个服务器,以及在窗格外停止,行为不变。
 
 ## 通知
 
@@ -181,11 +182,11 @@ herdr guest log [<guest-id>] [--limit N]          # 活动记录,最新在前
 ```bash
 herdr session list [--json]
 herdr session attach <name>
-herdr session stop <name> [--json]
+herdr session stop <name> [--json] [--force]
 herdr session delete <name> [--json]
 ```
 
-需要显式停止默认会话时,把会话名写成 `default`。
+需要显式停止默认会话时,把会话名写成 `default`。与 `server stop` 一样,在窗格内运行的 `session stop` 不加 `--force` 时会拒绝停止托管该窗格的会话。
 
 ## 工作区
 
