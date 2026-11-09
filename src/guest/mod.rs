@@ -281,6 +281,32 @@ pub(crate) fn follow_rename(terminal_id: &str, old: Option<&str>, new: &str, kin
     }
 }
 
+/// The agent `name` of kind `kind` in `terminal_id` sends a Gram from
+/// harness session `session`, as this machine sees it run there. A guest
+/// grant that followed this agent to that terminal takes the session first,
+/// so its Gram (and a relayed Gram's copy) is the guest's at once after the
+/// agent restarted there, not only once the guest probed it (#387-f2).
+pub(crate) fn note_sending_session(
+    terminal_id: &str,
+    name: Option<&str>,
+    kind: Option<&str>,
+    session: Option<&crate::api::schema::AgentSessionInfo>,
+) {
+    let (Some(name), Some(kind), Some(session)) = (name, kind, session) else {
+        return;
+    };
+    let dir = store::guest_dir();
+    // No guest was ever invited here: leave the guest directory alone.
+    if !dir.join("guests.json").exists() {
+        return;
+    }
+    match store::note_terminal_session(&dir, terminal_id, name, kind, session) {
+        Ok(true) => notify_changes(),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "guest grant session record failed"),
+    }
+}
+
 /// A terminal holding an agent session, as this server sees it now.
 pub(crate) struct SessionHolder {
     pub terminal_id: String,

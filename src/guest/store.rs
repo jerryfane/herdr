@@ -465,6 +465,46 @@ pub(crate) fn update_grant_session(
     })
 }
 
+/// The granted agent (this terminal, name and kind) runs `session` in a
+/// terminal its grant followed it to: that session's Grams are the agent's
+/// for every active guest and pending invite holding it there. Grants in the
+/// terminal the guest accepted keep every session already. Returns whether
+/// anything changed.
+pub(crate) fn note_terminal_session(
+    dir: &Path,
+    terminal_id: &str,
+    name: &str,
+    kind: &str,
+    session: &AgentSessionInfo,
+) -> io::Result<bool> {
+    let holds = |grant: &GuestGrantInfo, sessions: &[AgentSessionInfo]| {
+        !sessions.is_empty()
+            && !sessions.contains(session)
+            && super::grant_names(grant, terminal_id, Some(name), kind)
+    };
+    update_store(dir, |store| {
+        let mut changed = false;
+        for guest in store
+            .guests
+            .iter_mut()
+            .filter(|guest| !guest.revoked && holds(&guest.grant, &guest.terminal_sessions))
+        {
+            guest.terminal_sessions.push(session.clone());
+            changed = true;
+        }
+        let now = now_ms();
+        for invite in store
+            .invites
+            .iter_mut()
+            .filter(|invite| invite.pending(now) && holds(&invite.grant, &invite.terminal_sessions))
+        {
+            invite.terminal_sessions.push(session.clone());
+            changed = true;
+        }
+        (changed, changed)
+    })
+}
+
 /// The active grant of this guest as stored now.
 pub(crate) fn active_grant(dir: &Path, guest_id: &str) -> Option<GuestGrantInfo> {
     active_record(dir, guest_id).map(|guest| guest.grant)

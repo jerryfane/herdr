@@ -1005,17 +1005,27 @@ impl App {
             .or_else(|| self.public_pane_id(ws_idx, pane_id))
     }
 
-    /// The terminal and agent kind behind a caller pane, recorded on the Gram
-    /// it sends so a guest's view follows the agent, not a reusable name.
+    /// The terminal, agent kind and harness session behind a caller pane,
+    /// recorded on the Gram it sends so a guest's view follows the agent, not
+    /// a reusable name. A guest grant that followed the agent to this
+    /// terminal takes the session before the Gram is stored.
     fn caller_sender(&self, caller_pane_id: &str) -> Option<crate::persist::gram::GramSender> {
         let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         let terminal = self.state.terminals.get(terminal_id)?;
-        Some(crate::persist::gram::GramSender {
+        let sender = crate::persist::gram::GramSender {
             terminal_id: terminal_id.to_string(),
             agent: terminal.effective_agent_label().map(str::to_string),
             session: crate::app::creation::terminal_agent_session_info(terminal),
-        })
+        };
+        #[cfg(unix)]
+        crate::guest::note_sending_session(
+            &sender.terminal_id,
+            terminal.agent_name.as_deref(),
+            sender.agent.as_deref(),
+            sender.session.as_ref(),
+        );
+        Some(sender)
     }
 
     /// Whether some live terminal has this exact unique agent name. Used to reject

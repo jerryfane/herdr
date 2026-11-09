@@ -1536,6 +1536,12 @@ pub(super) fn after_relayed_gram(
         .filter(|before| before.terminal_id == agent.terminal_id)
         .and_then(|before| before.session)
         .filter(|before| agent.agent_session.as_ref() == Some(before));
+    crate::guest::note_sending_session(
+        &agent.terminal_id,
+        Some(&local),
+        agent.agent.as_deref(),
+        session.as_ref(),
+    );
     let sender = crate::persist::gram::GramSender {
         terminal_id: agent.terminal_id,
         agent: agent.agent,
