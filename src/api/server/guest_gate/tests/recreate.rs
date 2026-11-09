@@ -133,6 +133,91 @@ fn a_guest_keeps_its_agent_recreated_in_a_new_terminal() {
     assert_eq!(texts(&listed), ["agent after", "agent before"], "{listed}");
 }
 
+/// An agent's Gram from `pane` carrying a file holding `hello`.
+fn send_file_from(harness: &Harness, pane: &str, from: &str, name: &str) -> String {
+    let upload = format!("up-{name}");
+    let staged = owner(
+        harness,
+        json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
+    );
+    assert_eq!(staged["result"]["type"], "ok", "{staged}");
+    sent_id(&owner(
+        harness,
+        json!({"id": "s", "method": "gram.send", "params": {"text": name, "from": from, "caller_pane_id": pane, "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
+    ))
+}
+
+/// #387-f1: the terminal a grant follows to may have run another
+/// conversation first, under the granted name. Its Grams and files from
+/// before the grant arrived stay hidden from the guest; the agent's Grams
+/// from its old terminal and from the new one since the move are the guest's.
+#[test]
+fn grams_the_new_terminal_sent_before_the_grant_moved_stay_private() {
+    let _config = ConfigHome::new("recreate-private");
+    let harness = start_renaming("recreate-private");
+    let tick = || std::thread::sleep(Duration::from_millis(5));
+    let admitted = harness.admit_with(0, true);
+    server_pass(&harness);
+    send_file_from(&harness, &harness.pane_ids[0], "llm-opt", "before.txt");
+    tick();
+
+    // The granted terminal is gone; agent 1's terminal runs another
+    // conversation under the granted name, so the grant stays.
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-private", false);
+    tick();
+    let pane = harness.pane_ids[1].clone();
+    send_gram_as(&harness, Some(pane.clone()), "llm-opt", "private");
+    let private_file = send_file_from(&harness, &pane, "llm-opt", "private.txt");
+    tick();
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id).grant,
+        admitted.grant
+    );
+
+    // That terminal resumes the granted session: the grant follows.
+    let (done_tx, done_rx) = std_mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut App| {
+            let pane = app.state.workspaces[1].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("session-0").unwrap(),
+            });
+            app.state.mark_session_dirty();
+            app.follow_recreated_guest_agents_if_changed();
+            let _ = done_tx.send(());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    tick();
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id)
+            .grant
+            .terminal_id,
+        recreated
+    );
+    let after_file = send_file_from(&harness, &pane, "llm-opt", "after.txt");
+
+    let (guest, _) = readmit(&harness, &admitted);
+    let listed = guest_list(&harness, &guest, json!({}));
+    assert_eq!(texts(&listed), ["after.txt", "before.txt"], "{listed}");
+    let fetch = |id: &str| {
+        harness.call(
+            &guest,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
+        )
+    };
+    let refused = fetch(&private_file);
+    assert_eq!(code(&refused), "guest_forbidden", "{refused:?}");
+    assert_eq!(fetch(&after_file)[0]["result"]["data_base64"], "aGVsbG8=");
+}
+
 /// A guest never reaches another conversation: an agent recreated under
 /// the granted name but on another harness session gets no grant.
 #[test]

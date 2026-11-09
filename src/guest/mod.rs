@@ -96,6 +96,8 @@ pub struct GuestPrincipal {
     pub(crate) former_names: Vec<store::FormerName>,
     /// Terminals the agent ran in before it was recreated in another one.
     pub(crate) former_terminals: Vec<store::FormerTerminal>,
+    /// Since when the grant's terminal holds the agent, once it moved there.
+    pub(crate) terminal_since_ms: Option<u64>,
 }
 
 impl GuestPrincipal {
@@ -109,6 +111,7 @@ impl GuestPrincipal {
             created_ms: record.created_ms,
             former_names: record.former_names.clone(),
             former_terminals: record.former_terminals.clone(),
+            terminal_since_ms: record.terminal_since_ms,
         }
     }
 
@@ -221,24 +224,34 @@ pub(crate) fn sent_from_grant(
     })
 }
 
-/// The recorded sender is a terminal the granted agent left when it was
-/// recreated (see [`follow_recreated_agents`]), with the grant's kind, and
-/// the Gram is from before it left.
-pub(crate) fn sent_from_former_terminal(
+/// A Gram created at `created_ms` was sent by the granted agent: from the
+/// grant's terminal since the agent holds it (`terminal_since_ms`, see
+/// [`follow_recreated_agents`]), or from a terminal it left while it held
+/// that one, with the grant's kind. A terminal's Grams from before the agent
+/// came there were another conversation's.
+pub(crate) fn sent_while_granted(
     grant: &GuestGrantInfo,
+    terminal_since_ms: Option<u64>,
     former_terminals: &[store::FormerTerminal],
     created_ms: u64,
     sender: Option<&crate::persist::gram::GramSender>,
 ) -> bool {
-    sender.is_some_and(|sender| {
-        sender
-            .agent
-            .as_deref()
-            .is_some_and(|kind| same_kind(kind, grant.kind()))
-            && former_terminals.iter().any(|former| {
-                former.terminal_id == sender.terminal_id && created_ms < former.until_ms
-            })
-    })
+    let Some(sender) = sender else {
+        return false;
+    };
+    if !sender
+        .agent
+        .as_deref()
+        .is_some_and(|kind| same_kind(kind, grant.kind()))
+    {
+        return false;
+    }
+    if sender.terminal_id == grant.terminal_id {
+        return terminal_since_ms.is_none_or(|since| since <= created_ms);
+    }
+    former_terminals
+        .iter()
+        .any(|former| former.terminal_id == sender.terminal_id && former.held_at(created_ms))
 }
 
 /// The owner renamed the agent in `terminal_id` from `old` to `new`. Its

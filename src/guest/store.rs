@@ -278,6 +278,11 @@ pub(crate) struct GuestRecord {
     /// one, so the guest's Gram from before that stays visible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_terminals: Vec<FormerTerminal>,
+    /// Since when the grant's terminal holds the granted agent, set when the
+    /// grant followed the agent there: that terminal's earlier Grams belong
+    /// to another conversation. `None`: the terminal the guest accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_since_ms: Option<u64>,
 }
 
 /// A name the granted agent gave up in a rename. It names the agent only in
@@ -289,11 +294,22 @@ pub(crate) struct FormerName {
 }
 
 /// A terminal the granted agent left when it was recreated in another one.
-/// Its Grams count as the agent's only when created before `until_ms`.
+/// Its Grams count as the agent's only when created while it held the
+/// agent: from `since_ms` (`None`: the terminal the guest accepted) until
+/// `until_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FormerTerminal {
     pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
     pub until_ms: u64,
+}
+
+impl FormerTerminal {
+    /// A Gram created at `created_ms` in this terminal was the agent's.
+    pub(crate) fn held_at(&self, created_ms: u64) -> bool {
+        self.since_ms.is_none_or(|since| since <= created_ms) && created_ms < self.until_ms
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,6 +571,7 @@ pub(crate) fn rebind_grants<'a>(
             let from = std::mem::replace(&mut guest.grant.terminal_id, holder.terminal_id.clone());
             guest.former_terminals.push(FormerTerminal {
                 terminal_id: from.clone(),
+                since_ms: guest.terminal_since_ms.replace(now),
                 until_ms: now,
             });
             if let Some(name) = holder.name.as_deref() {
@@ -853,6 +870,7 @@ pub(crate) fn admit_in(
             share_gram: invite.share_gram,
             former_names: Vec::new(),
             former_terminals: Vec::new(),
+            terminal_since_ms: None,
         };
         store.invites[index].used_by = Some(guest_id);
         let short = store.invites[index].short.take();
