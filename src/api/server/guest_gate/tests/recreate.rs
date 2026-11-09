@@ -322,6 +322,12 @@ fn relay_file(harness: &Harness, index: usize, name: &str) -> String {
 /// Agent 1's terminal resumes the granted agent's session `session-0`, and
 /// the server loop passes.
 fn resume_granted_session_in_agent_1(harness: &Harness) {
+    agent_1_runs_session(harness, "session-0");
+}
+
+/// Agent 1's terminal now runs harness session `session`, and the server
+/// loop passes.
+fn agent_1_runs_session(harness: &Harness, session: &'static str) {
     let (done_tx, done_rx) = std_mpsc::channel();
     harness
         .control
@@ -334,7 +340,7 @@ fn resume_granted_session_in_agent_1(harness: &Harness) {
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "herdr".into(),
                 agent: "pi".into(),
-                session_ref: crate::agent_resume::AgentSessionRef::id("session-0").unwrap(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session).unwrap(),
             });
             app.state.mark_session_dirty();
             app.follow_recreated_guest_agents_if_changed();
@@ -406,4 +412,93 @@ fn relayed_grams_follow_the_session_with_the_coordinator_clock_ahead() {
 #[test]
 fn relayed_grams_follow_the_session_with_the_coordinator_clock_behind() {
     relayed_grams_follow_the_session_not_the_clock("recreate-relay-behind", -200);
+}
+
+/// The harness session `session-restarted` of the granted `pi` agent.
+fn restarted_session() -> crate::api::schema::AgentSessionInfo {
+    serde_json::from_value(
+        json!({"source": "herdr", "agent": "pi", "kind": "id", "value": "session-restarted"}),
+    )
+    .unwrap()
+}
+
+/// #387-f2: after the grant followed its agent to a new terminal, the agent
+/// restarts there on a new harness session and sends a Gram with a file
+/// before the guest asks for anything. The server records that session on
+/// the grant when the Gram is sent, and the guest sees the Gram and its file.
+#[test]
+fn a_moved_agent_restarted_on_a_new_session_keeps_its_grams_for_the_guest() {
+    let _config = ConfigHome::new("recreate-restart");
+    let harness = start_renaming("recreate-restart");
+    let admitted = harness.admit_with(0, true);
+    server_pass(&harness);
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-0", false);
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id)
+            .grant
+            .terminal_id,
+        recreated
+    );
+
+    agent_1_runs_session(&harness, "session-restarted");
+    let restarted = send_file_from(&harness, &harness.pane_ids[1], "llm-opt", "restarted.txt");
+    assert!(
+        stored_record(&harness, &admitted.guest_id)
+            .terminal_sessions
+            .contains(&restarted_session()),
+        "the send recorded the restarted session before any guest request"
+    );
+
+    let (guest, _) = readmit(&harness, &admitted);
+    let listed = guest_list(&harness, &guest, json!({}));
+    assert_eq!(texts(&listed), ["restarted.txt"], "{listed}");
+    let fetched = harness.call(
+        &guest,
+        json!({"id": "f", "method": "gram.get_file", "params": {"id": restarted}}),
+    );
+    assert_eq!(
+        fetched[0]["result"]["data_base64"], "aGVsbG8=",
+        "{fetched:?}"
+    );
+}
+
+/// #387-f2 on a Gram-relay remote: the restarted agent's relayed Gram is
+/// recorded and mirrored for the guest when it is sent, so the guest lists it
+/// across reconciliation with the coordinator and opens its file.
+#[test]
+fn a_moved_agent_restarted_on_a_new_session_keeps_its_relayed_grams_for_the_guest() {
+    let (_config, harness, coordinator) = relay_remote("recreate-relay-restart");
+    let admitted = harness.admit_with(0, true);
+    server_pass(&harness);
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-0", false);
+    coordinator.names(&harness.pane_ids[1], "mac-studio/llm-opt");
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id)
+            .grant
+            .terminal_id,
+        recreated
+    );
+
+    agent_1_runs_session(&harness, "session-restarted");
+    let restarted = relay_file(&harness, 1, "restarted.txt");
+    assert!(
+        stored_record(&harness, &admitted.guest_id)
+            .terminal_sessions
+            .contains(&restarted_session()),
+        "the relayed send recorded the restarted session before any guest request"
+    );
+
+    let (guest, _) = readmit(&harness, &admitted);
+    for _ in 0..2 {
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["restarted.txt"], "{listed}");
+    }
+    let fetched = harness.call(
+        &guest,
+        json!({"id": "f", "method": "gram.get_file", "params": {"id": restarted}}),
+    );
+    assert_eq!(
+        fetched[0]["result"]["data_base64"], "aGVsbG8=",
+        "{fetched:?}"
+    );
 }
