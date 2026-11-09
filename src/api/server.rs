@@ -1629,11 +1629,12 @@ fn handle_principal_connection(
     // gateway stamps the pinned machine alias; TCP federation never enters here.
     #[cfg(unix)]
     if federation.is_none() {
+        let sent_from = guest_gate::before_relayed_gram(&request, api_tx);
         if let Some(response) = crate::api::reverse::forward_local(&request) {
             let written = write_text_line_allow_disconnect(&mut stream, &response);
             // The coordinator keeps the Gram; the guests of the sending agent
             // on this machine get their own copy.
-            guest_gate::after_relayed_gram(&request, &response, api_tx);
+            guest_gate::after_relayed_gram(&request, &response, api_tx, sent_from);
             return written;
         }
     }

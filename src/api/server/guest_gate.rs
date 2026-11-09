@@ -1484,7 +1484,12 @@ fn mirrored_file(
 /// the owner's notifications stay with the coordinator.
 ///
 /// A relayed `gram.delete` that the coordinator accepted drops the copy too.
-pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &ApiRequestSender) {
+pub(super) fn after_relayed_gram(
+    request: &Request,
+    response: &str,
+    api_tx: &ApiRequestSender,
+    sent_from: Option<RelaySender>,
+) {
     // No guest was ever invited here: leave the guest directory alone.
     let dir = crate::guest::store::guest_dir();
     if !dir.join("guests.json").exists() {
@@ -1524,15 +1529,61 @@ pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &Api
     let Some(local) = agent.name else {
         return;
     };
+    // The session this machine saw the pane run before the coordinator
+    // accepted the Gram, and still runs now; otherwise none (see
+    // `GramSender::session`). The coordinator's clock decides nothing here.
+    let session = sent_from
+        .filter(|before| before.terminal_id == agent.terminal_id)
+        .and_then(|before| before.session)
+        .filter(|before| agent.agent_session.as_ref() == Some(before));
+    crate::guest::note_sending_session(
+        &agent.terminal_id,
+        Some(&local),
+        agent.agent.as_deref(),
+        session.as_ref(),
+    );
     let sender = crate::persist::gram::GramSender {
         terminal_id: agent.terminal_id,
         agent: agent.agent,
+        session,
     };
     if let Some(item) = mirror_relayed(&dir, response, pane, &local, Some(sender)) {
         let cfg = crate::config::Config::load().config.push;
         // The guest's copy names the agent as this machine does: no machine label.
         crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item, None)]);
     }
+}
+
+/// The terminal and harness session behind a relayed `gram.send`'s pane
+/// before it leaves this machine.
+pub(super) struct RelaySender {
+    terminal_id: String,
+    session: Option<crate::api::schema::AgentSessionInfo>,
+}
+
+/// Witness the sending pane's terminal and session before a `gram.send` is
+/// relayed to the coordinator, when guests are kept here; see
+/// [`after_relayed_gram`].
+pub(super) fn before_relayed_gram(
+    request: &Request,
+    api_tx: &ApiRequestSender,
+) -> Option<RelaySender> {
+    let Method::GramSend(params) = &request.method else {
+        return None;
+    };
+    let pane = params.caller_pane_id.as_deref()?;
+    if crate::api::gram_relay::policy().remote_socket().is_none()
+        || !crate::guest::store::guest_dir()
+            .join("guests.json")
+            .exists()
+    {
+        return None;
+    }
+    let agent = probe_target(api_tx, None, Some(pane)).ok()?.agent?;
+    Some(RelaySender {
+        terminal_id: agent.terminal_id,
+        session: agent.agent_session,
+    })
 }
 
 /// Most pages of the agent's coordinator Gram one check reads.
@@ -5532,6 +5583,8 @@ mod tests {
         posts: Vec<Value>,
         /// Relayed `gram.list` calls answered.
         lists: usize,
+        /// Added to this coordinator's clock for the Grams it stores.
+        skew_ms: i64,
     }
 
     /// A coordinator behind the production gateway (`serve_one`) that answers
@@ -5541,6 +5594,8 @@ mod tests {
     /// and so the name its Gram stores. It serves files 3 bytes per chunk.
     struct Coordinator {
         state: Arc<Mutex<CoordinatorState>>,
+        /// The roster name of each remote pane.
+        names: Arc<Mutex<HashMap<String, &'static str>>>,
         _socket: RelaySocket,
     }
 
@@ -5597,12 +5652,15 @@ mod tests {
             socket.enable();
 
             let state: Arc<Mutex<CoordinatorState>> = Arc::default();
-            let names: HashMap<String, &str> = [
-                (harness.pane_ids[0].clone(), "mac-studio/llm-opt"),
-                (harness.pane_ids[1].clone(), "mac-studio/other-agent"),
-            ]
-            .into_iter()
-            .collect();
+            let names: Arc<Mutex<HashMap<String, &'static str>>> = Arc::new(Mutex::new(
+                [
+                    (harness.pane_ids[0].clone(), "mac-studio/llm-opt"),
+                    (harness.pane_ids[1].clone(), "mac-studio/other-agent"),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            let roster = Arc::clone(&names);
             let handled = Arc::clone(&state);
             std::thread::spawn(move || {
                 let b64 = base64::engine::general_purpose::STANDARD;
@@ -5614,6 +5672,7 @@ mod tests {
                     assert_eq!(relay.peer_alias, "mac-studio");
                     let mut state = handled.lock().unwrap();
                     let caller = |pane: &Option<String>| {
+                        let names = roster.lock().unwrap();
                         pane.as_deref().and_then(|pane| names.get(pane).copied())
                     };
                     let file_record =
@@ -5657,7 +5716,8 @@ mod tests {
                             let mut stored = json!({
                                 "id": format!("relay-{}", state.messages.len()),
                                 "direction": "agent_to_owner", "from": from, "text": send.text,
-                                "created_unix_ms": now_ms(), "read_by_owner": false,
+                                "created_unix_ms": now_ms().saturating_add_signed(state.skew_ms),
+                                "read_by_owner": false,
                             });
                             if !file.is_null() {
                                 stored["file"] = file;
@@ -5760,8 +5820,19 @@ mod tests {
             });
             Self {
                 state,
+                names,
                 _socket: socket,
             }
+        }
+
+        /// Stores this coordinator's Grams `skew_ms` off the remote's clock.
+        fn skew(&self, skew_ms: i64) {
+            self.state.lock().unwrap().skew_ms = skew_ms;
+        }
+
+        /// The roster now names the remote's `pane` as `name`.
+        fn names(&self, pane: &str, name: &'static str) {
+            self.names.lock().unwrap().insert(pane.to_string(), name);
         }
     }
 
@@ -6210,4 +6281,6 @@ mod tests {
         assert!(message.get("file").is_none(), "{message}");
         assert_eq!(message["expired_file"]["name"], "report.txt", "{message}");
     }
+
+    mod recreate;
 }

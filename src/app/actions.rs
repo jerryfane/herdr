@@ -668,11 +668,15 @@ impl AppState {
                         .any(|pane| pane.attached_terminal_id == terminal_id)
                 })
             });
-            if !still_attached
-                && self.terminals.remove(&terminal_id).is_some()
-                && !self.terminal_runtime_shutdowns.contains(&terminal_id)
-            {
-                self.terminal_runtime_shutdowns.push(terminal_id);
+            if still_attached {
+                continue;
+            }
+            if self.terminals.remove(&terminal_id).is_some() {
+                // A grant may now follow its agent recreated elsewhere.
+                self.agents_changed = true;
+                if !self.terminal_runtime_shutdowns.contains(&terminal_id) {
+                    self.terminal_runtime_shutdowns.push(terminal_id);
+                }
             }
         }
     }
@@ -1837,6 +1841,8 @@ impl AppState {
             )
         };
         if completion_reset {
+            // A new agent kind or session here: a guest grant may follow it.
+            self.agents_changed = true;
             self.pending_agent_notifications.remove(&pane_id);
             self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
         }

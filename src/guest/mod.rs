@@ -94,6 +94,10 @@ pub struct GuestPrincipal {
     pub(crate) created_ms: u64,
     /// Names the agent had before the owner renamed it.
     pub(crate) former_names: Vec<store::FormerName>,
+    /// Terminals the agent ran in before it was recreated in another one.
+    pub(crate) former_terminals: Vec<store::FormerTerminal>,
+    /// The sessions the agent ran in its terminal since the grant moved there.
+    pub(crate) terminal_sessions: Vec<crate::api::schema::AgentSessionInfo>,
 }
 
 impl GuestPrincipal {
@@ -106,6 +110,8 @@ impl GuestPrincipal {
             dir,
             created_ms: record.created_ms,
             former_names: record.former_names.clone(),
+            former_terminals: record.former_terminals.clone(),
+            terminal_sessions: record.terminal_sessions.clone(),
         }
     }
 
@@ -218,6 +224,44 @@ pub(crate) fn sent_from_grant(
     })
 }
 
+/// A Gram was sent by the granted agent, with the grant's kind: from the
+/// grant's terminal, or from a terminal it left. A terminal the grant
+/// followed the agent to (see [`follow_recreated_agents`]) counts only for
+/// the sessions the agent ran there since, as this machine recorded them
+/// when the Gram was sent (`GramSender::session`): before the agent came,
+/// that terminal held another conversation. No timestamp is compared, so a
+/// coordinator's clock cannot widen or narrow this.
+pub(crate) fn sent_while_granted(
+    grant: &GuestGrantInfo,
+    terminal_sessions: &[crate::api::schema::AgentSessionInfo],
+    former_terminals: &[store::FormerTerminal],
+    sender: Option<&crate::persist::gram::GramSender>,
+) -> bool {
+    let Some(sender) = sender else {
+        return false;
+    };
+    if !sender
+        .agent
+        .as_deref()
+        .is_some_and(|kind| same_kind(kind, grant.kind()))
+    {
+        return false;
+    }
+    let sent_in = |sessions: &[crate::api::schema::AgentSessionInfo]| {
+        sessions.is_empty()
+            || sender
+                .session
+                .as_ref()
+                .is_some_and(|session| sessions.contains(session))
+    };
+    if sender.terminal_id == grant.terminal_id {
+        return sent_in(terminal_sessions);
+    }
+    former_terminals
+        .iter()
+        .any(|former| former.terminal_id == sender.terminal_id && sent_in(&former.sessions))
+}
+
 /// The owner renamed the agent in `terminal_id` from `old` to `new`. Its
 /// guests and pending invites follow it: the grant is the terminal's agent,
 /// not the name, so a guest keeps access without a new invite, and another
@@ -234,6 +278,109 @@ pub(crate) fn follow_rename(terminal_id: &str, old: Option<&str>, new: &str, kin
         Ok(true) => notify_changes(),
         Ok(false) => {}
         Err(err) => tracing::warn!(err = %err, "guest grant rename failed"),
+    }
+}
+
+/// The agent `name` of kind `kind` in `terminal_id` sends a Gram from
+/// harness session `session`, as this machine sees it run there. A guest
+/// grant that followed this agent to that terminal takes the session first,
+/// so its Gram (and a relayed Gram's copy) is the guest's at once after the
+/// agent restarted there, not only once the guest probed it (#387-f2).
+pub(crate) fn note_sending_session(
+    terminal_id: &str,
+    name: Option<&str>,
+    kind: Option<&str>,
+    session: Option<&crate::api::schema::AgentSessionInfo>,
+) {
+    let (Some(name), Some(kind), Some(session)) = (name, kind, session) else {
+        return;
+    };
+    let dir = store::guest_dir();
+    // No guest was ever invited here: leave the guest directory alone.
+    if !dir.join("guests.json").exists() {
+        return;
+    }
+    match store::note_terminal_session(&dir, terminal_id, name, kind, session) {
+        Ok(true) => notify_changes(),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "guest grant session record failed"),
+    }
+}
+
+/// A terminal holding an agent session, as this server sees it now.
+pub(crate) struct SessionHolder {
+    pub terminal_id: String,
+    pub session: crate::api::schema::AgentSessionInfo,
+    /// The agent kind in the terminal when a grant may move there: a live
+    /// local agent, not archived and not being transferred. `None` still
+    /// holds the session.
+    pub kind: Option<String>,
+    /// The agent's name there.
+    pub name: Option<String>,
+}
+
+/// The terminal the grant's agent was recreated in: the grant's terminal is
+/// not in `terminals` (live or archived), and exactly one holder has the
+/// grant's exact harness session, with the grant's agent kind. Two holders
+/// of the session, or another kind there, leave the grant where it is.
+fn recreated_in<'a>(
+    grant: &GuestGrantInfo,
+    terminals: &std::collections::HashSet<String>,
+    holders: &'a [SessionHolder],
+) -> Option<&'a SessionHolder> {
+    if terminals.contains(&grant.terminal_id) {
+        return None;
+    }
+    let mut holding = holders
+        .iter()
+        .filter(|holder| holder.session == grant.agent_session);
+    let holder = holding.next()?;
+    if holding.next().is_some() {
+        return None;
+    }
+    holder
+        .kind
+        .as_deref()
+        .is_some_and(|kind| same_kind(kind, grant.kind()))
+        .then_some(holder)
+}
+
+/// The owner recreated agents in new terminals, resuming their harness
+/// sessions (or the server restarted without some terminals). A guest grant or
+/// pending invite whose terminal is gone follows its agent session to the one
+/// terminal now holding it; see [`recreated_in`] for when it stays. `terminals`
+/// holds every live and archived terminal id, `holders` every terminal with
+/// an agent session. Only the default session serves guests: a named
+/// session's terminals are not the store's, so it never moves a grant.
+pub(crate) fn follow_recreated_agents(
+    terminals: &std::collections::HashSet<String>,
+    holders: &[SessionHolder],
+) {
+    let dir = store::guest_dir();
+    // No guest was ever invited here: leave the guest directory alone.
+    if !session_serves_guests(crate::session::active_name().as_deref())
+        || !dir.join("guests.json").exists()
+    {
+        return;
+    }
+    let rebound = store::rebind_grants(&dir, store::now_ms(), |grant| {
+        recreated_in(grant, terminals, holders)
+    });
+    match rebound {
+        Ok(rebound) if rebound.is_empty() => {}
+        Ok(rebound) => {
+            for moved in &rebound {
+                tracing::info!(
+                    id = %moved.id,
+                    invite = moved.invite,
+                    from = %moved.from,
+                    to = %moved.to,
+                    "guest grant followed its agent session to a new terminal"
+                );
+            }
+            notify_changes();
+        }
+        Err(err) => tracing::warn!(err = %err, "guest grants did not follow recreated agents"),
     }
 }
 

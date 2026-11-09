@@ -963,6 +963,11 @@ pub struct AppState {
     pub(crate) host_cell_size: crate::kitty_graphics::HostCellSize,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
+    /// Set with `session_dirty`, when an agent's kind or session changes, and
+    /// at startup: a terminal, an agent or its session may have changed, so
+    /// guest grants follow recreated agents again (see
+    /// `App::follow_recreated_guest_agents_if_changed`).
+    pub(crate) agents_changed: bool,
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
@@ -977,6 +982,7 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+        self.agents_changed = true;
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1357,6 +1363,7 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
+            agents_changed: false,
             terminal_runtime_shutdowns: Vec::new(),
             archived_agents: Vec::new(),
         }

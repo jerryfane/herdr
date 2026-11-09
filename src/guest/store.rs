@@ -11,7 +11,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::api::schema::{GuestGrantInfo, GuestInfo, GuestInviteInfo};
+use crate::api::schema::{AgentSessionInfo, GuestGrantInfo, GuestInfo, GuestInviteInfo};
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -274,6 +274,17 @@ pub(crate) struct GuestRecord {
     /// guest's Gram from before a rename stays visible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_names: Vec<FormerName>,
+    /// Terminals the granted agent ran in before it was recreated in another
+    /// one, so the guest's Gram from before that stays visible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_terminals: Vec<FormerTerminal>,
+    /// The harness sessions the granted agent ran in the grant's terminal
+    /// since the grant followed it there (see [`rebind_grants`]): that
+    /// terminal's Grams count only when this machine saw one of them send it,
+    /// whatever its clock or a coordinator's said. Empty: the terminal the
+    /// guest accepted, whose Grams all count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_sessions: Vec<AgentSessionInfo>,
 }
 
 /// A name the granted agent gave up in a rename. It names the agent only in
@@ -282,6 +293,17 @@ pub(crate) struct GuestRecord {
 pub(crate) struct FormerName {
     pub name: String,
     pub until_ms: u64,
+}
+
+/// A terminal the granted agent left when it was recreated in another one.
+/// Its Grams count as the agent's when sent from one of `sessions`, or any
+/// of them when empty (the terminal the guest accepted). Terminal ids are
+/// never reused, so it sends nothing after the agent left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FormerTerminal {
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<AgentSessionInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +325,9 @@ pub(crate) struct InviteRecord {
     /// revoke and once the invite is redeemed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short: Option<ShortInvite>,
+    /// [`GuestRecord::terminal_sessions`] for the guest who accepts it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_sessions: Vec<AgentSessionInfo>,
 }
 
 /// Where a short invite's sealed blob lives. Its key is never stored: it
@@ -430,6 +455,51 @@ pub(crate) fn update_grant_session(
         let changed = guest.grant.agent_session != *session;
         if changed {
             guest.grant.agent_session = session.clone();
+            // In a terminal the grant followed the agent to, its new
+            // session's Grams are the agent's too.
+            if !guest.terminal_sessions.is_empty() && !guest.terminal_sessions.contains(session) {
+                guest.terminal_sessions.push(session.clone());
+            }
+        }
+        (changed, changed)
+    })
+}
+
+/// The granted agent (this terminal, name and kind) runs `session` in a
+/// terminal its grant followed it to: that session's Grams are the agent's
+/// for every active guest and pending invite holding it there. Grants in the
+/// terminal the guest accepted keep every session already. Returns whether
+/// anything changed.
+pub(crate) fn note_terminal_session(
+    dir: &Path,
+    terminal_id: &str,
+    name: &str,
+    kind: &str,
+    session: &AgentSessionInfo,
+) -> io::Result<bool> {
+    let holds = |grant: &GuestGrantInfo, sessions: &[AgentSessionInfo]| {
+        !sessions.is_empty()
+            && !sessions.contains(session)
+            && super::grant_names(grant, terminal_id, Some(name), kind)
+    };
+    update_store(dir, |store| {
+        let mut changed = false;
+        for guest in store
+            .guests
+            .iter_mut()
+            .filter(|guest| !guest.revoked && holds(&guest.grant, &guest.terminal_sessions))
+        {
+            guest.terminal_sessions.push(session.clone());
+            changed = true;
+        }
+        let now = now_ms();
+        for invite in store
+            .invites
+            .iter_mut()
+            .filter(|invite| invite.pending(now) && holds(&invite.grant, &invite.terminal_sessions))
+        {
+            invite.terminal_sessions.push(session.clone());
+            changed = true;
         }
         (changed, changed)
     })
@@ -498,6 +568,98 @@ pub(crate) fn rename_grants(
     })
 }
 
+/// A grant or pending invite moved to the terminal its agent was recreated in.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Rebound {
+    /// The guest id, or the invite id when `invite`.
+    pub id: String,
+    pub invite: bool,
+    pub from: String,
+    pub to: String,
+}
+
+/// Move every active guest and pending invite whose agent was recreated in
+/// another terminal to that terminal: `recreated` names the one terminal now
+/// holding the grant's agent session, or `None` to leave the grant alone. The
+/// grant takes the agent's name there, remembering the old one, and each guest
+/// remembers the terminal it left for its Gram from before `now`. A device
+/// already granted the new terminal keeps that grant alone, as accepting
+/// an invite there would have replaced this one. Revoked guests and used or
+/// expired invites never move. Returns what moved.
+pub(crate) fn rebind_grants<'a>(
+    dir: &Path,
+    now: u64,
+    recreated: impl Fn(&GuestGrantInfo) -> Option<&'a super::SessionHolder>,
+) -> io::Result<Vec<Rebound>> {
+    update_store(dir, |store| {
+        let mut rebound = Vec::new();
+        for index in 0..store.guests.len() {
+            let guest = &store.guests[index];
+            if guest.revoked {
+                continue;
+            }
+            let Some(holder) = recreated(&guest.grant) else {
+                continue;
+            };
+            let device = &guest.device_pub;
+            if store.guests.iter().any(|other| {
+                !other.revoked
+                    && other.device_pub == *device
+                    && other.grant.terminal_id == holder.terminal_id
+            }) {
+                continue;
+            }
+            let guest = &mut store.guests[index];
+            let from = std::mem::replace(&mut guest.grant.terminal_id, holder.terminal_id.clone());
+            guest.former_terminals.push(FormerTerminal {
+                terminal_id: from.clone(),
+                sessions: std::mem::replace(
+                    &mut guest.terminal_sessions,
+                    vec![guest.grant.agent_session.clone()],
+                ),
+            });
+            if let Some(name) = holder.name.as_deref() {
+                if guest.grant.agent_name.as_deref() != Some(name) {
+                    if let Some(old) = guest.grant.agent_name.replace(name.to_string()) {
+                        guest.former_names.push(FormerName {
+                            name: old,
+                            until_ms: now,
+                        });
+                    }
+                }
+            }
+            rebound.push(Rebound {
+                id: guest.guest_id.clone(),
+                invite: false,
+                from,
+                to: holder.terminal_id.clone(),
+            });
+        }
+        for invite in store
+            .invites
+            .iter_mut()
+            .filter(|invite| invite.pending(now))
+        {
+            let Some(holder) = recreated(&invite.grant) else {
+                continue;
+            };
+            let from = std::mem::replace(&mut invite.grant.terminal_id, holder.terminal_id.clone());
+            if holder.name.is_some() {
+                invite.grant.agent_name.clone_from(&holder.name);
+            }
+            invite.terminal_sessions = vec![invite.grant.agent_session.clone()];
+            rebound.push(Rebound {
+                id: invite.invite_id.clone(),
+                invite: true,
+                from,
+                to: holder.terminal_id.clone(),
+            });
+        }
+        let changed = !rebound.is_empty();
+        (rebound, changed)
+    })
+}
+
 /// Whether an active guest shares the agent's Gram. False for a revoked or
 /// unknown guest, or when the store cannot be read.
 pub(crate) fn shares_gram(dir: &Path, guest_id: &str) -> bool {
@@ -549,6 +711,7 @@ pub(crate) fn create_invite(
         used_by: None,
         share_gram,
         short: None,
+        terminal_sessions: Vec::new(),
     };
     let stored = record.clone();
     update_store(dir, move |store| {
@@ -752,6 +915,8 @@ pub(crate) fn admit_in(
             revoked_ms: None,
             share_gram: invite.share_gram,
             former_names: Vec::new(),
+            former_terminals: Vec::new(),
+            terminal_sessions: invite.terminal_sessions.clone(),
         };
         store.invites[index].used_by = Some(guest_id);
         let short = store.invites[index].short.take();

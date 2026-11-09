@@ -3590,6 +3590,9 @@ impl HeadlessServer {
             self.app.start_background_session_save();
         }
 
+        #[cfg(unix)]
+        self.app.follow_recreated_guest_agents_if_changed();
+
         if let Some(deadline) = self
             .app
             .agent_metadata_deadline
