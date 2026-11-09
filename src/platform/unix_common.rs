@@ -418,6 +418,35 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
     Some(description)
 }
 
+/// Whether this process is `ancestor_pid`, belongs to the session it leads, or
+/// descends from it. A pane's root process leads its session, so the session
+/// check still holds after an intermediate parent exits. `None` when the
+/// process tree cannot be read.
+pub(crate) fn current_process_descends_from(ancestor_pid: u32) -> Option<bool> {
+    const MAX_DEPTH: usize = 1024;
+
+    let mut pid = std::process::id();
+    if pid == ancestor_pid {
+        return Some(true);
+    }
+    // SAFETY: plain process query.
+    let session = unsafe { libc::getsid(0) };
+    if session > 0 && session as u32 == ancestor_pid {
+        return Some(true);
+    }
+    for _ in 0..MAX_DEPTH {
+        let (_, parent) = super::process_name_and_parent(pid)?;
+        if parent == ancestor_pid {
+            return Some(true);
+        }
+        if parent <= 1 {
+            return Some(false);
+        }
+        pid = parent;
+    }
+    Some(false)
+}
+
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }

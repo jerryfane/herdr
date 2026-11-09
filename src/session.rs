@@ -182,6 +182,24 @@ pub fn active_api_socket_path() -> PathBuf {
     api_socket_path_for(active_name().as_deref())
 }
 
+/// How [`active_api_socket_path`] chose its socket, for messages that name it.
+pub fn active_api_socket_source() -> String {
+    if explicit_session_requested() {
+        let name = active_name();
+        return format!(
+            "from --session {}",
+            name.as_deref().unwrap_or(DEFAULT_SESSION_NAME)
+        );
+    }
+    if std::env::var(crate::api::SOCKET_PATH_ENV_VAR).is_ok() {
+        return format!("from inherited {}", crate::api::SOCKET_PATH_ENV_VAR);
+    }
+    match active_name() {
+        Some(name) => format!("from {SESSION_ENV_VAR}={name}"),
+        None => "default socket".to_string(),
+    }
+}
+
 pub fn client_socket_path_for(name: Option<&str>) -> PathBuf {
     data_dir_for(name).join("herdr-client.sock")
 }
