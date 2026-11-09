@@ -5532,6 +5532,8 @@ mod tests {
         posts: Vec<Value>,
         /// Relayed `gram.list` calls answered.
         lists: usize,
+        /// Added to this coordinator's clock for the Grams it stores.
+        skew_ms: i64,
     }
 
     /// A coordinator behind the production gateway (`serve_one`) that answers
@@ -5541,6 +5543,8 @@ mod tests {
     /// and so the name its Gram stores. It serves files 3 bytes per chunk.
     struct Coordinator {
         state: Arc<Mutex<CoordinatorState>>,
+        /// The roster name of each remote pane.
+        names: Arc<Mutex<HashMap<String, &'static str>>>,
         _socket: RelaySocket,
     }
 
@@ -5597,12 +5601,15 @@ mod tests {
             socket.enable();
 
             let state: Arc<Mutex<CoordinatorState>> = Arc::default();
-            let names: HashMap<String, &str> = [
-                (harness.pane_ids[0].clone(), "mac-studio/llm-opt"),
-                (harness.pane_ids[1].clone(), "mac-studio/other-agent"),
-            ]
-            .into_iter()
-            .collect();
+            let names: Arc<Mutex<HashMap<String, &'static str>>> = Arc::new(Mutex::new(
+                [
+                    (harness.pane_ids[0].clone(), "mac-studio/llm-opt"),
+                    (harness.pane_ids[1].clone(), "mac-studio/other-agent"),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            let roster = Arc::clone(&names);
             let handled = Arc::clone(&state);
             std::thread::spawn(move || {
                 let b64 = base64::engine::general_purpose::STANDARD;
@@ -5614,6 +5621,7 @@ mod tests {
                     assert_eq!(relay.peer_alias, "mac-studio");
                     let mut state = handled.lock().unwrap();
                     let caller = |pane: &Option<String>| {
+                        let names = roster.lock().unwrap();
                         pane.as_deref().and_then(|pane| names.get(pane).copied())
                     };
                     let file_record =
@@ -5657,7 +5665,8 @@ mod tests {
                             let mut stored = json!({
                                 "id": format!("relay-{}", state.messages.len()),
                                 "direction": "agent_to_owner", "from": from, "text": send.text,
-                                "created_unix_ms": now_ms(), "read_by_owner": false,
+                                "created_unix_ms": now_ms().saturating_add_signed(state.skew_ms),
+                                "read_by_owner": false,
                             });
                             if !file.is_null() {
                                 stored["file"] = file;
@@ -5760,8 +5769,19 @@ mod tests {
             });
             Self {
                 state,
+                names,
                 _socket: socket,
             }
+        }
+
+        /// Stores this coordinator's Grams `skew_ms` off the remote's clock.
+        fn skew(&self, skew_ms: i64) {
+            self.state.lock().unwrap().skew_ms = skew_ms;
+        }
+
+        /// The roster now names the remote's `pane` as `name`.
+        fn names(&self, pane: &str, name: &'static str) {
+            self.names.lock().unwrap().insert(pane.to_string(), name);
         }
     }
 
