@@ -1,0 +1,220 @@
+//! Guests of agents recreated in new terminals.
+
+use super::*;
+
+/// One pass of the server loop over recreated agents (see
+/// `HeadlessServer::handle_scheduled_tasks_headless`).
+fn server_pass(harness: &Harness) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut App| {
+            app.follow_recreated_guest_agents_if_changed();
+            let _ = done_tx.send(());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+/// The owner recreates the granted agent (agent 0) in agent 1's terminal,
+/// as `herdr agent start` resuming its harness session did after the
+/// outage of 2026-11-08: the granted terminal is gone, a shell in a new
+/// terminal takes its pane, and agent 1's terminal runs a `pi` agent
+/// named `name` on harness session `session` (the granted agent's is
+/// `session-0`). With `twin`, the new shell terminal holds `session` too.
+/// Then the server loop passes. Returns the agent's new terminal id.
+fn recreate_granted_agent(harness: &Harness, name: &str, session: &str, twin: bool) -> String {
+    let (name, session) = (name.to_string(), session.to_string());
+    let (done_tx, done_rx) = std_mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut App| {
+            let held = || crate::agent_resume::PersistedAgentSession {
+                source: "herdr".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session.clone()).unwrap(),
+            };
+            let tab = &mut app.state.workspaces[0].tabs[0];
+            let pane = tab.root_pane;
+            let shell = crate::terminal::TerminalId::alloc();
+            let gone = std::mem::replace(
+                &mut tab.panes.get_mut(&pane).unwrap().attached_terminal_id,
+                shell.clone(),
+            );
+            let mut terminal =
+                crate::terminal::TerminalState::new(shell.clone(), std::env::temp_dir());
+            if twin {
+                terminal.set_persisted_agent_session(held());
+            }
+            app.state.terminals.insert(shell, terminal);
+            app.state.remove_unattached_terminal_ids([gone]);
+            let pane = app.state.workspaces[1].tabs[0].root_pane;
+            let recreated = app.state.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&recreated).unwrap();
+            terminal.set_agent_name(name);
+            terminal.set_persisted_agent_session(held());
+            app.follow_recreated_guest_agents_if_changed();
+            let _ = done_tx.send(recreated.to_string());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+}
+
+fn stored_record(harness: &Harness, guest_id: &str) -> crate::guest::store::GuestRecord {
+    crate::guest::store::load_store(&harness.dir.0)
+        .unwrap()
+        .guests
+        .into_iter()
+        .find(|record| record.guest_id == guest_id)
+        .unwrap()
+}
+
+fn stored_invite_terminal(harness: &Harness, invite_id: &str) -> String {
+    crate::guest::store::load_store(&harness.dir.0)
+        .unwrap()
+        .invites
+        .into_iter()
+        .find(|invite| invite.invite_id == invite_id)
+        .unwrap()
+        .grant
+        .terminal_id
+}
+
+/// 2026-11-08: the owner recreated shared agents in new terminals on the
+/// sessions they ran before, and their guest lost them. The grant follows
+/// the agent's session to its new terminal, a pending invite too, and the
+/// guest's Gram from before stays with it.
+#[test]
+fn a_guest_keeps_its_agent_recreated_in_a_new_terminal() {
+    let _config = ConfigHome::new("recreate");
+    let harness = start_renaming("recreate");
+    let tick = || std::thread::sleep(Duration::from_millis(5));
+    let admitted = harness.admit_with(0, true);
+    let pending = harness.invite(0, "later");
+    // The startup pass leaves a grant whose terminal is live alone.
+    server_pass(&harness);
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id).grant,
+        admitted.grant
+    );
+    send_gram(&harness, "llm-opt", "agent before");
+    tick();
+
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-0", false);
+    tick();
+    let record = stored_record(&harness, &admitted.guest_id);
+    assert!(!record.revoked);
+    assert_eq!(record.grant.terminal_id, recreated);
+    assert_eq!(record.grant.agent_name.as_deref(), Some("llm-opt"));
+    assert_eq!(
+        stored_invite_terminal(&harness, &pending.record.invite_id),
+        recreated
+    );
+
+    // A connection admitted before reads the moved grant.
+    let lines = harness.call(&admitted, prompt_request("llm-opt", "still here"));
+    assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+    let written = harness.pty_text(1, Duration::from_millis(600));
+    assert!(
+        written.contains("plotarmordev (via HerdrUp): still here"),
+        "{written:?}"
+    );
+    let (guest, reply) = readmit(&harness, &admitted);
+    assert_eq!(reply["agent"]["target"], recreated.as_str(), "{reply}");
+    send_gram_as(
+        &harness,
+        Some(harness.pane_ids[1].clone()),
+        "llm-opt",
+        "agent after",
+    );
+    let listed = guest_list(&harness, &guest, json!({}));
+    assert_eq!(texts(&listed), ["agent after", "agent before"], "{listed}");
+}
+
+/// A guest never reaches another conversation: an agent recreated under
+/// the granted name but on another harness session gets no grant.
+#[test]
+fn another_session_in_a_new_terminal_gains_no_guest() {
+    let _config = ConfigHome::new("recreate-other");
+    let harness = start_renaming("recreate-other");
+    let guest = harness.admit();
+    let pending = harness.invite(0, "later");
+    server_pass(&harness);
+
+    let other = recreate_granted_agent(&harness, "llm-opt", "session-other", false);
+    assert_eq!(stored_record(&harness, &guest.guest_id).grant, guest.grant);
+    assert_eq!(
+        stored_invite_terminal(&harness, &pending.record.invite_id),
+        guest.grant.terminal_id
+    );
+    assert_eq!(
+        code(&harness.call(&guest, prompt_request("llm-opt", "x"))),
+        "guest_paused"
+    );
+    for target in [other.as_str(), harness.pane_ids[1].as_str()] {
+        let lines = harness.call(&guest, prompt_request(target, "x"));
+        assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+    }
+    assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+}
+
+/// Two terminals holding the granted session: which one is the agent is
+/// unknown, so the grant and the pending invite stay where they are.
+#[test]
+fn a_session_held_by_two_terminals_leaves_the_grant_unattached() {
+    let _config = ConfigHome::new("recreate-twin");
+    let harness = start_renaming("recreate-twin");
+    let guest = harness.admit();
+    let pending = harness.invite(0, "later");
+    server_pass(&harness);
+
+    recreate_granted_agent(&harness, "llm-opt", "session-0", true);
+    assert_eq!(stored_record(&harness, &guest.guest_id).grant, guest.grant);
+    assert_eq!(
+        stored_invite_terminal(&harness, &pending.record.invite_id),
+        guest.grant.terminal_id
+    );
+    assert_eq!(
+        code(&harness.call(&guest, prompt_request("llm-opt", "x"))),
+        "guest_paused"
+    );
+    assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+}
+
+/// A revoked guest's grant never moves, while the pending invite to the
+/// same agent does.
+#[test]
+fn a_revoked_guest_stays_revoked_when_its_agent_is_recreated() {
+    let _config = ConfigHome::new("recreate-revoked");
+    let harness = start_renaming("recreate-revoked");
+    let guest = harness.admit();
+    let pending = harness.invite(0, "later");
+    server_pass(&harness);
+    crate::guest::store::revoke_in(
+        &harness.dir.0,
+        RevokeTarget::Guest(&guest.guest_id),
+        now_ms(),
+    )
+    .unwrap();
+
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-0", false);
+    assert_eq!(
+        stored_invite_terminal(&harness, &pending.record.invite_id),
+        recreated
+    );
+    let record = stored_record(&harness, &guest.guest_id);
+    assert!(record.revoked);
+    assert_eq!(record.grant, guest.grant);
+    assert_eq!(
+        code(&harness.call(&guest, prompt_request("llm-opt", "x"))),
+        "guest_revoked"
+    );
+    let hello = json!({"v": 1, "guest_id": guest.guest_id});
+    assert!(matches!(
+        admit_in(harness.dir.0.clone(), [4; 32], &hello),
+        Admission::Refused(_)
+    ));
+    assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
+}
