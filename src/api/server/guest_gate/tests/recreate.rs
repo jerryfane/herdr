@@ -303,3 +303,107 @@ fn a_revoked_guest_stays_revoked_when_its_agent_is_recreated() {
     ));
     assert!(harness.pty_text(1, Duration::from_millis(200)).is_empty());
 }
+
+/// Agent `index`'s Gram relayed to the coordinator from its pane, carrying
+/// a file named `name` holding `hello`; returns its id.
+fn relay_file(harness: &Harness, index: usize, name: &str) -> String {
+    let upload = format!("up-{name}");
+    let staged = local_call(
+        harness,
+        json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
+    );
+    assert_eq!(staged["result"]["type"], "ok", "{staged}");
+    sent_id(&local_call(
+        harness,
+        json!({"id": "s", "method": "gram.send", "params": {"text": name, "caller_pane_id": harness.pane_ids[index], "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
+    ))
+}
+
+/// Agent 1's terminal resumes the granted agent's session `session-0`, and
+/// the server loop passes.
+fn resume_granted_session_in_agent_1(harness: &Harness) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut App| {
+            let pane = app.state.workspaces[1].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("session-0").unwrap(),
+            });
+            app.state.mark_session_dirty();
+            app.follow_recreated_guest_agents_if_changed();
+            let _ = done_tx.send(());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+/// #387-f1 on a Gram-relay remote, where the coordinator stamps each Gram
+/// with its own clock, `skew_ms` off this machine's. Another conversation's
+/// Gram and file the destination terminal relayed before the grant moved
+/// stay private, and the agent's Grams from its old terminal and from the
+/// new one after the move reach the guest, whatever the skew.
+fn relayed_grams_follow_the_session_not_the_clock(tag: &str, skew_ms: i64) {
+    let (_config, harness, coordinator) = relay_remote(tag);
+    coordinator.skew(skew_ms);
+    let admitted = harness.admit_with(0, true);
+    server_pass(&harness);
+    // Room for a coordinator behind by less than the time since acceptance.
+    std::thread::sleep(Duration::from_millis(400));
+    relay_file(&harness, 0, "before.txt");
+
+    let recreated = recreate_granted_agent(&harness, "llm-opt", "session-private", false);
+    coordinator.names(&harness.pane_ids[1], "mac-studio/llm-opt");
+    let private_file = relay_file(&harness, 1, "private.txt");
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id).grant,
+        admitted.grant
+    );
+
+    resume_granted_session_in_agent_1(&harness);
+    assert_eq!(
+        stored_record(&harness, &admitted.guest_id)
+            .grant
+            .terminal_id,
+        recreated
+    );
+    let after_file = relay_file(&harness, 1, "after.txt");
+
+    let (guest, _) = readmit(&harness, &admitted);
+    let listed = guest_list(&harness, &guest, json!({}));
+    assert_eq!(texts(&listed), ["after.txt", "before.txt"], "{listed}");
+    let fetch = |id: &str| {
+        harness.call(
+            &guest,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
+        )
+    };
+    let refused = fetch(&private_file);
+    assert_eq!(code(&refused), "guest_forbidden", "{refused:?}");
+    let fetched = fetch(&after_file);
+    assert_eq!(
+        fetched[0]["result"]["data_base64"], "aGVsbG8=",
+        "{fetched:?}"
+    );
+}
+
+#[test]
+fn relayed_grams_follow_the_session_with_the_coordinator_on_the_same_clock() {
+    relayed_grams_follow_the_session_not_the_clock("recreate-relay-same", 0);
+}
+
+#[test]
+fn relayed_grams_follow_the_session_with_the_coordinator_clock_ahead() {
+    relayed_grams_follow_the_session_not_the_clock("recreate-relay-ahead", 3_600_000);
+}
+
+#[test]
+fn relayed_grams_follow_the_session_with_the_coordinator_clock_behind() {
+    relayed_grams_follow_the_session_not_the_clock("recreate-relay-behind", -200);
+}
