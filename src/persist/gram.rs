@@ -149,13 +149,19 @@ pub struct GramItem {
     pub sender: Option<GramSender>,
 }
 
-/// Who sent a local agent's gram: its terminal's public id and the agent kind
-/// running there at the time (for example `claude`).
+/// Who sent a local agent's gram: its terminal's public id, the agent kind
+/// running there at the time (for example `claude`), and the harness session
+/// this machine saw it run then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GramSender {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Recorded by this machine when the agent sent the Gram, never taken
+    /// from a coordinator. `None` for older Grams, or when the session
+    /// changed while a relayed Gram was in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::api::schema::AgentSessionInfo>,
 }
 
 impl GramItem {

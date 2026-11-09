@@ -96,8 +96,8 @@ pub struct GuestPrincipal {
     pub(crate) former_names: Vec<store::FormerName>,
     /// Terminals the agent ran in before it was recreated in another one.
     pub(crate) former_terminals: Vec<store::FormerTerminal>,
-    /// Since when the grant's terminal holds the agent, once it moved there.
-    pub(crate) terminal_since_ms: Option<u64>,
+    /// The sessions the agent ran in its terminal since the grant moved there.
+    pub(crate) terminal_sessions: Vec<crate::api::schema::AgentSessionInfo>,
 }
 
 impl GuestPrincipal {
@@ -111,7 +111,7 @@ impl GuestPrincipal {
             created_ms: record.created_ms,
             former_names: record.former_names.clone(),
             former_terminals: record.former_terminals.clone(),
-            terminal_since_ms: record.terminal_since_ms,
+            terminal_sessions: record.terminal_sessions.clone(),
         }
     }
 
@@ -224,16 +224,17 @@ pub(crate) fn sent_from_grant(
     })
 }
 
-/// A Gram created at `created_ms` was sent by the granted agent: from the
-/// grant's terminal since the agent holds it (`terminal_since_ms`, see
-/// [`follow_recreated_agents`]), or from a terminal it left while it held
-/// that one, with the grant's kind. A terminal's Grams from before the agent
-/// came there were another conversation's.
+/// A Gram was sent by the granted agent, with the grant's kind: from the
+/// grant's terminal, or from a terminal it left. A terminal the grant
+/// followed the agent to (see [`follow_recreated_agents`]) counts only for
+/// the sessions the agent ran there since, as this machine recorded them
+/// when the Gram was sent (`GramSender::session`): before the agent came,
+/// that terminal held another conversation. No timestamp is compared, so a
+/// coordinator's clock cannot widen or narrow this.
 pub(crate) fn sent_while_granted(
     grant: &GuestGrantInfo,
-    terminal_since_ms: Option<u64>,
+    terminal_sessions: &[crate::api::schema::AgentSessionInfo],
     former_terminals: &[store::FormerTerminal],
-    created_ms: u64,
     sender: Option<&crate::persist::gram::GramSender>,
 ) -> bool {
     let Some(sender) = sender else {
@@ -246,12 +247,19 @@ pub(crate) fn sent_while_granted(
     {
         return false;
     }
+    let sent_in = |sessions: &[crate::api::schema::AgentSessionInfo]| {
+        sessions.is_empty()
+            || sender
+                .session
+                .as_ref()
+                .is_some_and(|session| sessions.contains(session))
+    };
     if sender.terminal_id == grant.terminal_id {
-        return terminal_since_ms.is_none_or(|since| since <= created_ms);
+        return sent_in(terminal_sessions);
     }
     former_terminals
         .iter()
-        .any(|former| former.terminal_id == sender.terminal_id && former.held_at(created_ms))
+        .any(|former| former.terminal_id == sender.terminal_id && sent_in(&former.sessions))
 }
 
 /// The owner renamed the agent in `terminal_id` from `old` to `new`. Its

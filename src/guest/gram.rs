@@ -29,7 +29,7 @@ pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
         &guest.grant,
         &guest.former_names,
         &guest.former_terminals,
-        guest.terminal_since_ms,
+        &guest.terminal_sessions,
         guest.created_ms,
         &guest.name,
         item,
@@ -42,7 +42,7 @@ pub(crate) fn visible_to(guest: &store::GuestRecord, item: &GramItem) -> bool {
         &guest.grant,
         &guest.former_names,
         &guest.former_terminals,
-        guest.terminal_since_ms,
+        &guest.terminal_sessions,
         guest.created_ms,
         &guest.name,
         item,
@@ -53,7 +53,7 @@ fn visible_in(
     grant: &crate::api::schema::GuestGrantInfo,
     former_names: &[store::FormerName],
     former_terminals: &[store::FormerTerminal],
-    terminal_since_ms: Option<u64>,
+    terminal_sessions: &[crate::api::schema::AgentSessionInfo],
     created_ms: u64,
     name: &str,
     item: &GramItem,
@@ -75,9 +75,8 @@ fn visible_in(
             names_agent(&item.from)
                 && super::sent_while_granted(
                     grant,
-                    terminal_since_ms,
+                    terminal_sessions,
                     former_terminals,
-                    item.created_unix_ms,
                     item.sender.as_ref(),
                 )
         }

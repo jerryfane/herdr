@@ -1014,6 +1014,7 @@ impl App {
         Some(crate::persist::gram::GramSender {
             terminal_id: terminal_id.to_string(),
             agent: terminal.effective_agent_label().map(str::to_string),
+            session: crate::app::creation::terminal_agent_session_info(terminal),
         })
     }
 

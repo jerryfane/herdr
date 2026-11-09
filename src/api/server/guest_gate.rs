@@ -1484,7 +1484,12 @@ fn mirrored_file(
 /// the owner's notifications stay with the coordinator.
 ///
 /// A relayed `gram.delete` that the coordinator accepted drops the copy too.
-pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &ApiRequestSender) {
+pub(super) fn after_relayed_gram(
+    request: &Request,
+    response: &str,
+    api_tx: &ApiRequestSender,
+    sent_from: Option<RelaySender>,
+) {
     // No guest was ever invited here: leave the guest directory alone.
     let dir = crate::guest::store::guest_dir();
     if !dir.join("guests.json").exists() {
@@ -1524,15 +1529,55 @@ pub(super) fn after_relayed_gram(request: &Request, response: &str, api_tx: &Api
     let Some(local) = agent.name else {
         return;
     };
+    // The session this machine saw the pane run before the coordinator
+    // accepted the Gram, and still runs now; otherwise none (see
+    // `GramSender::session`). The coordinator's clock decides nothing here.
+    let session = sent_from
+        .filter(|before| before.terminal_id == agent.terminal_id)
+        .and_then(|before| before.session)
+        .filter(|before| agent.agent_session.as_ref() == Some(before));
     let sender = crate::persist::gram::GramSender {
         terminal_id: agent.terminal_id,
         agent: agent.agent,
+        session,
     };
     if let Some(item) = mirror_relayed(&dir, response, pane, &local, Some(sender)) {
         let cfg = crate::config::Config::load().config.push;
         // The guest's copy names the agent as this machine does: no machine label.
         crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item, None)]);
     }
+}
+
+/// The terminal and harness session behind a relayed `gram.send`'s pane
+/// before it leaves this machine.
+pub(super) struct RelaySender {
+    terminal_id: String,
+    session: Option<crate::api::schema::AgentSessionInfo>,
+}
+
+/// Witness the sending pane's terminal and session before a `gram.send` is
+/// relayed to the coordinator, when guests are kept here; see
+/// [`after_relayed_gram`].
+pub(super) fn before_relayed_gram(
+    request: &Request,
+    api_tx: &ApiRequestSender,
+) -> Option<RelaySender> {
+    let Method::GramSend(params) = &request.method else {
+        return None;
+    };
+    let pane = params.caller_pane_id.as_deref()?;
+    if crate::api::gram_relay::policy().remote_socket().is_none()
+        || !crate::guest::store::guest_dir()
+            .join("guests.json")
+            .exists()
+    {
+        return None;
+    }
+    let agent = probe_target(api_tx, None, Some(pane)).ok()?.agent?;
+    Some(RelaySender {
+        terminal_id: agent.terminal_id,
+        session: agent.agent_session,
+    })
 }
 
 /// Most pages of the agent's coordinator Gram one check reads.
