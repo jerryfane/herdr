@@ -2261,12 +2261,11 @@ fn a_cancelled_questions_ask_has_no_answer() {
     );
     session.result("a", "ask", true, json!({}));
     let page = session.newest();
-    assert!(matches!(
-        form_entry(&page),
-        TranscriptEntry::Ask {
-            answer: None,
-            form: None,
-            ..
-        }
-    ));
+    // Before ask forms, empty details became `answer: Some([])`, which apps
+    // drew as an empty "You chose".
+    let answer = page.entries.iter().find_map(|entry| match entry {
+        TranscriptEntry::Ask { answer, .. } => Some(answer.clone()),
+        _ => None,
+    });
+    assert_eq!(answer, Some(None), "{:?}", page.entries);
 }
