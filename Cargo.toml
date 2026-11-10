@@ -46,7 +46,10 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
-serde_json = "1"
+# `float_roundtrip`: parse JSON numbers correctly rounded, so a number omp
+# records in an `ask` form result compares exactly with the one herdr typed
+# (`src/api/answer/form.rs`). No extra crates.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }

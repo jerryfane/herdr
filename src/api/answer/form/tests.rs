@@ -154,6 +154,9 @@ struct Dialog {
     refuse: Option<(usize, String)>,
     /// Keys after this many are swallowed (someone else holds the form).
     frozen_after: Option<usize>,
+    /// After this many keys the pane shows something else (the form closed,
+    /// another program); keys still arrive and are counted.
+    vanish_after: Option<usize>,
 }
 
 impl Dialog {
@@ -174,6 +177,7 @@ impl Dialog {
             errors: vec![None; count],
             refuse: None,
             frozen_after: None,
+            vanish_after: None,
             form,
         };
         for (index, field) in dialog.form.fields.iter().enumerate() {
@@ -208,6 +212,20 @@ impl Dialog {
         self.focus = (self.focus as isize + delta).clamp(0, self.stops.len() as isize - 1) as usize;
     }
 
+    /// `#moveField(-1)`: the previous field's first stop.
+    fn move_field_back(&mut self) {
+        let field = self.field_of();
+        let mut index = self.focus;
+        while index > 0 && self.stops[index].field() == field {
+            index -= 1;
+        }
+        let target = self.stops[index].field();
+        while index > 0 && self.stops[index - 1].field() == target {
+            index -= 1;
+        }
+        self.focus = index;
+    }
+
     fn move_field(&mut self) {
         let field = self.field_of();
         while self.focus + 1 < self.stops.len() && self.stops[self.focus].field() == field {
@@ -229,6 +247,10 @@ impl Dialog {
         self.keys.push(key.to_owned());
         if key == "tab" {
             self.move_field();
+            return;
+        }
+        if key == "shift+tab" {
+            self.move_field_back();
             return;
         }
         match self.stops[self.focus] {
@@ -434,6 +456,12 @@ impl Dialog {
     }
 
     fn render(&self) -> String {
+        if self
+            .vanish_after
+            .is_some_and(|limit| self.keys.len() >= limit)
+        {
+            return "$ vim notes.txt\n~\n~".into();
+        }
         let mut out = vec![
             "❯ an earlier prompt in the chat".to_owned(),
             "╭─ Ask ─╮".to_owned(),
@@ -486,13 +514,29 @@ impl Dialog {
                 let stop = Stop::Text { field: index };
                 self.label_rows(index, stop, star, out);
                 let lines = &self.lines[index];
-                let mut rows: Vec<String> = if lines.iter().all(String::is_empty) {
+                let height = input.height();
+                let value = lines.join("\n");
+                let focused = self.stops[self.focus] == stop;
+                // As `#textFieldLines`: focused, the input or editor viewport
+                // (scrolled to keep the caret in view); unfocused, the value
+                // from its first line, `…` past the height, or the
+                // placeholder when empty.
+                let mut rows: Vec<String> = if focused && input.multiline {
+                    let caret = self.caret[index].0;
+                    let offset = (caret + 1).saturating_sub(height);
+                    lines.iter().skip(offset).take(height).cloned().collect()
+                } else if value.is_empty() {
                     vec![input.placeholder.clone()]
                 } else {
                     lines.clone()
                 };
-                rows.resize(input.height(), String::new());
-                rows.truncate(input.height());
+                if rows.len() > height {
+                    rows.truncate(height);
+                    if !focused {
+                        rows[height - 1] = "…".into();
+                    }
+                }
+                rows.resize(height, String::new());
                 for row in rows {
                     out.push(format!("│   │ {row}"));
                 }
@@ -900,4 +944,89 @@ fn other_can_be_the_first_stop() {
     assert!(at_start(&start, &form));
     let typed = screen(&["  ○ A", "  ○ B", "❯ ○ Other: x", "  Submit"]);
     assert!(!at_start(&typed, &form));
+}
+
+/// #392 r3 F2: blank rows in view prove nothing: 500 blank lines above a
+/// retained line are cleared too, wherever the caret starts.
+#[test]
+fn a_hidden_tail_below_blank_rows_is_cleared() {
+    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
+    for caret in [0, 3, 250, 500] {
+        let mut dialog = Dialog::new(html);
+        let mut lines = vec![String::new(); 500];
+        lines.push("retained-secret".into());
+        dialog.lines[0] = lines;
+        dialog.caret[0] = (caret, 0);
+        let submitted = answer(&mut dialog, values(&[("log", text("fresh"))])).unwrap();
+        assert_eq!(
+            value(&submitted, "log"),
+            txt("fresh"),
+            "caret on line {caret}"
+        );
+    }
+}
+
+/// #392 r3 F2: a textarea that cannot be proven empty within the caps is
+/// refused before the answer is typed, and the probe is taken back out.
+#[test]
+fn an_unprovable_textarea_is_refused_before_typing() {
+    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
+    let mut dialog = Dialog::new(html);
+    dialog.lines[0] = (0..5_000).map(|line| format!("line{line}")).collect();
+    dialog.caret[0] = (0, 0);
+    let form = dialog.form.clone();
+    let plan = plan(&form, &values(&[("log", text("fresh"))])).unwrap();
+    let error = drive(&mut dialog, &form, &plan).unwrap_err();
+    assert_eq!(error.code, "ask_form_moved");
+    assert_eq!(dialog.submitted, None);
+    assert!(
+        !dialog.lines[0].iter().any(|line| line.contains("fresh")),
+        "nothing typed"
+    );
+    assert!(
+        dialog.keys.len() <= MAX_FIELD_KEYS + 2,
+        "{} keys",
+        dialog.keys.len()
+    );
+}
+
+/// #392 r3: when the textarea disappears mid-clear (focus lost, the form
+/// gone), clearing stops at once instead of typing into whatever is there.
+#[test]
+fn a_vanished_textarea_stops_the_clear_at_once() {
+    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
+    for limit in [2, 150, 205, 400] {
+        let mut dialog = Dialog::new(html);
+        dialog.lines[0] = (0..450).map(|line| format!("line{line}")).collect();
+        dialog.vanish_after = Some(limit);
+        let form = dialog.form.clone();
+        let plan = plan(&form, &values(&[("log", text("fresh"))])).unwrap();
+        let error = drive(&mut dialog, &form, &plan).unwrap_err();
+        assert_eq!(error.code, "ask_form_moved", "{limit}");
+        let after = dialog.keys.len().saturating_sub(limit);
+        assert!(
+            after <= 2 * CLEAR_ROUND_LINES + 1,
+            "{after} keys after it vanished at {limit}"
+        );
+        assert_eq!(dialog.submitted, None);
+    }
+}
+
+/// #392 r3: numbers compare exactly; near-zero values are not each other.
+#[test]
+fn near_zero_numbers_are_not_confused() {
+    let expected = vec![("n".to_owned(), Some(FormValue::Number(1e-30)))];
+    let recorded = |json: &str| {
+        serde_json::from_str::<serde_json::Value>(json)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    assert!(submission_matches(&expected, &recorded(r#"{"n": 1e-30}"#)));
+    assert!(!submission_matches(&expected, &recorded(r#"{"n": 0}"#)));
+    assert!(!submission_matches(&expected, &recorded(r#"{"n": 1e-17}"#)));
+    let zero = vec![("n".to_owned(), Some(FormValue::Number(0.0)))];
+    assert!(submission_matches(&zero, &recorded(r#"{"n": 0}"#)));
+    assert!(!submission_matches(&zero, &recorded(r#"{"n": 5e-324}"#)));
 }
