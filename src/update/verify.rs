@@ -265,14 +265,18 @@ fn is_hex(value: &str, len: usize) -> bool {
 /// A `build_id` names a directory under `updates/` that every apply removes
 /// and recreates, so it must be a plain name of its own there: at most
 /// `MAX_BUILD_ID_LEN` of `[A-Za-z0-9._-]`, starting with a letter or digit
-/// (so never `.`, `..` or a temp file), and not one of the layout's names.
+/// (so never `.`, `..` or a temp file), and not one of the layout's names in
+/// any letter case: on a case-insensitive filesystem (default macOS APFS)
+/// `PREVIOUS` is the same directory as `previous`, the rollback copy.
 fn is_build_id(value: &str) -> bool {
     (1..=MAX_BUILD_ID_LEN).contains(&value.len())
         && value.as_bytes()[0].is_ascii_alphanumeric()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        && !super::state::LAYOUT_NAMES.contains(&value)
+        && !super::state::LAYOUT_NAMES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(value))
 }
 
 /// Fetch `manifest_url` and `<manifest_url>.minisig`, and verify them.
@@ -1028,4 +1032,6 @@ mod tests {
         let err = seed(&value, &signer, &running(BUILD_ID)).expect_err("protocol mismatch");
         assert_eq!(err.code(), "update_manifest_invalid");
     }
+
+    mod build_id;
 }

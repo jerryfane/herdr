@@ -527,7 +527,30 @@ fn awaits_menu_input(agent: &AgentInfo) -> bool {
 /// a guest batch last committed a menu choice. Until detection has seen the
 /// agent change state since, the menu on record may already be gone, so no
 /// guest keys are accepted.
-static MENU_COMMITS: Mutex<Option<HashMap<(std::path::PathBuf, String), u64>>> = Mutex::new(None);
+///
+/// Each terminal has its own lock, held by a batch from its check through
+/// its write, so a concurrent batch for that terminal sees this one's commit.
+/// The map's own lock is only held to find that entry: a slow write to one
+/// terminal never holds up guest keys to another.
+static MENU_COMMITS: Mutex<Option<HashMap<MenuMarker, MenuCommit>>> = Mutex::new(None);
+
+type MenuMarker = (std::path::PathBuf, String);
+
+/// One terminal's last committed `state_change_seq`, if any.
+type MenuCommit = Arc<Mutex<Option<u64>>>;
+
+/// The commit record for `marker`, created on first use.
+fn menu_commit(marker: MenuMarker) -> MenuCommit {
+    let mut commits = MENU_COMMITS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        commits
+            .get_or_insert_with(HashMap::new)
+            .entry(marker)
+            .or_default(),
+    )
+}
 
 /// The rendered scrollback and the fields the app decodes; the workspace,
 /// tab and revision stay with the owner.
@@ -1137,20 +1160,17 @@ fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(stream);
             };
-            // Held through the write, so a concurrent guest batch sees this
-            // one's commit.
-            let mut commits = MENU_COMMITS
+            let commit = menu_commit((guest.dir.clone(), guest.grant.terminal_id.clone()));
+            // Held through the write, so a concurrent guest batch for this
+            // terminal sees this one's commit.
+            let mut committed_at = commit
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let commits = commits.get_or_insert_with(HashMap::new);
-            let marker = (guest.dir.clone(), guest.grant.terminal_id.clone());
-            let stale = commits
-                .get(&marker)
-                .is_some_and(|committed_at| agent.state_change_seq <= *committed_at);
+            let stale = committed_at.is_some_and(|seq| agent.state_change_seq <= seq);
             if stale || !awaits_menu_input(&agent) {
                 return forbidden(stream);
             }
-            commits.remove(&marker);
+            *committed_at = None;
             guest.audit(
                 GuestAuditEvent::Prompt,
                 Some(method),
@@ -1168,7 +1188,7 @@ fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             if commits_choice {
-                commits.insert(marker, agent.state_change_seq);
+                *committed_at = Some(agent.state_change_seq);
             }
             write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
@@ -6282,5 +6302,6 @@ mod tests {
         assert_eq!(message["expired_file"]["name"], "report.txt", "{message}");
     }
 
+    mod menu_keys;
     mod recreate;
 }
