@@ -26,6 +26,8 @@
 - Agent prompt CLI reports a written but unconfirmed submission as a non-failure result instead of a delivery error. `server agent-manifests` now shows which active manifests declare submission verification; unsupported agents are identified explicitly. (#210)
 - Grams from agents on federated machines name the machine instead of its id. Their message objects carry `machine_label` (the label the machine's agents carry), resolved when read so older Grams are covered too, and the owner's push reads "llm-opt on Jerry's Mac Studio". (#277)
 - Starting a named session (`herdr --session NAME`) on the same machine no longer cuts guests off. Every session reads the same guest store, so the named session dialled the relay as the same host and replaced the default session's connection, and guests stayed disconnected for as long as it ran (`guest link: replaced by another connection for this host`). Only the default session connects to the relay now, and `guest.invite.create` in a named session fails with `unsupported`, since its guests would reach the default session's server. (#345)
+- A guest's menu keys to one agent no longer wait behind another guest's key write that the server has not finished. Each shared terminal serializes its own guest key batches, so one slow write holds up only the keys to that terminal.
+- `server.update_apply` refuses a preview manifest whose `build_id` is one of the update directory's own names in any letter case. On a case-insensitive filesystem (default macOS APFS) a build named `PREVIOUS` would have been the rollback copy's directory, which an apply removes.
 
 ## [0.9.5] - 2026-10-14
 
