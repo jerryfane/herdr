@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    answer_agent, dispatch_to_app_with_timeout, error_response_json, finish_wait_response,
-    handle_request, pane_output_stream, parse_request_line, prompt_agent,
+    answer_agent, answer_agent_form, dispatch_to_app_with_timeout, error_response_json,
+    finish_wait_response, handle_request, pane_output_stream, parse_request_line, prompt_agent,
     read_initial_request_line, write_json_line_allow_disconnect, write_text_line_allow_disconnect,
     ApiRequestSender, ConnectionPrincipal, EventHub,
 };
@@ -470,6 +470,17 @@ fn project_answer(result: ResponseResult) -> Option<serde_json::Value> {
         return None;
     };
     Some(serde_json::json!({"type": "agent_answer", "status": serde_json::to_value(status).ok()?}))
+}
+
+fn project_answer_form(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::AskFormAnswered { status, answers } = result else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "type": "ask_form_answered",
+        "status": serde_json::to_value(status).ok()?,
+        "answers": serde_json::to_value(answers).ok()?,
+    }))
 }
 
 /// A key a guest may send to a menu, in the form the app parses; `None` for
@@ -1145,6 +1156,26 @@ fn serve_request(
             params.target = agent.pane_id;
             let response = answer_agent(id.clone(), params, api_tx);
             let reply = guest_reply(&id, &response, project_answer);
+            finish_wait_response(stream, Some(reply), &id, method, false)
+        }
+        Method::AgentAnswerForm(mut params) => {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.target, guest, state.pane_id()) {
+                return forbidden(stream);
+            }
+            let GrantState::Live(agent) = state else {
+                return paused(stream);
+            };
+            // The answers are what the guest said, like a prompt's text.
+            guest.audit(
+                GuestAuditEvent::Prompt,
+                Some(method),
+                serde_json::to_string(&params.values).ok(),
+                None,
+            );
+            params.target = agent.pane_id;
+            let response = answer_agent_form(id.clone(), params, api_tx);
+            let reply = guest_reply(&id, &response, project_answer_form);
             finish_wait_response(stream, Some(reply), &id, method, false)
         }
         Method::PaneSendKeys(params) => {

@@ -51,6 +51,18 @@ pub(super) fn answer_agent(
     answer_response(request_id, &params, api_tx, LIVE)
 }
 
+pub(super) fn answer_agent_form(
+    request_id: String,
+    _params: crate::api::schema::AgentAnswerFormParams,
+    _api_tx: &ApiRequestSender,
+) -> String {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id,
+        error: error("ask_unsupported", "agent.answer_form is not wired yet"),
+    })
+    .expect("agent.answer_form response serializes")
+}
+
 fn answer_response(
     request_id: String,
     params: &AgentAnswerParams,

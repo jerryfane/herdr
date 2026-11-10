@@ -203,6 +203,7 @@ mod tests {
             "agent.prompt",
             "agent.send_keys",
             "agent.answer",
+            "agent.answer_form",
             "pane.split",
             "pane.swap",
             "pane.move",

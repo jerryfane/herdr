@@ -959,6 +959,9 @@ impl View<'_> {
                     ts_ms,
                     questions: normalize::ask_questions(part.arguments.as_ref()),
                     answer,
+                    form: None,
+                    form_answer: None,
+                    form_status: None,
                 });
                 continue;
             }
@@ -1081,6 +1084,8 @@ impl View<'_> {
                     id: part.id.clone().unwrap_or_default(),
                     questions,
                     answerable,
+                    form: None,
+                    form_answerable: false,
                 });
             } else {
                 running = Some(part);

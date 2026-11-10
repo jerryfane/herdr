@@ -20,8 +20,8 @@ use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::transcript::{
-    PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
-    TranscriptSubagent, TranscriptWorking,
+    AskFormAnswer, PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem,
+    TranscriptRecap, TranscriptSubagent, TranscriptWorking,
 };
 use super::update::{
     UpdateAttempt, UpdateLatestBuild, UpdateMode, UpdateModeReason, UpdateRunningBuild,
@@ -116,6 +116,13 @@ pub enum ResponseResult {
     },
     AgentAnswer {
         status: AgentAnswerStatus,
+    },
+    /// `agent.answer_form`: `answered` once the tool result matched the
+    /// typed answers; `answers` is the result's `details.answers` (empty when
+    /// no result arrived in time).
+    AskFormAnswered {
+        status: AgentAnswerStatus,
+        answers: Vec<AskFormAnswer>,
     },
     /// `agent.avatar.set`: the agent's picture now, `null` once cleared.
     AgentAvatarSet {

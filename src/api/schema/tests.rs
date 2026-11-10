@@ -1197,6 +1197,7 @@ fn success_response_round_trips() {
                 server_update: false,
                 turn_origin: false,
                 rename_preconditions: false,
+                ask_form: false,
             }),
         },
     };

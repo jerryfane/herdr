@@ -442,6 +442,7 @@ mod tests {
                 server_update: false,
                 turn_origin: false,
                 rename_preconditions: false,
+                ask_form: false,
             }),
         }
     }

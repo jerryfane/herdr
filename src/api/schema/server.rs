@@ -116,4 +116,8 @@ pub struct ServerCapabilities {
     /// see this before relying on them.
     #[serde(default)]
     pub rename_preconditions: bool,
+    /// Parses omp HTML form asks (`form` on transcript asks and `pending_ask`)
+    /// and serves `agent.answer_form`.
+    #[serde(default)]
+    pub ask_form: bool,
 }

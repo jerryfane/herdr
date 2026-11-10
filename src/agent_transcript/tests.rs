@@ -746,6 +746,8 @@ fn an_ask_is_pending_until_its_result_records_the_answer() {
             recommended: Some(0),
         }],
         answerable: true,
+        form: None,
+        form_answerable: false,
     };
     let page = session.newest();
     assert_eq!(page.pending_ask, Some(pending.clone()));
