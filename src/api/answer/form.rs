@@ -121,10 +121,11 @@ fn initial(form: &ParsedForm, field: usize) -> Target {
     }
 }
 
-/// Control characters, but for a textarea's line breaks and tabs.
+/// Control characters, but for a textarea's line breaks (a tab would be
+/// drawn as spaces, which the read-back could not tell apart).
 fn has_control_chars(text: &str, multiline: bool) -> bool {
     text.chars()
-        .any(|ch| ch.is_control() && !(multiline && matches!(ch, '\n' | '\t')))
+        .any(|ch| ch.is_control() && !(multiline && ch == '\n'))
 }
 
 /// Longest textarea answer herdr types: omp's `Editor` turns a longer paste
@@ -713,11 +714,12 @@ fn is_empty_text(row: &str, placeholder: &str) -> bool {
     row.is_empty() || (!placeholder.is_empty() && placeholder.starts_with(row))
 }
 
-/// The rows of the focused textarea `field`'s editor: the `height` lines
-/// after its focused label, each with only the form's frame removed (the
-/// panel's left border, the field indent and the field's bar, then the
-/// panel's right border) and trailing spaces trimmed. The rest is the
-/// editor's text as drawn, read literally.
+/// The rows of the focused textarea `field`'s editor, raw: the `height`
+/// lines after its focused label with only the form's frame removed, every
+/// other cell kept as drawn (padding included). omp frames each one as the
+/// panel's `│ ` (`row`, overlay-box.ts:47-50), the field's `  │ `
+/// (`#textFieldLines`, dialog.ts:1375), the editor's row padded to the
+/// field's inner width, then the panel's ` │`. All rows have that width.
 fn editor_rows(
     screen: &str,
     form: &ParsedForm,
@@ -728,56 +730,68 @@ fn editor_rows(
     let rows = rows_of(screen);
     let (start, count) = focused_label(&rows, &form.fields[field].label)?;
     let values = lines.get(start + count..start + count + height)?;
-    values
+    let rows: Vec<String> = values
         .iter()
         .map(|line| {
-            // `│` panel border, ` `, the two-column field indent, then the
-            // field's bar and a space (dialog.ts `#textFieldLines`).
-            let rest = line.trim_start().strip_prefix('│')?;
-            let rest = rest.strip_prefix("   │")?;
-            let rest = rest.strip_prefix(' ').unwrap_or(rest);
-            let rest = rest.trim_end();
-            let rest = rest.strip_suffix('│').unwrap_or(rest);
-            Some(rest.trim_end().to_owned())
+            let rest = line.trim_start().strip_prefix("│   │ ")?;
+            let rest = rest.trim_end_matches(' ').strip_suffix('│')?;
+            Some(rest.strip_suffix(' ')?.to_owned())
         })
-        .collect()
+        .collect::<Option<_>>()?;
+    let width = cells(rows.first()?);
+    rows.iter().all(|row| cells(row) == width).then_some(rows)
 }
 
-/// What a focused textarea shows, for comparing with what was typed: its
-/// visible characters in order, whitespace (line breaks, wrapping, padding)
-/// left out. An editor showing only its placeholder (omp draws it flush
-/// right on the empty editor's first row after the caret cell, `hintTail`,
-/// editor.ts:1627-1630) is empty, not text.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct EditorText(String);
+fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
 
-impl EditorText {
-    fn of(text: &str) -> Self {
-        Self(text.chars().filter(|ch| !ch.is_whitespace()).collect())
-    }
+/// omp's `PLACEHOLDER_MIN_GAP` (editor.ts:465).
+const PLACEHOLDER_MIN_GAP: usize = 2;
 
-    fn read(rows: &[String], placeholder: &str) -> Self {
-        let placeholder = one_line(placeholder);
-        // Typed text starts at the row's first column; the placeholder sits
-        // after padding (and the caret cell), so text equal to the
-        // placeholder still reads as text.
-        let only_placeholder = !placeholder.is_empty()
-            && rows.first().is_some_and(|row| {
-                row.starts_with(char::is_whitespace) && row.trim() == placeholder
-            })
-            && rows[1..].iter().all(|row| row.trim().is_empty());
-        if only_placeholder {
-            return Self::default();
-        }
-        Self::of(&rows.concat())
+/// The rows an empty focused textarea of `width` cells and `height` rows
+/// shows. With the hardware cursor omp's form uses nothing is drawn at the
+/// caret, and the placeholder (the raw attribute, `editor.placeholder`,
+/// dialog.ts:677) is painted flush right on the first row when at least
+/// `PLACEHOLDER_MIN_GAP` cells stay free before it, else not at all: omp
+/// does not truncate it (`hintTail`, editor.ts:1627-1630).
+fn empty_rows(placeholder: &str, width: usize, height: usize) -> Vec<String> {
+    let blank = " ".repeat(width);
+    let mut rows = vec![blank; height];
+    let shown = cells(placeholder);
+    if !placeholder.is_empty() && width >= shown + PLACEHOLDER_MIN_GAP {
+        rows[0] = format!("{}{placeholder}", " ".repeat(width - shown));
     }
+    rows
+}
+
+/// The rows a focused textarea of `width` cells and `height` rows shows
+/// holding `text` when it fits (`answer_fits`): each line from the first
+/// column padded with spaces, then blank rows. An empty `text` is not this
+/// (see `empty_rows`).
+fn text_rows(text: &str, width: usize, height: usize) -> Vec<String> {
+    let mut rows: Vec<String> = text
+        .split('\n')
+        .map(|line| format!("{line}{}", " ".repeat(width.saturating_sub(cells(line)))))
+        .collect();
+    rows.resize(height, " ".repeat(width));
+    rows
+}
+
+/// Whether `text` shows whole in an editor of `width` cells and `height`
+/// rows: no more lines than rows, and every line narrower than the editor
+/// (the caret's cell stays free at the end), so nothing wraps or scrolls.
+fn answer_fits(text: &str, width: usize, height: usize) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    lines.len() <= height && lines.iter().all(|line| cells(line) < width)
 }
 
 /// The outcome of reading a focused textarea back.
 enum ReadBack {
     Shows,
-    /// What the editor showed last; `None` when it was not on screen.
-    Differs(Option<EditorText>),
+    /// The raw rows the editor showed last; `None` when it was not on
+    /// screen.
+    Differs(Option<Vec<String>>),
 }
 
 /// The agent's pane as the form driver sees it.
@@ -813,6 +827,8 @@ struct Driver<'a, P> {
     /// Keys sent and screens read for the current field.
     keys_sent: usize,
     reads: usize,
+    /// The textarea rows of the last `editor_shows` that matched.
+    last_rows: Option<Vec<String>>,
 }
 
 impl<P: FormPane> Driver<'_, P> {
@@ -960,7 +976,31 @@ impl<P: FormPane> Driver<'_, P> {
         let (before, after) = (self.stops[index - 1], self.stops[index + 1]);
         let name = self.form.fields[field].name.clone();
         self.until(stop, |_| true)?;
+        let height = input.height();
+        // The editor's width, read before anything is sent: an answer that
+        // would wrap, or whose rows could not be told from the empty
+        // editor's placeholder, is refused while the draft is intact.
+        let width = match self.editor_shows(field, height, |_| true)? {
+            ReadBack::Shows => self.last_rows.as_ref().map_or(0, |rows| cells(&rows[0])),
+            ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
+        };
+        if !answer_fits(text, width, height) {
+            return Err(invalid(&name, TOO_LONG));
+        }
+        let empty = empty_rows(&input.placeholder, width, height);
+        let want = if text.is_empty() {
+            empty.clone()
+        } else {
+            text_rows(text, width, height)
+        };
+        if !text.is_empty() && want == empty {
+            return Err(invalid(
+                &name,
+                "answer looks like the placeholder; answer in the terminal",
+            ));
+        }
         let mut up = 0;
+
         while self.step("up", [stop, before])? == 0 {
             up += 1;
             if up > TEXTAREA_MAX_MOVES {
@@ -981,37 +1021,40 @@ impl<P: FormPane> Driver<'_, P> {
         let mut keys = vec!["ctrl+e"];
         keys.extend(std::iter::repeat_n("ctrl+u", 2 * lines));
         self.keys(keys)?;
-        let height = input.height();
-        let empty = EditorText::default();
-        match self.editor_shows(field, height, input, |shown| *shown == empty)? {
+        match self.editor_shows(field, height, |rows| rows == empty.as_slice())? {
             ReadBack::Shows => {}
-            ReadBack::Differs(_) => return Err(self.displaced(stop)),
+            ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
         }
         self.type_text(text)?;
-        let want = EditorText::of(text);
-        match self.editor_shows(field, height, input, |shown| *shown == want)? {
+        match self.editor_shows(field, height, |rows| rows == want.as_slice())? {
             ReadBack::Shows => Ok(()),
-            // The editor scrolled to keep the caret in view: the answer wraps
-            // past its rows.
-            ReadBack::Differs(Some(shown))
-                if !shown.0.is_empty() && want.0.ends_with(&shown.0) && shown != want =>
-            {
-                Err(invalid(&name, TOO_LONG))
-            }
-            ReadBack::Differs(_) => Err(self.displaced(stop)),
+            ReadBack::Differs(rows) => Err(self.misread(stop, rows)),
         }
     }
 
-    /// Read until the focused textarea shows what `done` wants. Backend
+    /// `ask_form_moved` for a textarea that did not show what was expected,
+    /// naming what it showed.
+    fn misread(&self, stop: Stop, rows: Option<Vec<String>>) -> ErrorBody {
+        let mut error = self.displaced(stop);
+        if let Some(rows) = rows {
+            let shown: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+            error
+                .message
+                .push_str(&format!("; the editor showed {shown:?}"));
+        }
+        error
+    }
+
+    /// Read until the focused textarea's raw rows satisfy `done`. Backend
     /// errors (`pane_not_found`, a failed read) propagate unchanged; a
-    /// screen that never shows it is `ReadBack::Differs` with what the
-    /// editor showed last, `None` when the editor was not found.
+    /// screen that never shows it is `ReadBack::Differs` with the rows the
+    /// editor showed last, `None` when the editor was not found. The rows of
+    /// a `Shows` read are kept in `last_rows`.
     fn editor_shows(
         &mut self,
         field: usize,
         height: usize,
-        input: &crate::agent_transcript::ask_form::TextInput,
-        done: impl Fn(&EditorText) -> bool,
+        done: impl Fn(&[String]) -> bool,
     ) -> Result<ReadBack, ErrorBody> {
         let mut last = None;
         for read in 0..SETTLE_READS {
@@ -1019,9 +1062,9 @@ impl<P: FormPane> Driver<'_, P> {
                 self.pane.pause();
             }
             let screen = self.read()?;
-            last = editor_rows(&screen, self.form, field, height)
-                .map(|rows| EditorText::read(&rows, &input.placeholder));
-            if last.as_ref().is_some_and(&done) {
+            last = editor_rows(&screen, self.form, field, height);
+            if last.as_deref().is_some_and(&done) {
+                self.last_rows = last;
                 return Ok(ReadBack::Shows);
             }
         }
@@ -1194,6 +1237,7 @@ pub(crate) fn drive(
         at: 0,
         keys_sent: 0,
         reads: 0,
+        last_rows: None,
     };
     // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
     // the first stop ↑ goes nowhere.

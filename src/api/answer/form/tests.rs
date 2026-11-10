@@ -215,6 +215,12 @@ impl Dialog {
         self
     }
 
+    /// The textarea editor's inner width: the panel's width less its
+    /// `│ `/` │` frame and the field's `  │ ` (`#textFieldLines`).
+    fn editor_width(&self) -> usize {
+        self.width.saturating_sub(8).max(4)
+    }
+
     fn field_of(&self) -> Option<usize> {
         self.stops[self.focus].field()
     }
@@ -538,7 +544,7 @@ impl Dialog {
                 let mut rows: Vec<String> = if focused && input.multiline && !value.is_empty() {
                     // Lines wrap at the field width; the viewport keeps the
                     // caret's row in view like `#updateScrollOffset`.
-                    let width = self.width.saturating_sub(6).max(4);
+                    let width = self.editor_width();
                     let mut visual = Vec::new();
                     let mut caret_row = 0;
                     for (line_index, line) in lines.iter().enumerate() {
@@ -567,14 +573,19 @@ impl Dialog {
                     self.scroll[index].set(offset);
                     visual.into_iter().skip(offset).take(height).collect()
                 } else if value.is_empty() && focused && input.multiline {
-                    // omp's Editor: the caret cell, then the placeholder
-                    // flush right (`hintTail`, editor.ts:1627-1630).
-                    let width = self.width.saturating_sub(6).max(4);
-                    let gap = width.saturating_sub(1 + input.placeholder.chars().count());
-                    if input.placeholder.is_empty() || gap < 2 {
+                    // omp's Editor with the hardware cursor: the placeholder
+                    // flush right when 2 cells stay free before it, else
+                    // nothing (`hintTail`, editor.ts:1627-1630).
+                    let width = self.editor_width();
+                    let shown = input.placeholder.chars().count();
+                    if input.placeholder.is_empty() || width < shown + 2 {
                         vec![String::new()]
                     } else {
-                        vec![format!(" {}{}", " ".repeat(gap), input.placeholder)]
+                        vec![format!(
+                            "{}{}",
+                            " ".repeat(width - shown),
+                            input.placeholder
+                        )]
                     }
                 } else if value.is_empty() {
                     vec![input.placeholder.clone()]
@@ -588,8 +599,12 @@ impl Dialog {
                     }
                 }
                 rows.resize(height, String::new());
+                // The panel pads every row to the field's inner width and
+                // closes it with ` │` (overlay-box.ts `row`).
+                let width = self.editor_width();
                 for row in rows {
-                    out.push(format!("│   │ {row}"));
+                    let pad = width.saturating_sub(row.chars().count());
+                    out.push(format!("│   │ {row}{} │", " ".repeat(pad)));
                 }
             }
             FieldKind::Choice(choice) if choice.is_dropdown() => {
@@ -1239,17 +1254,90 @@ fn review_crlf_textarea_answer() {
     assert_eq!(error.message, "n: control characters are not allowed");
 }
 
-/// #394 F3: a backend read error after a clipped editor frame is reported
-/// as itself, not as "too long".
+/// #394 F3: a backend read error while reading the typed answer back is
+/// reported as itself.
 #[test]
 fn review_backend_read_error_is_preserved() {
-    let mut dialog = Dialog::new(VOICE_OVER);
-    dialog.width = 30;
-    dialog.fail_read_after_paste = Some(1);
+    for fail_at in [0, 1] {
+        let mut dialog = Dialog::new(VOICE_OVER);
+        dialog.fail_read_after_paste = Some(fail_at);
+        let form = dialog.form.clone();
+        let planned = plan(&form, &values(&[("vo", text("Short."))])).unwrap();
+        let error = drive(&mut dialog, &form, &planned).unwrap_err();
+        assert_eq!(error.code, "pane_not_found", "{error:?}");
+        assert_eq!(dialog.submitted, None);
+    }
+}
+
+/// #394 r2: a placeholder with a double space is read exactly, not
+/// collapsed, so the emptied editor is recognised.
+#[test]
+fn a_double_space_placeholder_is_read_exactly() {
+    let html = WITH_PLACEHOLDER.replace("Say something", "Say  something");
+    let mut dialog = Dialog::new(&html);
+    let submitted = answer(&mut dialog, values(&[("n", text("New notes."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("New notes."));
+    let mut dialog = Dialog::new(&html);
+    let submitted = answer(&mut dialog, values(&[("n", text(""))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(""));
+}
+
+/// #394 r2: a literal answer with a leading space is text, never the
+/// placeholder.
+#[test]
+fn a_leading_space_answer_is_text() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text(" Say something"))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(" Say something"));
+}
+
+/// #394 r2: a placeholder too long for the editor is not drawn (omp does not
+/// truncate it); the emptied editor is blank.
+#[test]
+fn a_placeholder_longer_than_the_editor_is_not_drawn() {
+    let long = "p".repeat(40);
+    let html = WITH_PLACEHOLDER.replace("Say something", &long);
+    let mut dialog = Dialog::new(&html);
+    dialog.width = 40;
+    let submitted = answer(&mut dialog, values(&[("n", text("Short."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("Short."));
+    assert_eq!(empty_rows(&long, 32, 2), vec![" ".repeat(32); 2]);
+    assert_eq!(empty_rows("ab", 4, 1), vec!["  ab".to_owned()]);
+    assert_eq!(
+        empty_rows("abc", 4, 1),
+        vec!["    ".to_owned()],
+        "one free cell is too few"
+    );
+}
+
+/// #394 r2: an answer drawn exactly like the empty editor's placeholder
+/// (possible when the placeholder ends in spaces) cannot be confirmed: it is
+/// refused before the draft is touched.
+#[test]
+fn an_answer_drawn_like_the_placeholder_is_invalid() {
+    let html = WITH_PLACEHOLDER.replace("Say something", "Say something  ");
+    let mut dialog = Dialog::new(&html);
+    dialog.width = 40;
+    let width = dialog.editor_width();
+    let lookalike = format!(
+        "{}Say something",
+        " ".repeat(width - "Say something  ".len())
+    );
+    assert_eq!(
+        text_rows(&lookalike, width, 4),
+        empty_rows("Say something  ", width, 4)
+    );
     let form = dialog.form.clone();
-    let paragraph = "word ".repeat(60);
-    let planned = plan(&form, &values(&[("vo", text(paragraph.trim()))])).unwrap();
+    let planned = plan(&form, &values(&[("n", text(&lookalike))])).unwrap();
+    let before = dialog.lines[1].clone();
     let error = drive(&mut dialog, &form, &planned).unwrap_err();
-    assert_eq!(error.code, "pane_not_found", "{error:?}");
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        (
+            "ask_form_invalid",
+            "n: answer looks like the placeholder; answer in the terminal"
+        )
+    );
+    assert_eq!(dialog.lines[1], before, "the draft is untouched");
     assert_eq!(dialog.submitted, None);
 }
