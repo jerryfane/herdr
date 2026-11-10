@@ -160,6 +160,9 @@ struct Dialog {
     received: Vec<(String, Stop)>,
     /// Pastes lose their last character (the terminal mangled the input).
     paste_drops_last: bool,
+    /// After a paste, the read with this index fails (`pane_not_found`).
+    fail_read_after_paste: Option<usize>,
+    reads_since_paste: Option<usize>,
 }
 
 impl Dialog {
@@ -182,6 +185,8 @@ impl Dialog {
             refuse: None,
             frozen_after: None,
             paste_drops_last: false,
+            fail_read_after_paste: None,
+            reads_since_paste: None,
             received: Vec::new(),
             form,
         };
@@ -382,6 +387,7 @@ impl Dialog {
             return;
         }
         self.keys.push(format!("text:{text}"));
+        self.reads_since_paste = Some(0);
         self.received
             .push((format!("text:{text}"), self.stops[self.focus]));
         let mut chars: Vec<char> = text.chars().collect();
@@ -560,6 +566,16 @@ impl Dialog {
                     offset = offset.min(visual.len().saturating_sub(height));
                     self.scroll[index].set(offset);
                     visual.into_iter().skip(offset).take(height).collect()
+                } else if value.is_empty() && focused && input.multiline {
+                    // omp's Editor: the caret cell, then the placeholder
+                    // flush right (`hintTail`, editor.ts:1627-1630).
+                    let width = self.width.saturating_sub(6).max(4);
+                    let gap = width.saturating_sub(1 + input.placeholder.chars().count());
+                    if input.placeholder.is_empty() || gap < 2 {
+                        vec![String::new()]
+                    } else {
+                        vec![format!(" {}{}", " ".repeat(gap), input.placeholder)]
+                    }
                 } else if value.is_empty() {
                     vec![input.placeholder.clone()]
                 } else {
@@ -647,6 +663,15 @@ impl Dialog {
 
 impl FormPane for Dialog {
     fn read_screen(&mut self) -> Result<String, ErrorBody> {
+        if let Some(reads) = self.reads_since_paste.as_mut() {
+            if Some(*reads) == self.fail_read_after_paste {
+                return Err(ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: "pane w1:p1 not found".into(),
+                });
+            }
+            *reads += 1;
+        }
         Ok(self.render())
     }
 
@@ -1163,4 +1188,68 @@ fn a_first_field_textarea_is_kept_but_not_edited() {
     let mut dialog = Dialog::new(html);
     let submitted = answer(&mut dialog, values(&[("r", options(&["b"]))])).unwrap();
     assert_eq!(value(&submitted, "n"), txt("draft"));
+}
+
+const WITH_PLACEHOLDER: &str = r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
+<label><input type="radio" name="r" value="b"> B</label>
+<label>Notes <textarea name="n" placeholder="Say something">old draft
+second line</textarea></label></form>"#;
+
+/// #394 F1: the placeholder omp draws flush right in an emptied editor reads
+/// as empty, so the draft is replaced.
+#[test]
+fn review_replacement_with_real_right_aligned_placeholder() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text("New notes."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("New notes."));
+}
+
+/// #394 F1: emptying a textarea that has a placeholder works.
+#[test]
+fn review_empty_answer_with_placeholder() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text(""))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(""));
+}
+
+/// #394 F1: an answer equal to the placeholder is text, not the placeholder.
+#[test]
+fn an_answer_equal_to_the_placeholder_is_text() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text("Say something"))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("Say something"));
+}
+
+/// #394 F2: CRLF and lone CR line breaks are normalized, not refused.
+#[test]
+fn review_crlf_textarea_answer() {
+    let form = parse(WITH_PLACEHOLDER);
+    for raw in ["Line one\r\nLine two", "Line one\rLine two"] {
+        let planned = plan(&form, &values(&[("n", text(raw))])).unwrap();
+        assert_eq!(
+            value(&planned.expected, "n"),
+            txt("Line one\nLine two"),
+            "{raw:?}"
+        );
+        let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+        let submitted = answer(&mut dialog, values(&[("n", text(raw))])).unwrap();
+        assert_eq!(value(&submitted, "n"), txt("Line one\nLine two"));
+    }
+    let error = plan(&form, &values(&[("n", text("bell\u{7}"))])).unwrap_err();
+    assert_eq!(error.message, "n: control characters are not allowed");
+}
+
+/// #394 F3: a backend read error after a clipped editor frame is reported
+/// as itself, not as "too long".
+#[test]
+fn review_backend_read_error_is_preserved() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 30;
+    dialog.fail_read_after_paste = Some(1);
+    let form = dialog.form.clone();
+    let paragraph = "word ".repeat(60);
+    let planned = plan(&form, &values(&[("vo", text(paragraph.trim()))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(error.code, "pane_not_found", "{error:?}");
+    assert_eq!(dialog.submitted, None);
 }

@@ -225,7 +225,16 @@ fn targets(
                 if value.options.is_some() || value.other.is_some() {
                     return Err(invalid(&field.name, "a text field takes text"));
                 }
-                match &value.text {
+                // A textarea answer's line breaks as omp's editor keeps them:
+                // CRLF and lone CR become LF (`#handlePaste`, editor.ts).
+                let text = value.text.as_ref().map(|text| {
+                    if input.multiline {
+                        text.replace("\r\n", "\n").replace('\r', "\n")
+                    } else {
+                        text.clone()
+                    }
+                });
+                match &text {
                     None => initial(form, index),
                     Some(text) if has_control_chars(text, input.multiline) => {
                         return Err(invalid(
@@ -238,7 +247,6 @@ fn targets(
                         ));
                     }
                     Some(text) if input.multiline => {
-                        let text = text.replace("\r\n", "\n");
                         if text.split('\n').count() > input.height()
                             || text.chars().count() > TEXTAREA_MAX_CHARS
                         {
@@ -252,7 +260,7 @@ fn targets(
                                 "the form's first field cannot be edited from the app; answer in the terminal",
                             ));
                         }
-                        Target::Text(text)
+                        Target::Text(text.clone())
                     }
                     Some(text) => Target::Text(text.clone()),
                 }
@@ -735,6 +743,43 @@ fn editor_rows(
         .collect()
 }
 
+/// What a focused textarea shows, for comparing with what was typed: its
+/// visible characters in order, whitespace (line breaks, wrapping, padding)
+/// left out. An editor showing only its placeholder (omp draws it flush
+/// right on the empty editor's first row after the caret cell, `hintTail`,
+/// editor.ts:1627-1630) is empty, not text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EditorText(String);
+
+impl EditorText {
+    fn of(text: &str) -> Self {
+        Self(text.chars().filter(|ch| !ch.is_whitespace()).collect())
+    }
+
+    fn read(rows: &[String], placeholder: &str) -> Self {
+        let placeholder = one_line(placeholder);
+        // Typed text starts at the row's first column; the placeholder sits
+        // after padding (and the caret cell), so text equal to the
+        // placeholder still reads as text.
+        let only_placeholder = !placeholder.is_empty()
+            && rows.first().is_some_and(|row| {
+                row.starts_with(char::is_whitespace) && row.trim() == placeholder
+            })
+            && rows[1..].iter().all(|row| row.trim().is_empty());
+        if only_placeholder {
+            return Self::default();
+        }
+        Self::of(&rows.concat())
+    }
+}
+
+/// The outcome of reading a focused textarea back.
+enum ReadBack {
+    Shows,
+    /// What the editor showed last; `None` when it was not on screen.
+    Differs(Option<EditorText>),
+}
+
 /// The agent's pane as the form driver sees it.
 pub(crate) trait FormPane {
     fn read_screen(&mut self) -> Result<String, ErrorBody>;
@@ -768,8 +813,6 @@ struct Driver<'a, P> {
     /// Keys sent and screens read for the current field.
     keys_sent: usize,
     reads: usize,
-    /// The focused textarea's rows as last read.
-    last_editor: Option<Vec<String>>,
 }
 
 impl<P: FormPane> Driver<'_, P> {
@@ -939,54 +982,50 @@ impl<P: FormPane> Driver<'_, P> {
         keys.extend(std::iter::repeat_n("ctrl+u", 2 * lines));
         self.keys(keys)?;
         let height = input.height();
-        let placeholder = one_line(&input.placeholder);
-        self.editor_shows(field, height, |rows| {
-            rows.iter().enumerate().all(|(row, shown)| {
-                shown.is_empty() || (row == 0 && !placeholder.is_empty() && *shown == placeholder)
-            })
-        })?;
+        let empty = EditorText::default();
+        match self.editor_shows(field, height, input, |shown| *shown == empty)? {
+            ReadBack::Shows => {}
+            ReadBack::Differs(_) => return Err(self.displaced(stop)),
+        }
         self.type_text(text)?;
-        let want: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-        let shown = |rows: &[String]| -> String {
-            rows.concat()
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect()
-        };
-        match self.editor_shows(field, height, |rows| shown(rows) == want) {
-            Ok(()) => Ok(()),
-            // The editor scrolled: the answer wraps past its rows.
-            Err(_)
-                if self.last_editor.as_deref().is_some_and(|rows| {
-                    let visible = shown(rows);
-                    !visible.is_empty() && want.ends_with(&visible) && visible != want
-                }) =>
+        let want = EditorText::of(text);
+        match self.editor_shows(field, height, input, |shown| *shown == want)? {
+            ReadBack::Shows => Ok(()),
+            // The editor scrolled to keep the caret in view: the answer wraps
+            // past its rows.
+            ReadBack::Differs(Some(shown))
+                if !shown.0.is_empty() && want.0.ends_with(&shown.0) && shown != want =>
             {
                 Err(invalid(&name, TOO_LONG))
             }
-            Err(error) => Err(error),
+            ReadBack::Differs(_) => Err(self.displaced(stop)),
         }
     }
 
-    /// Read until the focused textarea's rows satisfy `done`; the rows last
-    /// read are kept in `last_editor`.
+    /// Read until the focused textarea shows what `done` wants. Backend
+    /// errors (`pane_not_found`, a failed read) propagate unchanged; a
+    /// screen that never shows it is `ReadBack::Differs` with what the
+    /// editor showed last, `None` when the editor was not found.
     fn editor_shows(
         &mut self,
         field: usize,
         height: usize,
-        done: impl Fn(&[String]) -> bool,
-    ) -> Result<(), ErrorBody> {
+        input: &crate::agent_transcript::ask_form::TextInput,
+        done: impl Fn(&EditorText) -> bool,
+    ) -> Result<ReadBack, ErrorBody> {
+        let mut last = None;
         for read in 0..SETTLE_READS {
             if read > 0 {
                 self.pane.pause();
             }
             let screen = self.read()?;
-            self.last_editor = editor_rows(&screen, self.form, field, height);
-            if self.last_editor.as_deref().is_some_and(&done) {
-                return Ok(());
+            last = editor_rows(&screen, self.form, field, height)
+                .map(|rows| EditorText::read(&rows, &input.placeholder));
+            if last.as_ref().is_some_and(&done) {
+                return Ok(ReadBack::Shows);
             }
         }
-        Err(self.displaced(Stop::Text { field }))
+        Ok(ReadBack::Differs(last))
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), ErrorBody> {
@@ -1155,7 +1194,6 @@ pub(crate) fn drive(
         at: 0,
         keys_sent: 0,
         reads: 0,
-        last_editor: None,
     };
     // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
     // the first stop ↑ goes nowhere.
