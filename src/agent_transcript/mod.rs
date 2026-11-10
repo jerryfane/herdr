@@ -6,6 +6,7 @@
 //! chain of the newest entry, is shown. A per-file index (see `index`) keeps
 //! one small record per entry so a page reads only the lines it renders.
 
+pub(crate) mod ask_form;
 mod history;
 mod index;
 mod normalize;
@@ -21,7 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use base64::Engine as _;
 
-use crate::api::schema::PendingAsk;
+use crate::api::schema::{AskFormAnswer, PendingAsk};
 use crate::api::schema::{
     TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap, TranscriptStepStatus,
     TranscriptSubagent, TranscriptTurnStatus, TranscriptWorking,
@@ -185,8 +186,47 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
     )
 )]
 pub(crate) fn pending_ask(session_path: &Path) -> std::io::Result<Option<PendingAsk>> {
-    match with_index(session_path, |view| Ok(view.live_state()?.0)) {
+    match with_index(session_path, |view| Ok(view.live_state()?.ask)) {
         Ok(ask) => Ok(ask),
+        Err(TranscriptError::Unavailable(error)) => Err(error),
+        Err(other) => Err(std::io::Error::other(other.message())),
+    }
+}
+
+/// The pending `ask` and, for a form ask, its form HTML
+/// (`agent.answer_form` drives the form from it).
+pub(crate) fn pending_ask_with_form(
+    session_path: &Path,
+) -> std::io::Result<Option<(PendingAsk, Option<String>)>> {
+    let read = with_index(session_path, |view| {
+        let state = view.live_state()?;
+        Ok(state.ask.map(|ask| (ask, state.form_html)))
+    });
+    match read {
+        Ok(ask) => Ok(ask),
+        Err(TranscriptError::Unavailable(error)) => Err(error),
+        Err(other) => Err(std::io::Error::other(other.message())),
+    }
+}
+
+/// The `details.answers` recorded for the form `ask` call `ask_id`, once
+/// its result is written; `None` while it is unanswered.
+pub(crate) fn form_ask_result(
+    session_path: &Path,
+    ask_id: &str,
+) -> std::io::Result<Option<Vec<AskFormAnswer>>> {
+    let read = with_index(session_path, |view| {
+        let Some(result) = view.index.result_for(ask_id) else {
+            return Ok(None);
+        };
+        let failed = view.index.record(result).failed;
+        let line: ResultLine = view.parse(result)?.ok_or(TranscriptError::CursorExpired)?;
+        Ok(Some(
+            normalize::form_result(line.message.details.as_ref(), failed).0,
+        ))
+    });
+    match read {
+        Ok(answers) => Ok(answers),
         Err(TranscriptError::Unavailable(error)) => Err(error),
         Err(other) => Err(std::io::Error::other(other.message())),
     }
@@ -487,7 +527,11 @@ impl View<'_> {
             origins: Some(origins),
         }
         .encode(&session_id);
-        let (pending_ask, working) = self.live_state()?;
+        let LiveState {
+            ask: pending_ask,
+            working,
+            form_html: _,
+        } = self.live_state()?;
         Ok(Page {
             session_id,
             entries,
@@ -946,22 +990,48 @@ impl View<'_> {
                 }
             }
             if tool == "ask" {
-                let answer = match result {
-                    Some(result) => Some(
-                        self.parse::<ResultLine>(result)?
-                            .map(|line| normalize::ask_answer(line.message.details.as_ref()))
-                            .unwrap_or_default(),
-                    ),
-                    None => None,
+                let form = ask_form::form_html(part.arguments.as_ref())
+                    .map(ask_form::parse)
+                    .map(|parsed| {
+                        let wire = parsed.to_wire();
+                        (parsed.compat_questions(&wire), wire)
+                    });
+                let (questions, form) = match form {
+                    Some((questions, wire)) => (questions, Some(wire)),
+                    None => (normalize::ask_questions(part.arguments.as_ref()), None),
+                };
+                let (answer, form_answer, form_status) = match result {
+                    Some(result) => {
+                        let failed = self.index.record(result).failed;
+                        let line = self.parse::<ResultLine>(result)?;
+                        let details = line.as_ref().and_then(|line| line.message.details.as_ref());
+                        match &form {
+                            Some(wire) => {
+                                let (answers, status) = normalize::form_result(details, failed);
+                                let lines = normalize::form_answer_lines(wire, &answers);
+                                (
+                                    (!lines.is_empty()).then_some(lines),
+                                    Some(answers),
+                                    Some(status),
+                                )
+                            }
+                            None => {
+                                // An ask with no selection (cancelled, failed) has no answer.
+                                let answer = normalize::ask_answer(details);
+                                ((!answer.is_empty()).then_some(answer), None, None)
+                            }
+                        }
+                    }
+                    None => (None, None, None),
                 };
                 entries.push(TranscriptEntry::Ask {
                     id: call_id.to_owned(),
                     ts_ms,
-                    questions: normalize::ask_questions(part.arguments.as_ref()),
+                    questions,
                     answer,
-                    form: None,
-                    form_answer: None,
-                    form_status: None,
+                    form,
+                    form_answer,
+                    form_status,
                 });
                 continue;
             }
@@ -1044,21 +1114,25 @@ impl View<'_> {
     }
 
     /// The ask waiting for an answer and the step running now, both from the
-    /// newest model message (an exit after it cancels both).
-    fn live_state(
-        &self,
-    ) -> Result<(Option<PendingAsk>, Option<TranscriptWorking>), TranscriptError> {
+    /// newest model message (an exit after it cancels both), plus the pending
+    /// ask's form HTML when it is a form ask.
+    fn live_state(&self) -> Result<LiveState, TranscriptError> {
+        let none = || LiveState {
+            ask: None,
+            working: None,
+            form_html: None,
+        };
         let Some(position) = (0..self.branch.len())
             .rev()
             .find(|&position| matches!(self.kind(position), Kind::Assistant | Kind::SessionExit))
         else {
-            return Ok((None, None));
+            return Ok(none());
         };
         if self.kind(position) == Kind::SessionExit {
-            return Ok((None, None));
+            return Ok(none());
         }
         let Some(line) = self.parse::<AssistantLine>(self.branch[position])? else {
-            return Ok((None, None));
+            return Ok(none());
         };
         let message = &line.message;
         let open = message.content.iter().filter(|part| {
@@ -1072,21 +1146,40 @@ impl View<'_> {
         let abandoned =
             (position + 1..self.branch.len()).any(|later| self.kind(later) == Kind::User);
         let mut ask = None;
+        let mut form_html = None;
         let mut running = None;
         for part in open {
             if part.name.as_deref() == Some("ask") {
                 if abandoned {
                     continue;
                 }
-                let questions = normalize::ask_questions(part.arguments.as_ref());
-                let answerable = matches!(questions.as_slice(), [only] if !only.multi && !only.options.is_empty());
-                ask = Some(PendingAsk {
-                    id: part.id.clone().unwrap_or_default(),
-                    questions,
-                    answerable,
-                    form: None,
-                    form_answerable: false,
+                let id = part.id.clone().unwrap_or_default();
+                let html = ask_form::form_html(part.arguments.as_ref());
+                ask = Some(match html {
+                    Some(html) => {
+                        let parsed = ask_form::parse(html);
+                        let wire = parsed.to_wire();
+                        PendingAsk {
+                            id,
+                            questions: parsed.compat_questions(&wire),
+                            answerable: false,
+                            form: Some(wire),
+                            form_answerable: parsed.drivable(),
+                        }
+                    }
+                    None => {
+                        let questions = normalize::ask_questions(part.arguments.as_ref());
+                        let answerable = matches!(questions.as_slice(), [only] if !only.multi && !only.options.is_empty());
+                        PendingAsk {
+                            id,
+                            questions,
+                            answerable,
+                            form: None,
+                            form_answerable: false,
+                        }
+                    }
                 });
+                form_html = html.map(str::to_owned);
             } else {
                 running = Some(part);
             }
@@ -1101,6 +1194,16 @@ impl View<'_> {
             }),
             _ => None,
         };
-        Ok((ask, working))
+        Ok(LiveState {
+            ask,
+            working,
+            form_html,
+        })
     }
+}
+
+struct LiveState {
+    ask: Option<PendingAsk>,
+    working: Option<TranscriptWorking>,
+    form_html: Option<String>,
 }

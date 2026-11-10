@@ -5,8 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::schema::{
-    AskQuestion, TranscriptAuthor, TranscriptNoteSource, TranscriptPlanItem,
-    TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
+    AskForm, AskFormAnswer, AskFormStatus, AskQuestion, TranscriptAuthor, TranscriptNoteSource,
+    TranscriptPlanItem, TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
 };
 
 pub(super) const DETAIL_MAX_CHARS: usize = 300;
@@ -366,6 +366,63 @@ pub(super) fn ask_answer(details: Option<&Value>) -> Vec<String> {
         None => take(details),
     }
     answer
+}
+
+/// The answers of a form `ask` result (`details.answers`) and how it ended:
+/// timed out when `details.timedOut` is set; cancelled when the result is an
+/// error or carries no answers (omp throws on cancel, and a form without
+/// named controls records none).
+pub(super) fn form_result(
+    details: Option<&Value>,
+    failed: bool,
+) -> (Vec<AskFormAnswer>, AskFormStatus) {
+    let answers: Vec<AskFormAnswer> = details
+        .and_then(|details| details.get("answers"))
+        .and_then(Value::as_array)
+        .map(|answers| {
+            answers
+                .iter()
+                .filter_map(|answer| {
+                    let text =
+                        |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_owned);
+                    Some(AskFormAnswer {
+                        name: text("name")?,
+                        question: text("question").unwrap_or_default(),
+                        answer: text("answer").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let timed_out = details
+        .and_then(|details| details.get("timedOut"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = if failed || answers.is_empty() {
+        AskFormStatus::Cancelled
+    } else if timed_out {
+        AskFormStatus::TimedOut
+    } else {
+        AskFormStatus::Answered
+    };
+    (answers, status)
+}
+
+/// The compatibility `answer` lines of a form ask, `"<title>: <answer>"`
+/// per field (the form's title for the field, else omp's question).
+pub(super) fn form_answer_lines(form: &AskForm, answers: &[AskFormAnswer]) -> Vec<String> {
+    answers
+        .iter()
+        .map(|answer| {
+            let title = form
+                .fields
+                .iter()
+                .find(|field| field.name == answer.name)
+                .and_then(|field| field.title.as_deref())
+                .unwrap_or(&answer.question);
+            format!("{title}: {}", answer.answer)
+        })
+        .collect()
 }
 
 /// Todo items from a `todo` result's `details.phases[].tasks[]`; abandoned

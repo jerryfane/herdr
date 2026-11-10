@@ -2856,6 +2856,41 @@ mod tests {
         assert!(harness.pty_text(1, Duration::from_millis(50)).is_empty());
     }
 
+    /// `agent.answer_form` passes the gate under `agent.answer`'s rules: only
+    /// the granted agent, audited with the guest's values.
+    #[test]
+    fn a_guest_answers_the_granted_agents_form_but_no_other_agents() {
+        let harness = start("answer-form");
+        let _sessions = omp_sessions(&harness);
+        let guest = harness.admit();
+        let answer = |target: &str| json!({"id": "f", "method": "agent.answer_form", "params": {"target": target, "ask_id": "ask-1", "values": {"db": {"options": ["pg"]}}}});
+        for target in [
+            harness.pane_ids[1].as_str(),
+            "other-agent",
+            "studio/llm-opt",
+        ] {
+            let lines = harness.call(&guest, answer(target));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        // Past the gate it runs as for the owner: this agent has no pending
+        // form ask, so the driver refuses before touching the pane.
+        let lines = harness.call(&guest, answer("llm-opt"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], "f");
+        assert!(
+            matches!(code(&lines), "ask_unsupported" | "ask_not_pending"),
+            "{lines:?}"
+        );
+        let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 10).unwrap();
+        assert_eq!(audit[0].event, GuestAuditEvent::Prompt);
+        assert_eq!(audit[0].method.as_deref(), Some("agent.answer_form"));
+        assert_eq!(
+            audit[0].text.as_deref(),
+            Some(r#"{"db":{"options":["pg"]}}"#)
+        );
+        assert!(harness.pty_text(1, Duration::from_millis(50)).is_empty());
+    }
+
     /// Folders and stars are the owner's: a guest can neither read nor change
     /// them, and the granted agent's folder and star never reach it.
     #[test]
@@ -5596,6 +5631,7 @@ mod tests {
                     ask_id: "call_1".into(),
                     question: "Ship it?".into(),
                     options: vec!["Yes".into(), "No".into()],
+                    form: None,
                 });
                 alert
             })
