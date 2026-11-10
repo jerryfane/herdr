@@ -548,14 +548,12 @@ impl Dialog {
                     let mut visual = Vec::new();
                     let mut caret_row = 0;
                     for (line_index, line) in lines.iter().enumerate() {
-                        let chars: Vec<char> = line.chars().collect();
-                        let parts: Vec<String> = if chars.is_empty() {
-                            vec![String::new()]
+                        // omp's wrapping, as ported (checked against real
+                        // omp by `the_wrap_port_matches_omp_screens`).
+                        let parts: Vec<String> = if line.chars().count() <= width {
+                            vec![line.clone()]
                         } else {
-                            chars
-                                .chunks(width)
-                                .map(|part| part.iter().collect())
-                                .collect()
+                            word_wrap_line(line, width)
                         };
                         if line_index == self.caret[index].0 {
                             caret_row =
@@ -1323,10 +1321,9 @@ fn an_answer_drawn_like_the_placeholder_is_invalid() {
         "{}Say something",
         " ".repeat(width - "Say something  ".len())
     );
-    assert_eq!(
-        text_rows(&lookalike, width, 4),
-        empty_rows("Say something  ", width, 4)
-    );
+    let mut rows = layout_rows(&lookalike, width);
+    rows.resize(4, " ".repeat(width));
+    assert_eq!(rows, empty_rows("Say something  ", width, 4));
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("n", text(&lookalike))])).unwrap();
     let before = dialog.lines[1].clone();
@@ -1340,4 +1337,121 @@ fn an_answer_drawn_like_the_placeholder_is_invalid() {
     );
     assert_eq!(dialog.lines[1], before, "the draft is untouched");
     assert_eq!(dialog.submitted, None);
+}
+
+const OMP_WRAP: &str = include_str!("omp-18.18.6-textarea-wrap.json");
+
+fn shown_chars(line: &str) -> usize {
+    line.chars().count()
+}
+
+/// The answer rows of a focused textarea, as `editor_rows` reads them from
+/// a captured screen line.
+fn captured_row(line: &str) -> String {
+    let rest = line
+        .trim_start()
+        .strip_prefix("│   │ ")
+        .expect("framed row");
+    let rest = rest
+        .trim_end_matches(' ')
+        .strip_suffix('│')
+        .expect("closed row");
+    rest.strip_suffix(' ').expect("frame space").to_owned()
+}
+
+/// #394 r3: the port of omp's `wordWrapLine` reproduces omp 18.18.6's
+/// screens byte for byte: full-width lines, a word straddling the edge, a
+/// word longer than the row, a long word after a short one, CJK, ASCII then
+/// CJK, emoji, emoji at the edge, spaces at the wrap point, combining marks,
+/// two paragraphs. Captured from real omp in a 111-cell, 10-row textarea
+/// (`textarea-smoke-394r3/`). A ZWJ emoji sequence is drawn wider by the
+/// terminal than omp lays it out, so no port can match it: those answers
+/// are refused (`emoji_sequences_are_refused_in_textareas`).
+#[test]
+fn the_wrap_port_matches_omp_screens() {
+    let fixtures: serde_json::Value = serde_json::from_str(OMP_WRAP).unwrap();
+    let width = fixtures["width"].as_u64().unwrap() as usize;
+    let mut checked = 0;
+    for case in fixtures["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let text = case["text"].as_str().unwrap();
+        let lines: Vec<&str> = case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row.as_str().unwrap())
+            .collect();
+        if name == "combining" {
+            // omp lays `e` + U+0301 out as one cell, as the port does, but
+            // the terminal reads it back precomposed (`é`): such answers are
+            // refused (`combined_characters_are_refused_in_textareas`).
+            assert!(shown_chars(lines[0]) < cells(lines[0]) + 1);
+            continue;
+        }
+        if name == "zwj-emoji" {
+            // Each 👩‍💻 took four cells on the terminal's grid against omp's two:
+            // the row overflows the panel.
+            let last = shown_chars(lines[lines.len() - 1]);
+            assert!(
+                lines.iter().any(|line| shown_chars(line) != last),
+                "the terminal draws ZWJ sequences off omp's grid"
+            );
+            continue;
+        }
+        let shown: Vec<String> = lines.iter().map(|line| captured_row(line)).collect();
+        let mut want = layout_rows(text, width);
+        want.resize(shown.len(), " ".repeat(width));
+        assert_eq!(want, shown, "{name}");
+        checked += 1;
+    }
+    assert_eq!(checked, 15);
+}
+
+/// #394 r3: an answer that wraps but fits the editor's rows is typed and
+/// confirmed: 40 characters in a 32-cell, 4-row editor.
+#[test]
+fn a_wrapping_answer_that_fits_is_accepted() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    assert_eq!(dialog.editor_width(), 32);
+    let answer_text = "The new desk remembers how you work best.";
+    let submitted = answer(&mut dialog, values(&[("vo", text(answer_text))])).unwrap();
+    assert_eq!(value(&submitted, "vo"), txt(answer_text));
+    // Two paragraphs that wrap within the four rows.
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    let two = "Meet the new desk, built to last.\nIt keeps your notes close by.";
+    let submitted = answer(&mut dialog, values(&[("vo", text(two))])).unwrap();
+    assert_eq!(value(&submitted, "vo"), txt(two));
+}
+
+/// #394 r3: wrapping past the editor's rows is still refused before the
+/// draft is touched.
+#[test]
+fn a_wrapping_answer_past_the_rows_is_too_long() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    let before = dialog.lines[2].clone();
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("vo", text(&"word ".repeat(40)))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        error.message,
+        "vo: too long to edit from the app; answer in the terminal"
+    );
+    assert_eq!(dialog.lines[2], before);
+}
+
+/// #394 r3: characters built from several code points (ZWJ emoji, a letter
+/// plus a separate accent) cannot be confirmed on screen; precomposed
+/// letters, CJK and single-code-point emoji can.
+#[test]
+fn combined_characters_are_refused_in_textareas() {
+    let form = parse(VOICE_OVER);
+    let refused = "vo: combined characters (emoji sequences, separate accent marks) cannot be checked on screen; answer in the terminal";
+    for answer_text in ["Coding 👩\u{200d}💻 today", "Cafe\u{301}"] {
+        let error = plan(&form, &values(&[("vo", text(answer_text))])).unwrap_err();
+        assert_eq!(error.message, refused, "{answer_text:?}");
+    }
+    assert!(plan(&form, &values(&[("vo", text("Café 漢字 🙂"))])).is_ok());
 }

@@ -247,6 +247,23 @@ fn targets(
                             },
                         ));
                     }
+                    // A character built from several code points cannot be
+                    // confirmed on screen: herdr's terminal draws an emoji ZWJ
+                    // sequence wider than omp lays it out, and reads a letter
+                    // with a separate accent mark back precomposed.
+                    Some(text)
+                        if input.multiline
+                            && unicode_segmentation::UnicodeSegmentation::graphemes(
+                                text.as_str(),
+                                true,
+                            )
+                            .any(|grapheme| grapheme.chars().nth(1).is_some()) =>
+                    {
+                        return Err(invalid(
+                            &field.name,
+                            "combined characters (emoji sequences, separate accent marks) cannot be checked on screen; answer in the terminal",
+                        ));
+                    }
                     Some(text) if input.multiline => {
                         if text.split('\n').count() > input.height()
                             || text.chars().count() > TEXTAREA_MAX_CHARS
@@ -765,30 +782,196 @@ fn empty_rows(placeholder: &str, width: usize, height: usize) -> Vec<String> {
     rows
 }
 
-/// The rows a focused textarea of `width` cells and `height` rows shows
-/// holding `text` when it fits (`answer_fits`): each line from the first
-/// column padded with spaces, then blank rows. An empty `text` is not this
-/// (see `empty_rows`).
-fn text_rows(text: &str, width: usize, height: usize) -> Vec<String> {
-    let mut rows: Vec<String> = text
-        .split('\n')
-        .map(|line| format!("{line}{}", " ".repeat(width.saturating_sub(cells(line)))))
-        .collect();
-    rows.resize(height, " ".repeat(width));
-    rows
+/// The rows a focused textarea of `width` cells shows holding `text`, each
+/// padded to `width`, as omp's `Editor` lays it out (`#layoutText`,
+/// editor.ts:3160-3225): a logical line no wider than the editor is one row
+/// as is; a wider one is word-wrapped by `wordWrapLine`.
+fn layout_rows(text: &str, width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| {
+            if cells(line) <= width {
+                vec![line.to_owned()]
+            } else {
+                word_wrap_line(line, width)
+            }
+        })
+        .map(|row| {
+            let pad = width.saturating_sub(cells(&row));
+            format!("{row}{}", " ".repeat(pad))
+        })
+        .collect()
 }
 
-/// Whether `text` shows whole in an editor of `width` cells and `height`
-/// rows: no more lines than rows, and every line narrower than the editor
-/// (the caret's cell stays free at the end), so nothing wraps or scrolls.
-fn answer_fits(text: &str, width: usize, height: usize) -> bool {
-    let lines: Vec<&str> = text.split('\n').collect();
-    lines.len() <= height && lines.iter().all(|line| cells(line) < width)
+/// JS `\s` / `String.prototype.trimEnd`'s whitespace: Unicode White_Space
+/// but U+0085, plus U+FEFF.
+fn is_js_space(ch: char) -> bool {
+    (ch.is_whitespace() && ch != '\u{85}') || ch == '\u{feff}'
+}
+
+/// A port of omp's `wordWrapLine` (editor.ts:169-400) for a line wider than
+/// `max`: graphemes (`Intl.Segmenter`, here `unicode-segmentation`) grouped
+/// into runs of whitespace and non-whitespace (`getWordNavKind`, by a
+/// grapheme's first code point); runs that fit are packed onto a row, a
+/// row's trailing whitespace is trimmed when it wraps and the next row's
+/// leading whitespace skipped; a run wider than a row is broken by
+/// grapheme, first filling what is left of the current row; a run with a
+/// wide grapheme (CJK) fills the current row before wrapping.
+fn word_wrap_line(line: &str, max: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    if line.is_empty() || max == 0 {
+        return vec![String::new()];
+    }
+    // Grapheme start offsets (with an end sentinel) and widths.
+    let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
+    let starts: Vec<usize> = graphemes
+        .iter()
+        .map(|(start, _)| *start)
+        .chain([line.len()])
+        .collect();
+    let widths: Vec<usize> = graphemes.iter().map(|(_, g)| cells(g)).collect();
+    let is_space = |g: &str| g.chars().next().is_some_and(char::is_whitespace);
+    struct Token {
+        start_g: usize,
+        end_g: usize,
+        whitespace: bool,
+    }
+    let mut tokens: Vec<Token> = Vec::new();
+    for (index, (_, grapheme)) in graphemes.iter().enumerate() {
+        let whitespace = is_space(grapheme);
+        match tokens.last_mut() {
+            Some(token) if token.whitespace == whitespace => token.end_g = index + 1,
+            _ => tokens.push(Token {
+                start_g: index,
+                end_g: index + 1,
+                whitespace,
+            }),
+        }
+    }
+    let span = |start_g: usize, end_g: usize| -> usize { widths[start_g..end_g].iter().sum() };
+    // The widest grapheme prefix of [start_g, end_g) fitting `available`.
+    let prefix_to_width = |start_g: usize, end_g: usize, available: usize| -> usize {
+        let mut width = 0;
+        let mut g = start_g;
+        while g < end_g {
+            if width + widths[g] > available {
+                break;
+            }
+            width += widths[g];
+            g += 1;
+            if width == available {
+                break;
+            }
+        }
+        g
+    };
+    let mut chunks: Vec<String> = Vec::new();
+    // The pending chunk is line[chunk_start..chunk_end] (byte offsets).
+    let mut chunk_start = 0;
+    let mut chunk_end = 0;
+    let mut current = 0;
+    let mut at_line_start = true;
+    for token in &tokens {
+        let token_start = starts[token.start_g];
+        let token_end = starts[token.end_g];
+        let token_width = span(token.start_g, token.end_g);
+        if at_line_start && token.whitespace {
+            chunk_start = token_end;
+            chunk_end = token_end;
+            continue;
+        }
+        at_line_start = false;
+        if token_width > max {
+            let mut prefix_end_g = token.start_g;
+            if chunk_end > chunk_start && current < max {
+                prefix_end_g = prefix_to_width(token.start_g, token.end_g, max - current);
+            }
+            if chunk_end > chunk_start {
+                if prefix_end_g > token.start_g {
+                    let end = starts[prefix_end_g];
+                    chunks.push(line[chunk_start..end].to_owned());
+                    chunk_start = end;
+                    chunk_end = end;
+                } else {
+                    chunks.push(line[chunk_start..chunk_end].to_owned());
+                    chunk_start = token_start;
+                    chunk_end = token_start;
+                }
+                current = 0;
+            }
+            let mut piece_start = starts[prefix_end_g];
+            let mut piece_end = piece_start;
+            let mut piece_width = 0;
+            for g in prefix_end_g..token.end_g {
+                let w = widths[g];
+                if piece_width + w > max && piece_end > piece_start {
+                    chunks.push(line[piece_start..piece_end].to_owned());
+                    piece_start = piece_end;
+                    piece_width = w;
+                } else {
+                    piece_width += w;
+                }
+                piece_end = starts[g + 1];
+            }
+            if piece_end > piece_start {
+                chunk_start = piece_start;
+                chunk_end = piece_end;
+                current = piece_width;
+            }
+            continue;
+        }
+        if current + token_width > max {
+            if chunk_end > chunk_start
+                && !token.whitespace
+                && current < max
+                && (token.start_g..token.end_g).any(|g| widths[g] > 1)
+            {
+                let end_g = prefix_to_width(token.start_g, token.end_g, max - current);
+                if end_g > token.start_g {
+                    let end = starts[end_g];
+                    chunks.push(line[chunk_start..end].to_owned());
+                    chunk_start = end;
+                    chunk_end = token_end;
+                    current = cells(&line[end..token_end]);
+                    at_line_start = false;
+                    continue;
+                }
+            }
+            let trimmed = line[chunk_start..chunk_end].trim_end_matches(is_js_space);
+            if !trimmed.is_empty() || chunks.is_empty() {
+                chunks.push(trimmed.to_owned());
+            }
+            at_line_start = true;
+            if token.whitespace {
+                chunk_start = token_end;
+                chunk_end = token_end;
+                current = 0;
+            } else {
+                chunk_start = token_start;
+                chunk_end = token_end;
+                current = token_width;
+                at_line_start = false;
+            }
+        } else {
+            if chunk_end == chunk_start {
+                chunk_start = token_start;
+            }
+            chunk_end = token_end;
+            current += token_width;
+        }
+    }
+    if chunk_end > chunk_start {
+        chunks.push(line[chunk_start..chunk_end].to_owned());
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
 }
 
 /// The outcome of reading a focused textarea back.
 enum ReadBack {
-    Shows,
+    /// The raw rows the editor showed.
+    Shows(Vec<String>),
     /// The raw rows the editor showed last; `None` when it was not on
     /// screen.
     Differs(Option<Vec<String>>),
@@ -827,8 +1010,6 @@ struct Driver<'a, P> {
     /// Keys sent and screens read for the current field.
     keys_sent: usize,
     reads: usize,
-    /// The textarea rows of the last `editor_shows` that matched.
-    last_rows: Option<Vec<String>>,
 }
 
 impl<P: FormPane> Driver<'_, P> {
@@ -977,21 +1158,25 @@ impl<P: FormPane> Driver<'_, P> {
         let name = self.form.fields[field].name.clone();
         self.until(stop, |_| true)?;
         let height = input.height();
-        // The editor's width, read before anything is sent: an answer that
-        // would wrap, or whose rows could not be told from the empty
-        // editor's placeholder, is refused while the draft is intact.
+        // The editor's width (`editor_rows` returns rows of one width),
+        // read before anything is sent: an answer that would not show whole,
+        // or whose rows could not be told from the empty editor's
+        // placeholder, is refused while the draft is intact.
         let width = match self.editor_shows(field, height, |_| true)? {
-            ReadBack::Shows => self.last_rows.as_ref().map_or(0, |rows| cells(&rows[0])),
+            ReadBack::Shows(rows) => cells(&rows[0]),
             ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
         };
-        if !answer_fits(text, width, height) {
-            return Err(invalid(&name, TOO_LONG));
-        }
         let empty = empty_rows(&input.placeholder, width, height);
         let want = if text.is_empty() {
             empty.clone()
         } else {
-            text_rows(text, width, height)
+            let mut rows = layout_rows(text, width);
+            // More rows than the editor shows would scroll.
+            if rows.len() > height {
+                return Err(invalid(&name, TOO_LONG));
+            }
+            rows.resize(height, " ".repeat(width));
+            rows
         };
         if !text.is_empty() && want == empty {
             return Err(invalid(
@@ -1022,12 +1207,12 @@ impl<P: FormPane> Driver<'_, P> {
         keys.extend(std::iter::repeat_n("ctrl+u", 2 * lines));
         self.keys(keys)?;
         match self.editor_shows(field, height, |rows| rows == empty.as_slice())? {
-            ReadBack::Shows => {}
+            ReadBack::Shows(_) => {}
             ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
         }
         self.type_text(text)?;
         match self.editor_shows(field, height, |rows| rows == want.as_slice())? {
-            ReadBack::Shows => Ok(()),
+            ReadBack::Shows(_) => Ok(()),
             ReadBack::Differs(rows) => Err(self.misread(stop, rows)),
         }
     }
@@ -1048,8 +1233,7 @@ impl<P: FormPane> Driver<'_, P> {
     /// Read until the focused textarea's raw rows satisfy `done`. Backend
     /// errors (`pane_not_found`, a failed read) propagate unchanged; a
     /// screen that never shows it is `ReadBack::Differs` with the rows the
-    /// editor showed last, `None` when the editor was not found. The rows of
-    /// a `Shows` read are kept in `last_rows`.
+    /// editor showed last, `None` when the editor was not found.
     fn editor_shows(
         &mut self,
         field: usize,
@@ -1063,9 +1247,8 @@ impl<P: FormPane> Driver<'_, P> {
             }
             let screen = self.read()?;
             last = editor_rows(&screen, self.form, field, height);
-            if last.as_deref().is_some_and(&done) {
-                self.last_rows = last;
-                return Ok(ReadBack::Shows);
+            if let Some(rows) = last.take_if(|rows| done(rows)) {
+                return Ok(ReadBack::Shows(rows));
             }
         }
         Ok(ReadBack::Differs(last))
@@ -1237,7 +1420,6 @@ pub(crate) fn drive(
         at: 0,
         keys_sent: 0,
         reads: 0,
-        last_rows: None,
     };
     // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
     // the first stop ↑ goes nowhere.

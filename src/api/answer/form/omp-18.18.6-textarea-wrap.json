@@ -1,0 +1,294 @@
+{
+ "width": 111,
+ "cases": [
+  {
+   "name": "exact-width",
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "rows": [
+    "│   │ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "width-minus-1",
+   "text": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "rows": [
+    "│   │ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "width-plus-1",
+   "text": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "rows": [
+    "│   │ ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc │",
+    "│   │ c                                                                                                               │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "words-at-edge",
+   "text": "word word word word word word word word word word word word word word word word word word word word word word word word word",
+   "rows": [
+    "│   │ word word word word word word word word word word word word word word word word word word word word word word   │",
+    "│   │ word word word                                                                                                  │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "word-straddles-edge",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx longword tail",
+   "rows": [
+    "│   │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx    │",
+    "│   │ longword tail                                                                                                   │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "long-word",
+   "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+   "rows": [
+    "│   │ yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy │",
+    "│   │ yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy │",
+    "│   │ yyyyy                                                                                                           │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "mid-line-long-word",
+   "text": "short zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "rows": [
+    "│   │ short zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz │",
+    "│   │ zzzzzzzzzzzzzzzz                                                                                                │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "cjk",
+   "text": "漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字",
+   "rows": [
+    "│   │ 漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢  │",
+    "│   │ 字漢字漢字                                                                                                      │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "ascii-then-cjk",
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 漢字漢字",
+   "rows": [
+    "│   │ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 漢 │",
+    "│   │ 字漢字                                                                                                          │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "emoji",
+   "text": "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",
+   "rows": [
+    "│   │ 🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂  │",
+    "│   │ 🙂🙂🙂                                                                                                          │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "emoji-in-words",
+   "text": "Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there ",
+   "rows": [
+    "│   │ Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi 🙂 there Hi  │",
+    "│   │ 🙂 there Hi 🙂 there Hi 🙂 there                                                                                │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "x-then-emoji-at-edge",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🙂 tail",
+   "rows": [
+    "│   │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  │",
+    "│   │ 🙂 tail                                                                                                         │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "spaces-at-wrap",
+   "text": "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp     q",
+   "rows": [
+    "│   │ ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp   │",
+    "│   │ q                                                                                                               │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "zwj-emoji",
+   "text": "👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 ",
+   "rows": [
+    "│   │ 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻 👩‍💻  │",
+    "│   │ 👩‍💻 👩‍💻                                                                                                           │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "combining",
+   "text": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+   "rows": [
+    "│   │ ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé │",
+    "│   │ éééé                                                                                                            │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "exact-width-words",
+   "text": "abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd x next",
+   "rows": [
+    "│   │ abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd abcd x │",
+    "│   │ next                                                                                                            │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  },
+  {
+   "name": "two-paragraphs",
+   "text": "Meet the new desk, built to remember how you like to work and to get out of your way when you are in the flow.\nIt keeps your tools within reach and your notes one tap away, all day.",
+   "rows": [
+    "│   │ Meet the new desk, built to remember how you like to work and to get out of your way when you are in the flow.  │",
+    "│   │ It keeps your tools within reach and your notes one tap away, all day.                                          │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │",
+    "│   │                                                                                                                 │"
+   ],
+   "stable": true
+  }
+ ]
+}
