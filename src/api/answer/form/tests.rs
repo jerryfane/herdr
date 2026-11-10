@@ -143,9 +143,9 @@ struct Dialog {
     focus: usize,
     checked: Vec<Vec<usize>>,
     other: Vec<String>,
-    /// Text fields: lines and caret (line, column in chars).
-    lines: Vec<Vec<String>>,
-    caret: Vec<(usize, usize)>,
+    /// Text fields (single-line `Input`s): value and caret (in chars).
+    text: Vec<String>,
+    caret: Vec<usize>,
     width: usize,
     keys: Vec<String>,
     submitted: Option<Vec<(String, Option<FormValue>)>>,
@@ -154,9 +154,6 @@ struct Dialog {
     refuse: Option<(usize, String)>,
     /// Keys after this many are swallowed (someone else holds the form).
     frozen_after: Option<usize>,
-    /// After this many keys the pane shows something else (the form closed,
-    /// another program); keys still arrive and are counted.
-    vanish_after: Option<usize>,
 }
 
 impl Dialog {
@@ -169,24 +166,21 @@ impl Dialog {
             focus: 0,
             checked: vec![Vec::new(); count],
             other: vec![String::new(); count],
-            lines: vec![Vec::new(); count],
-            caret: vec![(0, 0); count],
+            text: vec![String::new(); count],
+            caret: vec![0; count],
             width: 200,
             keys: Vec::new(),
             submitted: None,
             errors: vec![None; count],
             refuse: None,
             frozen_after: None,
-            vanish_after: None,
             form,
         };
         for (index, field) in dialog.form.fields.iter().enumerate() {
             match &field.kind {
                 FieldKind::Choice(choice) => dialog.checked[index] = choice.initial_checked(),
                 // omp ≥ 18.18.6 opens prefilled fields with the caret at the start.
-                FieldKind::Text(input) => {
-                    dialog.lines[index] = input.value.split('\n').map(str::to_owned).collect()
-                }
+                FieldKind::Text(input) => dialog.text[index] = input.value.clone(),
             }
         }
         dialog
@@ -195,10 +189,8 @@ impl Dialog {
     /// omp 18.18.3: single-line inputs open with the caret at the end.
     fn caret_at_end(mut self) -> Self {
         for (index, field) in self.form.fields.iter().enumerate() {
-            if let FieldKind::Text(input) = &field.kind {
-                if !input.multiline {
-                    self.caret[index] = (0, self.lines[index][0].chars().count());
-                }
+            if let FieldKind::Text(_) = &field.kind {
+                self.caret[index] = self.text[index].chars().count();
             }
         }
         self
@@ -324,47 +316,32 @@ impl Dialog {
         }
     }
 
+    /// omp's `Input`: ↑/↓ and Enter leave it; Ctrl+E/Ctrl+U/Ctrl+K edit.
     fn text_key(&mut self, field: usize, key: &str) {
-        let multiline =
-            matches!(&self.form.fields[field].kind, FieldKind::Text(input) if input.multiline);
-        let (mut line, mut col) = self.caret[field];
-        let lines = &mut self.lines[field];
-        let len = |text: &str| text.chars().count();
+        let text = &mut self.text[field];
+        let mut col = self.caret[field];
         let byte = |text: &str, col: usize| {
             text.char_indices()
                 .nth(col)
                 .map_or(text.len(), |(at, _)| at)
         };
         match key {
-            "up" if !multiline || line == 0 => return self.move_stop(-1),
-            "down" if !multiline || line + 1 == lines.len() => return self.move_stop(1),
-            "up" => line -= 1,
-            "down" => line += 1,
-            "enter" if !multiline => return self.move_field(),
-            "ctrl+e" => col = len(&lines[line]),
-            "ctrl+u" if col > 0 => {
-                let at = byte(&lines[line], col);
-                lines[line].replace_range(..at, "");
+            "up" => return self.move_stop(-1),
+            "down" => return self.move_stop(1),
+            "enter" => return self.move_field(),
+            "ctrl+e" => col = text.chars().count(),
+            "ctrl+u" => {
+                let at = byte(text, col);
+                text.replace_range(..at, "");
                 col = 0;
             }
-            "ctrl+u" if multiline && line > 0 => {
-                let current = lines.remove(line);
-                line -= 1;
-                col = len(&lines[line]);
-                lines[line].push_str(&current);
-            }
-            "ctrl+k" if col < len(&lines[line]) => {
-                let at = byte(&lines[line], col);
-                lines[line].truncate(at);
-            }
-            "ctrl+k" if multiline && line + 1 < lines.len() => {
-                let next = lines.remove(line + 1);
-                lines[line].push_str(&next);
+            "ctrl+k" => {
+                let at = byte(text, col);
+                text.truncate(at);
             }
             _ => {}
         }
-        col = col.min(len(&lines[line]));
-        self.caret[field] = (line, col);
+        self.caret[field] = col.min(self.text[field].chars().count());
     }
 
     fn paste(&mut self, text: &str) {
@@ -383,22 +360,14 @@ impl Dialog {
                 }
             }
             Stop::Text { field } => {
-                let (line, col) = self.caret[field];
-                let current = &self.lines[field][line];
+                let col = self.caret[field];
+                let current = &mut self.text[field];
                 let at = current
                     .char_indices()
                     .nth(col)
                     .map_or(current.len(), |(at, _)| at);
-                let (before, after) = (current[..at].to_owned(), current[at..].to_owned());
-                let mut pasted: Vec<String> = format!("{before}{text}")
-                    .split('\n')
-                    .map(str::to_owned)
-                    .collect();
-                let last = pasted.len() - 1;
-                let caret = (line + last, pasted[last].chars().count());
-                pasted[last].push_str(&after);
-                self.lines[field].splice(line..=line, pasted);
-                self.caret[field] = caret;
+                current.insert_str(at, text);
+                self.caret[field] = col + text.chars().count();
             }
             _ => {}
         }
@@ -420,7 +389,7 @@ impl Dialog {
                         chosen.then_some(other.as_str()),
                     )
                 }
-                FieldKind::Text(input) => Some(text_value(input, &self.lines[index].join("\n"))),
+                FieldKind::Text(input) => Some(text_value(input, &self.text[index])),
             })
             .collect()
     }
@@ -456,12 +425,6 @@ impl Dialog {
     }
 
     fn render(&self) -> String {
-        if self
-            .vanish_after
-            .is_some_and(|limit| self.keys.len() >= limit)
-        {
-            return "$ vim notes.txt\n~\n~".into();
-        }
         let mut out = vec![
             "❯ an earlier prompt in the chat".to_owned(),
             "╭─ Ask ─╮".to_owned(),
@@ -513,33 +476,13 @@ impl Dialog {
             FieldKind::Text(input) => {
                 let stop = Stop::Text { field: index };
                 self.label_rows(index, stop, star, out);
-                let lines = &self.lines[index];
-                let height = input.height();
-                let value = lines.join("\n");
-                let focused = self.stops[self.focus] == stop;
-                // As `#textFieldLines`: focused, the input or editor viewport
-                // (scrolled to keep the caret in view); unfocused, the value
-                // from its first line, `…` past the height, or the
-                // placeholder when empty.
-                let mut rows: Vec<String> = if focused && input.multiline {
-                    let caret = self.caret[index].0;
-                    let offset = (caret + 1).saturating_sub(height);
-                    lines.iter().skip(offset).take(height).cloned().collect()
-                } else if value.is_empty() {
-                    vec![input.placeholder.clone()]
+                let value = &self.text[index];
+                let row = if value.is_empty() {
+                    &input.placeholder
                 } else {
-                    lines.clone()
+                    value
                 };
-                if rows.len() > height {
-                    rows.truncate(height);
-                    if !focused {
-                        rows[height - 1] = "…".into();
-                    }
-                }
-                rows.resize(height, String::new());
-                for row in rows {
-                    out.push(format!("│   │ {row}"));
-                }
+                out.push(format!("│   │ {row}"));
             }
             FieldKind::Choice(choice) if choice.is_dropdown() => {
                 let stop = Stop::Select { field: index };
@@ -726,28 +669,11 @@ fn text_is_replaced_whatever_the_starting_caret() {
     assert_eq!(value(&submitted, "notes"), txt(""));
 }
 
-/// #392 F2: a textarea someone filled with 500 lines is emptied completely,
-/// checked on screen, before the answer is typed.
-#[test]
-fn an_edited_textarea_is_emptied_before_typing() {
-    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
-    let mut dialog = Dialog::new(html);
-    dialog.lines[0] = (0..500).map(|line| format!("line{line}")).collect();
-    dialog.caret[0] = (250, 3);
-    let submitted = answer(&mut dialog, values(&[("log", text("fresh\nanswer"))])).unwrap();
-    assert_eq!(value(&submitted, "log"), txt("fresh\nanswer"));
-    // Kept, a textarea is still reset to its default.
-    let mut dialog = Dialog::new(html);
-    dialog.lines[0] = vec!["edited".into(), "in the terminal".into()];
-    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
-    assert_eq!(value(&submitted, "log"), txt("one line"));
-}
-
 /// #392 F2: text and dropdowns changed in the terminal are set back.
 #[test]
 fn edited_text_and_dropdowns_are_reset() {
     let mut dialog = Dialog::new(FORM);
-    dialog.lines[3] = vec!["changed".into()];
+    dialog.text[3] = "changed".into();
     dialog.checked[2] = vec![2];
     let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
     assert_eq!(value(&submitted, "region"), txt("us"));
@@ -946,72 +872,6 @@ fn other_can_be_the_first_stop() {
     assert!(!at_start(&typed, &form));
 }
 
-/// #392 r3 F2: blank rows in view prove nothing: 500 blank lines above a
-/// retained line are cleared too, wherever the caret starts.
-#[test]
-fn a_hidden_tail_below_blank_rows_is_cleared() {
-    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
-    for caret in [0, 3, 250, 500] {
-        let mut dialog = Dialog::new(html);
-        let mut lines = vec![String::new(); 500];
-        lines.push("retained-secret".into());
-        dialog.lines[0] = lines;
-        dialog.caret[0] = (caret, 0);
-        let submitted = answer(&mut dialog, values(&[("log", text("fresh"))])).unwrap();
-        assert_eq!(
-            value(&submitted, "log"),
-            txt("fresh"),
-            "caret on line {caret}"
-        );
-    }
-}
-
-/// #392 r3 F2: a textarea that cannot be proven empty within the caps is
-/// refused before the answer is typed, and the probe is taken back out.
-#[test]
-fn an_unprovable_textarea_is_refused_before_typing() {
-    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
-    let mut dialog = Dialog::new(html);
-    dialog.lines[0] = (0..5_000).map(|line| format!("line{line}")).collect();
-    dialog.caret[0] = (0, 0);
-    let form = dialog.form.clone();
-    let plan = plan(&form, &values(&[("log", text("fresh"))])).unwrap();
-    let error = drive(&mut dialog, &form, &plan).unwrap_err();
-    assert_eq!(error.code, "ask_form_moved");
-    assert_eq!(dialog.submitted, None);
-    assert!(
-        !dialog.lines[0].iter().any(|line| line.contains("fresh")),
-        "nothing typed"
-    );
-    assert!(
-        dialog.keys.len() <= MAX_FIELD_KEYS + 2,
-        "{} keys",
-        dialog.keys.len()
-    );
-}
-
-/// #392 r3: when the textarea disappears mid-clear (focus lost, the form
-/// gone), clearing stops at once instead of typing into whatever is there.
-#[test]
-fn a_vanished_textarea_stops_the_clear_at_once() {
-    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
-    for limit in [2, 150, 205, 400] {
-        let mut dialog = Dialog::new(html);
-        dialog.lines[0] = (0..450).map(|line| format!("line{line}")).collect();
-        dialog.vanish_after = Some(limit);
-        let form = dialog.form.clone();
-        let plan = plan(&form, &values(&[("log", text("fresh"))])).unwrap();
-        let error = drive(&mut dialog, &form, &plan).unwrap_err();
-        assert_eq!(error.code, "ask_form_moved", "{limit}");
-        let after = dialog.keys.len().saturating_sub(limit);
-        assert!(
-            after <= 2 * CLEAR_ROUND_LINES + 1,
-            "{after} keys after it vanished at {limit}"
-        );
-        assert_eq!(dialog.submitted, None);
-    }
-}
-
 /// #392 r3: numbers compare exactly; near-zero values are not each other.
 #[test]
 fn near_zero_numbers_are_not_confused() {
@@ -1029,4 +889,21 @@ fn near_zero_numbers_are_not_confused() {
     let zero = vec![("n".to_owned(), Some(FormValue::Number(0.0)))];
     assert!(submission_matches(&zero, &recorded(r#"{"n": 0}"#)));
     assert!(!submission_matches(&zero, &recorded(r#"{"n": 5e-324}"#)));
+}
+
+/// #392 r4: forms with a `<textarea>` are refused before anything is read or
+/// sent: omp's `Editor` has no key that empties a whole draft, so a textarea
+/// is answered in the terminal.
+#[test]
+fn a_form_with_a_textarea_is_not_driven() {
+    let form = parse(
+        r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
+        <label><input type="radio" name="r" value="b"> B</label>
+        <label>Notes <textarea name="notes">draft</textarea></label></form>"#,
+    );
+    assert!(!form.drivable());
+    assert_eq!(
+        form.refusal(),
+        Some("textarea fields: answer in the terminal")
+    );
 }

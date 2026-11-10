@@ -117,11 +117,8 @@ fn answer_form(
         )
     })?;
     let parsed = crate::agent_transcript::ask_form::parse(&html);
-    if !parsed.drivable() {
-        return Err(error(
-            "ask_unsupported",
-            "the form has no named field, or two fields share a name",
-        ));
+    if let Some(reason) = parsed.refusal() {
+        return Err(error("ask_unsupported", reason));
     }
     let plan = form::plan(&parsed, &params.values)?;
     let mut pane = AppPane {

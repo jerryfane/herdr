@@ -116,9 +116,8 @@ fn initial(form: &ParsedForm, field: usize) -> Target {
     }
 }
 
-fn has_control_chars(text: &str, allow_newlines: bool) -> bool {
-    text.chars()
-        .any(|ch| ch.is_control() && !(allow_newlines && matches!(ch, '\n' | '\t')))
+fn has_control_chars(text: &str) -> bool {
+    text.chars().any(char::is_control)
 }
 
 fn choice_target(
@@ -156,7 +155,7 @@ fn choice_target(
         Some(_) if !choice.other => {
             return Err(invalid(name, "this field has no Other answer"));
         }
-        Some(text) if has_control_chars(text, false) => {
+        Some(text) if has_control_chars(text) => {
             return Err(invalid(name, "Other takes a single line of plain text"));
         }
         Some(text) => Some(text.to_owned()),
@@ -208,20 +207,16 @@ fn targets(
             FieldKind::Choice(choice) => {
                 choice_target(&field.name, choice, choice.initial_checked(), value)?
             }
-            FieldKind::Text(input) => {
+            FieldKind::Text(_) => {
                 if value.options.is_some() || value.other.is_some() {
                     return Err(invalid(&field.name, "a text field takes text"));
                 }
                 match &value.text {
                     None => initial(form, index),
-                    Some(text) if has_control_chars(text, input.multiline) => {
+                    Some(text) if has_control_chars(text) => {
                         return Err(invalid(
                             &field.name,
-                            if input.multiline {
-                                "control characters are not allowed"
-                            } else {
-                                "this field takes a single line of plain text"
-                            },
+                            "this field takes a single line of plain text",
                         ));
                     }
                     Some(text) => Target::Text(text.clone()),
@@ -337,9 +332,6 @@ fn first_line(label: &str) -> String {
 /// A screen row with omp's form layout: the cursor slot, then (for option
 /// rows) a marker, then text, whitespace collapsed and the panel edge cut.
 struct Row {
-    /// Vertical bars before the text: the panel border, plus a text field's
-    /// own bar on its value rows.
-    bars: usize,
     focused: bool,
     /// `Some(selected)` for an option row.
     marker: Option<bool>,
@@ -347,12 +339,7 @@ struct Row {
 }
 
 fn parse_row(line: &str) -> Row {
-    let trimmed = line.trim_start_matches(LEFT_EDGE);
-    let bars = line[..line.len() - trimmed.len()]
-        .chars()
-        .filter(|ch| *ch != ' ')
-        .count();
-    let line = trim_right_edge(trimmed);
+    let line = trim_right_edge(line.trim_start_matches(LEFT_EDGE));
     let (focused, rest) = match line.chars().next() {
         Some(glyph) if CURSOR_GLYPHS.contains(&glyph) => {
             let rest = &line[glyph.len_utf8()..];
@@ -372,7 +359,6 @@ fn parse_row(line: &str) -> Row {
                 .and_then(|text| text.strip_prefix(' '))
             {
                 return Row {
-                    bars,
                     focused,
                     marker: Some(is_selected),
                     text: one_line(text),
@@ -381,7 +367,6 @@ fn parse_row(line: &str) -> Row {
         }
     }
     Row {
-        bars,
         focused,
         marker: None,
         text: one_line(rest),
@@ -593,8 +578,8 @@ enum Seen {
         selected: bool,
         text: String,
     },
-    /// A text field's value rows.
-    Text(Vec<String>),
+    /// A (single-line) text field's value row.
+    Text(String),
     /// A dropdown's 1-based position among all its options.
     Select {
         position: Option<usize>,
@@ -629,17 +614,13 @@ fn seen(screen: &str, form: &ParsedForm, stop: Stop) -> Option<Seen> {
             })
         }
         Stop::Text { field } => {
-            let FieldKind::Text(input) = &form.fields[field].kind else {
-                return None;
-            };
-            if !focused_markers.is_empty() {
+            if !matches!(&form.fields[field].kind, FieldKind::Text(_))
+                || !focused_markers.is_empty()
+            {
                 return None;
             }
             let (start, count) = focused_label(&rows, &form.fields[field].label)?;
-            let values = rows.get(start + count..start + count + input.height())?;
-            Some(Seen::Text(
-                values.iter().map(|row| row.text.clone()).collect(),
-            ))
+            Some(Seen::Text(rows.get(start + count)?.text.clone()))
         }
         Stop::Select { field } => {
             if !focused_markers.is_empty() {
@@ -681,76 +662,11 @@ fn dropdown_position(text: &str) -> Option<Option<usize>> {
     }
 }
 
-/// Whether a text field's value rows show it empty: blank, or its
-/// placeholder on the first row.
-/// Whether a text field's value rows show it empty: blank, or its
-/// placeholder on the first row.
-fn is_empty_text(rows: &[String], placeholder: &str) -> bool {
+/// Whether a text field's value row shows it empty: blank, or its
+/// placeholder.
+fn is_empty_text(row: &str, placeholder: &str) -> bool {
     let placeholder = one_line(placeholder);
-    rows.iter().enumerate().all(|(index, row)| {
-        row.is_empty()
-            || (index == 0 && !placeholder.is_empty() && placeholder.starts_with(row.as_str()))
-    })
-}
-
-/// The rows omp draws for an unfocused textarea holding `value`
-/// (`#textFieldLines`): its lines from the first, or the placeholder when
-/// empty; past `height` rows the last one becomes `…`; blank rows pad it.
-fn unfocused_rows(value: &str, placeholder: &str, height: usize) -> Vec<String> {
-    let mut rows: Vec<String> = if value.is_empty() {
-        vec![one_line(placeholder)]
-    } else {
-        value.split('\n').map(one_line).collect()
-    };
-    if rows.len() > height {
-        rows.truncate(height);
-        rows[height - 1] = "…".into();
-    }
-    rows.resize(height, String::new());
-    rows
-}
-
-/// Whether drawn rows are `expected`: equal, or a long line cut with `…`
-/// (never a blank expected row, so the overflow `…` is never mistaken for
-/// one).
-fn rows_show(rows: &[String], expected: &[String]) -> bool {
-    rows.len() == expected.len()
-        && rows.iter().zip(expected).all(|(row, want)| {
-            row == want
-                || (row.ends_with('…')
-                    && !want.is_empty()
-                    && want != "…"
-                    && want.starts_with(row.trim_end_matches('…')))
-        })
-}
-
-/// The value rows of the unfocused text field `field`: the rows after its
-/// label that carry the field's own bar, when exactly one place on screen
-/// reads that way.
-fn unfocused_value_rows(screen: &str, form: &ParsedForm, field: usize) -> Option<Vec<String>> {
-    let FieldKind::Text(input) = &form.fields[field].kind else {
-        return None;
-    };
-    let rows = rows_of(screen);
-    let height = input.height();
-    let mut found = (0..rows.len()).filter_map(|start| {
-        if rows[start].focused {
-            return None;
-        }
-        let count = label_rows(&rows, start, &form.fields[field].label)?;
-        let values = rows.get(start + count..start + count + height)?;
-        values
-            .iter()
-            .all(|row| row.bars > rows[start].bars && row.marker.is_none() && !row.focused)
-            .then(|| {
-                values
-                    .iter()
-                    .map(|row| row.text.clone())
-                    .collect::<Vec<_>>()
-            })
-    });
-    let first = found.next()?;
-    found.next().is_none().then_some(first)
+    row.is_empty() || (!placeholder.is_empty() && placeholder.starts_with(row))
 }
 
 /// The agent's pane as the form driver sees it.
@@ -762,18 +678,9 @@ pub(crate) trait FormPane {
 
 /// Screen reads (one pause apart) the form gets to show a step.
 const SETTLE_READS: usize = 20;
-/// Lines one textarea clearing round removes; each round is checked on
-/// screen before the next.
-const CLEAR_ROUND_LINES: usize = 100;
-/// Clearing rounds per direction: a textarea holding more than about
-/// `CLEAR_ROUNDS * CLEAR_ROUND_LINES` lines on either side of the caret is
-/// refused rather than cleared.
-const CLEAR_ROUNDS: usize = 10;
 /// Hard caps per field, whatever the screen shows.
 const MAX_FIELD_KEYS: usize = 6_000;
 const MAX_FIELD_READS: usize = 800;
-/// The probe typed into a cleared textarea to prove it empty.
-const PROBE: &str = "x";
 
 fn moved(message: impl Into<String>) -> ErrorBody {
     ErrorBody {
@@ -832,32 +739,23 @@ impl<P: FormPane> Driver<'_, P> {
         Ok(())
     }
 
-    /// Read until the focused stop is `stop` and `done` holds: `Some` then;
-    /// `None` when the screen keeps showing `stop` focused without `done`;
-    /// an `ask_form_moved` error as soon as the settled screen does not show
-    /// `stop` focused at all (focus lost, the form gone). Read failures
-    /// propagate at once.
-    fn watch(
-        &mut self,
-        stop: Stop,
-        done: impl Fn(&Seen) -> bool,
-    ) -> Result<Option<Seen>, ErrorBody> {
-        let mut last = None;
+    /// Read until the focused stop is `stop` and `done` holds; stop the
+    /// drive otherwise (the settled screen shows `stop` not done, another
+    /// stop, or no form). Read failures propagate at once. Nothing more is
+    /// sent after a miss: the form keeps whatever was typed so far, and Esc
+    /// would cancel the whole ask.
+    fn until(&mut self, stop: Stop, done: impl Fn(&Seen) -> bool) -> Result<Seen, ErrorBody> {
         for read in 0..SETTLE_READS {
             if read > 0 {
                 self.pane.pause();
             }
-            last = seen(&self.read()?, self.form, stop);
-            if let Some(seen) = &last {
-                if done(seen) {
-                    return Ok(last);
+            if let Some(seen) = seen(&self.read()?, self.form, stop) {
+                if done(&seen) {
+                    return Ok(seen);
                 }
             }
         }
-        match last {
-            Some(_) => Ok(None),
-            None => Err(self.displaced(stop)),
-        }
+        Err(self.displaced(stop))
     }
 
     fn displaced(&self, stop: Stop) -> ErrorBody {
@@ -867,166 +765,17 @@ impl<P: FormPane> Driver<'_, P> {
         ))
     }
 
-    /// Read until the focused stop is `stop` and `done` holds; stop the
-    /// drive otherwise. Nothing more is sent after a miss: the form keeps
-    /// whatever was typed so far, and Esc would cancel the whole ask.
-    fn until(&mut self, stop: Stop, done: impl Fn(&Seen) -> bool) -> Result<Seen, ErrorBody> {
-        match self.watch(stop, done)? {
-            Some(seen) => Ok(seen),
-            None => Err(self.displaced(stop)),
-        }
-    }
-
-    /// Read until the screen shows one of `stops` focused: its index.
-    fn which(&mut self, stops: [Stop; 2]) -> Result<usize, ErrorBody> {
-        let mut last = None;
-        for read in 0..SETTLE_READS {
-            if read > 0 {
-                self.pane.pause();
-            }
-            let screen = self.read()?;
-            last = stops
-                .iter()
-                .position(|stop| seen(&screen, self.form, *stop).is_some());
-            // The second stop is where focus goes; seeing it settles it.
-            if last == Some(1) {
-                return Ok(1);
-            }
-        }
-        last.ok_or_else(|| self.displaced(stops[0]))
-    }
-
     /// Empty a single-line input (a text field, or an Other row): Ctrl+E to
     /// the end, Ctrl+U deletes everything before it, so nothing can remain
     /// out of view.
     fn clear_line(&mut self, stop: Stop, placeholder: &str) -> Result<(), ErrorBody> {
         self.keys(vec!["ctrl+e", "ctrl+u"])?;
         self.until(stop, |seen| match seen {
-            Seen::Text(rows) => is_empty_text(rows, placeholder),
+            Seen::Text(row) => is_empty_text(row, placeholder),
             Seen::Other { text, .. } => text.is_empty(),
             _ => false,
         })
         .map(drop)
-    }
-
-    /// Empty a textarea and prove it empty, wherever its caret and whatever
-    /// it holds (lines out of view included):
-    /// 1. Caret to the last line: Ctrl+K pairs delete the lines below it,
-    ///    and ↓ leaves the field only from the last line (`#textInput`), so
-    ///    focus moving on proves the caret is there; ↑ comes back.
-    /// 2. From the last line, Ctrl+U pairs empty it and join the line above
-    ///    into it, keeping the caret on the last line.
-    /// 3. Type a probe, leave with Tab: unfocused, omp draws the value from
-    ///    its first line, so the probe alone on the first row (blank rows
-    ///    after it, no `…`) proves it is the only content. Shift+Tab back,
-    ///    Ctrl+U removes it: the field is empty.
-    ///
-    /// A field that cannot be proven empty within the caps is refused
-    /// (`ask_form_moved`) with the probe removed and nothing typed.
-    fn clear_textarea(
-        &mut self,
-        field: usize,
-        input: &crate::agent_transcript::ask_form::TextInput,
-    ) -> Result<(), ErrorBody> {
-        let stop = Stop::Text { field };
-        let index = self
-            .stops
-            .iter()
-            .position(|candidate| *candidate == stop)
-            .expect("a text field has a stop");
-        let next = self.stops[index + 1];
-        let mut at_last = false;
-        for _ in 0..CLEAR_ROUNDS {
-            let mut keys = vec!["ctrl+k"; 2 * CLEAR_ROUND_LINES];
-            keys.push("down");
-            self.keys(keys)?;
-            if self.which([stop, next])? == 1 {
-                self.keys(vec!["up"])?;
-                self.until(stop, |_| true)?;
-                at_last = true;
-                break;
-            }
-        }
-        if !at_last {
-            return Err(moved(format!(
-                "field {:?} holds more lines than herdr clears; stopped without submitting (answer in the terminal)",
-                self.form.fields[field].name
-            )));
-        }
-        let height = input.height();
-        let probe_rows = unfocused_rows(PROBE, &input.placeholder, height);
-        self.keys(vec!["ctrl+e", "ctrl+u"])?;
-        for _ in 0..CLEAR_ROUNDS {
-            self.keys(vec!["ctrl+u"; 2 * CLEAR_ROUND_LINES])?;
-            self.until(stop, |_| true)?;
-            self.type_text(PROBE)?;
-            self.until(stop, |_| true)?;
-            self.keys(vec!["tab"])?;
-            let mut proven = false;
-            let mut recognised = false;
-            for read in 0..SETTLE_READS {
-                if read > 0 {
-                    self.pane.pause();
-                }
-                let screen = self.read()?;
-                if let Some(rows) = unfocused_value_rows(&screen, self.form, field) {
-                    recognised = true;
-                    proven = rows_show(&rows, &probe_rows);
-                    if proven {
-                        break;
-                    }
-                }
-            }
-            self.keys(vec!["shift+tab"])?;
-            self.until(stop, |_| true)?;
-            // The caret is right after the probe, on the last line.
-            self.keys(vec!["ctrl+u"])?;
-            self.until(stop, |_| true)?;
-            if proven {
-                return Ok(());
-            }
-            // Only a field seen holding more content gets another round.
-            if !recognised {
-                return Err(self.displaced(stop));
-            }
-        }
-        Err(moved(format!(
-            "field {:?} could not be proven empty; stopped without submitting (answer in the terminal)",
-            self.form.fields[field].name
-        )))
-    }
-
-    /// After typing into a textarea: leave it and check, unfocused, that it
-    /// shows exactly the answer, then come back.
-    fn check_textarea(
-        &mut self,
-        field: usize,
-        input: &crate::agent_transcript::ask_form::TextInput,
-        text: &str,
-    ) -> Result<(), ErrorBody> {
-        let stop = Stop::Text { field };
-        let expected = unfocused_rows(text, &input.placeholder, input.height());
-        self.keys(vec!["tab"])?;
-        let mut shown = false;
-        for read in 0..SETTLE_READS {
-            if read > 0 {
-                self.pane.pause();
-            }
-            let screen = self.read()?;
-            if unfocused_value_rows(&screen, self.form, field)
-                .is_some_and(|rows| rows_show(&rows, &expected))
-            {
-                shown = true;
-                break;
-            }
-        }
-        self.keys(vec!["shift+tab"])?;
-        self.until(stop, |_| true)?;
-        if shown {
-            Ok(())
-        } else {
-            Err(self.displaced(stop))
-        }
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), ErrorBody> {
@@ -1044,16 +793,12 @@ impl<P: FormPane> Driver<'_, P> {
     ) -> Result<(), ErrorBody> {
         let form = self.form;
         match (&form.fields[field].kind, target) {
+            // Textareas never get here: `ParsedForm::refusal` refuses them.
             (FieldKind::Text(input), Target::Text(text)) => {
                 let stop = Stop::Text { field };
                 self.until(stop, |_| true)?;
-                if !input.multiline {
-                    self.clear_line(stop, &input.placeholder)?;
-                    return self.type_text(text);
-                }
-                self.clear_textarea(field, input)?;
-                self.type_text(text)?;
-                self.check_textarea(field, input, text)
+                self.clear_line(stop, &input.placeholder)?;
+                self.type_text(text)
             }
             (FieldKind::Choice(choice), Target::Choice { checked, .. }) if choice.is_dropdown() => {
                 let stop = Stop::Select { field };
@@ -1241,14 +986,14 @@ pub(crate) fn submit_error(screen: &str, form: &ParsedForm) -> Option<(String, S
     ];
     let rows = rows_of(screen);
     for field in &form.fields {
-        let FieldKind::Text(input) = &field.kind else {
+        if !matches!(&field.kind, FieldKind::Text(_)) {
             continue;
-        };
+        }
         for start in 0..rows.len() {
             let Some(count) = label_rows(&rows, start, &field.label) else {
                 continue;
             };
-            let Some(row) = rows.get(start + count + input.height()) else {
+            let Some(row) = rows.get(start + count + 1) else {
                 continue;
             };
             if MESSAGES.iter().any(|message| row.text.starts_with(message)) {

@@ -18,6 +18,9 @@ use dom::{Node, NodeRef};
 use crate::api::schema::AskFormAnswer;
 use crate::api::schema::{AskForm, AskFormField, AskFormFieldKind, AskFormOption, AskQuestion};
 
+/// Why `agent.answer_form` refuses a form with a `<textarea>`.
+pub(crate) const TEXTAREA_REFUSAL: &str = "textarea fields: answer in the terminal";
+
 /// Label of the free-text answer omp adds to radio and checkbox groups.
 pub(crate) const OTHER_LABEL: &str = "Other";
 
@@ -89,8 +92,6 @@ pub(crate) struct TextInput {
     pub pattern: Option<String>,
     pub min_length: Option<f64>,
     pub max_length: Option<f64>,
-    /// Visible rows a textarea asked for (`rows`, default 4); 1 for inputs.
-    pub rows: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,19 +116,6 @@ impl Field {
             FieldKind::Choice(choice) => Some(choice),
             FieldKind::Text(_) => None,
         }
-    }
-}
-
-impl TextInput {
-    /// Rows omp's form gives this field: a textarea's fixed height (the
-    /// `rows` asked for, grown to fit the prefilled draft, 2 to 10;
-    /// `#textareaRows`), else 1.
-    pub(crate) fn height(&self) -> usize {
-        if !self.multiline {
-            return 1;
-        }
-        let draft = self.value.split('\n').count() as f64;
-        self.rows.max(2.0).max(draft).min(10.0).ceil() as usize
     }
 }
 
@@ -738,7 +726,6 @@ impl<'a> Builder<'a> {
                         pattern: None,
                         min_length: number_attr(control, "minlength"),
                         max_length: number_attr(control, "maxlength"),
-                        rows: number_attr(control, "rows").unwrap_or(4.0),
                     }),
                 });
             }
@@ -812,7 +799,6 @@ impl<'a> Builder<'a> {
                 pattern: attr(control, "pattern").map(str::to_owned),
                 min_length: number_attr(control, "minlength"),
                 max_length: number_attr(control, "maxlength"),
-                rows: 1.0,
             }),
         });
     }
@@ -1083,9 +1069,26 @@ impl ParsedForm {
             .collect()
     }
 
-    /// herdr can answer the form by keys: it has a named field and no two
-    /// named fields share a name (a value could not say which it means).
+    /// herdr can answer the form by keys (`pending_ask.form_answerable`).
     pub(crate) fn drivable(&self) -> bool {
+        self.refusal().is_none()
+    }
+
+    /// Why herdr cannot answer the form by keys, `None` when it can: it
+    /// needs a named field, no two named fields sharing a name (a value
+    /// could not say which it means), and no `<textarea>`. omp's `Editor`
+    /// has no binding that empties a whole multi-line draft (`deleteToLineStart`
+    /// and `deleteToLineEnd` act on one line, PageUp/PageDown only scroll),
+    /// and nothing on screen proves a scrolled draft empty, so a textarea
+    /// is answered in the terminal.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        if self
+            .fields
+            .iter()
+            .any(|field| matches!(&field.kind, FieldKind::Text(input) if input.multiline))
+        {
+            return Some(TEXTAREA_REFUSAL);
+        }
         let mut names = HashSet::new();
         let mut any = false;
         for field in &self.fields {
@@ -1094,10 +1097,10 @@ impl ParsedForm {
             }
             any = true;
             if !names.insert(field.name.as_str()) {
-                return false;
+                return Some("the form has two fields with the same name: answer in the terminal");
             }
         }
-        any
+        (!any).then_some("the form has no named field: answer in the terminal")
     }
 }
 

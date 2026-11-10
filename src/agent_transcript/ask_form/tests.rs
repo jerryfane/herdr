@@ -264,9 +264,33 @@ fn other_answers_read_as_other_and_multi_answers_join() {
 
 #[test]
 fn duplicate_or_missing_names_are_not_drivable() {
-    assert!(!parse(r#"<form><input name="a"><textarea name="a"></textarea></form>"#).drivable());
-    assert!(!parse(r#"<form><input><p>x</p></form>"#).drivable());
+    let duplicate =
+        parse(r#"<form><input name="a"><select name="a"><option>x</option></select></form>"#);
+    assert_eq!(
+        duplicate.refusal(),
+        Some("the form has two fields with the same name: answer in the terminal")
+    );
+    let unnamed = parse(r#"<form><input><p>x</p></form>"#);
+    assert_eq!(
+        unnamed.refusal(),
+        Some("the form has no named field: answer in the terminal")
+    );
     assert!(parse(r#"<form><input><input name="b"></form>"#).drivable());
+}
+
+/// #392 r4: a `<textarea>` is shown in full (title, value, constraints) but
+/// makes the form unanswerable from the app.
+#[test]
+fn a_textarea_makes_the_form_unanswerable_but_stays_visible() {
+    let form = parse(
+        r#"<form><label>Notes <textarea name="notes" maxlength="50">draft</textarea></label></form>"#,
+    );
+    assert!(!form.drivable());
+    assert_eq!(form.refusal(), Some(TEXTAREA_REFUSAL));
+    let wire = form.to_wire();
+    assert_eq!(wire.fields[0].input_type.as_deref(), Some("textarea"));
+    assert_eq!(wire.fields[0].value.as_deref(), Some("draft"));
+    assert_eq!(wire.fields[0].maxlength, Some(50));
 }
 
 #[test]
