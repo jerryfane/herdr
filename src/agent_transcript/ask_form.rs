@@ -10,8 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ego_tree::NodeRef;
-use scraper::{Html, Node, Selector};
+mod dom;
+
+use dom::{Node, NodeRef};
 
 use crate::api::schema::{
     AskForm, AskFormAnswer, AskFormField, AskFormFieldKind, AskFormOption, AskQuestion,
@@ -190,17 +191,17 @@ fn is_control(tag: &str) -> bool {
 /// Parse agent-written form HTML; content outside the first `<form>` is
 /// ignored when one exists.
 pub(crate) fn parse(html: &str) -> ParsedForm {
-    let document = Html::parse_document(html);
-    let selector = Selector::parse("form").expect("static selector");
+    let document = dom::parse_document(html);
     let root = document
-        .select(&selector)
-        .next()
-        .map(|form| *form)
-        .unwrap_or_else(|| document.tree.root());
+        .root()
+        .descendants()
+        .skip(1)
+        .find(|node| tag(node) == Some("form"))
+        .unwrap_or_else(|| document.root());
     Builder::new(root).build()
 }
 
-type Dom<'a> = NodeRef<'a, Node>;
+type Dom<'a> = NodeRef<'a>;
 
 fn tag<'a>(node: &Dom<'a>) -> Option<&'a str> {
     node.value().as_element().map(|element| element.name())
@@ -309,13 +310,47 @@ fn number_attr(node: &Dom<'_>, name: &str) -> Option<f64> {
     js_number(attr(node, name)?)
 }
 
-/// JS `String(number)` for the numbers forms hold.
+/// JS `String(number)` (`Number::toString`, ECMA-262 §6.1.6.1.20): the
+/// shortest round-trip digits, positional for exponents in (-7, 21), else
+/// `d.ddde±n`.
 pub(crate) fn js_number_string(value: f64) -> String {
-    if value.fract() == 0.0 && value.abs() < 1e21 {
-        format!("{}", value as i128)
-    } else {
-        format!("{value}")
+    if value.is_nan() {
+        return "NaN".into();
     }
+    if value == 0.0 {
+        return "0".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    let sign = if value < 0.0 { "-" } else { "" };
+    // `{:e}` is Rust's shortest round-trip form: `d[.ddd]e<exp>`.
+    let scientific = format!("{:e}", value.abs());
+    let (mantissa, exponent) = scientific.split_once('e').expect("`{:e}` has an exponent");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let k = digits.len() as i64;
+    // The decimal point sits after `n` digits.
+    let n = exponent
+        .parse::<i64>()
+        .expect("`{:e}` exponent is an integer")
+        + 1;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let exponent = n - 1;
+        let sign = if exponent < 0 { '-' } else { '+' };
+        let mantissa = if k == 1 {
+            digits
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        format!("{mantissa}e{sign}{}", exponent.abs())
+    };
+    format!("{sign}{body}")
 }
 
 struct Builder<'a> {
@@ -423,9 +458,12 @@ impl<'a> Builder<'a> {
             "ul" | "ol" => self.list(node, tag == "ol"),
             "pre" => {
                 self.flush(false);
-                // html5ever already drops the newline right after `<pre>`,
-                // which is what omp's `.replace(/^\n/, "")` does.
-                let text = text_content(node).trim_end().to_owned();
+                let text = text_content(node);
+                let text = text
+                    .strip_prefix('\n')
+                    .unwrap_or(&text)
+                    .trim_end()
+                    .to_owned();
                 self.section().blocks.push(Block::Pre(text));
             }
             "table" => self.table(node),
@@ -667,9 +705,12 @@ impl<'a> Builder<'a> {
                 } else {
                     label
                 };
-                // html5ever already drops the newline right after `<textarea>`,
-                // which is what omp's `.replace(/^\r?\n/, "")` does.
-                let value = text_content(control);
+                let text = text_content(control);
+                let value = text
+                    .strip_prefix("\r\n")
+                    .or_else(|| text.strip_prefix('\n'))
+                    .unwrap_or(&text)
+                    .to_owned();
                 self.add_field(Field {
                     name,
                     label,
@@ -897,22 +938,34 @@ impl ParsedForm {
     }
 
     /// `details.answers` omp records for `data` (`formAnswers`): every named
-    /// field in form order, option values shown as their labels.
+    /// field in form order, option values shown as their labels. Like omp,
+    /// the answers read a name-keyed submission: hidden inputs first, then
+    /// each field that gives a value, so a field giving none (an unchecked
+    /// lone checkbox) reads a hidden input's value of the same name.
     pub(crate) fn answers(&self, data: &[Option<FormValue>]) -> Vec<AskFormAnswer> {
+        let mut submitted: HashMap<&str, FormValue> = self
+            .hidden
+            .iter()
+            .map(|(name, value)| (name.as_str(), FormValue::Text(value.clone())))
+            .collect();
+        for (field, value) in self.fields.iter().zip(data) {
+            if let (false, Some(value)) = (field.name.is_empty(), value) {
+                submitted.insert(field.name.as_str(), value.clone());
+            }
+        }
         let questions = self.questions();
         self.fields
             .iter()
-            .zip(data)
             .zip(questions)
-            .filter(|((field, _), _)| !field.name.is_empty())
-            .map(|((field, value), question)| AskFormAnswer {
+            .filter(|(field, _)| !field.name.is_empty())
+            .map(|(field, question)| AskFormAnswer {
                 name: field.name.clone(),
                 question: if question.is_empty() {
                     field.name.clone()
                 } else {
                     question
                 },
-                answer: answer_text(field, value.as_ref()),
+                answer: answer_text(field, submitted.get(field.name.as_str())),
             })
             .collect()
     }
@@ -964,21 +1017,19 @@ impl ParsedForm {
     }
 
     /// One compatibility question per choice field, for apps that predate
-    /// `form`.
+    /// `form`. `form` is [`Self::to_wire`]'s output, whose fields are the
+    /// named fields in the same order, so each pairs with its own title even
+    /// when names repeat.
     pub(crate) fn compat_questions(&self, form: &AskForm) -> Vec<AskQuestion> {
         let questions = self.questions();
-        let titles: HashMap<&str, Option<&str>> = form
-            .fields
-            .iter()
-            .map(|field| (field.name.as_str(), field.title.as_deref()))
-            .collect();
         self.fields
             .iter()
             .zip(questions)
             .filter(|(field, _)| !field.name.is_empty())
-            .filter_map(|(field, question)| {
+            .zip(&form.fields)
+            .filter_map(|((field, question), wire)| {
                 let choice = field.choice()?;
-                let title = titles.get(field.name.as_str()).copied().flatten();
+                let title = wire.title.as_deref();
                 Some(AskQuestion {
                     question: title.map_or(question, str::to_owned),
                     options: choice
@@ -1250,10 +1301,16 @@ pub(crate) fn field_error(field: &Field, value: Option<&FormValue>) -> Option<St
         return Some("Enter a full URL".into());
     }
     if let Some(pattern) = &input.pattern {
-        // An invalid pattern is ignored, as omp does.
-        if let Ok(regex) = regex::Regex::new(&format!("^(?:{pattern})$")) {
-            if !regex.is_match(&text) {
-                return Some(format!("Must match {pattern}"));
+        // omp compiles `^(?:pattern)$` with the `v` flag and ignores a pattern
+        // that does not compile; both need ECMAScript semantics, not Rust's.
+        if let Ok(regex) = regress::Regex::with_flags(&format!("^(?:{pattern})$"), "v") {
+            if regex.find(&text).is_none() {
+                let shown = if pattern.encode_utf16().count() > 40 {
+                    format!("{}…", pattern.chars().take(39).collect::<String>())
+                } else {
+                    pattern.clone()
+                };
+                return Some(format!("Must match {shown}"));
             }
         }
     }

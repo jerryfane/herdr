@@ -20,7 +20,7 @@ use crate::agent_transcript::ask_form::{
 };
 use crate::api::schema::{AskFormAnswer, AskFormValue, ErrorBody};
 
-use super::selector::{CURSOR_GLYPHS, LEFT_EDGE};
+use super::selector::{trim_right_edge, CURSOR_GLYPHS, LEFT_EDGE};
 
 /// What omp shows in an empty Other row.
 const OTHER_PLACEHOLDER: &str = "type your own";
@@ -28,9 +28,6 @@ const OTHER_PLACEHOLDER: &str = "type your own";
 const RADIO_MARKERS: [(&str, &str); 3] = [("◉", "○"), ("\u{f192}", "\u{f10c}"), ("(o)", "( )")];
 /// Checkbox markers of the same presets: (checked, unchecked).
 const CHECKBOX_MARKERS: [(&str, &str); 3] = [("☑", "☐"), ("\u{f14a}", "\u{f096}"), ("[x]", "[ ]")];
-/// How much of a label the screen check compares: enough to tell rows
-/// apart, short enough to sit on a label's first wrapped line.
-const LABEL_PREFIX_CHARS: usize = 12;
 
 /// One step of the drive: named keys (`pane.send_keys`) or literal text
 /// (typed, as a paste when the terminal asked for bracketed paste).
@@ -250,43 +247,37 @@ fn value_of(form: &ParsedForm, field: usize, target: &Target) -> Option<FormValu
     }
 }
 
-/// Where ←/→ presses from `from` land on a dropdown (`#step`): the nearest
-/// enabled option one step over, clamped at the ends.
-fn dropdown_keys(choice: &Choice, from: Option<usize>, to: usize) -> Vec<&'static str> {
+/// Keys that set a dropdown to option `to` whatever it shows now: ← once
+/// per enabled option reaches the first one (`#step` clamps at the ends),
+/// then → steps over enabled options to the target.
+fn dropdown_keys(choice: &Choice, to: usize) -> Vec<&'static str> {
     let enabled: Vec<usize> = (0..choice.options.len())
         .filter(|index| !choice.options[*index].disabled)
         .collect();
     let target = enabled.iter().position(|index| *index == to).unwrap_or(0);
-    // `#step` from `from` (or -1): the first press lands on the nearest
-    // enabled option in that direction.
-    let (key, presses) = match from {
-        Some(from) if from == to => return Vec::new(),
-        Some(from) if from < to => {
-            let start = enabled.iter().filter(|index| **index <= from).count();
-            ("right", target + 1 - start)
-        }
-        Some(from) => {
-            let start = enabled.iter().filter(|index| **index < from).count();
-            ("left", start - target)
-        }
-        None => ("right", target + 1),
-    };
-    vec![key; presses]
+    let mut keys = vec!["left"; enabled.len().saturating_sub(1)];
+    keys.extend(std::iter::repeat_n("right", target));
+    keys
 }
 
-/// Keys that empty a prefilled text field whose cursor sits at its start
-/// (omp opens prefilled fields there): `ctrl+k` deletes to the line end, and
-/// at a line end joins the next line.
+/// Lines a textarea is cleared through at least; a draft longer than this
+/// (only a paste makes one) keeps its tail, which the result check reports.
+const TEXTAREA_CLEAR_LINES: usize = 200;
+
+/// Keys that empty a text field wherever its caret is and whatever it
+/// holds. A single-line input: Ctrl+E to the end, Ctrl+U deletes to the
+/// start. A textarea: the same on the caret's line, then Ctrl+U pairs merge
+/// and empty each line above (a Ctrl+U at a line start joins it to the
+/// previous one) and Ctrl+K pairs each line below (a Ctrl+K at a line end
+/// joins the next); presses past the first or last line do nothing.
 fn clear_keys(value: &str, multiline: bool) -> Vec<&'static str> {
-    if value.is_empty() {
-        return Vec::new();
+    let mut keys = vec!["ctrl+e", "ctrl+u"];
+    if multiline {
+        let lines = value.split('\n').count().max(TEXTAREA_CLEAR_LINES);
+        keys.extend(std::iter::repeat_n("ctrl+u", 2 * (lines - 1)));
+        keys.extend(std::iter::repeat_n("ctrl+k", 2 * (lines - 1)));
     }
-    if !multiline {
-        return vec!["ctrl+k"];
-    }
-    let lines: Vec<&str> = value.split('\n').collect();
-    let presses = lines.iter().filter(|line| !line.is_empty()).count() + lines.len() - 1;
-    vec!["ctrl+k"; presses]
+    keys
 }
 
 /// The keys that turn the freshly opened form into `values` and submit it,
@@ -332,9 +323,10 @@ pub(crate) fn plan(
                 .count();
         let own = &stops[start..end];
         let target = &targets[field];
+        // Text fields and dropdowns are set outright, so whatever they show
+        // now (the screen check does not read them) cannot leak through.
         let unchanged = *target == initial(form, field);
         match (&form.fields[field].kind, target) {
-            _ if unchanged => keys.push("tab"),
             (FieldKind::Text(input), Target::Text(text)) => {
                 keys.extend(clear_keys(&input.value, input.multiline));
                 if !text.is_empty() {
@@ -344,11 +336,11 @@ pub(crate) fn plan(
                 keys.push("tab");
             }
             (FieldKind::Choice(choice), Target::Choice { checked, .. }) if choice.is_dropdown() => {
-                let from = choice.initial_checked().first().copied();
                 let to = checked.first().copied().unwrap_or_default();
-                keys.extend(dropdown_keys(choice, from, to));
+                keys.extend(dropdown_keys(choice, to));
                 keys.push("tab");
             }
+            _ if unchanged => keys.push("tab"),
             (FieldKind::Choice(choice), Target::Choice { checked, other }) if !choice.multi => {
                 let at = match other {
                     Some(_) => own.len() - 1,
@@ -397,26 +389,22 @@ pub(crate) fn plan(
     })
 }
 
-/// The first `LABEL_PREFIX_CHARS` characters of a label's first line, as
-/// the terminal draws it.
-fn label_prefix(label: &str) -> String {
+/// A label's first line as omp draws it, whitespace collapsed.
+fn first_line(label: &str) -> String {
     one_line(label.split('\n').next().unwrap_or_default())
-        .chars()
-        .take(LABEL_PREFIX_CHARS)
-        .collect()
 }
 
 /// A screen row with omp's form layout: the cursor slot, then (for option
-/// rows) a marker, then text.
-struct Row<'a> {
+/// rows) a marker, then text, whitespace collapsed and the panel edge cut.
+struct Row {
     focused: bool,
     /// `Some(selected)` for an option row.
     marker: Option<bool>,
-    text: &'a str,
+    text: String,
 }
 
-fn parse_row(line: &str) -> Row<'_> {
-    let line = line.trim_start_matches(LEFT_EDGE);
+fn parse_row(line: &str) -> Row {
+    let line = trim_right_edge(line.trim_start_matches(LEFT_EDGE));
     let (focused, rest) = match line.chars().next() {
         Some(glyph) if CURSOR_GLYPHS.contains(&glyph) => {
             let rest = &line[glyph.len_utf8()..];
@@ -438,7 +426,7 @@ fn parse_row(line: &str) -> Row<'_> {
                 return Row {
                     focused,
                     marker: Some(is_selected),
-                    text,
+                    text: one_line(text),
                 };
             }
         }
@@ -446,102 +434,147 @@ fn parse_row(line: &str) -> Row<'_> {
     Row {
         focused,
         marker: None,
-        text: rest,
+        text: one_line(rest),
     }
 }
 
-/// An option row the starting form draws: its label (or the Other row) and
-/// whether its marker is filled.
+/// An option row the untouched form draws, in screen order.
 struct ExpectedRow {
+    /// The label's first line; for the synthetic Other row, its empty text.
     text: String,
+    /// The synthetic Other row: only its exact empty text matches.
+    other: bool,
     selected: bool,
 }
 
-/// Whether `screen` shows the form as it opens: focus on its first stop and
-/// every visible option row (Other included) in its default state. Anything
-/// else means someone is answering in the terminal, the form is collapsed, or
-/// it is not on screen; nothing may be sent then.
-pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
-    let stops = stops(form);
-    let rows: Vec<Row<'_>> = screen.lines().map(parse_row).collect();
-    let first_ok = match stops[0] {
-        Stop::Option { field, option } => {
-            let choice = form.fields[field]
-                .choice()
-                .expect("option stops are choices");
-            let selected = choice.initial_checked().contains(&option);
-            let prefix = label_prefix(&choice.options[option].label);
-            rows.iter().any(|row| {
-                row.focused && row.marker == Some(selected) && row.text.starts_with(&prefix)
-            })
+impl ExpectedRow {
+    /// Whether a drawn option row is this one: the same marker and the whole
+    /// first line, or (a wrapped label) a prefix of it that ends at a word.
+    fn matches(&self, row: &Row) -> bool {
+        if row.marker != Some(self.selected) || row.text.is_empty() {
+            return false;
         }
-        Stop::Text { field } | Stop::Select { field } => {
-            let prefix = label_prefix(&form.fields[field].label);
-            rows.iter()
-                .any(|row| row.focused && row.marker.is_none() && row.text.starts_with(&prefix))
+        if self.other {
+            return row.text == self.text;
         }
-        // A form with no stops but Submit: nothing to verify but the button.
-        Stop::Other { .. } | Stop::Submit => rows
-            .iter()
-            .any(|row| row.focused && row.text.starts_with("Submit")),
-    };
-    if !first_ok {
-        return false;
+        row.text == self.text
+            || (self.text.starts_with(&row.text) && self.text[row.text.len()..].starts_with(' '))
     }
-    let mut expected: Vec<ExpectedRow> = Vec::new();
-    for field in &form.fields {
-        let Some(choice) = field.choice() else {
+}
+
+/// The option rows of the untouched form, and the index among them of each
+/// option and Other stop.
+fn expected_rows(form: &ParsedForm) -> (Vec<ExpectedRow>, Vec<(Stop, usize)>) {
+    let mut rows = Vec::new();
+    let mut stops = Vec::new();
+    for (field, entry) in form.fields.iter().enumerate() {
+        let Some(choice) = entry.choice() else {
             continue;
         };
         if choice.is_dropdown() {
             continue;
         }
         let checked = choice.initial_checked();
-        for (index, option) in choice.options.iter().enumerate() {
-            expected.push(ExpectedRow {
-                text: label_prefix(&option.label),
-                selected: checked.contains(&index),
+        for (option, entry) in choice.options.iter().enumerate() {
+            stops.push((Stop::Option { field, option }, rows.len()));
+            rows.push(ExpectedRow {
+                text: first_line(&entry.label),
+                other: false,
+                selected: checked.contains(&option),
             });
         }
         if choice.other {
-            expected.push(ExpectedRow {
+            stops.push((Stop::Other { field }, rows.len()));
+            rows.push(ExpectedRow {
                 text: format!("{OTHER_LABEL}: {OTHER_PLACEHOLDER}"),
+                other: true,
                 selected: false,
             });
         }
     }
-    // Walk the visible option rows in order against the expected ones; a row
-    // that matches a label must show that option's default marker, and an
-    // Other row must still be empty.
-    let mut next = 0;
-    for row in &rows {
-        let Some(selected) = row.marker else {
-            continue;
-        };
-        if row.text.starts_with(&format!("{OTHER_LABEL}: "))
-            && (selected
-                || !row
-                    .text
-                    .starts_with(&format!("{OTHER_LABEL}: {OTHER_PLACEHOLDER}")))
-        {
-            return false;
-        }
-        if let Some(offset) = expected[next..]
+    (rows, stops)
+}
+
+/// Whether a focused non-option row is the label row of `field`: its first
+/// line, then at most the required star and a text field's bounds.
+fn is_label_row(row: &Row, label: &str) -> bool {
+    let label = first_line(label);
+    if label.is_empty() || !row.text.starts_with(&label) {
+        return false;
+    }
+    let rest = row.text[label.len()..].trim_start_matches(" *").trim();
+    rest.is_empty()
+        || rest.starts_with('≥')
+        || rest.starts_with('≤')
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
+}
+
+/// Whether `screen` shows the form as it opens, as far as the drive depends
+/// on it: the focus on its first stop, and every option row (Other included)
+/// in its default state. The visible option rows must line up, in order and
+/// in exactly one way, with the rows the untouched form draws; the focused
+/// one must be the first stop. Text fields and dropdowns are not checked:
+/// the drive sets them whatever they hold.
+pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
+    let stops = stops(form);
+    let rows: Vec<Row> = screen.lines().map(parse_row).collect();
+    let markers: Vec<usize> = (0..rows.len())
+        .filter(|index| rows[*index].marker.is_some())
+        .collect();
+    let focused_markers: Vec<usize> = markers
+        .iter()
+        .copied()
+        .filter(|index| rows[*index].focused)
+        .collect();
+    let (expected, stop_rows) = expected_rows(form);
+    // Every place the visible option rows, all of them in order, line up
+    // with the expected ones (a scrolled form shows a window of them).
+    let alignments: Vec<usize> = (0..expected.len())
+        .filter(|&start| {
+            markers.len() <= expected.len() - start
+                && markers
+                    .iter()
+                    .zip(&expected[start..])
+                    .all(|(&row, want)| want.matches(&rows[row]))
+        })
+        .collect();
+    let first_stop_row = |stop: Stop| {
+        stop_rows
             .iter()
-            .position(|candidate| row.text.starts_with(&candidate.text))
-        {
-            if expected[next + offset].selected != selected {
+            .find(|(candidate, _)| *candidate == stop)
+            .map(|(_, row)| *row)
+    };
+    match stops[0] {
+        stop @ (Stop::Option { .. } | Stop::Other { .. }) => {
+            let Some(want) = first_stop_row(stop) else {
                 return false;
-            }
-            next += offset + 1;
+            };
+            let [focused] = focused_markers.as_slice() else {
+                return false;
+            };
+            // Exactly one reading of the screen, and in it the focused row is
+            // the first stop; ambiguous or wrong sends nothing.
+            matches!(alignments.as_slice(),
+                [start] if want >= *start && markers.get(want - start) == Some(focused))
+        }
+        Stop::Text { field } | Stop::Select { field } => {
+            focused_markers.is_empty()
+                && rows
+                    .iter()
+                    .filter(|row| row.focused && row.marker.is_none())
+                    .any(|row| is_label_row(row, &form.fields[field].label))
+                && (markers.is_empty() || alignments.len() == 1)
+        }
+        Stop::Submit => {
+            focused_markers.is_empty()
+                && rows
+                    .iter()
+                    .any(|row| row.focused && row.text.starts_with("Submit"))
         }
     }
-    // No other option row (or Submit) holds the focus; the chat above the
-    // form may hold unrelated `❯` lines, so only form rows count.
-    rows.iter()
-        .filter(|row| row.focused && (row.marker.is_some() || row.text.starts_with("Submit")))
-        .count()
-        <= 1
 }
 
 /// The agent's pane as the form driver sees it.

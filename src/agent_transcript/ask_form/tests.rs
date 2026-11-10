@@ -290,3 +290,83 @@ fn ask_arguments_without_html_are_not_forms() {
     assert_eq!(form_html(Some(&json!({"questions": []}))), None);
     assert_eq!(form_html(None), None);
 }
+
+/// #392 F6: omp's parser decodes only its own entity table; others stay as
+/// written, and so does the label omp draws.
+#[test]
+fn entities_decode_as_omps_parser_does() {
+    let form = parse(
+        r#"<form><label><input type="radio" name="a" value="1"> Go &rarr; &amp; &eacute; &#x41;&#66; &bogus;</label>
+        <label><input type="radio" name="a" value="2" title="x&quot;y"> B</label></form>"#,
+    );
+    let labels: Vec<&str> = choice(&form.fields[0])
+        .options
+        .iter()
+        .map(|option| option.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Go &rarr; & é AB &bogus;", "B"]);
+}
+
+/// #392 F7: `pattern` is an ECMAScript `v`-flag regex, whose `\W` is ASCII.
+#[test]
+fn patterns_follow_ecmascript_semantics() {
+    let form =
+        parse(r#"<form><input name="w" pattern="\W+"><input name="bad" pattern="(?<x"></form>"#);
+    assert_eq!(field_error(&form.fields[0], text("é").as_ref()), None);
+    assert_eq!(
+        field_error(&form.fields[0], text("a").as_ref()),
+        Some("Must match \\W+".into())
+    );
+    // A pattern JS cannot compile is ignored, as omp does.
+    assert_eq!(
+        field_error(&form.fields[1], text("anything").as_ref()),
+        None
+    );
+}
+
+/// #392 F8: a field that submits nothing reads the hidden input of its name.
+#[test]
+fn predicted_answers_fall_back_to_hidden_inputs() {
+    let form = parse(
+        r#"<form><input type="hidden" name="enabled" value="no">
+        <label><input type="checkbox" name="enabled" value="yes"> Enable</label></form>"#,
+    );
+    let data = vec![form.default_value(&form.fields[0])];
+    assert_eq!(form.answers(&data)[0].answer, "no");
+}
+
+/// #392 F9: numbers read as JS `String(number)` writes them.
+#[test]
+fn numbers_format_like_javascript() {
+    for (value, expected) in [
+        (0.0000001, "1e-7"),
+        (0.000001, "0.000001"),
+        (1e21, "1e+21"),
+        (123456789012345680000.0, "123456789012345680000"),
+        (1.5, "1.5"),
+        (-0.25, "-0.25"),
+        (3.0, "3"),
+        (2.5e-8, "2.5e-8"),
+    ] {
+        assert_eq!(js_number_string(value), expected, "{value}");
+    }
+    let form = parse(r#"<form><input type="number" name="n" value="0.0000001"></form>"#);
+    let data = vec![form.default_value(&form.fields[0])];
+    assert_eq!(form.answers(&data)[0].answer, "1e-7");
+}
+
+/// #392 F10: fields that share a name keep their own titles.
+#[test]
+fn compat_questions_keep_each_fields_own_title() {
+    let form = parse(
+        r#"<form><label>Primary <select name="db"><option>a</option></select></label>
+        <label>Backup <select name="db"><option>b</option></select></label></form>"#,
+    );
+    let wire = form.to_wire();
+    let titles: Vec<String> = form
+        .compat_questions(&wire)
+        .into_iter()
+        .map(|question| question.question)
+        .collect();
+    assert_eq!(titles, ["Primary", "Backup"]);
+}

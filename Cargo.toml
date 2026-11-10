@@ -69,13 +69,11 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 # Verifies the minisign signature on the preview update manifest (`src/update/verify.rs`).
 # Zero dependencies; legacy (non-prehashed) signatures are refused by the caller.
 minisign-verify = "0.3"
-# Parses omp's HTML form `ask` (`src/agent_transcript/ask_form.rs`). html5ever is the
-# WHATWG tree builder, so agent-written HTML (unclosed `<p>`/`<li>`, implied tbody,
-# void inputs) yields the DOM a browser and omp's own parser see; scraper is its
-# maintained DOM. Default features off: no CLI (getopts) and no error collection.
-scraper = { version = "0.29", default-features = false }
-# scraper's node tree type, named directly by the form walker; already in the tree via scraper.
-ego-tree = "0.11"
+# ECMAScript regular expressions for the `pattern` of omp HTML form fields
+# (`src/agent_transcript/ask_form.rs`): omp checks them as JS `v`-flag regexes, whose
+# classes (`\w`, `\d`, `\b`) are ASCII where the `regex` crate's are Unicode. Its only
+# dependencies (memchr, hashbrown) are already in the tree.
+regress = "0.12"
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }

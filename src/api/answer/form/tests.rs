@@ -82,7 +82,12 @@ fn accepting_the_recommendations_tabs_through_and_submits() {
     let plan = plan(&form, &BTreeMap::new()).unwrap();
     assert_eq!(
         plan.actions,
-        [keys(&["up"]), keys(&["tab", "tab", "tab", "tab", "enter"])]
+        [
+            keys(&["up"]),
+            keys(&["tab", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
+        ]
     );
     let answers: Vec<&str> = plan
         .expected
@@ -100,7 +105,9 @@ fn radio_moves_down_over_enabled_options_and_enters() {
         plan.actions,
         [
             keys(&["up"]),
-            keys(&["down", "down", "enter", "tab", "tab", "tab", "enter"])
+            keys(&["down", "down", "enter", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
         ]
     );
     assert_eq!(plan.expected[0].answer, "SQLite");
@@ -121,7 +128,9 @@ fn radio_other_types_on_the_other_row() {
             keys(&["up"]),
             keys(&["down", "down", "down"]),
             Action::Text("CockroachDB".into()),
-            keys(&["enter", "tab", "tab", "tab", "enter"]),
+            keys(&["enter", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
         ]
     );
     assert_eq!(plan.expected[0].answer, "Other: CockroachDB");
@@ -142,7 +151,9 @@ fn checkbox_toggles_only_the_differences_then_tabs() {
             keys(&["up"]),
             keys(&["tab", "space", "down", "down", "space", "down"]),
             Action::Text("just".into()),
-            keys(&["tab", "tab", "tab", "enter"]),
+            keys(&["tab", "left", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
         ]
     );
     assert_eq!(plan.expected[1].answer, "Nix, Other: just");
@@ -156,7 +167,9 @@ fn select_steps_over_disabled_options_with_arrows() {
         plan.actions,
         [
             keys(&["up"]),
-            keys(&["tab", "tab", "right", "tab", "tab", "enter"])
+            keys(&["tab", "tab", "left", "right", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
         ]
     );
     assert_eq!(plan.expected[2].answer, "AP");
@@ -174,12 +187,11 @@ fn text_clears_the_prefill_and_types() {
         plan.actions,
         [
             keys(&["up"]),
-            keys(&["tab", "tab", "tab", "ctrl+k"]),
+            keys(&["tab", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
             Action::Text("ship friday".into()),
             keys(&["tab", "enter"]),
         ]
     );
-    assert_eq!(clear_keys("a\n\nb", true), ["ctrl+k"; 4]);
 }
 
 #[test]
@@ -244,7 +256,9 @@ fn a_present_entry_without_options_unticks_a_checkbox_group() {
         plan.actions,
         [
             keys(&["up"]),
-            keys(&["tab", "space", "tab", "tab", "tab", "enter"])
+            keys(&["tab", "space", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
+            Action::Text("draft".into()),
+            keys(&["tab", "enter"]),
         ]
     );
     assert_eq!(plan.expected[1].answer, "");
@@ -272,4 +286,103 @@ fn a_present_radio_entry_without_options_needs_other() {
         ..AskFormValue::default()
     };
     assert!(plan(&form, &values(&[("db", other)])).is_ok());
+}
+
+fn screen(rows: &[&str]) -> String {
+    rows.join("\n")
+}
+
+/// #392 F1/F2: a text field is cleared wherever its caret is and retyped,
+/// even when kept, so neither the caret omp opens it with nor an edit made
+/// in the terminal reaches the submission.
+#[test]
+fn text_fields_are_cleared_caret_independently_and_always_set() {
+    let form = parse(
+        r#"<form><input name="notes" value="draft"><textarea name="long">a
+b</textarea></form>"#,
+    );
+    let plan = plan(&form, &BTreeMap::new()).unwrap();
+    let Action::Keys(first) = &plan.actions[1] else {
+        panic!("{:?}", plan.actions);
+    };
+    assert_eq!(first, &["ctrl+e", "ctrl+u"]);
+    assert_eq!(plan.actions[2], Action::Text("draft".into()));
+    let Action::Keys(second) = &plan.actions[3] else {
+        panic!("{:?}", plan.actions);
+    };
+    assert_eq!(second[0], "tab");
+    assert_eq!(&second[1..3], ["ctrl+e", "ctrl+u"]);
+    assert_eq!(
+        second.iter().filter(|key| **key == "ctrl+k").count(),
+        2 * 199
+    );
+    assert_eq!(plan.actions[4], Action::Text("a\nb".into()));
+}
+
+/// #392 F2: a dropdown is set outright, from whatever it shows.
+#[test]
+fn dropdowns_are_set_outright() {
+    let form = parse(FORM);
+    let plan = plan(&form, &BTreeMap::new()).unwrap();
+    let Action::Keys(keys) = &plan.actions[1] else {
+        panic!("{:?}", plan.actions);
+    };
+    // Region has 2 enabled options: one ← reaches US from either.
+    assert_eq!(&keys[..4], ["tab", "tab", "left", "tab"]);
+}
+
+/// #392 F3: labels sharing a long prefix are told apart; focus on the third
+/// is not the first stop.
+#[test]
+fn the_screen_check_needs_the_whole_label() {
+    let form = parse(
+        r#"<form><label><input type="radio" name="r" value="a"> abcdefghijkl A</label>
+        <label><input type="radio" name="r" value="b"> abcdefghijkl B</label>
+        <label><input type="radio" name="r" value="c"> abcdefghijkl C</label></form>"#,
+    );
+    let rows = |focus: usize| {
+        let mut lines = vec!["Ask".to_owned()];
+        for (index, letter) in ["A", "B", "C"].iter().enumerate() {
+            let cursor = if index == focus { "❯ " } else { "  " };
+            lines.push(format!("│ {cursor}○ abcdefghijkl {letter}   │"));
+        }
+        lines.push("│   ○ Other: type your own │".into());
+        lines.join("\n")
+    };
+    assert!(at_start(&rows(0), &form));
+    assert!(!at_start(&rows(2), &form));
+}
+
+/// #392 F4: an option of the agent's own labelled "Other: …" is a label,
+/// not the synthetic Other row.
+#[test]
+fn an_option_labelled_other_is_an_ordinary_row() {
+    let form = parse(
+        r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
+        <label><input type="radio" name="r" value="s"> Other: skip</label></form>"#,
+    );
+    assert!(!choice_other(&form));
+    assert!(at_start(
+        &screen(&["❯ ◉ A", "  ○ Other: skip", "  Submit"]),
+        &form
+    ));
+}
+
+fn choice_other(form: &ParsedForm) -> bool {
+    form.fields[0].choice().unwrap().other
+}
+
+/// #392 F5: Other can be the first stop (every option disabled).
+#[test]
+fn other_can_be_the_first_stop() {
+    let form = parse(
+        r#"<form><label><input type="radio" name="r" value="a" disabled> A</label>
+        <label><input type="radio" name="r" value="b" disabled> B</label></form>"#,
+    );
+    assert_eq!(stops(&form)[0], Stop::Other { field: 0 });
+    // Focused and empty, omp draws a cursor block before the placeholder.
+    let start = screen(&["  ○ A", "  ○ B", "❯ ○ Other:  type your own", "  Submit"]);
+    assert!(at_start(&start, &form));
+    let typed = screen(&["  ○ A", "  ○ B", "❯ ○ Other: x", "  Submit"]);
+    assert!(!at_start(&typed, &form));
 }

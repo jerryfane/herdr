@@ -409,16 +409,23 @@ pub(super) fn form_result(
 }
 
 /// The compatibility `answer` lines of a form ask, `"<title>: <answer>"`
-/// per field (the form's title for the field, else omp's question).
+/// per field (the form's title for the field, else omp's question). omp
+/// records one answer per named field in form order, so answers pair with
+/// the form's fields by position; a result that does not line up (another
+/// form, edited history) falls back to omp's question.
 pub(super) fn form_answer_lines(form: &AskForm, answers: &[AskFormAnswer]) -> Vec<String> {
+    let aligned = answers.len() == form.fields.len()
+        && answers
+            .iter()
+            .zip(&form.fields)
+            .all(|(answer, field)| answer.name == field.name);
     answers
         .iter()
-        .map(|answer| {
-            let title = form
-                .fields
-                .iter()
-                .find(|field| field.name == answer.name)
-                .and_then(|field| field.title.as_deref())
+        .enumerate()
+        .map(|(index, answer)| {
+            let title = aligned
+                .then(|| form.fields[index].title.as_deref())
+                .flatten()
                 .unwrap_or(&answer.question);
             format!("{title}: {}", answer.answer)
         })

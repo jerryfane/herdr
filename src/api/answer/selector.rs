@@ -289,7 +289,7 @@ fn block_is_filtered(lines: &[&str], highlighted: usize, end: usize) -> bool {
         .any(|line| line.contains(FILTER_STATUS))
 }
 
-fn trim_right_edge(line: &str) -> &str {
+pub(crate) fn trim_right_edge(line: &str) -> &str {
     let mut line = line.trim_end();
     // Border plus scrollbar at most; more would start eating label text.
     for _ in 0..2 {
