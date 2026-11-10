@@ -5,8 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::schema::{
-    AskQuestion, TranscriptAuthor, TranscriptNoteSource, TranscriptPlanItem,
-    TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
+    AskForm, AskFormAnswer, AskFormStatus, AskQuestion, TranscriptAuthor, TranscriptNoteSource,
+    TranscriptPlanItem, TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
 };
 
 pub(super) const DETAIL_MAX_CHARS: usize = 300;
@@ -94,6 +94,8 @@ pub(super) struct ResultMessage {
     pub(super) timestamp: Option<u64>,
     #[serde(default)]
     pub(super) details: Option<Value>,
+    #[serde(default)]
+    pub(super) content: Value,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +368,90 @@ pub(super) fn ask_answer(details: Option<&Value>) -> Vec<String> {
         None => take(details),
     }
     answer
+}
+
+/// The answers of a form `ask` result (`details.answers`) and how it ended:
+/// timed out when `details.timedOut` is set; cancelled when the result is an
+/// error or carries no answers (omp throws on cancel, and a form without
+/// named controls records none).
+pub(super) fn form_result(
+    details: Option<&Value>,
+    failed: bool,
+) -> (Vec<AskFormAnswer>, AskFormStatus) {
+    let answers: Vec<AskFormAnswer> = details
+        .and_then(|details| details.get("answers"))
+        .and_then(Value::as_array)
+        .map(|answers| {
+            answers
+                .iter()
+                .filter_map(|answer| {
+                    let text =
+                        |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_owned);
+                    Some(AskFormAnswer {
+                        name: text("name")?,
+                        question: text("question").unwrap_or_default(),
+                        answer: text("answer").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let timed_out = details
+        .and_then(|details| details.get("timedOut"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = if failed || answers.is_empty() {
+        AskFormStatus::Cancelled
+    } else if timed_out {
+        AskFormStatus::TimedOut
+    } else {
+        AskFormStatus::Answered
+    };
+    (answers, status)
+}
+
+/// The form data a form `ask` result's text carries: omp writes
+/// `User answers:` (or, on a timeout, `No answer before the timeout; …`)
+/// and the submitted data as JSON on the following lines.
+pub(super) fn form_result_data(content: &Value) -> Option<serde_json::Map<String, Value>> {
+    let text = match content {
+        Value::String(text) => text.as_str(),
+        Value::Array(parts) => parts
+            .iter()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))?
+            .get("text")?
+            .as_str()?,
+        _ => return None,
+    };
+    let (_, json) = text.split_once('\n')?;
+    match serde_json::from_str(json).ok()? {
+        Value::Object(data) => Some(data),
+        _ => None,
+    }
+}
+
+/// The compatibility `answer` lines of a form ask, `"<title>: <answer>"`
+/// per field (the form's title for the field, else omp's question). omp
+/// records one answer per named field in form order, so answers pair with
+/// the form's fields by position; a result that does not line up (another
+/// form, edited history) falls back to omp's question.
+pub(super) fn form_answer_lines(form: &AskForm, answers: &[AskFormAnswer]) -> Vec<String> {
+    let aligned = answers.len() == form.fields.len()
+        && answers
+            .iter()
+            .zip(&form.fields)
+            .all(|(answer, field)| answer.name == field.name);
+    answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            let title = aligned
+                .then(|| form.fields[index].title.as_deref())
+                .flatten()
+                .unwrap_or(&answer.question);
+            format!("{title}: {}", answer.answer)
+        })
+        .collect()
 }
 
 /// Todo items from a `todo` result's `details.phases[].tasks[]`; abandoned

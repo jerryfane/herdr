@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::api::schema::{
-    AskQuestion, TranscriptAuthor, TranscriptNoteSource, TranscriptPlanItem, TranscriptStepStatus,
-    TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
+    AskFormStatus, AskQuestion, TranscriptAuthor, TranscriptNoteSource, TranscriptPlanItem,
+    TranscriptStepStatus, TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
 };
 
 const T0_MS: u64 = 1_792_749_600_000; // 2026-10-23T10:00:00Z
@@ -746,6 +746,8 @@ fn an_ask_is_pending_until_its_result_records_the_answer() {
             recommended: Some(0),
         }],
         answerable: true,
+        form: None,
+        form_answerable: false,
     };
     let page = session.newest();
     assert_eq!(page.pending_ask, Some(pending.clone()));
@@ -2124,4 +2126,150 @@ fn an_after_page_does_not_resend_an_unmarked_user_entry() {
     )
     .unwrap();
     assert!(user_origins(&next).is_empty(), "{:?}", next.entries);
+}
+
+const FORM_HTML: &str = r#"<form><p>Two picks.</p><fieldset><legend>Database</legend>
+<label><input type="radio" name="db" value="pg" checked> Postgres</label>
+<label><input type="radio" name="db" value="my"> MySQL</label></fieldset>
+<label>Notes <input name="notes"></label></form>"#;
+
+fn form_session(tag: &str) -> Fixture {
+    let mut session = Fixture::new(tag);
+    session.user("pick");
+    session.assistant(
+        vec![call(
+            "f1",
+            "ask",
+            Some("Asking"),
+            json!({"html": FORM_HTML}),
+        )],
+        "toolUse",
+    );
+    session
+}
+
+fn form_entry(page: &Page) -> &TranscriptEntry {
+    page.entries
+        .iter()
+        .find(|entry| matches!(entry, TranscriptEntry::Ask { .. }))
+        .expect("ask entry")
+}
+
+#[test]
+fn a_pending_form_ask_carries_the_form_and_compat_questions() {
+    let session = form_session("form-pending");
+    let pending = pending_ask(&session.path).unwrap().expect("pending");
+    assert!(
+        !pending.answerable,
+        "the old selector path never drives forms"
+    );
+    assert!(pending.form_answerable);
+    let form = pending.form.as_ref().unwrap();
+    assert_eq!(form.intro.as_deref(), Some("Two picks."));
+    assert_eq!(form.fields.len(), 2);
+    assert_eq!(
+        pending.questions.len(),
+        1,
+        "one compat question per choice field"
+    );
+    assert_eq!(pending.questions[0].question, "Database");
+    assert_eq!(pending.questions[0].recommended, Some(0));
+    let page = session.newest();
+    let TranscriptEntry::Ask {
+        form,
+        answer,
+        form_status,
+        ..
+    } = form_entry(&page)
+    else {
+        unreachable!()
+    };
+    assert!(form.is_some() && answer.is_none() && form_status.is_none());
+}
+
+#[test]
+fn form_results_map_to_answered_timed_out_and_cancelled() {
+    let answers = json!([
+        {"name": "db", "question": "Database", "answer": "MySQL"},
+        {"name": "notes", "question": "Notes", "answer": "fast"},
+    ]);
+    for (tag, details, is_error, status) in [
+        (
+            "form-answered",
+            json!({"answers": answers}),
+            false,
+            AskFormStatus::Answered,
+        ),
+        (
+            "form-timeout",
+            json!({"answers": answers, "timedOut": true}),
+            false,
+            AskFormStatus::TimedOut,
+        ),
+        (
+            "form-error",
+            json!({"answers": answers}),
+            true,
+            AskFormStatus::Cancelled,
+        ),
+        ("form-empty", json!({}), false, AskFormStatus::Cancelled),
+    ] {
+        let mut session = form_session(tag);
+        session.result("f1", "ask", is_error, details);
+        assert_eq!(pending_ask(&session.path).unwrap(), None);
+        let page = session.newest();
+        let TranscriptEntry::Ask {
+            answer,
+            form_answer,
+            form_status,
+            ..
+        } = form_entry(&page)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*form_status, Some(status), "{tag}");
+        if status == AskFormStatus::Cancelled && tag == "form-empty" {
+            assert_eq!(*answer, None, "empty details are no answer, not Some([])");
+            assert_eq!(form_answer.as_deref(), Some(&[][..]));
+        } else {
+            assert_eq!(
+                answer.as_deref(),
+                Some(&["Database: MySQL".to_string(), "Notes: fast".to_string()][..]),
+                "{tag}"
+            );
+            assert_eq!(form_answer.as_ref().unwrap()[0].answer, "MySQL");
+        }
+    }
+    let mut session = form_session("form-result");
+    session.result("f1", "ask", false, json!({"answers": answers}));
+    assert_eq!(
+        form_ask_outcome(&session.path, "f1")
+            .unwrap()
+            .unwrap()
+            .answers
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_cancelled_questions_ask_has_no_answer() {
+    let mut session = Fixture::new("questions-cancel");
+    session.user("q");
+    session.assistant(
+        vec![ask_call(
+            "a",
+            json!([{"question": "Pick", "options": ["A"]}]),
+        )],
+        "toolUse",
+    );
+    session.result("a", "ask", true, json!({}));
+    let page = session.newest();
+    // Before ask forms, empty details became `answer: Some([])`, which apps
+    // drew as an empty "You chose".
+    let answer = page.entries.iter().find_map(|entry| match entry {
+        TranscriptEntry::Ask { answer, .. } => Some(answer.clone()),
+        _ => None,
+    });
+    assert_eq!(answer, Some(None), "{:?}", page.entries);
 }

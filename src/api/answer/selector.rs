@@ -26,15 +26,16 @@ const RECOMMENDED_SUFFIX: &str = " (Recommended)";
 const GUEST_ACTION_LABELS: [&str; 2] = ["Chat about this", "Next →"];
 
 /// Cursor glyphs of omp's unicode, nerd-font and ascii symbol presets.
-const CURSOR_GLYPHS: [char; 3] = ['❯', '\u{f054}', '>'];
+pub(crate) const CURSOR_GLYPHS: [char; 3] = ['❯', '\u{f054}', '>'];
 /// Single-select radio markers of the same presets, unselected and selected.
 const RADIO_MARKERS: [&str; 6] = ["○", "◉", "\u{f10c}", "\u{f192}", "( )", "(o)"];
 /// Characters that may sit left of the cursor slot: padding and the panel's
 /// left border.
-const LEFT_EDGE: [char; 5] = [' ', '│', '|', '┃', '║'];
+pub(crate) const LEFT_EDGE: [char; 5] = [' ', '│', '|', '┃', '║'];
 /// Characters that may close a row on the right: the panel border and the
 /// scrollbar track/thumb of a long list.
-const RIGHT_EDGE: [char; 12] = ['│', '|', '┃', '║', '█', '▐', '▌', '░', '▒', '▓', '╎', '┆'];
+pub(crate) const RIGHT_EDGE: [char; 12] =
+    ['│', '|', '┃', '║', '█', '▐', '▌', '░', '▒', '▓', '╎', '┆'];
 const NOTE_MARKER: &str = "✎ note";
 /// Status line text omp's older select lists show once the user typed a
 /// filter; a filtered list hides and reorders rows, so it is never driven.
@@ -288,7 +289,7 @@ fn block_is_filtered(lines: &[&str], highlighted: usize, end: usize) -> bool {
         .any(|line| line.contains(FILTER_STATUS))
 }
 
-fn trim_right_edge(line: &str) -> &str {
+pub(crate) fn trim_right_edge(line: &str) -> &str {
     let mut line = line.trim_end();
     // Border plus scrollbar at most; more would start eating label text.
     for _ in 0..2 {

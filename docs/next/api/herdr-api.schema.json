@@ -1703,6 +1703,32 @@
           ],
           "type": "object"
         },
+        "AgentAnswerFormParams": {
+          "description": "`agent.answer_form` — answer an omp agent's pending HTML form `ask` by\ndriving its terminal form, then confirm the answers from the tool result.",
+          "properties": {
+            "ask_id": {
+              "description": "The pending ask's tool call id, from `agent.transcript`'s `pending_ask`.",
+              "type": "string"
+            },
+            "target": {
+              "description": "Agent name or pane id, resolved like `agent.read`.",
+              "type": "string"
+            },
+            "values": {
+              "additionalProperties": {
+                "$ref": "#/schemas/request/$defs/AskFormValue"
+              },
+              "default": {},
+              "description": "Answers by field name. A field left out keeps its default (its checked\nor selected options, or its prefilled text); `{}` accepts every\nrecommendation.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "target",
+            "ask_id"
+          ],
+          "type": "object"
+        },
         "AgentAnswerParams": {
           "description": "`agent.answer` — pick one option of an omp agent's pending `ask` question\nby driving its on-screen selector.",
           "properties": {
@@ -2557,6 +2583,36 @@
           "required": [
             "target"
           ],
+          "type": "object"
+        },
+        "AskFormValue": {
+          "description": "One field's answer in `agent.answer_form`.",
+          "properties": {
+            "options": {
+              "description": "Choice fields: the chosen option values (a radio group or single\nselect takes at most one; none when answering with `other`).",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "other": {
+              "description": "Choice fields with `other`: the free text typed into Other.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "description": "Text fields: the whole answer, replacing any prefilled text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "ClientShellSurfaceSetParams": {
@@ -7808,6 +7864,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.answer_form",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentAnswerFormParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.restart",
               "type": "string"
             },
@@ -12391,6 +12463,231 @@
           ],
           "type": "string"
         },
+        "AskForm": {
+          "description": "An omp (≥ 18.18.3) `ask` HTML form, reduced the way omp's terminal form\ndraws it (upstream `packages/tui/src/html-form/parse.ts`). Hidden inputs\nare left out: omp submits them itself.",
+          "properties": {
+            "fields": {
+              "description": "The answerable fields in document (and terminal focus) order.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AskFormField"
+              },
+              "type": "array"
+            },
+            "intro": {
+              "default": null,
+              "description": "Plain text of the context blocks before the first section or field;\nparagraphs are separated by a blank line.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "fields"
+          ],
+          "type": "object"
+        },
+        "AskFormAnswer": {
+          "description": "One answered field, copied from the ask result's `details.answers`.",
+          "properties": {
+            "answer": {
+              "description": "The chosen label, `Other: <text>`, comma-joined labels, or the text.",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "question": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "question",
+            "answer"
+          ],
+          "type": "object"
+        },
+        "AskFormField": {
+          "description": "One field of an [`AskForm`].",
+          "properties": {
+            "description": {
+              "default": null,
+              "description": "Plain text of the context blocks in this field's section before it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "input_type": {
+              "default": null,
+              "description": "Text fields only: the `<input type>` (`text`, `number`, `email`, …) or\n`textarea`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/AskFormFieldKind"
+            },
+            "max": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "maxlength": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "min": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "minlength": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "multi": {
+              "default": false,
+              "description": "A checkbox group or `<select multiple>`.",
+              "type": "boolean"
+            },
+            "name": {
+              "description": "The control `name`; the key of this field in `agent.answer_form` values.",
+              "type": "string"
+            },
+            "options": {
+              "default": [],
+              "description": "Choice fields only; empty for text fields.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AskFormOption"
+              },
+              "type": "array"
+            },
+            "other": {
+              "default": false,
+              "description": "omp adds a free-text \"Other: type your own\" answer to this group.",
+              "type": "boolean"
+            },
+            "pattern": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "placeholder": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "required": {
+              "default": false,
+              "type": "boolean"
+            },
+            "select": {
+              "default": false,
+              "description": "Drawn from a `<select>` (never has Other).",
+              "type": "boolean"
+            },
+            "title": {
+              "default": null,
+              "description": "The section `<legend>`, else the field's own label, else null.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "value": {
+              "default": null,
+              "description": "Text fields only: the prefilled text (the default answer).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "AskFormFieldKind": {
+          "oneOf": [
+            {
+              "const": "choice",
+              "description": "A radio group, checkbox group or `<select>`.",
+              "type": "string"
+            },
+            {
+              "const": "text",
+              "description": "A text `<input>` or `<textarea>`.",
+              "type": "string"
+            }
+          ]
+        },
+        "AskFormOption": {
+          "description": "One option of a choice field. `checked` marks the agent's recommendation,\nwhich is also the default.",
+          "properties": {
+            "checked": {
+              "default": false,
+              "type": "boolean"
+            },
+            "disabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "value",
+            "label"
+          ],
+          "type": "object"
+        },
+        "AskFormStatus": {
+          "oneOf": [
+            {
+              "enum": [
+                "answered"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "timed_out",
+              "description": "The form timed out (`details.timedOut`); omp submitted the defaults.",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "The ask failed or was cancelled (an error result or empty details).",
+              "type": "string"
+            }
+          ]
+        },
         "AskQuestion": {
           "description": "One question of an omp `ask` tool call.",
           "properties": {
@@ -15490,7 +15787,23 @@
           "description": "The newest `ask` still waiting for an answer.",
           "properties": {
             "answerable": {
-              "description": "One single-select question with at least one option, and a caller that\nmay answer it (guests never may).",
+              "description": "One single-select question with at least one option, and a caller that\nmay answer it. Always false for an HTML form ask.",
+              "type": "boolean"
+            },
+            "form": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AskForm"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "An HTML form ask (omp ≥ 18.18.3); `questions` then lists one\ncompatibility entry per choice field."
+            },
+            "form_answerable": {
+              "default": false,
+              "description": "herdr can drive this form through `agent.answer_form` for this caller.",
               "type": "boolean"
             },
             "id": {
@@ -16473,6 +16786,30 @@
               "required": [
                 "type",
                 "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.answer_form`: `answered` once the tool result matched the\ntyped answers; `answers` is the result's `details.answers` (empty when\nno result arrived in time).",
+              "properties": {
+                "answers": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AskFormAnswer"
+                  },
+                  "type": "array"
+                },
+                "status": {
+                  "$ref": "#/schemas/success_response/$defs/AgentAnswerStatus"
+                },
+                "type": {
+                  "const": "ask_form_answered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "status",
+                "answers"
               ],
               "type": "object"
             },
@@ -18382,6 +18719,11 @@
               "description": "`herdr api-bridge --multi` forwards newline-delimited requests over one\nlong-lived bridge process instead of one process per request.",
               "type": "boolean"
             },
+            "ask_form": {
+              "default": false,
+              "description": "Parses omp HTML form asks (`form` on transcript asks and `pending_ask`)\nand serves `agent.answer_form`.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
@@ -18858,7 +19200,7 @@
               "type": "object"
             },
             {
-              "description": "An `ask` tool call; `id` is the tool call id, `answer` the selection once made.",
+              "description": "An `ask` tool call; `id` is the tool call id, `answer` the selection once made.\nFor an HTML form ask, `form` holds the form, `questions`/`answer` stay as a\ncompatibility view and `form_answer`/`form_status` arrive with the result.",
               "properties": {
                 "answer": {
                   "items": {
@@ -18867,6 +19209,35 @@
                   "type": [
                     "array",
                     "null"
+                  ]
+                },
+                "form": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AskForm"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "form_answer": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AskFormAnswer"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "form_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AskFormStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
                   ]
                 },
                 "id": {

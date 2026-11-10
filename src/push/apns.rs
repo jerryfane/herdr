@@ -58,13 +58,24 @@ pub(super) fn payload_body(notification: &PushNotification) -> String {
         payload["gram"] = serde_json::Value::Bool(true);
     }
     // An answerable question (herdr#309): the phone shows the options as
-    // notification actions and answers with `agent.answer`.
+    // notification actions and answers with `agent.answer`. A form ask
+    // offers one "Accept recommendations" action (`agent.answer_form` with
+    // `values: {}`) when every required field has a default.
     if let Some(ask) = &notification.ask {
+        let (body, category) = match &ask.form {
+            Some(form) => (
+                super::ask::form_body(form),
+                form.accept_defaults.then_some(super::ask::FORM_CATEGORY),
+            ),
+            None => (ask.question.clone(), Some(super::ask::CATEGORY)),
+        };
         payload["aps"]["alert"] = serde_json::json!({
             "title": format!("{} asks", ask.agent),
-            "body": ask.question,
+            "body": body,
         });
-        payload["aps"]["category"] = serde_json::json!(super::ask::CATEGORY);
+        if let Some(category) = category {
+            payload["aps"]["category"] = serde_json::json!(category);
+        }
         payload["aps"]["mutable-content"] = serde_json::json!(1);
         payload["herdr_ask"] = serde_json::json!(ask);
     }
@@ -390,6 +401,7 @@ mod tests {
             ask_id: "call_7".into(),
             question: "Ship it?".into(),
             options: vec!["Yes".into(), "No".into()],
+            form: None,
         });
         let payload: serde_json::Value =
             serde_json::from_str(&payload_body(&notification)).unwrap();

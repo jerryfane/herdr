@@ -124,6 +124,8 @@ struct PeerRouteState {
     identity_validation_required: bool,
     /// The peer's latest poll advertised `rename_preconditions`.
     rename_preconditions: AtomicBool,
+    /// The peer's latest poll advertised `ask_form`.
+    ask_form: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -143,6 +145,7 @@ impl PeerRoute {
                 identity_validated: AtomicBool::new(!requires_identity_validation),
                 identity_validation_required: requires_identity_validation,
                 rename_preconditions: AtomicBool::new(false),
+                ask_form: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -182,6 +185,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.rename_preconditions),
             Ordering::Release,
         );
+        self.state.ask_form.store(
+            capabilities.is_some_and(|capabilities| capabilities.ask_form),
+            Ordering::Release,
+        );
     }
 
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
@@ -195,6 +202,12 @@ impl PeerRoute {
     /// unpolled peer, or one whose boot changed since its last poll, is not.
     pub(crate) fn rename_preconditions(&self) -> bool {
         self.state.rename_preconditions.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to serve `agent.answer_form`. An unpolled
+    /// peer, or one whose boot changed since its last poll, is not.
+    pub(crate) fn ask_form(&self) -> bool {
+        self.state.ask_form.load(Ordering::Acquire)
     }
 
     /// The peer's current presentation, or the bare alias as its label when the
@@ -296,6 +309,7 @@ impl PeerRoute {
             self.state
                 .rename_preconditions
                 .store(false, Ordering::Release);
+            self.state.ask_form.store(false, Ordering::Release);
         }
         *current = Some(remote_boot_id.to_owned());
     }

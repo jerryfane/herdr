@@ -518,6 +518,36 @@ pub enum AgentAnswerStatus {
     SentUnconfirmed,
 }
 
+/// `agent.answer_form` — answer an omp agent's pending HTML form `ask` by
+/// driving its terminal form, then confirm the answers from the tool result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAnswerFormParams {
+    /// Agent name or pane id, resolved like `agent.read`.
+    pub target: String,
+    /// The pending ask's tool call id, from `agent.transcript`'s `pending_ask`.
+    pub ask_id: String,
+    /// Answers by field name. A field left out keeps its default (its checked
+    /// or selected options, or its prefilled text); `{}` accepts every
+    /// recommendation.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, AskFormValue>,
+}
+
+/// One field's answer in `agent.answer_form`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AskFormValue {
+    /// Choice fields: the chosen option values (a radio group or single
+    /// select takes at most one; none when answering with `other`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    /// Choice fields with `other`: the free text typed into Other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+    /// Text fields: the whole answer, replacing any prefilled text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 // `parked_work` holds arbitrary JSON (`serde_json::Value`), which is `PartialEq`
 // but not `Eq`, so `AgentInfo` can no longer derive `Eq`. Nothing keys a
 // map/set on it, so only the derive is dropped.

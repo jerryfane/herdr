@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
-use crate::api::answer::answer_agent;
+use crate::api::answer::{answer_agent, answer_agent_form};
 use crate::api::client::{
     parse_response_value, ApiClient, ApiClientError, ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
@@ -218,6 +218,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         server_update: true,
         turn_origin: true,
         rename_preconditions: true,
+        ask_form: true,
     })
 }
 
@@ -1854,6 +1855,10 @@ fn handle_principal_connection(
             let response = answer_agent(request_id.clone(), params, api_tx);
             finish_wait_response(&mut stream, Some(response), &request_id, method, changes_ui)
         }
+        Method::AgentAnswerForm(params) => {
+            let response = answer_agent_form(request_id.clone(), params, api_tx);
+            finish_wait_response(&mut stream, Some(response), &request_id, method, changes_ui)
+        }
         Method::PaneWaitForOutput(params) => {
             let response =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
@@ -1953,6 +1958,7 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // `agent.answer` drives the selector on the pane's own daemon, which is
         // the one that can read the agent's session file.
         Method::AgentAnswer(params) => Some(&mut params.target),
+        Method::AgentAnswerForm(params) => Some(&mut params.target),
         // Admin methods that name a pane/agent. `federation.rs` classifies all of these
         // as AllowedAt(Admin) - remote admin is INTENDED - but without an arm here they
         // fall through to `_ => None`, dispatch locally, and fail to resolve an
@@ -2075,6 +2081,30 @@ fn maybe_route_to_peer(
                 request_id,
                 method,
                 "precondition_unsupported",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
+    // A peer that does not advertise `ask_form` has no `agent.answer_form`;
+    // refuse here with the code an app already handles.
+    if matches!(&request.method, Method::AgentAnswerForm(_)) && !peer_target.ask_form() {
+        let response = ErrorResponse {
+            id: request_id.to_owned(),
+            error: ErrorBody {
+                code: "ask_unsupported".into(),
+                message: format!(
+                    "machine {alias} has not advertised ask_form, so it cannot answer HTML form asks; update Herdr there"
+                ),
+            },
+        };
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "ask_unsupported",
                 changes_ui,
             ),
             Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
@@ -3678,6 +3708,7 @@ mod tests {
                 server_update: false,
                 turn_origin: false,
                 rename_preconditions: false,
+                ask_form: false,
             }),
             None,
             None,
@@ -5132,6 +5163,7 @@ mod federation_tests {
             ("agent.prompt", AllowedAt(Interact)),
             ("agent.wait", AllowedAt(Observe)),
             ("agent.answer", AllowedAt(Admin)),
+            ("agent.answer_form", AllowedAt(Admin)),
             ("pane.copy_motion", Denied),
             ("pane.copy_search", Denied),
             ("pane.edit_scrollback", Denied),
@@ -7103,6 +7135,10 @@ mod federation_tests {
             (
                 "agent.answer",
                 serde_json::json!({ "target": "remote/w1:p1", "ask_id": "call_1", "option": "A" }),
+            ),
+            (
+                "agent.answer_form",
+                serde_json::json!({ "target": "remote/w1:p1", "ask_id": "call_1", "values": {} }),
             ),
             (
                 "pane.send_text",

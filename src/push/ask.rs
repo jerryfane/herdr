@@ -13,12 +13,17 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{PushKind, PushNotification};
-use crate::api::schema::PendingAsk;
+use crate::api::schema::{AskForm, AskFormField, AskFormFieldKind, PendingAsk};
 
 /// Notification actions the phone can show for one alert.
 pub(crate) const MAX_OPTIONS: usize = 4;
 /// The APNs alert category the phone registers the answer actions under.
 pub(super) const CATEGORY: &str = "herdr.ask";
+/// The category of a form ask whose recommendations can be accepted from the
+/// notification: one action, `accept_defaults` ("Accept recommendations").
+pub(super) const FORM_CATEGORY: &str = "herdr.ask_form";
+/// A form intro at most this long is the alert body itself.
+const FORM_INTRO_BODY_CHARS: usize = 120;
 const QUESTION_MAX_CHARS: usize = 240;
 const AGENT_MAX_CHARS: usize = 60;
 /// Labels travel verbatim (each is an `agent.answer` option), so an ask whose
@@ -47,7 +52,32 @@ pub(crate) struct PushAsk {
     pub machine_id: String,
     pub ask_id: String,
     pub question: String,
+    /// The options to offer as actions; always empty for a form ask.
     pub options: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<PushAskForm>,
+}
+
+/// What a form ask's alert says about the form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PushAskForm {
+    /// Answerable fields.
+    pub count: usize,
+    pub intro: Option<String>,
+    /// Every required field has a default, so `values: {}` is a valid answer.
+    pub accept_defaults: bool,
+}
+
+/// The alert body of a form ask: its intro when short, else a count.
+pub(super) fn form_body(form: &PushAskForm) -> String {
+    match &form.intro {
+        Some(intro) if intro.chars().count() <= FORM_INTRO_BODY_CHARS => intro.clone(),
+        _ => format!(
+            "{} {} · recommended preselected",
+            form.count,
+            if form.count == 1 { "choice" } else { "choices" }
+        ),
+    }
 }
 
 /// Fill `ask` on every NeedsInput alert whose agent has a pending ask that a
@@ -98,6 +128,9 @@ fn lookup(path: &Path, pause: Duration) -> Option<PendingAsk> {
 }
 
 fn push_ask(pending: &PendingAsk, agent: &str, pane_id: &str, machine_id: &str) -> Option<PushAsk> {
+    if let Some(form) = &pending.form {
+        return push_form_ask(pending, form, agent, pane_id, machine_id);
+    }
     let question = crate::api::answer::drivable_question(pending)?;
     let options_bytes: usize = question.options.iter().map(String::len).sum();
     if question.options.len() > MAX_OPTIONS || options_bytes > OPTIONS_MAX_BYTES {
@@ -110,6 +143,48 @@ fn push_ask(pending: &PendingAsk, agent: &str, pane_id: &str, machine_id: &str) 
         ask_id: pending.id.clone(),
         question: super::sanitized_notification_text(&question.question, QUESTION_MAX_CHARS)?,
         options: question.options.clone(),
+        form: None,
+    })
+}
+
+fn push_form_ask(
+    pending: &PendingAsk,
+    form: &AskForm,
+    agent: &str,
+    pane_id: &str,
+    machine_id: &str,
+) -> Option<PushAsk> {
+    let has_default = |field: &AskFormField| match field.kind {
+        AskFormFieldKind::Choice => field.options.iter().any(|option| option.checked),
+        AskFormFieldKind::Text => field.value.is_some(),
+    };
+    let accept_defaults = pending.form_answerable
+        && form
+            .fields
+            .iter()
+            .all(|field| !field.required || has_default(field));
+    let intro = form
+        .intro
+        .as_deref()
+        .and_then(|intro| super::sanitized_notification_text(intro, QUESTION_MAX_CHARS));
+    let question = intro.clone().or_else(|| {
+        form.fields
+            .iter()
+            .find_map(|field| field.title.as_deref())
+            .and_then(|title| super::sanitized_notification_text(title, QUESTION_MAX_CHARS))
+    })?;
+    Some(PushAsk {
+        agent: super::sanitized_notification_text(agent, AGENT_MAX_CHARS)?,
+        pane_id: pane_id.to_owned(),
+        machine_id: machine_id.to_owned(),
+        ask_id: pending.id.clone(),
+        question,
+        options: Vec::new(),
+        form: Some(PushAskForm {
+            count: form.fields.len(),
+            intro,
+            accept_defaults,
+        }),
     })
 }
 
@@ -208,6 +283,7 @@ mod tests {
                     "Option 2".into(),
                     "Option 3".into(),
                 ],
+                form: None,
             })
         );
     }
@@ -241,5 +317,56 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(batch[0].ask, None);
+    }
+
+    #[test]
+    fn a_form_ask_carries_its_summary_and_accept_action_only_when_defaults_cover_required() {
+        let pending = |html: &str| {
+            let parsed = crate::agent_transcript::ask_form::parse(html);
+            let wire = parsed.to_wire();
+            PendingAsk {
+                id: "f1".into(),
+                questions: parsed.compat_questions(&wire),
+                answerable: false,
+                form: Some(wire),
+                form_answerable: parsed.drivable(),
+            }
+        };
+        let defaults = pending(
+            r#"<form><p>Two picks.</p><input type="radio" name="a" value="1" checked required>
+            <input type="radio" name="a" value="2"><input name="note"></form>"#,
+        );
+        let ask = push_ask(&defaults, "jarvis", "w1-2", "m1").unwrap();
+        assert_eq!(ask.question, "Two picks.");
+        assert!(ask.options.is_empty());
+        let form = ask.form.clone().unwrap();
+        assert_eq!((form.count, form.accept_defaults), (2, true));
+        assert_eq!(form_body(&form), "Two picks.");
+        let mut notification = alert(PushKind::NeedsInput, None);
+        notification.ask = Some(ask);
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::super::apns::payload_body(&notification)).unwrap();
+        assert_eq!(payload["aps"]["category"], FORM_CATEGORY);
+        assert_eq!(payload["aps"]["alert"]["body"], "Two picks.");
+        assert_eq!(payload["herdr_ask"]["form"]["accept_defaults"], true);
+        assert_eq!(payload["herdr_ask"]["ask_id"], "f1");
+
+        let missing = pending(
+            r#"<form><fieldset><legend>Who?</legend><input name="who" required></fieldset></form>"#,
+        );
+        let ask = push_ask(&missing, "jarvis", "w1-2", "m1").unwrap();
+        assert_eq!(ask.question, "Who?");
+        let form = ask.form.clone().unwrap();
+        assert!(!form.accept_defaults);
+        assert_eq!(form_body(&form), "1 choice · recommended preselected");
+        let mut notification = alert(PushKind::NeedsInput, None);
+        notification.ask = Some(ask);
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::super::apns::payload_body(&notification)).unwrap();
+        assert_eq!(
+            payload["aps"].get("category"),
+            None,
+            "no action without defaults"
+        );
     }
 }
