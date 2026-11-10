@@ -189,8 +189,8 @@ prefilled</textarea>
         error(2, text("abc")),
         Some("Needs at least 5 characters".into())
     );
-    assert_eq!(error(3, text("abcd")), Some("Must match [A-Z]{3}".into()));
-    assert_eq!(error(3, text("ABC")), None);
+    // `pattern` is omp's to check (see `patterns_are_left_to_omp`).
+    assert_eq!(error(3, text("abcd")), None);
     assert_eq!(
         form.default_value(field(1)),
         Some(FormValue::Number(3.0)),
@@ -307,21 +307,22 @@ fn entities_decode_as_omps_parser_does() {
     assert_eq!(labels, ["Go &rarr; & é AB &bogus;", "B"]);
 }
 
-/// #392 F7: `pattern` is an ECMAScript `v`-flag regex, whose `\W` is ASCII.
+/// #392 F7: `pattern` is omp's to check (an ECMAScript `v`-flag regex,
+/// read back from its error row after Submit); herdr enforces none, so it
+/// never refuses an answer omp would take.
 #[test]
-fn patterns_follow_ecmascript_semantics() {
-    let form =
-        parse(r#"<form><input name="w" pattern="\W+"><input name="bad" pattern="(?<x"></form>"#);
-    assert_eq!(field_error(&form.fields[0], text("é").as_ref()), None);
-    assert_eq!(
-        field_error(&form.fields[0], text("a").as_ref()),
-        Some("Must match \\W+".into())
+fn patterns_are_left_to_omp() {
+    let form = parse(
+        r#"<form><input name="w" pattern="\W+"><input name="q" pattern="\q"><input name="b" pattern="[^\b]+"></form>"#,
     );
-    // A pattern JS cannot compile is ignored, as omp does.
-    assert_eq!(
-        field_error(&form.fields[1], text("anything").as_ref()),
-        None
-    );
+    for (field, answer) in [(0, "é"), (0, "a"), (1, "hello"), (2, "b")] {
+        assert_eq!(
+            field_error(&form.fields[field], text(answer).as_ref()),
+            None,
+            "{answer}"
+        );
+    }
+    assert_eq!(form.to_wire().fields[1].pattern.as_deref(), Some("\\q"));
 }
 
 /// #392 F8: a field that submits nothing reads the hidden input of its name.
@@ -369,4 +370,94 @@ fn compat_questions_keep_each_fields_own_title() {
         .map(|question| question.question)
         .collect();
     assert_eq!(titles, ["Primary", "Backup"]);
+}
+
+/// #392 N3: an unterminated tag after multibyte text does not panic, and the
+/// first form still parses.
+#[test]
+fn an_unterminated_tag_after_multibyte_text_parses() {
+    let form = parse("<form><input name=x></form><spané");
+    assert_eq!(form.fields.len(), 1);
+    assert_eq!(form.fields[0].name, "x");
+}
+
+/// #392 N3: the parser never panics. Seeded random edits of the enyo form
+/// (inserted markup characters, multibyte text, deletions, truncation at
+/// every kind of character) all parse.
+#[test]
+fn the_parser_never_panics_on_mutated_input() {
+    let args: Value = serde_json::from_str(ENYO_ARGS).unwrap();
+    let base: Vec<char> = form_html(Some(&args)).unwrap().chars().collect();
+    const PIECES: [&str; 18] = [
+        "<",
+        ">",
+        "</",
+        "/>",
+        "\"",
+        "'",
+        "=",
+        "&",
+        "&#",
+        "&#x",
+        ";",
+        "<!--",
+        "<!",
+        "<?",
+        "é",
+        "😀",
+        "\u{85}",
+        "<![CDATA[",
+    ];
+    let mut seed: u64 = 0x05ee_d392;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    for _ in 0..3000 {
+        let mut chars = base.clone();
+        for _ in 0..1 + next(6) {
+            let at = next(chars.len() + 1);
+            match next(4) {
+                0 => {
+                    let piece = PIECES[next(PIECES.len())];
+                    chars.splice(at..at, piece.chars());
+                }
+                1 if at < chars.len() => {
+                    let end = (at + 1 + next(8)).min(chars.len());
+                    chars.drain(at..end);
+                }
+                2 => chars.truncate(at),
+                _ => chars.insert(at, char::from_u32(next(0x3000) as u32).unwrap_or('x')),
+            }
+        }
+        let html: String = chars.into_iter().collect();
+        let parsed = std::panic::catch_unwind(|| {
+            let form = parse(&html);
+            let wire = form.to_wire();
+            form.compat_questions(&wire);
+        });
+        assert!(parsed.is_ok(), "parse panicked on {html:?}");
+    }
+}
+
+/// #392 N4: `textContent` includes a template's content, as omp's DOM does.
+#[test]
+fn option_text_includes_template_content() {
+    let form = parse(
+        r#"<form><select name="s"><option>before<template>inside</template>after</option></select></form>"#,
+    );
+    let option = &choice(&form.fields[0]).options[0];
+    assert_eq!(
+        (option.value.as_str(), option.label.as_str()),
+        ("beforeinsideafter", "beforeinsideafter")
+    );
+}
+
+/// #392 N5: attributes split on ECMAScript whitespace, which leaves U+0085 out.
+#[test]
+fn attributes_split_on_ecmascript_whitespace() {
+    let form = parse("<form><input name=account\u{85}id value=ok></form>");
+    assert_eq!(form.fields[0].name, "account\u{85}id");
 }

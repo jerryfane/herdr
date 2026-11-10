@@ -2243,7 +2243,11 @@ fn form_results_map_to_answered_timed_out_and_cancelled() {
     let mut session = form_session("form-result");
     session.result("f1", "ask", false, json!({"answers": answers}));
     assert_eq!(
-        form_ask_result(&session.path, "f1").unwrap().unwrap().len(),
+        form_ask_outcome(&session.path, "f1")
+            .unwrap()
+            .unwrap()
+            .answers
+            .len(),
         2
     );
 }

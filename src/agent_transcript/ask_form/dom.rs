@@ -93,7 +93,7 @@ impl<'a> NodeRef<'a> {
     }
 
     /// Child nodes. A `<template>`'s children are its content fragment,
-    /// which the DOM does not list as children.
+    /// which the DOM does not list as children (selectors never see them).
     pub(crate) fn children(&self) -> impl Iterator<Item = NodeRef<'a>> + use<'a> {
         let this = *self;
         let template = matches!(self.value(), Node::Element(element) if element.name == "template");
@@ -105,14 +105,36 @@ impl<'a> NodeRef<'a> {
         children.iter().map(move |&child| this.at(child))
     }
 
-    /// This node and its descendants in document order.
+    /// This node and its descendants in document order, as selectors see
+    /// them (template content left out).
     pub(crate) fn descendants(&self) -> impl Iterator<Item = NodeRef<'a>> + use<'a> {
+        self.walk(false)
+    }
+
+    /// `textContent`: the text of every descendant, template content
+    /// included (a template's `textContent` is its content's).
+    pub(crate) fn text_content(&self) -> String {
+        self.walk(true)
+            .filter_map(|node| node.value().as_text().map(String::as_str))
+            .collect()
+    }
+
+    fn walk(&self, templates: bool) -> impl Iterator<Item = NodeRef<'a>> + use<'a> {
         let mut stack = vec![*self];
         std::iter::from_fn(move || {
             let node = stack.pop()?;
-            let mut children: Vec<NodeRef<'a>> = node.children().collect();
-            children.reverse();
-            stack.extend(children);
+            let children: &'a [usize] = if templates {
+                &node.document.nodes[node.id].children
+            } else {
+                let template =
+                    matches!(node.value(), Node::Element(element) if element.name == "template");
+                if template {
+                    &[]
+                } else {
+                    &node.document.nodes[node.id].children
+                }
+            };
+            stack.extend(children.iter().rev().map(|&child| node.at(child)));
             Some(node)
         })
     }
@@ -328,9 +350,10 @@ fn named_entity(name: &str) -> Option<&'static str> {
     find(name).or_else(|| find(&name.to_lowercase()))
 }
 
-/// JS `\s`.
-fn is_space(ch: char) -> bool {
-    ch.is_whitespace() || ch == '\u{feff}'
+/// JS `\s` (WhiteSpace and LineTerminator): Rust's `is_whitespace` less
+/// U+0085, which ECMAScript does not count, plus U+FEFF.
+pub(crate) fn is_space(ch: char) -> bool {
+    (ch.is_whitespace() && ch != '\u{85}') || ch == '\u{feff}'
 }
 
 /// `decodeEntities`: the named table, then valid numeric references;
@@ -407,19 +430,22 @@ fn entity_at(tail: &str) -> Option<(usize, String)> {
 
 /// `findTagEnd`: the `>` closing a tag, skipping quoted runs; the last index
 /// when there is none.
-fn find_tag_end(html: &str, start: usize) -> usize {
+/// Returns where the tag's text ends and where parsing resumes: at the `>`
+/// and just past it; without one, JS's `html.length - 1` (the start of the
+/// last character) and the end of input.
+fn find_tag_end(html: &str, start: usize) -> (usize, usize) {
     let mut quote = None;
-    for (offset, ch) in html[start.min(html.len())..].char_indices() {
+    for (offset, ch) in html.get(start..).unwrap_or_default().char_indices() {
         match quote {
             Some(open) if ch == open => quote = None,
             Some(_) => {}
             None if ch == '"' || ch == '\'' => quote = Some(ch),
-            None if ch == '>' => return start + offset,
+            None if ch == '>' => return (start + offset, start + offset + 1),
             None => {}
         }
     }
-    // `html.length - 1`: the tag swallows everything but the last character.
-    html.char_indices().last().map_or(0, |(index, _)| index)
+    let last = html.char_indices().last().map_or(0, |(index, _)| index);
+    (last, html.len())
 }
 
 struct StartTag {
@@ -575,7 +601,7 @@ pub(crate) fn parse_document(html: &str) -> Document {
             continue;
         }
         if next == Some('/') {
-            let end = find_tag_end(html, index + 2);
+            let (end, resume) = find_tag_end(html, index + 2);
             let closing = html
                 .get(index + 2..end.max(index + 2))
                 .unwrap_or_default()
@@ -588,7 +614,7 @@ pub(crate) fn parse_document(html: &str) -> Document {
                 stack.truncate(position);
             }
             parent = stack.last().copied().unwrap_or(0);
-            index = end + 1;
+            index = resume;
             continue;
         }
         if next == Some('!') || next == Some('?') {
@@ -597,7 +623,7 @@ pub(crate) fn parse_document(html: &str) -> Document {
                 .map_or(html.len(), |end| index + 2 + end + 1);
             continue;
         }
-        let end = find_tag_end(html, index + 1);
+        let (end, resume) = find_tag_end(html, index + 1);
         let Some(tag) =
             parse_start_tag(html.get(index + 1..end.max(index + 1)).unwrap_or_default())
         else {
@@ -625,7 +651,7 @@ pub(crate) fn parse_document(html: &str) -> Document {
                 svg,
             }),
         );
-        index = end + 1;
+        index = resume;
         if (name == "script" || name == "style") && !self_closing {
             let close = find_raw_close(html, index.min(html.len()), &name);
             let raw_end = close.map_or(html.len(), |(start, _)| start);

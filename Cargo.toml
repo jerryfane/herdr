@@ -69,11 +69,6 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 # Verifies the minisign signature on the preview update manifest (`src/update/verify.rs`).
 # Zero dependencies; legacy (non-prehashed) signatures are refused by the caller.
 minisign-verify = "0.3"
-# ECMAScript regular expressions for the `pattern` of omp HTML form fields
-# (`src/agent_transcript/ask_form.rs`): omp checks them as JS `v`-flag regexes, whose
-# classes (`\w`, `\d`, `\b`) are ASCII where the `regex` crate's are Unicode. Its only
-# dependencies (memchr, hashbrown) are already in the tree.
-regress = "0.12"
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }

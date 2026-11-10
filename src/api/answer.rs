@@ -131,36 +131,59 @@ fn answer_form(
         pause: timing.selector_pause,
     };
     form::drive(&mut pane, &parsed, &plan)?;
-    // Submit is out: from here on a retry must not drive the form again.
+    // Submit is out: from here on a retry must not drive the form again,
+    // unless omp refuses the submission and keeps the form open.
     claim.keep();
-    Ok(confirm_form(
+    let outcome = confirm_form(
+        &mut pane,
         &session_path,
         &params.ask_id,
-        &plan.expected,
+        &parsed,
+        &plan,
         timing,
-    ))
+    );
+    if outcome.is_err() {
+        claim.release();
+    }
+    outcome
 }
 
-/// Wait for the form ask's result and compare its answers with the ones the
-/// keys should have produced.
+/// Wait for the form ask's result and compare the data omp recorded with
+/// the data the plan asked for, by value. While waiting, a validation error
+/// omp shows under a field (its own `pattern` and URL checks) means it
+/// refused the submission: that is `ask_form_invalid`, and the form stays
+/// open in the terminal with what was typed.
 fn confirm_form(
+    pane: &mut AppPane<'_>,
     path: &Path,
     ask_id: &str,
-    expected: &[AskFormAnswer],
+    parsed: &crate::agent_transcript::ask_form::ParsedForm,
+    plan: &form::Plan,
     timing: Timing,
-) -> (AgentAnswerStatus, Vec<AskFormAnswer>) {
+) -> Result<(AgentAnswerStatus, Vec<AskFormAnswer>), ErrorBody> {
     let deadline = Instant::now() + timing.confirm_timeout;
     loop {
-        if let Ok(Some(answers)) = crate::agent_transcript::form_ask_result(path, ask_id) {
-            let status = if answers == expected {
+        if let Ok(Some(result)) = crate::agent_transcript::form_ask_outcome(path, ask_id) {
+            let answered = !result.timed_out
+                && result
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| form::submission_matches(&plan.expected, data));
+            let status = if answered {
                 AgentAnswerStatus::Answered
             } else {
                 AgentAnswerStatus::SentUnconfirmed
             };
-            return (status, answers);
+            return Ok((status, result.answers));
+        }
+        if let Some((name, message)) = form::FormPane::read_screen(pane)
+            .ok()
+            .and_then(|screen| form::submit_error(&screen, parsed))
+        {
+            return Err(error("ask_form_invalid", format!("{name}: {message}")));
         }
         if Instant::now() >= deadline {
-            return (AgentAnswerStatus::SentUnconfirmed, Vec::new());
+            return Ok((AgentAnswerStatus::SentUnconfirmed, Vec::new()));
         }
         std::thread::sleep(timing.confirm_poll);
     }
@@ -323,6 +346,12 @@ impl Claim {
 
     fn keep(&mut self) {
         self.keep = true;
+    }
+
+    /// Undo [`Claim::keep`]: the submission was refused, so a retry may drive
+    /// the form again.
+    fn release(&mut self) {
+        self.keep = false;
     }
 }
 

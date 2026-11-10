@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::agent_transcript::ask_form::parse;
+use crate::agent_transcript::ask_form::{parse, Block};
 
 const FORM: &str = r#"<form><p>Intro</p>
 <fieldset><legend>Database</legend>
@@ -31,10 +31,6 @@ fn options(list: &[&str]) -> AskFormValue {
         options: Some(list.iter().map(|value| (*value).to_owned()).collect()),
         ..AskFormValue::default()
     }
-}
-
-fn keys(list: &[&'static str]) -> Action {
-    Action::Keys(list.to_vec())
 }
 
 #[test]
@@ -72,124 +68,6 @@ fn stops_follow_dialog_ts() {
             Stop::Select { field: 2 },
             Stop::Text { field: 3 },
             Stop::Submit,
-        ]
-    );
-}
-
-#[test]
-fn accepting_the_recommendations_tabs_through_and_submits() {
-    let form = parse(FORM);
-    let plan = plan(&form, &BTreeMap::new()).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["tab", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    let answers: Vec<&str> = plan
-        .expected
-        .iter()
-        .map(|answer| answer.answer.as_str())
-        .collect();
-    assert_eq!(answers, ["Postgres", "CI", "US", "draft"]);
-}
-
-#[test]
-fn radio_moves_down_over_enabled_options_and_enters() {
-    let form = parse(FORM);
-    let plan = plan(&form, &values(&[("db", options(&["sq"]))])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["down", "down", "enter", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    assert_eq!(plan.expected[0].answer, "SQLite");
-}
-
-#[test]
-fn radio_other_types_on_the_other_row() {
-    let form = parse(FORM);
-    let value = AskFormValue {
-        options: Some(Vec::new()),
-        other: Some(" CockroachDB ".into()),
-        text: None,
-    };
-    let plan = plan(&form, &values(&[("db", value)])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["down", "down", "down"]),
-            Action::Text("CockroachDB".into()),
-            keys(&["enter", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    assert_eq!(plan.expected[0].answer, "Other: CockroachDB");
-}
-
-#[test]
-fn checkbox_toggles_only_the_differences_then_tabs() {
-    let form = parse(FORM);
-    let value = AskFormValue {
-        options: Some(vec!["nx".into()]),
-        other: Some("just".into()),
-        text: None,
-    };
-    let plan = plan(&form, &values(&[("tools", value)])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["tab", "space", "down", "down", "space", "down"]),
-            Action::Text("just".into()),
-            keys(&["tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    assert_eq!(plan.expected[1].answer, "Nix, Other: just");
-}
-
-#[test]
-fn select_steps_over_disabled_options_with_arrows() {
-    let form = parse(FORM);
-    let plan = plan(&form, &values(&[("region", options(&["ap"]))])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["tab", "tab", "left", "right", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    assert_eq!(plan.expected[2].answer, "AP");
-}
-
-#[test]
-fn text_clears_the_prefill_and_types() {
-    let form = parse(FORM);
-    let value = AskFormValue {
-        text: Some("ship friday".into()),
-        ..AskFormValue::default()
-    };
-    let plan = plan(&form, &values(&[("notes", value)])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["tab", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("ship friday".into()),
-            keys(&["tab", "enter"]),
         ]
     );
 }
@@ -246,34 +124,648 @@ fn the_screen_check_wants_the_untouched_form() {
     assert!(!at_start("$ omp\n> ", &form), "no form on screen");
 }
 
+fn screen(rows: &[&str]) -> String {
+    rows.join("\n")
+}
+
+fn text(value: &str) -> AskFormValue {
+    AskFormValue {
+        text: Some(value.into()),
+        ..AskFormValue::default()
+    }
+}
+
+/// A model of omp's terminal form (`dialog.ts` with its `Input` and
+/// `Editor`), drawn as omp draws it, wrapping labels at `width`.
+struct Dialog {
+    form: ParsedForm,
+    stops: Vec<Stop>,
+    focus: usize,
+    checked: Vec<Vec<usize>>,
+    other: Vec<String>,
+    /// Text fields: lines and caret (line, column in chars).
+    lines: Vec<Vec<String>>,
+    caret: Vec<(usize, usize)>,
+    width: usize,
+    keys: Vec<String>,
+    submitted: Option<Vec<(String, Option<FormValue>)>>,
+    errors: Vec<Option<String>>,
+    /// omp's own Submit check, standing in for `pattern`: (field, message).
+    refuse: Option<(usize, String)>,
+    /// Keys after this many are swallowed (someone else holds the form).
+    frozen_after: Option<usize>,
+}
+
+impl Dialog {
+    fn new(html: &str) -> Self {
+        let form = parse(html);
+        let stops = stops(&form);
+        let count = form.fields.len();
+        let mut dialog = Self {
+            stops,
+            focus: 0,
+            checked: vec![Vec::new(); count],
+            other: vec![String::new(); count],
+            lines: vec![Vec::new(); count],
+            caret: vec![(0, 0); count],
+            width: 200,
+            keys: Vec::new(),
+            submitted: None,
+            errors: vec![None; count],
+            refuse: None,
+            frozen_after: None,
+            form,
+        };
+        for (index, field) in dialog.form.fields.iter().enumerate() {
+            match &field.kind {
+                FieldKind::Choice(choice) => dialog.checked[index] = choice.initial_checked(),
+                // omp ≥ 18.18.6 opens prefilled fields with the caret at the start.
+                FieldKind::Text(input) => {
+                    dialog.lines[index] = input.value.split('\n').map(str::to_owned).collect()
+                }
+            }
+        }
+        dialog
+    }
+
+    /// omp 18.18.3: single-line inputs open with the caret at the end.
+    fn caret_at_end(mut self) -> Self {
+        for (index, field) in self.form.fields.iter().enumerate() {
+            if let FieldKind::Text(input) = &field.kind {
+                if !input.multiline {
+                    self.caret[index] = (0, self.lines[index][0].chars().count());
+                }
+            }
+        }
+        self
+    }
+
+    fn field_of(&self) -> Option<usize> {
+        self.stops[self.focus].field()
+    }
+
+    fn move_stop(&mut self, delta: isize) {
+        self.focus = (self.focus as isize + delta).clamp(0, self.stops.len() as isize - 1) as usize;
+    }
+
+    fn move_field(&mut self) {
+        let field = self.field_of();
+        while self.focus + 1 < self.stops.len() && self.stops[self.focus].field() == field {
+            self.focus += 1;
+        }
+    }
+
+    fn choice(&self, field: usize) -> &Choice {
+        self.form.fields[field].choice().unwrap()
+    }
+
+    fn press(&mut self, key: &str) {
+        if self
+            .frozen_after
+            .is_some_and(|limit| self.keys.len() >= limit)
+        {
+            return;
+        }
+        self.keys.push(key.to_owned());
+        if key == "tab" {
+            self.move_field();
+            return;
+        }
+        match self.stops[self.focus] {
+            Stop::Text { field } => self.text_key(field, key),
+            Stop::Select { field } => match key {
+                "up" => self.move_stop(-1),
+                "down" => self.move_stop(1),
+                "left" | "right" => {
+                    let choice = self.choice(field).clone();
+                    let current = self.checked[field]
+                        .first()
+                        .copied()
+                        .map_or(-1, |c| c as isize);
+                    let delta: isize = if key == "right" { 1 } else { -1 };
+                    let mut index = current + delta;
+                    while index >= 0 && (index as usize) < choice.options.len() {
+                        if !choice.options[index as usize].disabled {
+                            self.checked[field] = vec![index as usize];
+                            break;
+                        }
+                        index += delta;
+                    }
+                }
+                "enter" => self.move_field(),
+                _ => {}
+            },
+            Stop::Other { field } => match key {
+                "up" => self.move_stop(-1),
+                "down" => self.move_stop(1),
+                "enter" => {
+                    if !self.choice(field).multi && !self.other[field].trim().is_empty() {
+                        self.checked[field].clear();
+                    }
+                    self.move_field();
+                }
+                // Other is an `Input` whose caret follows typing: at the end.
+                "ctrl+u" => self.other[field].clear(),
+                _ => {}
+            },
+            Stop::Option { field, option } => match key {
+                "up" => self.move_stop(-1),
+                "down" => self.move_stop(1),
+                "space" => self.toggle(field, option),
+                "enter" => {
+                    if !self.choice(field).multi {
+                        self.toggle(field, option);
+                    }
+                    self.move_field();
+                }
+                _ => {}
+            },
+            Stop::Submit => match key {
+                "up" => self.move_stop(-1),
+                "down" => self.move_stop(1),
+                "enter" => self.submit(),
+                _ => {}
+            },
+        }
+    }
+
+    fn toggle(&mut self, field: usize, option: usize) {
+        if self.choice(field).multi {
+            if let Some(at) = self.checked[field].iter().position(|o| *o == option) {
+                self.checked[field].remove(at);
+            } else {
+                self.checked[field].push(option);
+                self.checked[field].sort_unstable();
+            }
+        } else {
+            self.checked[field] = vec![option];
+        }
+    }
+
+    fn text_key(&mut self, field: usize, key: &str) {
+        let multiline =
+            matches!(&self.form.fields[field].kind, FieldKind::Text(input) if input.multiline);
+        let (mut line, mut col) = self.caret[field];
+        let lines = &mut self.lines[field];
+        let len = |text: &str| text.chars().count();
+        let byte = |text: &str, col: usize| {
+            text.char_indices()
+                .nth(col)
+                .map_or(text.len(), |(at, _)| at)
+        };
+        match key {
+            "up" if !multiline || line == 0 => return self.move_stop(-1),
+            "down" if !multiline || line + 1 == lines.len() => return self.move_stop(1),
+            "up" => line -= 1,
+            "down" => line += 1,
+            "enter" if !multiline => return self.move_field(),
+            "ctrl+e" => col = len(&lines[line]),
+            "ctrl+u" if col > 0 => {
+                let at = byte(&lines[line], col);
+                lines[line].replace_range(..at, "");
+                col = 0;
+            }
+            "ctrl+u" if multiline && line > 0 => {
+                let current = lines.remove(line);
+                line -= 1;
+                col = len(&lines[line]);
+                lines[line].push_str(&current);
+            }
+            "ctrl+k" if col < len(&lines[line]) => {
+                let at = byte(&lines[line], col);
+                lines[line].truncate(at);
+            }
+            "ctrl+k" if multiline && line + 1 < lines.len() => {
+                let next = lines.remove(line + 1);
+                lines[line].push_str(&next);
+            }
+            _ => {}
+        }
+        col = col.min(len(&lines[line]));
+        self.caret[field] = (line, col);
+    }
+
+    fn paste(&mut self, text: &str) {
+        if self
+            .frozen_after
+            .is_some_and(|limit| self.keys.len() >= limit)
+        {
+            return;
+        }
+        self.keys.push(format!("text:{text}"));
+        match self.stops[self.focus] {
+            Stop::Other { field } => {
+                self.other[field].push_str(text);
+                if !self.choice(field).multi && !self.other[field].trim().is_empty() {
+                    self.checked[field].clear();
+                }
+            }
+            Stop::Text { field } => {
+                let (line, col) = self.caret[field];
+                let current = &self.lines[field][line];
+                let at = current
+                    .char_indices()
+                    .nth(col)
+                    .map_or(current.len(), |(at, _)| at);
+                let (before, after) = (current[..at].to_owned(), current[at..].to_owned());
+                let mut pasted: Vec<String> = format!("{before}{text}")
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect();
+                let last = pasted.len() - 1;
+                let caret = (line + last, pasted[last].chars().count());
+                pasted[last].push_str(&after);
+                self.lines[field].splice(line..=line, pasted);
+                self.caret[field] = caret;
+            }
+            _ => {}
+        }
+    }
+
+    fn values(&self) -> Vec<Option<FormValue>> {
+        self.form
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| match &field.kind {
+                FieldKind::Choice(choice) => {
+                    let other = &self.other[index];
+                    let chosen = !other.trim().is_empty()
+                        && (choice.multi || self.checked[index].is_empty());
+                    choice_value(
+                        choice,
+                        &self.checked[index],
+                        chosen.then_some(other.as_str()),
+                    )
+                }
+                FieldKind::Text(input) => Some(text_value(input, &self.lines[index].join("\n"))),
+            })
+            .collect()
+    }
+
+    fn submit(&mut self) {
+        if let Some((field, message)) = self.refuse.clone() {
+            self.errors[field] = Some(message);
+            self.focus = self
+                .stops
+                .iter()
+                .position(|stop| stop.field() == Some(field))
+                .unwrap();
+            return;
+        }
+        self.submitted = Some(self.form.submission(&self.values()));
+    }
+
+    fn wrap(&self, text: &str, indent: usize) -> Vec<String> {
+        let width = self.width.saturating_sub(indent).max(4);
+        let mut rows = vec![String::new()];
+        for word in text.split(' ') {
+            let last = rows.last_mut().unwrap();
+            if !last.is_empty() && last.chars().count() + 1 + word.chars().count() > width {
+                rows.push(word.to_owned());
+            } else {
+                if !last.is_empty() {
+                    last.push(' ');
+                }
+                last.push_str(word);
+            }
+        }
+        rows
+    }
+
+    fn render(&self) -> String {
+        let mut out = vec![
+            "❯ an earlier prompt in the chat".to_owned(),
+            "╭─ Ask ─╮".to_owned(),
+        ];
+        for section in &self.form.sections {
+            if !section.title.is_empty() {
+                out.push(format!("│ {}", section.title));
+            }
+            for block in &section.blocks {
+                match block {
+                    Block::Field(index) => self.render_field(*index, &mut out),
+                    Block::Text { text, .. } => out.push(format!("│ {}", one_line(text))),
+                    _ => {}
+                }
+            }
+        }
+        let cursor = if self.stops[self.focus] == Stop::Submit {
+            "❯ "
+        } else {
+            "  "
+        };
+        out.push(format!("│ {cursor}Submit"));
+        out.push("╰───────╯".into());
+        out.join("\n")
+    }
+
+    fn cursor(&self, stop: Stop) -> &'static str {
+        if self.stops[self.focus] == stop {
+            "❯ "
+        } else {
+            "  "
+        }
+    }
+
+    fn label_rows(&self, index: usize, stop: Stop, suffix: &str, out: &mut Vec<String>) {
+        let field = &self.form.fields[index];
+        let mut rows = self.wrap(&one_line(&field.label), 4);
+        *rows.last_mut().unwrap() += suffix;
+        for (row, text) in rows.iter().enumerate() {
+            let lead = if row == 0 { self.cursor(stop) } else { "  " };
+            out.push(format!("│ {lead}{text}"));
+        }
+    }
+
+    fn render_field(&self, index: usize, out: &mut Vec<String>) {
+        let field = &self.form.fields[index];
+        let star = if field.required { " *" } else { "" };
+        match &field.kind {
+            FieldKind::Text(input) => {
+                let stop = Stop::Text { field: index };
+                self.label_rows(index, stop, star, out);
+                let lines = &self.lines[index];
+                let mut rows: Vec<String> = if lines.iter().all(String::is_empty) {
+                    vec![input.placeholder.clone()]
+                } else {
+                    lines.clone()
+                };
+                rows.resize(input.height(), String::new());
+                rows.truncate(input.height());
+                for row in rows {
+                    out.push(format!("│   │ {row}"));
+                }
+            }
+            FieldKind::Choice(choice) if choice.is_dropdown() => {
+                let stop = Stop::Select { field: index };
+                let current = self.checked[index].first().copied();
+                let value =
+                    current.map_or("—".to_owned(), |c| one_line(&choice.options[c].label));
+                let position = current.map_or(String::new(), |c| {
+                    format!("  {}/{}", c + 1, choice.options.len())
+                });
+                if one_line(&field.label).is_empty() {
+                    out.push(format!(
+                        "│ {}‹ {value} ›{position}{star}",
+                        self.cursor(stop)
+                    ));
+                } else {
+                    self.label_rows(index, stop, star, out);
+                    out.push(format!("│   │ ‹ {value} ›{position}"));
+                }
+            }
+            FieldKind::Choice(choice) => {
+                let (on, off) = if choice.multi {
+                    ("☑", "☐")
+                } else {
+                    ("◉", "○")
+                };
+                for (option, entry) in choice.options.iter().enumerate() {
+                    let stop = Stop::Option {
+                        field: index,
+                        option,
+                    };
+                    let marker = if self.checked[index].contains(&option) {
+                        on
+                    } else {
+                        off
+                    };
+                    let rows = self.wrap(&one_line(&entry.label), 6);
+                    for (row, text) in rows.iter().enumerate() {
+                        if row == 0 {
+                            out.push(format!("│ {}{marker} {text}", self.cursor(stop)));
+                        } else {
+                            out.push(format!("│     {text}"));
+                        }
+                    }
+                }
+                if choice.other {
+                    let stop = Stop::Other { field: index };
+                    let other = &self.other[index];
+                    let chosen = !other.trim().is_empty()
+                        && (choice.multi || self.checked[index].is_empty());
+                    let marker = if chosen { on } else { off };
+                    let shown = if other.is_empty() {
+                        if self.stops[self.focus] == stop {
+                            " type your own"
+                        } else {
+                            "type your own"
+                        }
+                        .to_owned()
+                    } else {
+                        other.clone()
+                    };
+                    out.push(format!("│ {}{marker} Other: {shown}", self.cursor(stop)));
+                }
+            }
+        }
+        if let Some(error) = &self.errors[index] {
+            out.push(format!("│     {error}"));
+        }
+    }
+}
+
+impl FormPane for Dialog {
+    fn read_screen(&mut self) -> Result<String, ErrorBody> {
+        Ok(self.render())
+    }
+
+    fn send(&mut self, action: &Action) -> Result<(), ErrorBody> {
+        match action {
+            Action::Keys(keys) => keys.iter().for_each(|key| self.press(key)),
+            Action::Text(text) => self.paste(text),
+        }
+        Ok(())
+    }
+
+    fn pause(&mut self) {}
+}
+
+/// Plan and drive `values` into `dialog`; the data it submitted.
+fn answer(
+    dialog: &mut Dialog,
+    values: BTreeMap<String, AskFormValue>,
+) -> Result<Vec<(String, Option<FormValue>)>, ErrorBody> {
+    let form = dialog.form.clone();
+    let plan = plan(&form, &values)?;
+    drive(dialog, &form, &plan)?;
+    let submitted = dialog.submitted.clone().expect("the form was submitted");
+    assert_eq!(
+        submitted, plan.expected,
+        "omp submits what the plan expects"
+    );
+    Ok(submitted)
+}
+
+fn value(submitted: &[(String, Option<FormValue>)], name: &str) -> Option<FormValue> {
+    submitted
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .and_then(|(_, value)| value.clone())
+}
+
+fn list(items: &[&str]) -> Option<FormValue> {
+    Some(FormValue::List(
+        items.iter().map(|item| (*item).to_owned()).collect(),
+    ))
+}
+
+fn txt(value: &str) -> Option<FormValue> {
+    Some(FormValue::Text(value.to_owned()))
+}
+
+#[test]
+fn accepting_the_recommendations_submits_the_defaults() {
+    let mut dialog = Dialog::new(FORM);
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "db"), txt("pg"));
+    assert_eq!(value(&submitted, "tools"), list(&["ci"]));
+    assert_eq!(value(&submitted, "region"), txt("us"));
+    assert_eq!(value(&submitted, "notes"), txt("draft"));
+    assert_eq!(
+        dialog.keys.first().map(String::as_str),
+        Some("up"),
+        "↑ releases a composer draft"
+    );
+    assert_eq!(dialog.keys.last().map(String::as_str), Some("enter"));
+}
+
+#[test]
+fn every_control_type_is_driven() {
+    let mut dialog = Dialog::new(FORM);
+    let submitted = answer(
+        &mut dialog,
+        values(&[
+            ("db", options(&["sq"])),
+            (
+                "tools",
+                AskFormValue {
+                    options: Some(vec!["tf".into()]),
+                    other: Some("just".into()),
+                    text: None,
+                },
+            ),
+            ("region", options(&["ap"])),
+            ("notes", text("ship friday")),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(value(&submitted, "db"), txt("sq"));
+    assert_eq!(value(&submitted, "tools"), list(&["tf", "just"]));
+    assert_eq!(value(&submitted, "region"), txt("ap"));
+    assert_eq!(value(&submitted, "notes"), txt("ship friday"));
+}
+
+#[test]
+fn radio_other_replaces_the_option() {
+    let mut dialog = Dialog::new(FORM);
+    let other = AskFormValue {
+        options: Some(Vec::new()),
+        other: Some(" CockroachDB ".into()),
+        text: None,
+    };
+    let submitted = answer(&mut dialog, values(&[("db", other)])).unwrap();
+    assert_eq!(value(&submitted, "db"), txt("CockroachDB"));
+}
+
+/// #392 F1: omp 18.18.3 opens inputs with the caret at the end; the clear
+/// does not depend on where it is.
+#[test]
+fn text_is_replaced_whatever_the_starting_caret() {
+    for mut dialog in [Dialog::new(FORM), Dialog::new(FORM).caret_at_end()] {
+        let submitted = answer(&mut dialog, values(&[("notes", text("ship friday"))])).unwrap();
+        assert_eq!(value(&submitted, "notes"), txt("ship friday"));
+    }
+    let mut dialog = Dialog::new(FORM).caret_at_end();
+    let submitted = answer(&mut dialog, values(&[("notes", text(""))])).unwrap();
+    assert_eq!(value(&submitted, "notes"), txt(""));
+}
+
+/// #392 F2: a textarea someone filled with 500 lines is emptied completely,
+/// checked on screen, before the answer is typed.
+#[test]
+fn an_edited_textarea_is_emptied_before_typing() {
+    let html = r#"<form><label>Log <textarea name="log">one line</textarea></label></form>"#;
+    let mut dialog = Dialog::new(html);
+    dialog.lines[0] = (0..500).map(|line| format!("line{line}")).collect();
+    dialog.caret[0] = (250, 3);
+    let submitted = answer(&mut dialog, values(&[("log", text("fresh\nanswer"))])).unwrap();
+    assert_eq!(value(&submitted, "log"), txt("fresh\nanswer"));
+    // Kept, a textarea is still reset to its default.
+    let mut dialog = Dialog::new(html);
+    dialog.lines[0] = vec!["edited".into(), "in the terminal".into()];
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "log"), txt("one line"));
+}
+
+/// #392 F2: text and dropdowns changed in the terminal are set back.
+#[test]
+fn edited_text_and_dropdowns_are_reset() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.lines[3] = vec!["changed".into()];
+    dialog.checked[2] = vec![2];
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "region"), txt("us"));
+    assert_eq!(value(&submitted, "notes"), txt("draft"));
+}
+
+/// #392 N1: a dropdown whose default is a disabled option ahead of the
+/// enabled ones is still set to the answer.
+#[test]
+fn a_dropdown_starting_on_a_disabled_option_is_set() {
+    let html = r#"<form><label>Size <select name="s"><option value="a" disabled selected>A</option><option value="b">B</option><option value="c">C</option></select></label></form>"#;
+    let mut dialog = Dialog::new(html);
+    let submitted = answer(&mut dialog, values(&[("s", options(&["b"]))])).unwrap();
+    assert_eq!(value(&submitted, "s"), txt("b"));
+    let mut dialog = Dialog::new(html);
+    let submitted = answer(&mut dialog, values(&[("s", options(&["c"]))])).unwrap();
+    assert_eq!(value(&submitted, "s"), txt("c"));
+}
+
+/// #392 N2: labels omp wraps over several rows are still found.
+#[test]
+fn wrapped_labels_are_followed() {
+    let html = r#"<form><label>Please describe your preferred deployment environment in detail <input name="env" value="x"></label>
+        <label>Which of the regions should we deploy to first <select name="r"><option>eu</option><option>us</option></select></label>
+        <label><input type="radio" name="p" value="a" checked> A long option label that the form wraps onto a second row</label>
+        <label><input type="radio" name="p" value="b"> Short</label></form>"#;
+    let mut dialog = Dialog::new(html);
+    dialog.width = 24;
+    assert!(at_start(&dialog.render(), &dialog.form));
+    let submitted = answer(
+        &mut dialog,
+        values(&[
+            ("env", text("prod")),
+            ("r", options(&["us"])),
+            ("p", options(&["b"])),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(value(&submitted, "env"), txt("prod"));
+    assert_eq!(value(&submitted, "r"), txt("us"));
+    assert_eq!(value(&submitted, "p"), txt("b"));
+}
+
 /// A present entry without `options` (`"tools": {}`) means none chosen:
 /// only a missing name keeps the default.
 #[test]
 fn a_present_entry_without_options_unticks_a_checkbox_group() {
-    let form = parse(FORM);
-    let plan = plan(&form, &values(&[("tools", AskFormValue::default())])).unwrap();
-    assert_eq!(
-        plan.actions,
-        [
-            keys(&["up"]),
-            keys(&["tab", "space", "tab", "left", "tab", "ctrl+e", "ctrl+u"]),
-            Action::Text("draft".into()),
-            keys(&["tab", "enter"]),
-        ]
-    );
-    assert_eq!(plan.expected[1].answer, "");
+    let mut dialog = Dialog::new(FORM);
+    let submitted = answer(&mut dialog, values(&[("tools", AskFormValue::default())])).unwrap();
+    assert_eq!(value(&submitted, "tools"), list(&[]));
 
     let required = parse(
         r#"<form><label><input type="checkbox" name="t" value="a" checked required> A</label>
         <label><input type="checkbox" name="t" value="b"> B</label></form>"#,
     );
-    let error = super::plan(&required, &values(&[("t", AskFormValue::default())])).unwrap_err();
+    let error = plan(&required, &values(&[("t", AskFormValue::default())])).unwrap_err();
     assert_eq!(
         (error.code.as_str(), error.message.as_str()),
         ("ask_form_invalid", "t: Select at least one")
     );
     // Missing keeps the default, which satisfies `required`.
-    assert!(super::plan(&required, &BTreeMap::new()).is_ok());
+    assert!(plan(&required, &BTreeMap::new()).is_ok());
 }
 
 #[test]
@@ -281,54 +773,77 @@ fn a_present_radio_entry_without_options_needs_other() {
     let form = parse(FORM);
     let error = plan(&form, &values(&[("db", AskFormValue::default())])).unwrap_err();
     assert_eq!(error.message, "db: choose one option or Other");
-    let other = AskFormValue {
-        other: Some("Mongo".into()),
-        ..AskFormValue::default()
-    };
-    assert!(plan(&form, &values(&[("db", other)])).is_ok());
 }
 
-fn screen(rows: &[&str]) -> String {
-    rows.join("\n")
-}
-
-/// #392 F1/F2: a text field is cleared wherever its caret is and retyped,
-/// even when kept, so neither the caret omp opens it with nor an edit made
-/// in the terminal reaches the submission.
+/// A field that does not show what was sent stops the drive before Submit.
 #[test]
-fn text_fields_are_cleared_caret_independently_and_always_set() {
-    let form = parse(
-        r#"<form><input name="notes" value="draft"><textarea name="long">a
-b</textarea></form>"#,
-    );
-    let plan = plan(&form, &BTreeMap::new()).unwrap();
-    let Action::Keys(first) = &plan.actions[1] else {
-        panic!("{:?}", plan.actions);
-    };
-    assert_eq!(first, &["ctrl+e", "ctrl+u"]);
-    assert_eq!(plan.actions[2], Action::Text("draft".into()));
-    let Action::Keys(second) = &plan.actions[3] else {
-        panic!("{:?}", plan.actions);
-    };
-    assert_eq!(second[0], "tab");
-    assert_eq!(&second[1..3], ["ctrl+e", "ctrl+u"]);
+fn a_form_that_stops_responding_is_never_submitted() {
+    for limit in [1, 3, 6, 10] {
+        let mut dialog = Dialog::new(FORM);
+        dialog.frozen_after = Some(limit);
+        let form = dialog.form.clone();
+        let plan = plan(
+            &form,
+            &values(&[("db", options(&["sq"])), ("notes", text("x"))]),
+        )
+        .unwrap();
+        let error = drive(&mut dialog, &form, &plan).unwrap_err();
+        assert_eq!(error.code, "ask_form_moved", "{limit}");
+        assert_eq!(dialog.submitted, None, "{limit}");
+    }
+}
+
+/// #392 F7: omp checks `pattern` itself; its refusal is read off the screen.
+#[test]
+fn a_refused_submission_is_read_from_the_screen() {
+    let html = r#"<form><label>Code <input name="code" pattern="[A-Z]{3}"></label></form>"#;
+    let mut dialog = Dialog::new(html);
+    dialog.refuse = Some((0, "Must match [A-Z]{3}".into()));
+    let form = dialog.form.clone();
+    let plan = plan(&form, &values(&[("code", text("abcd"))])).unwrap();
+    drive(&mut dialog, &form, &plan).unwrap();
+    assert_eq!(dialog.submitted, None);
     assert_eq!(
-        second.iter().filter(|key| **key == "ctrl+k").count(),
-        2 * 199
+        submit_error(&dialog.render(), &form),
+        Some(("code".to_owned(), "Must match [A-Z]{3}".to_owned()))
     );
-    assert_eq!(plan.actions[4], Action::Text("a\nb".into()));
+    assert_eq!(submit_error(&Dialog::new(html).render(), &form), None);
 }
 
-/// #392 F2: a dropdown is set outright, from whatever it shows.
+/// #392 F9: what omp recorded is compared by value, not by spelling.
 #[test]
-fn dropdowns_are_set_outright() {
-    let form = parse(FORM);
-    let plan = plan(&form, &BTreeMap::new()).unwrap();
-    let Action::Keys(keys) = &plan.actions[1] else {
-        panic!("{:?}", plan.actions);
-    };
-    // Region has 2 enabled options: one ← reaches US from either.
-    assert_eq!(&keys[..4], ["tab", "tab", "left", "tab"]);
+fn recorded_data_is_compared_by_value() {
+    let expected = vec![
+        ("n".to_owned(), Some(FormValue::Number(2.0f64.powi(-25)))),
+        ("t".to_owned(), txt("ship")),
+        ("l".to_owned(), list(&["a", "b"])),
+        ("none".to_owned(), None),
+    ];
+    let recorded = |json: serde_json::Value| json.as_object().unwrap().clone();
+    assert!(submission_matches(
+        &expected,
+        // As omp writes it: JS spells 2^-25 `2.9802322387695312e-8`.
+        &recorded(
+            serde_json::from_str(
+                r#"{"n": 2.9802322387695312e-8, "t": " ship ", "l": ["a", "b"], "hidden": "x"}"#
+            )
+            .unwrap()
+        )
+    ));
+    assert!(!submission_matches(
+        &expected,
+        &recorded(serde_json::json!({"n": 3e-8, "t": "ship", "l": ["a", "b"]}))
+    ));
+    assert!(!submission_matches(
+        &expected,
+        &recorded(serde_json::json!({"n": 2.0f64.powi(-25), "t": "ship", "l": ["b", "a"]}))
+    ));
+    assert!(!submission_matches(
+        &expected,
+        &recorded(
+            serde_json::json!({"n": 2.0f64.powi(-25), "t": "ship", "l": ["a", "b"], "none": "x"})
+        )
+    ));
 }
 
 /// #392 F3: labels sharing a long prefix are told apart; focus on the third

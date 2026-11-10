@@ -94,6 +94,8 @@ pub(super) struct ResultMessage {
     pub(super) timestamp: Option<u64>,
     #[serde(default)]
     pub(super) details: Option<Value>,
+    #[serde(default)]
+    pub(super) content: Value,
 }
 
 #[derive(Deserialize)]
@@ -406,6 +408,26 @@ pub(super) fn form_result(
         AskFormStatus::Answered
     };
     (answers, status)
+}
+
+/// The form data a form `ask` result's text carries: omp writes
+/// `User answers:` (or, on a timeout, `No answer before the timeout; …`)
+/// and the submitted data as JSON on the following lines.
+pub(super) fn form_result_data(content: &Value) -> Option<serde_json::Map<String, Value>> {
+    let text = match content {
+        Value::String(text) => text.as_str(),
+        Value::Array(parts) => parts
+            .iter()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))?
+            .get("text")?
+            .as_str()?,
+        _ => return None,
+    };
+    let (_, json) = text.split_once('\n')?;
+    match serde_json::from_str(json).ok()? {
+        Value::Object(data) => Some(data),
+        _ => None,
+    }
 }
 
 /// The compatibility `answer` lines of a form ask, `"<title>: <answer>"`

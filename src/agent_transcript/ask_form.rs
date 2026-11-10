@@ -14,9 +14,9 @@ mod dom;
 
 use dom::{Node, NodeRef};
 
-use crate::api::schema::{
-    AskForm, AskFormAnswer, AskFormField, AskFormFieldKind, AskFormOption, AskQuestion,
-};
+#[cfg(test)]
+use crate::api::schema::AskFormAnswer;
+use crate::api::schema::{AskForm, AskFormField, AskFormFieldKind, AskFormOption, AskQuestion};
 
 /// Label of the free-text answer omp adds to radio and checkbox groups.
 pub(crate) const OTHER_LABEL: &str = "Other";
@@ -89,6 +89,8 @@ pub(crate) struct TextInput {
     pub pattern: Option<String>,
     pub min_length: Option<f64>,
     pub max_length: Option<f64>,
+    /// Visible rows a textarea asked for (`rows`, default 4); 1 for inputs.
+    pub rows: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +115,19 @@ impl Field {
             FieldKind::Choice(choice) => Some(choice),
             FieldKind::Text(_) => None,
         }
+    }
+}
+
+impl TextInput {
+    /// Rows omp's form gives this field: a textarea's fixed height (the
+    /// `rows` asked for, grown to fit the prefilled draft, 2 to 10;
+    /// `#textareaRows`), else 1.
+    pub(crate) fn height(&self) -> usize {
+        if !self.multiline {
+            return 1;
+        }
+        let draft = self.value.split('\n').count() as f64;
+        self.rows.max(2.0).max(draft).min(10.0).ceil() as usize
     }
 }
 
@@ -216,9 +231,7 @@ fn has_attr(node: &Dom<'_>, name: &str) -> bool {
 }
 
 fn text_content(node: &Dom<'_>) -> String {
-    node.descendants()
-        .filter_map(|descendant| descendant.value().as_text().map(|text| &**text))
-        .collect()
+    node.text_content()
 }
 
 fn element_children<'a>(node: &Dom<'a>) -> impl Iterator<Item = Dom<'a>> {
@@ -246,7 +259,7 @@ fn contains(outer: &Dom<'_>, inner: &Dom<'_>) -> bool {
 }
 
 fn is_js_space(ch: char) -> bool {
-    ch.is_whitespace() || ch == '\u{feff}'
+    dom::is_space(ch)
 }
 
 /// Collapse whitespace like HTML layout does: runs become one space, spaces
@@ -725,6 +738,7 @@ impl<'a> Builder<'a> {
                         pattern: None,
                         min_length: number_attr(control, "minlength"),
                         max_length: number_attr(control, "maxlength"),
+                        rows: number_attr(control, "rows").unwrap_or(4.0),
                     }),
                 });
             }
@@ -798,6 +812,7 @@ impl<'a> Builder<'a> {
                 pattern: attr(control, "pattern").map(str::to_owned),
                 min_length: number_attr(control, "minlength"),
                 max_length: number_attr(control, "maxlength"),
+                rows: 1.0,
             }),
         });
     }
@@ -937,12 +952,14 @@ impl ParsedForm {
         }
     }
 
-    /// `details.answers` omp records for `data` (`formAnswers`): every named
-    /// field in form order, option values shown as their labels. Like omp,
-    /// the answers read a name-keyed submission: hidden inputs first, then
-    /// each field that gives a value, so a field giving none (an unchecked
-    /// lone checkbox) reads a hidden input's value of the same name.
-    pub(crate) fn answers(&self, data: &[Option<FormValue>]) -> Vec<AskFormAnswer> {
+    /// The name-keyed data omp submits for `data` (each field's value, in
+    /// form order): hidden inputs first, then every named field that gives
+    /// a value, so a field that gives none (an unchecked lone checkbox)
+    /// reads the hidden input of its name. One entry per named field.
+    pub(crate) fn submission(
+        &self,
+        data: &[Option<FormValue>],
+    ) -> Vec<(String, Option<FormValue>)> {
         let mut submitted: HashMap<&str, FormValue> = self
             .hidden
             .iter()
@@ -953,6 +970,25 @@ impl ParsedForm {
                 submitted.insert(field.name.as_str(), value.clone());
             }
         }
+        let mut seen = HashSet::new();
+        self.fields
+            .iter()
+            .filter(|field| !field.name.is_empty() && seen.insert(field.name.as_str()))
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    submitted.get(field.name.as_str()).cloned(),
+                )
+            })
+            .collect()
+    }
+
+    /// `details.answers` omp records for `data` (`formAnswers`): every named
+    /// field in form order, option values shown as their labels.
+    #[cfg(test)]
+    pub(crate) fn answers(&self, data: &[Option<FormValue>]) -> Vec<AskFormAnswer> {
+        let submitted: HashMap<String, Option<FormValue>> =
+            self.submission(data).into_iter().collect();
         let questions = self.questions();
         self.fields
             .iter()
@@ -965,7 +1001,7 @@ impl ParsedForm {
                 } else {
                     question
                 },
-                answer: answer_text(field, submitted.get(field.name.as_str())),
+                answer: answer_text(field, submitted.get(&field.name).and_then(Option::as_ref)),
             })
             .collect()
     }
@@ -1207,6 +1243,7 @@ pub(crate) fn text_value(input: &TextInput, text: &str) -> FormValue {
     FormValue::Text(text.to_owned())
 }
 
+#[cfg(test)]
 fn answer_text(field: &Field, value: Option<&FormValue>) -> String {
     let Some(value) = value else {
         return String::new();
@@ -1300,20 +1337,8 @@ pub(crate) fn field_error(field: &Field, value: Option<&FormValue>) -> Option<St
     if input.input_type == "url" && !is_url(&text) {
         return Some("Enter a full URL".into());
     }
-    if let Some(pattern) = &input.pattern {
-        // omp compiles `^(?:pattern)$` with the `v` flag and ignores a pattern
-        // that does not compile; both need ECMAScript semantics, not Rust's.
-        if let Ok(regex) = regress::Regex::with_flags(&format!("^(?:{pattern})$"), "v") {
-            if regex.find(&text).is_none() {
-                let shown = if pattern.encode_utf16().count() > 40 {
-                    format!("{}…", pattern.chars().take(39).collect::<String>())
-                } else {
-                    pattern.clone()
-                };
-                return Some(format!("Must match {shown}"));
-            }
-        }
-    }
+    // `pattern` is left to omp: it checks an ECMAScript `v`-flag regex on
+    // Submit, and `agent.answer_form` reads the error omp then shows.
     None
 }
 

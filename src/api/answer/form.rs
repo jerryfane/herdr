@@ -8,9 +8,12 @@
 //! and moves on; Space toggles a checkbox; typing on an Other row or a text
 //! field edits it; ←/→ change a dropdown; Enter on Submit submits.
 //!
-//! [`plan`] turns requested values into that key sequence from the form's
-//! starting state (focus on the first stop, defaults checked), which
-//! [`at_start`] checks on screen before anything is sent.
+//! [`plan`] validates the requested values and settles every field's
+//! target. [`drive`] checks the form is untouched ([`at_start`]), then sets
+//! every field outright from whatever it shows (radios with Space, each
+//! checkbox to its target, inputs cleared and retyped, dropdowns stepped from
+//! the position they show), reading the focused stop back after each step,
+//! and presses Submit only once every field showed what was sent.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +21,7 @@ use crate::agent_transcript::ask_form::{
     choice_value, field_error, one_line, text_value, Choice, FieldKind, FormValue, ParsedForm,
     OTHER_LABEL,
 };
-use crate::api::schema::{AskFormAnswer, AskFormValue, ErrorBody};
+use crate::api::schema::{AskFormValue, ErrorBody};
 
 use super::selector::{trim_right_edge, CURSOR_GLYPHS, LEFT_EDGE};
 
@@ -35,13 +38,6 @@ const CHECKBOX_MARKERS: [(&str, &str); 3] = [("☑", "☐"), ("\u{f14a}", "\u{f0
 pub(crate) enum Action {
     Keys(Vec<&'static str>),
     Text(String),
-}
-
-/// The keys to send and the `details.answers` omp should record for them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Plan {
-    pub actions: Vec<Action>,
-    pub expected: Vec<AskFormAnswer>,
 }
 
 /// A focus stop of the terminal form, in focus order (`#stops`).
@@ -247,42 +243,18 @@ fn value_of(form: &ParsedForm, field: usize, target: &Target) -> Option<FormValu
     }
 }
 
-/// Keys that set a dropdown to option `to` whatever it shows now: ← once
-/// per enabled option reaches the first one (`#step` clamps at the ends),
-/// then → steps over enabled options to the target.
-fn dropdown_keys(choice: &Choice, to: usize) -> Vec<&'static str> {
-    let enabled: Vec<usize> = (0..choice.options.len())
-        .filter(|index| !choice.options[*index].disabled)
-        .collect();
-    let target = enabled.iter().position(|index| *index == to).unwrap_or(0);
-    let mut keys = vec!["left"; enabled.len().saturating_sub(1)];
-    keys.extend(std::iter::repeat_n("right", target));
-    keys
+/// What `agent.answer_form` will make the form hold: each field's target
+/// state, and the name-keyed data omp should then submit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Plan {
+    targets: Vec<Target>,
+    /// One entry per named field: the value omp should submit (hidden
+    /// inputs filling in for fields that give none).
+    pub expected: Vec<(String, Option<FormValue>)>,
 }
 
-/// Lines a textarea is cleared through at least; a draft longer than this
-/// (only a paste makes one) keeps its tail, which the result check reports.
-const TEXTAREA_CLEAR_LINES: usize = 200;
-
-/// Keys that empty a text field wherever its caret is and whatever it
-/// holds. A single-line input: Ctrl+E to the end, Ctrl+U deletes to the
-/// start. A textarea: the same on the caret's line, then Ctrl+U pairs merge
-/// and empty each line above (a Ctrl+U at a line start joins it to the
-/// previous one) and Ctrl+K pairs each line below (a Ctrl+K at a line end
-/// joins the next); presses past the first or last line do nothing.
-fn clear_keys(value: &str, multiline: bool) -> Vec<&'static str> {
-    let mut keys = vec!["ctrl+e", "ctrl+u"];
-    if multiline {
-        let lines = value.split('\n').count().max(TEXTAREA_CLEAR_LINES);
-        keys.extend(std::iter::repeat_n("ctrl+u", 2 * (lines - 1)));
-        keys.extend(std::iter::repeat_n("ctrl+k", 2 * (lines - 1)));
-    }
-    keys
-}
-
-/// The keys that turn the freshly opened form into `values` and submit it,
-/// with the answers omp should then record. Validates `values` against the
-/// form as omp would before submitting.
+/// Validate `values` against the form as omp would on Submit (all but
+/// `pattern`, which omp checks itself) and settle every field's target.
 pub(crate) fn plan(
     form: &ParsedForm,
     values: &BTreeMap<String, AskFormValue>,
@@ -303,90 +275,56 @@ pub(crate) fn plan(
             return Err(invalid(&name, reason));
         }
     }
+    Ok(Plan {
+        expected: form.submission(&data),
+        targets,
+    })
+}
 
-    let stops = stops(form);
-    // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
-    // the first stop ↑ goes nowhere.
-    let mut actions = vec![Action::Keys(vec!["up"])];
-    let mut keys: Vec<&'static str> = Vec::new();
-    let flush = |keys: &mut Vec<&'static str>, actions: &mut Vec<Action>| {
-        if !keys.is_empty() {
-            actions.push(Action::Keys(std::mem::take(keys)));
+/// Whether the data omp recorded (`User answers:` JSON) is the one `plan`
+/// asked for, compared by value: numbers numerically, text and option
+/// values trimmed, lists in order. Formatting differences between herdr and
+/// omp (number spelling, whitespace) never turn a real answer into a miss.
+pub(crate) fn submission_matches(
+    expected: &[(String, Option<FormValue>)],
+    recorded: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    use serde_json::Value;
+    let text = |value: &Value| -> Option<String> {
+        match value {
+            Value::String(text) => Some(text.trim().to_owned()),
+            Value::Number(number) => number
+                .as_f64()
+                .map(crate::agent_transcript::ask_form::js_number_string),
+            _ => None,
         }
     };
-    let mut start = 0;
-    while let Some(field) = stops[start].field() {
-        let end = start
-            + stops[start..]
-                .iter()
-                .take_while(|stop| stop.field() == Some(field))
-                .count();
-        let own = &stops[start..end];
-        let target = &targets[field];
-        // Text fields and dropdowns are set outright, so whatever they show
-        // now (the screen check does not read them) cannot leak through.
-        let unchanged = *target == initial(form, field);
-        match (&form.fields[field].kind, target) {
-            (FieldKind::Text(input), Target::Text(text)) => {
-                keys.extend(clear_keys(&input.value, input.multiline));
-                if !text.is_empty() {
-                    flush(&mut keys, &mut actions);
-                    actions.push(Action::Text(text.clone()));
-                }
-                keys.push("tab");
-            }
-            (FieldKind::Choice(choice), Target::Choice { checked, .. }) if choice.is_dropdown() => {
-                let to = checked.first().copied().unwrap_or_default();
-                keys.extend(dropdown_keys(choice, to));
-                keys.push("tab");
-            }
-            _ if unchanged => keys.push("tab"),
-            (FieldKind::Choice(choice), Target::Choice { checked, other }) if !choice.multi => {
-                let at = match other {
-                    Some(_) => own.len() - 1,
-                    None => own
-                        .iter()
-                        .position(|stop| matches!(stop, Stop::Option { option, .. } if checked.contains(option)))
-                        .unwrap_or_default(),
+    expected
+        .iter()
+        .all(|(name, want)| match (want, recorded.get(name)) {
+            (None, None) => true,
+            (Some(FormValue::Number(want)), Some(got)) => {
+                let got = match got {
+                    Value::Number(number) => number.as_f64(),
+                    Value::String(text) => text.trim().parse::<f64>().ok(),
+                    _ => None,
                 };
-                keys.extend(std::iter::repeat_n("down", at));
-                if let Some(other) = other {
-                    flush(&mut keys, &mut actions);
-                    actions.push(Action::Text(other.clone()));
-                }
-                // Enter picks the option (or keeps the typed Other) and moves on.
-                keys.push("enter");
+                got.is_some_and(|got| {
+                    got == *want || (got - want).abs() <= f64::EPSILON * want.abs().max(1.0)
+                })
             }
-            (FieldKind::Choice(choice), Target::Choice { checked, other }) => {
-                let was = choice.initial_checked();
-                let mut at = 0;
-                for (position, stop) in own.iter().enumerate() {
-                    let Stop::Option { option, .. } = stop else {
-                        continue;
-                    };
-                    if was.contains(option) != checked.contains(option) {
-                        keys.extend(std::iter::repeat_n("down", position - at));
-                        keys.push("space");
-                        at = position;
-                    }
-                }
-                if let Some(other) = other {
-                    keys.extend(std::iter::repeat_n("down", own.len() - 1 - at));
-                    flush(&mut keys, &mut actions);
-                    actions.push(Action::Text(other.clone()));
-                }
-                keys.push("tab");
+            (Some(FormValue::Text(want)), Some(got)) => {
+                text(got).is_some_and(|got| got == want.trim())
             }
-            _ => keys.push("tab"),
-        }
-        start = end;
-    }
-    keys.push("enter");
-    flush(&mut keys, &mut actions);
-    Ok(Plan {
-        actions,
-        expected: form.answers(&data),
-    })
+            (Some(FormValue::List(want)), Some(Value::Array(got))) => {
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(want)
+                        .all(|(got, want)| text(got).is_some_and(|got| got == want.trim()))
+            }
+            _ => false,
+        })
 }
 
 /// A label's first line as omp draws it, whitespace collapsed.
@@ -438,27 +376,45 @@ fn parse_row(line: &str) -> Row {
     }
 }
 
+fn rows_of(screen: &str) -> Vec<Row> {
+    screen.lines().map(parse_row).collect()
+}
+
+/// Whether an option row's text is `label` as omp draws it: the whole first
+/// line, or (a wrapped label) a prefix of it ending at a word.
+fn reads_as_label(text: &str, label: &str) -> bool {
+    let label = first_line(label);
+    !text.is_empty()
+        && (text == label || (label.starts_with(text) && label[text.len()..].starts_with(' ')))
+}
+
+/// The synthetic Other row's text (after `Other: `), `None` when the row is
+/// not an Other row. An empty Other shows its placeholder.
+fn other_text(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix(OTHER_LABEL)?
+        .strip_prefix(':')?
+        .trim_start();
+    Some(if rest == OTHER_PLACEHOLDER { "" } else { rest })
+}
+
 /// An option row the untouched form draws, in screen order.
 struct ExpectedRow {
-    /// The label's first line; for the synthetic Other row, its empty text.
-    text: String,
-    /// The synthetic Other row: only its exact empty text matches.
+    /// The option's label; empty for the synthetic Other row.
+    label: String,
     other: bool,
     selected: bool,
 }
 
 impl ExpectedRow {
-    /// Whether a drawn option row is this one: the same marker and the whole
-    /// first line, or (a wrapped label) a prefix of it that ends at a word.
     fn matches(&self, row: &Row) -> bool {
-        if row.marker != Some(self.selected) || row.text.is_empty() {
+        if row.marker != Some(self.selected) {
             return false;
         }
         if self.other {
-            return row.text == self.text;
+            return other_text(&row.text) == Some("");
         }
-        row.text == self.text
-            || (self.text.starts_with(&row.text) && self.text[row.text.len()..].starts_with(' '))
+        reads_as_label(&row.text, &self.label)
     }
 }
 
@@ -478,7 +434,7 @@ fn expected_rows(form: &ParsedForm) -> (Vec<ExpectedRow>, Vec<(Stop, usize)>) {
         for (option, entry) in choice.options.iter().enumerate() {
             stops.push((Stop::Option { field, option }, rows.len()));
             rows.push(ExpectedRow {
-                text: first_line(&entry.label),
+                label: entry.label.clone(),
                 other: false,
                 selected: checked.contains(&option),
             });
@@ -486,7 +442,7 @@ fn expected_rows(form: &ParsedForm) -> (Vec<ExpectedRow>, Vec<(Stop, usize)>) {
         if choice.other {
             stops.push((Stop::Other { field }, rows.len()));
             rows.push(ExpectedRow {
-                text: format!("{OTHER_LABEL}: {OTHER_PLACEHOLDER}"),
+                label: String::new(),
                 other: true,
                 selected: false,
             });
@@ -495,14 +451,47 @@ fn expected_rows(form: &ParsedForm) -> (Vec<ExpectedRow>, Vec<(Stop, usize)>) {
     (rows, stops)
 }
 
-/// Whether a focused non-option row is the label row of `field`: its first
-/// line, then at most the required star and a text field's bounds.
-fn is_label_row(row: &Row, label: &str) -> bool {
-    let label = first_line(label);
-    if label.is_empty() || !row.text.starts_with(&label) {
-        return false;
+/// How many rows from `start` the label `label` takes: omp wraps it at the
+/// panel width (at a space, or inside a long word), and the last row may add
+/// the required star and a number field's bounds. An empty label is one row
+/// holding just the cursor. `None` when the rows do not read as the label.
+fn label_rows(rows: &[Row], start: usize, label: &str) -> Option<usize> {
+    let label = one_line(label);
+    let first = rows.get(start)?;
+    if first.marker.is_some() {
+        return None;
     }
-    let rest = row.text[label.len()..].trim_start_matches(" *").trim();
+    if label.is_empty() {
+        return is_label_suffix(&first.text).then_some(1);
+    }
+    let mut rest = label.as_str();
+    for (offset, row) in rows[start..].iter().enumerate() {
+        if offset > 0 && (row.focused || row.marker.is_some()) {
+            return None;
+        }
+        let text = row.text.as_str();
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix(text) {
+            rest = after.trim_start();
+            if rest.is_empty() {
+                return Some(offset + 1);
+            }
+        } else if let Some(suffix) = text.strip_prefix(rest) {
+            return is_label_suffix(suffix).then_some(offset + 1);
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// What may follow a field label on its last row: the required star and a
+/// number field's bounds (`1–9`, `≥ 1`, `≤ 9`).
+fn is_label_suffix(suffix: &str) -> bool {
+    let rest = suffix.trim_start();
+    let rest = rest.strip_prefix('*').unwrap_or(rest).trim_start();
     rest.is_empty()
         || rest.starts_with('≥')
         || rest.starts_with('≤')
@@ -512,15 +501,25 @@ fn is_label_row(row: &Row, label: &str) -> bool {
             .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
 }
 
-/// Whether `screen` shows the form as it opens, as far as the drive depends
-/// on it: the focus on its first stop, and every option row (Other included)
-/// in its default state. The visible option rows must line up, in order and
-/// in exactly one way, with the rows the untouched form draws; the focused
-/// one must be the first stop. Text fields and dropdowns are not checked:
-/// the drive sets them whatever they hold.
+/// The focused text or dropdown field: where its label starts and how many
+/// rows it takes, when exactly one focused row starts it.
+fn focused_label(rows: &[Row], label: &str) -> Option<(usize, usize)> {
+    let mut found = (0..rows.len())
+        .filter(|&index| rows[index].focused)
+        .filter_map(|index| label_rows(rows, index, label).map(|count| (index, count)));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+/// Whether `screen` shows the form as it opens: the focus on its first stop,
+/// and every visible option row (Other included) in its default state, read
+/// in exactly one way against the rows the untouched form draws. Only the
+/// starting focus matters to the drive (it sets every field outright and
+/// checks each one as it goes); the rest refuses a form someone is filling
+/// in the terminal.
 pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
     let stops = stops(form);
-    let rows: Vec<Row> = screen.lines().map(parse_row).collect();
+    let rows = rows_of(screen);
     let markers: Vec<usize> = (0..rows.len())
         .filter(|index| rows[*index].marker.is_some())
         .collect();
@@ -531,7 +530,7 @@ pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
         .collect();
     let (expected, stop_rows) = expected_rows(form);
     // Every place the visible option rows, all of them in order, line up
-    // with the expected ones (a scrolled form shows a window of them).
+    // with the expected ones (a paged form shows a window of them).
     let alignments: Vec<usize> = (0..expected.len())
         .filter(|&start| {
             markers.len() <= expected.len() - start
@@ -541,40 +540,143 @@ pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
                     .all(|(&row, want)| want.matches(&rows[row]))
         })
         .collect();
-    let first_stop_row = |stop: Stop| {
-        stop_rows
-            .iter()
-            .find(|(candidate, _)| *candidate == stop)
-            .map(|(_, row)| *row)
-    };
     match stops[0] {
         stop @ (Stop::Option { .. } | Stop::Other { .. }) => {
-            let Some(want) = first_stop_row(stop) else {
+            let Some(want) = stop_rows
+                .iter()
+                .find(|(candidate, _)| *candidate == stop)
+                .map(|(_, row)| *row)
+            else {
                 return false;
             };
             let [focused] = focused_markers.as_slice() else {
                 return false;
             };
-            // Exactly one reading of the screen, and in it the focused row is
-            // the first stop; ambiguous or wrong sends nothing.
             matches!(alignments.as_slice(),
                 [start] if want >= *start && markers.get(want - start) == Some(focused))
         }
         Stop::Text { field } | Stop::Select { field } => {
             focused_markers.is_empty()
-                && rows
-                    .iter()
-                    .filter(|row| row.focused && row.marker.is_none())
-                    .any(|row| is_label_row(row, &form.fields[field].label))
+                && focused_label(&rows, &form.fields[field].label).is_some()
                 && (markers.is_empty() || alignments.len() == 1)
         }
         Stop::Submit => {
             focused_markers.is_empty()
                 && rows
                     .iter()
-                    .any(|row| row.focused && row.text.starts_with("Submit"))
+                    .any(|row| row.focused && row.text.starts_with(SUBMIT_LABEL))
         }
     }
+}
+
+const SUBMIT_LABEL: &str = "Submit";
+
+/// What the focused stop shows, read off the screen.
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    Option {
+        selected: bool,
+    },
+    Other {
+        selected: bool,
+        text: String,
+    },
+    /// A text field's value rows.
+    Text(Vec<String>),
+    /// A dropdown's 1-based position among all its options.
+    Select {
+        position: Option<usize>,
+    },
+    Submit,
+}
+
+/// The focused stop as `stop`, if the screen shows that stop focused.
+fn seen(screen: &str, form: &ParsedForm, stop: Stop) -> Option<Seen> {
+    let rows = rows_of(screen);
+    let focused_markers: Vec<&Row> = rows
+        .iter()
+        .filter(|row| row.focused && row.marker.is_some())
+        .collect();
+    match stop {
+        Stop::Option { field, option } => {
+            let choice = form.fields[field].choice()?;
+            let [row] = focused_markers.as_slice() else {
+                return None;
+            };
+            reads_as_label(&row.text, &choice.options[option].label).then(|| Seen::Option {
+                selected: row.marker == Some(true),
+            })
+        }
+        Stop::Other { .. } => {
+            let [row] = focused_markers.as_slice() else {
+                return None;
+            };
+            other_text(&row.text).map(|text| Seen::Other {
+                selected: row.marker == Some(true),
+                text: text.to_owned(),
+            })
+        }
+        Stop::Text { field } => {
+            let FieldKind::Text(input) = &form.fields[field].kind else {
+                return None;
+            };
+            if !focused_markers.is_empty() {
+                return None;
+            }
+            let (start, count) = focused_label(&rows, &form.fields[field].label)?;
+            let values = rows.get(start + count..start + count + input.height())?;
+            Some(Seen::Text(
+                values.iter().map(|row| row.text.clone()).collect(),
+            ))
+        }
+        Stop::Select { field } => {
+            if !focused_markers.is_empty() {
+                return None;
+            }
+            let label = &form.fields[field].label;
+            let row = if one_line(label).is_empty() {
+                // An unlabeled dropdown is one row: cursor, then the value.
+                let mut found = rows
+                    .iter()
+                    .filter(|row| row.focused && row.text.starts_with('‹'));
+                let row = found.next()?;
+                found.next().is_none().then_some(row)?
+            } else {
+                let (start, count) = focused_label(&rows, label)?;
+                rows.get(start + count)?
+            };
+            Some(Seen::Select {
+                position: dropdown_position(&row.text)?,
+            })
+        }
+        Stop::Submit => (focused_markers.is_empty()
+            && rows
+                .iter()
+                .any(|row| row.focused && row.text.starts_with(SUBMIT_LABEL)))
+        .then_some(Seen::Submit),
+    }
+}
+
+/// `‹ value ›  i/n`: the position `i`, `Some(None)` for `—` (nothing
+/// chosen), `None` when the row is not a dropdown row.
+fn dropdown_position(text: &str) -> Option<Option<usize>> {
+    let rest = text.strip_prefix('‹')?;
+    let (_, after) = rest.rsplit_once('›')?;
+    let token = after.split_whitespace().next();
+    match token.and_then(|token| token.split_once('/')) {
+        Some((at, _)) => Some(Some(at.parse().ok()?)),
+        None => Some(None),
+    }
+}
+
+/// Whether a text field's value rows show it empty: blank, or its
+/// placeholder on the first row.
+fn is_empty_text(rows: &[String], placeholder: &str) -> bool {
+    let placeholder = one_line(placeholder);
+    rows.iter().enumerate().all(|(index, row)| {
+        row.is_empty()
+            || (index == 0 && !placeholder.is_empty() && placeholder.starts_with(row.as_str()))
+    })
 }
 
 /// The agent's pane as the form driver sees it.
@@ -584,11 +686,223 @@ pub(crate) trait FormPane {
     fn pause(&mut self);
 }
 
-/// Screen reads [`drive`] makes while the form may still be drawing.
-const START_READS: usize = 3;
+/// Screen reads (one pause apart) the form gets to show a step.
+const SETTLE_READS: usize = 20;
+/// Lines one textarea clearing round removes above and below the caret;
+/// rounds repeat, each checked on screen, until the field shows empty.
+const CLEAR_ROUND_LINES: usize = 100;
+const CLEAR_ROUNDS: usize = 50;
 
-/// Check the form is in its starting state, then send `plan`. Nothing is
-/// sent unless the screen shows the untouched form.
+fn moved(message: impl Into<String>) -> ErrorBody {
+    ErrorBody {
+        code: "ask_form_moved".into(),
+        message: message.into(),
+    }
+}
+
+struct Driver<'a, P> {
+    pane: &'a mut P,
+    form: &'a ParsedForm,
+    stops: Vec<Stop>,
+    /// The stop the focus is on.
+    at: usize,
+}
+
+impl<P: FormPane> Driver<'_, P> {
+    fn keys(&mut self, keys: Vec<&'static str>) -> Result<(), ErrorBody> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.pane.send(&Action::Keys(keys))
+    }
+
+    /// Move the focus to stop `to` with ↑/↓ (one stop each).
+    fn go(&mut self, to: usize) -> Result<(), ErrorBody> {
+        let key = if to > self.at { "down" } else { "up" };
+        self.keys(vec![key; to.abs_diff(self.at)])?;
+        self.at = to;
+        Ok(())
+    }
+
+    /// Read until the focused stop is `stop` and `done` holds; stop the
+    /// drive otherwise. Nothing more is sent after a miss: the form keeps
+    /// whatever was typed so far, and Esc would cancel the whole ask.
+    fn until(&mut self, stop: Stop, done: impl Fn(&Seen) -> bool) -> Result<Seen, ErrorBody> {
+        for read in 0..SETTLE_READS {
+            if read > 0 {
+                self.pane.pause();
+            }
+            if let Some(seen) = seen(&self.pane.read_screen()?, self.form, stop) {
+                if done(&seen) {
+                    return Ok(seen);
+                }
+            }
+        }
+        let what = match stop.field() {
+            Some(field) => format!("field {:?}", self.form.fields[field].name),
+            None => "Submit".to_owned(),
+        };
+        Err(moved(format!(
+            "the terminal form did not show {what} as expected; stopped without submitting (answer in the terminal)"
+        )))
+    }
+
+    /// Empty an input (a text field, or an Other row) wherever its caret is.
+    fn clear(&mut self, stop: Stop, multiline: bool, placeholder: &str) -> Result<(), ErrorBody> {
+        let empty = |seen: &Seen| match seen {
+            Seen::Text(rows) => is_empty_text(rows, placeholder),
+            Seen::Other { text, .. } => text.is_empty(),
+            _ => false,
+        };
+        for _ in 0..if multiline { CLEAR_ROUNDS } else { 1 } {
+            // Ctrl+E to the line end, Ctrl+U to its start. In a textarea each
+            // further Ctrl+U pair joins the line above and empties it, and
+            // each Ctrl+K pair the line below.
+            let mut keys = vec!["ctrl+e", "ctrl+u"];
+            if multiline {
+                keys.extend(std::iter::repeat_n("ctrl+u", 2 * CLEAR_ROUND_LINES));
+                keys.extend(std::iter::repeat_n("ctrl+k", 2 * CLEAR_ROUND_LINES));
+            }
+            self.keys(keys)?;
+            if self.until(stop, empty).is_ok() {
+                return Ok(());
+            }
+        }
+        self.until(stop, empty).map(drop)
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), ErrorBody> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.pane.send(&Action::Text(text.to_owned()))
+    }
+
+    fn field(
+        &mut self,
+        field: usize,
+        own: std::ops::Range<usize>,
+        target: &Target,
+    ) -> Result<(), ErrorBody> {
+        let form = self.form;
+        match (&form.fields[field].kind, target) {
+            (FieldKind::Text(input), Target::Text(text)) => {
+                let stop = Stop::Text { field };
+                self.until(stop, |_| true)?;
+                self.clear(stop, input.multiline, &input.placeholder)?;
+                self.type_text(text)
+            }
+            (FieldKind::Choice(choice), Target::Choice { checked, .. }) if choice.is_dropdown() => {
+                let stop = Stop::Select { field };
+                let Seen::Select { position } = self.until(stop, |_| true)? else {
+                    unreachable!("a dropdown stop reads as a dropdown");
+                };
+                let target = checked.first().copied().unwrap_or_default();
+                let current = position.map(|position| position - 1);
+                self.keys(dropdown_keys(choice, current, target))?;
+                self.until(stop, |seen| {
+                    *seen
+                        == Seen::Select {
+                            position: Some(target + 1),
+                        }
+                })
+                .map(drop)
+            }
+            (FieldKind::Choice(choice), Target::Choice { checked, other }) => {
+                let stops = self.stops.clone();
+                let option_stop = |option: usize| {
+                    own.clone()
+                        .find(|&index| stops[index] == Stop::Option { field, option })
+                };
+                if choice.other {
+                    // Empty Other first: a radio's Other text would otherwise
+                    // stand in for the picked option.
+                    self.go(own.end - 1)?;
+                    let stop = Stop::Other { field };
+                    self.until(stop, |_| true)?;
+                    self.clear(stop, false, "")?;
+                    if let Some(text) = other {
+                        self.type_text(text)?;
+                        self.until(stop, |seen| matches!(seen, Seen::Other { selected: true, text: shown } if !shown.is_empty()))?;
+                    }
+                }
+                if choice.multi {
+                    // Every enabled option, set to its target whatever it shows.
+                    for (option, entry) in choice.options.iter().enumerate() {
+                        let Some(index) = option_stop(option).filter(|_| !entry.disabled) else {
+                            continue;
+                        };
+                        self.go(index)?;
+                        let stop = Stop::Option { field, option };
+                        let want = checked.contains(&option);
+                        if let Seen::Option { selected } = self.until(stop, |_| true)? {
+                            if selected != want {
+                                self.keys(vec!["space"])?;
+                            }
+                        }
+                        self.until(stop, |seen| *seen == Seen::Option { selected: want })?;
+                    }
+                    return Ok(());
+                }
+                if other.is_some() {
+                    return Ok(());
+                }
+                match checked
+                    .first()
+                    .copied()
+                    .and_then(|option| option_stop(option).map(|index| (option, index)))
+                {
+                    // Space picks the option and stays on it.
+                    Some((option, index)) => {
+                        self.go(index)?;
+                        let stop = Stop::Option { field, option };
+                        self.until(stop, |_| true)?;
+                        self.keys(vec!["space"])?;
+                        self.until(stop, |seen| *seen == Seen::Option { selected: true })
+                            .map(drop)
+                    }
+                    // Nothing to pick (no default, no answer): nothing may be
+                    // picked either.
+                    None => {
+                        for option in 0..choice.options.len() {
+                            let Some(index) = option_stop(option) else {
+                                continue;
+                            };
+                            self.go(index)?;
+                            self.until(Stop::Option { field, option }, |seen| {
+                                *seen == Seen::Option { selected: false }
+                            })?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// ←/→ presses from `current` to `target` on a dropdown: `#step` moves to
+/// the next enabled option in that direction each press.
+fn dropdown_keys(choice: &Choice, current: Option<usize>, target: usize) -> Vec<&'static str> {
+    let enabled = |range: std::ops::Range<usize>| {
+        range
+            .filter(|index| !choice.options[*index].disabled)
+            .count()
+    };
+    match current {
+        Some(current) if current == target => Vec::new(),
+        Some(current) if current < target => vec!["right"; enabled(current + 1..target + 1)],
+        Some(current) => vec!["left"; enabled(target..current)],
+        // `#step` from -1: the first press lands on the first enabled option.
+        None => vec!["right"; enabled(0..target + 1)],
+    }
+}
+
+/// Check the form shows its starting state, then set every field to its
+/// target, checking each on screen as it goes, and press Submit once the
+/// focus is on it. A field that does not show what was sent stops the drive
+/// before Submit.
 pub(crate) fn drive(
     pane: &mut impl FormPane,
     form: &ParsedForm,
@@ -605,18 +919,75 @@ pub(crate) fn drive(
         }
     }
     if !ready {
-        return Err(ErrorBody {
-            code: "ask_form_moved".into(),
-            message: "the form on the agent's screen is not in its starting state (being answered in the terminal, hidden, or scrolled away)".into(),
-        });
+        return Err(moved(
+            "the form on the agent's screen is not in its starting state (being answered in the terminal, hidden, or scrolled away)",
+        ));
     }
-    for (index, action) in plan.actions.iter().enumerate() {
-        if index > 0 {
-            pane.pause();
+    let mut driver = Driver {
+        pane,
+        form,
+        stops: stops(form),
+        at: 0,
+    };
+    // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
+    // the first stop ↑ goes nowhere.
+    driver.keys(vec!["up"])?;
+    while let Some(field) = driver.stops[driver.at].field() {
+        let start = driver
+            .stops
+            .iter()
+            .position(|stop| stop.field() == Some(field))
+            .unwrap_or(driver.at);
+        let end = start
+            + driver.stops[start..]
+                .iter()
+                .take_while(|stop| stop.field() == Some(field))
+                .count();
+        driver.field(field, start..end, &plan.targets[field])?;
+        // Tab leaves the field from any of its stops for the next field's first.
+        driver.keys(vec!["tab"])?;
+        driver.at = end;
+    }
+    driver.until(Stop::Submit, |_| true)?;
+    driver.keys(vec!["enter"])
+}
+
+/// Screen reads [`drive`] makes while the form may still be drawing.
+const START_READS: usize = 3;
+
+/// An error omp shows under a field after a refused Submit, as
+/// `(field name, message)`: the first text field whose rows are followed by
+/// one of omp's validation messages (`pattern` and URL checks are omp's).
+pub(crate) fn submit_error(screen: &str, form: &ParsedForm) -> Option<(String, String)> {
+    const MESSAGES: [&str; 9] = [
+        "Must match ",
+        "Enter a full URL",
+        "Enter an email address",
+        "Enter a number",
+        "Must be at least",
+        "Must be at most",
+        "Needs at least",
+        "At most",
+        "Required",
+    ];
+    let rows = rows_of(screen);
+    for field in &form.fields {
+        let FieldKind::Text(input) = &field.kind else {
+            continue;
+        };
+        for start in 0..rows.len() {
+            let Some(count) = label_rows(&rows, start, &field.label) else {
+                continue;
+            };
+            let Some(row) = rows.get(start + count + input.height()) else {
+                continue;
+            };
+            if MESSAGES.iter().any(|message| row.text.starts_with(message)) {
+                return Some((field.name.clone(), row.text.clone()));
+            }
         }
-        pane.send(action)?;
     }
-    Ok(())
+    None
 }
 
 #[cfg(test)]

@@ -426,8 +426,13 @@ impl FakeForm {
             let marker = if self.db == Some(index) { "◉" } else { "○" };
             screen.push_str(&format!("│ {}{marker} {label}\n", cursor(index)));
         }
+        let db_other = if self.db.is_none() && !self.db_other.is_empty() {
+            "◉"
+        } else {
+            "○"
+        };
         screen.push_str(&format!(
-            "│ {}○ Other: {}\n Tools\n",
+            "│ {}{db_other} Other: {}\n Tools\n",
             cursor(2),
             other(&self.db_other)
         ));
@@ -435,8 +440,13 @@ impl FakeForm {
             let marker = if self.tools[index] { "☑" } else { "☐" };
             screen.push_str(&format!("│ {}{marker} {label}\n", cursor(3 + index)));
         }
+        let tools_other = if self.tools_other.is_empty() {
+            "☐"
+        } else {
+            "☑"
+        };
         screen.push_str(&format!(
-            "│ {}☐ Other: {}\n",
+            "│ {}{tools_other} Other: {}\n",
             cursor(5),
             other(&self.tools_other)
         ));
@@ -467,7 +477,10 @@ impl FakeForm {
                 }
                 self.move_field();
             }
+            ("space", 0 | 1) => self.db = Some(self.focus),
             ("space", 3 | 4) => self.tools[self.focus - 3] ^= true,
+            ("ctrl+u", 2) => self.db_other.clear(),
+            ("ctrl+u", 5) => self.tools_other.clear(),
             ("enter", 6) => self.submit(),
             _ => {}
         }
@@ -499,9 +512,24 @@ impl FakeForm {
         if !self.tools_other.trim().is_empty() {
             tools.push(format!("Other: {}", self.tools_other.trim()));
         }
+        let db_value = match self.db {
+            Some(index) => DB[index].0.to_owned(),
+            None => self.db_other.trim().to_owned(),
+        };
+        let mut tools_value: Vec<String> = TOOLS
+            .iter()
+            .zip(self.tools)
+            .filter(|(_, on)| *on)
+            .map(|((value, _), _)| (*value).to_owned())
+            .collect();
+        if !self.tools_other.trim().is_empty() {
+            tools_value.push(self.tools_other.trim().to_owned());
+        }
+        let data = json!({"db": db_value, "tools": tools_value});
         let line = json!({
             "type": "message", "id": "e_result", "parentId": "e_ask",
             "message": {"role": "toolResult", "toolCallId": self.ask_id, "toolName": "ask",
+                "content": [{"type": "text", "text": format!("User answers:\n{data:#}")}],
                 "details": {"answers": [
                     {"name": "db", "question": "Database", "answer": db},
                     {"name": "tools", "question": "Tools", "answer": tools.join(", ")},
@@ -619,7 +647,15 @@ fn answer_form_accepts_the_recommendations_with_empty_values() {
     let (harness, form) = form_harness();
     let response = answer_form_via_app(&harness, &form, json!({}));
     assert_eq!(response["result"]["status"], "answered", "{response}");
-    assert_eq!(form.lock().unwrap().keys, ["up", "tab", "tab", "enter"]);
+    // Every field is set outright: Other emptied, the default picked, each
+    // checkbox read and kept.
+    assert_eq!(
+        form.lock().unwrap().keys,
+        [
+            "up", "down", "down", "ctrl+e", "ctrl+u", "up", "up", "space", "tab", "down", "down",
+            "ctrl+e", "ctrl+u", "up", "up", "down", "tab", "enter"
+        ]
+    );
     assert_eq!(response["result"]["answers"][1]["answer"], "CI");
 }
 

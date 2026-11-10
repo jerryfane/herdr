@@ -209,24 +209,40 @@ pub(crate) fn pending_ask_with_form(
     }
 }
 
-/// The `details.answers` recorded for the form `ask` call `ask_id`, once
-/// its result is written; `None` while it is unanswered.
-pub(crate) fn form_ask_result(
+/// A form `ask` call's recorded result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FormAskOutcome {
+    /// `details.answers`.
+    pub(crate) answers: Vec<AskFormAnswer>,
+    /// The submitted data from the result text, when it parses.
+    pub(crate) data: Option<serde_json::Map<String, serde_json::Value>>,
+    pub(crate) timed_out: bool,
+}
+
+/// The result recorded for the form `ask` call `ask_id`, once written;
+/// `None` while it is unanswered.
+pub(crate) fn form_ask_outcome(
     session_path: &Path,
     ask_id: &str,
-) -> std::io::Result<Option<Vec<AskFormAnswer>>> {
+) -> std::io::Result<Option<FormAskOutcome>> {
     let read = with_index(session_path, |view| {
         let Some(result) = view.index.result_for(ask_id) else {
             return Ok(None);
         };
         let failed = view.index.record(result).failed;
         let line: ResultLine = view.parse(result)?.ok_or(TranscriptError::CursorExpired)?;
-        Ok(Some(
-            normalize::form_result(line.message.details.as_ref(), failed).0,
-        ))
+        let details = line.message.details.as_ref();
+        let (answers, status) = normalize::form_result(details, failed);
+        Ok(Some(FormAskOutcome {
+            answers,
+            data: (!failed)
+                .then(|| normalize::form_result_data(&line.message.content))
+                .flatten(),
+            timed_out: status == crate::api::schema::AskFormStatus::TimedOut,
+        }))
     });
     match read {
-        Ok(answers) => Ok(answers),
+        Ok(outcome) => Ok(outcome),
         Err(TranscriptError::Unavailable(error)) => Err(error),
         Err(other) => Err(std::io::Error::other(other.message())),
     }
