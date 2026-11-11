@@ -23,7 +23,7 @@ use crate::agent_transcript::ask_form::{
 };
 use crate::api::schema::{AskFormValue, ErrorBody};
 
-use super::selector::{trim_right_edge, CURSOR_GLYPHS, LEFT_EDGE};
+use super::selector::{trim_right_edge, BOX_VERTICAL, CURSOR_GLYPHS, LEFT_EDGE};
 
 /// What omp shows in an empty Other row.
 const OTHER_PLACEHOLDER: &str = "type your own";
@@ -735,8 +735,9 @@ fn is_empty_text(row: &str, placeholder: &str) -> bool {
 /// lines after its focused label with only the form's frame removed, every
 /// other cell kept as drawn (padding included). omp frames each one as the
 /// panel's `│ ` (`row`, overlay-box.ts:47-50), the field's `  │ `
-/// (`#textFieldLines`, dialog.ts:1375), the editor's row padded to the
-/// field's inner width, then the panel's ` │`. All rows have that width.
+/// (`#textFieldLines`, dialog.ts:1369-1375), the editor's row padded to the
+/// field's inner width, then the panel's ` │`; every `│` is the symbol
+/// preset's `boxRound.vertical` (`BOX_VERTICAL`). All rows have that width.
 fn editor_rows(
     screen: &str,
     form: &ParsedForm,
@@ -750,8 +751,10 @@ fn editor_rows(
     let rows: Vec<String> = values
         .iter()
         .map(|line| {
-            let rest = line.trim_start().strip_prefix("│   │ ")?;
-            let rest = rest.trim_end_matches(' ').strip_suffix('│')?;
+            let rest = line.trim_start().strip_prefix(BOX_VERTICAL)?;
+            let rest = rest.strip_prefix("   ")?.strip_prefix(BOX_VERTICAL)?;
+            let rest = rest.strip_prefix(' ')?;
+            let rest = rest.trim_end_matches(' ').strip_suffix(BOX_VERTICAL)?;
             Some(rest.strip_suffix(' ')?.to_owned())
         })
         .collect::<Option<_>>()?;
@@ -1453,7 +1456,11 @@ const START_READS: usize = 3;
 
 /// An error omp shows under a field after a refused Submit, as
 /// `(field name, message)`: the first text field whose rows are followed by
-/// one of omp's validation messages (`pattern` and URL checks are omp's).
+/// one of omp's validation messages (`pattern` and URL checks are omp's, and
+/// a kept textarea's content was never checked by herdr). omp draws the
+/// error after the whole field (dialog.ts:1255-1271): its label rows, then
+/// its value rows (`TextInput::height`: one for an input, the textarea's
+/// fixed editor height).
 pub(crate) fn submit_error(screen: &str, form: &ParsedForm) -> Option<(String, String)> {
     const MESSAGES: [&str; 9] = [
         "Must match ",
@@ -1468,14 +1475,14 @@ pub(crate) fn submit_error(screen: &str, form: &ParsedForm) -> Option<(String, S
     ];
     let rows = rows_of(screen);
     for field in &form.fields {
-        if !matches!(&field.kind, FieldKind::Text(_)) {
+        let FieldKind::Text(input) = &field.kind else {
             continue;
-        }
+        };
         for start in 0..rows.len() {
             let Some(count) = label_rows(&rows, start, &field.label) else {
                 continue;
             };
-            let Some(row) = rows.get(start + count + 1) else {
+            let Some(row) = rows.get(start + count + input.height()) else {
                 continue;
             };
             if MESSAGES.iter().any(|message| row.text.starts_with(message)) {
