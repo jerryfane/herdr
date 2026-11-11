@@ -1222,14 +1222,83 @@ fn foreign_garbled_or_rewritten_cursors_expire() {
 }
 
 #[test]
-fn a_missing_file_is_unavailable() {
-    let session = Fixture::new("missing");
+fn a_fresh_session_is_an_empty_page_whose_cursor_returns_the_first_turn() {
+    // omp reports the session file before its first turn creates it (#399).
+    let mut session = Fixture::new("fresh");
+    let header = std::fs::read_to_string(&session.path).unwrap();
     std::fs::remove_file(&session.path).unwrap();
+
+    let fresh = session.newest();
+    assert!(fresh.entries.is_empty());
+    assert_eq!(fresh.session_id, "sess-1", "the id in omp's file name");
+    assert_eq!(fresh.before, None);
+    assert_eq!(fresh.pending_ask, None);
+    assert_eq!(fresh.working, None);
+    // Nothing can be pending without a file; askers already treat this as no ask.
+    assert!(pending_ask(&session.path).is_err());
+    let idle = session.page(None, Some(&fresh.after), None);
+    assert!(idle.entries.is_empty());
+    assert_eq!(
+        idle.after, fresh.after,
+        "polling a fresh session keeps its place"
+    );
+    assert_eq!(
+        read_err(&session.path, Some(&fresh.after), None),
+        "cursor_expired"
+    );
+
+    // omp creates the file, header first.
+    std::fs::write(&session.path, "").unwrap();
+    let created = session.page(None, Some(&fresh.after), None);
+    assert!(created.entries.is_empty());
+    assert_eq!(created.after, fresh.after);
+    session.raw(&header);
+    let headed = session.page(None, Some(&fresh.after), None);
+    assert!(headed.entries.is_empty());
+    assert_eq!(
+        headed.after, fresh.after,
+        "the header names the same session"
+    );
+
+    session.user("first");
+    session.assistant(vec![text("hello")], "stop");
+    let first = session.page(None, Some(&fresh.after), None);
+    assert_eq!(kinds(&first.entries), vec!["user", "reply", "turn_end"]);
+    assert_eq!(user_texts(&first.entries), vec!["first"]);
+    assert_eq!(first.session_id, "sess-1");
+    assert_eq!(pending_ask(&session.path).unwrap(), None);
+    assert_eq!(
+        session.newest().entries,
+        first.entries,
+        "the newest page agrees"
+    );
+}
+
+#[test]
+fn a_session_file_that_cannot_be_read_is_unavailable() {
+    // Its directory is gone: not a session omp is about to start.
+    let session = Fixture::new("missing-dir");
+    std::fs::remove_dir_all(session.path.parent().unwrap()).unwrap();
     assert_eq!(
         read_err(&session.path, None, None),
         "transcript_unavailable"
     );
     assert!(pending_ask(&session.path).is_err());
+
+    // Something other than a file is at the path.
+    let session = Fixture::new("not-a-file");
+    std::fs::remove_file(&session.path).unwrap();
+    std::fs::create_dir(&session.path).unwrap();
+    assert_eq!(
+        read_err(&session.path, None, None),
+        "transcript_unavailable"
+    );
+    assert!(pending_ask(&session.path).is_err());
+
+    // The directory is a file.
+    let session = Fixture::new("parent-is-a-file");
+    let below = session.path.join("2026-10-23T10-00-00-000Z_sess-2.jsonl");
+    assert_eq!(read_err(&below, None, None), "transcript_unavailable");
 }
 
 #[test]

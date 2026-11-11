@@ -69,7 +69,8 @@ pub(crate) struct Page {
 
 #[derive(Debug)]
 pub(crate) enum TranscriptError {
-    /// The session file is missing or unreadable.
+    /// The session file is unreadable, or missing along with its directory
+    /// (a missing file in an existing directory is a new, empty session).
     Unavailable(std::io::Error),
     /// The cursor no longer names this file's active branch.
     CursorExpired,
@@ -171,10 +172,71 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
             with_index(&child, |view| view.page(request, limit, &[]))
         }
-        None => with_index(path, |view| {
+        None => match with_index(path, |view| {
             view.page(request, limit, &request.other_prompts)
-        }),
+        }) {
+            Err(TranscriptError::Unavailable(error)) if not_written_yet(path, &error) => {
+                unwritten_page(path, request)
+            }
+            read => read,
+        },
     }
+}
+
+/// omp names a new session's file before its first turn creates it: the file
+/// is missing but the directory omp writes it to exists. A missing directory
+/// (or any other error) stays unreadable.
+fn not_written_yet(path: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound && path.parent().is_some_and(Path::is_dir)
+}
+
+/// The page of a session whose file omp has not written yet: an empty
+/// conversation whose `after` cursor is the one the file accepts once omp
+/// writes it, so the next poll returns the first turn.
+fn unwritten_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptError> {
+    let session_id = file_session_id(path).unwrap_or_default().to_owned();
+    // There are no records yet: only an `after` cursor that has seen none
+    // still names a position here.
+    let valid = match (&request.before, &request.after) {
+        (Some(_), _) => false,
+        (None, Some(token)) => matches!(
+            Cursor::decode(token, &session_id)?,
+            Cursor::After {
+                seen: 0,
+                tip: None,
+                ..
+            }
+        ),
+        (None, None) => true,
+    };
+    if !valid {
+        return Err(TranscriptError::CursorExpired);
+    }
+    let after = Cursor::After {
+        seen: 0,
+        tip: None,
+        origins: Some(origin::fingerprint(&request.other_prompts)),
+    }
+    .encode(&session_id);
+    Ok(Page {
+        session_id,
+        entries: Vec::new(),
+        before: None,
+        after,
+        pending_ask: None,
+        working: None,
+        model: None,
+        plan: None,
+        recap: None,
+        subagents: None,
+    })
+}
+
+/// The session id in omp's file name (`<timestamp>_<id>.jsonl`), for a file
+/// whose `session` header is not written yet.
+fn file_session_id(path: &Path) -> Option<&str> {
+    let (_, id) = path.file_stem()?.to_str()?.split_once('_')?;
+    (!id.is_empty()).then_some(id)
 }
 
 /// The newest `ask` on the active branch still waiting for its answer.
@@ -376,8 +438,14 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    /// The `session` header's id; until omp writes it, the id in the file
+    /// name, so cursors issued before the header still resolve after it.
     fn session_id(&self) -> &str {
-        self.index.session_id.as_deref().unwrap_or_default()
+        self.index
+            .session_id
+            .as_deref()
+            .or_else(|| file_session_id(self.index.path()))
+            .unwrap_or_default()
     }
 
     fn kind(&self, position: usize) -> Kind {
