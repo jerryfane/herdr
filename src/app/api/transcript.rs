@@ -141,3 +141,49 @@ fn transcript_response(
         Err(error) => encode_error(id, error.code(), error.message()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::agent_transcript::tests::{text, Fixture};
+
+    fn respond(source: &TranscriptSource, after: Option<&str>) -> Value {
+        let params = AgentTranscriptParams {
+            target: source.agent.clone(),
+            before: None,
+            after: after.map(str::to_owned),
+            limit: None,
+            subagent: None,
+        };
+        serde_json::from_str(&transcript_response("t".into(), source, params)).unwrap()
+    }
+
+    #[test]
+    fn a_fresh_omp_session_answers_an_empty_page_whose_after_poll_returns_the_first_turn() {
+        // omp reports the session file before its first turn creates it (#399).
+        let mut session = Fixture::new("api-fresh");
+        let header = std::fs::read_to_string(&session.path).unwrap();
+        std::fs::remove_file(&session.path).unwrap();
+        let source = TranscriptSource {
+            path: session.path.clone(),
+            agent: "omp".into(),
+            pane_id: "w1:p1".into(),
+            other_prompts: Vec::new(),
+        };
+
+        let fresh = respond(&source, None);
+        assert_eq!(fresh["result"]["type"], "agent_transcript", "{fresh}");
+        assert_eq!(fresh["result"]["entries"], json!([]));
+        assert_eq!(fresh["result"]["pending_ask"], Value::Null);
+        let after = fresh["result"]["after"].as_str().unwrap();
+
+        session.raw(&header);
+        session.user("first");
+        session.assistant(vec![text("hello")], "stop");
+        let first = respond(&source, Some(after));
+        assert_eq!(first["result"]["entries"][0]["kind"], "user", "{first}");
+        assert_eq!(first["result"]["entries"][0]["text"], "first");
+    }
+}
