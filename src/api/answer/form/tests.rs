@@ -156,6 +156,9 @@ struct Dialog {
     refuse: Option<(usize, String)>,
     /// Keys after this many are swallowed (someone else holds the form).
     frozen_after: Option<usize>,
+    /// Draw with omp's ascii symbol preset (`|` borders and rails, `>`
+    /// cursor, `(o)`/`[x]` markers; pi-tui theme/symbols.ts:1200-1400).
+    ascii: bool,
     /// Each key or paste with the stop it reached.
     received: Vec<(String, Stop)>,
     /// Pastes lose their last character (the terminal mangled the input).
@@ -184,6 +187,7 @@ impl Dialog {
             errors: vec![None; count],
             refuse: None,
             frozen_after: None,
+            ascii: false,
             paste_drops_last: false,
             fail_read_after_paste: None,
             reads_since_paste: None,
@@ -674,6 +678,25 @@ impl Dialog {
     }
 }
 
+/// A screen drawn with omp's unicode preset, redrawn with its ascii one.
+fn ascii_preset(screen: &str) -> String {
+    let mut out = String::with_capacity(screen.len());
+    for ch in screen.chars() {
+        match ch {
+            '│' => out.push('|'),
+            '❯' => out.push('>'),
+            '◉' => out.push_str("(o)"),
+            '○' => out.push_str("( )"),
+            '☑' => out.push_str("[x]"),
+            '☐' => out.push_str("[ ]"),
+            '╭' | '╮' | '╰' | '╯' => out.push('+'),
+            '─' => out.push('-'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 impl FormPane for Dialog {
     fn read_screen(&mut self) -> Result<String, ErrorBody> {
         if let Some(reads) = self.reads_since_paste.as_mut() {
@@ -685,7 +708,11 @@ impl FormPane for Dialog {
             }
             *reads += 1;
         }
-        Ok(self.render())
+        Ok(if self.ascii {
+            ascii_preset(&self.render())
+        } else {
+            self.render()
+        })
     }
 
     fn send(&mut self, action: &Action) -> Result<(), ErrorBody> {
@@ -1454,4 +1481,93 @@ fn combined_characters_are_refused_in_textareas() {
         assert_eq!(error.message, refused, "{answer_text:?}");
     }
     assert!(plan(&form, &values(&[("vo", text("Café 漢字 🙂"))])).is_ok());
+}
+
+/// #395: with omp's ascii symbol preset (`|` panel borders and field rail)
+/// a textarea is still read and replaced.
+#[test]
+fn a_textarea_is_replaced_under_the_ascii_preset() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.ascii = true;
+    let new = "Line one.\nLine two.";
+    let submitted = answer(
+        &mut dialog,
+        values(&[("voice", options(&["crisp"])), ("vo", text(new))]),
+    )
+    .unwrap();
+    assert_eq!(value(&submitted, "vo"), txt(new));
+    assert_eq!(value(&submitted, "voice"), txt("crisp"));
+}
+
+/// Screens of a real omp 18.18.6 drawn with its ascii symbol preset
+/// (`symbolPreset: ascii`), captured through a scratch herdr server.
+const OMP_ASCII: &str = include_str!("omp-18.18.6-ascii-textarea.json");
+
+/// #395: on a real ascii-preset screen the untouched form is recognised at
+/// its start and the focused textarea's raw rows are read.
+#[test]
+fn a_real_ascii_preset_screen_is_read() {
+    let fixture: serde_json::Value = serde_json::from_str(OMP_ASCII).unwrap();
+    let form = parse(fixture["html"].as_str().unwrap());
+    let start = fixture["start_screen"].as_str().unwrap();
+    assert!(at_start(start, &form), "{start}");
+    let focused = fixture["textarea_focused_screen"].as_str().unwrap();
+    let field = form
+        .fields
+        .iter()
+        .position(|field| field.name == "notes")
+        .unwrap();
+    let FieldKind::Text(input) = &form.fields[field].kind else {
+        unreachable!()
+    };
+    let rows = editor_rows(focused, &form, field, input.height()).expect("textarea rows");
+    let width = cells(&rows[0]);
+    let mut want = layout_rows(fixture["textarea_text"].as_str().unwrap(), width);
+    want.resize(input.height(), " ".repeat(width));
+    assert_eq!(rows, want);
+}
+
+/// #396: omp draws a validation error under the whole textarea; the row
+/// after its last editor row is read, not the one after its first.
+#[test]
+fn an_error_under_a_textarea_is_read() {
+    let html = r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
+<label><input type="radio" name="r" value="b"> B</label>
+<label>Notes <textarea name="n" rows="4" required>keep me</textarea></label></form>"#;
+    let mut dialog = Dialog::new(html);
+    // Emptied in the terminal before the app answered.
+    dialog.lines[1] = vec![String::new()];
+    dialog.refuse = Some((1, "Required".into()));
+    let form = dialog.form.clone();
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    drive(&mut dialog, &form, &planned).unwrap();
+    assert_eq!(dialog.submitted, None);
+    assert_eq!(
+        submit_error(&dialog.render(), &form),
+        Some(("n".to_owned(), "Required".to_owned()))
+    );
+}
+
+/// #396: the same on the real screen after omp refused the form's required
+/// textarea, emptied in the terminal, with the app's answer that kept it.
+#[test]
+fn a_real_required_error_under_a_textarea_is_read() {
+    let fixture: serde_json::Value = serde_json::from_str(OMP_ASCII).unwrap();
+    let form = parse(fixture["html"].as_str().unwrap());
+    let screen = fixture["required_refused_screen"].as_str().unwrap();
+    assert_eq!(
+        submit_error(screen, &form),
+        Some(("notes".to_owned(), "Required".to_owned()))
+    );
+}
+
+/// The textarea reader and the label/option readers share one set of frame
+/// glyphs: every preset's `boxRound.vertical` is a row edge for both.
+#[test]
+fn every_preset_frame_is_a_row_edge() {
+    use super::super::selector::RIGHT_EDGE;
+    for glyph in BOX_VERTICAL {
+        assert!(LEFT_EDGE.contains(&glyph), "{glyph}");
+        assert!(RIGHT_EDGE.contains(&glyph), "{glyph}");
+    }
 }

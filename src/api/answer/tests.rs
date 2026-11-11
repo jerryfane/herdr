@@ -403,6 +403,8 @@ struct FakeForm {
     tools_other: String,
     /// Someone already moved the focus in the terminal.
     touched: bool,
+    /// Enter on Submit does nothing (omp stalled; no result is written).
+    stalls_submit: bool,
     keys: Vec<String>,
 }
 
@@ -481,6 +483,7 @@ impl FakeForm {
             ("space", 3 | 4) => self.tools[self.focus - 3] ^= true,
             ("ctrl+u", 2) => self.db_other.clear(),
             ("ctrl+u", 5) => self.tools_other.clear(),
+            ("enter", 6) if self.stalls_submit => {}
             ("enter", 6) => self.submit(),
             _ => {}
         }
@@ -564,6 +567,7 @@ fn form_harness() -> (Harness, Arc<Mutex<FakeForm>>) {
         tools: [true, false],
         tools_other: String::new(),
         touched: false,
+        stalls_submit: false,
         keys: Vec::new(),
     };
     (harness, Arc::new(Mutex::new(form)))
@@ -694,6 +698,7 @@ fn answer_form_refuses_a_questions_ask() {
         tools: [true, false],
         tools_other: String::new(),
         touched: false,
+        stalls_submit: false,
         keys: Vec::new(),
     }));
     let response = answer_form_via_app(&harness, &form, json!({}));
@@ -719,4 +724,25 @@ fn a_form_with_a_textarea_is_answerable() {
         .unwrap()
         .unwrap();
     assert!(pending.form_answerable);
+}
+
+/// #396: a drive that ends without a recorded result (`sent_unconfirmed`)
+/// releases its claim: once the terminal shows the form at its start again,
+/// a later attempt drives it instead of being refused as `ask_not_pending`.
+#[test]
+fn an_unconfirmed_answer_does_not_block_a_later_attempt() {
+    let (harness, form) = form_harness();
+    form.lock().unwrap().stalls_submit = true;
+    let response = answer_form_via_app(&harness, &form, json!({}));
+    assert_eq!(
+        response["result"]["status"], "sent_unconfirmed",
+        "{response}"
+    );
+    {
+        let mut fake = form.lock().unwrap();
+        fake.stalls_submit = false;
+        fake.focus = 0;
+    }
+    let response = answer_form_via_app(&harness, &form, json!({}));
+    assert_eq!(response["result"]["status"], "answered", "{response}");
 }

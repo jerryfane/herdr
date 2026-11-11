@@ -29,6 +29,11 @@ const GUEST_ACTION_LABELS: [&str; 2] = ["Chat about this", "Next →"];
 pub(crate) const CURSOR_GLYPHS: [char; 3] = ['❯', '\u{f054}', '>'];
 /// Single-select radio markers of the same presets, unselected and selected.
 const RADIO_MARKERS: [&str; 6] = ["○", "◉", "\u{f10c}", "\u{f192}", "( )", "(o)"];
+/// omp's `boxRound.vertical` in each of its symbol presets (unicode and
+/// nerd `│`, ascii `|`; pi-tui theme/symbols.ts:441, :780, :1243): the ask
+/// panel's left and right borders and a text field's rail. `LEFT_EDGE` and
+/// `RIGHT_EDGE` contain both.
+pub(crate) const BOX_VERTICAL: [char; 2] = ['│', '|'];
 /// Characters that may sit left of the cursor slot: padding and the panel's
 /// left border.
 pub(crate) const LEFT_EDGE: [char; 5] = [' ', '│', '|', '┃', '║'];
