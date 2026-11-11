@@ -97,6 +97,10 @@ enum Target {
         other: Option<String>,
     },
     Text(String),
+    /// A textarea the values leave out: left exactly as it is (Tab passes
+    /// it). Its prefill is what omp should submit; confirmation reports an
+    /// edit made in the terminal.
+    Keep,
 }
 
 fn invalid(name: &str, reason: impl std::fmt::Display) -> ErrorBody {
@@ -112,13 +116,24 @@ fn initial(form: &ParsedForm, field: usize) -> Target {
             checked: choice.initial_checked(),
             other: None,
         },
+        FieldKind::Text(input) if input.multiline => Target::Keep,
         FieldKind::Text(input) => Target::Text(input.value.clone()),
     }
 }
 
-fn has_control_chars(text: &str) -> bool {
-    text.chars().any(char::is_control)
+/// Control characters, but for a textarea's line breaks (a tab would be
+/// drawn as spaces, which the read-back could not tell apart).
+fn has_control_chars(text: &str, multiline: bool) -> bool {
+    text.chars()
+        .any(|ch| ch.is_control() && !(multiline && ch == '\n'))
 }
+
+/// Longest textarea answer herdr types: omp's `Editor` turns a longer paste
+/// into a `[Paste #N]` marker (`isMarkerSized`, editor.ts `#handlePaste`),
+/// which the read-back could not check.
+const TEXTAREA_MAX_CHARS: usize = 1000;
+
+const TOO_LONG: &str = "too long to edit from the app; answer in the terminal";
 
 fn choice_target(
     name: &str,
@@ -155,7 +170,7 @@ fn choice_target(
         Some(_) if !choice.other => {
             return Err(invalid(name, "this field has no Other answer"));
         }
-        Some(text) if has_control_chars(text) => {
+        Some(text) if has_control_chars(text, false) => {
             return Err(invalid(name, "Other takes a single line of plain text"));
         }
         Some(text) => Some(text.to_owned()),
@@ -207,17 +222,63 @@ fn targets(
             FieldKind::Choice(choice) => {
                 choice_target(&field.name, choice, choice.initial_checked(), value)?
             }
-            FieldKind::Text(_) => {
+            FieldKind::Text(input) => {
                 if value.options.is_some() || value.other.is_some() {
                     return Err(invalid(&field.name, "a text field takes text"));
                 }
-                match &value.text {
+                // A textarea answer's line breaks as omp's editor keeps them:
+                // CRLF and lone CR become LF (`#handlePaste`, editor.ts).
+                let text = value.text.as_ref().map(|text| {
+                    if input.multiline {
+                        text.replace("\r\n", "\n").replace('\r', "\n")
+                    } else {
+                        text.clone()
+                    }
+                });
+                match &text {
                     None => initial(form, index),
-                    Some(text) if has_control_chars(text) => {
+                    Some(text) if has_control_chars(text, input.multiline) => {
                         return Err(invalid(
                             &field.name,
-                            "this field takes a single line of plain text",
+                            if input.multiline {
+                                "control characters are not allowed"
+                            } else {
+                                "this field takes a single line of plain text"
+                            },
                         ));
+                    }
+                    // A character built from several code points cannot be
+                    // confirmed on screen: herdr's terminal draws an emoji ZWJ
+                    // sequence wider than omp lays it out, and reads a letter
+                    // with a separate accent mark back precomposed.
+                    Some(text)
+                        if input.multiline
+                            && unicode_segmentation::UnicodeSegmentation::graphemes(
+                                text.as_str(),
+                                true,
+                            )
+                            .any(|grapheme| grapheme.chars().nth(1).is_some()) =>
+                    {
+                        return Err(invalid(
+                            &field.name,
+                            "combined characters (emoji sequences, separate accent marks) cannot be checked on screen; answer in the terminal",
+                        ));
+                    }
+                    Some(text) if input.multiline => {
+                        if text.split('\n').count() > input.height()
+                            || text.chars().count() > TEXTAREA_MAX_CHARS
+                        {
+                            return Err(invalid(&field.name, TOO_LONG));
+                        }
+                        // Clearing needs a stop before the textarea to prove
+                        // the caret reached the first line (`clear_textarea`).
+                        if stops(form).first() == Some(&Stop::Text { field: index }) {
+                            return Err(invalid(
+                                &field.name,
+                                "the form's first field cannot be edited from the app; answer in the terminal",
+                            ));
+                        }
+                        Target::Text(text.clone())
                     }
                     Some(text) => Target::Text(text.clone()),
                 }
@@ -234,6 +295,7 @@ fn value_of(form: &ParsedForm, field: usize, target: &Target) -> Option<FormValu
             choice_value(choice, checked, other.as_deref())
         }
         (FieldKind::Text(input), Target::Text(text)) => Some(text_value(input, text)),
+        (FieldKind::Text(input), Target::Keep) => Some(text_value(input, &input.value)),
         _ => None,
     }
 }
@@ -669,6 +731,252 @@ fn is_empty_text(row: &str, placeholder: &str) -> bool {
     row.is_empty() || (!placeholder.is_empty() && placeholder.starts_with(row))
 }
 
+/// The rows of the focused textarea `field`'s editor, raw: the `height`
+/// lines after its focused label with only the form's frame removed, every
+/// other cell kept as drawn (padding included). omp frames each one as the
+/// panel's `│ ` (`row`, overlay-box.ts:47-50), the field's `  │ `
+/// (`#textFieldLines`, dialog.ts:1375), the editor's row padded to the
+/// field's inner width, then the panel's ` │`. All rows have that width.
+fn editor_rows(
+    screen: &str,
+    form: &ParsedForm,
+    field: usize,
+    height: usize,
+) -> Option<Vec<String>> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let rows = rows_of(screen);
+    let (start, count) = focused_label(&rows, &form.fields[field].label)?;
+    let values = lines.get(start + count..start + count + height)?;
+    let rows: Vec<String> = values
+        .iter()
+        .map(|line| {
+            let rest = line.trim_start().strip_prefix("│   │ ")?;
+            let rest = rest.trim_end_matches(' ').strip_suffix('│')?;
+            Some(rest.strip_suffix(' ')?.to_owned())
+        })
+        .collect::<Option<_>>()?;
+    let width = cells(rows.first()?);
+    rows.iter().all(|row| cells(row) == width).then_some(rows)
+}
+
+fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// omp's `PLACEHOLDER_MIN_GAP` (editor.ts:465).
+const PLACEHOLDER_MIN_GAP: usize = 2;
+
+/// The rows an empty focused textarea of `width` cells and `height` rows
+/// shows. With the hardware cursor omp's form uses nothing is drawn at the
+/// caret, and the placeholder (the raw attribute, `editor.placeholder`,
+/// dialog.ts:677) is painted flush right on the first row when at least
+/// `PLACEHOLDER_MIN_GAP` cells stay free before it, else not at all: omp
+/// does not truncate it (`hintTail`, editor.ts:1627-1630).
+fn empty_rows(placeholder: &str, width: usize, height: usize) -> Vec<String> {
+    let blank = " ".repeat(width);
+    let mut rows = vec![blank; height];
+    let shown = cells(placeholder);
+    if !placeholder.is_empty() && width >= shown + PLACEHOLDER_MIN_GAP {
+        rows[0] = format!("{}{placeholder}", " ".repeat(width - shown));
+    }
+    rows
+}
+
+/// The rows a focused textarea of `width` cells shows holding `text`, each
+/// padded to `width`, as omp's `Editor` lays it out (`#layoutText`,
+/// editor.ts:3160-3225): a logical line no wider than the editor is one row
+/// as is; a wider one is word-wrapped by `wordWrapLine`.
+fn layout_rows(text: &str, width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| {
+            if cells(line) <= width {
+                vec![line.to_owned()]
+            } else {
+                word_wrap_line(line, width)
+            }
+        })
+        .map(|row| {
+            let pad = width.saturating_sub(cells(&row));
+            format!("{row}{}", " ".repeat(pad))
+        })
+        .collect()
+}
+
+/// JS `\s` / `String.prototype.trimEnd`'s whitespace: Unicode White_Space
+/// but U+0085, plus U+FEFF.
+fn is_js_space(ch: char) -> bool {
+    (ch.is_whitespace() && ch != '\u{85}') || ch == '\u{feff}'
+}
+
+/// A port of omp's `wordWrapLine` (editor.ts:169-400) for a line wider than
+/// `max`: graphemes (`Intl.Segmenter`, here `unicode-segmentation`) grouped
+/// into runs of whitespace and non-whitespace (`getWordNavKind`, by a
+/// grapheme's first code point); runs that fit are packed onto a row, a
+/// row's trailing whitespace is trimmed when it wraps and the next row's
+/// leading whitespace skipped; a run wider than a row is broken by
+/// grapheme, first filling what is left of the current row; a run with a
+/// wide grapheme (CJK) fills the current row before wrapping.
+fn word_wrap_line(line: &str, max: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    if line.is_empty() || max == 0 {
+        return vec![String::new()];
+    }
+    // Grapheme start offsets (with an end sentinel) and widths.
+    let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
+    let starts: Vec<usize> = graphemes
+        .iter()
+        .map(|(start, _)| *start)
+        .chain([line.len()])
+        .collect();
+    let widths: Vec<usize> = graphemes.iter().map(|(_, g)| cells(g)).collect();
+    let is_space = |g: &str| g.chars().next().is_some_and(char::is_whitespace);
+    struct Token {
+        start_g: usize,
+        end_g: usize,
+        whitespace: bool,
+    }
+    let mut tokens: Vec<Token> = Vec::new();
+    for (index, (_, grapheme)) in graphemes.iter().enumerate() {
+        let whitespace = is_space(grapheme);
+        match tokens.last_mut() {
+            Some(token) if token.whitespace == whitespace => token.end_g = index + 1,
+            _ => tokens.push(Token {
+                start_g: index,
+                end_g: index + 1,
+                whitespace,
+            }),
+        }
+    }
+    let span = |start_g: usize, end_g: usize| -> usize { widths[start_g..end_g].iter().sum() };
+    // The widest grapheme prefix of [start_g, end_g) fitting `available`.
+    let prefix_to_width = |start_g: usize, end_g: usize, available: usize| -> usize {
+        let mut width = 0;
+        let mut g = start_g;
+        while g < end_g {
+            if width + widths[g] > available {
+                break;
+            }
+            width += widths[g];
+            g += 1;
+            if width == available {
+                break;
+            }
+        }
+        g
+    };
+    let mut chunks: Vec<String> = Vec::new();
+    // The pending chunk is line[chunk_start..chunk_end] (byte offsets).
+    let mut chunk_start = 0;
+    let mut chunk_end = 0;
+    let mut current = 0;
+    let mut at_line_start = true;
+    for token in &tokens {
+        let token_start = starts[token.start_g];
+        let token_end = starts[token.end_g];
+        let token_width = span(token.start_g, token.end_g);
+        if at_line_start && token.whitespace {
+            chunk_start = token_end;
+            chunk_end = token_end;
+            continue;
+        }
+        at_line_start = false;
+        if token_width > max {
+            let mut prefix_end_g = token.start_g;
+            if chunk_end > chunk_start && current < max {
+                prefix_end_g = prefix_to_width(token.start_g, token.end_g, max - current);
+            }
+            if chunk_end > chunk_start {
+                if prefix_end_g > token.start_g {
+                    let end = starts[prefix_end_g];
+                    chunks.push(line[chunk_start..end].to_owned());
+                    chunk_start = end;
+                    chunk_end = end;
+                } else {
+                    chunks.push(line[chunk_start..chunk_end].to_owned());
+                    chunk_start = token_start;
+                    chunk_end = token_start;
+                }
+                current = 0;
+            }
+            let mut piece_start = starts[prefix_end_g];
+            let mut piece_end = piece_start;
+            let mut piece_width = 0;
+            for g in prefix_end_g..token.end_g {
+                let w = widths[g];
+                if piece_width + w > max && piece_end > piece_start {
+                    chunks.push(line[piece_start..piece_end].to_owned());
+                    piece_start = piece_end;
+                    piece_width = w;
+                } else {
+                    piece_width += w;
+                }
+                piece_end = starts[g + 1];
+            }
+            if piece_end > piece_start {
+                chunk_start = piece_start;
+                chunk_end = piece_end;
+                current = piece_width;
+            }
+            continue;
+        }
+        if current + token_width > max {
+            if chunk_end > chunk_start
+                && !token.whitespace
+                && current < max
+                && (token.start_g..token.end_g).any(|g| widths[g] > 1)
+            {
+                let end_g = prefix_to_width(token.start_g, token.end_g, max - current);
+                if end_g > token.start_g {
+                    let end = starts[end_g];
+                    chunks.push(line[chunk_start..end].to_owned());
+                    chunk_start = end;
+                    chunk_end = token_end;
+                    current = cells(&line[end..token_end]);
+                    at_line_start = false;
+                    continue;
+                }
+            }
+            let trimmed = line[chunk_start..chunk_end].trim_end_matches(is_js_space);
+            if !trimmed.is_empty() || chunks.is_empty() {
+                chunks.push(trimmed.to_owned());
+            }
+            at_line_start = true;
+            if token.whitespace {
+                chunk_start = token_end;
+                chunk_end = token_end;
+                current = 0;
+            } else {
+                chunk_start = token_start;
+                chunk_end = token_end;
+                current = token_width;
+                at_line_start = false;
+            }
+        } else {
+            if chunk_end == chunk_start {
+                chunk_start = token_start;
+            }
+            chunk_end = token_end;
+            current += token_width;
+        }
+    }
+    if chunk_end > chunk_start {
+        chunks.push(line[chunk_start..chunk_end].to_owned());
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// The outcome of reading a focused textarea back.
+enum ReadBack {
+    /// The raw rows the editor showed.
+    Shows(Vec<String>),
+    /// The raw rows the editor showed last; `None` when it was not on
+    /// screen.
+    Differs(Option<Vec<String>>),
+}
+
 /// The agent's pane as the form driver sees it.
 pub(crate) trait FormPane {
     fn read_screen(&mut self) -> Result<String, ErrorBody>;
@@ -678,6 +986,10 @@ pub(crate) trait FormPane {
 
 /// Screen reads (one pause apart) the form gets to show a step.
 const SETTLE_READS: usize = 20;
+/// Reads a stop must hold, after a key, to count as not having moved.
+const STAY_READS: usize = 3;
+/// ↑/↓ presses one textarea may take to reach its first or last line.
+const TEXTAREA_MAX_MOVES: usize = 40;
 /// Hard caps per field, whatever the screen shows.
 const MAX_FIELD_KEYS: usize = 6_000;
 const MAX_FIELD_READS: usize = 800;
@@ -778,6 +1090,170 @@ impl<P: FormPane> Driver<'_, P> {
         .map(drop)
     }
 
+    /// Send `key` and read until the focus settles on one of `stops`: its
+    /// index. Leaving for `stops[1]` shows at once; staying on `stops[0]` is
+    /// taken once it held for `STAY_READS` reads. A later move than that is
+    /// caught by the next key, which then finds focus on neither stop.
+    fn step(&mut self, key: &'static str, stops: [Stop; 2]) -> Result<usize, ErrorBody> {
+        self.keys(vec![key])?;
+        let mut stayed = 0;
+        for read in 0..SETTLE_READS {
+            if read > 0 {
+                self.pane.pause();
+            }
+            let screen = self.read()?;
+            if seen(&screen, self.form, stops[1]).is_some() {
+                return Ok(1);
+            }
+            if seen(&screen, self.form, stops[0]).is_some() {
+                stayed += 1;
+                if stayed >= STAY_READS {
+                    return Ok(0);
+                }
+            } else {
+                stayed = 0;
+            }
+        }
+        Err(self.displaced(stops[0]))
+    }
+
+    /// Replace a textarea's whole content with `text`, proving each step by
+    /// where omp's form moves the focus rather than by the editor viewport
+    /// (which can hide lines and show blank ones):
+    /// 1. ↑ until the focus leaves for the stop before: `#textInput`
+    ///    (dialog.ts:857-861) hands ↑ to the form only on the first logical
+    ///    line, so the caret is then on line 0. Tab comes back (the caret
+    ///    stays).
+    /// 2. ↓ until the focus leaves for the stop after, counting presses: ↓
+    ///    leaves only from the last logical line and moves at most one line
+    ///    otherwise, so the count `n` is at least the number of lines.
+    ///    Shift+Tab comes back; the caret is on the last line.
+    /// 3. Ctrl+E puts the caret at the end of that line (`#moveToLineEnd`,
+    ///    editor.ts:4258-4263), the end of the text. Each Ctrl+U deletes to
+    ///    the line start, or at a line start joins the line above
+    ///    (`#deleteToStartOfLine`, editor.ts:4495-4523), so `2n` of them
+    ///    empty the editor; more do nothing on an empty first line.
+    /// 4. Paste `text`, then read the focused editor back: every visible
+    ///    character of `text` must show, in order, within its rows.
+    ///
+    /// Too many lines to count (`TEXTAREA_MAX_MOVES`) or an answer that does
+    /// not fit the editor is `ask_form_invalid`; anything else unexpected is
+    /// `ask_form_moved`. Nothing is submitted either way, and omp's Editor
+    /// has no key that empties a whole draft (`keybindings.ts:9-30`), so
+    /// these steps are the clear.
+    fn edit_textarea(
+        &mut self,
+        field: usize,
+        input: &crate::agent_transcript::ask_form::TextInput,
+        text: &str,
+    ) -> Result<(), ErrorBody> {
+        let stop = Stop::Text { field };
+        let index = self
+            .stops
+            .iter()
+            .position(|candidate| *candidate == stop)
+            .expect("a text field has a stop");
+        // `plan` refuses a textarea that is the first stop.
+        let (before, after) = (self.stops[index - 1], self.stops[index + 1]);
+        let name = self.form.fields[field].name.clone();
+        self.until(stop, |_| true)?;
+        let height = input.height();
+        // The editor's width (`editor_rows` returns rows of one width),
+        // read before anything is sent: an answer that would not show whole,
+        // or whose rows could not be told from the empty editor's
+        // placeholder, is refused while the draft is intact.
+        let width = match self.editor_shows(field, height, |_| true)? {
+            ReadBack::Shows(rows) => cells(&rows[0]),
+            ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
+        };
+        let empty = empty_rows(&input.placeholder, width, height);
+        let want = if text.is_empty() {
+            empty.clone()
+        } else {
+            let mut rows = layout_rows(text, width);
+            // More rows than the editor shows would scroll.
+            if rows.len() > height {
+                return Err(invalid(&name, TOO_LONG));
+            }
+            rows.resize(height, " ".repeat(width));
+            rows
+        };
+        if !text.is_empty() && want == empty {
+            return Err(invalid(
+                &name,
+                "answer looks like the placeholder; answer in the terminal",
+            ));
+        }
+        let mut up = 0;
+
+        while self.step("up", [stop, before])? == 0 {
+            up += 1;
+            if up > TEXTAREA_MAX_MOVES {
+                return Err(invalid(&name, TOO_LONG));
+            }
+        }
+        self.keys(vec!["tab"])?;
+        self.until(stop, |_| true)?;
+        let mut lines = 1;
+        while self.step("down", [stop, after])? == 0 {
+            lines += 1;
+            if lines > TEXTAREA_MAX_MOVES {
+                return Err(invalid(&name, TOO_LONG));
+            }
+        }
+        self.keys(vec!["shift+tab"])?;
+        self.until(stop, |_| true)?;
+        let mut keys = vec!["ctrl+e"];
+        keys.extend(std::iter::repeat_n("ctrl+u", 2 * lines));
+        self.keys(keys)?;
+        match self.editor_shows(field, height, |rows| rows == empty.as_slice())? {
+            ReadBack::Shows(_) => {}
+            ReadBack::Differs(rows) => return Err(self.misread(stop, rows)),
+        }
+        self.type_text(text)?;
+        match self.editor_shows(field, height, |rows| rows == want.as_slice())? {
+            ReadBack::Shows(_) => Ok(()),
+            ReadBack::Differs(rows) => Err(self.misread(stop, rows)),
+        }
+    }
+
+    /// `ask_form_moved` for a textarea that did not show what was expected,
+    /// naming what it showed.
+    fn misread(&self, stop: Stop, rows: Option<Vec<String>>) -> ErrorBody {
+        let mut error = self.displaced(stop);
+        if let Some(rows) = rows {
+            let shown: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+            error
+                .message
+                .push_str(&format!("; the editor showed {shown:?}"));
+        }
+        error
+    }
+
+    /// Read until the focused textarea's raw rows satisfy `done`. Backend
+    /// errors (`pane_not_found`, a failed read) propagate unchanged; a
+    /// screen that never shows it is `ReadBack::Differs` with the rows the
+    /// editor showed last, `None` when the editor was not found.
+    fn editor_shows(
+        &mut self,
+        field: usize,
+        height: usize,
+        done: impl Fn(&[String]) -> bool,
+    ) -> Result<ReadBack, ErrorBody> {
+        let mut last = None;
+        for read in 0..SETTLE_READS {
+            if read > 0 {
+                self.pane.pause();
+            }
+            let screen = self.read()?;
+            last = editor_rows(&screen, self.form, field, height);
+            if let Some(rows) = last.take_if(|rows| done(rows)) {
+                return Ok(ReadBack::Shows(rows));
+            }
+        }
+        Ok(ReadBack::Differs(last))
+    }
+
     fn type_text(&mut self, text: &str) -> Result<(), ErrorBody> {
         if text.is_empty() {
             return Ok(());
@@ -793,7 +1269,13 @@ impl<P: FormPane> Driver<'_, P> {
     ) -> Result<(), ErrorBody> {
         let form = self.form;
         match (&form.fields[field].kind, target) {
-            // Textareas never get here: `ParsedForm::refusal` refuses them.
+            // A textarea the values leave out is left as it is.
+            (FieldKind::Text(_), Target::Keep) => {
+                self.until(Stop::Text { field }, |_| true).map(drop)
+            }
+            (FieldKind::Text(input), Target::Text(text)) if input.multiline => {
+                self.edit_textarea(field, input, text)
+            }
             (FieldKind::Text(input), Target::Text(text)) => {
                 let stop = Stop::Text { field };
                 self.until(stop, |_| true)?;

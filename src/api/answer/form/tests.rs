@@ -143,9 +143,11 @@ struct Dialog {
     focus: usize,
     checked: Vec<Vec<usize>>,
     other: Vec<String>,
-    /// Text fields (single-line `Input`s): value and caret (in chars).
-    text: Vec<String>,
-    caret: Vec<usize>,
+    /// Text fields: lines and caret (line, column in chars).
+    lines: Vec<Vec<String>>,
+    caret: Vec<(usize, usize)>,
+    /// A textarea editor's scroll offset (visual rows), kept across frames.
+    scroll: Vec<std::cell::Cell<usize>>,
     width: usize,
     keys: Vec<String>,
     submitted: Option<Vec<(String, Option<FormValue>)>>,
@@ -154,6 +156,13 @@ struct Dialog {
     refuse: Option<(usize, String)>,
     /// Keys after this many are swallowed (someone else holds the form).
     frozen_after: Option<usize>,
+    /// Each key or paste with the stop it reached.
+    received: Vec<(String, Stop)>,
+    /// Pastes lose their last character (the terminal mangled the input).
+    paste_drops_last: bool,
+    /// After a paste, the read with this index fails (`pane_not_found`).
+    fail_read_after_paste: Option<usize>,
+    reads_since_paste: Option<usize>,
 }
 
 impl Dialog {
@@ -166,21 +175,29 @@ impl Dialog {
             focus: 0,
             checked: vec![Vec::new(); count],
             other: vec![String::new(); count],
-            text: vec![String::new(); count],
-            caret: vec![0; count],
+            lines: vec![Vec::new(); count],
+            caret: vec![(0, 0); count],
+            scroll: (0..count).map(|_| std::cell::Cell::new(0)).collect(),
             width: 200,
             keys: Vec::new(),
             submitted: None,
             errors: vec![None; count],
             refuse: None,
             frozen_after: None,
+            paste_drops_last: false,
+            fail_read_after_paste: None,
+            reads_since_paste: None,
+            received: Vec::new(),
             form,
         };
         for (index, field) in dialog.form.fields.iter().enumerate() {
             match &field.kind {
                 FieldKind::Choice(choice) => dialog.checked[index] = choice.initial_checked(),
                 // omp ≥ 18.18.6 opens prefilled fields with the caret at the start.
-                FieldKind::Text(input) => dialog.text[index] = input.value.clone(),
+                // omp ≥ 18.18.6 opens prefilled fields with the caret at the start.
+                FieldKind::Text(input) => {
+                    dialog.lines[index] = input.value.split('\n').map(str::to_owned).collect()
+                }
             }
         }
         dialog
@@ -189,11 +206,19 @@ impl Dialog {
     /// omp 18.18.3: single-line inputs open with the caret at the end.
     fn caret_at_end(mut self) -> Self {
         for (index, field) in self.form.fields.iter().enumerate() {
-            if let FieldKind::Text(_) = &field.kind {
-                self.caret[index] = self.text[index].chars().count();
+            if let FieldKind::Text(input) = &field.kind {
+                if !input.multiline {
+                    self.caret[index] = (0, self.lines[index][0].chars().count());
+                }
             }
         }
         self
+    }
+
+    /// The textarea editor's inner width: the panel's width less its
+    /// `│ `/` │` frame and the field's `  │ ` (`#textFieldLines`).
+    fn editor_width(&self) -> usize {
+        self.width.saturating_sub(8).max(4)
     }
 
     fn field_of(&self) -> Option<usize> {
@@ -237,6 +262,7 @@ impl Dialog {
             return;
         }
         self.keys.push(key.to_owned());
+        self.received.push((key.to_owned(), self.stops[self.focus]));
         if key == "tab" {
             self.move_field();
             return;
@@ -316,32 +342,47 @@ impl Dialog {
         }
     }
 
-    /// omp's `Input`: ↑/↓ and Enter leave it; Ctrl+E/Ctrl+U/Ctrl+K edit.
     fn text_key(&mut self, field: usize, key: &str) {
-        let text = &mut self.text[field];
-        let mut col = self.caret[field];
+        let multiline =
+            matches!(&self.form.fields[field].kind, FieldKind::Text(input) if input.multiline);
+        let (mut line, mut col) = self.caret[field];
+        let lines = &mut self.lines[field];
+        let len = |text: &str| text.chars().count();
         let byte = |text: &str, col: usize| {
             text.char_indices()
                 .nth(col)
                 .map_or(text.len(), |(at, _)| at)
         };
         match key {
-            "up" => return self.move_stop(-1),
-            "down" => return self.move_stop(1),
-            "enter" => return self.move_field(),
-            "ctrl+e" => col = text.chars().count(),
-            "ctrl+u" => {
-                let at = byte(text, col);
-                text.replace_range(..at, "");
+            "up" if !multiline || line == 0 => return self.move_stop(-1),
+            "down" if !multiline || line + 1 == lines.len() => return self.move_stop(1),
+            "up" => line -= 1,
+            "down" => line += 1,
+            "enter" if !multiline => return self.move_field(),
+            "ctrl+e" => col = len(&lines[line]),
+            "ctrl+u" if col > 0 => {
+                let at = byte(&lines[line], col);
+                lines[line].replace_range(..at, "");
                 col = 0;
             }
-            "ctrl+k" => {
-                let at = byte(text, col);
-                text.truncate(at);
+            "ctrl+u" if multiline && line > 0 => {
+                let current = lines.remove(line);
+                line -= 1;
+                col = len(&lines[line]);
+                lines[line].push_str(&current);
+            }
+            "ctrl+k" if col < len(&lines[line]) => {
+                let at = byte(&lines[line], col);
+                lines[line].truncate(at);
+            }
+            "ctrl+k" if multiline && line + 1 < lines.len() => {
+                let next = lines.remove(line + 1);
+                lines[line].push_str(&next);
             }
             _ => {}
         }
-        self.caret[field] = col.min(self.text[field].chars().count());
+        col = col.min(len(&lines[line]));
+        self.caret[field] = (line, col);
     }
 
     fn paste(&mut self, text: &str) {
@@ -352,6 +393,14 @@ impl Dialog {
             return;
         }
         self.keys.push(format!("text:{text}"));
+        self.reads_since_paste = Some(0);
+        self.received
+            .push((format!("text:{text}"), self.stops[self.focus]));
+        let mut chars: Vec<char> = text.chars().collect();
+        if self.paste_drops_last {
+            chars.pop();
+        }
+        let text: &str = &chars.into_iter().collect::<String>();
         match self.stops[self.focus] {
             Stop::Other { field } => {
                 self.other[field].push_str(text);
@@ -360,14 +409,22 @@ impl Dialog {
                 }
             }
             Stop::Text { field } => {
-                let col = self.caret[field];
-                let current = &mut self.text[field];
+                let (line, col) = self.caret[field];
+                let current = &self.lines[field][line];
                 let at = current
                     .char_indices()
                     .nth(col)
                     .map_or(current.len(), |(at, _)| at);
-                current.insert_str(at, text);
-                self.caret[field] = col + text.chars().count();
+                let (before, after) = (current[..at].to_owned(), current[at..].to_owned());
+                let mut pasted: Vec<String> = format!("{before}{text}")
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect();
+                let last = pasted.len() - 1;
+                let caret = (line + last, pasted[last].chars().count());
+                pasted[last].push_str(&after);
+                self.lines[field].splice(line..=line, pasted);
+                self.caret[field] = caret;
             }
             _ => {}
         }
@@ -389,7 +446,7 @@ impl Dialog {
                         chosen.then_some(other.as_str()),
                     )
                 }
-                FieldKind::Text(input) => Some(text_value(input, &self.text[index])),
+                FieldKind::Text(input) => Some(text_value(input, &self.lines[index].join("\n"))),
             })
             .collect()
     }
@@ -476,13 +533,77 @@ impl Dialog {
             FieldKind::Text(input) => {
                 let stop = Stop::Text { field: index };
                 self.label_rows(index, stop, star, out);
-                let value = &self.text[index];
-                let row = if value.is_empty() {
-                    &input.placeholder
+                let lines = &self.lines[index];
+                let height = input.height();
+                let value = lines.join("\n");
+                let focused = self.stops[self.focus] == stop;
+                // As `#textFieldLines`: focused, the input or editor viewport
+                // (scrolled to keep the caret in view); unfocused, the value
+                // from its first line, `…` past the height, or the
+                // placeholder when empty.
+                let mut rows: Vec<String> = if focused && input.multiline && !value.is_empty() {
+                    // Lines wrap at the field width; the viewport keeps the
+                    // caret's row in view like `#updateScrollOffset`.
+                    let width = self.editor_width();
+                    let mut visual = Vec::new();
+                    let mut caret_row = 0;
+                    for (line_index, line) in lines.iter().enumerate() {
+                        // omp's wrapping, as ported (checked against real
+                        // omp by `the_wrap_port_matches_omp_screens`).
+                        let parts: Vec<String> = if line.chars().count() <= width {
+                            vec![line.clone()]
+                        } else {
+                            word_wrap_line(line, width)
+                        };
+                        if line_index == self.caret[index].0 {
+                            caret_row =
+                                visual.len() + (self.caret[index].1 / width).min(parts.len() - 1);
+                        }
+                        visual.extend(parts);
+                    }
+                    let mut offset = self.scroll[index].get();
+                    if caret_row < offset {
+                        offset = caret_row;
+                    } else if caret_row >= offset + height {
+                        offset = caret_row + 1 - height;
+                    }
+                    offset = offset.min(visual.len().saturating_sub(height));
+                    self.scroll[index].set(offset);
+                    visual.into_iter().skip(offset).take(height).collect()
+                } else if value.is_empty() && focused && input.multiline {
+                    // omp's Editor with the hardware cursor: the placeholder
+                    // flush right when 2 cells stay free before it, else
+                    // nothing (`hintTail`, editor.ts:1627-1630).
+                    let width = self.editor_width();
+                    let shown = input.placeholder.chars().count();
+                    if input.placeholder.is_empty() || width < shown + 2 {
+                        vec![String::new()]
+                    } else {
+                        vec![format!(
+                            "{}{}",
+                            " ".repeat(width - shown),
+                            input.placeholder
+                        )]
+                    }
+                } else if value.is_empty() {
+                    vec![input.placeholder.clone()]
                 } else {
-                    value
+                    lines.clone()
                 };
-                out.push(format!("│   │ {row}"));
+                if rows.len() > height {
+                    rows.truncate(height);
+                    if !focused {
+                        rows[height - 1] = "…".into();
+                    }
+                }
+                rows.resize(height, String::new());
+                // The panel pads every row to the field's inner width and
+                // closes it with ` │` (overlay-box.ts `row`).
+                let width = self.editor_width();
+                for row in rows {
+                    let pad = width.saturating_sub(row.chars().count());
+                    out.push(format!("│   │ {row}{} │", " ".repeat(pad)));
+                }
             }
             FieldKind::Choice(choice) if choice.is_dropdown() => {
                 let stop = Stop::Select { field: index };
@@ -555,6 +676,15 @@ impl Dialog {
 
 impl FormPane for Dialog {
     fn read_screen(&mut self) -> Result<String, ErrorBody> {
+        if let Some(reads) = self.reads_since_paste.as_mut() {
+            if Some(*reads) == self.fail_read_after_paste {
+                return Err(ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: "pane w1:p1 not found".into(),
+                });
+            }
+            *reads += 1;
+        }
         Ok(self.render())
     }
 
@@ -673,7 +803,7 @@ fn text_is_replaced_whatever_the_starting_caret() {
 #[test]
 fn edited_text_and_dropdowns_are_reset() {
     let mut dialog = Dialog::new(FORM);
-    dialog.text[3] = "changed".into();
+    dialog.lines[3] = vec!["changed".into()];
     dialog.checked[2] = vec![2];
     let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
     assert_eq!(value(&submitted, "region"), txt("us"));
@@ -891,19 +1021,437 @@ fn near_zero_numbers_are_not_confused() {
     assert!(!submission_matches(&zero, &recorded(r#"{"n": 5e-324}"#)));
 }
 
-/// #392 r4: forms with a `<textarea>` are refused before anything is read or
-/// sent: omp's `Editor` has no key that empties a whole draft, so a textarea
-/// is answered in the terminal.
+/// The owner's shape (xreal-desk): two radio groups and a prefilled,
+/// multi-line "edit freely" textarea.
+const VOICE_OVER: &str = r#"<form><fieldset><legend>Voice</legend>
+<label><input type="radio" name="voice" value="warm" checked> Warm</label>
+<label><input type="radio" name="voice" value="crisp"> Crisp</label></fieldset>
+<fieldset><legend>Pace</legend>
+<label><input type="radio" name="pace" value="slow"> Slow</label>
+<label><input type="radio" name="pace" value="normal" checked> Normal</label></fieldset>
+<fieldset><legend>Script</legend><label>Voice-over text (edit freely) <textarea name="vo" rows="4">Meet the new desk.
+It remembers how you work.</textarea></label></fieldset></form>"#;
+
+const VO_PREFILL: &str = "Meet the new desk.\nIt remembers how you work.";
+
+/// A textarea the values leave out is passed with Tab, never edited, and its
+/// prefill is what omp submits.
 #[test]
-fn a_form_with_a_textarea_is_not_driven() {
-    let form = parse(
-        r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
-        <label><input type="radio" name="r" value="b"> B</label>
-        <label>Notes <textarea name="notes">draft</textarea></label></form>"#,
-    );
-    assert!(!form.drivable());
+fn an_untouched_textarea_is_kept() {
+    for values_in in [BTreeMap::new(), values(&[("pace", options(&["slow"]))])] {
+        let mut dialog = Dialog::new(VOICE_OVER);
+        let submitted = answer(&mut dialog, values_in).unwrap();
+        assert_eq!(value(&submitted, "vo"), txt(VO_PREFILL));
+        let at_textarea: Vec<&str> = dialog
+            .received
+            .iter()
+            .filter(|(_, stop)| *stop == Stop::Text { field: 2 })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(at_textarea, ["tab"], "only Tab reaches the textarea");
+    }
+}
+
+/// An edit made in the terminal before the app answered is submitted as it
+/// is, and confirmation does not call it answered.
+#[test]
+fn a_terminal_edited_textarea_is_reported_unconfirmed() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.lines[2] = vec![
+        "Meet the new desk.".into(),
+        "Edited in the terminal.".into(),
+    ];
+    let form = dialog.form.clone();
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    drive(&mut dialog, &form, &planned).unwrap();
+    let submitted = dialog.submitted.clone().expect("submitted");
+    let recorded: serde_json::Map<String, serde_json::Value> = submitted
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = match value.as_ref()? {
+                FormValue::Text(text) => serde_json::Value::String(text.clone()),
+                FormValue::Number(number) => serde_json::json!(number),
+                FormValue::List(items) => serde_json::json!(items),
+            };
+            Some((name.clone(), value))
+        })
+        .collect();
     assert_eq!(
-        form.refusal(),
-        Some("textarea fields: answer in the terminal")
+        value(&submitted, "vo"),
+        txt("Meet the new desk.\nEdited in the terminal.")
     );
+    assert!(!submission_matches(&planned.expected, &recorded));
+}
+
+/// A changed textarea is emptied (wherever the caret is, whatever it holds
+/// out of view) and gets exactly the new text.
+#[test]
+fn a_changed_textarea_is_replaced() {
+    let new = "Line one.\nLine two.\nLine three.";
+    for (content, caret) in [
+        (
+            vec![
+                "Meet the new desk.".to_owned(),
+                "It remembers how you work.".to_owned(),
+            ],
+            (0, 0),
+        ),
+        (
+            vec![
+                "Meet the new desk.".to_owned(),
+                "It remembers how you work.".to_owned(),
+            ],
+            (1, 7),
+        ),
+        // Blank lines hiding a retained line below the viewport.
+        (
+            std::iter::repeat_n(String::new(), 20)
+                .chain(["retained-secret".to_owned()])
+                .collect(),
+            (0, 0),
+        ),
+        (
+            std::iter::repeat_n(String::new(), 20)
+                .chain(["retained-secret".to_owned()])
+                .collect(),
+            (10, 0),
+        ),
+    ] {
+        let mut dialog = Dialog::new(VOICE_OVER);
+        dialog.lines[2] = content;
+        dialog.caret[2] = caret;
+        let submitted = answer(
+            &mut dialog,
+            values(&[("voice", options(&["crisp"])), ("vo", text(new))]),
+        )
+        .unwrap();
+        assert_eq!(value(&submitted, "vo"), txt(new), "caret {caret:?}");
+        assert_eq!(value(&submitted, "voice"), txt("crisp"));
+    }
+}
+
+/// Too much to count, or an answer that does not fit the editor, is
+/// `ask_form_invalid` and nothing is submitted; a draft too long to count is
+/// left untouched.
+#[test]
+fn a_textarea_too_long_to_edit_is_invalid() {
+    let too_long = "vo: too long to edit from the app; answer in the terminal";
+    let mut dialog = Dialog::new(VOICE_OVER);
+    let long: Vec<String> = (0..60).map(|line| format!("line{line}")).collect();
+    dialog.lines[2] = long.clone();
+    dialog.caret[2] = (30, 0);
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("vo", text("short"))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        ("ask_form_invalid", too_long)
+    );
+    assert_eq!(dialog.lines[2], long, "the draft is untouched");
+    assert_eq!(dialog.submitted, None);
+
+    // More lines than the editor shows: refused before anything is sent.
+    let form = parse(VOICE_OVER);
+    let error = plan(&form, &values(&[("vo", text("1\n2\n3\n4\n5"))])).unwrap_err();
+    assert_eq!(error.message, too_long);
+
+    // One long paragraph that wraps past the editor's rows.
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 30;
+    let paragraph = "word ".repeat(60);
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("vo", text(paragraph.trim()))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        ("ask_form_invalid", too_long)
+    );
+    assert_eq!(dialog.submitted, None);
+}
+
+/// The editor not showing what was typed stops before Submit.
+#[test]
+fn a_textarea_reading_mismatch_is_moved() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.paste_drops_last = true;
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("vo", text("New text."))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(error.code, "ask_form_moved");
+    assert_eq!(dialog.submitted, None);
+    assert!(
+        !dialog.keys.iter().any(|key| key == "escape"),
+        "Esc would cancel the ask"
+    );
+}
+
+/// A textarea that is the form's first stop has no stop before it to prove
+/// the caret reached its first line: changing it is refused, keeping it works.
+#[test]
+fn a_first_field_textarea_is_kept_but_not_edited() {
+    let html = r#"<form><label>Notes <textarea name="n">draft</textarea></label>
+        <label><input type="radio" name="r" value="a" checked> A</label>
+        <label><input type="radio" name="r" value="b"> B</label></form>"#;
+    let form = parse(html);
+    let error = plan(&form, &values(&[("n", text("new"))])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "n: the form's first field cannot be edited from the app; answer in the terminal"
+    );
+    let mut dialog = Dialog::new(html);
+    let submitted = answer(&mut dialog, values(&[("r", options(&["b"]))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("draft"));
+}
+
+const WITH_PLACEHOLDER: &str = r#"<form><label><input type="radio" name="r" value="a" checked> A</label>
+<label><input type="radio" name="r" value="b"> B</label>
+<label>Notes <textarea name="n" placeholder="Say something">old draft
+second line</textarea></label></form>"#;
+
+/// #394 F1: the placeholder omp draws flush right in an emptied editor reads
+/// as empty, so the draft is replaced.
+#[test]
+fn review_replacement_with_real_right_aligned_placeholder() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text("New notes."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("New notes."));
+}
+
+/// #394 F1: emptying a textarea that has a placeholder works.
+#[test]
+fn review_empty_answer_with_placeholder() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text(""))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(""));
+}
+
+/// #394 F1: an answer equal to the placeholder is text, not the placeholder.
+#[test]
+fn an_answer_equal_to_the_placeholder_is_text() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text("Say something"))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("Say something"));
+}
+
+/// #394 F2: CRLF and lone CR line breaks are normalized, not refused.
+#[test]
+fn review_crlf_textarea_answer() {
+    let form = parse(WITH_PLACEHOLDER);
+    for raw in ["Line one\r\nLine two", "Line one\rLine two"] {
+        let planned = plan(&form, &values(&[("n", text(raw))])).unwrap();
+        assert_eq!(
+            value(&planned.expected, "n"),
+            txt("Line one\nLine two"),
+            "{raw:?}"
+        );
+        let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+        let submitted = answer(&mut dialog, values(&[("n", text(raw))])).unwrap();
+        assert_eq!(value(&submitted, "n"), txt("Line one\nLine two"));
+    }
+    let error = plan(&form, &values(&[("n", text("bell\u{7}"))])).unwrap_err();
+    assert_eq!(error.message, "n: control characters are not allowed");
+}
+
+/// #394 F3: a backend read error while reading the typed answer back is
+/// reported as itself.
+#[test]
+fn review_backend_read_error_is_preserved() {
+    for fail_at in [0, 1] {
+        let mut dialog = Dialog::new(VOICE_OVER);
+        dialog.fail_read_after_paste = Some(fail_at);
+        let form = dialog.form.clone();
+        let planned = plan(&form, &values(&[("vo", text("Short."))])).unwrap();
+        let error = drive(&mut dialog, &form, &planned).unwrap_err();
+        assert_eq!(error.code, "pane_not_found", "{error:?}");
+        assert_eq!(dialog.submitted, None);
+    }
+}
+
+/// #394 r2: a placeholder with a double space is read exactly, not
+/// collapsed, so the emptied editor is recognised.
+#[test]
+fn a_double_space_placeholder_is_read_exactly() {
+    let html = WITH_PLACEHOLDER.replace("Say something", "Say  something");
+    let mut dialog = Dialog::new(&html);
+    let submitted = answer(&mut dialog, values(&[("n", text("New notes."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("New notes."));
+    let mut dialog = Dialog::new(&html);
+    let submitted = answer(&mut dialog, values(&[("n", text(""))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(""));
+}
+
+/// #394 r2: a literal answer with a leading space is text, never the
+/// placeholder.
+#[test]
+fn a_leading_space_answer_is_text() {
+    let mut dialog = Dialog::new(WITH_PLACEHOLDER);
+    let submitted = answer(&mut dialog, values(&[("n", text(" Say something"))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt(" Say something"));
+}
+
+/// #394 r2: a placeholder too long for the editor is not drawn (omp does not
+/// truncate it); the emptied editor is blank.
+#[test]
+fn a_placeholder_longer_than_the_editor_is_not_drawn() {
+    let long = "p".repeat(40);
+    let html = WITH_PLACEHOLDER.replace("Say something", &long);
+    let mut dialog = Dialog::new(&html);
+    dialog.width = 40;
+    let submitted = answer(&mut dialog, values(&[("n", text("Short."))])).unwrap();
+    assert_eq!(value(&submitted, "n"), txt("Short."));
+    assert_eq!(empty_rows(&long, 32, 2), vec![" ".repeat(32); 2]);
+    assert_eq!(empty_rows("ab", 4, 1), vec!["  ab".to_owned()]);
+    assert_eq!(
+        empty_rows("abc", 4, 1),
+        vec!["    ".to_owned()],
+        "one free cell is too few"
+    );
+}
+
+/// #394 r2: an answer drawn exactly like the empty editor's placeholder
+/// (possible when the placeholder ends in spaces) cannot be confirmed: it is
+/// refused before the draft is touched.
+#[test]
+fn an_answer_drawn_like_the_placeholder_is_invalid() {
+    let html = WITH_PLACEHOLDER.replace("Say something", "Say something  ");
+    let mut dialog = Dialog::new(&html);
+    dialog.width = 40;
+    let width = dialog.editor_width();
+    let lookalike = format!(
+        "{}Say something",
+        " ".repeat(width - "Say something  ".len())
+    );
+    let mut rows = layout_rows(&lookalike, width);
+    rows.resize(4, " ".repeat(width));
+    assert_eq!(rows, empty_rows("Say something  ", width, 4));
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("n", text(&lookalike))])).unwrap();
+    let before = dialog.lines[1].clone();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        (
+            "ask_form_invalid",
+            "n: answer looks like the placeholder; answer in the terminal"
+        )
+    );
+    assert_eq!(dialog.lines[1], before, "the draft is untouched");
+    assert_eq!(dialog.submitted, None);
+}
+
+const OMP_WRAP: &str = include_str!("omp-18.18.6-textarea-wrap.json");
+
+fn shown_chars(line: &str) -> usize {
+    line.chars().count()
+}
+
+/// The answer rows of a focused textarea, as `editor_rows` reads them from
+/// a captured screen line.
+fn captured_row(line: &str) -> String {
+    let rest = line
+        .trim_start()
+        .strip_prefix("│   │ ")
+        .expect("framed row");
+    let rest = rest
+        .trim_end_matches(' ')
+        .strip_suffix('│')
+        .expect("closed row");
+    rest.strip_suffix(' ').expect("frame space").to_owned()
+}
+
+/// #394 r3: the port of omp's `wordWrapLine` reproduces omp 18.18.6's
+/// screens byte for byte: full-width lines, a word straddling the edge, a
+/// word longer than the row, a long word after a short one, CJK, ASCII then
+/// CJK, emoji, emoji at the edge, spaces at the wrap point, combining marks,
+/// two paragraphs. Captured from real omp in a 111-cell, 10-row textarea
+/// (`textarea-smoke-394r3/`). A ZWJ emoji sequence is drawn wider by the
+/// terminal than omp lays it out, so no port can match it: those answers
+/// are refused (`emoji_sequences_are_refused_in_textareas`).
+#[test]
+fn the_wrap_port_matches_omp_screens() {
+    let fixtures: serde_json::Value = serde_json::from_str(OMP_WRAP).unwrap();
+    let width = fixtures["width"].as_u64().unwrap() as usize;
+    let mut checked = 0;
+    for case in fixtures["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let text = case["text"].as_str().unwrap();
+        let lines: Vec<&str> = case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row.as_str().unwrap())
+            .collect();
+        if name == "combining" {
+            // omp lays `e` + U+0301 out as one cell, as the port does, but
+            // the terminal reads it back precomposed (`é`): such answers are
+            // refused (`combined_characters_are_refused_in_textareas`).
+            assert!(shown_chars(lines[0]) < cells(lines[0]) + 1);
+            continue;
+        }
+        if name == "zwj-emoji" {
+            // Each 👩‍💻 took four cells on the terminal's grid against omp's two:
+            // the row overflows the panel.
+            let last = shown_chars(lines[lines.len() - 1]);
+            assert!(
+                lines.iter().any(|line| shown_chars(line) != last),
+                "the terminal draws ZWJ sequences off omp's grid"
+            );
+            continue;
+        }
+        let shown: Vec<String> = lines.iter().map(|line| captured_row(line)).collect();
+        let mut want = layout_rows(text, width);
+        want.resize(shown.len(), " ".repeat(width));
+        assert_eq!(want, shown, "{name}");
+        checked += 1;
+    }
+    assert_eq!(checked, 15);
+}
+
+/// #394 r3: an answer that wraps but fits the editor's rows is typed and
+/// confirmed: 40 characters in a 32-cell, 4-row editor.
+#[test]
+fn a_wrapping_answer_that_fits_is_accepted() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    assert_eq!(dialog.editor_width(), 32);
+    let answer_text = "The new desk remembers how you work best.";
+    let submitted = answer(&mut dialog, values(&[("vo", text(answer_text))])).unwrap();
+    assert_eq!(value(&submitted, "vo"), txt(answer_text));
+    // Two paragraphs that wrap within the four rows.
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    let two = "Meet the new desk, built to last.\nIt keeps your notes close by.";
+    let submitted = answer(&mut dialog, values(&[("vo", text(two))])).unwrap();
+    assert_eq!(value(&submitted, "vo"), txt(two));
+}
+
+/// #394 r3: wrapping past the editor's rows is still refused before the
+/// draft is touched.
+#[test]
+fn a_wrapping_answer_past_the_rows_is_too_long() {
+    let mut dialog = Dialog::new(VOICE_OVER);
+    dialog.width = 40;
+    let before = dialog.lines[2].clone();
+    let form = dialog.form.clone();
+    let planned = plan(&form, &values(&[("vo", text(&"word ".repeat(40)))])).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        error.message,
+        "vo: too long to edit from the app; answer in the terminal"
+    );
+    assert_eq!(dialog.lines[2], before);
+}
+
+/// #394 r3: characters built from several code points (ZWJ emoji, a letter
+/// plus a separate accent) cannot be confirmed on screen; precomposed
+/// letters, CJK and single-code-point emoji can.
+#[test]
+fn combined_characters_are_refused_in_textareas() {
+    let form = parse(VOICE_OVER);
+    let refused = "vo: combined characters (emoji sequences, separate accent marks) cannot be checked on screen; answer in the terminal";
+    for answer_text in ["Coding 👩\u{200d}💻 today", "Cafe\u{301}"] {
+        let error = plan(&form, &values(&[("vo", text(answer_text))])).unwrap_err();
+        assert_eq!(error.message, refused, "{answer_text:?}");
+    }
+    assert!(plan(&form, &values(&[("vo", text("Café 漢字 🙂"))])).is_ok());
 }

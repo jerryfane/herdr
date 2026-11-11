@@ -700,11 +700,10 @@ fn answer_form_refuses_a_questions_ask() {
     assert_eq!(error_code(&response), "ask_unsupported");
 }
 
-/// #392 r4: a form with a `<textarea>` is refused before any pane read or
-/// key, with the message the apps show as "Answer in Terminal".
+/// A form with a `<textarea>` is answerable from the app.
 #[test]
-fn answer_form_refuses_a_form_with_a_textarea() {
-    let (harness, form) = form_harness();
+fn a_form_with_a_textarea_is_answerable() {
+    let (harness, _form) = form_harness();
     let html = FORM_HTML.replace(
         "</form>",
         r#"<label>Notes <textarea name="notes">draft</textarea></label></form>"#,
@@ -719,12 +718,5 @@ fn answer_form_refuses_a_form_with_a_textarea() {
     let pending = crate::agent_transcript::pending_ask(&harness.session)
         .unwrap()
         .unwrap();
-    assert!(!pending.form_answerable);
-    let response = answer_form_via_app(&harness, &form, json!({}));
-    assert_eq!(error_code(&response), "ask_unsupported", "{response}");
-    assert_eq!(
-        response["error"]["message"],
-        "textarea fields: answer in the terminal"
-    );
-    assert!(form.lock().unwrap().keys.is_empty(), "nothing is sent");
+    assert!(pending.form_answerable);
 }

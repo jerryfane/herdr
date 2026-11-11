@@ -278,15 +278,27 @@ fn duplicate_or_missing_names_are_not_drivable() {
     assert!(parse(r#"<form><input><input name="b"></form>"#).drivable());
 }
 
-/// #392 r4: a `<textarea>` is shown in full (title, value, constraints) but
-/// makes the form unanswerable from the app.
+/// A `<textarea>` keeps the form answerable from the app, and carries its
+/// editor height (`rows`, grown to the prefill, 2 to 10) for the driver.
 #[test]
-fn a_textarea_makes_the_form_unanswerable_but_stays_visible() {
+fn a_textarea_form_is_answerable() {
     let form = parse(
-        r#"<form><label>Notes <textarea name="notes" maxlength="50">draft</textarea></label></form>"#,
+        r#"<form><label>Notes <textarea name="notes" maxlength="50">draft</textarea></label>
+        <label>Script <textarea name="script" rows="1">a
+b
+c</textarea></label><textarea name="long" rows="30"></textarea></form>"#,
     );
-    assert!(!form.drivable());
-    assert_eq!(form.refusal(), Some(TEXTAREA_REFUSAL));
+    assert!(form.drivable());
+    assert_eq!(form.refusal(), None);
+    let heights: Vec<usize> = form
+        .fields
+        .iter()
+        .map(|field| match &field.kind {
+            FieldKind::Text(input) => input.height(),
+            FieldKind::Choice(_) => 0,
+        })
+        .collect();
+    assert_eq!(heights, [4, 3, 10]);
     let wire = form.to_wire();
     assert_eq!(wire.fields[0].input_type.as_deref(), Some("textarea"));
     assert_eq!(wire.fields[0].value.as_deref(), Some("draft"));
