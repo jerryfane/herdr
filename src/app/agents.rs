@@ -1367,6 +1367,7 @@ impl App {
             origin_machine_id: Some(crate::persist::machine::get_or_create()),
             reachability: None,
             last_known_status: None,
+            gram_reachable: None,
             // A live pane is never archived; the archived list is emitted
             // separately in `collect_agent_infos`.
             archived: None,
@@ -1659,6 +1660,7 @@ fn archived_agent_info(
         origin_machine_id: None,
         reachability: None,
         last_known_status: None,
+        gram_reachable: None,
         archived: Some(crate::api::schema::AgentArchivedInfo {
             at: record.archived.at.clone(),
             by: record.archived.by.clone(),

@@ -219,6 +219,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         turn_origin: true,
         rename_preconditions: true,
         ask_form: true,
+        gram_reachable: true,
     })
 }
 
@@ -3709,6 +3710,7 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                gram_reachable: false,
             }),
             None,
             None,

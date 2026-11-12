@@ -328,6 +328,21 @@ pub(crate) fn policy() -> &'static GramRelayPolicy {
     &POLICY
 }
 
+/// Whether `gram.post` may address an agent of the saved peer with routing
+/// `alias`: the live coordinator consent, so `agent.list` and the post check
+/// agree and both follow a reload. No platform without the relay reaches one.
+pub(crate) fn gram_reachable(alias: &str) -> bool {
+    #[cfg(unix)]
+    {
+        policy().allows(alias)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = alias;
+        false
+    }
+}
+
 /// Apply this daemon's `[gram_relay]` config against its real environment.
 pub(crate) fn apply_config(config: &GramRelayConfig) {
     policy().apply(

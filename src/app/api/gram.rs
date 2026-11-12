@@ -1056,9 +1056,10 @@ impl App {
                                         == Some(
                                             crate::api::federation_store::Reachability::Reachable,
                                         )
-                                    && agent.machine_id.as_deref().is_some_and(|alias| {
-                                        crate::api::gram_relay::policy().allows(alias)
-                                    })
+                                    && agent
+                                        .machine_id
+                                        .as_deref()
+                                        .is_some_and(crate::api::gram_relay::gram_reachable)
                             })
                 }
                 #[cfg(not(unix))]
@@ -2656,39 +2657,163 @@ mod tests {
         /// `w1-1` and `other-agent` in `w1-2`, merged as the coordinator's
         /// federation poll merges them: every name and id `PEER/`-qualified.
         fn coordinator() -> App {
+            coordinator_with_config().0
+        }
+
+        /// [`coordinator`] with its config file, for a test that reloads it.
+        fn coordinator_with_config() -> (App, std::path::PathBuf) {
             let (mut app, path) = app_with_config_file();
             reload(
                 &mut app,
                 &path,
                 &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
             );
-            let presentation = crate::api::federation_manager::PeerPresentation {
-                profile_id: Some(PEER.into()),
-                label: "Jerrys-Mac-Studio".into(),
-            };
-            let agent = |pane: &str, name: &str| -> crate::api::schema::AgentInfo {
-                let local = serde_json::from_value(serde_json::json!({
-                    "terminal_id": format!("term_65c2c15717c84.{pane}"),
-                    "name": name,
-                    "agent": "omp",
-                    "agent_status": "idle",
-                    "workspace_id": "w1",
-                    "tab_id": "w1:t1",
-                    "pane_id": pane,
-                    "focused": false,
-                    "revision": 1,
-                }))
-                .unwrap();
-                crate::api::prefix_remote_agent(PEER, &presentation, local).unwrap()
-            };
-            app.federation.lock().unwrap().set_peer(
+            cache_peer(
+                &mut app,
                 PEER,
+                "Jerrys-Mac-Studio",
+                &[("w1-1", "llm-opt"), ("w1-2", "other-agent")],
+            );
+            (app, path)
+        }
+
+        /// Cache saved peer `alias`'s reachable roster of `(pane, name)`
+        /// agents as the coordinator's federation poll merges it.
+        fn cache_peer(app: &mut App, alias: &str, label: &str, roster: &[(&str, &str)]) {
+            let presentation = crate::api::federation_manager::PeerPresentation {
+                profile_id: Some(alias.into()),
+                label: label.into(),
+            };
+            let agents = roster
+                .iter()
+                .map(|(pane, name)| {
+                    let local = serde_json::from_value(serde_json::json!({
+                        "terminal_id": format!("term_65c2c15717c84.{pane}"),
+                        "name": name,
+                        "agent": "omp",
+                        "agent_status": "idle",
+                        "workspace_id": "w1",
+                        "tab_id": "w1:t1",
+                        "pane_id": pane,
+                        "focused": false,
+                        "revision": 1,
+                    }))
+                    .unwrap();
+                    crate::api::prefix_remote_agent(alias, &presentation, local).unwrap()
+                })
+                .collect();
+            app.federation.lock().unwrap().set_peer(
+                alias,
                 crate::api::federation_store::PeerCacheEntry::reachable(
-                    vec![agent("w1-1", "llm-opt"), agent("w1-2", "other-agent")],
+                    agents,
                     std::time::Instant::now(),
                 ),
             );
-            app
+        }
+
+        /// A saved peer the coordinator caches but the relay policy never names.
+        const UNLISTED_PEER: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
+
+        /// [`coordinator`] that also caches `UNLISTED_PEER`, running `builder`.
+        fn coordinator_with_unlisted_peer() -> (App, std::path::PathBuf) {
+            let (mut app, path) = coordinator_with_config();
+            cache_peer(&mut app, UNLISTED_PEER, "Build box", &[("w1-1", "builder")]);
+            (app, path)
+        }
+
+        /// Each `agent.list` row's name and `gram_reachable`, sorted by name.
+        fn gram_reachable_rows(app: &mut App) -> Vec<(String, serde_json::Value)> {
+            let list: serde_json::Value = serde_json::from_str(&app.handle_agent_list(
+                "l".into(),
+                crate::api::schema::AgentListParams { local_only: false },
+            ))
+            .unwrap();
+            assert_eq!(
+                list["result"]["origin_capabilities"]["gram_reachable"], true,
+                "{list}"
+            );
+            let mut rows: Vec<_> = list["result"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|agent| {
+                    (
+                        agent["name"].as_str().unwrap_or_default().to_owned(),
+                        agent["gram_reachable"].clone(),
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        }
+
+        fn post_to(app: &mut App, to: &str) -> serde_json::Value {
+            serde_json::from_str(&app.handle_gram_post(
+                "p".into(),
+                serde_json::from_value(serde_json::json!({"text": "notes", "to": to})).unwrap(),
+            ))
+            .unwrap()
+        }
+
+        #[test]
+        fn agent_list_says_which_peers_gram_post_can_reach() {
+            let (mut app, _path) = coordinator_with_unlisted_peer();
+            assert_eq!(
+                gram_reachable_rows(&mut app),
+                vec![
+                    (format!("{UNLISTED_PEER}/builder"), serde_json::json!(false)),
+                    (format!("{PEER}/llm-opt"), serde_json::json!(true)),
+                    (format!("{PEER}/other-agent"), serde_json::json!(true)),
+                ]
+            );
+        }
+
+        #[test]
+        fn gram_reachable_follows_reload() {
+            let (mut app, path) = coordinator_with_unlisted_peer();
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\", \"{UNLISTED_PEER}\"]\n"),
+            );
+            assert!(
+                gram_reachable_rows(&mut app)
+                    .iter()
+                    .all(|(_, reachable)| reachable == true),
+                "{:?}",
+                gram_reachable_rows(&mut app)
+            );
+
+            reload(&mut app, &path, "");
+            assert!(
+                gram_reachable_rows(&mut app)
+                    .iter()
+                    .all(|(_, reachable)| reachable == false),
+                "{:?}",
+                gram_reachable_rows(&mut app)
+            );
+        }
+
+        /// The field only reports the check `gram.post` already makes: a post
+        /// to a row marked unreachable is rejected exactly as before.
+        #[test]
+        fn gram_post_accepts_exactly_the_rows_marked_gram_reachable() {
+            let (mut app, _path) = coordinator_with_unlisted_peer();
+            let unlisted = format!("{UNLISTED_PEER}/builder");
+            let rejected = post_to(&mut app, &unlisted);
+            assert_eq!(rejected["error"]["code"], "invalid_params", "{rejected}");
+            assert_eq!(
+                rejected["error"]["message"],
+                format!("no live agent named '{unlisted}'; omit --to to post to the shared queue")
+            );
+            for (name, reachable) in gram_reachable_rows(&mut app) {
+                let answer = post_to(&mut app, &name);
+                assert_eq!(
+                    answer["result"]["type"] == "gram_sent",
+                    reachable == true,
+                    "{name}: {answer}"
+                );
+            }
         }
 
         fn relay(app: &mut App, call: serde_json::Value) -> serde_json::Value {

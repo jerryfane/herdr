@@ -52,7 +52,17 @@ impl App {
                 .federation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            agents.extend(store.merged_agents());
+            // Stamped from the live relay policy at response time so a reload
+            // takes effect on the next list; `gram.post` asks the same policy.
+            agents.extend(store.merged_agents().into_iter().map(|mut agent| {
+                agent.gram_reachable = Some(
+                    agent
+                        .machine_id
+                        .as_deref()
+                        .is_some_and(crate::api::gram_relay::gram_reachable),
+                );
+                agent
+            }));
         }
         encode_success(
             id,
