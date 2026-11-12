@@ -443,6 +443,7 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                gram_reachable: false,
             }),
         }
     }

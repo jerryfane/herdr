@@ -640,6 +640,14 @@ pub struct AgentInfo {
     /// local agent or a reachable peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_known_status: Option<AgentStatus>,
+    /// Federation, coordinator `agent.list` only: whether `gram.post` may name
+    /// this agent in `to`, that is whether this daemon's Gram relay policy
+    /// allows the agent's machine. Read from the live policy per response, so it
+    /// follows `server.reload_config`. A post also needs the peer `reachable`.
+    /// `None` for a local agent, which a post can always name. Servers that set
+    /// it advertise `capabilities.gram_reachable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gram_reachable: Option<bool>,
     /// Present only for archived agents (issue #173). Its presence is the
     /// load-bearing signal that this agent is archived; absent means active, so
     /// older clients that ignore the field see a normal (active) agent list.

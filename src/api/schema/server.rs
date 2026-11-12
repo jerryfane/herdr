@@ -120,4 +120,9 @@ pub struct ServerCapabilities {
     /// and serves `agent.answer_form`.
     #[serde(default)]
     pub ask_form: bool,
+    /// `agent.list` marks each remote agent with `gram_reachable`, whether
+    /// `gram.post` may name it. Without this, a client cannot tell and should
+    /// keep offering every live agent.
+    #[serde(default)]
+    pub gram_reachable: bool,
 }

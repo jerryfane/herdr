@@ -2673,6 +2673,7 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                gram_reachable: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2764,6 +2765,7 @@ mod tests {
                     turn_origin: false,
                     rename_preconditions: false,
                     ask_form: false,
+                    gram_reachable: false,
                 }),
             },
         };
@@ -3042,6 +3044,7 @@ mod tests {
                     turn_origin: false,
                     rename_preconditions: false,
                     ask_form: false,
+                    gram_reachable: false,
                 }),
             },
         };

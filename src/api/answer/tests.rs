@@ -192,6 +192,7 @@ fn harness(questions: Value) -> Harness {
         origin_machine_id: None,
         reachability: None,
         last_known_status: None,
+        gram_reachable: None,
         archived: None,
         parked_work: Vec::new(),
         session_transfer: None,

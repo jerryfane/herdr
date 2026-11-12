@@ -11994,6 +11994,13 @@
                 "null"
               ]
             },
+            "gram_reachable": {
+              "description": "Federation, coordinator `agent.list` only: whether `gram.post` may name\nthis agent in `to`, that is whether this daemon's Gram relay policy\nallows the agent's machine. Read from the live policy per response, so it\nfollows `server.reload_config`. A post also needs the peer `reachable`.\n`None` for a local agent, which a post can always name. Servers that set\nit advertise `capabilities.gram_reachable`.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "input_pending": {
               "type": "boolean"
             },
@@ -18740,6 +18747,11 @@
             "events_v2": {
               "default": false,
               "description": "`events.subscribe` accepts `events_v2: true` (sequence-numbered lines,\n`lagged` and `heartbeat` control lines, per-entry `pane_not_found`\nrejection) and all-pane `pane.agent_status_changed` and\n`pane.turn_completed` entries without a `pane_id`.",
+              "type": "boolean"
+            },
+            "gram_reachable": {
+              "default": false,
+              "description": "`agent.list` marks each remote agent with `gram_reachable`, whether\n`gram.post` may name it. Without this, a client cannot tell and should\nkeep offering every live agent.",
               "type": "boolean"
             },
             "gram_upload_stream": {
