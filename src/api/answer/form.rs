@@ -579,12 +579,51 @@ const BOX_HORIZONTAL: [char; 2] = ['─', '-'];
 /// omp's `boxRound.bottomLeft` (unicode and nerd `╰`, ascii `+`; pi-tui
 /// theme/symbols.ts:438, :774, :1240): the ask panel's bottom border.
 const BOX_BOTTOM_LEFT: [char; 2] = ['╰', '+'];
+/// The left tee of the rule between the panel's body and its footer:
+/// `boxRound.teeRight`, which is `boxSharp.teeRight` (theme/theme-class.ts:
+/// 594-602; unicode and nerd `├`, ascii `+`; symbols.ts:455, :806, :1257),
+/// drawn by `divider` (chrome/overlay-box.ts:35-39).
+const BOX_TEE_RIGHT: [char; 2] = ['├', '+'];
 
-/// Whether `line` is the ask panel's bottom border.
-fn is_panel_bottom(line: &str) -> bool {
+fn is_rule(line: &str, left: [char; 2]) -> bool {
     line.trim_start()
-        .strip_prefix(BOX_BOTTOM_LEFT)
+        .strip_prefix(left)
         .is_some_and(|rest| rest.starts_with(BOX_HORIZONTAL))
+}
+
+/// The ask panel on the screen: its top border (with the page, see
+/// [`panel_top`]) and its bottom border. omp builds it as the body, a
+/// `PanelDivider` rule, then a one-row footer (dialog.ts:362-366), closed by
+/// `bottomBorder` (chrome/overlay-box.ts:41-44). Under the ascii preset the
+/// divider and the bottom border are both `+---+`; the bottom is the first
+/// one no panel row (`│`/`|`) follows.
+struct Panel {
+    top: usize,
+    page: Option<(usize, usize)>,
+    bottom: usize,
+}
+
+fn panel(lines: &[&str]) -> Option<Panel> {
+    let (top, page) = panel_top(lines)?;
+    let bottom = (top + 1..lines.len())
+        .find(|&index| {
+            is_rule(lines[index], BOX_BOTTOM_LEFT)
+                && !lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with(BOX_VERTICAL))
+        })
+        .unwrap_or(lines.len() - 1);
+    Some(Panel { top, page, bottom })
+}
+
+impl Panel {
+    /// The footer row: the one between the divider and the bottom border.
+    fn footer<'a>(&self, lines: &[&'a str]) -> Option<&'a str> {
+        let footer = self.bottom.checked_sub(1).filter(|&row| row > self.top)?;
+        let divider = footer.checked_sub(1).filter(|&row| row > self.top)?;
+        (is_rule(lines[divider], BOX_TEE_RIGHT) && is_rule(lines[self.bottom], BOX_BOTTOM_LEFT))
+            .then(|| lines[footer])
+    }
 }
 
 /// The form panel's title (`DEFAULT_TITLE`, dialog.ts:124).
@@ -670,27 +709,20 @@ impl std::fmt::Display for NotAtStart {
 pub(crate) fn start_state(screen: &str, form: &ParsedForm) -> Result<(), NotAtStart> {
     let stops = stops(form);
     let lines: Vec<&str> = screen.lines().collect();
-    let panel = panel_top(&lines);
+    let panel = panel(&lines);
     // Only the panel's rows count when it is on screen: the composer under
     // it shows its own `❯` (with a draft after it).
-    let rows = rows_of(&match panel {
-        Some((top, _)) => {
-            let bottom = (top + 1..lines.len())
-                .find(|&index| is_panel_bottom(lines[index]))
-                .unwrap_or(lines.len() - 1);
-            lines[top..=bottom].join("\n")
-        }
+    let rows = rows_of(&match &panel {
+        Some(panel) => lines[panel.top..=panel.bottom].join("\n"),
         None => screen.to_owned(),
     });
     // No focused row inside the panel: omp shows a page the focus is not on
     // (it opened on context before the first stop, or someone paged).
     let focused = rows.iter().any(|row| row.focused);
-    match panel {
-        None if !focused => return Err(NotAtStart::NoPanel),
-        Some((_, Some((page, pages)))) if !focused => {
-            return Err(NotAtStart::FocusOffPage { page, pages })
-        }
-        _ => {}
+    match panel.and_then(|panel| panel.page) {
+        _ if focused => {}
+        Some((page, pages)) => return Err(NotAtStart::FocusOffPage { page, pages }),
+        None => return Err(NotAtStart::NoPanel),
     }
     let markers: Vec<usize> = (0..rows.len())
         .filter(|index| rows[*index].marker.is_some())
@@ -1713,23 +1745,30 @@ fn bring_to_start(pane: &mut impl FormPane, form: &ParsedForm) -> Result<bool, D
 /// 879-881).
 const DRAFT_HINT: &str = "typing edits your prompt";
 
-/// Whether the form's footer shows omp's input guard: the release keys, then
-/// ` answer · ` and [`DRAFT_HINT`] (`#footerText`/`#guardHint`, dialog.ts:
-/// 913-915, :1375-1376), possibly cut short with `…` in a narrow pane.
+/// Whether the ask panel's footer row shows omp's input guard: the release
+/// keys, then ` answer · ` and [`DRAFT_HINT`] (`#footerText` puts
+/// `#guardHint` first, dialog.ts:1371-1376 and :913-915, into the footer,
+/// :608), possibly cut short with `…` in a narrow pane. Only that row: the
+/// same words in the form's text, the transcript or the composer are not
+/// the guard.
 fn draft_holds_keys(screen: &str) -> bool {
-    rows_of(screen).iter().any(|row| {
-        row.text
-            .split_once(" answer · ")
-            .is_some_and(|(keys, rest)| {
-                let hint = rest.split(" · ").next().unwrap_or_default();
-                !keys.is_empty()
-                    && !keys.contains(' ')
-                    && (hint == DRAFT_HINT
-                        || hint
-                            .strip_suffix('…')
-                            .is_some_and(|cut| DRAFT_HINT.starts_with(cut.trim_end())))
-            })
-    })
+    let lines: Vec<&str> = screen.lines().collect();
+    panel(&lines)
+        .and_then(|panel| panel.footer(&lines))
+        .map(parse_row)
+        .is_some_and(|row| {
+            row.text
+                .split_once(" answer · ")
+                .is_some_and(|(keys, rest)| {
+                    let hint = rest.split(" · ").next().unwrap_or_default();
+                    !keys.is_empty()
+                        && !keys.contains(' ')
+                        && (hint == DRAFT_HINT
+                            || hint
+                                .strip_suffix('…')
+                                .is_some_and(|cut| DRAFT_HINT.starts_with(cut.trim_end())))
+                })
+        })
 }
 
 /// An error omp shows under a field after a refused Submit, as

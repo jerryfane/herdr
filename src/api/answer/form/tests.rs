@@ -541,9 +541,14 @@ impl Dialog {
     }
 
     /// omp's footer while a draft holds the keys (`#guardHint`).
+    /// The panel's divider and one-row footer (dialog.ts:362-366): the
+    /// guard's hint while a draft holds the keys, else the key hints.
     fn footer(&self, out: &mut Vec<String>) {
+        out.push("├───────┤".into());
         if self.draft {
             out.push("│ ↑/↓ answer · typing edits your prompt · ⎋ cancel".into());
+        } else {
+            out.push("│ ⏎ choose · ↑/↓ move · ⇥ next field · ⎋ cancel".into());
         }
     }
 
@@ -790,7 +795,7 @@ fn ascii_preset(screen: &str) -> String {
             '○' => out.push_str("( )"),
             '☑' => out.push_str("[x]"),
             '☐' => out.push_str("[ ]"),
-            '╭' | '╮' | '╰' | '╯' => out.push('+'),
+            '╭' | '╮' | '╰' | '╯' | '├' | '┤' => out.push('+'),
             '─' => out.push('-'),
             other => out.push(other),
         }
@@ -1917,4 +1922,53 @@ fn a_real_draft_on_a_context_page_is_released_then_revealed() {
     let up = Action::Keys(vec!["up"]);
     assert_eq!(pane.sent[..2], [up.clone(), up.clone()], "{:?}", pane.sent);
     assert_ne!(pane.sent.get(2), Some(&up), "{:?}", pane.sent);
+}
+
+/// Review #405 r2: omp's guard hint as words in the form's own text is not
+/// the guard (only the panel's footer row is): no draft is released, the
+/// drive's single opening ↑ is the only one, and the form is answered.
+#[test]
+fn the_guard_hint_in_the_form_text_is_not_a_draft() {
+    let html = FORM.replace(
+        "<p>Intro</p>",
+        "<p>↑/↓ answer · typing edits your prompt</p>",
+    );
+    let mut dialog = Dialog::new(&html);
+    let screen = dialog.render();
+    assert!(
+        screen.contains("│ ↑/↓ answer · typing edits your prompt\n"),
+        "{screen}"
+    );
+    assert!(!draft_holds_keys(&screen), "{screen}");
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "db"), txt("pg"));
+    assert_eq!(dialog.keys[0], "up");
+    assert_ne!(dialog.keys[1], "up", "{:?}", dialog.keys);
+}
+
+/// The same words in the composer under the panel (or anywhere outside
+/// its footer row) on a real omp 18.18.8 screen are not the guard either.
+#[test]
+fn the_guard_hint_outside_the_footer_is_not_a_draft() {
+    let fixture: serde_json::Value = serde_json::from_str(OMP_DRAFT_CONTEXT_PAGE).unwrap();
+    let form = parse(fixture["html"].as_str().unwrap());
+    let opened = fixture["opened_screen"].as_str().unwrap();
+    assert!(draft_holds_keys(opened), "{opened}");
+    let revealed = fixture["after_reveal_screen"].as_str().unwrap().replace(
+        "❯ half-written note for later",
+        "❯ ↑/↓ answer · typing edits your prompt",
+    );
+    assert!(!draft_holds_keys(&revealed), "{revealed}");
+    let mut pane = Screens::new(&[&revealed]);
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    // The screen never changes, so the drive ends in the form; it must get
+    // there past the start check, not stop on a draft.
+    let moved = drive(&mut pane, &form, &planned)
+        .err()
+        .and_then(|error| error.moved);
+    assert_ne!(moved, Some(Moved::DraftHeld));
+    let up = Action::Keys(vec!["up"]);
+    assert_eq!(pane.sent.first(), Some(&up), "{:?}", pane.sent);
+    assert_ne!(pane.sent.get(1), Some(&up), "{:?}", pane.sent);
+    assert!(pane.sent.len() > 1, "{:?}", pane.sent);
 }
