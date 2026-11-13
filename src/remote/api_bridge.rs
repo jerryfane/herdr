@@ -1409,7 +1409,7 @@ mod tests {
         let started = Instant::now();
         bridge.send(&request("slow", "agent.wait", 10_000));
         bridge.send(&cancel("c", "slow"));
-        let mut replies = vec![bridge.read_line(), bridge.read_line()];
+        let mut replies = [bridge.read_line(), bridge.read_line()];
         replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
 
         assert_eq!(replies[0]["id"], "c");
