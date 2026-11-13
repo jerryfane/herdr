@@ -129,6 +129,20 @@ pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &s
     );
 }
 
+/// Why `agent.answer_form` stopped before Submit with `ask_form_moved`: the
+/// check that failed (`form::Moved`, which names no value or typed text).
+pub(crate) fn ask_form_moved(request_id: &str, target: &str, reason: &str) {
+    tracing::info!(
+        event = "agent.answer_form.moved",
+        subsystem = "api",
+        outcome = "ask_form_moved",
+        request_id,
+        target,
+        reason,
+        "agent.answer_form stopped: the form is not as expected"
+    );
+}
+
 pub(crate) fn api_wait_started(request_id: &str, pane_id: &str, timeout_ms: Option<u64>) {
     tracing::info!(
         event = "api.wait.start",
