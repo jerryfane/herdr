@@ -561,6 +561,14 @@ JSON のデコードまで到達したリクエスト行では、メソッドや
   レスポンスは `{"frame":"<id>","len":0,"last":true,"abort":true}` で破棄させ、そのリクエストには `cancelled` エラーを返します。
   キャンセル自体への応答は `{"type":"bridge_cancel","cancelled":<bool>}` です。`false` はレスポンスがすでに書き出された
   (またはその id のリクエストが処理中でなかった)ことを意味します。`bridge.cancel` はフレームの有無に関係なく使えます。
+- フレームを使うクライアントは gzip も要求できます(対応するブリッジを持つサーバーは
+  `capabilities.compressed_replies: true` を返します)。hello に `"compress":"gzip"` を加えます
+  (`{"frames":true,"compress":"gzip"}`、または後から送る hello)。hello の応答が `"compress":"gzip"` を返せば有効です。
+  返さない(`null` または欠落)ときは何も圧縮されません。以後、1024 バイト以上で gzip により小さくなるレスポンス行は
+  gzip で送られ、そのフレームのヘッダーにはすべて `"enc":"gzip"` が付きます。いつも通りフレームを連結し、結果を
+  gunzip するとレスポンス行になります(gzip メンバー 1 つ、10 バイトの素のヘッダー)。`enc` のないフレームは平文です。
+  `len` は gzip のバイト数です。圧縮にはフレームが必要です。`frames` がなければブリッジは平文の行のまま書き、
+  `"compress":null` を返します。
 
 ## ソケットパス
 

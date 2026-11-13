@@ -131,4 +131,9 @@ pub struct ServerCapabilities {
     /// says the daemon's binary ships that bridge.
     #[serde(default)]
     pub api_bridge_frames: bool,
+    /// `api-bridge --multi` answers `bridge.hello {frames: true, compress:
+    /// "gzip"}` with `compress: "gzip"` and then gzips large replies, each
+    /// frame of one marked `"enc":"gzip"`. The hello reply is authoritative.
+    #[serde(default)]
+    pub compressed_replies: bool,
 }

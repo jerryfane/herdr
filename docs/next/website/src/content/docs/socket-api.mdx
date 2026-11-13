@@ -740,6 +740,17 @@ instead (servers whose bridge supports it report
   cancel itself is `{"type":"bridge_cancel","cancelled":<bool>}`; `false` means
   the response was already written (or no such request was in flight).
   `bridge.cancel` works with or without frames.
+- With frames, a client can also ask for gzip (servers whose bridge supports
+  it return `capabilities.compressed_replies: true`): add `"compress":"gzip"`
+  to the hello (`{"frames":true,"compress":"gzip"}`, or a later hello). The
+  hello answer then says `"compress":"gzip"`; without it (`null` or absent),
+  nothing is compressed. From then on, every response line of 1024 bytes or
+  more that gzip makes smaller is sent gzipped, and each of its frames says
+  `"enc":"gzip"` in the header: concatenate the frames as usual, then gunzip
+  the result (one gzip member, a bare 10-byte header) to get the response line.
+  Frames without `enc` are plain. `len` counts the gzip bytes. Compression
+  needs frames: without `frames`, the bridge keeps writing plain lines and
+  answers `"compress":null`.
 
 ## Socket paths
 

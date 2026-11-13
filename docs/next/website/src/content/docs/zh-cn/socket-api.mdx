@@ -551,6 +551,12 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
   socket 连接(服务器随之停止生成响应),用 `{"frame":"<id>","len":0,"last":true,"abort":true}` 丢弃已发送一部分的帧响应,
   并以 `cancelled` 错误应答该请求。取消请求本身的应答是 `{"type":"bridge_cancel","cancelled":<bool>}`;`false`
   表示响应已经写出(或没有该 id 的请求在处理中)。`bridge.cancel` 无论是否启用帧都可使用。
+- 启用帧后,客户端还可以请求 gzip(桥接进程支持它的服务器会返回 `capabilities.compressed_replies: true`):
+  在 hello 中加上 `"compress":"gzip"`(`{"frames":true,"compress":"gzip"}`,或之后再发一次 hello)。hello 的应答
+  返回 `"compress":"gzip"` 即表示启用;若为 `null` 或缺失,则不压缩任何内容。此后,凡是 1024 字节及以上、且 gzip
+  能使其变小的响应行都以 gzip 发送,其每一帧的头都带 `"enc":"gzip"`:照常拼接帧,再对结果 gunzip 即得到响应行
+  (一个 gzip 成员,10 字节的最简头)。不带 `enc` 的帧是明文。`len` 计的是 gzip 字节数。压缩需要帧:没有
+  `frames` 时,桥接进程继续写明文行,并应答 `"compress":null`。
 
 ## Socket 路径
 

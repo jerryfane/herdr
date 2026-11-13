@@ -16,6 +16,13 @@
 //! the bytes a cancelled reply already sent; its `cancelled` error follows as
 //! a reply of its own.
 //!
+//! A framed client may also ask for gzip (`bridge.hello {compress: "gzip"}`).
+//! Then a reply line of at least [`COMPRESS_MIN_BYTES`] is gzipped by the
+//! worker that produced it, before it is queued, and every frame of it says
+//! `"enc":"gzip"`: its frames' bytes are one gzip member whose content is the
+//! reply line. Smaller replies, and replies queued before the hello reply was
+//! written, stay plain. Unframed replies are never compressed.
+//!
 //! Producers (the request reader and the workers) hand over one reply at a
 //! time and wait until it has been written or cancelled, so the bridge never
 //! buffers more than one reply per worker, the same bound the old whole-line
@@ -25,7 +32,21 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+use crate::remote::API_BRIDGE_COMPRESS_MIN_BYTES as COMPRESS_MIN_BYTES;
 use crate::remote::API_BRIDGE_FRAME_BYTES as FRAME_BYTES;
+
+/// How the bridge writes replies, as the client's `bridge.hello` set it. Both
+/// only ever turn on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Session {
+    /// Replies are framed and interleaved.
+    pub(super) frames: bool,
+    /// Large replies are gzipped. Only ever set together with `frames`.
+    pub(super) gzip: bool,
+}
 
 /// How one reply left the bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +68,7 @@ pub(super) struct Outbox {
 
 #[derive(Default)]
 struct State {
-    framed: bool,
+    session: Session,
     /// Every reply not yet fully written, in arrival order. The writer serves
     /// them round robin from `cursor`; a reply waits behind an earlier one
     /// with the same id, so one id's replies never interleave.
@@ -84,8 +105,10 @@ struct Reply {
     /// Bytes of this reply the writer is writing right now, outside the lock.
     in_write: usize,
     cancelled: bool,
-    /// The `bridge.hello` reply that switches to frames once written.
-    switches_to_frames: bool,
+    /// The bytes are a gzip member of the reply line (sent as `"enc":"gzip"`).
+    gzip: bool,
+    /// The `bridge.hello` reply: the session it turns on once written.
+    switches_to: Option<Session>,
 }
 
 impl Reply {
@@ -99,9 +122,9 @@ impl Outbox {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether replies are framed (the client's `bridge.hello` was answered).
-    pub(super) fn framed(&self) -> bool {
-        self.state().framed
+    /// How replies are written now (the client's `bridge.hello` was answered).
+    pub(super) fn session(&self) -> Session {
+        self.state().session
     }
 
     /// Registers a request under `id` until [`Outbox::end`].
@@ -159,7 +182,7 @@ impl Outbox {
     pub(super) fn cancel(&self, id: &str) -> bool {
         let mut state = self.state();
         let state = &mut *state;
-        let framed = state.framed;
+        let framed = state.session.frames;
         let mut cancelled = false;
         for (key, active) in state.active.iter_mut() {
             if active.id != id || active.answered || active.cancelled {
@@ -218,12 +241,27 @@ impl Outbox {
         id: &str,
         line: Vec<u8>,
     ) -> io::Result<Delivery> {
-        self.enqueue(key, id, line, false)
+        // Compress here, on the producer's thread, so the writer never waits
+        // for it. A session with gzip is framed, and stays so, so the reply
+        // will be written as frames.
+        let gzipped = (line.len() >= COMPRESS_MIN_BYTES && self.state().session.gzip)
+            .then(|| gzip(&line))
+            .filter(|gzipped| gzipped.len() < line.len());
+        match gzipped {
+            Some(gzipped) => self.enqueue(key, id, gzipped, true, None),
+            None => self.enqueue(key, id, line, false, None),
+        }
     }
 
-    /// Queues the `bridge.hello` reply; replies written after it are framed.
-    pub(super) fn send_switch_to_frames(&self, id: &str, line: Vec<u8>) -> io::Result<Delivery> {
-        self.enqueue(None, id, line, true)
+    /// Queues the `bridge.hello` reply; replies written after it follow
+    /// `session`.
+    pub(super) fn send_switch(
+        &self,
+        id: &str,
+        line: Vec<u8>,
+        session: Session,
+    ) -> io::Result<Delivery> {
+        self.enqueue(None, id, line, false, Some(session))
     }
 
     fn enqueue(
@@ -231,7 +269,8 @@ impl Outbox {
         key: Option<RequestKey>,
         id: &str,
         bytes: Vec<u8>,
-        switches_to_frames: bool,
+        gzip: bool,
+        switches_to: Option<Session>,
     ) -> io::Result<Delivery> {
         let mut state = self.state();
         if state.failed {
@@ -250,7 +289,8 @@ impl Outbox {
             sent: 0,
             in_write: 0,
             cancelled: false,
-            switches_to_frames,
+            gzip,
+            switches_to,
         });
         self.changed.notify_all();
         loop {
@@ -293,13 +333,13 @@ impl Outbox {
                         .wait(state)
                         .unwrap_or_else(PoisonError::into_inner);
                 };
-                let framed = state.framed;
+                let framed = state.session.frames;
                 let reply = &mut state.queue[index];
                 buf.clear();
                 let ticket = reply.ticket;
                 if reply.cancelled {
                     // Started and framed: tell the client to drop it.
-                    push_header(&mut buf, &reply.id, 0, true, true);
+                    push_header(&mut buf, &reply.id, 0, true, ABORT);
                     state.queue.remove(index);
                     state.cursor = index;
                     state.finished.insert(ticket, Delivery::Cancelled);
@@ -313,10 +353,12 @@ impl Outbox {
                 let written = if framed {
                     let len = (reply.bytes.len() - reply.sent).min(FRAME_BYTES);
                     let last = reply.sent + len == reply.bytes.len();
-                    push_header(&mut buf, &reply.id, len, last, false);
+                    let mark = if reply.gzip { GZIP } else { b"" };
+                    push_header(&mut buf, &reply.id, len, last, mark);
                     buf.extend_from_slice(&reply.bytes[reply.sent..reply.sent + len]);
                     len
                 } else {
+                    debug_assert!(!reply.gzip, "only a framed session compresses");
                     buf.extend_from_slice(&reply.bytes);
                     buf.push(b'\n');
                     reply.bytes.len() - reply.sent
@@ -347,8 +389,9 @@ impl Outbox {
                 if let Some(active) = reply.key.and_then(|key| state.active.get_mut(&key)) {
                     active.answered = true;
                 }
-                if reply.switches_to_frames {
-                    state.framed = true;
+                if let Some(session) = reply.switches_to {
+                    state.session.frames |= session.frames;
+                    state.session.gzip |= session.gzip;
                 }
                 state.finished.insert(ticket, Delivery::Written);
             }
@@ -380,15 +423,28 @@ impl State {
     }
 }
 
-fn push_header(buf: &mut Vec<u8>, id: &str, len: usize, last: bool, abort: bool) {
+/// Header fields after `last`: an aborted reply, or a gzipped one.
+const ABORT: &[u8] = b",\"abort\":true";
+const GZIP: &[u8] = b",\"enc\":\"gzip\"";
+
+fn push_header(buf: &mut Vec<u8>, id: &str, len: usize, last: bool, mark: &[u8]) {
     buf.extend_from_slice(b"{\"frame\":");
     // Serializing a `&str` cannot fail.
     serde_json::to_writer(&mut *buf, id).expect("frame id serializes");
     let _ = write!(buf, ",\"len\":{len},\"last\":{last}");
-    if abort {
-        buf.extend_from_slice(b",\"abort\":true");
-    }
+    buf.extend_from_slice(mark);
     buf.extend_from_slice(b"}\n");
+}
+
+/// One gzip member of `line`: a fixed 10-byte header (no name, comment or
+/// extra field, `FLG` 0), the deflate stream, then CRC-32 and size. A client
+/// without a gzip reader can drop those 10 + 8 bytes and inflate the rest as
+/// raw deflate.
+fn gzip(line: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(line.len() / 4), Compression::default());
+    // Writing to a `Vec` cannot fail.
+    encoder.write_all(line).expect("gzip into memory");
+    encoder.finish().expect("gzip into memory")
 }
 
 fn output_gone() -> io::Error {

@@ -221,6 +221,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ask_form: true,
         gram_reachable: true,
         api_bridge_frames: true,
+        compressed_replies: true,
     })
 }
 
@@ -3713,6 +3714,7 @@ mod tests {
                 ask_form: false,
                 gram_reachable: false,
                 api_bridge_frames: false,
+                compressed_replies: false,
             }),
             None,
             None,
@@ -4526,6 +4528,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["capabilities"]["api_bridge_multi"], true);
         assert_eq!(value["result"]["capabilities"]["api_bridge_frames"], true);
+        assert_eq!(value["result"]["capabilities"]["compressed_replies"], true);
     }
 
     /// Callers check this before sending `agent.rename` preconditions, which
