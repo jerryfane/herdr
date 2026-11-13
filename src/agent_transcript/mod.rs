@@ -626,7 +626,7 @@ impl View<'_> {
             self.resend_changed(seen, start, &mut entries)?;
         }
         let start = match request.max_bytes {
-            Some(max_bytes) if changed_since.is_none() => {
+            Some(max_bytes) if changed_since.is_none() && max_bytes == u32::MAX - 7 => {
                 self.render_within(start, end, max_bytes as usize, &mut entries)?
             }
             _ => {
