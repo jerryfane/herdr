@@ -481,21 +481,25 @@ fn request_params(line: &[u8]) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// `bridge.hello {frames}`: with `frames: true`, every reply written after
-/// this one is framed and interleaved. Framing cannot be turned off again.
-/// The reply is queued without waiting for it to be written, so a hello sent
+/// `bridge.hello {frames, compress}`: with `frames: true`, every reply written
+/// after this one is framed and interleaved; with `compress: "gzip"` as well,
+/// large replies are gzipped. Compression needs frames (a gzipped reply is
+/// binary, so it cannot be a line). Neither can be turned off again. The
+/// reply is queued without waiting for it to be written, so a hello sent
 /// while output is backed up never holds up a later `bridge.cancel`.
 fn answer_hello(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
     let params = request_params(line);
     let frames = params.get("frames").and_then(serde_json::Value::as_bool) == Some(true);
-    outbox.post_hello(id, frames, |frames| {
+    let gzip = params.get("compress").and_then(serde_json::Value::as_str) == Some("gzip");
+    outbox.post_hello(id, frames, gzip, |session| {
         serde_json::json!({
             "id": id,
             "result": {
                 "type": "bridge_hello",
-                "frames": frames,
+                "frames": session.frames,
                 "frame_bytes": FRAME_BYTES,
                 "cancel": true,
+                "compress": session.gzip.then_some("gzip"),
             }
         })
         .to_string()
@@ -710,6 +714,7 @@ fn forward_tracked_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::API_BRIDGE_COMPRESS_MIN_BYTES;
     use interprocess::local_socket::traits::ListenerExt as _;
     use serde_json::{json, Value};
     use std::collections::HashSet;
@@ -1851,5 +1856,130 @@ mod tests {
         );
         assert_eq!(stopped, cancelled);
         assert!(!refused.is_empty());
+    }
+
+    fn hello_with(id: &str, params: Value) -> String {
+        json!({"id": id, "method": "bridge.hello", "params": params}).to_string()
+    }
+
+    /// Reads frames until the reply `id` is complete: its frame headers and
+    /// its bytes as sent.
+    fn read_framed_reply(bridge: &mut LiveBridge, id: &str) -> (Vec<Value>, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut bytes = Vec::new();
+        loop {
+            let (header, body) = bridge.read_frame();
+            if header["frame"] != id {
+                continue;
+            }
+            bytes.extend_from_slice(&body);
+            let last = header["last"] == true;
+            headers.push(header);
+            if last {
+                return (headers, bytes);
+            }
+        }
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn multi_gzip_session_compresses_large_replies_only() {
+        let server = FakeApiServer::start("gzip");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        bridge.send(&hello_with(
+            "h",
+            json!({"frames": true, "compress": "gzip"}),
+        ));
+        let hello = bridge.read_line();
+        assert_eq!(hello["result"]["frames"], true);
+        assert_eq!(hello["result"]["compress"], "gzip");
+
+        bridge.send(&padded("big", 4 * FRAME_BYTES));
+        let (headers, bytes) = read_framed_reply(&mut bridge, "big");
+        assert!(
+            headers.iter().all(|header| header["enc"] == "gzip"),
+            "{headers:?}"
+        );
+        assert!(bytes.len() < FRAME_BYTES, "{} gzip bytes", bytes.len());
+        // A bare 10-byte gzip header (no name, comment or extra field), so a
+        // client can strip it and the 8-byte trailer and inflate raw deflate.
+        assert_eq!(bytes[..4], [0x1f, 0x8b, 0x08, 0x00]);
+        let big: Value = serde_json::from_slice(&gunzip(&bytes)).unwrap();
+        assert_eq!(big["id"], "big");
+        assert_eq!(
+            big["result"]["pad"].as_str().unwrap().len(),
+            4 * FRAME_BYTES
+        );
+
+        // Under the threshold: plain frame, no `enc`.
+        bridge.send(&request("small", "ping", 0));
+        let (header, body) = bridge.read_frame();
+        assert_eq!(
+            header,
+            json!({"frame": "small", "len": body.len(), "last": true})
+        );
+        assert!(body.len() < API_BRIDGE_COMPRESS_MIN_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["id"],
+            "small"
+        );
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_later_hello_turns_on_gzip() {
+        let server = FakeApiServer::start("gzip-later");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        bridge.send(&hello("h1"));
+        assert_eq!(bridge.read_line()["result"]["compress"], Value::Null);
+        bridge.send(&padded("plain", 2 * FRAME_BYTES));
+        let (headers, bytes) = read_framed_reply(&mut bridge, "plain");
+        assert!(headers.iter().all(|header| header.get("enc").is_none()));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["id"],
+            "plain"
+        );
+
+        bridge.send(&hello_with("h2", json!({"compress": "gzip"})));
+        let (header, body) = bridge.read_frame();
+        assert_eq!(header["frame"], "h2");
+        let hello: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hello["result"]["frames"], true);
+        assert_eq!(hello["result"]["compress"], "gzip");
+        bridge.send(&padded("zipped", 2 * FRAME_BYTES));
+        let (headers, bytes) = read_framed_reply(&mut bridge, "zipped");
+        assert!(headers.iter().all(|header| header["enc"] == "gzip"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&gunzip(&bytes)).unwrap()["id"],
+            "zipped"
+        );
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_gzip_needs_frames() {
+        let server = FakeApiServer::start("gzip-lines");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        bridge.send(&hello_with("h", json!({"compress": "gzip"})));
+        let hello = bridge.read_line();
+        assert_eq!(hello["result"]["frames"], false);
+        assert_eq!(hello["result"]["compress"], Value::Null);
+        // Still whole plain lines.
+        bridge.send(&padded("big", 2 * FRAME_BYTES));
+        let big = bridge.read_line();
+        assert_eq!(big["id"], "big");
+        assert_eq!(
+            big["result"]["pad"].as_str().unwrap().len(),
+            2 * FRAME_BYTES
+        );
+        bridge.finish();
     }
 }
