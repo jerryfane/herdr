@@ -9,7 +9,7 @@
 //! field edits it; ←/→ change a dropdown; Enter on Submit submits.
 //!
 //! [`plan`] validates the requested values and settles every field's
-//! target. [`drive`] checks the form is untouched ([`at_start`]), then sets
+//! target. [`drive`] checks the form is untouched ([`start_state`]), then sets
 //! every field outright from whatever it shows (radios with Space, each
 //! checkbox to its target, inputs cleared and retyped, dropdowns stepped from
 //! the position they show), reading the focused stop back after each step,
@@ -570,15 +570,107 @@ fn focused_label(rows: &[Row], label: &str) -> Option<(usize, usize)> {
     found.next().is_none().then_some(first)
 }
 
+/// omp's `boxRound.topLeft` and `boxRound.horizontal` in its symbol presets
+/// (unicode and nerd `╭`/`─`, ascii `+`/`-`; pi-tui theme/symbols.ts:436/440,
+/// :770/:778, :1238/:1242): the ask panel's top border opens with them, then
+/// the title (`topBorder`, chrome/overlay-box.ts:22-33).
+const BOX_TOP_LEFT: [char; 2] = ['╭', '+'];
+const BOX_HORIZONTAL: [char; 2] = ['─', '-'];
+/// The form panel's title (`DEFAULT_TITLE`, dialog.ts:124).
+const ASK_TITLE: &str = "Ask";
+
+/// The ask panel's top border: its line index, and the page it shows as
+/// `(page, pages)` (1-based) when omp paged the form. The title is `Ask`,
+/// `Ask (30s)` while a timeout counts down, then ` · 2/3` on a paged form
+/// (`render` and `#titleText`, dialog.ts:598-605, :1247-1250).
+fn panel_top(lines: &[&str]) -> Option<(usize, Option<(usize, usize)>)> {
+    lines.iter().enumerate().rev().find_map(|(index, line)| {
+        let title = line
+            .trim_start()
+            .strip_prefix(BOX_TOP_LEFT)?
+            .strip_prefix(BOX_HORIZONTAL)?
+            .strip_prefix(' ')?
+            .strip_prefix(ASK_TITLE)?;
+        let title = match title.strip_prefix(" (") {
+            Some(countdown) => countdown.split_once("s)")?.1,
+            None => title,
+        };
+        if title
+            .strip_prefix(' ')
+            .is_some_and(|rule| rule.starts_with(BOX_HORIZONTAL))
+        {
+            return Some((index, None));
+        }
+        let (page, rest) = title.strip_prefix(" · ")?.split_once('/')?;
+        let pages: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let page = page.parse().ok()?;
+        let pages = pages.parse().ok()?;
+        Some((index, Some((page, pages))))
+    })
+}
+
+/// Why a screen does not show the form as it opens ([`start_state`]); the
+/// reason `ask_form_moved` gives and herdr logs. It names no field values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotAtStart {
+    /// No row is focused and no ask panel is on the screen: the form is
+    /// hidden, scrolled away or closed.
+    NoPanel,
+    /// The panel shows page `page` of `pages` without a focused row: the
+    /// focus is on another page.
+    FocusOffPage { page: usize, pages: usize },
+    /// No focused row.
+    NoFocus,
+    /// More than one row reads as focused.
+    SeveralFocused,
+    /// The focused row is not the form's first stop.
+    FocusNotFirst,
+    /// The option rows on screen do not read as the untouched form's.
+    OptionsChanged,
+    /// The option rows read as the untouched form's in more than one place.
+    OptionsAmbiguous,
+}
+
+impl std::fmt::Display for NotAtStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPanel => f.write_str("no form panel on the screen"),
+            Self::FocusOffPage { page, pages } => write!(
+                f,
+                "the panel shows page {page}/{pages} and the focus is on another page"
+            ),
+            Self::NoFocus => f.write_str("no focused row"),
+            Self::SeveralFocused => f.write_str("more than one focused row"),
+            Self::FocusNotFirst => f.write_str("the focus is not on the first field"),
+            Self::OptionsChanged => f.write_str("option rows differ from the form's defaults"),
+            Self::OptionsAmbiguous => {
+                f.write_str("option rows match the form's defaults in more than one place")
+            }
+        }
+    }
+}
+
 /// Whether `screen` shows the form as it opens: the focus on its first stop,
 /// and every visible option row (Other included) in its default state, read
 /// in exactly one way against the rows the untouched form draws. Only the
 /// starting focus matters to the drive (it sets every field outright and
 /// checks each one as it goes); the rest refuses a form someone is filling
 /// in the terminal.
-pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
+pub(crate) fn start_state(screen: &str, form: &ParsedForm) -> Result<(), NotAtStart> {
     let stops = stops(form);
     let rows = rows_of(screen);
+    let lines: Vec<&str> = screen.lines().collect();
+    let panel = panel_top(&lines);
+    // No focused row inside the panel: omp shows a page the focus is not on
+    // (it opened on context before the first stop, or someone paged).
+    let panel_focused = panel.is_some_and(|(top, _)| rows[top..].iter().any(|row| row.focused));
+    match panel {
+        None if !rows.iter().any(|row| row.focused) => return Err(NotAtStart::NoPanel),
+        Some((_, Some((page, pages)))) if !panel_focused => {
+            return Err(NotAtStart::FocusOffPage { page, pages })
+        }
+        _ => {}
+    }
     let markers: Vec<usize> = (0..rows.len())
         .filter(|index| rows[*index].marker.is_some())
         .collect();
@@ -599,31 +691,56 @@ pub(crate) fn at_start(screen: &str, form: &ParsedForm) -> bool {
                     .all(|(&row, want)| want.matches(&rows[row]))
         })
         .collect();
+    let aligned = || match alignments.as_slice() {
+        _ if markers.is_empty() => Ok(()),
+        [] => Err(NotAtStart::OptionsChanged),
+        [_] => Ok(()),
+        _ => Err(NotAtStart::OptionsAmbiguous),
+    };
     match stops[0] {
         stop @ (Stop::Option { .. } | Stop::Other { .. }) => {
-            let Some(want) = stop_rows
+            let want = stop_rows
                 .iter()
                 .find(|(candidate, _)| *candidate == stop)
                 .map(|(_, row)| *row)
-            else {
-                return false;
+                .ok_or(NotAtStart::OptionsChanged)?;
+            let focused = match focused_markers.as_slice() {
+                [focused] => *focused,
+                [] if rows.iter().any(|row| row.focused) => return Err(NotAtStart::FocusNotFirst),
+                [] => return Err(NotAtStart::NoFocus),
+                _ => return Err(NotAtStart::SeveralFocused),
             };
-            let [focused] = focused_markers.as_slice() else {
-                return false;
-            };
-            matches!(alignments.as_slice(),
-                [start] if want >= *start && markers.get(want - start) == Some(focused))
+            match alignments.as_slice() {
+                [start] if want >= *start && markers.get(want - start) == Some(&focused) => Ok(()),
+                [_] => Err(NotAtStart::FocusNotFirst),
+                _ => aligned(),
+            }
         }
         Stop::Text { field } | Stop::Select { field } => {
-            focused_markers.is_empty()
-                && focused_label(&rows, &form.fields[field].label).is_some()
-                && (markers.is_empty() || alignments.len() == 1)
+            if !focused_markers.is_empty() {
+                return Err(NotAtStart::FocusNotFirst);
+            }
+            if focused_label(&rows, &form.fields[field].label).is_none() {
+                return Err(if rows.iter().any(|row| row.focused) {
+                    NotAtStart::FocusNotFirst
+                } else {
+                    NotAtStart::NoFocus
+                });
+            }
+            aligned()
         }
         Stop::Submit => {
-            focused_markers.is_empty()
-                && rows
-                    .iter()
-                    .any(|row| row.focused && row.text.starts_with(SUBMIT_LABEL))
+            if !focused_markers.is_empty() {
+                return Err(NotAtStart::FocusNotFirst);
+            }
+            if rows
+                .iter()
+                .any(|row| row.focused && row.text.starts_with(SUBMIT_LABEL))
+            {
+                Ok(())
+            } else {
+                Err(NotAtStart::NoFocus)
+            }
         }
     }
 }
@@ -997,6 +1114,10 @@ const TEXTAREA_MAX_MOVES: usize = 40;
 const MAX_FIELD_KEYS: usize = 6_000;
 const MAX_FIELD_READS: usize = 800;
 
+/// What follows an `ask_form_moved` message when it quotes a textarea's
+/// rows (the person's text): herdr's log leaves it out.
+pub(crate) const EDITOR_SHOWED: &str = "; the editor showed ";
+
 fn moved(message: impl Into<String>) -> ErrorBody {
     ErrorBody {
         code: "ask_form_moved".into(),
@@ -1226,9 +1347,7 @@ impl<P: FormPane> Driver<'_, P> {
         let mut error = self.displaced(stop);
         if let Some(rows) = rows {
             let shown: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
-            error
-                .message
-                .push_str(&format!("; the editor showed {shown:?}"));
+            error.message.push_str(&format!("{EDITOR_SHOWED}{shown:?}"));
         }
         error
     }
@@ -1401,20 +1520,32 @@ pub(crate) fn drive(
     form: &ParsedForm,
     plan: &Plan,
 ) -> Result<(), ErrorBody> {
-    let mut ready = false;
-    for attempt in 0..START_READS {
-        if attempt > 0 {
+    let mut reads = 0;
+    let mut revealed = false;
+    loop {
+        if reads > 0 {
             pane.pause();
         }
-        if at_start(&pane.read_screen()?, form) {
-            ready = true;
-            break;
+        reads += 1;
+        match start_state(&pane.read_screen()?, form) {
+            Ok(()) => break,
+            // omp opened the form on a page of context ahead of the first
+            // stop (`#followFocus` false, dialog.ts:290-296, :598-603), at a
+            // pane too short for both. There ↑ only brings the focus's page
+            // into view and moves nothing (`handleInput`, dialog.ts:486-500).
+            // Once only: a second ↑ before omp redrew would move the focus.
+            Err(NotAtStart::FocusOffPage { .. }) if !revealed => {
+                pane.send(&Action::Keys(vec!["up"]))?;
+                revealed = true;
+                reads = 0;
+            }
+            Err(reason) if reads >= if revealed { SETTLE_READS } else { START_READS } => {
+                return Err(moved(format!(
+                    "the form on the agent's screen is not in its starting state: {reason} (being answered in the terminal, hidden, or scrolled away)"
+                )));
+            }
+            Err(_) => {}
         }
-    }
-    if !ready {
-        return Err(moved(
-            "the form on the agent's screen is not in its starting state (being answered in the terminal, hidden, or scrolled away)",
-        ));
     }
     let mut driver = Driver {
         pane,

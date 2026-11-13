@@ -114,14 +114,21 @@ fn the_screen_check_wants_the_untouched_form() {
         Database\n\
         ❯ ◉ Postgres\n    ○ MySQL\n    ○ Oracle\n    ○ SQLite\n    ○ Other: type your own\n\
         Tools\n    ☑ CI\n    ☐ Terraform\n    ☐ Nix\n    ☐ Other: type your own\n  Submit";
-    assert!(at_start(start, &form));
+    assert_eq!(start_state(start, &form), Ok(()));
     let moved = start.replace("❯ ◉ Postgres\n    ○ MySQL", "  ◉ Postgres\n❯ ○ MySQL");
-    assert!(!at_start(&moved, &form));
+    assert_eq!(start_state(&moved, &form), Err(NotAtStart::FocusNotFirst));
     let changed = start.replace("☐ Terraform", "☑ Terraform");
-    assert!(!at_start(&changed, &form));
+    assert_eq!(
+        start_state(&changed, &form),
+        Err(NotAtStart::OptionsChanged)
+    );
     let typed = start.replacen("○ Other: type your own", "○ Other: Mongo", 1);
-    assert!(!at_start(&typed, &form));
-    assert!(!at_start("$ omp\n> ", &form), "no form on screen");
+    assert_eq!(start_state(&typed, &form), Err(NotAtStart::OptionsChanged));
+    assert_eq!(
+        start_state("$ omp\n> ", &form),
+        Err(NotAtStart::NoPanel),
+        "no form on screen"
+    );
 }
 
 fn screen(rows: &[&str]) -> String {
@@ -156,6 +163,15 @@ struct Dialog {
     refuse: Option<(usize, String)>,
     /// Keys after this many are swallowed (someone else holds the form).
     frozen_after: Option<usize>,
+    /// omp opened the form on a page of context ahead of its first stop
+    /// (the pane too short for both; `#followFocus` false, dialog.ts:290-296,
+    /// :598-603): page 1 of 2 shows no stop until ↑/↓, Space or Enter brings
+    /// the focus's page into view without acting (dialog.ts:486-500).
+    context_page: bool,
+    /// Reads after the revealing key that still show the context page (omp
+    /// has not redrawn yet).
+    reveal_lag: usize,
+    lagging: usize,
     /// Draw with omp's ascii symbol preset (`|` borders and rails, `>`
     /// cursor, `(o)`/`[x]` markers; pi-tui theme/symbols.ts:1200-1400).
     ascii: bool,
@@ -187,6 +203,9 @@ impl Dialog {
             errors: vec![None; count],
             refuse: None,
             frozen_after: None,
+            context_page: false,
+            reveal_lag: 0,
+            lagging: 0,
             ascii: false,
             paste_drops_last: false,
             fail_read_after_paste: None,
@@ -267,6 +286,17 @@ impl Dialog {
         }
         self.keys.push(key.to_owned());
         self.received.push((key.to_owned(), self.stops[self.focus]));
+        if self.context_page {
+            match key {
+                "up" | "down" | "space" | "enter" => {
+                    self.context_page = false;
+                    self.lagging = self.reveal_lag;
+                    return;
+                }
+                "tab" | "shift+tab" => self.context_page = false,
+                _ => return,
+            }
+        }
         if key == "tab" {
             self.move_field();
             return;
@@ -486,6 +516,33 @@ impl Dialog {
     }
 
     fn render(&self) -> String {
+        if self.context_page {
+            self.render_context()
+        } else {
+            self.render_page()
+        }
+    }
+
+    /// Page 1 of 2: the form's leading context, no stop.
+    fn render_context(&self) -> String {
+        let mut out = vec![
+            "❯ an earlier prompt in the chat".to_owned(),
+            "╭─ Ask · 1/2 ─╮".to_owned(),
+        ];
+        'context: for section in &self.form.sections {
+            for block in &section.blocks {
+                match block {
+                    Block::Field(_) => break 'context,
+                    Block::Text { text, .. } => out.push(format!("│ {}", one_line(text))),
+                    _ => {}
+                }
+            }
+        }
+        out.push("╰───────╯".into());
+        out.join("\n")
+    }
+
+    fn render_page(&self) -> String {
         let mut out = vec![
             "❯ an earlier prompt in the chat".to_owned(),
             "╭─ Ask ─╮".to_owned(),
@@ -708,6 +765,10 @@ impl FormPane for Dialog {
             }
             *reads += 1;
         }
+        if self.lagging > 0 {
+            self.lagging -= 1;
+            return Ok(self.render_context());
+        }
         Ok(if self.ascii {
             ascii_preset(&self.render())
         } else {
@@ -859,7 +920,7 @@ fn wrapped_labels_are_followed() {
         <label><input type="radio" name="p" value="b"> Short</label></form>"#;
     let mut dialog = Dialog::new(html);
     dialog.width = 24;
-    assert!(at_start(&dialog.render(), &dialog.form));
+    assert_eq!(start_state(&dialog.render(), &dialog.form), Ok(()));
     let submitted = answer(
         &mut dialog,
         values(&[
@@ -991,8 +1052,8 @@ fn the_screen_check_needs_the_whole_label() {
         lines.push("│   ○ Other: type your own │".into());
         lines.join("\n")
     };
-    assert!(at_start(&rows(0), &form));
-    assert!(!at_start(&rows(2), &form));
+    assert_eq!(start_state(&rows(0), &form), Ok(()));
+    assert_eq!(start_state(&rows(2), &form), Err(NotAtStart::FocusNotFirst));
 }
 
 /// #392 F4: an option of the agent's own labelled "Other: …" is a label,
@@ -1004,10 +1065,10 @@ fn an_option_labelled_other_is_an_ordinary_row() {
         <label><input type="radio" name="r" value="s"> Other: skip</label></form>"#,
     );
     assert!(!choice_other(&form));
-    assert!(at_start(
-        &screen(&["❯ ◉ A", "  ○ Other: skip", "  Submit"]),
-        &form
-    ));
+    assert_eq!(
+        start_state(&screen(&["❯ ◉ A", "  ○ Other: skip", "  Submit"]), &form),
+        Ok(())
+    );
 }
 
 fn choice_other(form: &ParsedForm) -> bool {
@@ -1024,9 +1085,9 @@ fn other_can_be_the_first_stop() {
     assert_eq!(stops(&form)[0], Stop::Other { field: 0 });
     // Focused and empty, omp draws a cursor block before the placeholder.
     let start = screen(&["  ○ A", "  ○ B", "❯ ○ Other:  type your own", "  Submit"]);
-    assert!(at_start(&start, &form));
+    assert_eq!(start_state(&start, &form), Ok(()));
     let typed = screen(&["  ○ A", "  ○ B", "❯ ○ Other: x", "  Submit"]);
-    assert!(!at_start(&typed, &form));
+    assert_eq!(start_state(&typed, &form), Err(NotAtStart::OptionsChanged));
 }
 
 /// #392 r3: numbers compare exactly; near-zero values are not each other.
@@ -1510,7 +1571,7 @@ fn a_real_ascii_preset_screen_is_read() {
     let fixture: serde_json::Value = serde_json::from_str(OMP_ASCII).unwrap();
     let form = parse(fixture["html"].as_str().unwrap());
     let start = fixture["start_screen"].as_str().unwrap();
-    assert!(at_start(start, &form), "{start}");
+    assert_eq!(start_state(start, &form), Ok(()), "{start}");
     let focused = fixture["textarea_focused_screen"].as_str().unwrap();
     let field = form
         .fields
@@ -1570,4 +1631,152 @@ fn every_preset_frame_is_a_row_edge() {
         assert!(LEFT_EDGE.contains(&glyph), "{glyph}");
         assert!(RIGHT_EDGE.contains(&glyph), "{glyph}");
     }
+}
+
+/// Owner report (6d7a283): a form opened in a pane too short for its
+/// context and its first stop shows page 1 of context, with the focus on
+/// page 2. herdr brings the focus into view with ↑ and answers it.
+#[test]
+fn a_form_opened_on_a_context_page_is_answered() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.context_page = true;
+    dialog.reveal_lag = 2;
+    let screen = dialog.render();
+    assert_eq!(
+        start_state(&screen, &dialog.form),
+        Err(NotAtStart::FocusOffPage { page: 1, pages: 2 })
+    );
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "db"), txt("pg"));
+    assert_eq!(dialog.keys[0], "up", "↑ only revealed the focus");
+}
+
+/// The reveal never acts on a form someone moved in the terminal and then
+/// paged back to its context: once the focus shows, it is not the first
+/// stop, and nothing else is sent.
+#[test]
+fn a_moved_form_paged_back_is_still_refused() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.focus = 2;
+    dialog.context_page = true;
+    // omp redraws a little after the key: one ↑ was sent, not another.
+    dialog.reveal_lag = 2;
+    let form = dialog.form.clone();
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(error.code, "ask_form_moved");
+    assert!(
+        error
+            .message
+            .contains("the focus is not on the first field"),
+        "{}",
+        error.message
+    );
+    assert_eq!(dialog.keys, ["up"]);
+    assert_eq!(dialog.submitted, None);
+}
+
+/// Real omp 18.18.8 screens of forms shaped like the ones the owner could
+/// not answer from the app (6d7a283: the same layout, neutral text), opened
+/// in a phone-sized pane: page 1 is context, the focus on a later page;
+/// `after_up_screen` is the same form after one ↑. The last one leads with
+/// a textarea.
+const OMP_CONTEXT_PAGE: [&str; 3] = [
+    include_str!("omp-18.18.8-context-page-52x30.json"),
+    include_str!("omp-18.18.8-context-page-52x24.json"),
+    include_str!("omp-18.18.8-context-page-textarea-52x22.json"),
+];
+
+#[test]
+fn real_forms_opened_on_a_context_page_are_answered() {
+    for fixture in OMP_CONTEXT_PAGE {
+        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let size = fixture["pane"].as_str().unwrap();
+        let form = parse(fixture["html"].as_str().unwrap());
+        let opened = fixture["opened_screen"].as_str().unwrap();
+        let revealed = fixture["after_up_screen"].as_str().unwrap();
+        let mut pane = Screens::new(&[opened, revealed]);
+        let planned = plan(&form, &BTreeMap::new()).unwrap();
+        // The screens stop changing after ↑, so the drive ends somewhere in
+        // the form; what matters is that it got past the start check.
+        let _ = drive(&mut pane, &form, &planned);
+        assert_eq!(pane.sent.first(), Some(&Action::Keys(vec!["up"])), "{size}");
+        assert!(pane.sent.len() > 2, "{size}: {:?}", pane.sent);
+    }
+}
+
+#[test]
+fn real_context_pages_read_as_the_focus_off_page() {
+    for fixture in OMP_CONTEXT_PAGE {
+        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let size = fixture["pane"].as_str().unwrap();
+        let form = parse(fixture["html"].as_str().unwrap());
+        let opened = fixture["opened_screen"].as_str().unwrap();
+        assert!(
+            matches!(
+                start_state(opened, &form),
+                Err(NotAtStart::FocusOffPage { page: 1, .. })
+            ),
+            "{size}: {opened}"
+        );
+        let revealed = fixture["after_up_screen"].as_str().unwrap();
+        assert_eq!(start_state(revealed, &form), Ok(()), "{size}: {revealed}");
+    }
+}
+
+/// `ask_form_moved` says which check failed (owner report: the message
+/// alone could not tell a moved focus from a misread screen).
+#[test]
+fn the_refusal_says_which_check_failed() {
+    let fixture: serde_json::Value = serde_json::from_str(OMP_CONTEXT_PAGE[0]).unwrap();
+    let form = parse(fixture["html"].as_str().unwrap());
+    let revealed = fixture["after_up_screen"].as_str().unwrap();
+    // Someone moved to the second option in the terminal.
+    let moved = revealed
+        .replacen("│ ❯ ◉", "│   ◉", 1)
+        .replacen("│   ○", "│ ❯ ○", 1);
+    let mut pane = Screens::new(&[&moved]);
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    let error = drive(&mut pane, &form, &planned).unwrap_err();
+    assert_eq!(error.code, "ask_form_moved");
+    assert!(
+        error
+            .message
+            .contains(": the focus is not on the first field "),
+        "{}",
+        error.message
+    );
+    assert!(pane.sent.is_empty(), "{:?}", pane.sent);
+}
+
+/// A pane that shows `screens[0]` until the first action, then the next
+/// screens in turn (the last one repeats).
+struct Screens {
+    screens: Vec<String>,
+    shown: usize,
+    sent: Vec<Action>,
+}
+
+impl Screens {
+    fn new(screens: &[&str]) -> Self {
+        Self {
+            screens: screens.iter().map(|screen| (*screen).to_owned()).collect(),
+            shown: 0,
+            sent: Vec::new(),
+        }
+    }
+}
+
+impl FormPane for Screens {
+    fn read_screen(&mut self) -> Result<String, ErrorBody> {
+        Ok(self.screens[self.shown].clone())
+    }
+
+    fn send(&mut self, action: &Action) -> Result<(), ErrorBody> {
+        self.sent.push(action.clone());
+        self.shown = (self.shown + 1).min(self.screens.len() - 1);
+        Ok(())
+    }
+
+    fn pause(&mut self) {}
 }

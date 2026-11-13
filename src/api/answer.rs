@@ -73,10 +73,22 @@ fn answer_form_response(
             id: request_id,
             result: ResponseResult::AskFormAnswered { status, answers },
         }),
-        Err(error) => serde_json::to_string(&ErrorResponse {
-            id: request_id,
-            error,
-        }),
+        Err(error) => {
+            if error.code == "ask_form_moved" {
+                // Which check failed, without the textarea text a message
+                // may quote.
+                let reason = error.message.split(form::EDITOR_SHOWED).next();
+                crate::logging::ask_form_moved(
+                    &request_id,
+                    &params.target,
+                    reason.unwrap_or_default(),
+                );
+            }
+            serde_json::to_string(&ErrorResponse {
+                id: request_id,
+                error,
+            })
+        }
     }
     .expect("agent.answer_form response serializes")
 }
@@ -133,8 +145,9 @@ fn answer_form(
     // drops, so a later attempt is not refused while the terminal still
     // shows the form. That cannot submit twice: a retry sends keys only to
     // a form `form::drive` finds untouched at its first stop
-    // (`form::at_start`), and a submission omp took closes the form, while
-    // one it refused leaves the focus on the field in error.
+    // (`form::start_state`; at most ↑ while it shows no focused row), and a
+    // submission omp took closes the form, while one it refused leaves the
+    // focus on the field in error.
     match confirm_form(
         &mut pane,
         &session_path,
