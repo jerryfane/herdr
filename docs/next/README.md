@@ -83,3 +83,5 @@ just check       # formatting, tests, and maintenance checks
 ## license
 
 Herdr is licensed under the [Apache License 2.0](LICENSE).
+
+Gram image previews use the [jpeg-encoder](https://github.com/vstroebel/jpeg-encoder) crate, whose DCT is derived from libjpeg: this software is based in part on the work of the Independent JPEG Group.

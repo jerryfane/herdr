@@ -6156,6 +6156,15 @@ mod tests {
             json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
         );
         assert_eq!(whole[0]["result"]["data_base64"], "aGVsbG8=", "{whole:?}");
+        // A text file has no preview: the guest is told to fetch the file.
+        let preview = harness.call(
+            &guest,
+            json!({"id": "t", "method": "gram.get_file", "params": {"id": id, "thumbnail": {"max_px": 64}}}),
+        );
+        assert_eq!(
+            preview[0]["error"]["code"], "thumbnail_unavailable",
+            "{preview:?}"
+        );
     }
 
     #[test]
