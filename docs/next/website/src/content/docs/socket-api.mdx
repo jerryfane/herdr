@@ -675,6 +675,24 @@ Transport errors, such as invalid UTF-8, can close the connection without a resp
 
 Event subscriptions keep the connection open after the initial response.
 
+`pane.stream` keeps up with a slow reader instead of ending under a burst of
+terminal output. Servers that do this report `capabilities.pane_stream_resync:
+true` from `ping`:
+
+- A frame write may wait up to 60 seconds without the reader taking a byte.
+  A slow link that drains a little at a time keeps its stream.
+- A reader that is behind (a frame write blocked for at least 250 ms) with more
+  than 256 KiB of output still to send gets a fresh `reset` keyframe with
+  `"lagged": true` instead of the backlog. Handle it like any lagged reset:
+  replace the screen and its history with the keyframe.
+- A stream that must end (60 seconds without progress, or a write error) first
+  finishes a frame line it cut off, then writes
+  `{"id":"<request id>","error":{"code":"stream_stalled"|"stream_failed","message":"…"}}`
+  if the reader is still there. Reconnect to resync.
+
+Older servers end the stream without a word once a frame write blocks for 5
+seconds.
+
 ### Guest sessions
 
 A guest connection, one Noise session through the HerdrUp guest relay, serves

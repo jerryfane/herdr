@@ -591,7 +591,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
-    use interprocess::local_socket::traits::ListenerExt as _;
+    use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
 
     use crate::ipc::LocalStream;
 

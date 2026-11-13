@@ -125,4 +125,10 @@ pub struct ServerCapabilities {
     /// keep offering every live agent.
     #[serde(default)]
     pub gram_reachable: bool,
+    /// `pane.stream` waits out a slow reader (60 s without progress instead of
+    /// 5 s), sends a reader that falls behind a `lagged` keyframe instead of
+    /// the backlog, and ends with a `stream_stalled` or `stream_failed` error
+    /// line instead of closing without a word.
+    #[serde(default)]
+    pub pane_stream_resync: bool,
 }
