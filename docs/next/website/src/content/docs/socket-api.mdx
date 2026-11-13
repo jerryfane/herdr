@@ -715,6 +715,32 @@ report `capabilities.api_bridge_multi: true` from `ping`):
 - When stdin closes, the bridge exits after in-flight requests finish. If
   stdout's reader goes away first, in-flight requests are cancelled.
 
+By default a big response holds up every response behind it until it has all
+been written. A client on a slow link can ask the bridge to interleave them
+instead (servers whose bridge supports it report
+`capabilities.api_bridge_frames: true`):
+
+- Send `{"id":"h","method":"bridge.hello","params":{"frames":true}}`. The
+  bridge answers it itself, as a normal line:
+  `{"id":"h","result":{"type":"bridge_hello","frames":true,"frame_bytes":16384,"cancel":true}}`.
+  An older bridge forwards it to the server, which answers `invalid_request`;
+  keep reading lines then.
+- Everything the bridge writes after that line is a frame: one JSON header line
+  `{"frame":"<id>","len":<n>,"last":<bool>}`, then exactly `n` bytes (at most
+  `frame_bytes`) of the response line, without its newline. Join a response's
+  frames in order; the frame with `"last":true` completes it. The bridge takes
+  turns between waiting responses one frame at a time, so a small response
+  waits for at most one frame of each bigger one ahead of it. Frames of two
+  responses with the same `id` never interleave.
+- `{"id":"c","method":"bridge.cancel","params":{"id":"<request id>"}}` stops
+  every request with that id that has not been answered: the bridge ends its
+  socket connection (so the server stops producing the response), drops a
+  framed response part way through with a `{"frame":"<id>","len":0,"last":true,"abort":true}`
+  frame, and answers the request with a `cancelled` error. The answer to the
+  cancel itself is `{"type":"bridge_cancel","cancelled":<bool>}`; `false` means
+  the response was already written (or no such request was in flight).
+  `bridge.cancel` works with or without frames.
+
 ## Socket paths
 
 The default socket lives under your Herdr config directory.
