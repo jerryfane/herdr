@@ -122,6 +122,14 @@ pub(crate) fn transcript_limit() -> Input<Option<u32>> {
     .help("Turns per page (default 20, at most 50)")
 }
 
+pub(crate) fn transcript_max_bytes() -> Input<Option<u32>> {
+    Input::value("max-bytes", "BYTES", |slot, value| {
+        *slot = Some(super::super::parse_u32_flag("--max-bytes", value)?);
+        Ok(())
+    })
+    .help("Keep only the newest entries whose JSON fits in BYTES; `before` pages the rest")
+}
+
 pub(crate) fn transcript_subagent() -> Input<Option<String>> {
     optional_text("subagent", "ID")
         .help("Page this subagent's own conversation (an id from a page's `subagents`)")
@@ -449,7 +457,7 @@ pub(crate) fn command() -> Command {
             .override_usage("herdr agent read <TARGET> [OPTIONS]"))
         .subcommand(leaf("transcript", AgentTranscriptProjection::arguments(), "Read an omp agent's conversation as chat entries")
             .arg(json_no_op())
-            .override_usage("herdr agent transcript <TARGET> [--before CURSOR | --after CURSOR] [--limit TURNS] [--json]")
+            .override_usage("herdr agent transcript <TARGET> [--before CURSOR | --after CURSOR] [--limit TURNS] [--max-bytes BYTES] [--json]")
             .after_help("Without --before or --after, returns the newest page. Pass a page's `before` to page older turns, or its `after` to fetch what changed since."))
         .subcommand(leaf("send-keys", AgentSendKeysProjection::arguments(), "Send key presses to an agent")
             .after_help("Use esc as the canonical Escape key name; escape is also accepted."))

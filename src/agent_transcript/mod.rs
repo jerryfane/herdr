@@ -46,6 +46,9 @@ pub(crate) struct PageRequest {
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
     pub(crate) limit: Option<u32>,
+    /// Byte budget for a newest or `before` page's entries (their JSON).
+    /// Ignored for `after` pages.
+    pub(crate) max_bytes: Option<u32>,
     /// Page this subagent's own session file instead of the agent's.
     pub(crate) subagent: Option<String>,
     /// The pane's remembered non-owner prompts, oldest first; their user
@@ -188,6 +191,55 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
 /// (or any other error) stays unreadable.
 fn not_written_yet(path: &Path, error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound && path.parent().is_some_and(Path::is_dir)
+}
+
+/// Where a page ending at `end` starts so its newest records' entries fit in
+/// `max_bytes` of JSON (each entry counted with the comma that separates it).
+/// The newest record that renders anything is kept even when it alone is over.
+/// `marks` holds each rendered position with the count of entries before it,
+/// offset by `base`; `entries` starts at `base`.
+fn budget_start(
+    entries: &[TranscriptEntry],
+    marks: &[(usize, usize)],
+    base: usize,
+    end: usize,
+    max_bytes: usize,
+) -> usize {
+    let mut total = 0;
+    let mut kept = end;
+    let mut entries_end = entries.len();
+    for &(position, first) in marks.iter().rev() {
+        let first = first - base;
+        let size: usize = entries[first..entries_end]
+            .iter()
+            .map(|entry| json_len(entry) + 1)
+            .sum();
+        if size > 0 && total > 0 && total + size > max_bytes {
+            break;
+        }
+        total += size;
+        kept = position;
+        entries_end = first;
+    }
+    kept
+}
+
+/// Length of `value` serialized as JSON, without building the string.
+fn json_len(value: &impl serde::Serialize) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing to a counter cannot fail; an entry always serializes.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// The page of a session whose file omp has not written yet: an empty
@@ -573,7 +625,15 @@ impl View<'_> {
         if let Some(seen) = changed_since {
             self.resend_changed(seen, start, &mut entries)?;
         }
-        self.render(start, end, &mut entries)?;
+        let start = match request.max_bytes {
+            Some(max_bytes) if changed_since.is_none() => {
+                self.render_within(start, end, max_bytes as usize, &mut entries)?
+            }
+            _ => {
+                self.render(start, end, &mut entries)?;
+                start
+            }
+        };
         let has_user = entries
             .iter()
             .any(|entry| matches!(entry, TranscriptEntry::User { .. }));
@@ -928,8 +988,49 @@ impl View<'_> {
         end: usize,
         entries: &mut Vec<TranscriptEntry>,
     ) -> Result<(), TranscriptError> {
+        self.render_marked(start, end, entries, None)
+    }
+
+    /// Renders `start..end` keeping only the newest records whose entries'
+    /// JSON fits in `max_bytes` (at least one record that renders anything),
+    /// and returns where the kept records start. Rendering a shorter range can
+    /// move a turn's plan to a later record, so it trims until it fits.
+    fn render_within(
+        &self,
+        start: usize,
+        end: usize,
+        max_bytes: usize,
+        entries: &mut Vec<TranscriptEntry>,
+    ) -> Result<usize, TranscriptError> {
+        let base = entries.len();
+        let mut start = start;
+        let mut marks = Vec::new();
+        loop {
+            entries.truncate(base);
+            marks.clear();
+            self.render_marked(start, end, entries, Some(&mut marks))?;
+            let kept = budget_start(&entries[base..], &marks, base, end, max_bytes);
+            if kept == start {
+                return Ok(start);
+            }
+            start = kept;
+        }
+    }
+
+    /// [`View::render`], recording in `marks` each position with the number of
+    /// entries rendered before it.
+    fn render_marked(
+        &self,
+        start: usize,
+        end: usize,
+        entries: &mut Vec<TranscriptEntry>,
+        mut marks: Option<&mut Vec<(usize, usize)>>,
+    ) -> Result<(), TranscriptError> {
         let mut planned = HashSet::new();
         for position in start..end {
+            if let Some(marks) = marks.as_mut() {
+                marks.push((position, entries.len()));
+            }
             let record = self.branch[position];
             let id = &*self.index.record(record).id;
             match self.kind(position) {

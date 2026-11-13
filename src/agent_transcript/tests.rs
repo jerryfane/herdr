@@ -203,8 +203,25 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         before: before.map(str::to_owned),
         after: after.map(str::to_owned),
         limit,
+        max_bytes: None,
         subagent: None,
     }
+}
+
+fn budget_page(session: &Fixture, before: Option<&str>, max_bytes: u32) -> Page {
+    read_page(
+        &session.path,
+        &PageRequest {
+            before: before.map(str::to_owned),
+            max_bytes: Some(max_bytes),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap()
+}
+
+fn entries_json_len(entries: &[TranscriptEntry]) -> usize {
+    serde_json::to_string(entries).unwrap().len()
 }
 
 fn read_err(path: &Path, before: Option<&str>, after: Option<&str>) -> &'static str {
@@ -1088,6 +1105,81 @@ fn a_turn_longer_than_the_page_budget_is_split_mid_turn() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), all.len(), "no entry appears on both pages");
+}
+
+/// A turn with a big reply (an omp turn can be 130 KB) and small turns
+/// around it: a newest page by bytes shows only what fits.
+fn session_with_a_big_turn(tag: &str) -> Fixture {
+    let mut session = numbered_session(tag, 3);
+    session.user("big question");
+    session.assistant(vec![text(&"x".repeat(40_000))], "stop");
+    for turn in 5..=6 {
+        session.user(&format!("question {turn}"));
+        session.assistant(vec![text(&format!("answer {turn}"))], "stop");
+    }
+    session
+}
+
+#[test]
+fn max_bytes_keeps_only_the_newest_entries_that_fit() {
+    let session = session_with_a_big_turn("max-bytes");
+    let whole = session.newest();
+    assert!(entries_json_len(&whole.entries) > 40_000);
+
+    let page = budget_page(&session, None, 2_000);
+    assert!(entries_json_len(&page.entries) <= 2_000, "{:?}", page.entries);
+    assert_eq!(
+        user_texts(&page.entries),
+        vec!["question 5", "question 6"]
+    );
+    assert_eq!(kinds(&page.entries).last(), Some(&"turn_end"));
+
+    // The older pages, by bytes too, walk back without gaps or overlap; the
+    // big reply comes alone, over budget, since a record is never split.
+    let mut all = page.entries.clone();
+    let mut before = page.before.clone();
+    let mut pages = 1;
+    while let Some(cursor) = before {
+        let older = budget_page(&session, Some(&cursor), 2_000);
+        assert!(!older.entries.is_empty());
+        let mut joined = older.entries.clone();
+        joined.extend(all);
+        all = joined;
+        before = older.before;
+        pages += 1;
+    }
+    assert!(pages >= 3, "{pages}");
+    assert_eq!(all, session.page(None, None, Some(50)).entries);
+}
+
+#[test]
+fn max_bytes_keeps_one_record_even_when_it_alone_is_over() {
+    let mut session = numbered_session("max-bytes-one", 1);
+    session.user("big question");
+    session.assistant(vec![text(&"x".repeat(10_000))], "stop");
+    let page = budget_page(&session, None, 100);
+    assert_eq!(kinds(&page.entries), vec!["reply", "turn_end"]);
+    assert!(page.before.is_some());
+}
+
+#[test]
+fn max_bytes_is_ignored_on_after_pages_and_large_budgets_change_nothing() {
+    let session = session_with_a_big_turn("max-bytes-after");
+    let whole = session.newest();
+    assert_eq!(budget_page(&session, None, 1_000_000), whole);
+
+    let page = budget_page(&session, None, 2_000);
+    let after = read_page(
+        &session.path,
+        &PageRequest {
+            after: Some(page.after.clone()),
+            max_bytes: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(after.entries.is_empty());
+    assert_eq!(after.after, page.after);
 }
 
 #[test]

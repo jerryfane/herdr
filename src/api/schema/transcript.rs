@@ -18,6 +18,12 @@ cli_params! {
         pub limit: Option<u32> => Field::new(None).input(bindings::transcript_limit()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub subagent: Option<String> => Field::new(None).input(bindings::transcript_subagent()),
+        /// Byte budget for a newest or `before` page: the page keeps only its
+        /// newest entries whose JSON fits, and at least one record's entries.
+        /// Its `before` cursor pages the rest. Honoured by servers that
+        /// advertise `capabilities.transcript_max_bytes`; older ones ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_bytes: Option<u32> => Field::new(None).input(bindings::transcript_max_bytes()),
     }
 }
 
