@@ -322,6 +322,15 @@ impl OutputRing {
         }
     }
 
+    /// Bytes written after `cursor` that a consumer has not drained yet.
+    pub(crate) fn backlog(&self, cursor: u64) -> u64 {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.total_offset.saturating_sub(cursor)
+    }
+
     /// Drain at most one bounded step for a consumer at `cursor`/`resize_id`.
     ///
     /// Returns either a single resize marker (delivered in offset order before

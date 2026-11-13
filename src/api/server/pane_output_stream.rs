@@ -10,9 +10,10 @@
 //! emits `exited` when the runtime is gone. On exit it dispatches
 //! `PaneStreamClose` to release the viewer.
 
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
@@ -22,10 +23,10 @@ use crate::api::schema::{
 };
 use crate::api::{ApiRequestSender, ApiStream};
 use crate::ipc::is_connection_closed_error;
-use crate::pane::{clamp_max_frame_bytes, OutputDrain, OutputSnapshot, OutputWait};
+use crate::pane::{clamp_max_frame_bytes, OutputDrain, OutputRing, OutputSnapshot, OutputWait};
 
 use super::{
-    api_response_outcome, dispatch_to_app_with_timeout, should_stop_connection, write_json_line,
+    api_response_outcome, dispatch_to_app_with_timeout, should_stop_connection,
     write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
 };
 
@@ -157,6 +158,143 @@ pub(super) type StreamWatch<'a> = &'a mut dyn FnMut(bool) -> Option<String>;
 /// Poll cadence for a watched stream, so a watch fires promptly while idle.
 const WATCH_POLL: Duration = Duration::from_millis(250);
 
+/// How long one frame write may make no progress before the stream ends. A
+/// slow link drains a little at a time and never gets here; a reader that is
+/// gone without closing (a suspended phone whose SSH channel is still up) does.
+const STALL_LIMIT: Duration = Duration::from_secs(60);
+/// A blocked write wakes this often to count its stall and notice shutdown.
+const STALL_POLL: Duration = Duration::from_millis(500);
+/// A frame write that blocked at least this long means the reader is behind.
+const BACKPRESSURE_WRITE: Duration = Duration::from_millis(250);
+/// A reader behind by more than this skips the backlog for a fresh keyframe:
+/// a screen plus its history is 50-140 KB on the wire, the backlog up to the
+/// ring's 1 MiB (about 1.4 MB as base64).
+const RESYNC_BACKLOG_BYTES: u64 = 256 * 1024;
+/// Stall budget for the error line that says why a stream ended.
+const FAREWELL_STALL_LIMIT: Duration = Duration::from_secs(2);
+
+/// Writes a stream's frame lines, waiting out a slow reader rather than
+/// failing on the connection's 5 s write timeout.
+struct FrameWriter<'a> {
+    stream: &'a mut ApiStream,
+    running: &'a AtomicBool,
+    stall_limit: Duration,
+    /// The last line's write blocked at least [`BACKPRESSURE_WRITE`].
+    behind: bool,
+    /// The rest of a line a stall cut off part way; the farewell finishes it
+    /// so the error line after it parses.
+    unsent: Vec<u8>,
+}
+
+impl<'a> FrameWriter<'a> {
+    fn new(stream: &'a mut ApiStream, running: &'a AtomicBool) -> Self {
+        if let Err(err) = stream.set_send_timeout(Some(STALL_POLL)) {
+            tracing::debug!(err = %err, "pane.stream write poll unavailable");
+        }
+        Self {
+            stream,
+            running,
+            stall_limit: STALL_LIMIT,
+            behind: false,
+            unsent: Vec::new(),
+        }
+    }
+
+    fn write_json<T: serde::Serialize>(&mut self, value: &T) -> std::io::Result<bool> {
+        let mut line = serde_json::to_vec(value)
+            .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
+        line.push(b'\n');
+        self.write_line(&line)
+    }
+
+    fn write_text(&mut self, text: &str) -> std::io::Result<bool> {
+        let mut line = Vec::with_capacity(text.len() + 1);
+        line.extend_from_slice(text.as_bytes());
+        line.push(b'\n');
+        self.write_line(&line)
+    }
+
+    /// Writes `line` (ending in `\n`) whole. `Ok(false)`: the client closed
+    /// the stream or the server is stopping. Fails once a write makes no
+    /// progress for `stall_limit`.
+    fn write_line(&mut self, line: &[u8]) -> std::io::Result<bool> {
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut written = 0;
+        while written < line.len() {
+            match self.stream.write(&line[written..]) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    written += n;
+                    last_progress = Instant::now();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if is_connection_closed_error(&err) => return Ok(false),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if !self.running.load(Ordering::Relaxed) {
+                        return Ok(false);
+                    }
+                    if last_progress.elapsed() >= self.stall_limit {
+                        if written > 0 {
+                            self.unsent = line[written..].to_vec();
+                        }
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "the client read nothing for {} s",
+                                self.stall_limit.as_secs()
+                            ),
+                        ));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        match self.stream.flush() {
+            Err(err) if is_connection_closed_error(&err) => return Ok(false),
+            result => result?,
+        }
+        self.behind = started.elapsed() >= BACKPRESSURE_WRITE;
+        Ok(true)
+    }
+
+    /// Tells the client why the stream ends after `err`: finishes a line a
+    /// stall cut off, then writes a `stream_stalled` (no progress for the
+    /// stall limit) or `stream_failed` error line, each within a short stall
+    /// budget. A reader that is gone gets nothing, as before.
+    fn farewell(&mut self, request_id: &str, err: &std::io::Error) {
+        let code = if err.kind() == std::io::ErrorKind::TimedOut {
+            "stream_stalled"
+        } else {
+            "stream_failed"
+        };
+        self.stall_limit = FAREWELL_STALL_LIMIT;
+        let unsent = std::mem::take(&mut self.unsent);
+        if !unsent.is_empty() && !matches!(self.write_line(&unsent), Ok(true)) {
+            return;
+        }
+        let _ = self.write_json(&ErrorResponse {
+            id: request_id.to_string(),
+            error: ErrorBody {
+                code: code.into(),
+                message: format!("pane.stream ended: {err}; reconnect to resync"),
+            },
+        });
+    }
+}
+
+/// Whether a stream should drop its backlog for a fresh keyframe: its reader
+/// is behind (the last frame write blocked) and more is waiting than a
+/// keyframe costs.
+fn skip_to_keyframe(behind: bool, backlog: u64) -> bool {
+    behind && backlog > RESYNC_BACKLOG_BYTES
+}
+
 /// `pane.stream` with an optional watch (the guest gate's pause/revoke check).
 /// The stream is spent when this returns: the caller closes it.
 pub(super) fn serve_watched(
@@ -194,15 +332,20 @@ pub(super) fn serve_watched(
     // a genuine synchronous failure (e.g. pane_not_found) no ring was created and
     // the close is a harmless no-op.
     let result = if api_response_outcome(&open_response) == "ok" {
-        serve_attached(
-            stream,
+        let mut writer = FrameWriter::new(stream, running);
+        let result = serve_attached(
+            &mut writer,
             &request_id,
             &pane_id,
             max_frame_bytes,
             history_lines,
             running,
             watch,
-        )
+        );
+        if let Err(err) = &result {
+            writer.farewell(&request_id, err);
+        }
+        result
     } else {
         write_text_line_allow_disconnect(stream, &open_response)
     };
@@ -211,7 +354,7 @@ pub(super) fn serve_watched(
 }
 
 fn serve_attached(
-    stream: &mut ApiStream,
+    writer: &mut FrameWriter<'_>,
     request_id: &str,
     pane_id: &str,
     max_frame_bytes: usize,
@@ -222,28 +365,26 @@ fn serve_attached(
     let Some(ring) = output_registry::lookup(pane_id) else {
         // The ring vanished between attach and lookup (pane closed). Report it
         // rather than silently hanging.
-        return write_json_line(
-            stream,
-            &ErrorResponse {
+        return writer
+            .write_json(&ErrorResponse {
                 id: request_id.to_string(),
                 error: ErrorBody {
                     code: "pane_not_found".into(),
                     message: format!("pane {pane_id} has no live output stream"),
                 },
-            },
-        )
-        .or_else(swallow_disconnect);
+            })
+            .map(drop);
     };
 
     let epoch = ring.epoch();
     let Some(seed) = ring.snapshot(history_lines) else {
         // The runtime is already gone; tell the client and close.
-        return finish_exited(stream, &mut watch, 0, epoch);
+        return finish_exited(writer, &mut watch, 0, epoch);
     };
 
     // stream_started ack carries the geometry the client lacks today.
     if !emit_watched(
-        stream,
+        writer,
         &mut watch,
         &SuccessResponse {
             id: request_id.to_string(),
@@ -263,7 +404,7 @@ fn serve_attached(
     // reset seed: base64 full-screen ANSI at exactly `base_seq`, with the
     // requested scrollback captured in the same critical section.
     if !emit_watched(
-        stream,
+        writer,
         &mut watch,
         &StreamFrameLine::reset(seed.cursor, epoch, &seed, false),
     )? {
@@ -285,42 +426,44 @@ fn serve_attached(
         }
         match ring.wait_for_activity(cursor, resize_id, wait) {
             OutputWait::Closed => {
-                return finish_exited(stream, &mut watch, cursor, epoch);
+                return finish_exited(writer, &mut watch, cursor, epoch);
             }
             OutputWait::Idle => {
                 // On the idle tick, reap a dead peer before heartbeating.
-                if should_stop_connection(stream, running)? {
+                if should_stop_connection(writer.stream, running)? {
                     return Ok(());
                 }
                 // An idle watched stream still closes promptly on pause or revoke.
                 if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
-                    return write_text_line_allow_disconnect(stream, &line);
+                    return writer.write_text(&line).map(drop);
                 }
                 if watch.is_none() || last_ping.elapsed() >= PING_INTERVAL {
                     last_ping = std::time::Instant::now();
-                    if !emit_watched(stream, &mut watch, &StreamFrameLine::ping(cursor, epoch))? {
+                    if !emit_watched(writer, &mut watch, &StreamFrameLine::ping(cursor, epoch))? {
                         return Ok(());
                     }
                 }
             }
+            // A reader that fell behind under backpressure gets the current
+            // screen instead of every byte it missed.
+            OutputWait::Ready if skip_to_keyframe(writer.behind, ring.backlog(cursor)) => {
+                let Some((next_cursor, next_resize_id)) =
+                    resync(writer, &mut watch, &ring, history_lines, epoch, cursor)?
+                else {
+                    return Ok(());
+                };
+                cursor = next_cursor;
+                resize_id = next_resize_id;
+            }
             OutputWait::Ready => match ring.drain(cursor, resize_id, max_frame_bytes) {
                 OutputDrain::Lagged => {
-                    // Snapshot-collapse resync: discard the backlog, re-seed one
-                    // full-screen keyframe, and jump the cursor to the live edge.
-                    // It carries history too: the bytes dropped from the backlog
-                    // may have scrolled into it.
-                    let Some(seed) = ring.snapshot(history_lines) else {
-                        return finish_exited(stream, &mut watch, cursor, epoch);
-                    };
-                    if !emit_watched(
-                        stream,
-                        &mut watch,
-                        &StreamFrameLine::reset(seed.cursor, epoch, &seed, true),
-                    )? {
+                    let Some((next_cursor, next_resize_id)) =
+                        resync(writer, &mut watch, &ring, history_lines, epoch, cursor)?
+                    else {
                         return Ok(());
-                    }
-                    cursor = seed.cursor;
-                    resize_id = seed.resize_id;
+                    };
+                    cursor = next_cursor;
+                    resize_id = next_resize_id;
                 }
                 OutputDrain::Resize {
                     cols,
@@ -328,7 +471,7 @@ fn serve_attached(
                     resize_id: next_resize_id,
                 } => {
                     if !emit_watched(
-                        stream,
+                        writer,
                         &mut watch,
                         &StreamFrameLine::resize(cursor, epoch, cols, rows),
                     )? {
@@ -349,7 +492,7 @@ fn serve_attached(
                         payload.extend_from_slice(chunk);
                     }
                     if !emit_watched(
-                        stream,
+                        writer,
                         &mut watch,
                         &StreamFrameLine::data(cursor, epoch, encode_bytes(&payload)),
                     )? {
@@ -363,52 +506,62 @@ fn serve_attached(
     }
 }
 
+/// Snapshot-collapse resync: discard the backlog, re-seed one full-screen
+/// keyframe (`lagged: true`), and jump the cursor to the live edge. It carries
+/// history too: the bytes dropped from the backlog may have scrolled into it.
+/// Returns the new cursor and resize id, or `None` once the stream is done.
+fn resync(
+    writer: &mut FrameWriter<'_>,
+    watch: &mut Option<StreamWatch<'_>>,
+    ring: &OutputRing,
+    history_lines: usize,
+    epoch: u64,
+    cursor: u64,
+) -> std::io::Result<Option<(u64, u64)>> {
+    let Some(seed) = ring.snapshot(history_lines) else {
+        finish_exited(writer, watch, cursor, epoch)?;
+        return Ok(None);
+    };
+    if !emit_watched(
+        writer,
+        watch,
+        &StreamFrameLine::reset(seed.cursor, epoch, &seed, true),
+    )? {
+        return Ok(None);
+    }
+    Ok(Some((seed.cursor, seed.resize_id)))
+}
+
 /// End the stream because the runtime ended. A watched stream reports it
 /// through its watch instead of an `exited` frame.
 fn finish_exited(
-    stream: &mut ApiStream,
+    writer: &mut FrameWriter<'_>,
     watch: &mut Option<StreamWatch<'_>>,
     cursor: u64,
     epoch: u64,
 ) -> std::io::Result<()> {
     if let Some(line) = watch.as_mut().and_then(|watch| watch(true)) {
-        return write_text_line_allow_disconnect(stream, &line);
+        return writer.write_text(&line).map(drop);
     }
-    emit(stream, &StreamFrameLine::exited(cursor, epoch)).map(|_| ())
+    writer
+        .write_json(&StreamFrameLine::exited(cursor, epoch))
+        .map(drop)
 }
 
-/// [`emit`] after asking the watch whether the stream may still send. Every
-/// frame is checked, so no output follows a pause or revoke; a refusal writes
-/// the watch's line and reports `false` to stop.
+/// Write a frame after asking the watch whether the stream may still send.
+/// Every frame is checked, so no output follows a pause or revoke; a refusal
+/// writes the watch's line and reports `false` to stop. `false` also means
+/// the client closed the stream.
 fn emit_watched<T: serde::Serialize>(
-    stream: &mut ApiStream,
+    writer: &mut FrameWriter<'_>,
     watch: &mut Option<StreamWatch<'_>>,
     value: &T,
 ) -> std::io::Result<bool> {
     if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
-        write_text_line_allow_disconnect(stream, &line)?;
+        writer.write_text(&line)?;
         return Ok(false);
     }
-    emit(stream, value)
-}
-
-/// Write one frame/response line, reporting `false` when the peer has closed so
-/// the caller can stop cleanly. A wedged socket write times out via the
-/// connection-wide send timeout and tears down only this connection.
-fn emit<T: serde::Serialize>(stream: &mut ApiStream, value: &T) -> std::io::Result<bool> {
-    match write_json_line(stream, value) {
-        Ok(()) => Ok(true),
-        Err(err) if is_connection_closed_error(&err) => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-fn swallow_disconnect(err: std::io::Error) -> std::io::Result<()> {
-    if is_connection_closed_error(&err) {
-        Ok(())
-    } else {
-        Err(err)
-    }
+    writer.write_json(value)
 }
 
 fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestSender) {
@@ -434,6 +587,193 @@ fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    use interprocess::local_socket::traits::ListenerExt as _;
+
+    use crate::ipc::LocalStream;
+
+    /// A connected local socket pair: the server end as an [`ApiStream`] with
+    /// the API server's 5 s write timeout, and the client end.
+    fn socket_pair(name: &str) -> (ApiStream, LocalStream) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = PathBuf::from("/tmp").join(format!(
+            "hps-{name}-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.incoming().next().unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut server = ApiStream::Local(server);
+        server
+            .set_send_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (server, client)
+    }
+
+    /// Answers the stream's open and close on the "app loop".
+    fn app_loop() -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::api::ApiRequestMessage,
+        >();
+        let app = std::thread::spawn(move || {
+            while let Some(message) = api_rx.blocking_recv() {
+                let close = matches!(message.request.method, Method::PaneStreamClose(_));
+                let reply = serde_json::to_string(&SuccessResponse {
+                    id: message.request.id.clone(),
+                    result: ResponseResult::Ok {},
+                })
+                .unwrap();
+                let _ = message.respond_to.send(reply);
+                if close {
+                    return;
+                }
+            }
+        });
+        (api_tx, app)
+    }
+
+    fn stream_params(pane_id: &str) -> PaneStreamParams {
+        serde_json::from_value(serde_json::json!({"pane_id": pane_id})).unwrap()
+    }
+
+    fn read_frame(reader: &mut BufReader<LocalStream>) -> Option<serde_json::Value> {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(serde_json::from_str(&line).expect("a whole JSON line")),
+        }
+    }
+
+    /// A burst the reader cannot keep up with (the measured 3G case): the
+    /// reader stops reading for longer than the API server's 5 s write
+    /// timeout. The stream used to end there without a word; now it waits,
+    /// skips the backlog with a fresh keyframe, and keeps streaming.
+    #[test]
+    fn a_reader_that_stalls_past_the_write_timeout_gets_a_keyframe_not_a_dead_stream() {
+        let tokio = tokio::runtime::Runtime::new().unwrap();
+        let _enter = tokio.enter();
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"hello");
+        let ring = runtime.attach_output_stream(crate::pane::OUTPUT_RING_CAPACITY_BYTES);
+        let pane_id = format!("stall-{}", std::process::id());
+        output_registry::register(&pane_id, &ring);
+        let (mut server, client) = socket_pair("stall");
+        let (api_tx, app) = app_loop();
+        let running = Arc::new(AtomicBool::new(true));
+
+        let serve = {
+            let pane_id = pane_id.clone();
+            let running = Arc::clone(&running);
+            std::thread::spawn(move || {
+                serve_watched(
+                    &mut server,
+                    "s".into(),
+                    stream_params(&pane_id),
+                    &api_tx,
+                    &running,
+                    None,
+                )
+            })
+        };
+        client
+            .set_recv_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        assert_eq!(read_frame(&mut reader).unwrap()["result"]["type"], "stream_started");
+        assert_eq!(read_frame(&mut reader).unwrap()["frame"], "reset");
+
+        // 960 KiB of output (about 1.3 MB as base64 frames), more than the
+        // socket buffers hold, while nobody reads for longer than the 5 s
+        // write timeout.
+        for _ in 0..15 {
+            ring.append(&[b'x'; 64 * 1024]);
+        }
+        std::thread::sleep(Duration::from_secs(7));
+
+        let mut skipped = 0;
+        loop {
+            let frame = read_frame(&mut reader).expect("the stream ended under backpressure");
+            assert!(frame.get("error").is_none(), "{frame}");
+            if frame["frame"] == "reset" {
+                assert_eq!(frame["lagged"], true);
+                break;
+            }
+            assert_eq!(frame["frame"], "data", "{frame}");
+            skipped += 1;
+            assert!(skipped < 15, "the backlog was replayed instead of skipped");
+        }
+
+        // The stream is alive after the keyframe: new output arrives.
+        ring.append(b"live tail");
+        let frame = read_frame(&mut reader).expect("the stream ended after the keyframe");
+        assert_eq!(frame["frame"], "data", "{frame}");
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(frame["data_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(data, b"live tail");
+
+        running.store(false, Ordering::Relaxed);
+        ring.mark_closed();
+        drop(reader);
+        serve.join().unwrap().unwrap();
+        app.join().unwrap();
+        output_registry::unregister(&pane_id);
+    }
+
+    /// A reader that reads nothing at all ends the stream after the stall
+    /// limit, and a reader that comes back finds the cut line finished and an
+    /// error line saying why, not a silent close.
+    #[test]
+    fn a_stalled_stream_ends_with_an_error_line() {
+        let (mut server, client) = socket_pair("farewell");
+        let running = AtomicBool::new(true);
+        let mut writer = FrameWriter::new(&mut server, &running);
+        writer.stall_limit = Duration::from_secs(1);
+        let frame = StreamFrameLine::data(1, 2, "A".repeat(256 * 1024));
+
+        let err = loop {
+            match writer.write_json(&frame) {
+                Ok(true) => {}
+                Ok(false) => panic!("the client is still connected"),
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut client = client;
+            let _ = client.read_to_end(&mut bytes);
+            bytes
+        });
+        writer.farewell("s", &err);
+        drop(writer);
+        drop(server);
+        let bytes = reader.join().unwrap();
+        let lines: Vec<serde_json::Value> = bytes
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("every line whole"))
+            .collect();
+        let last = lines.last().unwrap();
+        assert_eq!(last["id"], "s");
+        assert_eq!(last["error"]["code"], "stream_stalled");
+        assert!(lines[..lines.len() - 1]
+            .iter()
+            .all(|line| line["frame"] == "data"));
+    }
+
+    #[test]
+    fn only_a_reader_behind_by_more_than_a_keyframe_skips_ahead() {
+        assert!(!skip_to_keyframe(false, 10 * RESYNC_BACKLOG_BYTES));
+        assert!(!skip_to_keyframe(true, RESYNC_BACKLOG_BYTES));
+        assert!(skip_to_keyframe(true, RESYNC_BACKLOG_BYTES + 1));
+    }
 
     fn seed(history: Option<&str>) -> OutputSnapshot {
         OutputSnapshot {
