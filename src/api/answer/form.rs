@@ -576,6 +576,17 @@ fn focused_label(rows: &[Row], label: &str) -> Option<(usize, usize)> {
 /// the title (`topBorder`, chrome/overlay-box.ts:22-33).
 const BOX_TOP_LEFT: [char; 2] = ['╭', '+'];
 const BOX_HORIZONTAL: [char; 2] = ['─', '-'];
+/// omp's `boxRound.bottomLeft` (unicode and nerd `╰`, ascii `+`; pi-tui
+/// theme/symbols.ts:438, :774, :1240): the ask panel's bottom border.
+const BOX_BOTTOM_LEFT: [char; 2] = ['╰', '+'];
+
+/// Whether `line` is the ask panel's bottom border.
+fn is_panel_bottom(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(BOX_BOTTOM_LEFT)
+        .is_some_and(|rest| rest.starts_with(BOX_HORIZONTAL))
+}
+
 /// The form panel's title (`DEFAULT_TITLE`, dialog.ts:124).
 const ASK_TITLE: &str = "Ask";
 
@@ -658,15 +669,25 @@ impl std::fmt::Display for NotAtStart {
 /// in the terminal.
 pub(crate) fn start_state(screen: &str, form: &ParsedForm) -> Result<(), NotAtStart> {
     let stops = stops(form);
-    let rows = rows_of(screen);
     let lines: Vec<&str> = screen.lines().collect();
     let panel = panel_top(&lines);
+    // Only the panel's rows count when it is on screen: the composer under
+    // it shows its own `❯` (with a draft after it).
+    let rows = rows_of(&match panel {
+        Some((top, _)) => {
+            let bottom = (top + 1..lines.len())
+                .find(|&index| is_panel_bottom(lines[index]))
+                .unwrap_or(lines.len() - 1);
+            lines[top..=bottom].join("\n")
+        }
+        None => screen.to_owned(),
+    });
     // No focused row inside the panel: omp shows a page the focus is not on
     // (it opened on context before the first stop, or someone paged).
-    let panel_focused = panel.is_some_and(|(top, _)| rows[top..].iter().any(|row| row.focused));
+    let focused = rows.iter().any(|row| row.focused);
     match panel {
-        None if !rows.iter().any(|row| row.focused) => return Err(NotAtStart::NoPanel),
-        Some((_, Some((page, pages)))) if !panel_focused => {
+        None if !focused => return Err(NotAtStart::NoPanel),
+        Some((_, Some((page, pages)))) if !focused => {
             return Err(NotAtStart::FocusOffPage { page, pages })
         }
         _ => {}
@@ -1114,14 +1135,68 @@ const TEXTAREA_MAX_MOVES: usize = 40;
 const MAX_FIELD_KEYS: usize = 6_000;
 const MAX_FIELD_READS: usize = 800;
 
-/// What follows an `ask_form_moved` message when it quotes a textarea's
-/// rows (the person's text): herdr's log leaves it out.
-pub(crate) const EDITOR_SHOWED: &str = "; the editor showed ";
+/// Which check stopped a drive with `ask_form_moved`: what herdr logs. It
+/// names a field at most (the form's own `name`), never a value or text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Moved {
+    /// The screen is not the form as it opens.
+    NotAtStart(NotAtStart),
+    /// A draft in the composer still held the keys after ↑ released it.
+    DraftHeld,
+    /// The focused stop did not show what herdr sent (`field` is the form's
+    /// field name, or `Submit`).
+    NotShown {
+        field: String,
+    },
+    TooManyKeys,
+    TooManyReads,
+}
 
-fn moved(message: impl Into<String>) -> ErrorBody {
-    ErrorBody {
-        code: "ask_form_moved".into(),
-        message: message.into(),
+impl std::fmt::Display for Moved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAtStart(reason) => write!(f, "not in its starting state: {reason}"),
+            Self::DraftHeld => f.write_str("a draft in the composer kept the keys"),
+            Self::NotShown { field } => write!(f, "{field} did not show what was sent"),
+            Self::TooManyKeys => f.write_str("a field took too many keys"),
+            Self::TooManyReads => f.write_str("a field took too many screen reads"),
+        }
+    }
+}
+
+/// Why [`drive`] stopped: the response's error, and for `ask_form_moved`
+/// the check that failed, kept apart from the message (which may quote what
+/// a textarea showed) so it can be logged.
+#[derive(Debug)]
+pub(crate) struct DriveError {
+    pub(crate) body: ErrorBody,
+    pub(crate) moved: Option<Moved>,
+}
+
+impl From<ErrorBody> for DriveError {
+    fn from(body: ErrorBody) -> Self {
+        Self { body, moved: None }
+    }
+}
+
+impl From<DriveError> for ErrorBody {
+    fn from(error: DriveError) -> Self {
+        error.body
+    }
+}
+
+/// [`invalid`] where the drive refuses a value it found it cannot send.
+fn refused(name: &str, reason: impl std::fmt::Display) -> DriveError {
+    invalid(name, reason).into()
+}
+
+fn moved(reason: Moved, message: impl Into<String>) -> DriveError {
+    DriveError {
+        body: ErrorBody {
+            code: "ask_form_moved".into(),
+            message: message.into(),
+        },
+        moved: Some(reason),
     }
 }
 
@@ -1144,31 +1219,33 @@ impl<P: FormPane> Driver<'_, P> {
         }
     }
 
-    fn keys(&mut self, keys: Vec<&'static str>) -> Result<(), ErrorBody> {
+    fn keys(&mut self, keys: Vec<&'static str>) -> Result<(), DriveError> {
         if keys.is_empty() {
             return Ok(());
         }
         self.keys_sent += keys.len();
         if self.keys_sent > MAX_FIELD_KEYS {
             return Err(moved(
+                Moved::TooManyKeys,
                 "a field took more keys than herdr sends to one field; stopped without submitting (answer in the terminal)",
             ));
         }
-        self.pane.send(&Action::Keys(keys))
+        Ok(self.pane.send(&Action::Keys(keys))?)
     }
 
-    fn read(&mut self) -> Result<String, ErrorBody> {
+    fn read(&mut self) -> Result<String, DriveError> {
         self.reads += 1;
         if self.reads > MAX_FIELD_READS {
             return Err(moved(
+                Moved::TooManyReads,
                 "a field took more screen reads than herdr makes for one field; stopped without submitting (answer in the terminal)",
             ));
         }
-        self.pane.read_screen()
+        Ok(self.pane.read_screen()?)
     }
 
     /// Move the focus to stop `to` with ↑/↓ (one stop each).
-    fn go(&mut self, to: usize) -> Result<(), ErrorBody> {
+    fn go(&mut self, to: usize) -> Result<(), DriveError> {
         let key = if to > self.at { "down" } else { "up" };
         self.keys(vec![key; to.abs_diff(self.at)])?;
         self.at = to;
@@ -1180,7 +1257,7 @@ impl<P: FormPane> Driver<'_, P> {
     /// stop, or no form). Read failures propagate at once. Nothing more is
     /// sent after a miss: the form keeps whatever was typed so far, and Esc
     /// would cancel the whole ask.
-    fn until(&mut self, stop: Stop, done: impl Fn(&Seen) -> bool) -> Result<Seen, ErrorBody> {
+    fn until(&mut self, stop: Stop, done: impl Fn(&Seen) -> bool) -> Result<Seen, DriveError> {
         for read in 0..SETTLE_READS {
             if read > 0 {
                 self.pane.pause();
@@ -1194,8 +1271,12 @@ impl<P: FormPane> Driver<'_, P> {
         Err(self.displaced(stop))
     }
 
-    fn displaced(&self, stop: Stop) -> ErrorBody {
-        moved(format!(
+    fn displaced(&self, stop: Stop) -> DriveError {
+        let field = match stop.field() {
+            Some(field) => self.form.fields[field].name.clone(),
+            None => "Submit".to_owned(),
+        };
+        moved(Moved::NotShown { field }, format!(
             "the terminal form did not show {} as expected; stopped without submitting (answer in the terminal)",
             self.field_name(stop)
         ))
@@ -1204,7 +1285,7 @@ impl<P: FormPane> Driver<'_, P> {
     /// Empty a single-line input (a text field, or an Other row): Ctrl+E to
     /// the end, Ctrl+U deletes everything before it, so nothing can remain
     /// out of view.
-    fn clear_line(&mut self, stop: Stop, placeholder: &str) -> Result<(), ErrorBody> {
+    fn clear_line(&mut self, stop: Stop, placeholder: &str) -> Result<(), DriveError> {
         self.keys(vec!["ctrl+e", "ctrl+u"])?;
         self.until(stop, |seen| match seen {
             Seen::Text(row) => is_empty_text(row, placeholder),
@@ -1218,7 +1299,7 @@ impl<P: FormPane> Driver<'_, P> {
     /// index. Leaving for `stops[1]` shows at once; staying on `stops[0]` is
     /// taken once it held for `STAY_READS` reads. A later move than that is
     /// caught by the next key, which then finds focus on neither stop.
-    fn step(&mut self, key: &'static str, stops: [Stop; 2]) -> Result<usize, ErrorBody> {
+    fn step(&mut self, key: &'static str, stops: [Stop; 2]) -> Result<usize, DriveError> {
         self.keys(vec![key])?;
         let mut stayed = 0;
         for read in 0..SETTLE_READS {
@@ -1270,7 +1351,7 @@ impl<P: FormPane> Driver<'_, P> {
         field: usize,
         input: &crate::agent_transcript::ask_form::TextInput,
         text: &str,
-    ) -> Result<(), ErrorBody> {
+    ) -> Result<(), DriveError> {
         let stop = Stop::Text { field };
         let index = self
             .stops
@@ -1297,13 +1378,13 @@ impl<P: FormPane> Driver<'_, P> {
             let mut rows = layout_rows(text, width);
             // More rows than the editor shows would scroll.
             if rows.len() > height {
-                return Err(invalid(&name, TOO_LONG));
+                return Err(refused(&name, TOO_LONG));
             }
             rows.resize(height, " ".repeat(width));
             rows
         };
         if !text.is_empty() && want == empty {
-            return Err(invalid(
+            return Err(refused(
                 &name,
                 "answer looks like the placeholder; answer in the terminal",
             ));
@@ -1313,7 +1394,7 @@ impl<P: FormPane> Driver<'_, P> {
         while self.step("up", [stop, before])? == 0 {
             up += 1;
             if up > TEXTAREA_MAX_MOVES {
-                return Err(invalid(&name, TOO_LONG));
+                return Err(refused(&name, TOO_LONG));
             }
         }
         self.keys(vec!["tab"])?;
@@ -1322,7 +1403,7 @@ impl<P: FormPane> Driver<'_, P> {
         while self.step("down", [stop, after])? == 0 {
             lines += 1;
             if lines > TEXTAREA_MAX_MOVES {
-                return Err(invalid(&name, TOO_LONG));
+                return Err(refused(&name, TOO_LONG));
             }
         }
         self.keys(vec!["shift+tab"])?;
@@ -1343,11 +1424,14 @@ impl<P: FormPane> Driver<'_, P> {
 
     /// `ask_form_moved` for a textarea that did not show what was expected,
     /// naming what it showed.
-    fn misread(&self, stop: Stop, rows: Option<Vec<String>>) -> ErrorBody {
+    fn misread(&self, stop: Stop, rows: Option<Vec<String>>) -> DriveError {
         let mut error = self.displaced(stop);
         if let Some(rows) = rows {
             let shown: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
-            error.message.push_str(&format!("{EDITOR_SHOWED}{shown:?}"));
+            error
+                .body
+                .message
+                .push_str(&format!("; the editor showed {shown:?}"));
         }
         error
     }
@@ -1361,7 +1445,7 @@ impl<P: FormPane> Driver<'_, P> {
         field: usize,
         height: usize,
         done: impl Fn(&[String]) -> bool,
-    ) -> Result<ReadBack, ErrorBody> {
+    ) -> Result<ReadBack, DriveError> {
         let mut last = None;
         for read in 0..SETTLE_READS {
             if read > 0 {
@@ -1376,11 +1460,11 @@ impl<P: FormPane> Driver<'_, P> {
         Ok(ReadBack::Differs(last))
     }
 
-    fn type_text(&mut self, text: &str) -> Result<(), ErrorBody> {
+    fn type_text(&mut self, text: &str) -> Result<(), DriveError> {
         if text.is_empty() {
             return Ok(());
         }
-        self.pane.send(&Action::Text(text.to_owned()))
+        Ok(self.pane.send(&Action::Text(text.to_owned()))?)
     }
 
     fn field(
@@ -1388,7 +1472,7 @@ impl<P: FormPane> Driver<'_, P> {
         field: usize,
         own: std::ops::Range<usize>,
         target: &Target,
-    ) -> Result<(), ErrorBody> {
+    ) -> Result<(), DriveError> {
         let form = self.form;
         match (&form.fields[field].kind, target) {
             // A textarea the values leave out is left as it is.
@@ -1519,34 +1603,8 @@ pub(crate) fn drive(
     pane: &mut impl FormPane,
     form: &ParsedForm,
     plan: &Plan,
-) -> Result<(), ErrorBody> {
-    let mut reads = 0;
-    let mut revealed = false;
-    loop {
-        if reads > 0 {
-            pane.pause();
-        }
-        reads += 1;
-        match start_state(&pane.read_screen()?, form) {
-            Ok(()) => break,
-            // omp opened the form on a page of context ahead of the first
-            // stop (`#followFocus` false, dialog.ts:290-296, :598-603), at a
-            // pane too short for both. There ↑ only brings the focus's page
-            // into view and moves nothing (`handleInput`, dialog.ts:486-500).
-            // Once only: a second ↑ before omp redrew would move the focus.
-            Err(NotAtStart::FocusOffPage { .. }) if !revealed => {
-                pane.send(&Action::Keys(vec!["up"]))?;
-                revealed = true;
-                reads = 0;
-            }
-            Err(reason) if reads >= if revealed { SETTLE_READS } else { START_READS } => {
-                return Err(moved(format!(
-                    "the form on the agent's screen is not in its starting state: {reason} (being answered in the terminal, hidden, or scrolled away)"
-                )));
-            }
-            Err(_) => {}
-        }
-    }
+) -> Result<(), DriveError> {
+    let draft_seen = bring_to_start(pane, form)?;
     let mut driver = Driver {
         pane,
         form,
@@ -1555,9 +1613,12 @@ pub(crate) fn drive(
         keys_sent: 0,
         reads: 0,
     };
-    // ↑ first: a draft in the composer holds the keyboard until ↑/↓, and on
-    // the first stop ↑ goes nowhere.
-    driver.keys(vec!["up"])?;
+    // A draft herdr did not see (its hint cut off in a very narrow pane)
+    // would take typed keys; ↑ releases it, and on the first stop ↑ goes
+    // nowhere (`#moveStop`, dialog.ts:1125-1134).
+    if !draft_seen {
+        driver.keys(vec!["up"])?;
+    }
     while let Some(field) = driver.stops[driver.at].field() {
         let start = driver
             .stops
@@ -1584,6 +1645,92 @@ pub(crate) fn drive(
 
 /// Screen reads [`drive`] makes while the form may still be drawing.
 const START_READS: usize = 3;
+
+/// Bring the untouched form to where [`drive`] starts, one observed state
+/// at a time, and check it is untouched ([`start_state`]). Each key is sent
+/// once, for the state the screen shows, and its effect is read back before
+/// anything else is sent:
+///
+/// 1. A draft in the composer holds the keys (omp's input guard; its footer
+///    says `↑/↓ answer · typing edits your prompt`): ↑ releases it and does
+///    nothing else (`handleInput`, dialog.ts:468-472, before any paging).
+/// 2. The form opened on a page of context ahead of its first stop, in a
+///    pane too short for both (`#followFocus` false, dialog.ts:290-296,
+///    :598-603): ↑ only brings the focus's page into view
+///    (dialog.ts:486-500).
+///
+/// Returns whether a draft was seen and released.
+fn bring_to_start(pane: &mut impl FormPane, form: &ParsedForm) -> Result<bool, DriveError> {
+    let mut reads = 0;
+    let mut released = false;
+    let mut revealed = false;
+    loop {
+        if reads > 0 {
+            pane.pause();
+        }
+        reads += 1;
+        let settle = if released || revealed {
+            SETTLE_READS
+        } else {
+            START_READS
+        };
+        let screen = pane.read_screen()?;
+        if draft_holds_keys(&screen) {
+            if !released {
+                pane.send(&Action::Keys(vec!["up"]))?;
+                released = true;
+                reads = 0;
+            } else if reads >= settle {
+                return Err(moved(
+                    Moved::DraftHeld,
+                    "a draft in the agent's composer kept the keys after ↑; stopped without changing the form (answer in the terminal)",
+                ));
+            }
+            continue;
+        }
+        match start_state(&screen, form) {
+            Ok(()) => return Ok(released),
+            Err(NotAtStart::FocusOffPage { .. }) if !revealed => {
+                pane.send(&Action::Keys(vec!["up"]))?;
+                revealed = true;
+                reads = 0;
+            }
+            Err(reason) if reads >= settle => {
+                return Err(moved(
+                    Moved::NotAtStart(reason),
+                    format!(
+                        "the form on the agent's screen is not in its starting state: {reason} (being answered in the terminal, hidden, or scrolled away)"
+                    ),
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// omp's input-guard hint, shown while a draft that predates the form owns
+/// typing (`hint`, coding-agent modes/controllers/extension-ui-controller.ts:
+/// 879-881).
+const DRAFT_HINT: &str = "typing edits your prompt";
+
+/// Whether the form's footer shows omp's input guard: the release keys, then
+/// ` answer · ` and [`DRAFT_HINT`] (`#footerText`/`#guardHint`, dialog.ts:
+/// 913-915, :1375-1376), possibly cut short with `…` in a narrow pane.
+fn draft_holds_keys(screen: &str) -> bool {
+    rows_of(screen).iter().any(|row| {
+        row.text
+            .split_once(" answer · ")
+            .is_some_and(|(keys, rest)| {
+                let hint = rest.split(" · ").next().unwrap_or_default();
+                !keys.is_empty()
+                    && !keys.contains(' ')
+                    && (hint == DRAFT_HINT
+                        || hint
+                            .strip_suffix('…')
+                            .is_some_and(|cut| DRAFT_HINT.starts_with(cut.trim_end())))
+            })
+    })
+}
 
 /// An error omp shows under a field after a refused Submit, as
 /// `(field name, message)`: the first text field whose rows are followed by

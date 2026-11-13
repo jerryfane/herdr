@@ -168,10 +168,18 @@ struct Dialog {
     /// :598-603): page 1 of 2 shows no stop until ↑/↓, Space or Enter brings
     /// the focus's page into view without acting (dialog.ts:486-500).
     context_page: bool,
-    /// Reads after the revealing key that still show the context page (omp
-    /// has not redrawn yet).
-    reveal_lag: usize,
-    lagging: usize,
+    /// A draft in the composer holds the keys (omp's input guard): ↑/↓
+    /// release it and do nothing else; other keys edit the draft
+    /// (dialog.ts:468-472).
+    draft: bool,
+    /// ↑/↓ do not release the draft.
+    draft_sticks: bool,
+    /// The composer shows a draft under the panel (held or released).
+    has_draft: bool,
+    /// Reads after a release or reveal that still show the previous frame
+    /// (omp has not redrawn yet).
+    redraw_lag: usize,
+    stale: Option<(String, usize)>,
     /// Draw with omp's ascii symbol preset (`|` borders and rails, `>`
     /// cursor, `(o)`/`[x]` markers; pi-tui theme/symbols.ts:1200-1400).
     ascii: bool,
@@ -204,8 +212,11 @@ impl Dialog {
             refuse: None,
             frozen_after: None,
             context_page: false,
-            reveal_lag: 0,
-            lagging: 0,
+            draft: false,
+            draft_sticks: false,
+            has_draft: false,
+            redraw_lag: 0,
+            stale: None,
             ascii: false,
             paste_drops_last: false,
             fail_read_after_paste: None,
@@ -286,11 +297,18 @@ impl Dialog {
         }
         self.keys.push(key.to_owned());
         self.received.push((key.to_owned(), self.stops[self.focus]));
+        if self.draft {
+            if matches!(key, "up" | "down") && !self.draft_sticks {
+                self.redraw_later();
+                self.draft = false;
+            }
+            return;
+        }
         if self.context_page {
             match key {
                 "up" | "down" | "space" | "enter" => {
+                    self.redraw_later();
                     self.context_page = false;
-                    self.lagging = self.reveal_lag;
                     return;
                 }
                 "tab" | "shift+tab" => self.context_page = false,
@@ -515,6 +533,20 @@ impl Dialog {
         rows
     }
 
+    /// Keep showing the current frame for `redraw_lag` reads.
+    fn redraw_later(&mut self) {
+        if self.redraw_lag > 0 {
+            self.stale = Some((self.render(), self.redraw_lag));
+        }
+    }
+
+    /// omp's footer while a draft holds the keys (`#guardHint`).
+    fn footer(&self, out: &mut Vec<String>) {
+        if self.draft {
+            out.push("│ ↑/↓ answer · typing edits your prompt · ⎋ cancel".into());
+        }
+    }
+
     fn render(&self) -> String {
         if self.context_page {
             self.render_context()
@@ -538,8 +570,18 @@ impl Dialog {
                 }
             }
         }
+        self.footer(&mut out);
         out.push("╰───────╯".into());
+        self.composer(&mut out);
         out.join("\n")
+    }
+
+    /// The composer under the panel, with the draft typed before the form
+    /// opened (it stays there once released).
+    fn composer(&self, out: &mut Vec<String>) {
+        if self.has_draft {
+            out.push("❯ half-written note for later".into());
+        }
     }
 
     fn render_page(&self) -> String {
@@ -565,7 +607,9 @@ impl Dialog {
             "  "
         };
         out.push(format!("│ {cursor}Submit"));
+        self.footer(&mut out);
         out.push("╰───────╯".into());
+        self.composer(&mut out);
         out.join("\n")
     }
 
@@ -765,9 +809,11 @@ impl FormPane for Dialog {
             }
             *reads += 1;
         }
-        if self.lagging > 0 {
-            self.lagging -= 1;
-            return Ok(self.render_context());
+        if let Some((frame, left)) = self.stale.take() {
+            if left > 1 {
+                self.stale = Some((frame.clone(), left - 1));
+            }
+            return Ok(frame);
         }
         Ok(if self.ascii {
             ascii_preset(&self.render())
@@ -975,7 +1021,7 @@ fn a_form_that_stops_responding_is_never_submitted() {
             &values(&[("db", options(&["sq"])), ("notes", text("x"))]),
         )
         .unwrap();
-        let error = drive(&mut dialog, &form, &plan).unwrap_err();
+        let error = drive(&mut dialog, &form, &plan).unwrap_err().body;
         assert_eq!(error.code, "ask_form_moved", "{limit}");
         assert_eq!(dialog.submitted, None, "{limit}");
     }
@@ -1230,7 +1276,7 @@ fn a_textarea_too_long_to_edit_is_invalid() {
     dialog.caret[2] = (30, 0);
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("vo", text("short"))])).unwrap();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(
         (error.code.as_str(), error.message.as_str()),
         ("ask_form_invalid", too_long)
@@ -1249,7 +1295,7 @@ fn a_textarea_too_long_to_edit_is_invalid() {
     let paragraph = "word ".repeat(60);
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("vo", text(paragraph.trim()))])).unwrap();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(
         (error.code.as_str(), error.message.as_str()),
         ("ask_form_invalid", too_long)
@@ -1264,7 +1310,7 @@ fn a_textarea_reading_mismatch_is_moved() {
     dialog.paste_drops_last = true;
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("vo", text("New text."))])).unwrap();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(error.code, "ask_form_moved");
     assert_eq!(dialog.submitted, None);
     assert!(
@@ -1349,7 +1395,7 @@ fn review_backend_read_error_is_preserved() {
         dialog.fail_read_after_paste = Some(fail_at);
         let form = dialog.form.clone();
         let planned = plan(&form, &values(&[("vo", text("Short."))])).unwrap();
-        let error = drive(&mut dialog, &form, &planned).unwrap_err();
+        let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
         assert_eq!(error.code, "pane_not_found", "{error:?}");
         assert_eq!(dialog.submitted, None);
     }
@@ -1415,7 +1461,7 @@ fn an_answer_drawn_like_the_placeholder_is_invalid() {
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("n", text(&lookalike))])).unwrap();
     let before = dialog.lines[1].clone();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(
         (error.code.as_str(), error.message.as_str()),
         (
@@ -1522,7 +1568,7 @@ fn a_wrapping_answer_past_the_rows_is_too_long() {
     let before = dialog.lines[2].clone();
     let form = dialog.form.clone();
     let planned = plan(&form, &values(&[("vo", text(&"word ".repeat(40)))])).unwrap();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(
         error.message,
         "vo: too long to edit from the app; answer in the terminal"
@@ -1640,7 +1686,7 @@ fn every_preset_frame_is_a_row_edge() {
 fn a_form_opened_on_a_context_page_is_answered() {
     let mut dialog = Dialog::new(FORM);
     dialog.context_page = true;
-    dialog.reveal_lag = 2;
+    dialog.redraw_lag = 2;
     let screen = dialog.render();
     assert_eq!(
         start_state(&screen, &dialog.form),
@@ -1660,10 +1706,10 @@ fn a_moved_form_paged_back_is_still_refused() {
     dialog.focus = 2;
     dialog.context_page = true;
     // omp redraws a little after the key: one ↑ was sent, not another.
-    dialog.reveal_lag = 2;
+    dialog.redraw_lag = 2;
     let form = dialog.form.clone();
     let planned = plan(&form, &BTreeMap::new()).unwrap();
-    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err().body;
     assert_eq!(error.code, "ask_form_moved");
     assert!(
         error
@@ -1737,7 +1783,7 @@ fn the_refusal_says_which_check_failed() {
         .replacen("│   ○", "│ ❯ ○", 1);
     let mut pane = Screens::new(&[&moved]);
     let planned = plan(&form, &BTreeMap::new()).unwrap();
-    let error = drive(&mut pane, &form, &planned).unwrap_err();
+    let error = drive(&mut pane, &form, &planned).unwrap_err().body;
     assert_eq!(error.code, "ask_form_moved");
     assert!(
         error
@@ -1779,4 +1825,96 @@ impl FormPane for Screens {
     }
 
     fn pause(&mut self) {}
+}
+
+/// Review #405: a form opened on a context page while a draft sits in the
+/// composer. The first ↑ only releases the draft; once the footer shows it
+/// released, a second ↑ brings the focus into view, then the form is
+/// answered. Each ↑ is sent once, after omp redrew.
+#[test]
+fn a_draft_and_a_context_page_are_each_passed_once() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.draft = true;
+    dialog.has_draft = true;
+    dialog.context_page = true;
+    dialog.redraw_lag = 2;
+    let screen = dialog.render();
+    assert!(draft_holds_keys(&screen), "{screen}");
+    let submitted = answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(value(&submitted, "db"), txt("pg"));
+    assert_eq!(dialog.keys[..2], ["up", "up"], "release, then reveal");
+    // The drive sends no fallback ↑ after a release it saw.
+    assert_ne!(dialog.keys[2], "up", "{:?}", dialog.keys);
+}
+
+/// A draft on an ordinary page: one ↑ releases it, nothing else is needed.
+#[test]
+fn a_draft_is_released_once() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.draft = true;
+    dialog.has_draft = true;
+    dialog.redraw_lag = 2;
+    answer(&mut dialog, BTreeMap::new()).unwrap();
+    assert_eq!(dialog.keys[0], "up");
+    assert_ne!(dialog.keys[1], "up", "{:?}", dialog.keys);
+}
+
+/// A draft that keeps the keys after ↑ stops the drive with its own
+/// reason; ↑ is not repeated and nothing reaches the draft.
+#[test]
+fn a_draft_that_keeps_the_keys_stops_the_drive() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.draft = true;
+    dialog.has_draft = true;
+    dialog.draft_sticks = true;
+    dialog.context_page = true;
+    let form = dialog.form.clone();
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(error.moved, Some(Moved::DraftHeld));
+    assert_eq!(error.body.code, "ask_form_moved");
+    assert_eq!(dialog.keys, ["up"]);
+}
+
+/// The check that failed travels apart from the message, so the log never
+/// depends on the message's wording (which may quote a textarea).
+#[test]
+fn a_moved_drive_carries_its_check() {
+    let mut dialog = Dialog::new(FORM);
+    dialog.focus = 2;
+    let form = dialog.form.clone();
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    let error = drive(&mut dialog, &form, &planned).unwrap_err();
+    assert_eq!(
+        error.moved,
+        Some(Moved::NotAtStart(NotAtStart::FocusNotFirst))
+    );
+}
+
+/// A real omp 18.18.8 form opened in a 52x30 pane while a draft sat in the
+/// composer (the panel, then the composer and status line under it): the
+/// guard's footer on the context page, then (after one ↑)
+/// the context page released, then (after another) the focus's page.
+const OMP_DRAFT_CONTEXT_PAGE: &str = include_str!("omp-18.18.8-context-page-draft-52x30.json");
+
+#[test]
+fn a_real_draft_on_a_context_page_is_released_then_revealed() {
+    let fixture: serde_json::Value = serde_json::from_str(OMP_DRAFT_CONTEXT_PAGE).unwrap();
+    let form = parse(fixture["html"].as_str().unwrap());
+    let opened = fixture["opened_screen"].as_str().unwrap();
+    let released = fixture["after_release_screen"].as_str().unwrap();
+    let revealed = fixture["after_reveal_screen"].as_str().unwrap();
+    assert!(draft_holds_keys(opened), "{opened}");
+    assert!(!draft_holds_keys(released), "{released}");
+    assert!(matches!(
+        start_state(released, &form),
+        Err(NotAtStart::FocusOffPage { page: 1, .. })
+    ));
+    assert_eq!(start_state(revealed, &form), Ok(()));
+    let mut pane = Screens::new(&[opened, released, revealed]);
+    let planned = plan(&form, &BTreeMap::new()).unwrap();
+    let _ = drive(&mut pane, &form, &planned);
+    let up = Action::Keys(vec!["up"]);
+    assert_eq!(pane.sent[..2], [up.clone(), up.clone()], "{:?}", pane.sent);
+    assert_ne!(pane.sent.get(2), Some(&up), "{:?}", pane.sent);
 }

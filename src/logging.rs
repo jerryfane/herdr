@@ -129,8 +129,8 @@ pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &s
     );
 }
 
-/// Why `agent.answer_form` stopped without driving or submitting the form
-/// (`ask_form_moved`): the screen check that failed.
+/// Why `agent.answer_form` stopped before Submit with `ask_form_moved`: the
+/// check that failed (`form::Moved`, which names no value or typed text).
 pub(crate) fn ask_form_moved(request_id: &str, target: &str, reason: &str) {
     tracing::info!(
         event = "agent.answer_form.moved",
