@@ -34,14 +34,16 @@
 //! capability-bound identity that would make it a real boundary is the
 //! durable-identity follow-up (issue #49).
 
+use std::sync::mpsc::Sender;
+
 use base64::Engine as _;
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::api::schema::{
     GramDeleteParams, GramDirection, GramFileInfo, GramFileUpload, GramGetFileChunkParams,
     GramGetFileParams, GramGrabParams, GramListParams, GramMarkReadParams, GramMessageInfo,
     GramPostParams, GramSendParams, GramUploadChunkParams, GramUploadDiscardParams,
-    GramUploadStreamParams, ResponseResult,
+    GramUploadStreamParams, ErrorBody, Method, Request, ResponseResult,
 };
 #[cfg(unix)]
 use crate::api::schema::{GramRelayCall, GramRelayParams};
@@ -872,43 +874,14 @@ impl App {
     }
 
     pub(super) fn handle_gram_get_file(&mut self, id: String, params: GramGetFileParams) -> String {
-        if self.no_session {
-            return gram_unavailable(id);
+        let (message_id, file) = match self.gram_file_for_download(&params) {
+            Ok(found) => found,
+            Err(error) => return encode_error_body(id, error),
+        };
+        if let Some(thumbnail) = params.thumbnail {
+            return gram_thumbnail_response(id, message_id, file, thumbnail.max_px);
         }
-        // Resolve the caller's authority: the owner (no caller pane) may download
-        // any file; an agent may download only a file on a message it can see.
-        let identity = match params.caller_pane_id.as_deref() {
-            Some(pane) => match self.caller_identity(pane) {
-                Some(identity) => Some(identity),
-                None => {
-                    return encode_error(
-                        id,
-                        "unknown_caller",
-                        "caller_pane_id is not a known pane; omit it to read as the owner",
-                    );
-                }
-            },
-            None => None,
-        };
-        let Some(item) = crate::persist::gram::load()
-            .into_iter()
-            .find(|item| item.id == params.id)
-        else {
-            return encode_error(id, "not_found", "no gram message with that id");
-        };
-        if let Some(identity) = &identity {
-            if !agent_can_see(&item, identity) {
-                return encode_error(
-                    id,
-                    "forbidden",
-                    "you can only download a file on a message you can see",
-                );
-            }
-        }
-        let Some(file) = item.file else {
-            return encode_error(id, "no_file", "that message has no attached file");
-        };
-        match crate::persist::gram_files::read_message_file(&item.id, &file.name) {
+        match crate::persist::gram_files::read_message_file(&message_id, &file.name) {
             Ok(bytes) => {
                 let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 encode_success(
@@ -923,6 +896,91 @@ impl App {
             }
             Err(err) => encode_error(id, "gram_file_error", format!("failed to read file: {err}")),
         }
+    }
+
+    /// Answers `gram.get_file` with `thumbnail` through `respond_to`: the
+    /// caller is checked here, the image decoded on a worker thread. Returns
+    /// false for any other request.
+    pub(crate) fn handle_deferred_gram_thumbnail_request(
+        &self,
+        request: Request,
+        respond_to: Sender<String>,
+    ) -> bool {
+        let Method::GramGetFile(params) = request.method else {
+            return false;
+        };
+        let Some(thumbnail) = params.thumbnail else {
+            return false;
+        };
+        let id = request.id;
+        let (message_id, file) = match self.gram_file_for_download(&params) {
+            Ok(found) => found,
+            Err(error) => {
+                let _ = respond_to.send(encode_error_body(id, error));
+                return true;
+            }
+        };
+        let reply = respond_to.clone();
+        let reply_id = id.clone();
+        let spawned = crate::thread_spawn::spawn_named("herdr-gram-thumbnail", move || {
+            let _ = reply.send(gram_thumbnail_response(
+                reply_id,
+                message_id,
+                file,
+                thumbnail.max_px,
+            ));
+        });
+        if let Err(err) = spawned {
+            tracing::warn!(err = %err, "failed to spawn gram thumbnail renderer");
+            let _ = respond_to.send(encode_error(
+                id,
+                "gram_file_error",
+                format!("could not start the thumbnail renderer: {err}"),
+            ));
+        }
+        true
+    }
+
+    /// The message id and attachment `gram.get_file` reads, once the caller
+    /// may: the owner (no caller pane) may download any file; an agent may
+    /// download only a file on a message it can see.
+    fn gram_file_for_download(
+        &self,
+        params: &GramGetFileParams,
+    ) -> Result<(String, GramFile), ErrorBody> {
+        let error = |code: &str, message: &str| ErrorBody {
+            code: code.into(),
+            message: message.into(),
+        };
+        if self.no_session {
+            return Err(error("gram_unavailable", GRAM_UNAVAILABLE));
+        }
+        let identity = match params.caller_pane_id.as_deref() {
+            Some(pane) => Some(self.caller_identity(pane).ok_or_else(|| {
+                error(
+                    "unknown_caller",
+                    "caller_pane_id is not a known pane; omit it to read as the owner",
+                )
+            })?),
+            None => None,
+        };
+        let item = crate::persist::gram::load()
+            .into_iter()
+            .find(|item| item.id == params.id)
+            .ok_or_else(|| error("not_found", "no gram message with that id"))?;
+        if identity
+            .as_deref()
+            .is_some_and(|identity| !agent_can_see(&item, identity))
+        {
+            return Err(error(
+                "forbidden",
+                "you can only download a file on a message you can see",
+            ));
+        }
+        let file = item
+            .file
+            .ok_or_else(|| error("no_file", "that message has no attached file"))?;
+        Ok((item.id, file))
     }
     pub(super) fn handle_gram_get_file_chunk(
         &mut self,
@@ -1331,11 +1389,20 @@ fn validate_label(id: &str, field: &str, value: Option<&str>) -> Option<String> 
 }
 
 fn gram_unavailable(id: String) -> String {
-    encode_error(
-        id,
-        "gram_unavailable",
-        "gram requires the shared herdr server",
-    )
+    encode_error(id, "gram_unavailable", GRAM_UNAVAILABLE)
+}
+
+const GRAM_UNAVAILABLE: &str = "gram requires the shared herdr server";
+
+/// The reply to `gram.get_file {thumbnail}` for the attachment `file` of
+/// `message_id`. Decodes the image on a miss, so it runs off the app thread
+/// where it can.
+fn gram_thumbnail_response(id: String, message_id: String, file: GramFile, max_px: u32) -> String {
+    let load = || crate::persist::gram_files::read_message_file(&message_id, &file.name);
+    match crate::gram_thumbnail::file_thumbnail(&file, max_px, load, true) {
+        Ok(result) => encode_success(id, result),
+        Err(error) => encode_error_body(id, error),
+    }
 }
 
 fn gram_item_to_info(item: GramItem, labels: &MachineLabels) -> GramMessageInfo {
@@ -1909,6 +1976,7 @@ mod tests {
             GramGetFileParams {
                 id: message_id,
                 caller_pane_id: None,
+                thumbnail: None,
             },
         ))
         .unwrap();
@@ -1929,6 +1997,120 @@ mod tests {
         match prev_xdg {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn get_file_thumbnail_returns_a_cached_preview_dropped_with_the_message() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-gram-thumbnail-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", tmp.join("config"));
+        std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let post = |app: &mut App, upload_id: &str, bytes: &[u8], name: &str, mime: &str| {
+            let raw = app.handle_gram_upload_chunk(
+                "u".into(),
+                serde_json::from_value(serde_json::json!({
+                    "upload_id": upload_id,
+                    "offset": 0,
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }))
+                .unwrap(),
+            );
+            assert!(raw.contains("\"ok\""), "{raw}");
+            let raw = app.handle_gram_post(
+                "p".into(),
+                serde_json::from_value(serde_json::json!(
+                    {"text": "", "file": {"upload_id": upload_id, "name": name, "mime": mime}}
+                ))
+                .unwrap(),
+            );
+            let reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            reply["result"]["message"].clone()
+        };
+        let thumbnail = |app: &mut App, message_id: &str, max_px: u32| -> serde_json::Value {
+            let raw = app.handle_gram_get_file(
+                "t".into(),
+                serde_json::from_value(serde_json::json!(
+                    {"id": message_id, "thumbnail": {"max_px": max_px}}
+                ))
+                .unwrap(),
+            );
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        let photo = crate::gram_thumbnail::tests::jpeg_of(1600, 1200);
+        let message = post(&mut app, "up-photo", &photo, "photo.jpg", "image/jpeg");
+        let message_id = message["id"].as_str().unwrap().to_string();
+        let sha256 = message["file"]["sha256"].as_str().unwrap().to_string();
+
+        let reply = thumbnail(&mut app, &message_id, 256);
+        let result = &reply["result"];
+        assert_eq!(result["type"], "gram_file_thumbnail", "{reply}");
+        assert_eq!(result["name"], "photo.jpg");
+        assert_eq!(result["size"], photo.len() as u64);
+        assert_eq!(result["sha256"], sha256.as_str());
+        assert_eq!((result["width"].as_u64(), result["height"].as_u64()), (Some(256), Some(192)));
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .decode(result["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(result["thumbnail_size"], jpeg.len() as u64);
+        assert_eq!(crate::gram_thumbnail::jpeg_size(&jpeg), Some((256, 192)));
+
+        // Cached by hash and size: served again without the source file.
+        let cached = crate::config::state_dir()
+            .join("gram-thumbs")
+            .join(&sha256)
+            .join("256.jpg");
+        assert_eq!(std::fs::read(&cached).unwrap(), jpeg);
+        std::fs::remove_dir_all(crate::config::config_dir().join("gram-files").join(&message_id))
+            .unwrap();
+        assert_eq!(thumbnail(&mut app, &message_id, 256), reply);
+        // A size not cached yet needs the file, which is gone now.
+        assert_eq!(
+            thumbnail(&mut app, &message_id, 128)["error"]["code"],
+            "gram_file_error"
+        );
+        // An out-of-range size is clamped, onto the cached 16 px minimum here.
+        crate::persist::gram_thumbs::put(&sha256, 16, &jpeg);
+        assert_eq!(
+            thumbnail(&mut app, &message_id, 1)["result"]["type"],
+            "gram_file_thumbnail"
+        );
+
+        // Not an image: no preview, and the caller fetches the file.
+        let notes = post(&mut app, "up-notes", b"hello", "a.txt", "text/plain");
+        let reply = thumbnail(&mut app, notes["id"].as_str().unwrap(), 256);
+        assert_eq!(reply["error"]["code"], "thumbnail_unavailable", "{reply}");
+
+        // Deleting the only message holding the image drops its previews.
+        let deleted = app.handle_gram_delete(
+            "d".into(),
+            serde_json::from_value(serde_json::json!({"id": message_id})).unwrap(),
+        );
+        assert!(deleted.contains("\"ok\""), "{deleted}");
+        assert!(!cached.exists(), "a deleted image leaves no preview behind");
+
+        for (key, prev) in [("XDG_CONFIG_HOME", prev_config), ("XDG_STATE_HOME", prev_state)] {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

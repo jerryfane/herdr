@@ -436,7 +436,7 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true},
     }))
 }
 
@@ -1373,7 +1373,11 @@ fn serve_request(
             let Some(item) = may_fetch(guest, method, &params.id) else {
                 return forbidden(stream);
             };
-            if let Some(reply) = mirrored_file(guest, &id, &item, None) {
+            if let Some(thumbnail) = params.thumbnail {
+                if let Some(reply) = mirrored_thumbnail(guest, &id, &item, thumbnail.max_px) {
+                    return write_text_line_allow_disconnect(stream, &reply);
+                }
+            } else if let Some(reply) = mirrored_file(guest, &id, &item, None) {
                 return write_text_line_allow_disconnect(stream, &reply);
             }
             let request = Request {
@@ -1381,6 +1385,7 @@ fn serve_request(
                 method: Method::GramGetFile(GramGetFileParams {
                     id: params.id,
                     caller_pane_id: None,
+                    thumbnail: params.thumbnail,
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
@@ -1527,6 +1532,30 @@ fn mirrored_file(
         },
     };
     Some(success_value(id, serde_json::to_value(result).ok()?))
+}
+
+/// [`mirrored_file`] for `gram.get_file {thumbnail}`: the preview of a guest
+/// copy's image. Rendered on this connection's thread and not cached, since
+/// the mirror prunes its copies on its own schedule.
+fn mirrored_thumbnail(
+    guest: &GuestPrincipal,
+    id: &str,
+    item: &GramItem,
+    max_px: u32,
+) -> Option<String> {
+    let mirrored = crate::guest::mirror::get(&guest.dir, &item.id)?;
+    let Some(file) = mirrored.file else {
+        return Some(error_response_json(
+            id.to_string(),
+            "no_file",
+            "that message has no attached file".into(),
+        ));
+    };
+    let load = || crate::guest::mirror::read_file(&guest.dir, &item.id, 0, file.size);
+    match crate::gram_thumbnail::file_thumbnail(&file, max_px, load, false) {
+        Ok(result) => Some(success_value(id, serde_json::to_value(result).ok()?)),
+        Err(error) => Some(error_response_json(id.to_string(), &error.code, error.message)),
+    }
 }
 
 /// On a Gram-relay remote, after the coordinator accepted a local agent's
@@ -1992,7 +2021,9 @@ fn pull_relayed_file(message_id: &str, size: u64, pane: &str) -> Option<Vec<u8>>
 /// File bytes and the metadata the owner's reply carries.
 fn project_file(result: ResponseResult) -> Option<serde_json::Value> {
     match result {
-        ResponseResult::GramFileContent { .. } | ResponseResult::GramFileChunk { .. } => {
+        ResponseResult::GramFileContent { .. }
+        | ResponseResult::GramFileChunk { .. }
+        | ResponseResult::GramFileThumbnail { .. } => {
             serde_json::to_value(result).ok()
         }
         _ => None,
@@ -4217,7 +4248,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true}),
             "only what the gate serves"
         );
 

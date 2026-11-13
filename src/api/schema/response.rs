@@ -493,6 +493,20 @@ pub enum ResponseResult {
         size: u64,
         data_base64: String,
     },
+    /// `gram.get_file` with `thumbnail`: a JPEG preview of the attachment,
+    /// upright, its longer edge at most `max_px`. `name`, `size`, `mime` and
+    /// `sha256` describe the attachment itself; the preview is
+    /// `width`x`height`, `thumbnail_size` bytes of `image/jpeg`.
+    GramFileThumbnail {
+        name: String,
+        mime: String,
+        size: u64,
+        sha256: String,
+        width: u32,
+        height: u32,
+        thumbnail_size: u64,
+        data_base64: String,
+    },
     /// One bounded range of an attachment. `sha256` and `size` describe the
     /// complete committed file, so a downloader can reject truncation/corruption.
     GramFileChunk {

@@ -125,4 +125,9 @@ pub struct ServerCapabilities {
     /// keep offering every live agent.
     #[serde(default)]
     pub gram_reachable: bool,
+    /// `gram.get_file` accepts `thumbnail: {max_px}` and answers it with a
+    /// small JPEG (`gram_file_thumbnail`). Older servers ignore the field and
+    /// send the whole file.
+    #[serde(default)]
+    pub gram_thumbnails: bool,
 }

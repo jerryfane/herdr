@@ -251,6 +251,7 @@ fn update_in_checked<T>(
     with_registry_lock_in(dir, || {
         let path = registry_path_in(dir);
         let mut items = load_from_path_strict(&path)?;
+        let held_before = attachment_hashes(&items);
         let (result, changed) = mutation(&mut items);
         if changed {
             let files_to_remove = normalize(&mut items);
@@ -260,9 +261,22 @@ fn update_in_checked<T>(
             for id in &files_to_remove {
                 crate::persist::gram_files::remove_message_files_in(dir, id);
             }
+            // Previews of an attachment no message holds any more go with it.
+            let held_after = attachment_hashes(&items);
+            for sha256 in held_before.difference(&held_after) {
+                crate::persist::gram_thumbs::forget(sha256);
+            }
         }
         Ok((result, items))
     })
+}
+
+/// The SHA-256 of every attachment the store still holds bytes for.
+fn attachment_hashes(items: &[GramItem]) -> std::collections::HashSet<String> {
+    items
+        .iter()
+        .filter_map(|item| item.file.as_ref().map(|file| file.sha256.clone()))
+        .collect()
 }
 
 fn update_in<T>(

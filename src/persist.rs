@@ -10,6 +10,7 @@ pub mod agent_groups;
 pub mod devices;
 pub mod gram;
 pub mod gram_files;
+pub mod gram_thumbs;
 mod io;
 pub mod machine;
 pub mod plugin_registry;

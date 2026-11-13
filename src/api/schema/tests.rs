@@ -1199,6 +1199,7 @@ fn success_response_round_trips() {
                 rename_preconditions: false,
                 ask_form: false,
                 gram_reachable: false,
+                gram_thumbnails: false,
             }),
         },
     };

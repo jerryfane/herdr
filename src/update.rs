@@ -2674,6 +2674,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 gram_reachable: false,
+                gram_thumbnails: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2766,6 +2767,7 @@ mod tests {
                     rename_preconditions: false,
                     ask_form: false,
                     gram_reachable: false,
+                    gram_thumbnails: false,
                 }),
             },
         };
@@ -3045,6 +3047,7 @@ mod tests {
                     rename_preconditions: false,
                     ask_form: false,
                     gram_reachable: false,
+                    gram_thumbnails: false,
                 }),
             },
         };

@@ -143,6 +143,8 @@ fn spawn_server_with_relay(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    // Derived state (Gram thumbnails) stays inside the test's directory.
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -506,6 +508,77 @@ fn gram_download_refuses_late_credentials_without_reveal() {
         "explicit reveal failed: {allowed:?}"
     );
     assert_eq!(fs::read(&out).unwrap(), bytes);
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn gram_get_file_thumbnail_serves_a_small_jpeg() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // An 800x600 photo, noisy enough that the JPEG is large.
+    let (width, height) = (800u16, 600u16);
+    let pixels: Vec<u8> = (0..u32::from(width) * u32::from(height) * 3)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let mut photo = Vec::new();
+    jpeg_encoder::Encoder::new(&mut photo, 90)
+        .encode(&pixels, width, height, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+    let mut offset = 0;
+    for chunk in photo.chunks(256 * 1024) {
+        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let up = api_request(
+            &api_socket,
+            &format!(
+                r#"{{"id":"u","method":"gram.upload_chunk","params":{{"upload_id":"photo","offset":{offset},"data_base64":"{data}"}}}}"#
+            ),
+        );
+        assert_eq!(up["result"]["type"], "ok", "upload: {up}");
+        offset += chunk.len();
+    }
+    let post = api_request(
+        &api_socket,
+        r#"{"id":"p","method":"gram.post","params":{"text":"","file":{"upload_id":"photo","name":"p.jpg","mime":"image/jpeg"}}}"#,
+    );
+    let message_id = post["result"]["message"]["id"].as_str().expect("message id");
+
+    let reply = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"t","method":"gram.get_file","params":{{"id":"{message_id}","thumbnail":{{"max_px":320}}}}}}"#
+        ),
+    );
+    let result = &reply["result"];
+    assert_eq!(result["type"], "gram_file_thumbnail", "{reply}");
+    assert_eq!((result["width"].as_u64(), result["height"].as_u64()), (Some(320), Some(240)));
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(result["data_base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+    assert!(
+        jpeg.len() * 10 < photo.len(),
+        "{} byte preview of a {} byte photo",
+        jpeg.len(),
+        photo.len()
+    );
+
+    // Without `thumbnail`, still the whole file.
+    let full = api_request(
+        &api_socket,
+        &format!(r#"{{"id":"f","method":"gram.get_file","params":{{"id":"{message_id}"}}}}"#),
+    );
+    assert_eq!(full["result"]["type"], "gram_file_content");
+    assert_eq!(full["result"]["size"], photo.len() as u64);
 
     cleanup_spawned_herdr(spawned, base);
 }

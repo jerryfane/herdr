@@ -220,6 +220,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         rename_preconditions: true,
         ask_form: true,
         gram_reachable: true,
+        gram_thumbnails: true,
     })
 }
 
@@ -3711,6 +3712,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 gram_reachable: false,
+                gram_thumbnails: false,
             }),
             None,
             None,
@@ -4523,6 +4525,26 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["capabilities"]["api_bridge_multi"], true);
+    }
+
+    /// Clients check this before asking `gram.get_file` for a `thumbnail`,
+    /// which older servers ignore (they send the whole file).
+    #[test]
+    fn ping_advertises_gram_thumbnails() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["capabilities"]["gram_thumbnails"], true);
     }
 
     /// Callers check this before sending `agent.rename` preconditions, which

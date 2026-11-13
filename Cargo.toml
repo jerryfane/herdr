@@ -42,6 +42,13 @@ libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 portable-pty = "=0.9.0"
 png = "0.17"
+# `gram.get_file {thumbnail}`: decode JPEG attachments (PNG goes through `png` above) and
+# encode the small JPEG preview. Both pure Rust; zune-jpeg's only dependency is zune-core, and
+# jpeg-encoder has none. Chosen over `image`, which would add about eight crates (moxcms,
+# bytemuck, a second `png`, ...) for the same two codecs. jpeg-encoder's DCT derives from
+# libjpeg, so its IJG license asks for the acknowledgement in docs/next/README.md.
+zune-jpeg = "0.5"
+jpeg-encoder = "0.7"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

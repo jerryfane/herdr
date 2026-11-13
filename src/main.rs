@@ -24,6 +24,7 @@ mod config;
 mod copy_mode;
 mod detect;
 mod events;
+mod gram_thumbnail;
 use ghostty_vt as ghostty;
 #[cfg(unix)]
 mod guest;
