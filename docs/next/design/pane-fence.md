@@ -180,22 +180,28 @@ Profiles may keep a removed capability (`keep_caps`), never add one.
   the bounding set already caps what any exec can gain.
 - **No user namespace.** The pane stays uid 0 in the init user namespace so file ownership, git, ssh keys and
   every tool behave as today.
-- **A PID namespace is used** (section 3.5); a profile can turn it off.
+- **A PID namespace is built but off by default** (section 3.5); `pid_namespace` turns it on.
 - **No network namespace.** Not a v1 goal.
 
 ### 3.5 PID namespace and signal isolation
 
 A fenced root process could otherwise `kill` any root process: `pkill -f herdr` or `killall` in a cleanup
 script would take down the server and every agent. Landlock can scope signals per domain only from ABI 6
-(Linux 6.12); dev2306 runs 6.8 (ABI 4). So every fenced pane gets its own PID namespace (owner decision via
-jarvis, gitmoot message 487780). When a kernel with Landlock ABI 6 is available the fence also sets
-`LANDLOCK_SCOPE_SIGNAL`, which lets a profile with `pid_namespace = false` still keep signals in.
+(Linux 6.12); dev2306 runs 6.8 (ABI 4). So #418 builds a PID namespace per fenced pane (jarvis, gitmoot
+message 487780). When a kernel with Landlock ABI 6 is available the fence also sets
+`LANDLOCK_SCOPE_SIGNAL`, which keeps signals in even without a PID namespace.
+
+**It ships off** (`[fence] pid_namespace = false`; jarvis, gitmoot message 487804). Agents run the gitmoot
+CLI all day, and a namespace pid written as a lock owner, or a host pid judged dead from inside a pane, can
+make gitmoot reap a live lock or keep a dead one (table below). The pilot runs in two steps: first the fence
+without a PID namespace, then with one, after the gitmoot seat confirms its pid paths are namespace-safe.
+Until then signals stay a residual risk (section 13).
 
 - **Mounts:** before the fresh `/proc` is mounted, pid 1 binds the host `/proc` read-only at
-  `/run/herdr/host-proc`, so checks that need host processes (`grep -l cargo /run/herdr/host-proc/*/comm`)
+  `/run/herdr-host-proc`, so checks that need host processes (`grep -l cargo /run/herdr-host-proc/*/comm`)
   still work. It can read `cmdline`, `status` and the rest but cannot send signals through it
   (`pidfd_send_signal` with a `/proc` directory fd from another namespace gives `EINVAL`, probe P-50).
-  The server creates the empty mount-point directory `/run/herdr/host-proc` once at startup; it is the only
+  The server creates the empty mount-point directory `/run/herdr-host-proc` once at startup; it is the only
   host-side path the fence creates.
 - **pid 1 is the helper itself**, not the shell. It reaps orphans, forwards `SIGHUP`/`SIGTERM`/`SIGINT`/
   `SIGQUIT` to the pane command, and exits with the command's status. The kernel does not deliver signals
@@ -213,10 +219,10 @@ Effects on agents (sent to jarvis, gitmoot message 487802; the pilot decides on 
 
 | Effect | Probe | Mitigation |
 |---|---|---|
-| `ps`, `pgrep`, `top` show only the pane's own processes; a host-wide "is cargo already running" check sees nothing | P-44, P-45 | read `/run/herdr/host-proc` |
-| A host pid read from a file or database (`daemon.pid`, lock-owner pids in `gitmoot.db`) gives `ESRCH`, so "is it alive" checks report dead | P-46 | tools that act on that verdict (gitmoot `processRunning`, `lockOwnerPIDLive`, `probeRuntimePID`) must not run their reap/steal paths from a fenced pane, or must read `/run/herdr/host-proc`; listed for the gitmoot seat |
+| `ps`, `pgrep`, `top` show only the pane's own processes; a host-wide "is cargo already running" check sees nothing | P-44, P-45 | read `/run/herdr-host-proc` (jarvis: ship it) |
+| A host pid read from a file or database (`daemon.pid`, lock-owner pids in `gitmoot.db`) gives `ESRCH`, so "is it alive" checks report dead | P-46 | **blocker for turning it on**: gitmoot `processRunning`, `lockOwnerPIDLive`, `probeRuntimePID` must be namespace-safe first; the gitmoot seat checks (jarvis) |
 | Pids a fenced process records (`os.Getpid()` in lock rows) are namespace-local and name other host processes | — | same list |
-| Every process in the pane dies when the pane's command exits, including `setsid`/`nohup` background jobs (an agent restart ends them) | P-53, control P-54 | long-running services belong in systemd, not a pane; a profile can set `pid_namespace = false` |
+| Every process in the pane dies when the pane's command exits, including `setsid`/`nohup` background jobs (an agent restart ends them) | P-53, control P-54 | accepted (jarvis 487804): long-running services belong in systemd units; documented in the #421 user docs |
 
 ## 4. Config schema
 
@@ -235,12 +241,15 @@ allow = ["/mnt/storagebox-workspaces/worktrees/{agent}"]
 # Sockets masked in every fenced pane (connect fails).
 mask_sockets = ["/run/systemd/private", "/run/dbus/system_bus_socket", "/run/docker.sock"]
 
+# PID namespace per fenced pane (section 3.5). Off until gitmoot's pid handling is namespace-safe.
+pid_namespace = false
+
 [fence.profiles.installer]
 reason = "fleetup installs packages and writes system config"
 allow = ["/etc", "/usr", "/var/lib/dpkg", "/var/lib/apt", "/var/cache/apt"]
 unmask_sockets = ["/run/systemd/private", "/run/dbus/system_bus_socket"]
 keep_caps = []
-pid_namespace = true         # default; false lets the profile's panes signal host processes (section 3.5)
+pid_namespace = false        # per-profile override of [fence] pid_namespace, either value (section 3.5)
 
 [fence.profiles.coordinator]
 reason = "jarvis restarts agents and drives other panes"
@@ -257,9 +266,10 @@ reason = "..."
 
 Rules:
 
-- **Deny-list model (owner decision).** Everything not denied is writable. Profiles only relax:
-  `allow`, `unmask_sockets`, `keep_caps`, `pid_namespace = false`, `api`. There are no per-agent allow
-  lists for the base and no way for a profile to add capabilities beyond root's.
+- **Deny-list model (owner decision).** Everything not denied is writable. Profiles relax the paths and
+  rights: `allow`, `unmask_sockets`, `keep_caps`, `api`. There are no per-agent allow lists for the base and
+  no way for a profile to add capabilities beyond root's. `pid_namespace` is the one switch a profile may
+  set either way, so the pilot can turn it on for one agent.
 - **`reason` is required** on every profile and every agent entry; a missing reason is a config error.
 - **Agent identity** is the herdr agent name the pane runs (`[fence.agents.<name>]`). Panes without an
   agent, and agents without an entry, get the base fence (profile `default`). Built-in profile names:
@@ -492,7 +502,7 @@ the host, fenced panes keep the old (dead) connection until they restart (sectio
 | `gitmoot` CLI (writes `gitmoot.db`) | section 5 carve-outs; verified with `strace` in #419 |
 | omp sessions under `~/.omp` | writable |
 | `sudo`, setuid tools | uid stays 0; no `no_new_privs` |
-| `ps`, `kill` of own processes | own PID namespace (section 3.5) |
+| `ps`, `kill` of own processes | unchanged while `pid_namespace = false`; with it on, only the pane's own processes (section 3.5) |
 
 Known breakage by design: `systemctl`, `docker`, `crontab`, `apt`, `mount`, writes to `/etc` and other
 denied paths, `bwrap`/rootless containers that need a user namespace with capabilities (already blocked for
@@ -500,8 +510,9 @@ capability-less callers by this host's AppArmor sysctl). The matching profiles r
 
 ## 13. Residual risks (accepted for v1)
 
-- **Signals with `pid_namespace = false`.** A profile that turns the PID namespace off can again signal any
-  root process, unless the kernel has Landlock ABI 6 (section 3.5).
+- **Signals while `pid_namespace = false`** (the v1 default, section 3.5). A fenced root process can still
+  `kill` any root process, including the herdr server (`pkill -f herdr` in a test), unless the kernel has
+  Landlock ABI 6. Closed when the PID namespace is turned on after pilot step 2.
 - **Indirect execution.** Files that unfenced processes later execute or source stay writable when they are
   outside the deny list: shell rc files, scripts under `/root/fleet-tools/state` run by systemd units (for
   example `phobos-openrouter-credit.service`), omp hooks under `~/.omp`, git hooks in shared repos. Out of
@@ -538,9 +549,9 @@ other targets.
 | # | Question | Recommendation |
 |---|---|---|
 | Q1 | Agents run as uid 0; should fenced panes use a different uid instead? | No. A uid change breaks file ownership, git, ssh keys and every seat's tooling; the fence keeps uid 0 and removes capabilities instead. |
-| Q2 | Mount propagation: `private` (as #418 says) or `slave`? | `slave` (`MS_REC | MS_SLAVE`). Same guarantee for the host (nothing travels from pane to host) plus host mounts still reach uncovered paths in the pane. The #423 suite asserts no pane mount reaches the outer namespace either way. |
+| Q2 | Mount propagation: `private` (as #418 says) or `slave`? | `slave` (`MS_REC` plus `MS_SLAVE`). Same guarantee for the host (nothing travels from pane to host) plus host mounts still reach uncovered paths in the pane. The #423 suite asserts no pane mount reaches the outer namespace either way. |
 | Q3 | API caller identity: process ancestry, mount-namespace inode, or cgroup? | Mount-namespace inode plus a bounding-set check (section 8). Ancestry breaks for `setsid`/double-forked processes reparented to init, which would make a daemonized child look unfenced; a cgroup needs systemd delegation. |
-| Q4 | Signals: fenced panes can kill the server and other agents. | **Decided (jarvis, 487780): PID namespace per fenced pane in #418**, since dev2306's 6.8 kernel has no Landlock signal scoping. Section 3.5 lists the effects; `pid_namespace = false` per profile; Landlock signal scoping added when the kernel has ABI 6. |
+| Q4 | Signals: fenced panes can kill the server and other agents. | **Decided (jarvis, 487780/487804):** #418 builds a PID namespace per fenced pane (dev2306's 6.8 kernel has no Landlock signal scoping) and ships it **off** until the gitmoot seat confirms its pid paths are namespace-safe; pilot step 2 turns it on. Landlock signal scoping is added when the kernel has ABI 6. |
 | Q5 | Landlock unavailable on a host? | Fail closed (pane does not start) with a clear error, since without it B4/B5 are open. Both fleet hosts have it (dev2306: ABI 4). |
 | Q6 | Stale binds after host-side replacement | `herdr fence explain` and the `fence` field report binds whose host path now resolves to a different inode, so restarts can be targeted. No live re-binding in v1. |
 | Q7 | gitmoot `-wal`/`-shm` stay deletable | Ask the gitmoot seat to move `gitmoot.db` into its own directory (e.g. `~/.gitmoot/db/`), so only that directory is a carve-out. Until then accept the residual. |
