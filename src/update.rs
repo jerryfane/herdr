@@ -2676,6 +2676,7 @@ mod tests {
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
+                compressed_replies: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2770,6 +2771,7 @@ mod tests {
                     gram_reachable: false,
                     transcript_max_bytes: false,
                     api_bridge_frames: false,
+                    compressed_replies: false,
                 }),
             },
         };
@@ -3051,6 +3053,7 @@ mod tests {
                     gram_reachable: false,
                     transcript_max_bytes: false,
                     api_bridge_frames: false,
+                    compressed_replies: false,
                 }),
             },
         };

@@ -18745,6 +18745,11 @@
               "description": "Parses omp HTML form asks (`form` on transcript asks and `pending_ask`)\nand serves `agent.answer_form`.",
               "type": "boolean"
             },
+            "compressed_replies": {
+              "default": false,
+              "description": "`api-bridge --multi` answers `bridge.hello {frames: true, compress:\n\"gzip\"}` with `compress: \"gzip\"` and then gzips large replies, each\nframe of one marked `\"enc\":\"gzip\"`. The hello reply is authoritative.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
