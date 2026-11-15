@@ -18721,6 +18721,11 @@
               "description": "Serves `agent.transcript`: an omp agent's conversation as chat entries.",
               "type": "boolean"
             },
+            "api_bridge_frames": {
+              "default": false,
+              "description": "`api-bridge --multi` answers `bridge.hello {frames: true}` and then\nwrites replies as interleaved frames, and answers `bridge.cancel {id}`.\nThe bridge's own `bridge.hello` reply is authoritative; this flag only\nsays the daemon's binary ships that bridge.",
+              "type": "boolean"
+            },
             "api_bridge_multi": {
               "default": false,
               "description": "`herdr api-bridge --multi` forwards newline-delimited requests over one\nlong-lived bridge process instead of one process per request.",

@@ -537,6 +537,21 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
   如果无法连接 socket,该请求会得到 `transport_error`。两种情况下桥接进程都会继续运行。
 - stdin 关闭后,桥接进程会在处理中的请求完成后退出。如果 stdout 的读取方先断开,处理中的请求会被取消。
 
+默认情况下,一个大响应在全部写完之前会挡住它后面的所有响应。慢速链路上的客户端可以让桥接进程交错发送响应
+(桥接进程支持该功能的服务器会返回 `capabilities.api_bridge_frames: true`):
+
+- 发送 `{"id":"h","method":"bridge.hello","params":{"frames":true}}`。桥接进程自己以普通行回答:
+  `{"id":"h","result":{"type":"bridge_hello","frames":true,"frame_bytes":16384,"cancel":true}}`。
+  较旧的桥接进程会把它转发给服务器,服务器返回 `invalid_request`;此时请继续按行读取。
+- 该行之后桥接进程写出的所有内容都是帧:一行 JSON 头 `{"frame":"<id>","len":<n>,"last":<bool>}`,后跟响应行
+  (不含换行)的恰好 `n` 个字节(最多 `frame_bytes`)。按顺序拼接一个响应的帧,`"last":true` 的帧表示完成。
+  桥接进程在等待中的响应之间每次轮流发送一帧,因此小响应最多只需等待前面每个大响应的一帧。
+  同一 `id` 的两个响应的帧不会交错。
+- `{"id":"c","method":"bridge.cancel","params":{"id":"<请求 id>"}}` 会停止该 id 所有尚未应答的请求:桥接进程关闭其
+  socket 连接(服务器随之停止生成响应),用 `{"frame":"<id>","len":0,"last":true,"abort":true}` 丢弃已发送一部分的帧响应,
+  并以 `cancelled` 错误应答该请求。取消请求本身的应答是 `{"type":"bridge_cancel","cancelled":<bool>}`;`false`
+  表示响应已经写出(或没有该 id 的请求在处理中)。`bridge.cancel` 无论是否启用帧都可使用。
+
 ## Socket 路径
 
 默认 socket 位于你的 Herdr 配置目录下。
