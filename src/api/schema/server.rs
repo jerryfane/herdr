@@ -130,4 +130,10 @@ pub struct ServerCapabilities {
     /// and page by turns alone.
     #[serde(default)]
     pub transcript_max_bytes: bool,
+    /// `api-bridge --multi` answers `bridge.hello {frames: true}` and then
+    /// writes replies as interleaved frames, and answers `bridge.cancel {id}`.
+    /// The bridge's own `bridge.hello` reply is authoritative; this flag only
+    /// says the daemon's binary ships that bridge.
+    #[serde(default)]
+    pub api_bridge_frames: bool,
 }
