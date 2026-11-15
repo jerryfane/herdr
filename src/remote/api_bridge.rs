@@ -290,7 +290,11 @@ fn run_multi<R: BufRead, W: Write + Send>(
     teardown: &Teardown,
 ) -> io::Result<()> {
     let outbox = Outbox::default();
-    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<MultiJob>(0);
+    // Up to MULTI_MAX_IN_FLIGHT more requests wait here for a worker, so the
+    // reader keeps reading (and answering `bridge.cancel`) while every worker
+    // is busy. Past that bound the reader blocks until a worker frees up, as
+    // before: a cancel sent behind a full queue waits with it.
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<MultiJob>(MULTI_MAX_IN_FLIGHT);
     let jobs_rx = Mutex::new(jobs_rx);
     let output_error = Mutex::new(None::<io::Error>);
 
@@ -1427,6 +1431,39 @@ mod tests {
         // The bridge keeps serving, and a cancelled id is free to reuse.
         bridge.send(&request("slow", "ping", 0));
         assert_eq!(bridge.read_line()["result"]["method"], "ping");
+        bridge.finish();
+    }
+
+    /// Every worker waits on a slow reply and one more request waits for a
+    /// worker: a cancel read after them still frees a slot for it.
+    #[test]
+    fn multi_cancel_reaches_a_saturated_bridge_and_frees_a_slot() {
+        let server = FakeApiServer::start("cancel-saturated");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+
+        let started = Instant::now();
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+        }
+        bridge.send(&request("next", "ping", 0));
+        bridge.send(&cancel("c", "slow0"));
+        let mut replies = [bridge.read_line(), bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        assert_eq!(replies[0]["id"], "c");
+        assert_eq!(replies[0]["result"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "next");
+        assert_eq!(replies[1]["result"]["method"], "ping");
+        assert_eq!(replies[2]["id"], "slow0");
+        assert_eq!(replies[2]["error"]["code"], "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        for slot in 1..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&cancel(&format!("c{slot}"), &format!("slow{slot}")));
+        }
+        for _ in 1..MULTI_MAX_IN_FLIGHT {
+            bridge.read_line();
+            bridge.read_line();
+        }
         bridge.finish();
     }
 

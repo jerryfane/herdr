@@ -282,8 +282,11 @@ impl Outbox {
     /// Writes queued replies to `out` until [`Outbox::close`] and an empty
     /// queue. A write failure fails every waiting producer and is returned.
     pub(super) fn run_writer<W: Write>(&self, mut out: W) -> io::Result<()> {
+        // Builds frame headers and frames only; a whole line is written from
+        // its own buffer.
         let mut buf = Vec::new();
         loop {
+            let mut line = None;
             let (ticket, written) = {
                 let mut state = self.state();
                 let index = loop {
@@ -322,16 +325,21 @@ impl Outbox {
                     buf.extend_from_slice(&reply.bytes[reply.sent..reply.sent + len]);
                     len
                 } else {
-                    buf.extend_from_slice(&reply.bytes);
-                    buf.push(b'\n');
-                    reply.bytes.len() - reply.sent
+                    // Unframed replies go whole: the bytes leave the queue
+                    // with the writer, which leaves `sent == bytes.len()`.
+                    line = Some(std::mem::take(&mut reply.bytes));
+                    0
                 };
                 // Mark it even when empty so a cancel cannot take it mid-write.
                 reply.in_write = written.max(1);
                 (ticket, written)
             };
 
-            if let Err(err) = out.write_all(&buf).and_then(|()| out.flush()) {
+            let result = match &line {
+                Some(line) => out.write_all(line).and_then(|()| out.write_all(b"\n")),
+                None => out.write_all(&buf),
+            };
+            if let Err(err) = result.and_then(|()| out.flush()) {
                 return Err(self.fail(err));
             }
 
