@@ -10,7 +10,6 @@
 //! emits `exited` when the runtime is gone. On exit it dispatches
 //! `PaneStreamClose` to release the viewer.
 
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,19 +174,21 @@ const FAREWELL_STALL_LIMIT: Duration = Duration::from_secs(2);
 
 /// Writes a stream's frame lines, waiting out a slow reader rather than
 /// failing on the connection's 5 s write timeout.
-struct FrameWriter<'a> {
-    stream: &'a mut ApiStream,
+struct FrameWriter<'a, W: std::io::Write = ApiStream> {
+    stream: &'a mut W,
     running: &'a AtomicBool,
     stall_limit: Duration,
     /// The last line's write blocked at least [`BACKPRESSURE_WRITE`].
     behind: bool,
-    /// The rest of a line a stall cut off part way; the farewell finishes it
-    /// so the error line after it parses.
+    /// The rest of a line a stall or write error cut off part way; the
+    /// farewell finishes it so the error line after it parses.
     unsent: Vec<u8>,
 }
 
 impl<'a> FrameWriter<'a> {
     fn new(stream: &'a mut ApiStream, running: &'a AtomicBool) -> Self {
+        // Windows named pipes have no write timeout, so there a slow reader
+        // still blocks the write and `pane_stream_resync` is not advertised.
         if let Err(err) = stream.set_send_timeout(Some(STALL_POLL)) {
             tracing::debug!(err = %err, "pane.stream write poll unavailable");
         }
@@ -199,7 +200,9 @@ impl<'a> FrameWriter<'a> {
             unsent: Vec::new(),
         }
     }
+}
 
+impl<W: std::io::Write> FrameWriter<'_, W> {
     fn write_json<T: serde::Serialize>(&mut self, value: &T) -> std::io::Result<bool> {
         let mut line = serde_json::to_vec(value)
             .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
@@ -252,7 +255,12 @@ impl<'a> FrameWriter<'a> {
                         ));
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if written > 0 {
+                        self.unsent = line[written..].to_vec();
+                    }
+                    return Err(err);
+                }
             }
         }
         match self.stream.flush() {
@@ -587,16 +595,25 @@ fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestS
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::{BufRead as _, BufReader, Read as _};
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
 
+    #[cfg(unix)]
     use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
 
+    #[cfg(unix)]
     use crate::ipc::LocalStream;
+
+    // The socket tests need a frame write that times out, which Windows
+    // named pipes do not offer (see `pane_stream_resync`).
 
     /// A connected local socket pair: the server end as an [`ApiStream`] with
     /// the API server's 5 s write timeout, and the client end.
+    #[cfg(unix)]
     fn socket_pair(name: &str) -> (ApiStream, LocalStream) {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = PathBuf::from("/tmp").join(format!(
@@ -617,6 +634,7 @@ mod tests {
     }
 
     /// Answers the stream's open and close on the "app loop".
+    #[cfg(unix)]
     fn app_loop() -> (ApiRequestSender, std::thread::JoinHandle<()>) {
         let (api_tx, mut api_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
@@ -637,10 +655,12 @@ mod tests {
         (api_tx, app)
     }
 
+    #[cfg(unix)]
     fn stream_params(pane_id: &str) -> PaneStreamParams {
         serde_json::from_value(serde_json::json!({"pane_id": pane_id})).unwrap()
     }
 
+    #[cfg(unix)]
     fn read_frame(reader: &mut BufReader<LocalStream>) -> Option<serde_json::Value> {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -653,6 +673,7 @@ mod tests {
     /// reader stops reading for longer than the API server's 5 s write
     /// timeout. The stream used to end there without a word; now it waits,
     /// skips the backlog with a fresh keyframe, and keeps streaming.
+    #[cfg(unix)]
     #[test]
     fn a_reader_that_stalls_past_the_write_timeout_gets_a_keyframe_not_a_dead_stream() {
         let tokio = tokio::runtime::Runtime::new().unwrap();
@@ -730,6 +751,7 @@ mod tests {
     /// A reader that reads nothing at all ends the stream after the stall
     /// limit, and a reader that comes back finds the cut line finished and an
     /// error line saying why, not a silent close.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_stream_ends_with_an_error_line() {
         let (mut server, client) = socket_pair("farewell");
@@ -768,6 +790,69 @@ mod tests {
         assert!(lines[..lines.len() - 1]
             .iter()
             .all(|line| line["frame"] == "data"));
+    }
+
+    /// Writes the first 8 bytes it is given, then fails once with a write
+    /// error that is neither a timeout nor a closed connection, then takes
+    /// everything.
+    struct FailsOnceAfterEightBytes {
+        out: Vec<u8>,
+        writes: usize,
+    }
+
+    impl std::io::Write for FailsOnceAfterEightBytes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            match self.writes {
+                1 => {
+                    let n = buf.len().min(8);
+                    self.out.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+                2 => Err(std::io::Error::other("no buffer space available")),
+                _ => {
+                    self.out.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write error part way through a frame (not a stall) still leaves the
+    /// reader whole JSON lines: the farewell finishes the cut frame before
+    /// the `stream_failed` line.
+    #[test]
+    fn a_write_error_mid_frame_ends_with_the_frame_finished_then_an_error_line() {
+        let mut sink = FailsOnceAfterEightBytes {
+            out: Vec::new(),
+            writes: 0,
+        };
+        let running = AtomicBool::new(true);
+        let mut writer = FrameWriter {
+            stream: &mut sink,
+            running: &running,
+            stall_limit: STALL_LIMIT,
+            behind: false,
+            unsent: Vec::new(),
+        };
+        let frame = StreamFrameLine::data(1, 2, "A".repeat(64));
+        let err = writer.write_json(&frame).unwrap_err();
+        writer.farewell("s", &err);
+
+        let lines: Vec<serde_json::Value> = sink
+            .out
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("every line whole"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["frame"], "data");
+        assert_eq!(lines[1]["id"], "s");
+        assert_eq!(lines[1]["error"]["code"], "stream_failed");
     }
 
     #[test]

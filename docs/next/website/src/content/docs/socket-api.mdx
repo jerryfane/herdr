@@ -693,7 +693,9 @@ true` from `ping`:
   if the reader is still there. Reconnect to resync.
 
 Older servers end the stream without a word once a frame write blocks for 5
-seconds.
+seconds. On Windows, named pipes have no write timeout, so the server does not
+report `pane_stream_resync` there and a frame write waits until the reader
+takes the bytes.
 
 ### Guest sessions
 
