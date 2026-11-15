@@ -95,18 +95,6 @@ pub(crate) const DEFAULT_MASK_SOCKETS: &[&str] = &[
     "/run/snapd.socket",
 ];
 
-/// `/proc` entries made read-only in every fenced pane (Docker's default list).
-pub(crate) const PROC_READ_ONLY: &[&str] = &[
-    "/proc/sys",
-    "/proc/sysrq-trigger",
-    "/proc/irq",
-    "/proc/bus",
-    "/proc/fs",
-];
-
-/// Character devices that give raw access to memory or I/O ports; bound `nodev`.
-pub(crate) const RAW_CHAR_DEVICES: &[&str] = &["/dev/mem", "/dev/kmem", "/dev/port"];
-
 /// Capabilities removed from every set, including the bounding set, with the reason.
 pub(crate) const DROPPED_CAPS: &[(u8, &str, &str)] = &[
     (21, "sys_admin", "mount, umount, setns, new namespaces, bpf"),
@@ -346,7 +334,7 @@ pub(crate) fn resolve_plan(
     for path in dedup(mask) {
         mounts.push((depth(&path), 3, FenceMount::Mask(path)));
     }
-    mounts.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    mounts.sort_by_key(|(depth, order, _)| (*depth, *order));
 
     FencePlan {
         mounts: mounts.into_iter().map(|(_, _, mount)| mount).collect(),

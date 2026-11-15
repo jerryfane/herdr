@@ -12,7 +12,19 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-use crate::fence::{FenceMount, FencePlan, PROC_READ_ONLY, RAW_CHAR_DEVICES};
+use crate::fence::{FenceMount, FencePlan};
+
+/// `/proc` entries made read-only in every fenced pane (Docker's default list).
+const PROC_READ_ONLY: &[&str] = &[
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+    "/proc/irq",
+    "/proc/bus",
+    "/proc/fs",
+];
+
+/// Character devices that give raw access to memory or I/O ports; bound `nodev`.
+const RAW_CHAR_DEVICES: &[&str] = &["/dev/mem", "/dev/kmem", "/dev/port"];
 
 pub(crate) const FENCE_SUPPORTED: bool = true;
 /// The pane's child execs the server binary it was forked from, even if the file
