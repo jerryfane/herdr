@@ -224,6 +224,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         api_bridge_frames: true,
         // Only where a frame write can time out: Windows named pipes cannot.
         pane_stream_resync: cfg!(unix),
+        compressed_replies: true,
     })
 }
 
@@ -3718,6 +3719,7 @@ mod tests {
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
                 pane_stream_resync: false,
+                compressed_replies: false,
             }),
             None,
             None,
@@ -4539,6 +4541,7 @@ mod tests {
             value["result"]["capabilities"]["pane_stream_resync"],
             cfg!(unix)
         );
+        assert_eq!(value["result"]["capabilities"]["compressed_replies"], true);
     }
 
     /// Callers check this before sending `agent.rename` preconditions, which

@@ -142,4 +142,9 @@ pub struct ServerCapabilities {
     /// line instead of closing without a word.
     #[serde(default)]
     pub pane_stream_resync: bool,
+    /// `api-bridge --multi` answers `bridge.hello {frames: true, compress:
+    /// "gzip"}` with `compress: "gzip"` and then gzips large replies, each
+    /// frame of one marked `"enc":"gzip"`. The hello reply is authoritative.
+    #[serde(default)]
+    pub compressed_replies: bool,
 }

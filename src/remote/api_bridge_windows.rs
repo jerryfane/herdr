@@ -60,9 +60,28 @@ impl Shared {
     }
 }
 
-pub(super) fn connect(socket_path: &Path) -> io::Result<Connection> {
+/// Connects to the API pipe, retrying while every instance is busy, until
+/// `stop` says the request no longer needs it (cancelled, or output gone).
+/// Checks `stop` before the first attempt.
+pub(super) fn connect(socket_path: &Path, stop: impl Fn() -> bool) -> io::Result<Connection> {
+    let stream = loop {
+        if stop() {
+            return Err(super::api_bridge::connect_stopped());
+        }
+        match crate::platform::connect_local_stream_with_timeout(
+            socket_path,
+            super::api_bridge::CONNECT_RETRY_INTERVAL,
+        ) {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            result => break result?,
+        }
+    };
     Ok(Connection {
-        stream: crate::ipc::connect_local_stream(socket_path)?,
+        stream,
         shared: Arc::default(),
         poll_interval: READ_POLL_MIN_INTERVAL,
     })

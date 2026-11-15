@@ -38,6 +38,12 @@ pub(crate) const API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 /// most one frame of each bigger reply ahead of it rather than for all of it.
 pub(crate) const API_BRIDGE_FRAME_BYTES: usize = 16 * 1024;
 
+/// Smallest reply line a gzip session (`bridge.hello {compress: "gzip"}`)
+/// compresses. Below this the gzip header and trailer (18 bytes) and a frame
+/// header's `"enc"` eat most of what deflate saves, and the client pays a
+/// decode for nothing.
+pub(crate) const API_BRIDGE_COMPRESS_MIN_BYTES: usize = 1024;
+
 /// Methods that keep their connection open after the first response line.
 /// `api-bridge --multi` gives each request one connection and answers it from
 /// that connection alone, so these keep their own SSH channel.

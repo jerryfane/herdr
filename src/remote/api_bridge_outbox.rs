@@ -16,6 +16,13 @@
 //! the bytes a cancelled reply already sent; its `cancelled` error follows as
 //! a reply of its own.
 //!
+//! A framed client may also ask for gzip (`bridge.hello {compress: "gzip"}`).
+//! Then a reply line of at least [`COMPRESS_MIN_BYTES`] is gzipped by the
+//! worker that produced it, before it is queued, and every frame of it says
+//! `"enc":"gzip"`: its frames' bytes are one gzip member whose content is the
+//! reply line. Smaller replies, and replies queued before the hello reply was
+//! written, stay plain. Unframed replies are never compressed.
+//!
 //! Workers hand over one reply at a time and wait until it has been written
 //! or cancelled, so the bridge never buffers more than one reply per worker,
 //! the same bound the old whole-line writer had. The request reader never
@@ -31,6 +38,10 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+use crate::remote::API_BRIDGE_COMPRESS_MIN_BYTES as COMPRESS_MIN_BYTES;
 use crate::remote::API_BRIDGE_FRAME_BYTES as FRAME_BYTES;
 use crate::remote::API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT;
 
@@ -39,6 +50,15 @@ use crate::remote::API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT;
 /// more requests than it can answer loses the excess replies rather than
 /// stalling the reader.
 pub(super) const MAX_POSTED: usize = 64;
+/// How the bridge writes replies, as the client's `bridge.hello` set it. Both
+/// only ever turn on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Session {
+    /// Replies are framed and interleaved.
+    pub(super) frames: bool,
+    /// Large replies are gzipped. Only ever set together with `frames`.
+    pub(super) gzip: bool,
+}
 
 /// Owed replies waiting to be written at which the reader stops accepting
 /// requests (it answers `busy`): what a full admission (16 running, 16
@@ -66,12 +86,18 @@ pub(super) struct Outbox {
 
 #[derive(Default)]
 struct State {
-    framed: bool,
-    /// Every reply not yet fully written, in arrival order. The writer serves
-    /// them round robin from `cursor`; a reply waits behind an earlier one
-    /// with the same id, so one id's replies never interleave.
+    /// How replies are written now: the hello reply that turned it on has
+    /// been written.
+    session: Session,
+    /// What `bridge.hello` requests have asked for so far: every hello reply
+    /// says so and turns it on once written, never before.
+    requested: Session,
+    /// Every reply not yet fully written. The writer serves the first one it
+    /// may write and moves a reply it has not finished behind every other
+    /// waiting reply, so a new reply cannot keep overtaking an unfinished
+    /// one. A reply waits behind an earlier one (lower ticket) with the same
+    /// id, so one id's replies never interleave.
     queue: Vec<Reply>,
-    cursor: usize,
     next_ticket: u64,
     finished: HashMap<u64, Delivery>,
     next_key: RequestKey,
@@ -107,8 +133,10 @@ struct Reply {
     /// Bytes of this reply the writer is writing right now, outside the lock.
     in_write: usize,
     cancelled: bool,
-    /// The `bridge.hello` reply that switches to frames once written.
-    switches_to_frames: bool,
+    /// The bytes are a gzip member of the reply line (sent as `"enc":"gzip"`).
+    gzip: bool,
+    /// The `bridge.hello` reply: the session it turns on once written.
+    switches_to: Option<Session>,
     /// Who learns how it left the bridge.
     waiter: Waiter,
 }
@@ -135,9 +163,43 @@ impl Outbox {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether replies are framed (the client's `bridge.hello` was answered).
-    pub(super) fn framed(&self) -> bool {
-        self.state().framed
+    /// Queues the `bridge.hello` reply without waiting for it to be written,
+    /// so the reader stays free to read `bridge.cancel` while output is
+    /// backed up. Adds `frames` and `gzip` (which needs frames) to what was
+    /// requested before; `reply` builds the reply from that session, which
+    /// replies written after it follow. A hello that asks for something new
+    /// is never dropped; any other is a posted reply, dropped past
+    /// [`MAX_POSTED`]. Fails once output has failed.
+    pub(super) fn post_hello(
+        &self,
+        id: &str,
+        frames: bool,
+        gzip: bool,
+        reply: impl FnOnce(Session) -> Vec<u8>,
+    ) -> io::Result<()> {
+        let mut state = self.state();
+        if state.failed {
+            return Err(output_gone());
+        }
+        let before = state.requested;
+        let frames = before.frames || frames;
+        let wanted = Session {
+            frames,
+            gzip: before.gzip || (gzip && frames),
+        };
+        state.requested = wanted;
+        let waiter = if wanted != before {
+            state.owed += 1;
+            Waiter::Owed
+        } else if state.posted < MAX_POSTED {
+            state.posted += 1;
+            Waiter::Posted
+        } else {
+            return Ok(());
+        };
+        state.push(None, id, reply(wanted), false, Some(wanted), waiter);
+        self.changed.notify_all();
+        Ok(())
     }
 
     /// Registers a request under `id` until [`Outbox::end`].
@@ -195,7 +257,7 @@ impl Outbox {
     pub(super) fn cancel(&self, id: &str) -> bool {
         let mut state = self.state();
         let state = &mut *state;
-        let framed = state.framed;
+        let framed = state.session.frames;
         let mut cancelled = false;
         for (key, active) in state.active.iter_mut() {
             if active.id != id || active.answered || active.cancelled {
@@ -235,9 +297,6 @@ impl Outbox {
                 index += 1;
             } else {
                 let reply = state.queue.remove(index);
-                if index < state.cursor {
-                    state.cursor -= 1;
-                }
                 state.finish(&reply, Delivery::Cancelled);
             }
         }
@@ -254,12 +313,16 @@ impl Outbox {
         id: &str,
         line: Vec<u8>,
     ) -> io::Result<Delivery> {
-        self.enqueue(key, id, line, false)
-    }
-
-    /// Queues the `bridge.hello` reply; replies written after it are framed.
-    pub(super) fn send_switch_to_frames(&self, id: &str, line: Vec<u8>) -> io::Result<Delivery> {
-        self.enqueue(None, id, line, true)
+        // Compress here, on the producer's thread, so the writer never waits
+        // for it. A session with gzip is framed, and stays so, so the reply
+        // will be written as frames.
+        let gzipped = (line.len() >= COMPRESS_MIN_BYTES && self.state().session.gzip)
+            .then(|| gzip(&line))
+            .filter(|gzipped| gzipped.len() < line.len());
+        match gzipped {
+            Some(gzipped) => self.enqueue(key, id, gzipped, true),
+            None => self.enqueue(key, id, line, false),
+        }
     }
 
     /// Queues `line` (one reply to refused work, without its newline) for
@@ -275,7 +338,7 @@ impl Outbox {
             return Ok(false);
         }
         state.posted += 1;
-        state.push(None, id, line, false, Waiter::Posted);
+        state.push(None, id, line, false, None, Waiter::Posted);
         self.changed.notify_all();
         Ok(true)
     }
@@ -290,7 +353,7 @@ impl Outbox {
             return Err(output_gone());
         }
         state.owed += 1;
-        state.push(None, id, line, false, Waiter::Owed);
+        state.push(None, id, line, false, None, Waiter::Owed);
         self.changed.notify_all();
         Ok(())
     }
@@ -306,7 +369,7 @@ impl Outbox {
         key: Option<RequestKey>,
         id: &str,
         bytes: Vec<u8>,
-        switches_to_frames: bool,
+        gzip: bool,
     ) -> io::Result<Delivery> {
         let mut state = self.state();
         if state.failed {
@@ -320,7 +383,7 @@ impl Outbox {
         }) {
             return Ok(Delivery::Cancelled);
         }
-        let ticket = state.push(key, id, bytes, switches_to_frames, Waiter::Producer);
+        let ticket = state.push(key, id, bytes, gzip, None, Waiter::Producer);
         self.changed.notify_all();
         loop {
             if let Some(delivery) = state.finished.remove(&ticket) {
@@ -365,15 +428,14 @@ impl Outbox {
                         .wait(state)
                         .unwrap_or_else(PoisonError::into_inner);
                 };
-                let framed = state.framed;
+                let framed = state.session.frames;
                 let reply = &mut state.queue[index];
                 buf.clear();
                 let ticket = reply.ticket;
                 if reply.cancelled {
                     // Started and framed: tell the client to drop it.
-                    push_header(&mut buf, &reply.id, 0, true, true);
+                    push_header(&mut buf, &reply.id, 0, true, ABORT);
                     let reply = state.queue.remove(index);
-                    state.cursor = index;
                     state.finish(&reply, Delivery::Cancelled);
                     self.changed.notify_all();
                     drop(state);
@@ -385,10 +447,12 @@ impl Outbox {
                 let written = if framed {
                     let len = (reply.bytes.len() - reply.sent).min(FRAME_BYTES);
                     let last = reply.sent + len == reply.bytes.len();
-                    push_header(&mut buf, &reply.id, len, last, false);
+                    let mark = if reply.gzip { GZIP } else { b"" };
+                    push_header(&mut buf, &reply.id, len, last, mark);
                     buf.extend_from_slice(&reply.bytes[reply.sent..reply.sent + len]);
                     len
                 } else {
+                    debug_assert!(!reply.gzip, "only a framed session compresses");
                     // Unframed replies go whole: the bytes leave the queue
                     // with the writer, which leaves `sent == bytes.len()`.
                     line = Some(std::mem::take(&mut reply.bytes));
@@ -417,15 +481,17 @@ impl Outbox {
             reply.sent += written;
             reply.in_write = 0;
             if reply.sent < reply.bytes.len() {
-                state.cursor = index + 1;
+                // Round robin: behind everything already waiting.
+                let reply = state.queue.remove(index);
+                state.queue.push(reply);
             } else {
                 let reply = state.queue.remove(index);
-                state.cursor = index;
                 if let Some(active) = reply.key.and_then(|key| state.active.get_mut(&key)) {
                     active.answered = true;
                 }
-                if reply.switches_to_frames {
-                    state.framed = true;
+                if let Some(session) = reply.switches_to {
+                    state.session.frames |= session.frames;
+                    state.session.gzip |= session.gzip;
                 }
                 state.finish(&reply, Delivery::Written);
             }
@@ -452,7 +518,8 @@ impl State {
         key: Option<RequestKey>,
         id: &str,
         bytes: Vec<u8>,
-        switches_to_frames: bool,
+        gzip: bool,
+        switches_to: Option<Session>,
         waiter: Waiter,
     ) -> u64 {
         let ticket = self.next_ticket;
@@ -465,7 +532,8 @@ impl State {
             sent: 0,
             in_write: 0,
             cancelled: false,
-            switches_to_frames,
+            gzip,
+            switches_to,
             waiter,
         });
         ticket
@@ -483,30 +551,130 @@ impl State {
         }
     }
 
-    /// The next reply to write from, round robin from `cursor`, skipping a
-    /// reply that waits behind an earlier one with the same id.
+    /// The next reply to write from: the first in the rotation that does not
+    /// wait behind an earlier reply (lower ticket) with the same id.
     fn next_index(&self) -> Option<usize> {
-        let len = self.queue.len();
-        (0..len)
-            .map(|offset| (self.cursor + offset) % len)
-            .find(|&index| {
-                let id = &self.queue[index].id;
-                !self.queue[..index].iter().any(|earlier| &earlier.id == id)
-            })
+        self.queue.iter().position(|reply| {
+            !self
+                .queue
+                .iter()
+                .any(|other| other.id == reply.id && other.ticket < reply.ticket)
+        })
     }
 }
 
-fn push_header(buf: &mut Vec<u8>, id: &str, len: usize, last: bool, abort: bool) {
+/// Header fields after `last`: an aborted reply, or a gzipped one.
+const ABORT: &[u8] = b",\"abort\":true";
+const GZIP: &[u8] = b",\"enc\":\"gzip\"";
+
+fn push_header(buf: &mut Vec<u8>, id: &str, len: usize, last: bool, mark: &[u8]) {
     buf.extend_from_slice(b"{\"frame\":");
     // Serializing a `&str` cannot fail.
     serde_json::to_writer(&mut *buf, id).expect("frame id serializes");
     let _ = write!(buf, ",\"len\":{len},\"last\":{last}");
-    if abort {
-        buf.extend_from_slice(b",\"abort\":true");
-    }
+    buf.extend_from_slice(mark);
     buf.extend_from_slice(b"}\n");
+}
+
+/// One gzip member of `line`: a fixed 10-byte header (no name, comment or
+/// extra field, `FLG` 0), the deflate stream, then CRC-32 and size. A client
+/// without a gzip reader can drop those 10 + 8 bytes and inflate the rest as
+/// raw deflate.
+fn gzip(line: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(line.len() / 4), Compression::default());
+    // Writing to a `Vec` cannot fail.
+    encoder.write_all(line).expect("gzip into memory");
+    encoder.finish().expect("gzip into memory")
 }
 
 fn output_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "api-bridge: output closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Output that hands each flushed frame to the test and waits for leave
+    /// to go on, so the test can queue replies while a frame is being written.
+    struct GatedOutput {
+        buf: Vec<u8>,
+        written: mpsc::Sender<String>,
+        permits: mpsc::Receiver<()>,
+    }
+
+    impl Write for GatedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let header_end = self.buf.iter().position(|&b| b == b'\n').unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&self.buf[..header_end]).unwrap();
+            self.buf.clear();
+            let id = header["frame"].as_str().unwrap().to_owned();
+            self.written.send(id).unwrap();
+            self.permits.recv().map_err(|_| output_gone())
+        }
+    }
+
+    /// Small replies arriving while others are written cannot keep a big
+    /// reply waiting: it gets a turn after every reply already queued.
+    #[test]
+    fn new_small_replies_do_not_starve_an_unfinished_big_one() {
+        let outbox = Outbox::default();
+        outbox.state().session.frames = true;
+        assert!(outbox.post("big", vec![b'x'; 3 * FRAME_BYTES]).unwrap());
+        assert!(outbox.post("small0", b"{}".to_vec()).unwrap());
+
+        let (written, frames) = mpsc::channel();
+        let (permit, permits) = mpsc::channel();
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                outbox.run_writer(GatedOutput {
+                    buf: Vec::new(),
+                    written,
+                    permits,
+                })
+            });
+            let mut order = Vec::new();
+            let smalls = 9;
+            for _ in 0..3 + smalls {
+                order.push(frames.recv().unwrap());
+                // A new small reply arrives during every write.
+                let next = order.iter().filter(|id| id.starts_with("small")).count()
+                    + order.iter().filter(|id| *id == "big").count();
+                if next < smalls {
+                    assert!(outbox
+                        .post(&format!("small{next}"), b"{}".to_vec())
+                        .unwrap());
+                }
+                permit.send(()).unwrap();
+            }
+            outbox.close();
+            writer.join().unwrap().unwrap();
+
+            // Between two turns of `big`, only replies already queued when
+            // the first turn was written may go: `small{n}` was posted while
+            // frame `n` of the order was written.
+            let mut last_big = None;
+            for (index, id) in order.iter().enumerate() {
+                if id == "big" {
+                    last_big = Some(index);
+                } else if let Some(turn) = last_big {
+                    let n: usize = id["small".len()..].parse().unwrap();
+                    assert!(n <= turn + 1, "{id} overtook big: {order:?}");
+                }
+            }
+            assert_eq!(
+                order.iter().filter(|id| *id == "big").count(),
+                3,
+                "{order:?}"
+            );
+        });
+    }
 }
