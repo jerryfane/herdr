@@ -706,8 +706,12 @@ report `capabilities.api_bridge_multi: true` from `ping`):
   `busy` error at once (retry it once a response arrives), so `bridge.cancel`
   is always read promptly, even while stdout is backed up. The bridge's own
   short replies (`busy` and other errors, cancel answers, `cancelled`) never
-  hold up reading; if more than 64 of them are waiting for stdout, further
-  ones are dropped. A `busy` reply for an id whose earlier reply is still being
+  hold up reading. A request the bridge accepted always gets its response or
+  its `cancelled` error, and a cancel that stopped a request always gets its
+  answer: none of these is ever dropped, and while 64 such replies wait for
+  stdout, new requests get `busy`. Replies to refused work (`busy` and other
+  errors, and the answer to a cancel that stopped nothing) are dropped once 64
+  are waiting. A `busy` reply for an id whose earlier reply is still being
   sent follows that reply.
 - Every response line is written to stdout whole and unchanged. Responses can
   arrive out of order, so match them by `id`.

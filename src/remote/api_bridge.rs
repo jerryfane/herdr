@@ -343,12 +343,23 @@ fn run_multi<R: BufRead, W: Write + Send>(
         .and(output_error.map_or(Ok(()), Err))
 }
 
-/// An error reply from the request reader, or a worker's `cancelled`: posted,
-/// so neither waits on output (see [`Outbox::post`]).
+/// An error reply from the request reader to work it refused: posted, so the
+/// reader never waits on output, and dropped once too many wait (see
+/// [`Outbox::post`]).
 fn post_error(outbox: &Outbox, id: &str, code: &str, message: &str) -> io::Result<()> {
     outbox
         .post(id, error_envelope(id, code, message).into_bytes())
         .map(drop)
+}
+
+/// Refuses a request the bridge has no room for; the client retries later.
+fn post_busy(outbox: &Outbox, id: &str) -> io::Result<()> {
+    post_error(
+        outbox,
+        id,
+        "busy",
+        "api-bridge: too many requests in flight; retry once one finishes",
+    )
 }
 
 enum InputLine {
@@ -433,7 +444,15 @@ fn read_requests<R: BufRead>(
             }
             _ => {}
         }
-
+        // Never block the reader on admission (nor, by posting the reply, on
+        // output): it must stay free to read `bridge.cancel` at any load. A
+        // request is refused `busy` with every slot taken, or while too many
+        // replies owed to accepted requests wait for output, which keeps
+        // those bounded without ever dropping one.
+        if !outbox.admits() {
+            post_busy(outbox, &id)?;
+            continue;
+        }
         let key = outbox.begin(&id);
         let job = MultiJob {
             line: std::mem::take(&mut line),
@@ -443,16 +462,8 @@ fn read_requests<R: BufRead>(
         match jobs.try_send(job) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(job)) => {
-                // Never block the reader on admission (nor, by posting the
-                // reply, on output): it must stay free to read
-                // `bridge.cancel` at any load. The client retries later.
                 outbox.end(job.key);
-                post_error(
-                    outbox,
-                    &job.id,
-                    "busy",
-                    "api-bridge: too many requests in flight; retry once one finishes",
-                )?;
+                post_busy(outbox, &job.id)?;
             }
             Err(mpsc::TrySendError::Disconnected(job)) => {
                 outbox.end(job.key);
@@ -512,8 +523,15 @@ fn answer_cancel(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
     let reply = serde_json::json!({
         "id": id,
         "result": { "type": "bridge_cancel", "cancelled": cancelled }
-    });
-    outbox.post(id, reply.to_string().into_bytes()).map(drop)
+    })
+    .to_string()
+    .into_bytes();
+    if cancelled {
+        // Owed to the requests it stopped: the client retires them by it.
+        outbox.post_owed(id, reply)
+    } else {
+        outbox.post(id, reply).map(drop)
+    }
 }
 
 /// Reads one request line into `line` without its terminator. A line longer
@@ -613,12 +631,14 @@ fn forward_request(
         if outbox.is_cancelled(key) {
             // Not tied to `key`, which refuses replies once cancelled, and
             // posted so the worker is free for the next request at once.
-            post_error(
-                outbox,
+            // Owed: the client retires the request by it, so it is never
+            // dropped.
+            let line = error_envelope(
                 &job.id,
                 "cancelled",
                 "api-bridge: request cancelled by bridge.cancel",
-            )
+            );
+            outbox.post_owed(&job.id, line.into_bytes())
         } else {
             Ok(())
         }
@@ -702,6 +722,8 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use crate::remote::api_bridge_outbox::{MAX_OWED, MAX_POSTED};
 
     fn unique_socket_path(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1377,6 +1399,22 @@ mod tests {
             drop(self.input.take());
             self.bridge.take().unwrap().join().unwrap().unwrap();
         }
+
+        /// Closes stdin, waits for the bridge to finish, and returns every
+        /// reply line it wrote that was not read yet.
+        fn finish_lines(mut self) -> Vec<Value> {
+            drop(self.input.take());
+            self.bridge.take().unwrap().join().unwrap().unwrap();
+            let mut bytes = std::mem::take(&mut self.pending);
+            while let Ok(chunk) = self.output.try_recv() {
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect()
+        }
     }
 
     fn hello(id: &str) -> String {
@@ -1707,5 +1745,77 @@ mod tests {
         bridge.send(&json!({"id": "bad", "method": "bridge.cancel", "params": {}}).to_string());
         assert_eq!(bridge.read_line()["error"]["code"], "invalid_request");
         bridge.finish();
+    }
+
+    /// A reply that completes an accepted request is never dropped. With
+    /// stdout backed up and the budget for replies to refused work used up
+    /// by answers to cancels that found nothing, a real request's cancel
+    /// answer and its `cancelled` error still arrive once output drains.
+    #[test]
+    fn multi_never_drops_the_replies_an_accepted_request_is_owed() {
+        let server = FakeApiServer::start("owed");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        // The first write takes two seconds; nothing else is written before.
+        bridge.set_write_delay(Duration::from_secs(2));
+        for n in 0..MAX_POSTED + 8 {
+            bridge.send(&cancel(&format!("none{n}"), "nothing"));
+        }
+        bridge.send(&request("real", "agent.wait", 10_000));
+        bridge.send(&cancel("c", "real"));
+        // The reader and the cancelled request's worker post while output is
+        // still stuck.
+        thread::sleep(Duration::from_secs(1));
+        bridge.set_write_delay(Duration::ZERO);
+
+        let (mut answer, mut cancelled) = (None, None);
+        while answer.is_none() || cancelled.is_none() {
+            let reply = bridge.read_line();
+            match reply["id"].as_str() {
+                Some("c") => answer = Some(reply),
+                Some("real") => cancelled = Some(reply),
+                _ => assert_eq!(reply["result"]["cancelled"], false, "{reply}"),
+            }
+        }
+        assert_eq!(answer.unwrap()["result"]["cancelled"], true);
+        assert_eq!(cancelled.unwrap()["error"]["code"], "cancelled");
+        bridge.finish();
+    }
+
+    /// Owed replies count against admission, so they stay bounded without
+    /// one being dropped: with stdout backed up, a client that keeps sending
+    /// requests and cancelling them is refused `busy` once `MAX_OWED` owed
+    /// replies wait, and every request the bridge accepted still gets both
+    /// its cancel answer and its `cancelled` error.
+    #[test]
+    fn multi_bounds_owed_replies_by_refusing_requests() {
+        let server = FakeApiServer::start("owed-bound");
+        let bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        // The first write takes two seconds; nothing else is written before.
+        bridge.set_write_delay(Duration::from_secs(2));
+        for n in 0..2 * MAX_OWED {
+            bridge.send(&request(&format!("r{n}"), "agent.wait", 10_000));
+            bridge.send(&cancel(&format!("c{n}"), &format!("r{n}")));
+        }
+        thread::sleep(Duration::from_secs(1));
+        bridge.set_write_delay(Duration::ZERO);
+
+        let replies = bridge.finish_lines();
+        let numbers = |matches: &dyn Fn(&Value) -> bool| -> HashSet<String> {
+            replies
+                .iter()
+                .filter(|reply| matches(reply))
+                .map(|reply| reply["id"].as_str().unwrap()[1..].to_owned())
+                .collect()
+        };
+        let stopped = numbers(&|reply| reply["result"]["cancelled"] == true);
+        let cancelled = numbers(&|reply| reply["error"]["code"] == "cancelled");
+        let refused = numbers(&|reply| reply["error"]["code"] == "busy");
+        assert!(
+            !stopped.is_empty() && stopped.len() <= MAX_OWED,
+            "{} requests accepted while output was stuck",
+            stopped.len()
+        );
+        assert_eq!(stopped, cancelled);
+        assert!(!refused.is_empty());
     }
 }

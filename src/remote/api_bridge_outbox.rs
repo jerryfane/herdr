@@ -20,21 +20,31 @@
 //! or cancelled, so the bridge never buffers more than one reply per worker,
 //! the same bound the old whole-line writer had. The request reader never
 //! waits on output, so it always reads the next `bridge.cancel`: it posts its
-//! own small replies (errors, `busy`, cancel answers) without waiting, as does
-//! a worker its `cancelled` error, at most [`MAX_POSTED`] of them pending;
-//! past that a posted reply is dropped.
+//! own small replies without waiting. A reply to work the bridge refused (an
+//! error, `busy`, the answer to a cancel that stopped nothing) is dropped
+//! past [`MAX_POSTED`] pending. A reply owed to a request it accepted (the
+//! request's `cancelled` error, which its worker posts, and the answer to the
+//! cancel that stopped it) is never dropped; the reader accepts no request
+//! while [`MAX_OWED`] of them wait, which keeps them bounded.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::remote::API_BRIDGE_FRAME_BYTES as FRAME_BYTES;
+use crate::remote::API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT;
 
-/// Replies the request reader may have waiting to be written at once. They
-/// are one short line each; a client flooding the bridge with more requests
-/// than it can answer loses the excess replies rather than stalling the
-/// reader.
+/// Replies to refused work the request reader may have waiting to be written
+/// at once. They are one short line each; a client flooding the bridge with
+/// more requests than it can answer loses the excess replies rather than
+/// stalling the reader.
 pub(super) const MAX_POSTED: usize = 64;
+
+/// Owed replies waiting to be written at which the reader stops accepting
+/// requests (it answers `busy`): what a full admission (16 running, 16
+/// waiting), every request cancelled, owes. Each accepted request owes at
+/// most two, so fewer than `MAX_OWED` + 64 are ever queued.
+pub(super) const MAX_OWED: usize = 4 * MULTI_MAX_IN_FLIGHT;
 
 /// How one reply left the bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +76,10 @@ struct State {
     finished: HashMap<u64, Delivery>,
     next_key: RequestKey,
     active: HashMap<RequestKey, Active>,
-    /// Posted replies in `queue` (nobody waits for them).
+    /// Posted replies to refused work in `queue`.
     posted: usize,
+    /// Owed replies in `queue`.
+    owed: usize,
     /// No producer is left; the writer drains the queue and returns.
     closed: bool,
     /// Writing failed; nothing more can be delivered.
@@ -97,8 +109,19 @@ struct Reply {
     cancelled: bool,
     /// The `bridge.hello` reply that switches to frames once written.
     switches_to_frames: bool,
-    /// Posted by the request reader: nobody waits for its delivery.
-    posted: bool,
+    /// Who learns how it left the bridge.
+    waiter: Waiter,
+}
+
+/// Who learns how a reply left the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waiter {
+    /// Its producer, waiting in [`Outbox::send`].
+    Producer,
+    /// Nobody: a reply to refused work, dropped past [`MAX_POSTED`].
+    Posted,
+    /// Nobody, and never dropped: it completes an accepted request.
+    Owed,
 }
 
 impl Reply {
@@ -239,10 +262,10 @@ impl Outbox {
         self.enqueue(None, id, line, true)
     }
 
-    /// Queues `line` (one reply, without its newline) for `id` without
-    /// waiting for it to be written. Returns `false`, dropping it, when
-    /// [`MAX_POSTED`] posted replies are already waiting. Fails once output
-    /// has failed.
+    /// Queues `line` (one reply to refused work, without its newline) for
+    /// `id` without waiting for it to be written. Returns `false`, dropping
+    /// it, when [`MAX_POSTED`] such replies are already waiting. Fails once
+    /// output has failed.
     pub(super) fn post(&self, id: &str, line: Vec<u8>) -> io::Result<bool> {
         let mut state = self.state();
         if state.failed {
@@ -252,9 +275,30 @@ impl Outbox {
             return Ok(false);
         }
         state.posted += 1;
-        state.push(None, id, line, false, true);
+        state.push(None, id, line, false, Waiter::Posted);
         self.changed.notify_all();
         Ok(true)
+    }
+
+    /// Queues `line` (one reply, without its newline) for `id` without
+    /// waiting, like [`Outbox::post`], but never drops it: it completes a
+    /// request the bridge accepted. [`Outbox::admits`] keeps these bounded.
+    /// Fails once output has failed.
+    pub(super) fn post_owed(&self, id: &str, line: Vec<u8>) -> io::Result<()> {
+        let mut state = self.state();
+        if state.failed {
+            return Err(output_gone());
+        }
+        state.owed += 1;
+        state.push(None, id, line, false, Waiter::Owed);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Whether the reader may accept another request: fewer than
+    /// [`MAX_OWED`] owed replies are waiting for output.
+    pub(super) fn admits(&self) -> bool {
+        self.state().owed < MAX_OWED
     }
 
     fn enqueue(
@@ -276,7 +320,7 @@ impl Outbox {
         }) {
             return Ok(Delivery::Cancelled);
         }
-        let ticket = state.push(key, id, bytes, switches_to_frames, false);
+        let ticket = state.push(key, id, bytes, switches_to_frames, Waiter::Producer);
         self.changed.notify_all();
         loop {
             if let Some(delivery) = state.finished.remove(&ticket) {
@@ -394,6 +438,7 @@ impl Outbox {
         state.failed = true;
         state.queue.clear();
         state.posted = 0;
+        state.owed = 0;
         drop(state);
         self.changed.notify_all();
         err
@@ -408,7 +453,7 @@ impl State {
         id: &str,
         bytes: Vec<u8>,
         switches_to_frames: bool,
-        posted: bool,
+        waiter: Waiter,
     ) -> u64 {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
@@ -421,18 +466,20 @@ impl State {
             in_write: 0,
             cancelled: false,
             switches_to_frames,
-            posted,
+            waiter,
         });
         ticket
     }
 
     /// Records how `reply`, just taken off the queue, left the bridge, for
-    /// the producer waiting on it (a posted reply has none).
+    /// the producer waiting on it (a posted or owed reply has none).
     fn finish(&mut self, reply: &Reply, delivery: Delivery) {
-        if reply.posted {
-            self.posted -= 1;
-        } else {
-            self.finished.insert(reply.ticket, delivery);
+        match reply.waiter {
+            Waiter::Producer => {
+                self.finished.insert(reply.ticket, delivery);
+            }
+            Waiter::Posted => self.posted -= 1,
+            Waiter::Owed => self.owed -= 1,
         }
     }
 
