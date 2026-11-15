@@ -508,6 +508,14 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 
 事件订阅在初始响应之后保持连接打开。
 
+`pane.stream` 在终端输出突发时会迁就慢速读取方,而不是结束流。支持此行为的服务器会在 `ping` 中返回 `capabilities.pane_stream_resync: true`:
+
+- 在读取方一个字节都不读取的情况下,一次帧写入最多等待 60 秒。一点一点读取的慢速链路会保持流不断。
+- 落后的读取方(一次帧写入阻塞了至少 250 ms)若还有超过 256 KiB 的输出待发送,会收到一个带 `"lagged": true` 的新 `reset` 关键帧,而不是积压的输出。像处理其他 lagged 重置一样处理它:用关键帧替换屏幕及其历史。
+- 流必须结束时(60 秒没有进展,或写入出错),会先写完被截断的帧行;如果读取方仍在,再写入 `{"id":"<请求 id>","error":{"code":"stream_stalled"|"stream_failed","message":"…"}}`。请重新连接以重新同步。
+
+旧服务器在一次帧写入阻塞 5 秒后会不加说明地结束流。Windows 命名管道没有写入超时,因此 Windows 上的服务器不会返回 `pane_stream_resync`,帧写入会一直等到读取方取走数据。
+
 ### 访客会话
 
 访客连接(经由 HerdrUp 访客中继的一个 Noise 会话)会依次处理多个请求,而不是每个连接只处理一个请求。
@@ -527,8 +535,11 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
 避免为每个请求启动一个进程(适用于 Unix 和 Windows;支持该模式的服务器会在 `ping` 中返回
 `capabilities.api_bridge_multi: true`):
 
-- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个;16 个都在处理时,
-  桥接进程会暂停读取 stdin,直到其中一个完成。
+- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个,另有最多 16 个
+  等待空位。桥接进程从不停止读取 stdin:在 16 个运行、16 个等待时到达的请求会立即收到 `busy` 错误(收到某个响应后再重试),
+  因此即使 stdout 拥堵,`bridge.cancel` 也总能被及时读取。桥接进程自己的简短响应(`busy` 等错误、取消应答、`cancelled`)从不阻塞读取。
+  已接受的请求一定会收到响应或 `cancelled` 错误,停止了请求的取消一定会收到应答:这些响应从不丢弃;等待 stdout 的此类响应达到 64 个时,
+  新请求会收到 `busy`。对被拒绝工作的响应(`busy` 等错误,以及没有停止任何请求的取消应答)在等待数达到 64 个后会被丢弃。与正在发送的响应同 id 的 `busy` 会排在该响应之后。
 - 每个响应行都会完整、原样地写入 stdout。响应可能乱序到达,请按 `id` 匹配。
 - `events.subscribe`、`pane.stream`、`pane.input.stream`、`gram.upload.stream` 和
   `server.ssh_agent.register` 会保持连接打开,因此桥接进程会对它们返回 `unsupported_method` 错误。
@@ -536,6 +547,27 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
 - 不是带字符串 `method` 的 JSON 对象的行,或超过 1 MiB 的行,会得到 `invalid_request` 错误。
   如果无法连接 socket,该请求会得到 `transport_error`。两种情况下桥接进程都会继续运行。
 - stdin 关闭后,桥接进程会在处理中的请求完成后退出。如果 stdout 的读取方先断开,处理中的请求会被取消。
+
+默认情况下,一个大响应在全部写完之前会挡住它后面的所有响应。慢速链路上的客户端可以让桥接进程交错发送响应
+(桥接进程支持该功能的服务器会返回 `capabilities.api_bridge_frames: true`):
+
+- 发送 `{"id":"h","method":"bridge.hello","params":{"frames":true}}`。桥接进程自己以普通行回答:
+  `{"id":"h","result":{"type":"bridge_hello","frames":true,"frame_bytes":16384,"cancel":true}}`。
+  较旧的桥接进程会把它转发给服务器,服务器返回 `invalid_request`;此时请继续按行读取。
+- 该行之后桥接进程写出的所有内容都是帧:一行 JSON 头 `{"frame":"<id>","len":<n>,"last":<bool>}`,后跟响应行
+  (不含换行)的恰好 `n` 个字节(最多 `frame_bytes`)。按顺序拼接一个响应的帧,`"last":true` 的帧表示完成。
+  桥接进程在等待中的响应之间每次轮流发送一帧,因此小响应最多只需等待前面每个大响应的一帧。
+  同一 `id` 的两个响应的帧不会交错。
+- `{"id":"c","method":"bridge.cancel","params":{"id":"<请求 id>"}}` 会停止该 id 所有尚未应答的请求:桥接进程关闭其
+  socket 连接(服务器随之停止生成响应),用 `{"frame":"<id>","len":0,"last":true,"abort":true}` 丢弃已发送一部分的帧响应,
+  并以 `cancelled` 错误应答该请求。取消请求本身的应答是 `{"type":"bridge_cancel","cancelled":<bool>}`;`false`
+  表示响应已经写出(或没有该 id 的请求在处理中)。`bridge.cancel` 无论是否启用帧都可使用。
+- 启用帧后,客户端还可以请求 gzip(桥接进程支持它的服务器会返回 `capabilities.compressed_replies: true`):
+  在 hello 中加上 `"compress":"gzip"`(`{"frames":true,"compress":"gzip"}`,或之后再发一次 hello)。hello 的应答
+  返回 `"compress":"gzip"` 即表示启用;若为 `null` 或缺失,则不压缩任何内容。此后,凡是 1024 字节及以上、且 gzip
+  能使其变小的响应行都以 gzip 发送,其每一帧的头都带 `"enc":"gzip"`:照常拼接帧,再对结果 gunzip 即得到响应行
+  (一个 gzip 成员,10 字节的最简头)。不带 `enc` 的帧是明文。`len` 计的是 gzip 字节数。压缩需要帧:没有
+  `frames` 时,桥接进程继续写明文行,并应答 `"compress":null`。
 
 ## Socket 路径
 
@@ -737,6 +769,8 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 `agent.prompt`、`agent.send_keys`、`pane.send_text`、`pane.send_input`、`pane.send_keys` 以及 `pane.input.stream` 的打开请求接受可选的 `input_source`。代表所有者操作的 HerdrUp 客户端发送 `"input_source": "app"`;脚本、CLI 和其他代理省略它。Herdr 只在所有者自己的连接上采用该值:访客和联邦对等方的值按省略处理。每个代理窗格会记录当前轮次由谁发起:带 `"input_source": "app"` 的输入或在已连接的 herdr 终端中输入记为 `mine`,其他发起轮次的输入记为 `other`,代理工作期间所有者的输入会把该轮次变为 `mine`。完成的轮次在 `pane.get`、`agent.get` 和 `agent.list` 的 `last_completed_turn`、`pane.turns` 记录以及 `pane.turn_completed` 事件中带有 `turn_origin`(`"mine"` 或 `"other"`,未知时省略,例如重启之后)。`notifications.register_device` 接受 `notify_finishes_mine_only`(默认 `false`):与 `notify_finishes` 一起使用时,设备只收到来源为 `mine` 或未知的轮次完成推送;需要输入和退出推送不变。Herdr 还会按窗格记住最近 200 条已送达的非所有者 `agent.prompt` 文本的 SHA-256 摘要,而不是文本本身(摘要随会话保存,提交失败的会被丢弃),`agent.transcript` 按顺序、按文本的摘要(统一换行符并去除首尾空白后计算),将它们与发送后 10 分钟内写入的用户条目(若没有,则为发送前 5 秒内的条目)匹配,并标记 `"origin": "other"`;所有者和未知条目省略 `origin`。当同一窗格之前的 64 条提示仍在提交时,不带 `input_source` 的 `agent.prompt` 会在写入任何内容之前以 `too_many_pending_prompts` 拒绝。如果页面发出后记住的提示发生变化(例如条目发出后才确认提示已送达),下一个 `after` 页面会以相同的 `id` 和 `"origin": "other"` 重新发送所有现在被标记的较早用户条目。`ping` 通过 `capabilities.turn_origin` 声明这些功能。
 
 `agent.transcript` 支持 omp 的 HTML 表单 `ask`(omp 18.18.3 及以后,`ask` 接受一个 `<form>`)。`ask` 条目和 `pending_ask` 带有 `form`:`intro`(第一个字段之前的文本)和 `fields`,每个字段包含 `name`、`kind`(`choice` 或 `text`)、`title`、`description`、`multi`、`select`、`other`(omp 会添加自由填写的 Other 答案)、`required`、`options`(`value`、`label`、表示代理推荐且为默认值的 `checked`、`disabled`),文本字段还有 `input_type`、`placeholder`、`value`、`min`、`max`、`minlength`、`maxlength` 和 `pattern`。hidden 输入不列出。为兼容旧客户端,`questions` 为每个选择字段列出一个兼容问题,`answer` 为每个已回答字段给出一行 `"<title>: <answer>"`。结果到达后,条目增加 `form_answer`(`details.answers` 的 `name`、`question`、`answer`)和 `form_status`(`answered`、`timed_out`,错误结果或没有答案的结果为 `cancelled`);没有选择的 ask 结果不再报告空的 `answer`。当 herdr 能操作该表单时,`pending_ask.form_answerable` 为 true。两个字段同名的表单或没有命名字段的表单为 false,此时 `agent.answer_form` 返回 `ask_unsupported`,应用提示在终端中回答。未包含在 `values` 中的 `<textarea>` 不会被修改:herdr 用 Tab 跳过它;如果 omp 记录的值与预填内容不同(有人在终端中编辑过),状态为 `sent_unconfirmed` 并附上记录的答案。包含在 `values` 中的文本区域会被替换:herdr 通过按 ↑ 和 ↓ 时焦点离开该字段来证明光标已到达第一行和最后一行,用 Ctrl+U 删除所有行,输入答案,并检查聚焦的编辑器显示了全部内容。答案可以折行(herdr 按 omp 编辑器的方式排版并逐行精确核对)。折行后超过编辑器可显示行数、超过 1000 个字符或包含由多个码位组成的字符(表情序列、独立的重音符号)的答案,超过 40 行的草稿,以及修改作为表单第一个字段的文本区域,均返回 `ask_form_invalid`(如 `"<name>: too long to edit from the app; answer in the terminal"`);读取不一致时在 Submit 前以 `ask_form_moved` 停止。用 `agent.answer_form` 回答:`{"target", "ask_id", "values": {"<name>": {"options": [...]} | {"options": [], "other": "..."} | {"text": "..."}}}`。省略的名称保持默认值,`values: {}` 接受所有推荐;出现但没有 `options` 的名称表示不选(复选框组全部取消;单选组则需要 `other`)。Herdr 按 omp 的规则校验,但 `pattern` 由 omp 在 Submit 时校验(`ask_form_invalid`,消息为 `"<name>: <reason>"`;Submit 后 omp 显示的错误也以同样方式返回,表单在终端中保持打开)。它确认终端中的表单仍是打开时的状态(否则 `ask_form_moved`,例如有人正在终端中回答;消息会说明哪项检查未通过)。如果窗格太矮,omp 打开表单时只显示说明页而看不到第一个字段,herdr 会先按 ↑ 显示焦点(在该页上它不会移动任何内容);如果代理输入框中的草稿占用着按键,会在此之前先按 ↑ 释放它(草稿保留在输入框中)。每次 ↑ 只发送一次,并在屏幕上确认结果后再继续,然后直接设置每个字段并在屏幕上读回,只有当所有字段都显示所发送的内容时才按 Submit。若某个字段没有显示,则以 `ask_form_moved` 停止,已输入的内容保留。返回 `{"type": "ask_form_answered", "status": "answered" | "sent_unconfirmed", "answers": [...]}`:omp 记录的数据与发送的值一致时(数字按数值比较,文本去除首尾空白)为 `answered`。若未及时收到结果,则为不带答案的 `sent_unconfirmed`;终端里的表单回到打开时的状态后,之后的调用可以再次回答同一个 ask。访客可以像 `agent.answer` 一样对被授权的代理调用。联邦只转发给声明 `ask_form` 的对等方(否则 `ask_unsupported`)。表单的 `herdr_ask` 推送带有 `options: []` 和 `form: {"count", "intro", "accept_defaults"}`,只有当每个必填字段都有默认值时才使用类别 `herdr.ask_form`(一个操作 "Accept recommendations")。`ping` 通过 `capabilities.ask_form` 声明这些功能。
+
+`agent.transcript` 按轮次分页(`limit`,默认 20,最多 50)。最新页和 `before` 页还接受 `max_bytes`:该页只保留 JSON(`entries` 数组)能放进 `max_bytes` 的最新条目,其余部分用它的 `before` 游标分页获取。慢速链路上的客户端可以先显示长对话的末尾(`"max_bytes": 32768`),滚动时再加载更早的条目。记录不会被拆分:即使最新一条记录的条目单独就超出预算(例如一条很长的回复),它也会被保留;更早的页面之间没有空缺也不重叠。`after` 页忽略该参数。支持它的服务器会通告 `capabilities.transcript_max_bytes`;较旧的服务器会忽略该参数,只按轮次分页。
 
 通过 `notifications.register_device` 注册的设备也会收到远程代理的推送通知,并按各设备的“需要你”“已完成”“已退出”偏好发送。标题会写明机器,例如 `llm-opt on Jerry's Mac Studio needs attention`;通知携带带 `<alias>/` 前缀的窗格 ID,因此在 `muted_panes` 中写入该 ID 即可静音远程窗格。每次状态变化只推送一次:重复中继的事件、重新同步,或重复已知状态的轮询都不会再发送。没有 `events_v2` 的对等方通过每 5 秒一次的轮询通知。可达对等方不再列出的代理窗格视为已退出,因此对等方离线期间丢失的退出事件仍会通知一次。Live Activity 会把可达对等方上的代理与本地代理一起计数。
 
