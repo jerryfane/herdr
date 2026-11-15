@@ -119,17 +119,21 @@ fn file_thumbnail_with<S: AsRef<[u8]>>(
             // Taken before the read: once the attachment is deleted, what
             // this render read can no longer be cached.
             let lease = cache.then(|| crate::persist::gram_thumbs::lease(&file.sha256));
-            let source = load().map_err(|err| ErrorBody {
-                code: "gram_file_error".into(),
-                message: format!("failed to read file: {err}"),
+            let source = load().map_err(|err| {
+                Failure::Unread(ErrorBody {
+                    code: "gram_file_error".into(),
+                    message: format!("failed to read file: {err}"),
+                })
             })?;
             let rendered = render(source.as_ref(), max_px);
             // Freed before the permit, so the next render's read never
             // overlaps it.
             drop(source);
-            let thumbnail = rendered.map_err(|message| ErrorBody {
-                code: "thumbnail_unavailable".into(),
-                message,
+            let thumbnail = rendered.map_err(|message| {
+                Failure::Refused(ErrorBody {
+                    code: "thumbnail_unavailable".into(),
+                    message,
+                })
             })?;
             if let Some(lease) = lease {
                 lease.put(max_px, &thumbnail.jpeg);
@@ -156,7 +160,25 @@ fn busy() -> ErrorBody {
     }
 }
 
-type Rendered = Result<Thumbnail, ErrorBody>;
+/// Why a render has no thumbnail.
+#[derive(Debug, Clone)]
+enum Failure {
+    /// The requester's own copy of the source could not be read (its
+    /// message was deleted, say). Requests sharing the render read their own.
+    Unread(ErrorBody),
+    /// The bytes have no thumbnail: true for every request of this content.
+    Refused(ErrorBody),
+}
+
+impl Failure {
+    fn into_body(self) -> ErrorBody {
+        match self {
+            Self::Unread(body) | Self::Refused(body) => body,
+        }
+    }
+}
+
+type Rendered = Result<Thumbnail, Failure>;
 
 /// Admission to rendering: `permits` renders at once, [`MAX_WAITING`]
 /// requests waiting, and one render per preview.
@@ -196,31 +218,47 @@ impl Renderer {
 
     /// The preview `key` names: the result of its render already under way,
     /// or of `render` once a permit is free. `busy`, without waiting, when
-    /// [`MAX_WAITING`] requests already wait.
-    fn run(&self, key: (String, u32), render: impl FnOnce() -> Rendered) -> Rendered {
+    /// [`MAX_WAITING`] requests already wait. A shared render that could not
+    /// read its requester's source is not taken as this request's answer:
+    /// it renders once more from its own source, without joining again.
+    fn run(
+        &self,
+        key: (String, u32),
+        render: impl FnOnce() -> Rendered,
+    ) -> Result<Thumbnail, ErrorBody> {
         let mut admission = self.admission();
         if let Some(result) = admission.renders.get(&key).cloned() {
             if admission.waiting >= MAX_WAITING {
                 return Err(busy());
             }
             admission.waiting += 1;
-            loop {
+            let rendered = loop {
                 if let Some(rendered) = result.get() {
-                    admission.waiting -= 1;
-                    return rendered.clone();
+                    break rendered.clone();
                 }
                 admission = self
                     .finished
                     .wait(admission)
                     .unwrap_or_else(PoisonError::into_inner);
+            };
+            admission.waiting -= 1;
+            match rendered {
+                Err(Failure::Unread(_)) => {}
+                rendered => return rendered.map_err(Failure::into_body),
             }
         }
+        if admission.running >= self.permits && admission.waiting >= MAX_WAITING {
+            return Err(busy());
+        }
+        // Registered for others to join unless a render of `key` already
+        // is: only after one that could not read its source.
+        let result = Arc::<OnceLock<Rendered>>::default();
+        admission
+            .renders
+            .entry(key.clone())
+            .or_insert_with(|| Arc::clone(&result));
         if admission.running >= self.permits {
-            if admission.waiting >= MAX_WAITING {
-                return Err(busy());
-            }
             admission.waiting += 1;
-            admission.renders.insert(key.clone(), Arc::default());
             admission = self
                 .finished
                 .wait_while(admission, |admission| admission.running >= self.permits)
@@ -228,7 +266,6 @@ impl Renderer {
             admission.waiting -= 1;
         }
         admission.running += 1;
-        let result = Arc::clone(admission.renders.entry(key.clone()).or_default());
         drop(admission);
         let running = Running {
             renderer: self,
@@ -237,7 +274,7 @@ impl Renderer {
         };
         let rendered = render();
         let _ = running.result.set(rendered.clone());
-        rendered
+        rendered.map_err(Failure::into_body)
     }
 }
 
@@ -253,12 +290,18 @@ impl Drop for Running<'_> {
     fn drop(&mut self) {
         let mut admission = self.renderer.admission();
         admission.running -= 1;
-        admission.renders.remove(&self.key);
+        if admission
+            .renders
+            .get(&self.key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.result))
+        {
+            admission.renders.remove(&self.key);
+        }
         // Only lands when the render panicked: its waiters get an answer.
-        let _ = self.result.set(Err(ErrorBody {
+        let _ = self.result.set(Err(Failure::Refused(ErrorBody {
             code: "thumbnail_unavailable".into(),
             message: "the thumbnail render failed".into(),
-        }));
+        })));
         self.renderer.finished.notify_all();
     }
 }
@@ -1030,5 +1073,37 @@ pub(crate) mod tests {
                 assert!(request.join().unwrap().is_ok());
             }
         });
+    }
+
+    #[test]
+    fn a_request_sharing_a_render_reads_its_own_source_when_that_render_could_not() {
+        let renderer = Renderer::new(1);
+        let source = jpeg_of(64, 64);
+        let file = image_file(&"c".repeat(64), "image/jpeg");
+        let (deleted, kept) = std::thread::scope(|scope| {
+            let (renderer, source, file) = (&renderer, &source, &file);
+            let deleted = scope.spawn(move || {
+                let load = || -> io::Result<Vec<u8>> {
+                    wait_until("the kept message's request joins", || {
+                        renderer.admission().waiting == 1
+                    });
+                    Err(io::Error::new(io::ErrorKind::NotFound, "message deleted"))
+                };
+                file_thumbnail_with(renderer, file, 32, load, false)
+            });
+            wait_until("the deleted message's render runs", || {
+                renderer.admission().running == 1
+            });
+            let kept = scope.spawn(move || {
+                file_thumbnail_with(renderer, file, 32, || Ok(source.clone()), false)
+            });
+            (deleted.join().unwrap(), kept.join().unwrap())
+        });
+        let error = deleted.expect_err("the deleted message has no source");
+        assert_eq!(error.code, "gram_file_error", "{error:?}");
+        assert!(kept.is_ok(), "{kept:?}");
+        let admission = renderer.admission();
+        assert_eq!((admission.running, admission.waiting), (0, 0));
+        assert!(admission.renders.is_empty());
     }
 }
