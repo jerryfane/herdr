@@ -227,11 +227,11 @@ fn startup_fence_from_str(content: &str) -> StartupFence {
                 Err(err) => StartupFence::Invalid(format!("invalid [fence]: {err}")),
             },
         },
-        // Unparsable file: whether it asks for a fence is unknown. Treat any line that
-        // could define the `fence` key (in any TOML spelling) as a fence request and
-        // fail closed; a file that never mentions it keeps today's behavior.
+        // Unparsable file: whether it asks for a fence cannot be known exactly, so
+        // fail closed whenever it might. A file that cannot spell the key keeps
+        // today's behavior.
         Err(err) => {
-            if content.lines().any(line_may_define_fence) {
+            if may_spell_fence_key(content) {
                 StartupFence::Invalid(format!("config.toml does not parse: {err}"))
             } else {
                 StartupFence::NotConfigured
@@ -240,20 +240,16 @@ fn startup_fence_from_str(content: &str) -> StartupFence {
     }
 }
 
-/// True when a TOML line could start a table or key whose first key is `fence`:
-/// `[fence]`, `[ fence ]`, `["fence"]`, `['fence']`, `[fence.x]`, `[[fence]]`,
-/// `fence.enabled = …`, `"fence" = {…}`. Over-matching is safe here: it only turns an
-/// already unparsable file into a refused spawn.
-fn line_may_define_fence(line: &str) -> bool {
-    let mut rest = line.trim_start();
-    while let Some(after) = rest.strip_prefix('[') {
-        rest = after.trim_start();
-    }
-    let key = rest
-        .strip_prefix("\"fence\"")
-        .or_else(|| rest.strip_prefix("'fence'"))
-        .or_else(|| rest.strip_prefix("fence"));
-    key.is_some_and(|after| matches!(after.trim_start().chars().next(), Some(']' | '.' | '=')))
+/// True unless `content` provably cannot contain a TOML key that decodes to `fence`.
+///
+/// TOML keys are bare (`fence`), literal (`'fence'`, no escapes) or basic strings
+/// (`"fence"`), and the only escapes in a basic string that can produce a letter are
+/// `\u` and `\U`. Keys are case-sensitive and cannot span lines. So a key spelled
+/// `fence` needs either the literal text `fence` or a `\u`/`\U` escape somewhere in
+/// the file. This over-matches (comments, values) on purpose: it is only consulted
+/// for a file that does not parse, where refusing a spawn is the safe outcome.
+fn may_spell_fence_key(content: &str) -> bool {
+    content.contains("fence") || content.contains("\\u") || content.contains("\\U")
 }
 
 fn current_policy() -> Policy {
@@ -891,7 +887,8 @@ mod tests {
             startup_fence_from_str("[fence]\nenabled = true\n[[broken\n"),
             StartupFence::Invalid(_)
         ));
-        // Every TOML spelling of the fence key, in a file that does not parse.
+        // Every TOML spelling of the fence key, in a file that does not parse,
+        // including unicode escapes in basic-string keys.
         for fence in [
             "[ fence ]\nenabled = true",
             "[\"fence\"]\nenabled = true",
@@ -899,18 +896,27 @@ mod tests {
             "fence.enabled = true",
             "\"fence\".enabled = true",
             "fence = { enabled = true }",
+            "[\"f\\u0065nce\"]\nenabled = true",
+            "\"\\u0066ence\".enabled = true",
+            "\"fenc\\U00000065\" = { enabled = true }",
         ] {
+            // Each spelling really is the fence key when the file parses.
+            let parsed: toml::Table = format!("{fence}\n").parse().expect("valid on its own");
+            assert!(
+                parsed.contains_key("fence"),
+                "{fence:?} should decode to `fence`"
+            );
             let content = format!("{fence}\n[ui]\nsidebar_width = [\n");
             assert!(
                 matches!(startup_fence_from_str(&content), StartupFence::Invalid(_)),
                 "{fence:?} in an unparsable file must fail closed"
             );
         }
-        // An unparsable file that never mentions the fence keeps today's behavior.
+        // An unparsable file that cannot spell the fence key keeps today's behavior.
         for content in [
             "[ui]\nsidebar_width = [\n",
-            "fences = 1\n[[broken\n",
-            "[fencing]\n[[x\n",
+            "[fencing_off]\n[[x\n",
+            "[ui]\nname = \"F\\tE\"\n[[broken\n",
         ] {
             assert!(
                 matches!(startup_fence_from_str(content), StartupFence::NotConfigured),
