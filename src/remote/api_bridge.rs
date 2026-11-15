@@ -483,10 +483,12 @@ fn request_params(line: &[u8]) -> serde_json::Value {
 
 /// `bridge.hello {frames}`: with `frames: true`, every reply written after
 /// this one is framed and interleaved. Framing cannot be turned off again.
+/// The reply is queued without waiting for it to be written, so a hello sent
+/// while output is backed up never holds up a later `bridge.cancel`.
 fn answer_hello(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
     let params = request_params(line);
     let frames = params.get("frames").and_then(serde_json::Value::as_bool) == Some(true);
-    let reply = |frames: bool| {
+    outbox.post_hello(id, frames, |frames| {
         serde_json::json!({
             "id": id,
             "result": {
@@ -498,13 +500,7 @@ fn answer_hello(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
         })
         .to_string()
         .into_bytes()
-    };
-    if frames && !outbox.framed() {
-        outbox.send_switch_to_frames(id, reply(true))
-    } else {
-        outbox.send(None, id, reply(outbox.framed()))
-    }
-    .map(drop)
+    })
 }
 
 /// `bridge.cancel {id}`: stops every unanswered request with that id. Each
@@ -1657,6 +1653,44 @@ mod tests {
             for id in rest {
                 bridge.send(&cancel(&format!("c-{id}"), &id));
             }
+            bridge.finish();
+        }
+    }
+
+    /// A `bridge.hello` sent while stdout is backed up is answered without
+    /// the reader waiting for that reply to be written, so a cancel right
+    /// behind it still ends its request at once. Line mode (a `frames: false`
+    /// hello) and framed mode (a repeated `frames: true` hello).
+    #[test]
+    fn multi_cancel_is_read_behind_a_hello_while_output_is_backed_up() {
+        for framed in [false, true] {
+            let server = FakeApiServer::start("hello-backpressure");
+            let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+            if framed {
+                bridge.send(&hello("h"));
+                bridge.read_line();
+            }
+            for slot in 0..MULTI_MAX_IN_FLIGHT {
+                bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+            }
+            wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+            bridge.send(&request("queued", "agent.wait", 10_000));
+            // Every write now takes a second: stdout is backed up.
+            bridge.set_write_delay(Duration::from_secs(1));
+            bridge.send(&request("extra", "ping", 0));
+            let again = json!({"id": "h2", "method": "bridge.hello", "params": {"frames": framed}});
+            bridge.send(&again.to_string());
+            bridge.send(&cancel("c", "slow0"));
+            assert!(
+                requests_reach(&server, MULTI_MAX_IN_FLIGHT + 1, Duration::from_millis(750)),
+                "cancel not read behind a hello while output was backed up (framed: {framed})"
+            );
+
+            bridge.set_write_delay(Duration::ZERO);
+            for slot in 1..MULTI_MAX_IN_FLIGHT {
+                bridge.send(&cancel(&format!("c{slot}"), &format!("slow{slot}")));
+            }
+            bridge.send(&cancel("cq", "queued"));
             bridge.finish();
         }
     }
