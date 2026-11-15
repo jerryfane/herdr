@@ -446,6 +446,7 @@ mod tests {
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
+                pane_stream_resync: false,
                 compressed_replies: false,
             }),
         }
