@@ -3170,7 +3170,7 @@
           "type": "object"
         },
         "GramGetFileParams": {
-          "description": "`gram.get_file` — legacy one-response download on the local socket. The\nbytes are inline base64 and can be as large as 100 MiB. For a remote relay,\nand for bounded new clients, use `gram.get_file_chunk` instead. Owner (no\ncaller pane) may download any file; an agent may only download one it can see.\n\nWith `thumbnail`, the reply is instead a small JPEG preview of an image\nattachment (`gram_file_thumbnail`), or `thumbnail_unavailable`. Servers\nthat do this advertise `capabilities.gram_thumbnails`; older ones ignore\nthe field and return the whole file (`gram_file_content`).",
+          "description": "`gram.get_file` — legacy one-response download on the local socket. The\nbytes are inline base64 and can be as large as 100 MiB. For a remote relay,\nand for bounded new clients, use `gram.get_file_chunk` instead. Owner (no\ncaller pane) may download any file; an agent may only download one it can see.\n\nWith `thumbnail`, the reply is instead a small JPEG preview of an image\nattachment (`gram_file_thumbnail`), `thumbnail_unavailable`, or `busy`\nwhile too many previews wait to render (retry shortly). Servers that do\nthis advertise `capabilities.gram_thumbnails`; older ones ignore the field\nand return the whole file (`gram_file_content`).",
           "properties": {
             "caller_pane_id": {
               "type": [

@@ -4,15 +4,18 @@
 //!
 //! JPEG and PNG sources are decoded (by content, not by the advisory MIME
 //! type), scaled down by area averaging so the longer edge is at most
-//! `max_px`, turned upright from the JPEG's EXIF orientation, and encoded as a
-//! baseline JPEG. Transparency is composited over white. Anything else (HEIC,
-//! GIF, WebP, a damaged file, an image over [`MAX_SOURCE_PIXELS`]) has no
-//! thumbnail; the caller says so and the client falls back to the full file.
-//! Decoding holds the whole source image in memory, so rendering is serialized
-//! (see [`render`]).
+//! `max_px`, turned upright from their EXIF orientation (a JPEG's APP1, a
+//! PNG's `eXIf`), and encoded as a baseline JPEG. Transparency is composited
+//! over white. Anything else (HEIC, GIF, WebP, a damaged file, an image over
+//! [`MAX_SOURCE_PIXELS`]) has no thumbnail; the caller says so and the client
+//! falls back to the full file. A render holds the whole source file and
+//! image in memory, so at most [`RENDER_PERMITS`] run at once, at most
+//! [`MAX_WAITING`] requests wait, and a request for a preview already being
+//! rendered waits for that render instead of reading the file again.
 
+use std::collections::BTreeMap;
 use std::io::{self, Cursor};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use base64::Engine as _;
 use zune_jpeg::zune_core::bytestream::ZCursor;
@@ -46,20 +49,24 @@ pub struct Thumbnail {
     pub jpeg: Vec<u8>,
 }
 
-/// One decode at a time: each holds a full-size source image.
-static RENDERING: Mutex<()> = Mutex::new(());
+/// Renders that may hold a source file at once. Each holds the whole
+/// attachment (up to 100 MiB) and, while decoding, up to 200 MB of pixels.
+pub const RENDER_PERMITS: usize = 1;
+
+/// Requests that may wait for a render, their own or one of the same preview
+/// already under way. One more answers `busy`.
+pub const MAX_WAITING: usize = 16;
+
+static RENDERER: Renderer = Renderer::new(RENDER_PERMITS);
 
 /// Renders `source` (a whole image file) as a JPEG whose longer edge is at
 /// most `max_px`. A smaller image keeps its size. `Err` says why there is no
 /// thumbnail.
 pub fn render(source: &[u8], max_px: u32) -> Result<Thumbnail, String> {
-    let _one_at_a_time = RENDERING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (image, orientation) = if source.starts_with(JPEG_MAGIC) {
         decode_jpeg(source, max_px)?
     } else if source.starts_with(PNG_MAGIC) {
-        (decode_png(source, max_px)?, 1)
+        (decode_png(source, max_px)?, png_orientation(source))
     } else {
         return Err("only JPEG and PNG images have thumbnails".into());
     };
@@ -74,25 +81,27 @@ pub fn render(source: &[u8], max_px: u32) -> Result<Thumbnail, String> {
 
 /// The `gram.get_file {thumbnail}` result for the attachment `file`: its
 /// cached preview at `max_px` (clamped to [`MIN_MAX_PX`]..=[`MAX_MAX_PX`]),
-/// or one rendered from the bytes `load` returns. `cache` keeps a rendered
-/// preview for next time. Errors are `thumbnail_unavailable` (the attachment
-/// has no preview; fetch the file) or `gram_file_error`.
-pub(crate) fn file_thumbnail(
+/// or one rendered from the bytes `load` returns, read only once the render
+/// is admitted. `cache` keeps a rendered preview for next time. Errors are
+/// `thumbnail_unavailable` (the attachment has no preview; fetch the file),
+/// `busy` (too many renders wait; retry) or `gram_file_error`.
+pub(crate) fn file_thumbnail<S: AsRef<[u8]>>(
     file: &GramFile,
     max_px: u32,
-    load: impl FnOnce() -> io::Result<Vec<u8>>,
+    load: impl FnOnce() -> io::Result<S>,
+    cache: bool,
+) -> Result<ResponseResult, ErrorBody> {
+    file_thumbnail_with(&RENDERER, file, max_px, load, cache)
+}
+
+fn file_thumbnail_with<S: AsRef<[u8]>>(
+    renderer: &Renderer,
+    file: &GramFile,
+    max_px: u32,
+    load: impl FnOnce() -> io::Result<S>,
     cache: bool,
 ) -> Result<ResponseResult, ErrorBody> {
     let max_px = max_px.clamp(MIN_MAX_PX, MAX_MAX_PX);
-    let unavailable = |message: String| ErrorBody {
-        code: "thumbnail_unavailable".into(),
-        message,
-    };
-    // The MIME type is advisory, but it spares reading a large file that is
-    // not meant as an image at all.
-    if !file.mime.starts_with("image/") {
-        return Err(unavailable(format!("{} is not an image", file.mime)));
-    }
     let cached = cache
         .then(|| crate::persist::gram_thumbs::get(&file.sha256, max_px))
         .flatten()
@@ -106,17 +115,27 @@ pub(crate) fn file_thumbnail(
         });
     let thumbnail = match cached {
         Some(thumbnail) => thumbnail,
-        None => {
+        None => renderer.run((file.sha256.clone(), max_px), || {
+            // Taken before the read: once the attachment is deleted, what
+            // this render read can no longer be cached.
+            let lease = cache.then(|| crate::persist::gram_thumbs::lease(&file.sha256));
             let source = load().map_err(|err| ErrorBody {
                 code: "gram_file_error".into(),
                 message: format!("failed to read file: {err}"),
             })?;
-            let thumbnail = render(&source, max_px).map_err(unavailable)?;
-            if cache {
-                crate::persist::gram_thumbs::put(&file.sha256, max_px, &thumbnail.jpeg);
+            let rendered = render(source.as_ref(), max_px);
+            // Freed before the permit, so the next render's read never
+            // overlaps it.
+            drop(source);
+            let thumbnail = rendered.map_err(|message| ErrorBody {
+                code: "thumbnail_unavailable".into(),
+                message,
+            })?;
+            if let Some(lease) = lease {
+                lease.put(max_px, &thumbnail.jpeg);
             }
-            thumbnail
-        }
+            Ok(thumbnail)
+        })?,
     };
     Ok(ResponseResult::GramFileThumbnail {
         name: file.name.clone(),
@@ -128,6 +147,120 @@ pub(crate) fn file_thumbnail(
         thumbnail_size: thumbnail.jpeg.len() as u64,
         data_base64: base64::engine::general_purpose::STANDARD.encode(&thumbnail.jpeg),
     })
+}
+
+fn busy() -> ErrorBody {
+    ErrorBody {
+        code: "busy".into(),
+        message: "too many thumbnails are waiting to render; retry shortly".into(),
+    }
+}
+
+type Rendered = Result<Thumbnail, ErrorBody>;
+
+/// Admission to rendering: `permits` renders at once, [`MAX_WAITING`]
+/// requests waiting, and one render per preview.
+struct Renderer {
+    permits: usize,
+    admission: Mutex<Admission>,
+    /// Signalled when a render finishes.
+    finished: Condvar,
+}
+
+struct Admission {
+    running: usize,
+    waiting: usize,
+    /// Renders running or waiting for a permit, by `(sha256, max_px)`, each
+    /// with its result once it has one.
+    renders: BTreeMap<(String, u32), Arc<OnceLock<Rendered>>>,
+}
+
+impl Renderer {
+    const fn new(permits: usize) -> Self {
+        Self {
+            permits,
+            admission: Mutex::new(Admission {
+                running: 0,
+                waiting: 0,
+                renders: BTreeMap::new(),
+            }),
+            finished: Condvar::new(),
+        }
+    }
+
+    fn admission(&self) -> MutexGuard<'_, Admission> {
+        self.admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The preview `key` names: the result of its render already under way,
+    /// or of `render` once a permit is free. `busy`, without waiting, when
+    /// [`MAX_WAITING`] requests already wait.
+    fn run(&self, key: (String, u32), render: impl FnOnce() -> Rendered) -> Rendered {
+        let mut admission = self.admission();
+        if let Some(result) = admission.renders.get(&key).cloned() {
+            if admission.waiting >= MAX_WAITING {
+                return Err(busy());
+            }
+            admission.waiting += 1;
+            loop {
+                if let Some(rendered) = result.get() {
+                    admission.waiting -= 1;
+                    return rendered.clone();
+                }
+                admission = self
+                    .finished
+                    .wait(admission)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        if admission.running >= self.permits {
+            if admission.waiting >= MAX_WAITING {
+                return Err(busy());
+            }
+            admission.waiting += 1;
+            admission.renders.insert(key.clone(), Arc::default());
+            admission = self
+                .finished
+                .wait_while(admission, |admission| admission.running >= self.permits)
+                .unwrap_or_else(PoisonError::into_inner);
+            admission.waiting -= 1;
+        }
+        admission.running += 1;
+        let result = Arc::clone(admission.renders.entry(key.clone()).or_default());
+        drop(admission);
+        let running = Running {
+            renderer: self,
+            key,
+            result,
+        };
+        let rendered = render();
+        let _ = running.result.set(rendered.clone());
+        rendered
+    }
+}
+
+/// A render holding a permit, which it gives back when dropped, also when
+/// the render panicked.
+struct Running<'a> {
+    renderer: &'a Renderer,
+    key: (String, u32),
+    result: Arc<OnceLock<Rendered>>,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let mut admission = self.renderer.admission();
+        admission.running -= 1;
+        admission.renders.remove(&self.key);
+        // Only lands when the render panicked: its waiters get an answer.
+        let _ = self.result.set(Err(ErrorBody {
+            code: "thumbnail_unavailable".into(),
+            message: "the thumbnail render failed".into(),
+        }));
+        self.renderer.finished.notify_all();
+    }
 }
 
 /// The pixel size of a JPEG this module wrote, read from its header.
@@ -159,7 +292,12 @@ fn check_size(width: u64, height: u64) -> Result<(), String> {
 }
 
 fn decode_jpeg(source: &[u8], max_px: u32) -> Result<(Rgb, u8), String> {
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    // Only the pixel count is limited (`check_size`), not either edge: the
+    // decoder's default 16384 would refuse a 20000x2000 panorama.
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX));
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(source), options);
     decoder
         .decode_headers()
@@ -288,6 +426,26 @@ fn downscale(
     }
 }
 
+/// The EXIF orientation in a PNG's `eXIf` chunk, 1 without one. Every chunk
+/// up to `IEND` is looked at, since writers put `eXIf` before or after the
+/// image data.
+fn png_orientation(png: &[u8]) -> u8 {
+    let mut at = PNG_MAGIC.len();
+    while let Some(header) = png.get(at..at + 8) {
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let Some(data) = png.get(at + 8..).and_then(|rest| rest.get(..len)) else {
+            break;
+        };
+        match &header[4..] {
+            b"eXIf" => return exif_orientation(data),
+            b"IEND" => break,
+            // Length, type, data, CRC.
+            _ => at += 8 + len + 4,
+        }
+    }
+    1
+}
+
 /// EXIF orientation (tag 0x0112 in IFD0), 1 when absent or unreadable.
 /// `exif` starts at the TIFF header (optionally behind `Exif\0\0`).
 fn exif_orientation(exif: &[u8]) -> u8 {
@@ -381,6 +539,7 @@ fn encode_jpeg(image: &Rgb) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A `width`x`height` RGB image: the left half red, the right half blue.
     pub(crate) fn split_rgb(width: u32, height: u32) -> Vec<u8> {
@@ -631,5 +790,245 @@ pub(crate) mod tests {
         assert_eq!(target_size(1170, 2532, 512), (237, 512));
         assert_eq!(target_size(10000, 3, 100), (100, 1));
         assert_eq!(target_size(300, 200, 512), (300, 200));
+    }
+
+    /// A baseline grayscale JPEG of `width`x`height`, mid-gray: every 8x8
+    /// block is DC-only, two zero bits under one-code Huffman tables. Cheap
+    /// at any size, where encoding a real image of 40 MP takes seconds.
+    fn gray_jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        // DQT: table 0, all ones.
+        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        jpeg.extend_from_slice(&[1; 64]);
+        // SOF0: 8-bit, one component (id 1, 1x1 sampling, table 0).
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+        jpeg.extend_from_slice(&height.to_be_bytes());
+        jpeg.extend_from_slice(&width.to_be_bytes());
+        jpeg.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        // DHT: DC table 0, then AC table 0, each one 1-bit code for symbol 0
+        // (DC difference 0; end of block).
+        for class in [0x00, 0x10] {
+            jpeg.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class, 1]);
+            jpeg.extend_from_slice(&[0; 16]);
+        }
+        // SOS: the one component, tables 0 and 0, coefficients 0..=63.
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        let blocks = usize::from(width).div_ceil(8) * usize::from(height).div_ceil(8);
+        jpeg.resize(jpeg.len() + (blocks * 2).div_ceil(8), 0);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    #[test]
+    fn a_panorama_wider_than_16384_px_renders_under_the_pixel_limit() {
+        let thumbnail = render(&gray_jpeg(20_000, 2_000), 256).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (256, 26));
+        let image = decode(&thumbnail.jpeg);
+        assert!(near(pixel(&image, 128, 13), [128, 128, 128]));
+        // 52 MP: refused from the header, before decoding.
+        let err = render(&gray_jpeg(20_000, 2_600), 256).unwrap_err();
+        assert!(err.contains("50000000-pixel thumbnail limit"), "{err}");
+    }
+
+    #[test]
+    fn a_png_turned_by_its_exif_comes_out_upright() {
+        // Stored 200x100 (red left, blue right), its eXIf chunk saying
+        // orientation 6: rotate 90 degrees clockwise, so red ends up on top.
+        let (width, height) = (200, 100);
+        let mut source = Vec::new();
+        let mut encoder = png::Encoder::new(&mut source, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_chunk(png::chunk::eXIf, &exif(true, 6))
+            .unwrap();
+        writer.write_image_data(&split_rgb(width, height)).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(png_orientation(&source), 6);
+        let thumbnail = render(&source, 100).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (50, 100));
+        let image = decode(&thumbnail.jpeg);
+        assert!(
+            near(pixel(&image, 25, 10), [255, 0, 0]),
+            "{:?}",
+            pixel(&image, 25, 10)
+        );
+        assert!(
+            near(pixel(&image, 25, 90), [0, 0, 255]),
+            "{:?}",
+            pixel(&image, 25, 90)
+        );
+        // No eXIf, or a damaged chunk list: as stored.
+        assert_eq!(
+            png_orientation(&png_of(2, 2, png::ColorType::Grayscale, &[0; 4])),
+            1
+        );
+        assert_eq!(png_orientation(&source[..40]), 1);
+    }
+
+    fn image_file(sha256: &str, mime: &str) -> GramFile {
+        GramFile {
+            name: "image".into(),
+            size: 0,
+            mime: mime.into(),
+            sha256: sha256.into(),
+        }
+    }
+
+    #[test]
+    fn an_image_is_known_by_its_content_not_its_mime() {
+        let renderer = Renderer::new(1);
+        let png = png_of(64, 32, png::ColorType::Rgb, &split_rgb(64, 32));
+        for (kind, source) in [("JPEG", jpeg_of(64, 32)), ("PNG", png)] {
+            for mime in ["", "application/octet-stream"] {
+                let file = image_file(&"a".repeat(64), mime);
+                let reply = file_thumbnail_with(&renderer, &file, 32, || Ok(source.clone()), false);
+                assert!(
+                    matches!(
+                        reply,
+                        Ok(ResponseResult::GramFileThumbnail {
+                            width: 32,
+                            height: 16,
+                            ..
+                        })
+                    ),
+                    "{kind} as {mime:?}: {reply:?}"
+                );
+            }
+        }
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Source bytes that count how many are alive.
+    struct Counted {
+        bytes: Vec<u8>,
+        alive: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cold_requests_hold_no_more_sources_than_permits() {
+        let renderer = Renderer::new(2);
+        let source = jpeg_of(64, 64);
+        let alive = Arc::new(AtomicUsize::new(0));
+        let most = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let (renderer, source, alive, most) = (&renderer, &source, &alive, &most);
+                scope.spawn(move || {
+                    let load = || {
+                        let now = alive.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        // Long enough for every other request to come in.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok(Counted {
+                            bytes: source.clone(),
+                            alive: Arc::clone(alive),
+                        })
+                    };
+                    let file = image_file(&format!("{n:064}"), "image/jpeg");
+                    let reply = file_thumbnail_with(renderer, &file, 32, load, false);
+                    assert!(reply.is_ok(), "{reply:?}");
+                });
+            }
+        });
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
+        let most = most.load(Ordering::SeqCst);
+        assert!(most <= 2, "{most} sources held at once");
+    }
+
+    #[test]
+    fn requests_for_one_preview_share_one_render() {
+        let renderer = Renderer::new(1);
+        let source = jpeg_of(64, 64);
+        let loads = AtomicUsize::new(0);
+        let others = 5;
+        let replies: Vec<_> = std::thread::scope(|scope| {
+            let (renderer, source, loads) = (&renderer, &source, &loads);
+            let requests: Vec<_> = (0..=others)
+                .map(|_| {
+                    scope.spawn(move || {
+                        let load = || {
+                            if loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                wait_until("the other requests wait", || {
+                                    renderer.admission().waiting == others
+                                });
+                            }
+                            Ok(source.clone())
+                        };
+                        let file = image_file(&"b".repeat(64), "image/jpeg");
+                        file_thumbnail_with(renderer, &file, 32, load, false)
+                    })
+                })
+                .collect();
+            requests
+                .into_iter()
+                .map(|request| request.join().unwrap())
+                .collect()
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(replies[0].is_ok(), "{:?}", replies[0]);
+        assert!(replies.iter().all(|reply| *reply == replies[0]));
+    }
+
+    #[test]
+    fn requests_past_the_waiting_limit_are_busy() {
+        let renderer = Renderer::new(1);
+        let source = jpeg_of(64, 64);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let request = |key: String| {
+            let load = || {
+                // Until the sender is dropped.
+                let _ = released.lock().unwrap().recv();
+                Ok(source.clone())
+            };
+            file_thumbnail_with(&renderer, &image_file(&key, "image/jpeg"), 32, load, false)
+        };
+        let refused = |key: String| {
+            let load = || -> io::Result<Vec<u8>> { panic!("a refused request reads nothing") };
+            file_thumbnail_with(&renderer, &image_file(&key, "image/jpeg"), 32, load, false)
+        };
+        std::thread::scope(|scope| {
+            // Owned here, so a failed assertion releases the renders too and
+            // the scope can join them.
+            let release = release;
+            let running = scope.spawn(|| request("running".into()));
+            wait_until("one render runs", || renderer.admission().running == 1);
+            let waiting: Vec<_> = (0..MAX_WAITING)
+                .map(|n| scope.spawn(move || request(format!("waiting-{n}"))))
+                .collect();
+            wait_until("the queue fills", || {
+                renderer.admission().waiting == MAX_WAITING
+            });
+            for key in ["one more", "running"] {
+                let reply = refused(key.into());
+                assert_eq!(reply.unwrap_err().code, "busy", "{key}");
+            }
+            drop(release);
+            assert!(running.join().unwrap().is_ok());
+            for request in waiting {
+                assert!(request.join().unwrap().is_ok());
+            }
+        });
     }
 }

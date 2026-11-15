@@ -219,9 +219,10 @@ pub struct GramUploadStreamParams {
 /// caller pane) may download any file; an agent may only download one it can see.
 ///
 /// With `thumbnail`, the reply is instead a small JPEG preview of an image
-/// attachment (`gram_file_thumbnail`), or `thumbnail_unavailable`. Servers
-/// that do this advertise `capabilities.gram_thumbnails`; older ones ignore
-/// the field and return the whole file (`gram_file_content`).
+/// attachment (`gram_file_thumbnail`), `thumbnail_unavailable`, or `busy`
+/// while too many previews wait to render (retry shortly). Servers that do
+/// this advertise `capabilities.gram_thumbnails`; older ones ignore the field
+/// and return the whole file (`gram_file_content`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramGetFileParams {
     pub id: String,

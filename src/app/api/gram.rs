@@ -2092,7 +2092,7 @@ mod tests {
             "gram_file_error"
         );
         // An out-of-range size is clamped, onto the cached 16 px minimum here.
-        crate::persist::gram_thumbs::put(&sha256, 16, &jpeg);
+        crate::persist::gram_thumbs::lease(&sha256).put(16, &jpeg);
         assert_eq!(
             thumbnail(&mut app, &message_id, 1)["result"]["type"],
             "gram_file_thumbnail"
@@ -2109,6 +2109,28 @@ mod tests {
             serde_json::from_value(serde_json::json!({"id": message_id})).unwrap(),
         );
         assert!(deleted.contains("\"ok\""), "{deleted}");
+        assert!(!cached.exists(), "a deleted image leaves no preview behind");
+
+        // Deleted while its preview renders: the render read the image first
+        // and still answers, but leaves no preview behind.
+        let message = post(&mut app, "up-again", &photo, "photo.jpg", "image/jpeg");
+        let message_id = message["id"].as_str().unwrap().to_string();
+        let file = crate::persist::gram::load()
+            .into_iter()
+            .find(|item| item.id == message_id)
+            .and_then(|item| item.file)
+            .unwrap();
+        let load = || {
+            let bytes = crate::persist::gram_files::read_message_file(&message_id, &file.name);
+            let deleted = app.handle_gram_delete(
+                "d".into(),
+                serde_json::from_value(serde_json::json!({"id": message_id})).unwrap(),
+            );
+            assert!(deleted.contains("\"ok\""), "{deleted}");
+            bytes
+        };
+        let reply = crate::gram_thumbnail::file_thumbnail(&file, 256, load, true);
+        assert!(reply.is_ok(), "{reply:?}");
         assert!(!cached.exists(), "a deleted image leaves no preview behind");
 
         for (key, prev) in [
