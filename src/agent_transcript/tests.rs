@@ -203,8 +203,25 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         before: before.map(str::to_owned),
         after: after.map(str::to_owned),
         limit,
+        max_bytes: None,
         subagent: None,
     }
+}
+
+fn budget_page(session: &Fixture, before: Option<&str>, max_bytes: u32) -> Page {
+    read_page(
+        &session.path,
+        &PageRequest {
+            before: before.map(str::to_owned),
+            max_bytes: Some(max_bytes),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap()
+}
+
+fn entries_json_len(entries: &[TranscriptEntry]) -> usize {
+    serde_json::to_string(entries).unwrap().len()
 }
 
 fn read_err(path: &Path, before: Option<&str>, after: Option<&str>) -> &'static str {
@@ -1088,6 +1105,207 @@ fn a_turn_longer_than_the_page_budget_is_split_mid_turn() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), all.len(), "no entry appears on both pages");
+}
+
+/// A turn with a big reply (an omp turn can be 130 KB) and small turns
+/// around it: a newest page by bytes shows only what fits.
+fn session_with_a_big_turn(tag: &str) -> Fixture {
+    let mut session = numbered_session(tag, 3);
+    session.user("big question");
+    session.assistant(vec![text(&"x".repeat(40_000))], "stop");
+    for turn in 5..=6 {
+        session.user(&format!("question {turn}"));
+        session.assistant(vec![text(&format!("answer {turn}"))], "stop");
+    }
+    session
+}
+
+#[test]
+fn max_bytes_keeps_only_the_newest_entries_that_fit() {
+    let session = session_with_a_big_turn("max-bytes");
+    let whole = session.newest();
+    assert!(entries_json_len(&whole.entries) > 40_000);
+
+    let page = budget_page(&session, None, 2_000);
+    assert!(
+        entries_json_len(&page.entries) <= 2_000,
+        "{:?}",
+        page.entries
+    );
+    assert_eq!(user_texts(&page.entries), vec!["question 5", "question 6"]);
+    assert_eq!(kinds(&page.entries).last(), Some(&"turn_end"));
+
+    // The older pages, by bytes too, walk back without gaps or overlap; the
+    // big reply comes alone, over budget, since a record is never split.
+    let mut all = page.entries.clone();
+    let mut before = page.before.clone();
+    let mut pages = 1;
+    while let Some(cursor) = before {
+        let older = budget_page(&session, Some(&cursor), 2_000);
+        assert!(!older.entries.is_empty());
+        let mut joined = older.entries.clone();
+        joined.extend(all);
+        all = joined;
+        before = older.before;
+        pages += 1;
+    }
+    assert!(pages >= 3, "{pages}");
+    assert_eq!(all, session.page(None, None, Some(50)).entries);
+}
+
+#[test]
+fn max_bytes_keeps_one_record_even_when_it_alone_is_over() {
+    let mut session = numbered_session("max-bytes-one", 1);
+    session.user("big question");
+    session.assistant(vec![text(&"x".repeat(10_000))], "stop");
+    let page = budget_page(&session, None, 100);
+    assert_eq!(kinds(&page.entries), vec!["reply", "turn_end"]);
+    assert!(page.before.is_some());
+}
+
+#[test]
+fn max_bytes_is_ignored_on_after_pages_and_large_budgets_change_nothing() {
+    let session = session_with_a_big_turn("max-bytes-after");
+    let whole = session.newest();
+    assert_eq!(budget_page(&session, None, 1_000_000), whole);
+
+    let page = budget_page(&session, None, 2_000);
+    let after = read_page(
+        &session.path,
+        &PageRequest {
+            after: Some(page.after.clone()),
+            max_bytes: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(after.entries.is_empty());
+    assert_eq!(after.after, page.after);
+}
+
+/// Walks a session back by `max_bytes` pages, oldest entry first.
+fn walk_budget_pages(session: &Fixture, max_bytes: u32, others: &[OtherPrompt]) -> Vec<Page> {
+    let mut pages = Vec::new();
+    let mut before = None;
+    loop {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                before,
+                max_bytes: Some(max_bytes),
+                other_prompts: others.to_vec(),
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        before = page.before.clone();
+        pages.push(page);
+        if before.is_none() {
+            break;
+        }
+    }
+    pages.reverse();
+    pages
+}
+
+/// The budget covers the entries array as sent: origins marked, brackets and
+/// commas counted. Every record here renders one entry, so only a page of
+/// one entry may go over.
+#[test]
+fn max_bytes_budgets_the_final_array_with_origins_and_delimiters() {
+    let mut session = Fixture::new("max-bytes-final");
+    let first_at = session.ms(session.next + 1);
+    session.user("first automation prompt");
+    let second_at = session.ms(session.next + 1);
+    session.user("second automation prompt");
+    session.user("an owner prompt");
+    let others = vec![
+        OtherPrompt::new("first automation prompt", first_at),
+        OtherPrompt::new("second automation prompt", second_at),
+    ];
+    for prompts in [Vec::new(), others] {
+        for max_bytes in 2..400 {
+            for page in walk_budget_pages(&session, max_bytes, &prompts) {
+                let len = entries_json_len(&page.entries);
+                assert!(
+                    len <= max_bytes as usize || page.entries.len() == 1,
+                    "{len} bytes over a budget of {max_bytes}: {:?}",
+                    page.entries
+                );
+            }
+        }
+    }
+}
+
+fn todo_update(session: &mut Fixture, call_id: &str, status: &str, padding: usize) {
+    session.assistant(vec![call(call_id, "todo", None, json!({}))], "toolUse");
+    session.result(
+        call_id,
+        "todo",
+        false,
+        json!({"phases": [{"name": "p", "tasks": [
+            {"content": "a", "status": status},
+            {"content": "x".repeat(padding), "status": "pending"},
+        ]}]}),
+    );
+}
+
+/// A turn's plan keeps one place across byte pages: walking back gives the
+/// unbudgeted sequence, every entry once.
+#[test]
+fn max_bytes_pages_keep_each_plan_in_one_place() {
+    let mut session = Fixture::new("max-bytes-plan");
+    session.user("plan it");
+    todo_update(&mut session, "t1", "in_progress", 0);
+    session.assistant(vec![text(&"r".repeat(1_000))], "toolUse");
+    todo_update(&mut session, "t2", "completed", 0);
+    let whole = session.newest().entries;
+
+    let walked: Vec<TranscriptEntry> = walk_budget_pages(&session, 300, &[])
+        .into_iter()
+        .flat_map(|page| page.entries)
+        .collect();
+    let walked_ids = ids(&walked);
+    let unique: HashSet<_> = walked_ids.iter().collect();
+    assert_eq!(unique.len(), walked_ids.len(), "{walked_ids:?}");
+    assert_eq!(walked, whole);
+}
+
+/// Sizing renders each record once: a page over many todo updates of a big
+/// plan renders no record twice, not a re-render per trimmed record.
+#[test]
+fn max_bytes_sizes_a_long_plan_turn_in_one_pass() {
+    let mut session = Fixture::new("max-bytes-many-todos");
+    session.user("long plan");
+    let updates = 50;
+    for update in 0..updates {
+        todo_update(&mut session, &format!("t{update}"), "in_progress", 2_000);
+    }
+    let records = 1 + 2 * updates;
+    RECORD_RENDERS.with(|renders| renders.set(0));
+    let page = budget_page(&session, None, 300);
+    let renders = RECORD_RENDERS.with(|renders| renders.get());
+    assert!(!page.entries.is_empty());
+    assert!(
+        renders <= records,
+        "{renders} record renders for a session of {records} records"
+    );
+}
+
+/// An empty active branch gives an empty page under a budget too: a
+/// zero-byte file, a header-only session, and a session just after a reset.
+#[test]
+fn max_bytes_on_an_empty_branch_is_an_empty_page() {
+    let empty = Fixture::new("max-bytes-zero-byte");
+    std::fs::write(&empty.path, "").unwrap();
+    let header_only = Fixture::new("max-bytes-header-only");
+    let mut reset = Fixture::new("max-bytes-after-reset");
+    reset.user("before the reset");
+    reset.push(json!({"type": "reset_boundary"}));
+    for session in [&empty, &header_only, &reset] {
+        let page = budget_page(session, None, 300);
+        assert!(page.entries.is_empty(), "{:?}", page.entries);
+    }
 }
 
 #[test]

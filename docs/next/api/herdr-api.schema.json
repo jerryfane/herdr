@@ -2216,6 +2216,15 @@
                 "null"
               ]
             },
+            "max_bytes": {
+              "description": "Byte budget for a newest or `before` page: the page keeps only its\nnewest entries whose JSON fits, and at least one record's entries.\nIts `before` cursor pages the rest. Honoured by servers that\nadvertise `capabilities.transcript_max_bytes`; older ones ignore it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "subagent": {
               "type": [
                 "string",
@@ -18795,6 +18804,11 @@
             "surface_interest": {
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
+              "type": "boolean"
+            },
+            "transcript_max_bytes": {
+              "default": false,
+              "description": "`agent.transcript` honours `max_bytes`: a newest or `before` page keeps\nonly its newest entries whose JSON fits. Older servers ignore the param\nand page by turns alone.",
               "type": "boolean"
             },
             "turn_origin": {
