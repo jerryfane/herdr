@@ -2411,14 +2411,13 @@ fn an_after_page_resends_marked_entries_only_from_the_clients_window() {
     let held_at = session.ms(session.next + 1);
     session.user("guest: held question");
     session.assistant(vec![text("held answer")], "stop");
-    let request = |after: Option<&str>, limit: Option<u32>, prompts: Vec<OtherPrompt>| {
-        PageRequest {
+    let request =
+        |after: Option<&str>, limit: Option<u32>, prompts: Vec<OtherPrompt>| PageRequest {
             after: after.map(str::to_owned),
             limit,
             other_prompts: prompts,
             ..PageRequest::default()
-        }
-    };
+        };
     let served = vec![OtherPrompt::new("guest: old question", old_at)];
     let first = read_page(&session.path, &request(None, Some(1), served)).unwrap();
     assert_eq!(
@@ -2434,8 +2433,11 @@ fn an_after_page_resends_marked_entries_only_from_the_clients_window() {
         OtherPrompt::new("guest: held question", held_at),
         OtherPrompt::new("guest: new question", new_at),
     ];
-    let next = read_page(&session.path, &request(Some(&first.after), None, delivered.clone()))
-        .unwrap();
+    let next = read_page(
+        &session.path,
+        &request(Some(&first.after), None, delivered.clone()),
+    )
+    .unwrap();
     assert_eq!(
         user_origins(&next),
         vec![

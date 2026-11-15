@@ -584,46 +584,44 @@ impl View<'_> {
     ) -> Result<Page, TranscriptError> {
         let session_id = self.session_id().to_owned();
         let origins = origin::fingerprint(other_prompts);
-        let (start, end, changed_since, served_origins, served_floor) = match (
-            &request.before,
-            &request.after,
-        ) {
-            (Some(token), _) => {
-                let Cursor::Before { record, id } = Cursor::decode(token, &session_id)? else {
-                    return Err(TranscriptError::CursorExpired);
-                };
-                let end = self
-                    .valid_record(record, &id)
-                    .and_then(|record| self.position_of(record))
-                    .ok_or(TranscriptError::CursorExpired)?;
-                (self.page_start(end, limit), end, None, None, None)
-            }
-            (None, Some(token)) => {
-                let Cursor::After {
-                    seen,
-                    tip,
-                    origins,
-                    floor,
-                } = Cursor::decode(token, &session_id)?
-                else {
-                    return Err(TranscriptError::CursorExpired);
-                };
-                if seen as usize > self.index.records.len() {
-                    return Err(TranscriptError::CursorExpired);
-                }
-                if let Some((tip, id)) = tip {
-                    self.valid_record(tip, &id)
+        let (start, end, changed_since, served_origins, served_floor) =
+            match (&request.before, &request.after) {
+                (Some(token), _) => {
+                    let Cursor::Before { record, id } = Cursor::decode(token, &session_id)? else {
+                        return Err(TranscriptError::CursorExpired);
+                    };
+                    let end = self
+                        .valid_record(record, &id)
                         .and_then(|record| self.position_of(record))
                         .ok_or(TranscriptError::CursorExpired)?;
+                    (self.page_start(end, limit), end, None, None, None)
                 }
-                let start = self.branch.partition_point(|&record| record < seen);
-                (start, self.budget_end(start), Some(seen), origins, floor)
-            }
-            (None, None) => {
-                let end = self.branch.len();
-                (self.page_start(end, limit), end, None, None, None)
-            }
-        };
+                (None, Some(token)) => {
+                    let Cursor::After {
+                        seen,
+                        tip,
+                        origins,
+                        floor,
+                    } = Cursor::decode(token, &session_id)?
+                    else {
+                        return Err(TranscriptError::CursorExpired);
+                    };
+                    if seen as usize > self.index.records.len() {
+                        return Err(TranscriptError::CursorExpired);
+                    }
+                    if let Some((tip, id)) = tip {
+                        self.valid_record(tip, &id)
+                            .and_then(|record| self.position_of(record))
+                            .ok_or(TranscriptError::CursorExpired)?;
+                    }
+                    let start = self.branch.partition_point(|&record| record < seen);
+                    (start, self.budget_end(start), Some(seen), origins, floor)
+                }
+                (None, None) => {
+                    let end = self.branch.len();
+                    (self.page_start(end, limit), end, None, None, None)
+                }
+            };
         let mut entries = Vec::new();
         // The prompts this client was served with changed (a prompt was
         // delivered, or one was forgotten): re-send, under the same ids, every
