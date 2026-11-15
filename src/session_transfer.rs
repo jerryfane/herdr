@@ -6448,6 +6448,7 @@ mod tests {
         let read = read_destination_transcript(HarnessKind::Codex, &root, &path, &expect)
             .expect("metadata sized by the target's own configuration must not be refused");
         assert_eq!(read.messages, expect);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-8 (the other half): the retention budget still binds.
@@ -6476,6 +6477,7 @@ mod tests {
                 if limit == DESTINATION_RECORD_BUDGET_BYTES),
             "expected a LineTooLarge naming the retention budget, got {err}"
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-9: a target named before the response survives the failure.
@@ -6666,6 +6668,7 @@ mod tests {
                 if limit == DESTINATION_RECORD_BUDGET_BYTES),
             "expected the production record budget, got {err}"
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-10: the total budget admits a modelled worst-case expansion.
@@ -6749,6 +6752,7 @@ mod tests {
             16 * TRANSFER_WINDOW_BYTES,
             "the total budget is a stated multiple of the window, not an inferred one"
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-9: the MAIN pass enforces the record budget on its own.
@@ -6785,6 +6789,7 @@ mod tests {
             matches!(err, TransferError::LineTooLarge { limit, .. } if limit == budget),
             "expected LineTooLarge naming the record budget, got {err}"
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-9: the CODEX PRE-PASS enforces the same budget.
@@ -6822,6 +6827,7 @@ mod tests {
             matches!(err, TransferError::LineTooLarge { limit, .. } if limit == budget),
             "expected LineTooLarge naming the record budget, got {err}"
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-9: TOTAL work is bounded, not just each record.
@@ -6886,6 +6892,7 @@ mod tests {
                 "expected DestinationTooLarge for {name}, got {err}"
             );
         }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-9: an EXACTLY budget-sized record is accepted by the real reader.
@@ -6911,6 +6918,7 @@ mod tests {
             .expect("a record of exactly the limit must be accepted");
         assert_eq!(read, limit + 1, "the delimiter is read but not counted");
         assert_eq!(content_len(&raw), limit);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// AXIS — ROUND-6: the delimiter is EXCLUDED from a record's measured length.
