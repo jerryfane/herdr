@@ -2395,6 +2395,71 @@ fn every_user_entry_marked_after_it_was_sent_is_resent_on_the_next_after_page() 
     assert!(user_origins(&again).is_empty(), "{:?}", again.entries);
 }
 
+/// A long-running agent shared with a guest: the client loaded only the
+/// newest turn. When the guest's next prompt is delivered, the fingerprint
+/// changes; the `after` page must not re-send the guest's older prompts from
+/// history the client never loaded, or the client appends them after its
+/// newest turn as prompts without replies.
+#[test]
+fn an_after_page_resends_marked_entries_only_from_the_clients_window() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-floor");
+    let old_at = session.ms(session.next + 1);
+    session.user("guest: old question");
+    session.assistant(vec![text("old answer")], "stop");
+    let held_at = session.ms(session.next + 1);
+    session.user("guest: held question");
+    session.assistant(vec![text("held answer")], "stop");
+    let request = |after: Option<&str>, limit: Option<u32>, prompts: Vec<OtherPrompt>| {
+        PageRequest {
+            after: after.map(str::to_owned),
+            limit,
+            other_prompts: prompts,
+            ..PageRequest::default()
+        }
+    };
+    let served = vec![OtherPrompt::new("guest: old question", old_at)];
+    let first = read_page(&session.path, &request(None, Some(1), served)).unwrap();
+    assert_eq!(
+        user_origins(&first),
+        vec![("guest: held question".into(), None)]
+    );
+
+    let new_at = session.ms(session.next + 1);
+    session.user("guest: new question");
+    session.assistant(vec![text("new answer")], "stop");
+    let delivered = vec![
+        OtherPrompt::new("guest: old question", old_at),
+        OtherPrompt::new("guest: held question", held_at),
+        OtherPrompt::new("guest: new question", new_at),
+    ];
+    let next = read_page(&session.path, &request(Some(&first.after), None, delivered.clone()))
+        .unwrap();
+    assert_eq!(
+        user_origins(&next),
+        vec![
+            ("guest: held question".into(), Some(TurnOrigin::Other)),
+            ("guest: new question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+
+    // The floor stays with the window the next `after` page extends.
+    let last_at = session.ms(session.next + 1);
+    session.user("guest: last question");
+    let mut all = delivered;
+    all.push(OtherPrompt::new("guest: last question", last_at));
+    let later = read_page(&session.path, &request(Some(&next.after), None, all)).unwrap();
+    assert_eq!(
+        user_origins(&later),
+        vec![
+            ("guest: held question".into(), Some(TurnOrigin::Other)),
+            ("guest: new question".into(), Some(TurnOrigin::Other)),
+            ("guest: last question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+}
+
 #[test]
 fn an_after_page_does_not_resend_an_unmarked_user_entry() {
     let mut session = Fixture::new("origin-unmarked");

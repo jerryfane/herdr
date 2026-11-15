@@ -255,6 +255,7 @@ fn unwritten_page(path: &Path, request: &PageRequest) -> Result<Page, Transcript
         seen: 0,
         tip: None,
         origins: Some(origin::fingerprint(&request.other_prompts)),
+        floor: Some(0),
     }
     .encode(&session_id);
     Ok(Page {
@@ -392,6 +393,11 @@ enum Cursor {
         /// [`origin::fingerprint`] of the non-owner prompts the page was
         /// marked with; `None` in a cursor from before origins existed.
         origins: Option<u64>,
+        /// The oldest record the client holds from the newest page it built
+        /// on: user entries before it are history it has not loaded, so a
+        /// changed fingerprint never re-sends them. `None` in a cursor from
+        /// before floors existed, which re-sends from the start.
+        floor: Option<u32>,
     },
 }
 
@@ -399,7 +405,12 @@ impl Cursor {
     fn encode(&self, session_id: &str) -> String {
         let raw = match self {
             Self::Before { record, id } => format!("1\nb\n{session_id}\n{record}\n{id}"),
-            Self::After { seen, tip, origins } => {
+            Self::After {
+                seen,
+                tip,
+                origins,
+                floor,
+            } => {
                 let tip = tip
                     .as_ref()
                     .map(|(tip, id)| format!("{tip} {id}"))
@@ -407,7 +418,11 @@ impl Cursor {
                 let origins = origins
                     .map(|origins| format!("\n{origins:x}"))
                     .unwrap_or_default();
-                format!("1\na\n{session_id}\n{seen}\n{tip}{origins}")
+                let floor = floor
+                    .filter(|_| !origins.is_empty())
+                    .map(|floor| format!("\n{floor}"))
+                    .unwrap_or_default();
+                format!("1\na\n{session_id}\n{seen}\n{tip}{origins}{floor}")
             }
         };
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
@@ -441,15 +456,20 @@ impl Cursor {
                 id: id.to_owned(),
             }),
             "a" => {
-                let (tip, origins) = match id.split_once('\n') {
-                    Some((tip, origins)) => (
-                        tip,
-                        Some(
-                            u64::from_str_radix(origins, 16)
-                                .map_err(|_| TranscriptError::CursorExpired)?,
-                        ),
-                    ),
-                    None => (id, None),
+                let (tip, origins, floor) = match id.split_once('\n') {
+                    Some((tip, rest)) => {
+                        let (origins, floor) = match rest.split_once('\n') {
+                            Some((origins, floor)) => (
+                                origins,
+                                Some(floor.parse().map_err(|_| TranscriptError::CursorExpired)?),
+                            ),
+                            None => (rest, None),
+                        };
+                        let origins = u64::from_str_radix(origins, 16)
+                            .map_err(|_| TranscriptError::CursorExpired)?;
+                        (tip, Some(origins), floor)
+                    }
+                    None => (id, None, None),
                 };
                 let tip = if tip.is_empty() {
                     None
@@ -462,6 +482,7 @@ impl Cursor {
                     seen: number,
                     tip,
                     origins,
+                    floor,
                 })
             }
             _ => Err(TranscriptError::CursorExpired),
@@ -563,7 +584,10 @@ impl View<'_> {
     ) -> Result<Page, TranscriptError> {
         let session_id = self.session_id().to_owned();
         let origins = origin::fingerprint(other_prompts);
-        let (start, end, changed_since, served_origins) = match (&request.before, &request.after) {
+        let (start, end, changed_since, served_origins, served_floor) = match (
+            &request.before,
+            &request.after,
+        ) {
             (Some(token), _) => {
                 let Cursor::Before { record, id } = Cursor::decode(token, &session_id)? else {
                     return Err(TranscriptError::CursorExpired);
@@ -572,10 +596,15 @@ impl View<'_> {
                     .valid_record(record, &id)
                     .and_then(|record| self.position_of(record))
                     .ok_or(TranscriptError::CursorExpired)?;
-                (self.page_start(end, limit), end, None, None)
+                (self.page_start(end, limit), end, None, None, None)
             }
             (None, Some(token)) => {
-                let Cursor::After { seen, tip, origins } = Cursor::decode(token, &session_id)?
+                let Cursor::After {
+                    seen,
+                    tip,
+                    origins,
+                    floor,
+                } = Cursor::decode(token, &session_id)?
                 else {
                     return Err(TranscriptError::CursorExpired);
                 };
@@ -588,23 +617,31 @@ impl View<'_> {
                         .ok_or(TranscriptError::CursorExpired)?;
                 }
                 let start = self.branch.partition_point(|&record| record < seen);
-                (start, self.budget_end(start), Some(seen), origins)
+                (start, self.budget_end(start), Some(seen), origins, floor)
             }
             (None, None) => {
                 let end = self.branch.len();
-                (self.page_start(end, limit), end, None, None)
+                (self.page_start(end, limit), end, None, None, None)
             }
         };
         let mut entries = Vec::new();
         // The prompts this client was served with changed (a prompt was
         // delivered, or one was forgotten): re-send, under the same ids, every
-        // user entry before its cursor that is now marked, since it may have
-        // gone out unmarked.
+        // user entry the client holds before its cursor that is now marked,
+        // since it may have gone out unmarked. Entries before its floor are
+        // history it has not loaded: an older page brings them marked, and a
+        // client that got them here would show them after its newest turn.
         let resend_origins = changed_since.is_some() && served_origins != Some(origins);
         let mut others = None;
         if resend_origins {
             let matched = self.other_user_turns(other_prompts)?;
-            for (position, _) in matched.iter().filter(|(position, _)| *position < start) {
+            let floor = self
+                .branch
+                .partition_point(|&record| record < served_floor.unwrap_or(0));
+            for (position, _) in matched
+                .iter()
+                .filter(|(position, _)| (floor..start).contains(position))
+            {
                 self.render(*position, position + 1, &mut entries)?;
             }
             others = Some(matched);
@@ -650,10 +687,22 @@ impl View<'_> {
         let tip = self.branch[..self.branch.partition_point(|&record| record < seen)]
             .last()
             .map(|&tip| (tip, self.index.record(tip).id.to_string()));
+        // A newest or older page starts the client's window; an `after` page
+        // keeps the window it extends.
+        let floor = match changed_since {
+            Some(_) => served_floor,
+            None => Some(
+                self.branch
+                    .get(start)
+                    .copied()
+                    .unwrap_or(self.index.records.len() as u32),
+            ),
+        };
         let after = Cursor::After {
             seen,
             tip,
             origins: Some(origins),
+            floor,
         }
         .encode(&session_id);
         let LiveState {
