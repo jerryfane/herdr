@@ -130,6 +130,12 @@ pub struct ServerCapabilities {
     /// and page by turns alone.
     #[serde(default)]
     pub transcript_max_bytes: bool,
+    /// `api-bridge --multi` answers `bridge.hello {frames: true}` and then
+    /// writes replies as interleaved frames, and answers `bridge.cancel {id}`.
+    /// The bridge's own `bridge.hello` reply is authoritative; this flag only
+    /// says the daemon's binary ships that bridge.
+    #[serde(default)]
+    pub api_bridge_frames: bool,
     /// `pane.stream` waits out a slow reader (60 s without progress instead of
     /// 5 s), sends a reader that falls behind a `lagged` keyframe instead of
     /// the backlog, and ends with a `stream_stalled` or `stream_failed` error

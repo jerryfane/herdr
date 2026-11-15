@@ -22,8 +22,9 @@ use super::api_bridge_unix as transport;
 use super::api_bridge_windows as transport;
 use transport::{Connection, ConnectionShutdown};
 
+use super::api_bridge_outbox::{Delivery, Outbox, RequestKey};
 use crate::remote::{
-    API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT,
+    API_BRIDGE_FRAME_BYTES as FRAME_BYTES, API_BRIDGE_MULTI_MAX_IN_FLIGHT as MULTI_MAX_IN_FLIGHT,
     API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES as MULTI_MAX_REQUEST_LINE_BYTES,
     API_BRIDGE_MULTI_STREAMING_METHODS as MULTI_UNSUPPORTED_METHODS,
 };
@@ -263,47 +264,24 @@ impl Drop for TrackedConnection<'_> {
     }
 }
 
-/// Whole-line writer shared by the reader and every worker. Each line is one
-/// locked write, so concurrent responses never interleave.
-struct LineOutput<W> {
-    out: Mutex<W>,
-}
-
-impl<W: Write> LineOutput<W> {
-    /// `line` must already end with `\n`.
-    fn write_line(&self, line: &[u8], teardown: &Teardown) -> io::Result<()> {
-        let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = out.write_all(line).and_then(|()| out.flush());
-        drop(out);
-        if result.is_err() {
-            // Nobody can read further responses: stop in-flight work and
-            // let the reader loop wind down.
-            teardown.hang_up();
-        }
-        result
-    }
-
-    fn write_error(
-        &self,
-        id: &str,
-        code: &str,
-        message: &str,
-        teardown: &Teardown,
-    ) -> io::Result<()> {
-        let mut line = error_envelope(id, code, message);
-        line.push('\n');
-        self.write_line(line.as_bytes(), teardown)
-    }
-}
+/// Request methods the `--multi` bridge answers itself instead of forwarding.
+/// An older bridge forwards them, and the server answers `invalid_request`,
+/// which tells the client the bridge lacks them.
+const BRIDGE_HELLO: &str = "bridge.hello";
+const BRIDGE_CANCEL: &str = "bridge.cancel";
 
 struct MultiJob {
     line: Vec<u8>,
     id: String,
+    /// Registered before the job is handed to a worker, so a `bridge.cancel`
+    /// read right after the request finds it.
+    key: RequestKey,
 }
 
 /// Forwards newline-delimited requests from `input` to the API socket at
 /// `socket_path`, one connection per request, up to [`MULTI_MAX_IN_FLIGHT`] at
-/// once, writing every response line to `output` as it arrives. Returns once
+/// once, writing every response to `output` as it arrives (whole lines, or
+/// interleaved frames once the client sent `bridge.hello`). Returns once
 /// `input` ends and every in-flight request has finished.
 fn run_multi<R: BufRead, W: Write + Send>(
     mut input: R,
@@ -311,38 +289,77 @@ fn run_multi<R: BufRead, W: Write + Send>(
     socket_path: &Path,
     teardown: &Teardown,
 ) -> io::Result<()> {
-    let output = LineOutput {
-        out: Mutex::new(output),
-    };
-    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<MultiJob>(0);
+    let outbox = Outbox::default();
+    // Up to MULTI_MAX_IN_FLIGHT more requests wait here for a worker. The
+    // reader never blocks on it: a request arriving with the queue full is
+    // answered `busy` at once, so `bridge.cancel` is read at any load.
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<MultiJob>(MULTI_MAX_IN_FLIGHT);
     let jobs_rx = Mutex::new(jobs_rx);
     let output_error = Mutex::new(None::<io::Error>);
 
-    let read_result = std::thread::scope(|scope| {
-        for _ in 0..MULTI_MAX_IN_FLIGHT {
-            scope.spawn(|| loop {
-                let job = jobs_rx
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .recv();
-                let Ok(job) = job else { return };
-                if let Err(err) = forward_request(socket_path, &job, &output, teardown) {
-                    output_error
+    let (read_result, write_result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let result = outbox.run_writer(output);
+            if result.is_err() {
+                // Nobody can read further responses: stop in-flight work and
+                // let the reader loop wind down.
+                teardown.hang_up();
+            }
+            result
+        });
+        let read_result = std::thread::scope(|workers| {
+            for _ in 0..MULTI_MAX_IN_FLIGHT {
+                workers.spawn(|| loop {
+                    let job = jobs_rx
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .get_or_insert(err);
-                }
-            });
-        }
-        // Moving the sender in means every return path closes the job queue,
-        // so the scope's implicit join drains in-flight work, then ends.
-        read_requests(&mut input, jobs_tx, &output, teardown)
+                        .recv();
+                    let Ok(job) = job else { return };
+                    if let Err(err) = forward_request(socket_path, &job, &outbox, teardown) {
+                        output_error
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .get_or_insert(err);
+                    }
+                });
+            }
+            // Moving the sender in means every return path closes the job
+            // queue, so the scope's implicit join drains in-flight work.
+            read_requests(&mut input, jobs_tx, &outbox, teardown)
+        });
+        // Every producer is done: let the writer drain and return.
+        outbox.close();
+        let write_result = writer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("api-bridge: reply writer panicked")));
+        (read_result, write_result)
     });
 
     let output_error = output_error
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-    read_result.and(output_error.map_or(Ok(()), Err))
+    read_result
+        .and(write_result)
+        .and(output_error.map_or(Ok(()), Err))
+}
+
+/// An error reply from the request reader to work it refused: posted, so the
+/// reader never waits on output, and dropped once too many wait (see
+/// [`Outbox::post`]).
+fn post_error(outbox: &Outbox, id: &str, code: &str, message: &str) -> io::Result<()> {
+    outbox
+        .post(id, error_envelope(id, code, message).into_bytes())
+        .map(drop)
+}
+
+/// Refuses a request the bridge has no room for; the client retries later.
+fn post_busy(outbox: &Outbox, id: &str) -> io::Result<()> {
+    post_error(
+        outbox,
+        id,
+        "busy",
+        "api-bridge: too many requests in flight; retry once one finishes",
+    )
 }
 
 enum InputLine {
@@ -351,10 +368,10 @@ enum InputLine {
     TooLong,
 }
 
-fn read_requests<R: BufRead, W: Write>(
+fn read_requests<R: BufRead>(
     input: &mut R,
     jobs: mpsc::SyncSender<MultiJob>,
-    output: &LineOutput<W>,
+    outbox: &Outbox,
     teardown: &Teardown,
 ) -> io::Result<()> {
     let mut line = Vec::new();
@@ -366,13 +383,13 @@ fn read_requests<R: BufRead, W: Write>(
             InputLine::Eof => return Ok(()),
             InputLine::TooLong => {
                 let probe = RequestProbe::scan(&line);
-                output.write_error(
+                post_error(
+                    outbox,
                     &probe.id.unwrap_or_default(),
                     "invalid_request",
                     &format!(
                         "api-bridge: request line exceeds {MULTI_MAX_REQUEST_LINE_BYTES} bytes"
                     ),
-                    teardown,
                 )?;
                 continue;
             }
@@ -387,44 +404,133 @@ fn read_requests<R: BufRead, W: Write>(
         let method = match (probe.error, probe.method) {
             (None, Some(method)) => method,
             (None, None) => {
-                output.write_error(
+                post_error(
+                    outbox,
                     &id,
                     "invalid_request",
                     "api-bridge: request has no method",
-                    teardown,
                 )?;
                 continue;
             }
             (Some(err), _) => {
-                output.write_error(
+                post_error(
+                    outbox,
                     &id,
                     "invalid_request",
                     &format!("api-bridge: malformed request line: {err}"),
-                    teardown,
                 )?;
                 continue;
             }
         };
         if MULTI_UNSUPPORTED_METHODS.contains(&method.as_str()) {
-            output.write_error(
+            post_error(
+                outbox,
                 &id,
                 "unsupported_method",
                 &format!(
                     "api-bridge --multi does not forward streaming method {method}; open a dedicated channel for it"
                 ),
-                teardown,
             )?;
             continue;
         }
-
+        match method.as_str() {
+            BRIDGE_HELLO => {
+                answer_hello(&line, &id, outbox)?;
+                continue;
+            }
+            BRIDGE_CANCEL => {
+                answer_cancel(&line, &id, outbox)?;
+                continue;
+            }
+            _ => {}
+        }
+        // Never block the reader on admission (nor, by posting the reply, on
+        // output): it must stay free to read `bridge.cancel` at any load. A
+        // request is refused `busy` with every slot taken, or while too many
+        // replies owed to accepted requests wait for output, which keeps
+        // those bounded without ever dropping one.
+        if !outbox.admits() {
+            post_busy(outbox, &id)?;
+            continue;
+        }
+        let key = outbox.begin(&id);
         let job = MultiJob {
             line: std::mem::take(&mut line),
             id,
+            key,
         };
-        if jobs.send(job).is_err() {
-            // Every worker is gone (only possible if they all panicked).
-            return Err(io::Error::other("api-bridge: request workers stopped"));
+        match jobs.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(job)) => {
+                outbox.end(job.key);
+                post_busy(outbox, &job.id)?;
+            }
+            Err(mpsc::TrySendError::Disconnected(job)) => {
+                outbox.end(job.key);
+                // Every worker is gone (only possible if they all panicked).
+                return Err(io::Error::other("api-bridge: request workers stopped"));
+            }
         }
+    }
+}
+
+fn request_params(line: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|mut request| request.get_mut("params").map(serde_json::Value::take))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// `bridge.hello {frames}`: with `frames: true`, every reply written after
+/// this one is framed and interleaved. Framing cannot be turned off again.
+fn answer_hello(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
+    let params = request_params(line);
+    let frames = params.get("frames").and_then(serde_json::Value::as_bool) == Some(true);
+    let reply = |frames: bool| {
+        serde_json::json!({
+            "id": id,
+            "result": {
+                "type": "bridge_hello",
+                "frames": frames,
+                "frame_bytes": FRAME_BYTES,
+                "cancel": true,
+            }
+        })
+        .to_string()
+        .into_bytes()
+    };
+    if frames && !outbox.framed() {
+        outbox.send_switch_to_frames(id, reply(true))
+    } else {
+        outbox.send(None, id, reply(outbox.framed()))
+    }
+    .map(drop)
+}
+
+/// `bridge.cancel {id}`: stops every unanswered request with that id. Each
+/// stopped request is answered with a `cancelled` error.
+fn answer_cancel(line: &[u8], id: &str, outbox: &Outbox) -> io::Result<()> {
+    let params = request_params(line);
+    let Some(target) = params.get("id").and_then(serde_json::Value::as_str) else {
+        return post_error(
+            outbox,
+            id,
+            "invalid_request",
+            "api-bridge: bridge.cancel needs params.id, the id of the request to cancel",
+        );
+    };
+    let cancelled = outbox.cancel(target);
+    let reply = serde_json::json!({
+        "id": id,
+        "result": { "type": "bridge_cancel", "cancelled": cancelled }
+    })
+    .to_string()
+    .into_bytes();
+    if cancelled {
+        // Owed to the requests it stopped: the client retires them by it.
+        outbox.post_owed(id, reply)
+    } else {
+        outbox.post(id, reply).map(drop)
     }
 }
 
@@ -512,17 +618,49 @@ impl<'de> serde::de::Visitor<'de> for &mut RequestProbe {
 }
 
 /// Runs one `--multi` request on its own socket connection. Only an output
-/// failure is returned; socket failures become a `transport_error` response.
-fn forward_request<W: Write>(
+/// failure is returned; socket failures become a `transport_error` response
+/// and a `bridge.cancel` a `cancelled` one.
+fn forward_request(
     socket_path: &Path,
     job: &MultiJob,
-    output: &LineOutput<W>,
+    outbox: &Outbox,
     teardown: &Teardown,
 ) -> io::Result<()> {
+    let key = job.key;
+    let result = forward_tracked_request(socket_path, job, key, outbox, teardown).and_then(|()| {
+        if outbox.is_cancelled(key) {
+            // Not tied to `key`, which refuses replies once cancelled, and
+            // posted so the worker is free for the next request at once.
+            // Owed: the client retires the request by it, so it is never
+            // dropped.
+            let line = error_envelope(
+                &job.id,
+                "cancelled",
+                "api-bridge: request cancelled by bridge.cancel",
+            );
+            outbox.post_owed(&job.id, line.into_bytes())
+        } else {
+            Ok(())
+        }
+    });
+    outbox.end(key);
+    result
+}
+
+fn forward_tracked_request(
+    socket_path: &Path,
+    job: &MultiJob,
+    key: RequestKey,
+    outbox: &Outbox,
+    teardown: &Teardown,
+) -> io::Result<()> {
+    let reply = |line: Vec<u8>| outbox.send(Some(key), &job.id, line);
     let transport_error = |err: io::Error| {
-        let mut line = transport_error_envelope(&job.id, &err);
-        line.push('\n');
-        output.write_line(line.as_bytes(), teardown)
+        if outbox.is_cancelled(key) {
+            // The cancel ended the connection; that is not a transport fault.
+            return Ok(());
+        }
+        reply(transport_error_envelope(&job.id, &err).into_bytes()).map(drop)
     };
 
     let mut conn = match transport::connect(socket_path) {
@@ -535,6 +673,14 @@ fn forward_request<W: Write>(
         Ok(None) => return Ok(()),
         Err(err) => return transport_error(err),
     };
+    match ConnectionShutdown::new(&conn) {
+        Ok(shutdown) => {
+            if !outbox.on_cancel(key, Box::new(move || shutdown.shut_down())) {
+                return Ok(());
+            }
+        }
+        Err(err) => return transport_error(err),
+    }
     if let Err(err) = conn
         .write_all(&job.line)
         .and_then(|()| conn.write_all(b"\n"))
@@ -544,20 +690,20 @@ fn forward_request<W: Write>(
     }
 
     let mut reader = io::BufReader::new(conn);
-    let mut reply = Vec::new();
     loop {
-        reply.clear();
-        match reader.read_until(b'\n', &mut reply) {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
             Ok(0) => return Ok(()),
             Ok(_) => {
-                if reply.last() == Some(&b'\n') {
-                    reply.pop();
+                if line.last() == Some(&b'\n') {
+                    line.pop();
                 }
-                if reply.last() == Some(&b'\r') {
-                    reply.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
                 }
-                reply.push(b'\n');
-                output.write_line(&reply, teardown)?;
+                if reply(line)? == Delivery::Cancelled {
+                    return Ok(());
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return transport_error(err),
@@ -572,10 +718,12 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashSet;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use crate::remote::api_bridge_outbox::{MAX_OWED, MAX_POSTED};
 
     fn unique_socket_path(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -624,6 +772,30 @@ mod tests {
         }
     }
 
+    /// Whether the server accepts `count` requests within `within`.
+    fn requests_reach(server: &FakeApiServer, count: usize, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while server.stats.requests.load(Ordering::SeqCst) < count {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Waits until the server has accepted `count` requests.
+    fn wait_for_requests(server: &FakeApiServer, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.stats.requests.load(Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "server saw fewer than {count} requests"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     impl Drop for FakeApiServer {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
@@ -645,9 +817,13 @@ mod tests {
         if let Some(delay) = request["params"]["delay_ms"].as_u64() {
             thread::sleep(Duration::from_millis(delay));
         }
+        let mut result = json!({"method": request["method"]});
+        if let Some(pad) = request["params"]["pad_bytes"].as_u64() {
+            result["pad"] = Value::String("x".repeat(pad as usize));
+        }
         let response = json!({
             "id": request["id"],
-            "result": {"method": request["method"]},
+            "result": result,
         });
         let mut conn = reader.into_inner();
         let _ = writeln!(conn, "{response}");
@@ -696,15 +872,18 @@ mod tests {
     #[test]
     fn multi_answers_every_request_with_bounded_concurrency() {
         let server = FakeApiServer::start("many");
-        let input: String = (0..48)
+        // No more than the queue holds, so none is refused however slowly the
+        // workers start.
+        let total = MULTI_MAX_IN_FLIGHT;
+        let input: String = (0..total)
             .map(|n| request(&format!("r{n}"), "ping", 50) + "\n")
             .collect();
 
         let responses = run(&input, &server.path);
 
         let got: HashSet<&str> = ids(&responses).into_iter().collect();
-        let want: Vec<String> = (0..48).map(|n| format!("r{n}")).collect();
-        assert_eq!(responses.len(), 48);
+        let want: Vec<String> = (0..total).map(|n| format!("r{n}")).collect();
+        assert_eq!(responses.len(), total);
         assert_eq!(got, want.iter().map(String::as_str).collect());
         for response in &responses {
             assert_eq!(response["result"]["method"], "ping");
@@ -1046,5 +1225,597 @@ mod tests {
             decode_request_arg("not base64!").unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    /// Feeds a bridge's stdin one chunk at a time; a closed sender is EOF.
+    struct ChannelInput {
+        chunks: mpsc::Receiver<Vec<u8>>,
+        buf: Vec<u8>,
+        pos: usize,
+    }
+
+    impl io::Read for ChannelInput {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let n = available.len().min(out.len());
+            out[..n].copy_from_slice(&available[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for ChannelInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.pos == self.buf.len() {
+                self.buf = self.chunks.recv().unwrap_or_default();
+                self.pos = 0;
+            }
+            Ok(&self.buf[self.pos..])
+        }
+
+        fn consume(&mut self, n: usize) {
+            self.pos += n;
+        }
+    }
+
+    /// A bridge's stdout as a slow link: each write takes `delay_ms`, which
+    /// the test may change while the bridge runs.
+    struct ChannelOutput {
+        writes: mpsc::Sender<Vec<u8>>,
+        delay_ms: Arc<AtomicU64>,
+    }
+
+    impl Write for ChannelOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::SeqCst)));
+            let _ = self.writes.send(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `--multi` bridge on its own thread, written to and read from live.
+    struct LiveBridge {
+        input: Option<mpsc::Sender<Vec<u8>>>,
+        output: mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+        /// Reply bytes of frames read so far, by reply id.
+        partial: HashMap<String, Vec<u8>>,
+        write_delay_ms: Arc<AtomicU64>,
+        bridge: Option<thread::JoinHandle<io::Result<()>>>,
+    }
+
+    impl LiveBridge {
+        fn start(socket_path: &Path, write_delay: Duration) -> Self {
+            let (input, chunks) = mpsc::channel();
+            let (writes, output) = mpsc::channel();
+            let socket_path = socket_path.to_owned();
+            let write_delay_ms = Arc::new(AtomicU64::new(write_delay.as_millis() as u64));
+            let delay_ms = Arc::clone(&write_delay_ms);
+            let bridge = thread::spawn(move || {
+                let input = ChannelInput {
+                    chunks,
+                    buf: Vec::new(),
+                    pos: 0,
+                };
+                let output = ChannelOutput { writes, delay_ms };
+                run_multi(input, output, &socket_path, &Teardown::default())
+            });
+            Self {
+                input: Some(input),
+                output,
+                pending: Vec::new(),
+                partial: HashMap::new(),
+                write_delay_ms,
+                bridge: Some(bridge),
+            }
+        }
+
+        fn set_write_delay(&self, delay: Duration) {
+            self.write_delay_ms
+                .store(delay.as_millis() as u64, Ordering::SeqCst);
+        }
+
+        /// Reads frames until reply `id` is complete and returns it.
+        fn read_framed_reply_to(&mut self, id: &str) -> Value {
+            loop {
+                for (done, reply) in self.read_replies(1) {
+                    if done == id {
+                        return reply.expect("a whole reply");
+                    }
+                }
+            }
+        }
+
+        fn send(&self, line: &str) {
+            let line = format!("{line}\n").into_bytes();
+            self.input.as_ref().unwrap().send(line).unwrap();
+        }
+
+        fn read_exact(&mut self, len: usize) -> Vec<u8> {
+            while self.pending.len() < len {
+                let chunk = self
+                    .output
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bridge output");
+                self.pending.extend_from_slice(&chunk);
+            }
+            self.pending.drain(..len).collect()
+        }
+
+        fn read_line(&mut self) -> Value {
+            loop {
+                if let Some(end) = self.pending.iter().position(|&byte| byte == b'\n') {
+                    let line: Vec<u8> = self.pending.drain(..=end).collect();
+                    return serde_json::from_slice(&line).unwrap();
+                }
+                let chunk = self
+                    .output
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bridge output");
+                self.pending.extend_from_slice(&chunk);
+            }
+        }
+
+        fn read_frame(&mut self) -> (Value, Vec<u8>) {
+            let header = self.read_line();
+            let len = header["len"].as_u64().expect("frame header") as usize;
+            let body = self.read_exact(len);
+            (header, body)
+        }
+
+        /// Reads one frame and keeps its bytes toward its reply.
+        fn read_frame_kept(&mut self) -> Value {
+            let (header, body) = self.read_frame();
+            let id = header["frame"].as_str().unwrap().to_owned();
+            self.partial.entry(id).or_default().extend_from_slice(&body);
+            header
+        }
+
+        /// Reads frames until `count` replies are complete, in completion
+        /// order. An aborted reply is `None`.
+        fn read_replies(&mut self, count: usize) -> Vec<(String, Option<Value>)> {
+            let mut done = Vec::new();
+            while done.len() < count {
+                let header = self.read_frame_kept();
+                let id = header["frame"].as_str().unwrap().to_owned();
+                if header["last"] != true {
+                    continue;
+                }
+                let bytes = self.partial.remove(&id).unwrap();
+                if header["abort"] == true {
+                    done.push((id, None));
+                } else {
+                    done.push((id, Some(serde_json::from_slice(&bytes).unwrap())));
+                }
+            }
+            done
+        }
+
+        fn finish(mut self) {
+            drop(self.input.take());
+            self.bridge.take().unwrap().join().unwrap().unwrap();
+        }
+
+        /// Closes stdin, waits for the bridge to finish, and returns every
+        /// reply line it wrote that was not read yet.
+        fn finish_lines(mut self) -> Vec<Value> {
+            drop(self.input.take());
+            self.bridge.take().unwrap().join().unwrap().unwrap();
+            let mut bytes = std::mem::take(&mut self.pending);
+            while let Ok(chunk) = self.output.try_recv() {
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect()
+        }
+    }
+
+    fn hello(id: &str) -> String {
+        json!({"id": id, "method": "bridge.hello", "params": {"frames": true}}).to_string()
+    }
+
+    fn cancel(id: &str, target: &str) -> String {
+        json!({"id": id, "method": "bridge.cancel", "params": {"id": target}}).to_string()
+    }
+
+    fn padded(id: &str, pad_bytes: usize) -> String {
+        json!({"id": id, "method": "gram.list", "params": {"pad_bytes": pad_bytes}}).to_string()
+    }
+
+    fn reply<'a>(replies: &'a [(String, Option<Value>)], id: &str) -> &'a Option<Value> {
+        &replies
+            .iter()
+            .find(|(reply_id, _)| reply_id == id)
+            .unwrap_or_else(|| panic!("no reply for {id}: {replies:?}"))
+            .1
+    }
+
+    #[test]
+    fn multi_switches_to_frames_after_answering_hello() {
+        let server = FakeApiServer::start("hello");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+
+        bridge.send(&request("before", "ping", 0));
+        assert_eq!(bridge.read_line()["id"], "before");
+        bridge.send(&hello("h"));
+        let hello = bridge.read_line();
+        assert_eq!(hello["id"], "h");
+        assert_eq!(hello["result"]["type"], "bridge_hello");
+        assert_eq!(hello["result"]["frames"], true);
+        assert_eq!(hello["result"]["frame_bytes"], FRAME_BYTES);
+        assert_eq!(hello["result"]["cancel"], true);
+
+        bridge.send(&request("after", "ping", 0));
+        let (header, body) = bridge.read_frame();
+        assert_eq!(
+            header,
+            json!({"frame": "after", "len": body.len(), "last": true})
+        );
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["result"]["method"], "ping");
+        bridge.finish();
+        // The bridge answered the hello itself.
+        assert_eq!(server.stats.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn multi_frames_let_a_small_reply_overtake_a_big_one() {
+        let server = FakeApiServer::start("interleave");
+        // About 2 ms per frame: the 1 MiB reply needs 64 frames.
+        let mut bridge = LiveBridge::start(&server.path, Duration::from_millis(2));
+        bridge.send(&hello("h"));
+        bridge.read_line();
+
+        bridge.send(&padded("big", 1024 * 1024));
+        let first = bridge.read_frame_kept();
+        assert_eq!(first["frame"], "big");
+        assert_eq!(first["last"], false);
+        assert_eq!(first["len"], FRAME_BYTES);
+        bridge.send(&request("small", "ping", 0));
+
+        let replies = bridge.read_replies(2);
+        let order: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, ["small", "big"]);
+        let big = reply(&replies, "big").as_ref().unwrap();
+        assert_eq!(big["result"]["pad"].as_str().unwrap().len(), 1024 * 1024);
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_frames_reassemble_into_the_reply_line() {
+        let server = FakeApiServer::start("reassemble");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        bridge.send(&hello("h"));
+        bridge.read_line();
+
+        bridge.send(&padded("big", 3 * FRAME_BYTES));
+        let replies = bridge.read_replies(1);
+        let big = reply(&replies, "big").as_ref().unwrap();
+        assert_eq!(big["id"], "big");
+        assert_eq!(
+            big["result"]["pad"].as_str().unwrap().len(),
+            3 * FRAME_BYTES
+        );
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_cancel_ends_a_request_still_waiting_for_its_reply() {
+        let server = FakeApiServer::start("cancel-wait");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+
+        let started = Instant::now();
+        bridge.send(&request("slow", "agent.wait", 10_000));
+        bridge.send(&cancel("c", "slow"));
+        let mut replies = [bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+
+        assert_eq!(replies[0]["id"], "c");
+        assert_eq!(
+            replies[0]["result"],
+            json!({"type": "bridge_cancel", "cancelled": true})
+        );
+        assert_eq!(replies[1]["id"], "slow");
+        assert_eq!(replies[1]["error"]["code"], "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The bridge keeps serving, and a cancelled id is free to reuse.
+        bridge.send(&request("slow", "ping", 0));
+        assert_eq!(bridge.read_line()["result"]["method"], "ping");
+        bridge.finish();
+    }
+
+    /// Every worker waits on a slow reply and one more request waits for a
+    /// worker: a cancel read after them still frees a slot for it.
+    #[test]
+    fn multi_cancel_reaches_a_saturated_bridge_and_frees_a_slot() {
+        let server = FakeApiServer::start("cancel-saturated");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+
+        let started = Instant::now();
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+        }
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+        bridge.send(&request("next", "ping", 0));
+        bridge.send(&cancel("c", "slow0"));
+        let mut replies = [bridge.read_line(), bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        assert_eq!(replies[0]["id"], "c");
+        assert_eq!(replies[0]["result"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "next");
+        assert_eq!(replies[1]["result"]["method"], "ping");
+        assert_eq!(replies[2]["id"], "slow0");
+        assert_eq!(replies[2]["error"]["code"], "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        for slot in 1..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&cancel(&format!("c{slot}"), &format!("slow{slot}")));
+        }
+        for _ in 1..MULTI_MAX_IN_FLIGHT {
+            bridge.read_line();
+            bridge.read_line();
+        }
+        bridge.finish();
+    }
+
+    /// At the real boundary (every worker busy, the queue full, one more
+    /// request arriving) the reader stays free: the extra request is answered
+    /// `busy` at once and a cancel for an active request is answered promptly,
+    /// freeing a slot for the next request.
+    #[test]
+    fn multi_cancel_is_read_with_every_worker_busy_and_the_queue_full() {
+        let server = FakeApiServer::start("cancel-overload");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+        }
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("queued{slot}"), "agent.wait", 10_000));
+        }
+        bridge.send(&request("extra", "ping", 0));
+        let busy = bridge.read_line();
+        assert_eq!(busy["id"], "extra");
+        assert_eq!(busy["error"]["code"], "busy");
+
+        let started = Instant::now();
+        bridge.send(&cancel("c", "slow0"));
+        let mut replies = [bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        assert_eq!(replies[0]["id"], "c");
+        assert_eq!(replies[0]["result"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "slow0");
+        assert_eq!(replies[1]["error"]["code"], "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // The freed worker took a queued request, so one more is admitted
+        // (queued, not refused): cancelling it finds it.
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT + 1);
+        bridge.send(&request("admitted", "agent.wait", 10_000));
+        bridge.send(&cancel("ca", "admitted"));
+        let admitted = bridge.read_line();
+        assert_eq!(admitted["id"], "ca");
+        assert_eq!(admitted["result"]["cancelled"], true);
+
+        // Its `cancelled` error comes once a worker reaches it.
+        let rest = (1..MULTI_MAX_IN_FLIGHT)
+            .map(|slot| format!("slow{slot}"))
+            .chain((0..MULTI_MAX_IN_FLIGHT).map(|slot| format!("queued{slot}")));
+        let mut pending = 1;
+        for id in rest {
+            bridge.send(&cancel(&format!("c-{id}"), &id));
+            pending += 2;
+        }
+        for _ in 0..pending {
+            bridge.read_line();
+        }
+        bridge.finish();
+    }
+
+    /// The reader never waits on output either: with stdout backed up, an
+    /// overflow request's `busy` reply waits for the writer, not the reader,
+    /// so a cancel right behind it still ends its request at once (the freed
+    /// worker takes the next queued request). Line and framed modes.
+    #[test]
+    fn multi_cancel_is_read_while_output_is_backed_up() {
+        for framed in [false, true] {
+            let server = FakeApiServer::start("cancel-backpressure");
+            let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+            if framed {
+                bridge.send(&hello("h"));
+                bridge.read_line();
+            }
+            for slot in 0..MULTI_MAX_IN_FLIGHT {
+                bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+            }
+            wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+            for slot in 0..MULTI_MAX_IN_FLIGHT {
+                bridge.send(&request(&format!("queued{slot}"), "agent.wait", 10_000));
+            }
+            // Every write now takes a second: stdout is backed up.
+            bridge.set_write_delay(Duration::from_secs(1));
+            bridge.send(&request("extra1", "ping", 0));
+            bridge.send(&request("extra2", "ping", 0));
+            bridge.send(&cancel("c", "slow0"));
+            assert!(
+                requests_reach(&server, MULTI_MAX_IN_FLIGHT + 1, Duration::from_millis(750)),
+                "cancel not read while output was backed up (framed: {framed})"
+            );
+
+            bridge.set_write_delay(Duration::ZERO);
+            let rest = (1..MULTI_MAX_IN_FLIGHT)
+                .map(|slot| format!("slow{slot}"))
+                .chain((0..MULTI_MAX_IN_FLIGHT).map(|slot| format!("queued{slot}")));
+            for id in rest {
+                bridge.send(&cancel(&format!("c-{id}"), &id));
+            }
+            bridge.finish();
+        }
+    }
+
+    /// An overflow request reusing the id of a reply still streaming is
+    /// refused without the reader waiting behind that stream, so a cancel
+    /// sent next still reaches the original request.
+    #[test]
+    fn multi_cancel_reaches_a_streaming_reply_after_an_overflow_with_its_id() {
+        let server = FakeApiServer::start("cancel-same-id");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        bridge.send(&hello("h"));
+        bridge.read_line();
+        // 20 ms a frame: the 4 MiB reply streams for about five seconds.
+        bridge.set_write_delay(Duration::from_millis(20));
+        bridge.send(&padded("r0", 4 * 1024 * 1024));
+        assert_eq!(bridge.read_frame_kept()["frame"], "r0");
+        for slot in 1..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+        }
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("queued{slot}"), "agent.wait", 10_000));
+        }
+        bridge.send(&request("r0", "ping", 0));
+        bridge.send(&cancel("c", "r0"));
+
+        let answer = bridge.read_framed_reply_to("c");
+        assert_eq!(answer["result"]["cancelled"], true, "{answer}");
+
+        bridge.set_write_delay(Duration::ZERO);
+        let rest = (1..MULTI_MAX_IN_FLIGHT)
+            .map(|slot| format!("slow{slot}"))
+            .chain((0..MULTI_MAX_IN_FLIGHT).map(|slot| format!("queued{slot}")));
+        for id in rest {
+            bridge.send(&cancel(&format!("c-{id}"), &id));
+        }
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_cancel_aborts_a_framed_reply_part_way_through() {
+        let server = FakeApiServer::start("cancel-frames");
+        let mut bridge = LiveBridge::start(&server.path, Duration::from_millis(5));
+        bridge.send(&hello("h"));
+        bridge.read_line();
+
+        bridge.send(&padded("big", 1024 * 1024));
+        let first = bridge.read_frame_kept();
+        assert_eq!(first["frame"], "big");
+        bridge.send(&cancel("c", "big"));
+
+        let replies = bridge.read_replies(3);
+        let order: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            *reply(&replies, "c"),
+            Some(json!({
+                "id": "c",
+                "result": {"type": "bridge_cancel", "cancelled": true},
+            }))
+        );
+        // The partial reply is dropped, then its `cancelled` error follows.
+        let big: Vec<&Option<Value>> = replies
+            .iter()
+            .filter(|(id, _)| id == "big")
+            .map(|(_, reply)| reply)
+            .collect();
+        assert_eq!(big.len(), 2, "{order:?}");
+        assert_eq!(*big[0], None);
+        assert_eq!(big[1].as_ref().unwrap()["error"]["code"], "cancelled");
+        bridge.finish();
+    }
+
+    #[test]
+    fn multi_cancel_of_an_answered_request_cancels_nothing() {
+        let server = FakeApiServer::start("cancel-late");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+
+        bridge.send(&request("done", "ping", 0));
+        assert_eq!(bridge.read_line()["id"], "done");
+        bridge.send(&cancel("c", "done"));
+        assert_eq!(
+            bridge.read_line(),
+            json!({"id": "c", "result": {"type": "bridge_cancel", "cancelled": false}})
+        );
+        bridge.send(&json!({"id": "bad", "method": "bridge.cancel", "params": {}}).to_string());
+        assert_eq!(bridge.read_line()["error"]["code"], "invalid_request");
+        bridge.finish();
+    }
+
+    /// A reply that completes an accepted request is never dropped. With
+    /// stdout backed up and the budget for replies to refused work used up
+    /// by answers to cancels that found nothing, a real request's cancel
+    /// answer and its `cancelled` error still arrive once output drains.
+    #[test]
+    fn multi_never_drops_the_replies_an_accepted_request_is_owed() {
+        let server = FakeApiServer::start("owed");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        // The first write takes two seconds; nothing else is written before.
+        bridge.set_write_delay(Duration::from_secs(2));
+        for n in 0..MAX_POSTED + 8 {
+            bridge.send(&cancel(&format!("none{n}"), "nothing"));
+        }
+        bridge.send(&request("real", "agent.wait", 10_000));
+        bridge.send(&cancel("c", "real"));
+        // The reader and the cancelled request's worker post while output is
+        // still stuck.
+        thread::sleep(Duration::from_secs(1));
+        bridge.set_write_delay(Duration::ZERO);
+
+        let (mut answer, mut cancelled) = (None, None);
+        while answer.is_none() || cancelled.is_none() {
+            let reply = bridge.read_line();
+            match reply["id"].as_str() {
+                Some("c") => answer = Some(reply),
+                Some("real") => cancelled = Some(reply),
+                _ => assert_eq!(reply["result"]["cancelled"], false, "{reply}"),
+            }
+        }
+        assert_eq!(answer.unwrap()["result"]["cancelled"], true);
+        assert_eq!(cancelled.unwrap()["error"]["code"], "cancelled");
+        bridge.finish();
+    }
+
+    /// Owed replies count against admission, so they stay bounded without
+    /// one being dropped: with stdout backed up, a client that keeps sending
+    /// requests and cancelling them is refused `busy` once `MAX_OWED` owed
+    /// replies wait, and every request the bridge accepted still gets both
+    /// its cancel answer and its `cancelled` error.
+    #[test]
+    fn multi_bounds_owed_replies_by_refusing_requests() {
+        let server = FakeApiServer::start("owed-bound");
+        let bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        // The first write takes two seconds; nothing else is written before.
+        bridge.set_write_delay(Duration::from_secs(2));
+        for n in 0..2 * MAX_OWED {
+            bridge.send(&request(&format!("r{n}"), "agent.wait", 10_000));
+            bridge.send(&cancel(&format!("c{n}"), &format!("r{n}")));
+        }
+        thread::sleep(Duration::from_secs(1));
+        bridge.set_write_delay(Duration::ZERO);
+
+        let replies = bridge.finish_lines();
+        let numbers = |matches: &dyn Fn(&Value) -> bool| -> HashSet<String> {
+            replies
+                .iter()
+                .filter(|reply| matches(reply))
+                .map(|reply| reply["id"].as_str().unwrap()[1..].to_owned())
+                .collect()
+        };
+        let stopped = numbers(&|reply| reply["result"]["cancelled"] == true);
+        let cancelled = numbers(&|reply| reply["error"]["code"] == "cancelled");
+        let refused = numbers(&|reply| reply["error"]["code"] == "busy");
+        assert!(
+            !stopped.is_empty() && stopped.len() <= MAX_OWED,
+            "{} requests accepted while output was stuck",
+            stopped.len()
+        );
+        assert_eq!(stopped, cancelled);
+        assert!(!refused.is_empty());
     }
 }

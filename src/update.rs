@@ -2675,6 +2675,7 @@ mod tests {
                 ask_form: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
+                api_bridge_frames: false,
                 pane_stream_resync: false,
             }),
         };
@@ -2769,6 +2770,7 @@ mod tests {
                     ask_form: false,
                     gram_reachable: false,
                     transcript_max_bytes: false,
+                    api_bridge_frames: false,
                     pane_stream_resync: false,
                 }),
             },
@@ -3050,6 +3052,7 @@ mod tests {
                     ask_form: false,
                     gram_reachable: false,
                     transcript_max_bytes: false,
+                    api_bridge_frames: false,
                     pane_stream_resync: false,
                 }),
             },

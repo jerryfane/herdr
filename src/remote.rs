@@ -1,4 +1,5 @@
 mod api_bridge;
+mod api_bridge_outbox;
 #[cfg(unix)]
 mod api_bridge_unix;
 #[cfg(windows)]
@@ -30,6 +31,12 @@ pub(crate) const API_BRIDGE_MULTI_MAX_IN_FLIGHT: usize = 16;
 /// anything longer. Longer lines are drained and answered with
 /// `invalid_request`.
 pub(crate) const API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+/// Largest reply slice an `api-bridge --multi` bridge writes in one frame once
+/// the client asked for frames (`bridge.hello`). The writer takes turns
+/// between waiting replies a frame at a time, so a small reply waits for at
+/// most one frame of each bigger reply ahead of it rather than for all of it.
+pub(crate) const API_BRIDGE_FRAME_BYTES: usize = 16 * 1024;
 
 /// Methods that keep their connection open after the first response line.
 /// `api-bridge --multi` gives each request one connection and answers it from

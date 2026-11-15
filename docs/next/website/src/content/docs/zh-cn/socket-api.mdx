@@ -535,8 +535,11 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
 避免为每个请求启动一个进程(适用于 Unix 和 Windows;支持该模式的服务器会在 `ping` 中返回
 `capabilities.api_bridge_multi: true`):
 
-- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个;16 个都在处理时,
-  桥接进程会暂停读取 stdin,直到其中一个完成。
+- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个,另有最多 16 个
+  等待空位。桥接进程从不停止读取 stdin:在 16 个运行、16 个等待时到达的请求会立即收到 `busy` 错误(收到某个响应后再重试),
+  因此即使 stdout 拥堵,`bridge.cancel` 也总能被及时读取。桥接进程自己的简短响应(`busy` 等错误、取消应答、`cancelled`)从不阻塞读取。
+  已接受的请求一定会收到响应或 `cancelled` 错误,停止了请求的取消一定会收到应答:这些响应从不丢弃;等待 stdout 的此类响应达到 64 个时,
+  新请求会收到 `busy`。对被拒绝工作的响应(`busy` 等错误,以及没有停止任何请求的取消应答)在等待数达到 64 个后会被丢弃。与正在发送的响应同 id 的 `busy` 会排在该响应之后。
 - 每个响应行都会完整、原样地写入 stdout。响应可能乱序到达,请按 `id` 匹配。
 - `events.subscribe`、`pane.stream`、`pane.input.stream`、`gram.upload.stream` 和
   `server.ssh_agent.register` 会保持连接打开,因此桥接进程会对它们返回 `unsupported_method` 错误。
@@ -544,6 +547,21 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
 - 不是带字符串 `method` 的 JSON 对象的行,或超过 1 MiB 的行,会得到 `invalid_request` 错误。
   如果无法连接 socket,该请求会得到 `transport_error`。两种情况下桥接进程都会继续运行。
 - stdin 关闭后,桥接进程会在处理中的请求完成后退出。如果 stdout 的读取方先断开,处理中的请求会被取消。
+
+默认情况下,一个大响应在全部写完之前会挡住它后面的所有响应。慢速链路上的客户端可以让桥接进程交错发送响应
+(桥接进程支持该功能的服务器会返回 `capabilities.api_bridge_frames: true`):
+
+- 发送 `{"id":"h","method":"bridge.hello","params":{"frames":true}}`。桥接进程自己以普通行回答:
+  `{"id":"h","result":{"type":"bridge_hello","frames":true,"frame_bytes":16384,"cancel":true}}`。
+  较旧的桥接进程会把它转发给服务器,服务器返回 `invalid_request`;此时请继续按行读取。
+- 该行之后桥接进程写出的所有内容都是帧:一行 JSON 头 `{"frame":"<id>","len":<n>,"last":<bool>}`,后跟响应行
+  (不含换行)的恰好 `n` 个字节(最多 `frame_bytes`)。按顺序拼接一个响应的帧,`"last":true` 的帧表示完成。
+  桥接进程在等待中的响应之间每次轮流发送一帧,因此小响应最多只需等待前面每个大响应的一帧。
+  同一 `id` 的两个响应的帧不会交错。
+- `{"id":"c","method":"bridge.cancel","params":{"id":"<请求 id>"}}` 会停止该 id 所有尚未应答的请求:桥接进程关闭其
+  socket 连接(服务器随之停止生成响应),用 `{"frame":"<id>","len":0,"last":true,"abort":true}` 丢弃已发送一部分的帧响应,
+  并以 `cancelled` 错误应答该请求。取消请求本身的应答是 `{"type":"bridge_cancel","cancelled":<bool>}`;`false`
+  表示响应已经写出(或没有该 id 的请求在处理中)。`bridge.cancel` 无论是否启用帧都可使用。
 
 ## Socket 路径
 
