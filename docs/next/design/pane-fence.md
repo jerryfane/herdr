@@ -233,13 +233,16 @@ Until then signals stay a residual risk (section 13).
   reporting root (#426 review). No descriptor is passed, because portable-pty closes inherited descriptors
   before the helper runs (#428). The foreground process group read from the PTY master is already
   translated by the kernel into the server's PID namespace.
-- **PIDs that cross the boundary:** `pane.report_agent*` from a fenced caller carries a namespace-local
-  `agent_process_pid`, which may name a process other than the caller (`--agent-process-pid`). The server
-  translates the reported pid, not the caller's: it takes the caller's PID namespace
-  (`/proc/<peer>/ns/pid`) and looks for the process in that namespace whose `NSpid` line ends in the
-  reported value, scanning only the descendants of the caller's pane pid 1. Found: the host pid (first
-  `NSpid` field) is stored. Not found, or the caller is not in a pane's PID namespace: the field is
-  dropped with a diagnostic, never stored untranslated (#426 review).
+- **PIDs that cross the boundary:** `pane.report_agent*` carries an `agent_process_pid`, which may name a
+  process other than the caller (`--agent-process-pid`). The server compares the caller's PID namespace
+  (`/proc/<peer>/ns/pid`) with its own:
+  - **Same namespace** (unfenced callers, and fenced panes with `pid_namespace = false`, the default): the
+    reported pid is already a server pid and is stored as today.
+  - **A pane's PID namespace:** the server translates the reported pid, not the caller's. It looks among
+    the descendants of that pane's pid 1 for the process whose `NSpid` line ends in the reported value and
+    stores its host pid (the first `NSpid` field).
+  - **Not found, or another namespace no pane owns:** the field is dropped with a diagnostic, never stored
+    untranslated (#426 review).
 
 Effects on agents (sent to jarvis, gitmoot message 487802; the pilot decides on further changes):
 
