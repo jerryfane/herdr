@@ -588,7 +588,7 @@ impl View<'_> {
     ) -> Result<Page, TranscriptError> {
         let session_id = self.session_id().to_owned();
         let origins = origin::fingerprint(other_prompts);
-        let (start, end, changed_since, served_origins, served_floor) =
+        let (start, end, changed_since, served_origins, served_floor, issued_floor) =
             match (&request.before, &request.after) {
                 (Some(token), _) => {
                     let Cursor::Before { record, id } = Cursor::decode(token, &session_id)? else {
@@ -598,7 +598,7 @@ impl View<'_> {
                         .valid_record(record, &id)
                         .and_then(|record| self.position_of(record))
                         .ok_or(TranscriptError::CursorExpired)?;
-                    (self.page_start(end, limit), end, None, None, None)
+                    (self.page_start(end, limit), end, None, None, None, None)
                 }
                 (None, Some(token)) => {
                     let Cursor::After {
@@ -619,12 +619,19 @@ impl View<'_> {
                             .ok_or(TranscriptError::CursorExpired)?;
                     }
                     let start = self.branch.partition_point(|&record| record < seen);
-                    let floor = self.held_floor(request.held_from.as_deref(), &session_id, floor);
-                    (start, self.budget_end(start), Some(seen), origins, floor)
+                    let held = self.held_floor(request.held_from.as_deref(), &session_id, floor);
+                    (
+                        start,
+                        self.budget_end(start),
+                        Some(seen),
+                        origins,
+                        held,
+                        floor,
+                    )
                 }
                 (None, None) => {
                     let end = self.branch.len();
-                    (self.page_start(end, limit), end, None, None, None)
+                    (self.page_start(end, limit), end, None, None, None, None)
                 }
             };
         let mut entries = Vec::new();
@@ -634,16 +641,28 @@ impl View<'_> {
         // since it may have gone out unmarked. Entries before its floor are
         // history it has not loaded: an older page brings them marked, and a
         // client that got them here would show them after its newest turn.
+        // With the same prompts, history the client newly says it holds
+        // (`held_from` below the floor its cursor was issued with) may have
+        // been loaded before a mark the cursor already carries: re-send the
+        // marked entries of that newly held range only.
         let resend_origins = changed_since.is_some() && served_origins != Some(origins);
+        let floor_at = |floor: Option<u32>| {
+            self.branch
+                .partition_point(|&record| record < floor.unwrap_or(0))
+        };
+        let replay = if resend_origins {
+            Some(floor_at(served_floor)..start)
+        } else if changed_since.is_some() && served_floor < issued_floor {
+            Some(floor_at(served_floor)..floor_at(issued_floor).min(start))
+        } else {
+            None
+        };
         let mut others = None;
-        if resend_origins {
+        if let Some(range) = replay {
             let matched = self.other_user_turns(other_prompts)?;
-            let floor = self
-                .branch
-                .partition_point(|&record| record < served_floor.unwrap_or(0));
             for (position, _) in matched
                 .iter()
-                .filter(|(position, _)| (floor..start).contains(position))
+                .filter(|(position, _)| range.contains(position))
             {
                 self.render(*position, position + 1, &mut entries)?;
             }

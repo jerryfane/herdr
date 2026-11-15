@@ -2524,6 +2524,78 @@ fn scrolled_history_receives_late_origin_updates() {
     );
 }
 
+/// #434: the client scrolled in guest 2's older turn while its prompt was
+/// unconfirmed, but its next `after` poll left before the scroll landed and
+/// still said it held only the newest page. That poll consumed the changed
+/// fingerprint. The poll after it, saying it holds the whole session with the
+/// same prompts, must still bring the newly held entry's late mark, once.
+#[test]
+fn a_widened_floor_replays_late_origins_of_newly_held_history() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-widened");
+    let older_at = session.ms(session.next + 1);
+    session.user("guest 2: older question");
+    session.assistant(vec![text("older answer")], "stop");
+    let newer_at = session.ms(session.next + 1);
+    session.user("guest: newer question");
+    session.assistant(vec![text("newer answer")], "stop");
+    let newest = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    let older = read_page(
+        &session.path,
+        &PageRequest {
+            before: newest.before.clone(),
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&older),
+        vec![("guest 2: older question".into(), None)]
+    );
+    assert_eq!(older.before, None);
+
+    let delivered = vec![
+        OtherPrompt::new("guest 2: older question", older_at),
+        OtherPrompt::new("guest: newer question", newer_at),
+    ];
+    let poll = |after: &str, held_from: Option<String>| {
+        read_page(
+            &session.path,
+            &PageRequest {
+                after: Some(after.to_owned()),
+                held_from,
+                other_prompts: delivered.clone(),
+                ..PageRequest::default()
+            },
+        )
+        .unwrap()
+    };
+    // In flight before the older page landed: the newest page's window only.
+    let first = poll(&newest.after, newest.before.clone());
+    assert_eq!(
+        user_origins(&first),
+        vec![("guest: newer question".into(), Some(TurnOrigin::Other))]
+    );
+    // Same prompts, wider window: the newly held entry gets its mark.
+    let widened = poll(&first.after, Some(String::new()));
+    assert_eq!(
+        user_origins(&widened),
+        vec![("guest 2: older question".into(), Some(TurnOrigin::Other))]
+    );
+    // Nothing more once the window and the prompts are both as served.
+    let settled = poll(&widened.after, Some(String::new()));
+    assert!(user_origins(&settled).is_empty(), "{:?}", settled.entries);
+}
+
 #[test]
 fn an_after_page_does_not_resend_an_unmarked_user_entry() {
     let mut session = Fixture::new("origin-unmarked");
