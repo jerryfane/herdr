@@ -44,9 +44,12 @@ until "$HERDR" pane list >/dev/null 2>&1; do
 done
 
 pane_ids() { "$HERDR" pane list | grep -o '"pane_id":"[^"]*"' | cut -d'"' -f4; }
+# A headless server starts with no workspace; create one in the denied directory so
+# its shell inherits a cwd inside the fence (exercises the cwd re-resolve), then
+# split it so a second spawn path is covered too.
+"$HERDR" workspace create --cwd /fleet/protected --label fence-test >/dev/null
 FIRST=$(pane_ids | head -n1)
-[ -n "$FIRST" ] || { echo "no pane"; exit 1; }
-# Fresh pane started under the fence (the first pane may predate nothing, but split makes the case explicit).
+[ -n "$FIRST" ] || { echo "no pane"; cat "$OUT/server.log"; exit 1; }
 "$HERDR" pane split --direction right --cwd /fleet/protected "$FIRST" >/dev/null
 PANE=$(pane_ids | grep -vx "$FIRST" | head -n1)
 [ -n "$PANE" ] || { echo "split pane missing"; exit 1; }
