@@ -938,12 +938,19 @@ impl View<'_> {
     /// lowered to the oldest history the client says it holds (`held_from`).
     /// A legacy cursor without a floor already re-sends from the start; a
     /// `held_from` this file did not issue is ignored.
-    fn held_floor(&self, held_from: Option<&str>, session_id: &str, floor: Option<u32>) -> Option<u32> {
+    fn held_floor(
+        &self,
+        held_from: Option<&str>,
+        session_id: &str,
+        floor: Option<u32>,
+    ) -> Option<u32> {
         let held = match held_from {
             None => return floor,
             Some("") => 0,
             Some(token) => match Cursor::decode(token, session_id) {
-                Ok(Cursor::Before { record, id }) if self.valid_record(record, &id).is_some() => record,
+                Ok(Cursor::Before { record, id }) if self.valid_record(record, &id).is_some() => {
+                    record
+                }
                 _ => return floor,
             },
         };
