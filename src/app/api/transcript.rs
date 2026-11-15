@@ -118,6 +118,7 @@ fn transcript_response(
         before: params.before,
         after: params.after,
         limit: params.limit,
+        max_bytes: params.max_bytes,
         subagent: params.subagent,
     };
     match agent_transcript::read_page(&source.path, &request) {
@@ -155,6 +156,7 @@ mod tests {
             before: None,
             after: after.map(str::to_owned),
             limit: None,
+            max_bytes: None,
             subagent: None,
         };
         serde_json::from_str(&transcript_response("t".into(), source, params)).unwrap()

@@ -444,6 +444,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 gram_reachable: false,
+                transcript_max_bytes: false,
             }),
         }
     }

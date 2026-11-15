@@ -125,4 +125,9 @@ pub struct ServerCapabilities {
     /// keep offering every live agent.
     #[serde(default)]
     pub gram_reachable: bool,
+    /// `agent.transcript` honours `max_bytes`: a newest or `before` page keeps
+    /// only its newest entries whose JSON fits. Older servers ignore the param
+    /// and page by turns alone.
+    #[serde(default)]
+    pub transcript_max_bytes: bool,
 }
