@@ -290,10 +290,9 @@ fn run_multi<R: BufRead, W: Write + Send>(
     teardown: &Teardown,
 ) -> io::Result<()> {
     let outbox = Outbox::default();
-    // Up to MULTI_MAX_IN_FLIGHT more requests wait here for a worker, so the
-    // reader keeps reading (and answering `bridge.cancel`) while every worker
-    // is busy. Past that bound the reader blocks until a worker frees up, as
-    // before: a cancel sent behind a full queue waits with it.
+    // Up to MULTI_MAX_IN_FLIGHT more requests wait here for a worker. The
+    // reader never blocks on it: a request arriving with the queue full is
+    // answered `busy` at once, so `bridge.cancel` is read at any load.
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<MultiJob>(MULTI_MAX_IN_FLIGHT);
     let jobs_rx = Mutex::new(jobs_rx);
     let output_error = Mutex::new(None::<io::Error>);
@@ -439,10 +438,24 @@ fn read_requests<R: BufRead>(
             id,
             key,
         };
-        if jobs.send(job).is_err() {
-            outbox.end(key);
-            // Every worker is gone (only possible if they all panicked).
-            return Err(io::Error::other("api-bridge: request workers stopped"));
+        match jobs.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(job)) => {
+                // Never block the reader on admission: it must stay free to
+                // read `bridge.cancel` at any load. The client retries later.
+                outbox.end(job.key);
+                send_error(
+                    outbox,
+                    &job.id,
+                    "busy",
+                    "api-bridge: too many requests in flight; retry once one finishes",
+                )?;
+            }
+            Err(mpsc::TrySendError::Disconnected(job)) => {
+                outbox.end(job.key);
+                // Every worker is gone (only possible if they all panicked).
+                return Err(io::Error::other("api-bridge: request workers stopped"));
+            }
         }
     }
 }
@@ -735,6 +748,18 @@ mod tests {
         }
     }
 
+    /// Waits until the server has accepted `count` requests.
+    fn wait_for_requests(server: &FakeApiServer, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.stats.requests.load(Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "server saw fewer than {count} requests"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     impl Drop for FakeApiServer {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
@@ -811,15 +836,18 @@ mod tests {
     #[test]
     fn multi_answers_every_request_with_bounded_concurrency() {
         let server = FakeApiServer::start("many");
-        let input: String = (0..48)
+        // No more than the queue holds, so none is refused however slowly the
+        // workers start.
+        let total = MULTI_MAX_IN_FLIGHT;
+        let input: String = (0..total)
             .map(|n| request(&format!("r{n}"), "ping", 50) + "\n")
             .collect();
 
         let responses = run(&input, &server.path);
 
         let got: HashSet<&str> = ids(&responses).into_iter().collect();
-        let want: Vec<String> = (0..48).map(|n| format!("r{n}")).collect();
-        assert_eq!(responses.len(), 48);
+        let want: Vec<String> = (0..total).map(|n| format!("r{n}")).collect();
+        assert_eq!(responses.len(), total);
         assert_eq!(got, want.iter().map(String::as_str).collect());
         for response in &responses {
             assert_eq!(response["result"]["method"], "ping");
@@ -1445,6 +1473,7 @@ mod tests {
         for slot in 0..MULTI_MAX_IN_FLIGHT {
             bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
         }
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
         bridge.send(&request("next", "ping", 0));
         bridge.send(&cancel("c", "slow0"));
         let mut replies = [bridge.read_line(), bridge.read_line(), bridge.read_line()];
@@ -1462,6 +1491,60 @@ mod tests {
         }
         for _ in 1..MULTI_MAX_IN_FLIGHT {
             bridge.read_line();
+            bridge.read_line();
+        }
+        bridge.finish();
+    }
+
+    /// At the real boundary (every worker busy, the queue full, one more
+    /// request arriving) the reader stays free: the extra request is answered
+    /// `busy` at once and a cancel for an active request is answered promptly,
+    /// freeing a slot for the next request.
+    #[test]
+    fn multi_cancel_is_read_with_every_worker_busy_and_the_queue_full() {
+        let server = FakeApiServer::start("cancel-overload");
+        let mut bridge = LiveBridge::start(&server.path, Duration::ZERO);
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("slow{slot}"), "agent.wait", 10_000));
+        }
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT);
+        for slot in 0..MULTI_MAX_IN_FLIGHT {
+            bridge.send(&request(&format!("queued{slot}"), "agent.wait", 10_000));
+        }
+        bridge.send(&request("extra", "ping", 0));
+        let busy = bridge.read_line();
+        assert_eq!(busy["id"], "extra");
+        assert_eq!(busy["error"]["code"], "busy");
+
+        let started = Instant::now();
+        bridge.send(&cancel("c", "slow0"));
+        let mut replies = [bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        assert_eq!(replies[0]["id"], "c");
+        assert_eq!(replies[0]["result"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "slow0");
+        assert_eq!(replies[1]["error"]["code"], "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // The freed worker took a queued request, so one more is admitted
+        // (queued, not refused): cancelling it finds it.
+        wait_for_requests(&server, MULTI_MAX_IN_FLIGHT + 1);
+        bridge.send(&request("admitted", "agent.wait", 10_000));
+        bridge.send(&cancel("ca", "admitted"));
+        let admitted = bridge.read_line();
+        assert_eq!(admitted["id"], "ca");
+        assert_eq!(admitted["result"]["cancelled"], true);
+
+        // Its `cancelled` error comes once a worker reaches it.
+        let rest = (1..MULTI_MAX_IN_FLIGHT)
+            .map(|slot| format!("slow{slot}"))
+            .chain((0..MULTI_MAX_IN_FLIGHT).map(|slot| format!("queued{slot}")));
+        let mut pending = 1;
+        for id in rest {
+            bridge.send(&cancel(&format!("c-{id}"), &id));
+            pending += 2;
+        }
+        for _ in 0..pending {
             bridge.read_line();
         }
         bridge.finish();

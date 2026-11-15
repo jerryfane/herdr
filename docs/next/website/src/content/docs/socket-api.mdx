@@ -701,8 +701,10 @@ through an SSH exec channel can avoid starting a process per request with
 report `capabilities.api_bridge_multi: true` from `ping`):
 
 - Write one request per line to the bridge's stdin. Each runs on its own socket
-  connection, up to 16 at a time; with all 16 busy, the bridge stops reading
-  stdin until one finishes.
+  connection, up to 16 at a time; up to 16 more wait for a free slot. The bridge
+  never stops reading stdin: a request arriving while 16 run and 16 wait gets a
+  `busy` error at once (retry it once a response arrives), so `bridge.cancel`
+  is always read promptly.
 - Every response line is written to stdout whole and unchanged. Responses can
   arrive out of order, so match them by `id`.
 - `events.subscribe`, `pane.stream`, `pane.input.stream`, `gram.upload.stream`

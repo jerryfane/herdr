@@ -527,8 +527,9 @@ Socket 每个连接只响应一个请求。通过 SSH exec 通道访问它的远
 避免为每个请求启动一个进程(适用于 Unix 和 Windows;支持该模式的服务器会在 `ping` 中返回
 `capabilities.api_bridge_multi: true`):
 
-- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个;16 个都在处理时,
-  桥接进程会暂停读取 stdin,直到其中一个完成。
+- 每行向桥接进程的 stdin 写入一个请求。每个请求使用各自的 socket 连接,最多同时运行 16 个,另有最多 16 个
+  等待空位。桥接进程从不停止读取 stdin:在 16 个运行、16 个等待时到达的请求会立即收到 `busy` 错误(收到某个响应后再重试),
+  因此 `bridge.cancel` 总能被及时读取。
 - 每个响应行都会完整、原样地写入 stdout。响应可能乱序到达,请按 `id` 匹配。
 - `events.subscribe`、`pane.stream`、`pane.input.stream`、`gram.upload.stream` 和
   `server.ssh_agent.register` 会保持连接打开,因此桥接进程会对它们返回 `unsupported_method` 错误。
