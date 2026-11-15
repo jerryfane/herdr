@@ -67,6 +67,9 @@ pub(super) struct Outbox {
 #[derive(Default)]
 struct State {
     framed: bool,
+    /// A `bridge.hello` asked for frames: replies written after the first
+    /// hello reply that says so are framed.
+    frames_requested: bool,
     /// Every reply not yet fully written, in arrival order. The writer serves
     /// them round robin from `cursor`; a reply waits behind an earlier one
     /// with the same id, so one id's replies never interleave.
@@ -107,7 +110,8 @@ struct Reply {
     /// Bytes of this reply the writer is writing right now, outside the lock.
     in_write: usize,
     cancelled: bool,
-    /// The `bridge.hello` reply that switches to frames once written.
+    /// A `bridge.hello` reply that says `frames: true`: replies written
+    /// after it are framed.
     switches_to_frames: bool,
     /// Who learns how it left the bridge.
     waiter: Waiter,
@@ -135,9 +139,37 @@ impl Outbox {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether replies are framed (the client's `bridge.hello` was answered).
-    pub(super) fn framed(&self) -> bool {
-        self.state().framed
+    /// Queues the `bridge.hello` reply without waiting for it to be written,
+    /// so the reader stays free to read `bridge.cancel` while output is
+    /// backed up. `reply` builds it from whether replies written after it
+    /// are framed: once any hello asked for frames, every hello reply says so
+    /// and switches to frames when written, never before. The first such
+    /// reply is never dropped; any other is a posted reply, dropped past
+    /// [`MAX_POSTED`]. Fails once output has failed.
+    pub(super) fn post_hello(
+        &self,
+        id: &str,
+        frames: bool,
+        reply: impl FnOnce(bool) -> Vec<u8>,
+    ) -> io::Result<()> {
+        let mut state = self.state();
+        if state.failed {
+            return Err(output_gone());
+        }
+        let first = frames && !state.frames_requested;
+        state.frames_requested |= frames;
+        let framed = state.frames_requested;
+        if first {
+            state.owed += 1;
+            state.push(None, id, reply(framed), framed, Waiter::Owed);
+        } else if state.posted < MAX_POSTED {
+            state.posted += 1;
+            state.push(None, id, reply(framed), framed, Waiter::Posted);
+        } else {
+            return Ok(());
+        }
+        self.changed.notify_all();
+        Ok(())
     }
 
     /// Registers a request under `id` until [`Outbox::end`].
@@ -254,12 +286,7 @@ impl Outbox {
         id: &str,
         line: Vec<u8>,
     ) -> io::Result<Delivery> {
-        self.enqueue(key, id, line, false)
-    }
-
-    /// Queues the `bridge.hello` reply; replies written after it are framed.
-    pub(super) fn send_switch_to_frames(&self, id: &str, line: Vec<u8>) -> io::Result<Delivery> {
-        self.enqueue(None, id, line, true)
+        self.enqueue(key, id, line)
     }
 
     /// Queues `line` (one reply to refused work, without its newline) for
@@ -301,13 +328,7 @@ impl Outbox {
         self.state().owed < MAX_OWED
     }
 
-    fn enqueue(
-        &self,
-        key: Option<RequestKey>,
-        id: &str,
-        bytes: Vec<u8>,
-        switches_to_frames: bool,
-    ) -> io::Result<Delivery> {
+    fn enqueue(&self, key: Option<RequestKey>, id: &str, bytes: Vec<u8>) -> io::Result<Delivery> {
         let mut state = self.state();
         if state.failed {
             return Err(output_gone());
@@ -320,7 +341,7 @@ impl Outbox {
         }) {
             return Ok(Delivery::Cancelled);
         }
-        let ticket = state.push(key, id, bytes, switches_to_frames, Waiter::Producer);
+        let ticket = state.push(key, id, bytes, false, Waiter::Producer);
         self.changed.notify_all();
         loop {
             if let Some(delivery) = state.finished.remove(&ticket) {
