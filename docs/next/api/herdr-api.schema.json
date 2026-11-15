@@ -2208,6 +2208,13 @@
                 "null"
               ]
             },
+            "held_from": {
+              "description": "With `after`: the `before` cursor of the oldest page the client\nholds, or `\"\"` when it holds the session from its start, so origin\nmarks that changed are re-sent for the history it scrolled in too.\nOlder servers ignore it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "limit": {
               "format": "uint32",
               "minimum": 0,
