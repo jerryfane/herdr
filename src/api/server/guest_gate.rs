@@ -3586,6 +3586,7 @@ mod tests {
                     after: None,
                     limit: None,
                     max_bytes: None,
+                    held_from: None,
                     subagent: None,
                 }),
             },
