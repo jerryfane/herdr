@@ -625,6 +625,25 @@ pub(crate) fn begin_cli_output() {}
 #[cfg(not(unix))]
 pub(crate) fn end_cli_output() {}
 
+/// The pane fence is Linux-only; elsewhere `[fence] enabled` logs a warning and
+/// panes start unfenced (docs/next/design/pane-fence.md, section 15).
+#[cfg(not(target_os = "linux"))]
+pub(crate) const FENCE_SUPPORTED: bool = false;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) const FENCE_HELPER_PROGRAM: &str = "";
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fence_exec(
+    _plan: &crate::fence::FencePlan,
+    _notice: &str,
+    _program: &std::ffi::OsStr,
+    _argv0: &std::ffi::OsStr,
+    _args: &[std::ffi::OsString],
+) -> std::io::Error {
+    std::io::Error::other("the pane fence is Linux-only")
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

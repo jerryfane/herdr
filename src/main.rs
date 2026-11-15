@@ -24,6 +24,7 @@ mod config;
 mod copy_mode;
 mod detect;
 mod events;
+mod fence;
 use ghostty_vt as ghostty;
 #[cfg(unix)]
 mod guest;
@@ -516,6 +517,15 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // The pane fence helper runs in a pane's child process before the pane command;
+    // it must not touch config, logging or sessions (docs/next/design/pane-fence.md).
+    {
+        let mut args_os = std::env::args_os().skip(1);
+        if args_os.next().as_deref() == Some(std::ffi::OsStr::new(fence::FENCE_EXEC_SUBCOMMAND)) {
+            let rest: Vec<std::ffi::OsString> = args_os.collect();
+            fence::run_fence_exec(&rest);
+        }
+    }
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {
