@@ -61,6 +61,10 @@ pub(crate) struct PageRequest {
     /// The pane's remembered non-owner prompts, oldest first; their user
     /// turns are marked `origin: "other"`. Ignored for subagent pages.
     pub(crate) other_prompts: Vec<OtherPrompt>,
+    /// With `after`: the `before` cursor of the oldest page the client holds,
+    /// or `""` when it holds the session from its start. Origin marks that
+    /// changed are re-sent from there instead of from the cursor's floor.
+    pub(crate) held_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -615,6 +619,7 @@ impl View<'_> {
                             .ok_or(TranscriptError::CursorExpired)?;
                     }
                     let start = self.branch.partition_point(|&record| record < seen);
+                    let floor = self.held_floor(request.held_from.as_deref(), &session_id, floor);
                     (start, self.budget_end(start), Some(seen), origins, floor)
                 }
                 (None, None) => {
@@ -927,6 +932,22 @@ impl View<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// The floor an `after` page re-sends origin marks from: the cursor's,
+    /// lowered to the oldest history the client says it holds (`held_from`).
+    /// A legacy cursor without a floor already re-sends from the start; a
+    /// `held_from` this file did not issue is ignored.
+    fn held_floor(&self, held_from: Option<&str>, session_id: &str, floor: Option<u32>) -> Option<u32> {
+        let held = match held_from {
+            None => return floor,
+            Some("") => 0,
+            Some(token) => match Cursor::decode(token, session_id) {
+                Ok(Cursor::Before { record, id }) if self.valid_record(record, &id).is_some() => record,
+                _ => return floor,
+            },
+        };
+        floor.map(|floor| floor.min(held))
     }
 
     fn valid_record(&self, record: u32, id: &str) -> Option<u32> {

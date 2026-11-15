@@ -2462,6 +2462,67 @@ fn an_after_page_resends_marked_entries_only_from_the_clients_window() {
     );
 }
 
+/// The client read the newest turn, then scrolled in the older one while
+/// both prompts were still unconfirmed. Once both are delivered, its next
+/// `after` poll (on the newest page's cursor, saying it holds the session
+/// from its start) gets both entries back marked, not only the newest.
+#[test]
+fn scrolled_history_receives_late_origin_updates() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-scrolled");
+    let first_at = session.ms(session.next + 1);
+    session.user("guest: first question");
+    session.assistant(vec![text("first answer")], "stop");
+    let second_at = session.ms(session.next + 1);
+    session.user("guest: second question");
+    session.assistant(vec![text("second answer")], "stop");
+    let newest = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    let older = read_page(
+        &session.path,
+        &PageRequest {
+            before: newest.before.clone(),
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&older),
+        vec![("guest: first question".into(), None)]
+    );
+    assert_eq!(older.before, None, "the client now holds the whole session");
+
+    let delivered = vec![
+        OtherPrompt::new("guest: first question", first_at),
+        OtherPrompt::new("guest: second question", second_at),
+    ];
+    let next = read_page(
+        &session.path,
+        &PageRequest {
+            after: Some(newest.after.clone()),
+            held_from: Some(older.before.clone().unwrap_or_default()),
+            other_prompts: delivered,
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&next),
+        vec![
+            ("guest: first question".into(), Some(TurnOrigin::Other)),
+            ("guest: second question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+}
+
 #[test]
 fn an_after_page_does_not_resend_an_unmarked_user_entry() {
     let mut session = Fixture::new("origin-unmarked");

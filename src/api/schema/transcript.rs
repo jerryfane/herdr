@@ -24,6 +24,12 @@ cli_params! {
         /// advertise `capabilities.transcript_max_bytes`; older ones ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_bytes: Option<u32> => Field::new(None).input(bindings::transcript_max_bytes()),
+        /// With `after`: the `before` cursor of the oldest page the client
+        /// holds, or `""` when it holds the session from its start, so origin
+        /// marks that changed are re-sent for the history it scrolled in too.
+        /// Older servers ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub held_from: Option<String> => Field::new(None::<String>),
     }
 }
 
