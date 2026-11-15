@@ -224,14 +224,22 @@ Until then signals stay a residual risk (section 13).
   without a handler to a namespace's pid 1 from inside the namespace, so `kill -9 -1` inside the pane cannot
   remove it (probe P-48).
 - **What the server tracks:** the pane's child pid is the outer helper. Cwd and process reporting
-  (`/proc/<pid>/cwd`, `pane.process_info`) must follow the pane command's host pid. The server finds it
-  from `/proc/<outer helper>/task/<tid>/children` (pid 1 of the namespace, then its one child) when it
-  needs it; no descriptor is passed, because portable-pty closes inherited descriptors before the helper
-  runs (#428). The foreground process group read from the PTY master is already translated by the kernel
-  into the server's PID namespace.
+  (`/proc/<pid>/cwd`, `pane.process_info`) must follow the pane command's host pid. That command has a
+  fixed identity: it is the first and only process pid 1 forks, so it is pid **2** inside the pane's PID
+  namespace for its whole life (the namespace ends when it exits, so pid 2 is never reused). The server
+  finds pid 1 as the outer helper's child (`/proc/<outer helper>/task/<tid>/children`) and then, among
+  pid 1's children, the one whose `NSpid` line in `/proc/<pid>/status` ends in `2`. Adopted orphans (a
+  double-forked daemon) are also children of pid 1 but never pid 2, so they cannot become the pane's
+  reporting root (#426 review). No descriptor is passed, because portable-pty closes inherited descriptors
+  before the helper runs (#428). The foreground process group read from the PTY master is already
+  translated by the kernel into the server's PID namespace.
 - **PIDs that cross the boundary:** `pane.report_agent*` from a fenced caller carries a namespace-local
-  `agent_process_pid`; the server translates it with the caller's `NSpid` line in `/proc/<peer>/status`
-  before storing it.
+  `agent_process_pid`, which may name a process other than the caller (`--agent-process-pid`). The server
+  translates the reported pid, not the caller's: it takes the caller's PID namespace
+  (`/proc/<peer>/ns/pid`) and looks for the process in that namespace whose `NSpid` line ends in the
+  reported value, scanning only the descendants of the caller's pane pid 1. Found: the host pid (first
+  `NSpid` field) is stored. Not found, or the caller is not in a pane's PID namespace: the field is
+  dropped with a diagnostic, never stored untranslated (#426 review).
 
 Effects on agents (sent to jarvis, gitmoot message 487802; the pilot decides on further changes):
 
