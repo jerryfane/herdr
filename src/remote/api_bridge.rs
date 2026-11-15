@@ -1397,7 +1397,10 @@ mod tests {
         let replies = bridge.read_replies(1);
         let big = reply(&replies, "big").as_ref().unwrap();
         assert_eq!(big["id"], "big");
-        assert_eq!(big["result"]["pad"].as_str().unwrap().len(), 3 * FRAME_BYTES);
+        assert_eq!(
+            big["result"]["pad"].as_str().unwrap().len(),
+            3 * FRAME_BYTES
+        );
         bridge.finish();
     }
 
@@ -1441,10 +1444,13 @@ mod tests {
 
         let replies = bridge.read_replies(3);
         let order: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(*reply(&replies, "c"), Some(json!({
-            "id": "c",
-            "result": {"type": "bridge_cancel", "cancelled": true},
-        })));
+        assert_eq!(
+            *reply(&replies, "c"),
+            Some(json!({
+                "id": "c",
+                "result": {"type": "bridge_cancel", "cancelled": true},
+            }))
+        );
         // The partial reply is dropped, then its `cancelled` error follows.
         let big: Vec<&Option<Value>> = replies
             .iter()

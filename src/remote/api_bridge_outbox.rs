@@ -237,7 +237,12 @@ impl Outbox {
         if state.failed {
             return Err(output_gone());
         }
-        if key.is_some_and(|key| state.active.get(&key).is_some_and(|active| active.cancelled)) {
+        if key.is_some_and(|key| {
+            state
+                .active
+                .get(&key)
+                .is_some_and(|active| active.cancelled)
+        }) {
             return Ok(Delivery::Cancelled);
         }
         let ticket = state.next_ticket;
