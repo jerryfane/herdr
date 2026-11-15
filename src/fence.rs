@@ -823,7 +823,7 @@ mod tests {
             &[herdr.to_str().unwrap(), herdr.join("sub").to_str().unwrap()],
             &[],
         );
-        let plan = resolve_plan(&cfg, &root, &[herdr.clone()]);
+        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&herdr));
         assert!(
             !plan
                 .mounts
@@ -847,7 +847,7 @@ mod tests {
         let srv = root.join("srv");
         let project = root.join("srv/project");
         let cfg = config(&[srv.to_str().unwrap()], &[project.to_str().unwrap()], &[]);
-        let plan = resolve_plan(&cfg, &root, &[config_file.clone()]);
+        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&config_file));
         let allow = position(&plan, &FenceMount::Allow(project));
         let file_deny = position(&plan, &FenceMount::Deny(config_file));
         assert!(allow < file_deny, "{:?}", plan.mounts);
