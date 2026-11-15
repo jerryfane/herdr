@@ -18786,6 +18786,11 @@
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
               "type": "boolean"
             },
+            "pane_stream_resync": {
+              "default": false,
+              "description": "`pane.stream` waits out a slow reader (60 s without progress instead of\n5 s), sends a reader that falls behind a `lagged` keyframe instead of\nthe backlog, and ends with a `stream_stalled` or `stream_failed` error\nline instead of closing without a word.",
+              "type": "boolean"
+            },
             "rename_preconditions": {
               "default": false,
               "description": "`agent.rename` enforces `expected_name` and `expect_inactive`. Older\nservers ignore both fields and rename unconditionally, so a caller must\nsee this before relying on them.",

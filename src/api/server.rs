@@ -221,6 +221,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ask_form: true,
         gram_reachable: true,
         transcript_max_bytes: true,
+        pane_stream_resync: true,
     })
 }
 
@@ -3713,6 +3714,7 @@ mod tests {
                 ask_form: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
+                pane_stream_resync: false,
             }),
             None,
             None,
@@ -4529,6 +4531,7 @@ mod tests {
             value["result"]["capabilities"]["transcript_max_bytes"],
             true
         );
+        assert_eq!(value["result"]["capabilities"]["pane_stream_resync"], true);
     }
 
     /// Callers check this before sending `agent.rename` preconditions, which

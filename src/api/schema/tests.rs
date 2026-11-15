@@ -1200,6 +1200,7 @@ fn success_response_round_trips() {
                 ask_form: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
+                pane_stream_resync: false,
             }),
         },
     };
