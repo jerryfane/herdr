@@ -2684,6 +2684,18 @@ mod tests {
         const PEER: &str = "8195b6326f748f4da1945364a4e205b9";
         const COORDINATOR: &str = "machine_f872cca4c7743d39c1fad1fa5a74a087";
 
+        /// Every test here repoints `XDG_CONFIG_HOME` and the config path and
+        /// reloads the process-wide relay policy, so it holds the config env
+        /// lock for its whole run. Without it, under `cargo test` threads it
+        /// swaps the config home out from under the other env-locked tests.
+        /// Serialized, each test also starts from an empty policy (see
+        /// [`app_with_config_file`]), not the one the previous test left.
+        fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+            crate::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
         fn app_with_config_file() -> (App, std::path::PathBuf) {
             let tmp = std::env::temp_dir().join(format!(
                 "herdr-gram-relay-reload-{}-{}",
@@ -2697,6 +2709,7 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &tmp);
             std::env::remove_var(crate::api::gram_relay::PEERS_ENV);
             std::env::remove_var(crate::api::gram_relay::SOCKET_ENV);
+            crate::api::gram_relay::apply_config(&crate::config::Config::default().gram_relay);
             let path = tmp.join("config.toml");
             std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
             let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2745,6 +2758,7 @@ mod tests {
 
         #[test]
         fn reload_grants_then_revokes_a_peer_without_restart() {
+            let _env = env_lock();
             let (mut app, path) = app_with_config_file();
             assert_eq!(relay_list(&mut app)["error"]["code"], "forbidden");
 
@@ -2771,6 +2785,7 @@ mod tests {
 
         #[test]
         fn explicit_empty_peers_revoke_a_peer_the_legacy_env_still_names() {
+            let _env = env_lock();
             let (mut app, path) = app_with_config_file();
             std::env::set_var(crate::api::gram_relay::PEERS_ENV, PEER);
             reload(
@@ -2793,6 +2808,7 @@ mod tests {
 
         #[test]
         fn invalid_reload_keeps_the_previous_effective_setting() {
+            let _env = env_lock();
             let (mut app, path) = app_with_config_file();
             reload(
                 &mut app,
@@ -2821,6 +2837,7 @@ mod tests {
 
         #[test]
         fn remote_socket_follows_reload() {
+            let _env = env_lock();
             let (mut app, path) = app_with_config_file();
             let own = crate::persist::machine::get_or_create();
             reload(
@@ -2947,6 +2964,7 @@ mod tests {
 
         #[test]
         fn agent_list_says_which_peers_gram_post_can_reach() {
+            let _env = env_lock();
             let (mut app, _path) = coordinator_with_unlisted_peer();
             assert_eq!(
                 gram_reachable_rows(&mut app),
@@ -2960,6 +2978,7 @@ mod tests {
 
         #[test]
         fn gram_reachable_follows_reload() {
+            let _env = env_lock();
             let (mut app, path) = coordinator_with_unlisted_peer();
             reload(
                 &mut app,
@@ -2988,6 +3007,7 @@ mod tests {
         /// to a row marked unreachable is rejected exactly as before.
         #[test]
         fn gram_post_accepts_exactly_the_rows_marked_gram_reachable() {
+            let _env = env_lock();
             let (mut app, _path) = coordinator_with_unlisted_peer();
             let unlisted = format!("{UNLISTED_PEER}/builder");
             let rejected = post_to(&mut app, &unlisted);
@@ -3024,6 +3044,7 @@ mod tests {
 
         #[test]
         fn a_relayed_guest_post_reaches_the_remote_agent_with_its_file() {
+            let _env = env_lock();
             let mut app = coordinator();
             let staged = relay(
                 &mut app,
@@ -3070,6 +3091,7 @@ mod tests {
 
         #[test]
         fn relayed_posts_are_only_guest_posts_to_the_peers_own_agents() {
+            let _env = env_lock();
             let mut app = coordinator();
             for call in [
                 guest_post("llm-opt", ""),
@@ -3088,6 +3110,7 @@ mod tests {
 
         #[test]
         fn a_relayed_gram_carries_its_machine_label_to_lists_and_the_owner_push() {
+            let _env = env_lock();
             let mut app = coordinator();
             app.state.push_config = crate::config::PushConfig {
                 mode: crate::config::PushMode::Direct,
