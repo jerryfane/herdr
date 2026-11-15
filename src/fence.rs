@@ -227,19 +227,33 @@ fn startup_fence_from_str(content: &str) -> StartupFence {
                 Err(err) => StartupFence::Invalid(format!("invalid [fence]: {err}")),
             },
         },
-        // Unparsable file: whether it asks for a fence is unknown, so assume it does
-        // when a [fence] header is present.
+        // Unparsable file: whether it asks for a fence is unknown. Treat any line that
+        // could define the `fence` key (in any TOML spelling) as a fence request and
+        // fail closed; a file that never mentions it keeps today's behavior.
         Err(err) => {
-            let mentions_fence = content
-                .lines()
-                .any(|line| line.trim_start().starts_with("[fence"));
-            if mentions_fence {
+            if content.lines().any(line_may_define_fence) {
                 StartupFence::Invalid(format!("config.toml does not parse: {err}"))
             } else {
                 StartupFence::NotConfigured
             }
         }
     }
+}
+
+/// True when a TOML line could start a table or key whose first key is `fence`:
+/// `[fence]`, `[ fence ]`, `["fence"]`, `['fence']`, `[fence.x]`, `[[fence]]`,
+/// `fence.enabled = …`, `"fence" = {…}`. Over-matching is safe here: it only turns an
+/// already unparsable file into a refused spawn.
+fn line_may_define_fence(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    while let Some(after) = rest.strip_prefix('[') {
+        rest = after.trim_start();
+    }
+    let key = rest
+        .strip_prefix("\"fence\"")
+        .or_else(|| rest.strip_prefix("'fence'"))
+        .or_else(|| rest.strip_prefix("fence"));
+    key.is_some_and(|after| matches!(after.trim_start().chars().next(), Some(']' | '.' | '=')))
 }
 
 fn current_policy() -> Policy {
@@ -877,6 +891,32 @@ mod tests {
             startup_fence_from_str("[fence]\nenabled = true\n[[broken\n"),
             StartupFence::Invalid(_)
         ));
+        // Every TOML spelling of the fence key, in a file that does not parse.
+        for fence in [
+            "[ fence ]\nenabled = true",
+            "[\"fence\"]\nenabled = true",
+            "['fence']\nenabled = true",
+            "fence.enabled = true",
+            "\"fence\".enabled = true",
+            "fence = { enabled = true }",
+        ] {
+            let content = format!("{fence}\n[ui]\nsidebar_width = [\n");
+            assert!(
+                matches!(startup_fence_from_str(&content), StartupFence::Invalid(_)),
+                "{fence:?} in an unparsable file must fail closed"
+            );
+        }
+        // An unparsable file that never mentions the fence keeps today's behavior.
+        for content in [
+            "[ui]\nsidebar_width = [\n",
+            "fences = 1\n[[broken\n",
+            "[fencing]\n[[x\n",
+        ] {
+            assert!(
+                matches!(startup_fence_from_str(content), StartupFence::NotConfigured),
+                "{content:?}"
+            );
+        }
     }
 
     #[test]
