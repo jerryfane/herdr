@@ -1183,6 +1183,117 @@ fn max_bytes_is_ignored_on_after_pages_and_large_budgets_change_nothing() {
     assert_eq!(after.after, page.after);
 }
 
+/// Walks a session back by `max_bytes` pages, oldest entry first.
+fn walk_budget_pages(session: &Fixture, max_bytes: u32, others: &[OtherPrompt]) -> Vec<Page> {
+    let mut pages = Vec::new();
+    let mut before = None;
+    loop {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                before,
+                max_bytes: Some(max_bytes),
+                other_prompts: others.to_vec(),
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        before = page.before.clone();
+        pages.push(page);
+        if before.is_none() {
+            break;
+        }
+    }
+    pages.reverse();
+    pages
+}
+
+/// The budget covers the entries array as sent: origins marked, brackets and
+/// commas counted. Every record here renders one entry, so only a page of
+/// one entry may go over.
+#[test]
+fn max_bytes_budgets_the_final_array_with_origins_and_delimiters() {
+    let mut session = Fixture::new("max-bytes-final");
+    let first_at = session.ms(session.next + 1);
+    session.user("first automation prompt");
+    let second_at = session.ms(session.next + 1);
+    session.user("second automation prompt");
+    session.user("an owner prompt");
+    let others = vec![
+        OtherPrompt::new("first automation prompt", first_at),
+        OtherPrompt::new("second automation prompt", second_at),
+    ];
+    for prompts in [Vec::new(), others] {
+        for max_bytes in 2..400 {
+            for page in walk_budget_pages(&session, max_bytes, &prompts) {
+                let len = entries_json_len(&page.entries);
+                assert!(
+                    len <= max_bytes as usize || page.entries.len() == 1,
+                    "{len} bytes over a budget of {max_bytes}: {:?}",
+                    page.entries
+                );
+            }
+        }
+    }
+}
+
+fn todo_update(session: &mut Fixture, call_id: &str, status: &str, padding: usize) {
+    session.assistant(vec![call(call_id, "todo", None, json!({}))], "toolUse");
+    session.result(
+        call_id,
+        "todo",
+        false,
+        json!({"phases": [{"name": "p", "tasks": [
+            {"content": "a", "status": status},
+            {"content": "x".repeat(padding), "status": "pending"},
+        ]}]}),
+    );
+}
+
+/// A turn's plan keeps one place across byte pages: walking back gives the
+/// unbudgeted sequence, every entry once.
+#[test]
+fn max_bytes_pages_keep_each_plan_in_one_place() {
+    let mut session = Fixture::new("max-bytes-plan");
+    session.user("plan it");
+    todo_update(&mut session, "t1", "in_progress", 0);
+    session.assistant(vec![text(&"r".repeat(1_000))], "toolUse");
+    todo_update(&mut session, "t2", "completed", 0);
+    let whole = session.newest().entries;
+
+    let walked: Vec<TranscriptEntry> = walk_budget_pages(&session, 300, &[])
+        .into_iter()
+        .flat_map(|page| page.entries)
+        .collect();
+    let walked_ids = ids(&walked);
+    let unique: HashSet<_> = walked_ids.iter().collect();
+    assert_eq!(unique.len(), walked_ids.len(), "{walked_ids:?}");
+    assert_eq!(walked, whole);
+}
+
+/// Sizing renders each record once: many todo updates of a big plan cost
+/// about what the unbudgeted page does, not a re-render per trimmed record.
+#[test]
+fn max_bytes_sizes_a_long_plan_turn_in_one_pass() {
+    let mut session = Fixture::new("max-bytes-many-todos");
+    session.user("long plan");
+    for update in 0..500 {
+        todo_update(&mut session, &format!("t{update}"), "in_progress", 2_000);
+    }
+    let started = std::time::Instant::now();
+    let whole = session.newest();
+    let unbudgeted = started.elapsed();
+    let started = std::time::Instant::now();
+    let page = budget_page(&session, None, 300);
+    let budgeted = started.elapsed();
+    assert!(!page.entries.is_empty());
+    assert!(!whole.entries.is_empty());
+    assert!(
+        budgeted <= unbudgeted * 20 + std::time::Duration::from_millis(100),
+        "budgeted {budgeted:?} vs unbudgeted {unbudgeted:?}"
+    );
+}
+
 #[test]
 fn after_returns_appended_entries_and_resends_changed_ones() {
     let mut session = Fixture::new("after");

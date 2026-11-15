@@ -193,35 +193,15 @@ fn not_written_yet(path: &Path, error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound && path.parent().is_some_and(Path::is_dir)
 }
 
-/// Where a page ending at `end` starts so its newest records' entries fit in
-/// `max_bytes` of JSON (each entry counted with the comma that separates it).
-/// The newest record that renders anything is kept even when it alone is over.
-/// `marks` holds each rendered position with the count of entries before it,
-/// offset by `base`; `entries` starts at `base`.
-fn budget_start(
-    entries: &[TranscriptEntry],
-    marks: &[(usize, usize)],
-    base: usize,
-    end: usize,
-    max_bytes: usize,
-) -> usize {
-    let mut total = 0;
-    let mut kept = end;
-    let mut entries_end = entries.len();
-    for &(position, first) in marks.iter().rev() {
-        let first = first - base;
-        let size: usize = entries[first..entries_end]
-            .iter()
-            .map(|entry| json_len(entry) + 1)
-            .sum();
-        if size > 0 && total > 0 && total + size > max_bytes {
-            break;
+/// Marks the user entries of other people's prompts (`others`) as theirs.
+fn mark_other_origins(entries: &mut [TranscriptEntry], others: &[(usize, String)]) {
+    for entry in entries {
+        if let TranscriptEntry::User { id, origin, .. } = entry {
+            if others.iter().any(|(_, other)| other == id) {
+                *origin = Some(crate::terminal::TurnOrigin::Other);
+            }
         }
-        total += size;
-        kept = position;
-        entries_end = first;
     }
-    kept
 }
 
 /// Length of `value` serialized as JSON, without building the string.
@@ -627,7 +607,11 @@ impl View<'_> {
         }
         let start = match request.max_bytes {
             Some(max_bytes) if changed_since.is_none() => {
-                self.render_within(start, end, max_bytes as usize, &mut entries)?
+                let matched = self.other_user_turns(other_prompts)?;
+                let start =
+                    self.render_within(start, end, max_bytes as usize, &matched, &mut entries)?;
+                others = Some(matched);
+                start
             }
             _ => {
                 self.render(start, end, &mut entries)?;
@@ -642,13 +626,7 @@ impl View<'_> {
             None if has_user => self.other_user_turns(other_prompts)?,
             None => Vec::new(),
         };
-        for entry in &mut entries {
-            if let TranscriptEntry::User { id, origin, .. } = entry {
-                if others.iter().any(|(_, other)| other == id) {
-                    *origin = Some(crate::terminal::TurnOrigin::Other);
-                }
-            }
-        }
+        mark_other_origins(&mut entries, &others);
         let before = (changed_since.is_none() && start > 0).then(|| {
             let record = self.branch[start];
             Cursor::Before {
@@ -988,49 +966,70 @@ impl View<'_> {
         end: usize,
         entries: &mut Vec<TranscriptEntry>,
     ) -> Result<(), TranscriptError> {
-        self.render_marked(start, end, entries, None)
+        self.render_records(start, end, entries, None)
     }
 
-    /// Renders `start..end` keeping only the newest records whose entries'
-    /// JSON fits in `max_bytes` (at least one record that renders anything),
-    /// and returns where the kept records start. Rendering a shorter range can
-    /// move a turn's plan to a later record, so it trims until it fits.
+    /// Renders the newest records of `start..end` whose entries, as the final
+    /// JSON array (origins marked, brackets and commas counted), fit in
+    /// `max_bytes`, and returns where the kept records start. The newest record
+    /// that renders anything is kept even when it alone is over. Each turn's
+    /// plan belongs to the turn's first todo result wherever the page starts,
+    /// so pages walked with `before` never repeat or move it. One pass: each
+    /// record renders once.
     fn render_within(
         &self,
         start: usize,
         end: usize,
         max_bytes: usize,
+        others: &[(usize, String)],
         entries: &mut Vec<TranscriptEntry>,
     ) -> Result<usize, TranscriptError> {
-        let base = entries.len();
-        let mut start = start;
-        let mut marks = Vec::new();
-        loop {
-            entries.truncate(base);
-            marks.clear();
-            self.render_marked(start, end, entries, Some(&mut marks))?;
-            let kept = budget_start(&entries[base..], &marks, base, end, max_bytes);
-            if kept == start {
-                return Ok(start);
+        let mut owners = HashSet::new();
+        let mut turn_has_plan = false;
+        for position in self.turn_start(start)..end {
+            match self.kind(position) {
+                Kind::User => turn_has_plan = false,
+                Kind::TodoResult if !turn_has_plan => {
+                    turn_has_plan = true;
+                    owners.insert(position);
+                }
+                _ => {}
             }
-            start = kept;
         }
+        // The array's "[" and "]" and a comma before every entry but the
+        // first: one byte, plus each entry's length and one.
+        let mut total = 1;
+        let mut kept_any = false;
+        let mut kept = end;
+        let mut rendered: Vec<Vec<TranscriptEntry>> = Vec::new();
+        for position in (start..end).rev() {
+            let mut record = Vec::new();
+            self.render_records(position, position + 1, &mut record, Some(&owners))?;
+            mark_other_origins(&mut record, others);
+            let size: usize = record.iter().map(|entry| json_len(entry) + 1).sum();
+            if size > 0 && kept_any && total + size > max_bytes {
+                break;
+            }
+            total += size;
+            kept_any |= size > 0;
+            kept = position;
+            rendered.push(record);
+        }
+        entries.extend(rendered.into_iter().rev().flatten());
+        Ok(kept)
     }
 
-    /// [`View::render`], recording in `marks` each position with the number of
-    /// entries rendered before it.
-    fn render_marked(
+    /// Renders `start..end`. A turn's plan goes with the first todo result in
+    /// the range, or, given `plan_owners`, only with those records.
+    fn render_records(
         &self,
         start: usize,
         end: usize,
         entries: &mut Vec<TranscriptEntry>,
-        mut marks: Option<&mut Vec<(usize, usize)>>,
+        plan_owners: Option<&HashSet<usize>>,
     ) -> Result<(), TranscriptError> {
         let mut planned = HashSet::new();
         for position in start..end {
-            if let Some(marks) = marks.as_mut() {
-                marks.push((position, entries.len()));
-            }
             let record = self.branch[position];
             let id = &*self.index.record(record).id;
             match self.kind(position) {
@@ -1057,7 +1056,11 @@ impl View<'_> {
                 Kind::Assistant => self.render_assistant(position, None, entries)?,
                 Kind::TodoResult => {
                     let turn = self.turn_start(position);
-                    if planned.insert(turn) {
+                    let owns = match plan_owners {
+                        Some(owners) => owners.contains(&position),
+                        None => planned.insert(turn),
+                    };
+                    if owns {
                         entries.extend(self.plan(turn)?);
                     }
                 }
