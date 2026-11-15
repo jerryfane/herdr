@@ -2674,6 +2674,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 gram_reachable: false,
+                transcript_max_bytes: false,
                 api_bridge_frames: false,
             }),
         };
@@ -2767,6 +2768,7 @@ mod tests {
                     rename_preconditions: false,
                     ask_form: false,
                     gram_reachable: false,
+                    transcript_max_bytes: false,
                     api_bridge_frames: false,
                 }),
             },
@@ -3047,6 +3049,7 @@ mod tests {
                     rename_preconditions: false,
                     ask_form: false,
                     gram_reachable: false,
+                    transcript_max_bytes: false,
                     api_bridge_frames: false,
                 }),
             },
