@@ -6,6 +6,10 @@
 //!
 //! Linux only, like the live handoff tests (macOS CI skips those): the guard
 //! identifies the serving binary through `/proc/<pid>/exe`.
+//!
+//! The `*_systemd_*` tests run the server as a transient unit of the calling
+//! user's systemd manager (`systemd-run --user`), with the same temp tree and
+//! its own sockets; they skip when there is no user manager to reach.
 #![cfg(target_os = "linux")]
 
 pub mod support;
@@ -128,6 +132,67 @@ struct Fixture {
     origin: Origin,
     signer: TestSigner,
     server: Option<SpawnedServer>,
+    unit: Option<Unit>,
+}
+
+/// A transient `systemd-run --user` service the test's server runs in.
+struct Unit {
+    name: String,
+}
+
+impl Unit {
+    fn show(&self, property: &str) -> String {
+        let output = std::process::Command::new("systemctl")
+            .args(["--user", "show", "--value", "-p", property, &self.name])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn main_pid(&self) -> u32 {
+        self.show("MainPID").parse().unwrap()
+    }
+
+    /// `systemctl --user stop`: the unit's `KillMode=` stops every process in it.
+    fn stop(&self) {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &self.name])
+            .status();
+    }
+
+    /// Whether `pid` belongs to this unit's control group.
+    fn contains(&self, pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|cgroup| {
+            cgroup
+                .lines()
+                .any(|line| line.ends_with(&format!("/{}", self.name)))
+        })
+    }
+}
+
+impl Drop for Unit {
+    fn drop(&mut self) {
+        self.stop();
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", &self.name])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Whether this user's systemd manager starts transient units. The skip is
+/// printed, so a run without one does not pass silently.
+fn user_systemd_available() -> bool {
+    let available = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--wait", "--collect", "--", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !available {
+        eprintln!("skipping: `systemd-run --user` is unavailable");
+    }
+    available
 }
 
 impl Fixture {
@@ -157,7 +222,80 @@ impl Fixture {
             origin: Origin::start(),
             signer: TestSigner::new(7),
             server: None,
+            unit: None,
         }
+    }
+
+    fn unit(&self) -> &Unit {
+        self.unit.as_ref().expect("the server runs in a unit")
+    }
+
+    /// Start the server as a transient user unit with the same overrides as
+    /// [`Self::start_server`], in a scratch HOME. `properties` are the unit's
+    /// (`Type=`, `NotifyAccess=`); systemd-run returns once the start job is
+    /// done, which for `Type=notify` means the server sent `READY=1`.
+    fn start_server_in_unit(&mut self, properties: &[&str], extra_env: &[(&str, &str)]) {
+        let runtime_dir = self.base.join("runtime");
+        let home = self.base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let name = format!(
+            "herdr-update-test-{}.service",
+            self.base.file_name().unwrap().to_string_lossy()
+        );
+        let mut env = vec![
+            ("HOME".to_string(), home.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                self.config_home.display().to_string(),
+            ),
+            (
+                "XDG_RUNTIME_DIR".to_string(),
+                runtime_dir.display().to_string(),
+            ),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                self.api_socket.display().to_string(),
+            ),
+            (
+                "HERDR_CLIENT_SOCKET_PATH".to_string(),
+                runtime_dir.join("herdr-client.sock").display().to_string(),
+            ),
+            ("SHELL".to_string(), "/bin/sh".to_string()),
+            ("HERDR_UPDATE_TEST_ORIGIN".to_string(), self.origin.url()),
+            (
+                "HERDR_UPDATE_TEST_PUBLIC_KEY".to_string(),
+                self.signer.public_key().to_string(),
+            ),
+            (
+                "HERDR_UPDATE_TEST_RUNNING_COMMIT".to_string(),
+                "0000000".to_string(),
+            ),
+        ];
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        let mut command = std::process::Command::new("systemd-run");
+        command.args(["--user", "--quiet", "--collect", "--unit", &name]);
+        command.args(["-p", "TimeoutStartSec=30"]);
+        command.arg(format!("--working-directory={}", self.base.display()));
+        for property in properties {
+            command.args(["-p", property]);
+        }
+        for (key, value) in &env {
+            command.arg(format!("--setenv={key}={value}"));
+        }
+        command.arg("--").arg(&self.install).arg("server");
+        // Owned from here, so a failed start is still stopped and reset.
+        self.unit = Some(Unit { name });
+        let status = command.status().unwrap();
+        assert!(
+            status.success(),
+            "systemd-run failed to start {}",
+            self.unit().name
+        );
+        support::wait_for_socket(&self.api_socket, Duration::from_secs(20));
     }
 
     fn updates(&self) -> PathBuf {
@@ -381,6 +519,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Whichever server serves now was started by this test.
         self.stop_server();
+        self.unit.take();
         support::cleanup_test_base(&self.base);
     }
 }
@@ -780,4 +919,169 @@ fn update_apply_refuses_a_build_the_owner_did_not_confirm() {
     let status = fixture.request("server.update_status", serde_json::json!({}));
     assert!(status["result"]["attempt"].is_null(), "{status}");
     assert!(!fixture.lock_held());
+}
+
+/// Wait until `pid` is gone, for a stop the test asked for.
+fn wait_gone(pid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "{what} (pid {pid}) is still running"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The owner's setup: herdr as the main process of a `Type=notify` user unit.
+/// The switch moves the unit's main pid to the new server before the old one
+/// exits, so the unit stays up in the same activation and the pane's process
+/// is never touched. A real stop afterwards still stops every pane.
+#[test]
+fn update_apply_switches_live_inside_a_systemd_notify_unit() {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(&["Type=notify", "NotifyAccess=all"], &[]);
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let unit = fixture.unit();
+    let invocation = unit.show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+    assert_eq!(
+        unit.main_pid(),
+        old_pid,
+        "the server is not the unit's main process"
+    );
+    assert!(
+        unit.contains(shell_pid),
+        "the pane does not run in the unit"
+    );
+
+    let check = fixture.request("server.update_check", serde_json::json!({}));
+    assert_eq!(check["result"]["mode"], "live", "{check}");
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+
+    assert_eq!(
+        attempt["outcome"],
+        "updated",
+        "{attempt}\n{}",
+        fixture.guard_log()
+    );
+    let unit = fixture.unit();
+    let new_pid = serving_pid(&fixture.api_socket);
+    assert_ne!(new_pid, old_pid, "the old server still serves");
+    assert!(!alive(old_pid), "the old server did not exit");
+    assert_eq!(unit.show("ActiveState"), "active");
+    assert_eq!(
+        unit.main_pid(),
+        new_pid,
+        "systemd does not follow the new server"
+    );
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    assert_eq!(
+        file_sha256(Path::new(&format!("/proc/{new_pid}/exe"))),
+        build.sha256
+    );
+    assert!(
+        alive(shell_pid),
+        "the pane's process did not survive the switch"
+    );
+    assert!(unit.contains(shell_pid));
+    assert!(
+        pane_ids(&fixture).contains(&pane_id),
+        "pane {pane_id} is gone"
+    );
+
+    unit.stop();
+    wait_gone(new_pid, "the new server after the unit stopped");
+    wait_gone(shell_pid, "the pane's process after the unit stopped");
+}
+
+/// The guard's handoff back runs on the new server, which is the unit's main
+/// process by then: it moves the main pid on to the previous build the same
+/// way. `NotifyAccess=main` is enough, since only main processes notify.
+#[test]
+fn update_guard_hands_back_inside_a_systemd_notify_unit() {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(
+        &["Type=notify", "NotifyAccess=main"],
+        &[("HERDR_UPDATE_TEST_GUARD_FAULT", "forward_checks")],
+    );
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let invocation = fixture.unit().show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+    let before = install_identity(&fixture.install);
+
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+
+    let log = fixture.guard_log();
+    assert_eq!(attempt["outcome"], "rolled_back", "{attempt}\n{log}");
+    assert_eq!(log.matches("live handoff to").count(), 2, "{log}");
+    let unit = fixture.unit();
+    let back_pid = serving_pid(&fixture.api_socket);
+    assert_ne!(back_pid, old_pid);
+    assert_eq!(
+        file_sha256(Path::new(&format!("/proc/{back_pid}/exe"))),
+        before.sha256,
+        "the previous build does not serve"
+    );
+    assert_eq!(unit.show("ActiveState"), "active");
+    assert_eq!(
+        unit.main_pid(),
+        back_pid,
+        "systemd does not follow the handoff back"
+    );
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    assert!(
+        alive(shell_pid),
+        "the pane's process did not survive both switches"
+    );
+    assert!(pane_ids(&fixture).contains(&pane_id));
+    let after = install_identity(&fixture.install);
+    assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
+}
+
+/// A `Type=simple` unit can't follow a new main process, so the update is
+/// refused before anything is touched, as before, and so is a plain handoff.
+#[test]
+fn update_apply_still_refuses_a_live_switch_in_a_simple_systemd_unit() {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(&["Type=simple"], &[]);
+    let (_, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let old_pid = serving_pid(&fixture.api_socket);
+
+    let check = fixture.request("server.update_check", serde_json::json!({}));
+    assert_eq!(check["result"]["mode"], "restart_required", "{check}");
+    assert_eq!(check["result"]["reason"], "systemd_main_process", "{check}");
+    let refused = fixture.request(
+        "server.update_apply",
+        serde_json::json!({"build_id": build.build_id}),
+    );
+    assert_eq!(
+        refused["error"]["code"], "update_restart_required",
+        "{refused}"
+    );
+    let handoff = fixture.request("server.live_handoff", serde_json::json!({}));
+    assert_eq!(
+        handoff["error"]["code"], "handoff_refused_supervised",
+        "{handoff}"
+    );
+
+    assert_eq!(serving_pid(&fixture.api_socket), old_pid);
+    assert_eq!(fixture.unit().show("ActiveState"), "active");
+    assert!(alive(shell_pid));
 }

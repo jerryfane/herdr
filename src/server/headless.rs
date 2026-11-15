@@ -248,6 +248,10 @@ pub struct HeadlessServer {
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
+    /// A replacement that owns the panes while systemd still names this process
+    /// the unit's main one: this process stays until it exits.
+    #[cfg(unix)]
+    main_pid_successor: Option<std::process::Child>,
     /// The guest relay link. Runs only while this process owns the panes: a
     /// live handoff stops it before the replacement starts its own.
     #[cfg(unix)]
@@ -415,6 +419,8 @@ impl HeadlessServer {
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
+            #[cfg(unix)]
+            main_pid_successor: None,
             #[cfg(unix)]
             guest_link: None,
             should_quit,
@@ -908,23 +914,26 @@ impl HeadlessServer {
         // The handoff below hands the sockets and PTYs to a replacement and then lets THIS
         // process exit. Under a `Type=simple` systemd unit that exit deactivates the unit,
         // and the default `KillMode=control-group` kills everything still in the cgroup —
-        // the replacement and every pane it just imported.
+        // the replacement and every pane it just imported. A `Type=notify` unit that takes
+        // `MAINPID=` from this process follows the replacement instead.
         //
         // The handoff cannot notice: spawn, import and version validation all succeed, the
         // API answers `ok`, and the supervisor kills the lot a moment later. On this fleet
         // that took 30 live panes down and they came back from the snapshot under the wrong
         // account. So the check must be here, before the first destructive step, and it
         // must fail closed.
-        if crate::server::supervision::detect().forbids_process_handoff() {
+        let supervision = crate::server::supervision::detect();
+        if supervision.forbids_process_handoff() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "refusing a live handoff: this process is the systemd unit's main process, so \
-                 exiting after the handoff would deactivate the unit and kill the replacement \
-                 and every pane with it. The staged manifest is left in place, but a \
-                 RESTART ALONE WILL NOT PICK IT UP: the live-path swap used to happen inside \
-                 the handoff this refusal prevents, so deploying now means moving \
-                 herdr.staged over the live binary (a rename, not a copy — the running \
-                 image is busy) and then restarting the service.",
+                format!(
+                    "{}. The staged manifest is left in place, but a RESTART ALONE WILL NOT \
+                     PICK IT UP: the live-path swap used to happen inside the handoff this \
+                     refusal prevents, so deploying now means moving herdr.staged over the \
+                     live binary (a rename, not a copy — the running image is busy) and then \
+                     restarting the service.",
+                    crate::server::supervision::HANDOFF_REFUSAL
+                ),
             ));
         }
 
@@ -942,11 +951,14 @@ impl HeadlessServer {
         // staged binary and commits), with the live path untouched, so a failed handoff leaves the
         // live binary byte-unchanged. The live path is swapped only AFTER commit (best-effort).
         let outcome = staged_build::apply_with_handoff(&staged_path, &live, || {
-            self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
-                import_exe: Some(staged_path.to_string_lossy().into_owned()),
-                expected_protocol: None,
-                expected_version: Some(staged.version.clone()),
-            })
+            self.perform_supervised_live_handoff(
+                crate::api::schema::ServerLiveHandoffParams {
+                    import_exe: Some(staged_path.to_string_lossy().into_owned()),
+                    expected_protocol: None,
+                    expected_version: Some(staged.version.clone()),
+                },
+                supervision,
+            )
         })?;
 
         // Stop advertising the update only once it is fully activated on disk; on a partial apply

@@ -121,10 +121,6 @@ herdr update
 
 `herdr update` は Herdr 自身のインストーラーで管理されているインストール向けです。Homebrew、mise、Nix のインストールは、それぞれのパッケージマネージャーでアップデートしてください。
 
-稼働中のサーバーがライブハンドオフを拒否することもあります。ハンドオフは新しいプロセスを起動してから古いプロセスを終了させる仕組みのため、その終了によって新しいプロセスまで巻き添えになる場合、Herdr はハンドオフを拒否します。特に Herdr が systemd ユニットのメインプロセスである場合が該当します。メインプロセスが終了するとユニットが停止し、そのコントロールグループにあるすべてのペインが強制終了されるからです。このときリクエストは明示的なエラーで失敗し、何も破棄されません。
-
-サービス管理下のインストールへ配布する場合は、バイナリを置き換えてからサービスを再起動してください。なお、サービスの再起動だけではステージ済みビルドは反映されません。ハンドオフが行うはずだった入れ替えが行われないため、ユニットは同じファイルを再実行します。先にステージ済みバイナリを稼働中のパスへ移動し (実行中のイメージは使用中なので、コピーではなく rename)、その後でサービスを再起動してください。
-
 Linux、macOS、Windows の直接インストールは、デフォルトで安定版アップデートチャンネルを使います。`master` からのプレビュービルドにオプトインするには、チャンネルを設定します:
 
 ```bash
@@ -156,6 +152,47 @@ herdr update --handoff
 両方のサーバーがエージェント状態の転送に対応している場合、ライブハンドオフはフックが報告したエージェント状態を次の報告が届くまで維持します。古いサーバーからハンドオフすると、実行中のエージェントが一時的に idle と表示される場合があります。
 
 ライブハンドオフは Homebrew、mise、Nix のパッケージマネージャー経由のアップデートには適用されません。それらのインストールではパッケージマネージャーで更新し、再度 Herdr を実行して更新済みクライアントで再接続します。互換性のある古いサーバーは動き続けます。新しいリリースのサーバー側変更が必要になったときだけ、`herdr server stop` または `herdr session stop <name>` で後から再起動してください。
+
+稼働中のサーバーがライブハンドオフを拒否することもあります。ハンドオフは新しいプロセスを起動してから古いプロセスを終了させる仕組みのため、その終了によって新しいプロセスまで巻き添えになる場合、Herdr はハンドオフを拒否します。特に Herdr が、新しいプロセスを追跡できない systemd ユニットのメインプロセスである場合が該当します。メインプロセスが終了するとユニットが停止し、そのコントロールグループにあるすべてのペインが強制終了されるからです。このときリクエストは明示的なエラーで失敗し、何も破棄されません。
+
+### systemd でサーバーを動かす
+
+`Type=notify` のユニットはライブハンドオフに追従できます。新しいプロセスがペインを引き継ぐと、古いサーバーは新しいプロセスがユニットのメインプロセスであることを systemd に伝え、systemd がそれを処理したのを待ってから終了します。ユニットは同じアクティベーションのまま稼働し続けるので、アプリ内アップデート (`server.update_apply`) と `herdr update --handoff` はペインを止めずにビルドを切り替えます。systemd 246 以降の Linux が必要です。
+
+推奨するユーザーユニット `~/.config/systemd/user/herdr.service`:
+
+```ini
+[Unit]
+Description=Herdr server
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`NotifyAccess=all` でも動作します。通知を送るのはユニットのメインプロセスであるサーバーだけなので `main` で十分であり、ペインのプロセスからの通知も防げます。`KillMode=` はデフォルトの `control-group` のままにしてください。実際に `systemctl --user stop` したときはサーバーと一緒にペインも止める必要があり、`KillMode=process` や `mixed` ではペインがどのサーバーにも属さないまま動き続けてしまいます。
+
+Herdr はハンドオフのたびにユニットを確認します。`Type=notify` ではないユニットや `NotifyAccess=` が `none` のユニットでは、これまでどおり拒否します (`server.update_check` は `mode: restart_required`、理由 `systemd_main_process` を返します)。そのようなユニットに配布する場合は、バイナリを置き換えてからサービスを再起動してください。なお、サービスの再起動だけではステージ済みビルドは反映されません。ハンドオフが行うはずだった入れ替えが行われないため、ユニットは同じファイルを再実行します。先にステージ済みバイナリを稼働中のパスへ移動し (実行中のイメージは使用中なので、コピーではなく rename)、その後でサービスを再起動してください。
+
+既存の `Type=simple` ユニットを移行するには:
+
+1. この機能に対応したビルドへ Herdr を更新し、サーバーが systemd に起動完了を通知するようにします。古いサーバーは `Type=notify` のもとで起動完了を通知しないため、`TimeoutStartSec=` が切れた時点で systemd に停止されます。
+2. ドロップインを追加して systemd を再読み込みします:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user/herdr.service.d
+   printf '[Service]\nType=notify\nNotifyAccess=main\n' > ~/.config/systemd/user/herdr.service.d/live-update.conf
+   systemctl --user daemon-reload
+   systemctl --user show -p Type -p NotifyAccess herdr.service
+   ```
+
+3. ペインを止めてもよいタイミングで、サービスを一度だけ再起動します: `systemctl --user restart herdr.service`。稼働中のサーバーは通知ソケットなしで起動しているため、それまではハンドオフできません。
+4. 確認: `server.update_check` が `mode: live` を返します。以降のアップデートのたびに、`systemctl --user show -p MainPID herdr.service` は新しいサーバープロセスを示し、`systemctl --user status herdr.service` は手順 3 の再起動からユニットが稼働し続けていることを示します。
 
 ## 動作要件
 

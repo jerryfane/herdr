@@ -70,7 +70,7 @@ herdr
 
 Stopping a server exits its pane processes. Named sessions use `herdr session stop <name>`. See [Install Herdr](/docs/install/#update) for updater, package-manager, and live-handoff behavior.
 
-If Herdr runs under a service manager such as a systemd unit, restarting the service is not enough on its own: the unit re-runs the same binary path, so it starts the old build again. Install the new binary over that path first, then restart the service.
+If Herdr runs under a service manager such as a systemd unit, restarting the service is not enough on its own: the unit re-runs the same binary path, so it starts the old build again. Install the new binary over that path first, then restart the service. A `Type=notify` unit can switch builds live instead, without the restart; see [Run the server under systemd](/docs/install/#run-the-server-under-systemd).
 
 ## Keychain-backed tools fail inside Herdr on macOS
 

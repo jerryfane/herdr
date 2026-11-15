@@ -2,6 +2,9 @@ use super::*;
 
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
+    // Before any thread starts or child spawns: only this process may notify systemd.
+    #[cfg(unix)]
+    crate::server::supervision::take_systemd_environment();
     let launcher_warning = crate::platform::leave_launcher_job();
     crate::platform::ignore_server_hangup();
     let args: Vec<String> = std::env::args().collect();
@@ -115,6 +118,9 @@ pub fn run_server() -> io::Result<()> {
             "herdr server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
+        // A `Type=notify` unit counts as started only now, with both sockets bound.
+        #[cfg(unix)]
+        crate::server::supervision::notify_ready();
         #[cfg(unix)]
         server.start_guest_link();
         server.app.run_plugin_startup_hooks();

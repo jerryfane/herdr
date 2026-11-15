@@ -65,11 +65,14 @@ pub(crate) fn handoff_socket_path() -> PathBuf {
     crate::session::data_dir().join(format!("herdr-handoff-{}.sock", std::process::id()))
 }
 
+/// `hand_over_main_pid`: the replacement will become the systemd unit's main
+/// process once it owns the panes.
 #[cfg(unix)]
 pub(crate) fn spawn_handoff_import(
     import_exe: Option<&Path>,
     socket_path: &Path,
     token: &str,
+    hand_over_main_pid: bool,
 ) -> io::Result<Child> {
     let fallback_exe;
     let exe = if let Some(import_exe) = import_exe {
@@ -98,6 +101,9 @@ pub(crate) fn spawn_handoff_import(
         command
             .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
             .env_remove(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR);
+    }
+    if hand_over_main_pid {
+        crate::server::supervision::prepare_main_pid_successor(&mut command);
     }
     crate::platform::detach_server_daemon_command(&mut command);
     command.spawn().map_err(|err| {

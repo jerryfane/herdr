@@ -121,10 +121,6 @@ herdr update
 
 `herdr update` 适用于由 Herdr 自带安装器管理的安装。Homebrew、mise 和 Nix 安装请改用那些包管理器更新。
 
-运行中的服务器也可能拒绝实时移交。移交的做法是先启动一个替代进程,再让旧进程退出;如果这次退出会把替代进程一起带走,Herdr 就会拒绝移交。最典型的情况是 Herdr 是某个 systemd 单元的主进程:主进程退出会停用该单元,进而杀掉其控制组中的每一个窗格。此时请求会以明确的错误失败,不会拆除任何东西。
-
-要向受服务管理的安装发布,请改为替换二进制文件后重启服务。注意仅重启服务并不会启用已暂存的构建:移交本应完成的替换没有发生,单元只会重新运行同一个文件。请先把暂存的二进制文件移动到运行路径上(用 rename 而不是复制,因为运行中的映像正被占用),然后再重启服务。
-
 Linux、macOS 和 Windows 的直接安装默认使用稳定更新通道。要启用来自 `master` 的预览构建,设置通道:
 
 ```bash
@@ -156,6 +152,47 @@ herdr update --handoff
 当两个服务器都支持智能体状态传输时,实时交接会保留钩子上报的智能体状态,直到下一次上报到达。从较旧服务器交接时,运行中的智能体可能暂时显示为 idle。
 
 实时交接不适用于 Homebrew、mise 或 Nix 的包管理器更新。这些安装先用包管理器更新,再重新运行 Herdr,用更新后的客户端连接。兼容的旧服务器会继续运行。只有需要新版本的服务器端改动时,才稍后用 `herdr server stop` 或 `herdr session stop <name>` 重启它。
+
+运行中的服务器也可能拒绝实时移交。移交的做法是先启动一个替代进程,再让旧进程退出;如果这次退出会把替代进程一起带走,Herdr 就会拒绝移交。最典型的情况是 Herdr 是某个无法跟随替代进程的 systemd 单元的主进程:主进程退出会停用该单元,进而杀掉其控制组中的每一个窗格。此时请求会以明确的错误失败,不会拆除任何东西。
+
+### 在 systemd 下运行服务器
+
+`Type=notify` 单元可以跟随实时移交。替代进程接管窗格后,旧服务器会告诉 systemd 替代进程现在是该单元的主进程,等 systemd 处理完这条通知后才退出。单元保持在同一次激活中持续运行,因此应用内更新(`server.update_apply`)和 `herdr update --handoff` 切换构建时不会停止任何窗格。需要 Linux 和 systemd 246 或更新版本。
+
+推荐的用户单元 `~/.config/systemd/user/herdr.service`:
+
+```ini
+[Unit]
+Description=Herdr server
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`NotifyAccess=all` 也可以;用 `main` 就够了,因为只有身为单元主进程的服务器才会发送通知,这样还能防止窗格中的进程发送通知。请保留默认的 `KillMode=control-group`:真正执行 `systemctl --user stop` 时必须连同窗格一起停止,而 `KillMode=process` 或 `mixed` 会让窗格继续运行,却不再属于任何服务器。
+
+Herdr 在每次移交前都会检查单元。对于不是 `Type=notify` 的单元,或 `NotifyAccess=` 为 `none` 的单元,它仍会拒绝(`server.update_check` 报告 `mode: restart_required`,原因 `systemd_main_process`)。向这样的单元发布时,请改为替换二进制文件后重启服务。注意仅重启服务并不会启用已暂存的构建:移交本应完成的替换没有发生,单元只会重新运行同一个文件。请先把暂存的二进制文件移动到运行路径上(用 rename 而不是复制,因为运行中的映像正被占用),然后再重启服务。
+
+迁移现有的 `Type=simple` 单元:
+
+1. 先把 Herdr 更新到支持此功能的构建,让服务器向 systemd 报告就绪。较旧的服务器在 `Type=notify` 下永远不会报告就绪,`TimeoutStartSec=` 到期后会被 systemd 停止。
+2. 添加一个 drop-in 并重新加载 systemd:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user/herdr.service.d
+   printf '[Service]\nType=notify\nNotifyAccess=main\n' > ~/.config/systemd/user/herdr.service.d/live-update.conf
+   systemctl --user daemon-reload
+   systemctl --user show -p Type -p NotifyAccess herdr.service
+   ```
+
+3. 在可以接受窗格停止的时候,重启服务一次:`systemctl --user restart herdr.service`。正在运行的服务器启动时没有通知套接字,在此之前无法移交。
+4. 确认:`server.update_check` 报告 `mode: live`。之后每次更新,`systemctl --user show -p MainPID herdr.service` 都会指向新的服务器进程,`systemctl --user status herdr.service` 显示单元自第 3 步的重启以来一直处于活动状态。
 
 ## 系统要求
 

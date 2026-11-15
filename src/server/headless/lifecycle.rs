@@ -39,18 +39,47 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
+        self.perform_supervised_live_handoff(params, crate::server::supervision::detect())
+    }
+
+    /// [`Self::perform_live_handoff`] for a caller that already asked how this
+    /// process is supervised. The single choke point for every handoff, however
+    /// it was requested: refuses before a socket is opened or a child spawned
+    /// when this process' exit would take the replacement down with it.
+    #[cfg(unix)]
+    pub(super) fn perform_supervised_live_handoff(
+        &mut self,
+        params: crate::api::schema::ServerLiveHandoffParams,
+        supervision: crate::server::supervision::Supervision,
+    ) -> io::Result<()> {
+        if supervision.forbids_process_handoff() {
+            warn!(
+                ?supervision,
+                pid = std::process::id(),
+                "refusing live handoff: exiting would deactivate the supervising unit and kill the panes"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::server::supervision::HANDOFF_REFUSAL,
+            ));
+        }
+        info!(?supervision, "live handoff allowed");
         drop(self.guest_link.take());
-        let result = self.export_live_handoff(params);
+        let result = self.export_live_handoff(params, supervision.hands_over_main_pid());
         if result.is_err() {
             self.start_guest_link();
         }
         result
     }
 
+    /// `hand_over_main_pid`: this is the main process of a `Type=notify` unit, so
+    /// the replacement gets the notification socket, and once it owns the panes
+    /// systemd is told it is the unit's main process before this one exits.
     #[cfg(unix)]
     fn export_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
+        hand_over_main_pid: bool,
     ) -> io::Result<()> {
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
@@ -144,6 +173,7 @@ impl HeadlessServer {
             import_exe.as_deref(),
             &socket_path,
             &token,
+            hand_over_main_pid,
         ) {
             Ok(child) => child,
             Err(err) => {
@@ -249,6 +279,26 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        if hand_over_main_pid {
+            match crate::server::supervision::hand_over_main_pid(child_pid) {
+                Ok(()) => info!(
+                    pid = child_pid,
+                    "systemd follows the replacement as the unit's main process"
+                ),
+                Err(err) => {
+                    // The replacement owns the panes, so this process can't take them
+                    // back; exiting would still be the unit's exit. Stay until the
+                    // replacement ends instead, so the unit and its panes live on.
+                    tracing::error!(
+                        pid = child_pid,
+                        err = %err,
+                        "systemd was not told about the replacement; staying as the unit's main process until it exits"
+                    );
+                    self.main_pid_successor = Some(import_child);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -256,6 +306,14 @@ impl HeadlessServer {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.policy.persist_session = false;
+        #[cfg(unix)]
+        if let Some(mut successor) = self.main_pid_successor.take() {
+            info!(
+                pid = successor.id(),
+                "live handoff completed; waiting for the replacement before exiting"
+            );
+            let _ = successor.wait();
+        }
         info!("live handoff completed; old server exiting");
     }
 
