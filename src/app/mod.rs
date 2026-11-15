@@ -448,7 +448,7 @@ impl App {
         let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         // Before session restore below spawns any pane.
-        crate::fence::set_config(&config.fence);
+        crate::fence::set_startup_config(&config.fence);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());

@@ -242,16 +242,25 @@ fn mask_socket(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Block devices (and raw memory/port devices) visible in /dev at pane start.
+/// Block devices anywhere below /dev (and raw memory/port devices) at pane start.
+/// Directory symlinks are not followed (`read_dir` file types do not follow links),
+/// so `/dev/disk/by-*` link farms and cycles are skipped; the nodes they point to
+/// are found where they live.
 fn raw_device_nodes() -> Vec<PathBuf> {
     let mut nodes = Vec::new();
-    for dir in ["/dev", "/dev/mapper"] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    let mut dirs = vec![PathBuf::from("/dev")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.filter_map(Result::ok) {
-            if entry.file_type().is_ok_and(|kind| kind.is_block_device()) {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_block_device() {
                 nodes.push(entry.path());
+            } else if kind.is_dir() {
+                dirs.push(entry.path());
             }
         }
     }

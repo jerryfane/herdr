@@ -164,22 +164,85 @@ impl FencePlan {
     }
 }
 
-/// Fence settings used by pane spawns; replaced at startup and on config reload.
-static CURRENT: LazyLock<RwLock<Arc<FenceConfig>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(FenceConfig::default())));
+/// The fence policy pane spawns use; replaced at startup and on config reload.
+/// `Err` means config.toml asks for a fence that could not be loaded: every pane
+/// spawn is refused until a valid `[fence]` is reloaded (fail closed).
+type Policy = Result<Arc<FenceConfig>, Arc<str>>;
 
-/// Install the fence settings used for pane spawns from now on (startup and reload).
+static CURRENT: LazyLock<RwLock<Policy>> =
+    LazyLock::new(|| RwLock::new(Ok(Arc::new(FenceConfig::default()))));
+
+fn install(policy: Policy) {
+    let mut slot = CURRENT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = policy;
+}
+
+/// Install a validated `[fence]` (startup, reload) for pane spawns from now on.
 pub(crate) fn set_config(config: &FenceConfig) {
     if config.enabled && !crate::platform::FENCE_SUPPORTED {
         warn!("[fence] enabled = true, but the pane fence is Linux-only; panes start unfenced");
     }
-    let mut slot = CURRENT
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = Arc::new(config.clone());
+    install(Ok(Arc::new(config.clone())));
 }
 
-fn current_config() -> Arc<FenceConfig> {
+/// Install the startup policy. `Config::load` replaces the whole config with
+/// defaults when any part of config.toml is invalid, which would silently turn a
+/// requested fence off. So the `[fence]` table is read from the file on its own:
+/// a valid table is used even when another section is broken, and a table (or a
+/// file) that cannot be read refuses pane spawns instead of starting them unfenced.
+pub(crate) fn set_startup_config(loaded: &FenceConfig) {
+    match startup_fence_from_file(&crate::config::config_path()) {
+        StartupFence::NotConfigured => set_config(loaded),
+        StartupFence::Valid(config) => set_config(&config),
+        StartupFence::Invalid(err) => {
+            tracing::error!(%err, "[fence] could not be loaded; refusing to start panes until it is fixed");
+            install(Err(err.into()));
+        }
+    }
+}
+
+enum StartupFence {
+    NotConfigured,
+    Valid(FenceConfig),
+    Invalid(String),
+}
+
+fn startup_fence_from_file(path: &Path) -> StartupFence {
+    let content = match crate::config::read_optional_config(path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return StartupFence::NotConfigured,
+        Err(err) => return StartupFence::Invalid(format!("cannot read {}: {err}", path.display())),
+    };
+    startup_fence_from_str(&content)
+}
+
+fn startup_fence_from_str(content: &str) -> StartupFence {
+    match content.parse::<toml::Table>() {
+        Ok(table) => match table.get("fence") {
+            None => StartupFence::NotConfigured,
+            Some(value) => match value.clone().try_into::<FenceConfig>() {
+                Ok(config) => StartupFence::Valid(config),
+                Err(err) => StartupFence::Invalid(format!("invalid [fence]: {err}")),
+            },
+        },
+        // Unparsable file: whether it asks for a fence is unknown, so assume it does
+        // when a [fence] header is present.
+        Err(err) => {
+            let mentions_fence = content
+                .lines()
+                .any(|line| line.trim_start().starts_with("[fence"));
+            if mentions_fence {
+                StartupFence::Invalid(format!("config.toml does not parse: {err}"))
+            } else {
+                StartupFence::NotConfigured
+            }
+        }
+    }
+}
+
+fn current_policy() -> Policy {
     CURRENT
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -201,15 +264,15 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
         }
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let deny_paths: Vec<PathBuf> = match deny {
-        Some(entries) => entries
-            .iter()
-            .map(|e| lexical(e, home.as_deref()))
-            .collect(),
-        None => DEFAULT_DENY
-            .iter()
-            .map(|e| lexical(e, home.as_deref()))
-            .collect(),
+    let deny_entries: Vec<String> = match deny {
+        Some(entries) => entries.to_vec(),
+        None => DEFAULT_DENY.iter().map(|e| (*e).to_string()).collect(),
+    };
+    // Resolved the same way as at pane start, for allows written through a symlink
+    // alias or below a wildcard that only exists on disk.
+    let resolved_deny: Vec<PathBuf> = match &home {
+        Some(home) => resolve_entries(&deny_entries, home, &mut Vec::new(), "deny"),
+        None => Vec::new(),
     };
     for entry in &config.allow {
         if let Err(err) = check_path_syntax(entry) {
@@ -217,13 +280,45 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
             continue;
         }
         let path = lexical(entry, home.as_deref());
-        if !deny_paths.iter().any(|deny| covers(deny, &path)) {
+        let lexically_below = deny_entries
+            .iter()
+            .any(|deny| pattern_covers(&lexical(deny, home.as_deref()), &path));
+        let resolved_below = || match &home {
+            Some(home) => {
+                resolve_entries(std::slice::from_ref(entry), home, &mut Vec::new(), "allow")
+                    .iter()
+                    .any(|allow| resolved_deny.iter().any(|deny| covers(deny, allow)))
+            }
+            None => false,
+        };
+        if !lexically_below && !resolved_below() {
             errors.push(format!(
                 "fence.allow entry {entry:?} is not below any fence.deny entry"
             ));
         }
     }
     errors
+}
+
+/// True when `path` is at or below a path matching `pattern` (`*` within a component).
+fn pattern_covers(pattern: &Path, path: &Path) -> bool {
+    let mut path_parts = path.components();
+    for pattern_part in pattern.components() {
+        let Some(path_part) = path_parts.next() else {
+            return false;
+        };
+        let matches = match (pattern_part, path_part) {
+            (Component::Normal(p), Component::Normal(n)) => match (p.to_str(), n.to_str()) {
+                (Some(p), Some(n)) if p.contains('*') => wildcard_match(p, n),
+                _ => p == n,
+            },
+            (p, n) => p == n,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
 }
 
 fn check_path_syntax(entry: &str) -> Result<(), &'static str> {
@@ -264,12 +359,14 @@ fn covers(parent: &Path, path: &Path) -> bool {
 /// Resolve `[fence]` into the mounts for one pane start on this host.
 ///
 /// Paths are expanded (`~`, `*`) and resolved with `realpath`; entries that match
-/// nothing are reported in `skipped`, never created. `herdr_config_dir` is always
-/// denied so the server's own settings stay protected wherever they live.
+/// nothing are reported in `skipped`, never created. `always_protected` (herdr's
+/// config directory and the config file actually loaded) is read-only whatever
+/// the deny and allow lists say: its binds go after every carve-out, and carve-outs
+/// inside it are dropped.
 pub(crate) fn resolve_plan(
     config: &FenceConfig,
     home: &Path,
-    herdr_config_dir: &Path,
+    always_protected: &[PathBuf],
 ) -> FencePlan {
     let mut skipped = Vec::new();
 
@@ -277,15 +374,30 @@ pub(crate) fn resolve_plan(
         Some(entries) => entries.clone(),
         None => DEFAULT_DENY.iter().map(|e| (*e).to_string()).collect(),
     };
-    let mut deny = resolve_entries(&deny_entries, home, &mut skipped, "deny");
-    if let Ok(dir) = herdr_config_dir.canonicalize() {
-        if !deny.iter().any(|d| covers(d, &dir)) {
-            deny.push(dir);
+    let deny = resolve_entries(&deny_entries, home, &mut skipped, "deny");
+    let mut protected: Vec<PathBuf> = Vec::new();
+    for path in always_protected {
+        if let Ok(real) = path.canonicalize() {
+            protected.push(real);
+        }
+    }
+    protected.sort_by_key(|path| depth(path));
+    let mut mandatory: Vec<PathBuf> = Vec::new();
+    for path in protected {
+        if !mandatory.iter().any(|m| covers(m, &path)) {
+            mandatory.push(path);
         }
     }
     let allow: Vec<PathBuf> = resolve_entries(&config.allow, home, &mut skipped, "allow")
         .into_iter()
         .filter(|path| {
+            if mandatory.iter().any(|m| covers(m, path)) {
+                skipped.push(format!(
+                    "allow {}: inside herdr's own config, which stays read-only",
+                    path.display()
+                ));
+                return false;
+            }
             let below = deny.iter().any(|d| covers(d, path));
             if !below {
                 skipped.push(format!("allow {}: not below a denied path", path.display()));
@@ -302,15 +414,35 @@ pub(crate) fn resolve_plan(
     };
     let mask = resolve_entries(&mask_entries, home, &mut skipped, "mask");
 
-    // Anchors: every ancestor of a fenced path that is not itself read-only, so a
-    // rename of the ancestor cannot move a protected tree away.
+    // Anchors: every ancestor of a fenced path that stays writable in the pane
+    // (outside every deny, or inside a carve-out), so renaming the ancestor cannot
+    // move a protected tree away. Read-only ancestors cannot be renamed anyway.
+    let read_only = |path: &Path| -> bool {
+        // The deepest rule covering the path decides; at equal depth a mandatory
+        // deny beats an allow, and an allow beats a deny (the mount order above).
+        let mut best: Option<(usize, u8)> = None;
+        let rules = deny
+            .iter()
+            .map(|p| (p, 1u8))
+            .chain(allow.iter().map(|p| (p, 2u8)))
+            .chain(mandatory.iter().map(|p| (p, 4u8)));
+        for (rule, order) in rules {
+            if covers(rule, path) {
+                let key = (depth(rule), order);
+                if best.is_none_or(|b| key > b) {
+                    best = Some(key);
+                }
+            }
+        }
+        best.is_some_and(|(_, order)| order != 2)
+    };
     let mut anchors: Vec<PathBuf> = Vec::new();
-    for path in deny.iter().chain(&allow).chain(&mask) {
+    for path in deny.iter().chain(&mandatory).chain(&allow).chain(&mask) {
         for ancestor in path.ancestors().skip(1) {
             if ancestor == Path::new("/") || ancestor.as_os_str().is_empty() {
                 continue;
             }
-            if deny.iter().any(|d| covers(d, ancestor)) {
+            if read_only(ancestor) || allow.iter().any(|a| a == ancestor) {
                 continue;
             }
             if !anchors.iter().any(|a| a == ancestor) {
@@ -321,6 +453,8 @@ pub(crate) fn resolve_plan(
 
     // Shallow paths first; at equal depth anchors, then denies, then allows, so an
     // allow re-opens a deny of the same path and a deeper deny closes an allow.
+    // Masks follow, and the mandatory read-only binds come last at their depth; a
+    // shallower allow is applied before them, so it cannot reopen herdr's config.
     let mut mounts: Vec<(usize, u8, FenceMount)> = Vec::new();
     for path in anchors {
         mounts.push((depth(&path), 0, FenceMount::Anchor(path)));
@@ -333,6 +467,9 @@ pub(crate) fn resolve_plan(
     }
     for path in dedup(mask) {
         mounts.push((depth(&path), 3, FenceMount::Mask(path)));
+    }
+    for path in mandatory {
+        mounts.push((depth(&path), 4, FenceMount::Deny(path)));
     }
     mounts.sort_by_key(|(depth, order, _)| (*depth, *order));
 
@@ -432,9 +569,13 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 
 /// Rewrite a pane command so it starts inside the fence. A no-op when the fence is
 /// off or unsupported on this platform; an error (the pane does not start) when the
-/// fence is on but the plan cannot be built.
+/// fence is on but the plan cannot be built, or when `[fence]` failed to load.
 pub(crate) fn fence_pane_command(cmd: &mut CommandBuilder) -> io::Result<()> {
-    let config = current_config();
+    let config = current_policy().map_err(|err| {
+        io::Error::other(format!(
+            "pane fence: {err}; not starting the pane. Fix [fence] in config.toml and run `herdr server reload-config`"
+        ))
+    })?;
     if !config.enabled || !crate::platform::FENCE_SUPPORTED {
         return Ok(());
     }
@@ -442,7 +583,10 @@ pub(crate) fn fence_pane_command(cmd: &mut CommandBuilder) -> io::Result<()> {
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("pane fence: HOME is not set; not starting the pane"))?;
-    let plan = resolve_plan(&config, &home, &crate::config::config_dir());
+    // Herdr's own settings, and the config file actually in use (HERDR_CONFIG_PATH
+    // may point outside the config directory), are always read-only.
+    let always_protected = [crate::config::config_dir(), crate::config::config_path()];
+    let plan = resolve_plan(&config, &home, &always_protected);
     let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
     wrap_command(cmd, &plan_json)
 }
@@ -606,7 +750,7 @@ mod tests {
             &[root.join("data/db").to_str().unwrap()],
             &[],
         );
-        let plan = resolve_plan(&cfg, &root, &root.join("herdr"));
+        let plan = resolve_plan(&cfg, &root, &[root.join("herdr")]);
 
         let anchor = position(&plan, &FenceMount::Anchor(root.clone()));
         let deny = position(&plan, &FenceMount::Deny(data.clone()));
@@ -638,7 +782,7 @@ mod tests {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         let cfg = config(&["~/state*"], &[], &[]);
-        let plan = resolve_plan(&cfg, &root, &root.join("missing-herdr"));
+        let plan = resolve_plan(&cfg, &root, &[root.join("missing-herdr")]);
         let denied: Vec<&FenceMount> = plan
             .mounts
             .iter()
@@ -663,6 +807,76 @@ mod tests {
             "{errors:?}"
         );
         assert!(validate_config(&config(&["/srv/data"], &["/srv/data/db"], &[])).is_empty());
+        // A carve-out below a wildcard deny is valid even before the path exists.
+        assert!(validate_config(&config(&["/srv/state*"], &["/srv/state-a/db"], &[])).is_empty());
+        assert!(!validate_config(&config(&["/srv/state*"], &["/srv/other/db"], &[])).is_empty());
+    }
+
+    #[test]
+    fn carve_out_cannot_reopen_herdr_config() {
+        let root = temp_root("mandatory");
+        let herdr = root.join("parent/herdr-dev");
+        std::fs::create_dir_all(herdr.join("sub")).unwrap();
+        let parent = root.join("parent");
+        let cfg = config(
+            &[parent.to_str().unwrap()],
+            &[herdr.to_str().unwrap(), herdr.join("sub").to_str().unwrap()],
+            &[],
+        );
+        let plan = resolve_plan(&cfg, &root, &[herdr.clone()]);
+        assert!(
+            !plan
+                .mounts
+                .iter()
+                .any(|m| matches!(m, FenceMount::Allow(_))),
+            "no carve-out inside herdr's config may survive: {:?}",
+            plan.mounts
+        );
+        let parent_deny = position(&plan, &FenceMount::Deny(parent));
+        let herdr_deny = position(&plan, &FenceMount::Deny(herdr));
+        assert!(parent_deny < herdr_deny, "{:?}", plan.mounts);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mandatory_deny_is_applied_after_a_shallower_carve_out() {
+        let root = temp_root("mandatory-order");
+        let config_file = root.join("srv/project/herdr.toml");
+        std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        std::fs::write(&config_file, "").unwrap();
+        let srv = root.join("srv");
+        let project = root.join("srv/project");
+        let cfg = config(&[srv.to_str().unwrap()], &[project.to_str().unwrap()], &[]);
+        let plan = resolve_plan(&cfg, &root, &[config_file.clone()]);
+        let allow = position(&plan, &FenceMount::Allow(project));
+        let file_deny = position(&plan, &FenceMount::Deny(config_file));
+        assert!(allow < file_deny, "{:?}", plan.mounts);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_fence_fails_closed_on_invalid_or_unreadable_config() {
+        assert!(matches!(
+            startup_fence_from_str("[ui]\nx = 1\n"),
+            StartupFence::NotConfigured
+        ));
+        assert!(matches!(
+            startup_fence_from_str("[fence]\nenabled = true\n"),
+            StartupFence::Valid(FenceConfig { enabled: true, .. })
+        ));
+        // A broken other section must not turn a valid fence off.
+        assert!(matches!(
+            startup_fence_from_str("[fence]\nenabled = true\n[ui]\nsidebar_width = \"x\"\n"),
+            StartupFence::Valid(FenceConfig { enabled: true, .. })
+        ));
+        assert!(matches!(
+            startup_fence_from_str("[fence]\nenabled = true\ndeny = [\"relative\"]\n"),
+            StartupFence::Invalid(_)
+        ));
+        assert!(matches!(
+            startup_fence_from_str("[fence]\nenabled = true\n[[broken\n"),
+            StartupFence::Invalid(_)
+        ));
     }
 
     #[test]
