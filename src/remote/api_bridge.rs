@@ -29,6 +29,18 @@ use crate::remote::{
     API_BRIDGE_MULTI_STREAMING_METHODS as MULTI_UNSUPPORTED_METHODS,
 };
 
+/// How often a worker waiting to connect (the API's listen backlog is full)
+/// rechecks whether its request was cancelled or output is gone.
+pub(super) const CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The error a connect attempt ends with when its request no longer needs it.
+pub(super) fn connect_stopped() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "api-bridge: connection attempt cancelled",
+    )
+}
+
 pub(crate) fn run_api_client_bridge(args: &[String]) -> io::Result<()> {
     let encoded_request = match args {
         [] => None,
@@ -77,7 +89,7 @@ fn forward_single_request<W: Write>(
         writeln!(out, "{reply}")?;
         return out.flush();
     }
-    let conn = match transport::connect(socket_path) {
+    let conn = match transport::connect(socket_path, || false) {
         Ok(conn) => conn,
         Err(err) => return emit_transport_error(out, request_line, &err),
     };
@@ -663,7 +675,11 @@ fn forward_tracked_request(
         reply(transport_error_envelope(&job.id, &err).into_bytes()).map(drop)
     };
 
-    let mut conn = match transport::connect(socket_path) {
+    // Cancellable: the API's backlog may be full, and a cancel (or output
+    // going away) must not wait for a connection.
+    let mut conn = match transport::connect(socket_path, || {
+        outbox.is_cancelled(key) || teardown.is_hung_up()
+    }) {
         Ok(conn) => conn,
         Err(err) => return transport_error(err),
     };
@@ -1084,7 +1100,7 @@ mod tests {
     #[test]
     fn single_request_streams_the_reply_to_output() {
         let server = FakeApiServer::start("single");
-        let conn = transport::connect(&server.path).unwrap();
+        let conn = transport::connect(&server.path, || false).unwrap();
         let mut output = Vec::new();
 
         send_and_stream(conn, &request("one", "agent.wait", 50), &mut output).unwrap();
@@ -1103,7 +1119,7 @@ mod tests {
     #[test]
     fn single_request_reports_connect_failures_as_transport_errors() {
         let missing = unique_socket_path("single-missing");
-        let Err(err) = transport::connect(&missing) else {
+        let Err(err) = transport::connect(&missing, || false) else {
             panic!("connected to a missing endpoint");
         };
         let mut output = Vec::new();
@@ -1122,7 +1138,7 @@ mod tests {
     #[test]
     fn connection_shutdown_ends_a_pending_read() {
         let server = FakeApiServer::start("shutdown");
-        let conn = transport::connect(&server.path).unwrap();
+        let conn = transport::connect(&server.path, || false).unwrap();
         let shutdown = ConnectionShutdown::new(&conn).unwrap();
         let mut output = Vec::new();
 
@@ -1185,7 +1201,7 @@ mod tests {
             // Stop reading, but keep the connection open.
             let _ = released.recv();
         });
-        let conn = transport::connect(&path).unwrap();
+        let conn = transport::connect(&path, || false).unwrap();
         let shutdown = ConnectionShutdown::new(&conn).unwrap();
         let request_line = format!(
             "{}\n{}",
@@ -1531,6 +1547,42 @@ mod tests {
         bridge.send(&request("slow", "ping", 0));
         assert_eq!(bridge.read_line()["result"]["method"], "ping");
         bridge.finish();
+    }
+
+    /// The API's listen backlog is full, so a request cannot connect: a
+    /// cancel still answers it at once, and the bridge exits on EOF. Linux
+    /// only: on macOS CI, 64 non-blocking connects to a backlog-0 listener
+    /// that accepts nothing all succeed, so the backlog never fills there.
+    /// `api_bridge_unix`'s `connect_with` tests cover the stop on every unix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multi_cancel_ends_a_request_waiting_to_connect() {
+        use std::os::fd::AsRawFd as _;
+
+        let path = unique_socket_path("backlog");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Nothing accepts; a backlog of 0 fills after a connection or two.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let mut queued = Vec::new();
+        while let Some(stream) = transport::try_connect(&path).unwrap() {
+            queued.push(stream);
+            assert!(queued.len() < 64, "the backlog never filled");
+        }
+
+        let mut bridge = LiveBridge::start(&path, Duration::ZERO);
+        let started = Instant::now();
+        bridge.send(&request("stuck", "ping", 0));
+        thread::sleep(Duration::from_millis(200));
+        bridge.send(&cancel("c", "stuck"));
+        let mut replies = [bridge.read_line(), bridge.read_line()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        assert_eq!(replies[0]["result"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "stuck");
+        assert_eq!(replies[1]["error"]["code"], "cancelled");
+        bridge.finish();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(queued);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Every worker waits on a slow reply and one more request waits for a

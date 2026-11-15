@@ -92,11 +92,12 @@ struct State {
     /// What `bridge.hello` requests have asked for so far: every hello reply
     /// says so and turns it on once written, never before.
     requested: Session,
-    /// Every reply not yet fully written, in arrival order. The writer serves
-    /// them round robin from `cursor`; a reply waits behind an earlier one
-    /// with the same id, so one id's replies never interleave.
+    /// Every reply not yet fully written. The writer serves the first one it
+    /// may write and moves a reply it has not finished behind every other
+    /// waiting reply, so a new reply cannot keep overtaking an unfinished
+    /// one. A reply waits behind an earlier one (lower ticket) with the same
+    /// id, so one id's replies never interleave.
     queue: Vec<Reply>,
-    cursor: usize,
     next_ticket: u64,
     finished: HashMap<u64, Delivery>,
     next_key: RequestKey,
@@ -296,9 +297,6 @@ impl Outbox {
                 index += 1;
             } else {
                 let reply = state.queue.remove(index);
-                if index < state.cursor {
-                    state.cursor -= 1;
-                }
                 state.finish(&reply, Delivery::Cancelled);
             }
         }
@@ -438,7 +436,6 @@ impl Outbox {
                     // Started and framed: tell the client to drop it.
                     push_header(&mut buf, &reply.id, 0, true, ABORT);
                     let reply = state.queue.remove(index);
-                    state.cursor = index;
                     state.finish(&reply, Delivery::Cancelled);
                     self.changed.notify_all();
                     drop(state);
@@ -484,10 +481,11 @@ impl Outbox {
             reply.sent += written;
             reply.in_write = 0;
             if reply.sent < reply.bytes.len() {
-                state.cursor = index + 1;
+                // Round robin: behind everything already waiting.
+                let reply = state.queue.remove(index);
+                state.queue.push(reply);
             } else {
                 let reply = state.queue.remove(index);
-                state.cursor = index;
                 if let Some(active) = reply.key.and_then(|key| state.active.get_mut(&key)) {
                     active.answered = true;
                 }
@@ -553,16 +551,15 @@ impl State {
         }
     }
 
-    /// The next reply to write from, round robin from `cursor`, skipping a
-    /// reply that waits behind an earlier one with the same id.
+    /// The next reply to write from: the first in the rotation that does not
+    /// wait behind an earlier reply (lower ticket) with the same id.
     fn next_index(&self) -> Option<usize> {
-        let len = self.queue.len();
-        (0..len)
-            .map(|offset| (self.cursor + offset) % len)
-            .find(|&index| {
-                let id = &self.queue[index].id;
-                !self.queue[..index].iter().any(|earlier| &earlier.id == id)
-            })
+        self.queue.iter().position(|reply| {
+            !self
+                .queue
+                .iter()
+                .any(|other| other.id == reply.id && other.ticket < reply.ticket)
+        })
     }
 }
 
@@ -592,4 +589,92 @@ fn gzip(line: &[u8]) -> Vec<u8> {
 
 fn output_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "api-bridge: output closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Output that hands each flushed frame to the test and waits for leave
+    /// to go on, so the test can queue replies while a frame is being written.
+    struct GatedOutput {
+        buf: Vec<u8>,
+        written: mpsc::Sender<String>,
+        permits: mpsc::Receiver<()>,
+    }
+
+    impl Write for GatedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let header_end = self.buf.iter().position(|&b| b == b'\n').unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&self.buf[..header_end]).unwrap();
+            self.buf.clear();
+            let id = header["frame"].as_str().unwrap().to_owned();
+            self.written.send(id).unwrap();
+            self.permits.recv().map_err(|_| output_gone())
+        }
+    }
+
+    /// Small replies arriving while others are written cannot keep a big
+    /// reply waiting: it gets a turn after every reply already queued.
+    #[test]
+    fn new_small_replies_do_not_starve_an_unfinished_big_one() {
+        let outbox = Outbox::default();
+        outbox.state().session.frames = true;
+        assert!(outbox.post("big", vec![b'x'; 3 * FRAME_BYTES]).unwrap());
+        assert!(outbox.post("small0", b"{}".to_vec()).unwrap());
+
+        let (written, frames) = mpsc::channel();
+        let (permit, permits) = mpsc::channel();
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                outbox.run_writer(GatedOutput {
+                    buf: Vec::new(),
+                    written,
+                    permits,
+                })
+            });
+            let mut order = Vec::new();
+            let smalls = 9;
+            for _ in 0..3 + smalls {
+                order.push(frames.recv().unwrap());
+                // A new small reply arrives during every write.
+                let next = order.iter().filter(|id| id.starts_with("small")).count()
+                    + order.iter().filter(|id| *id == "big").count();
+                if next < smalls {
+                    assert!(outbox
+                        .post(&format!("small{next}"), b"{}".to_vec())
+                        .unwrap());
+                }
+                permit.send(()).unwrap();
+            }
+            outbox.close();
+            writer.join().unwrap().unwrap();
+
+            // Between two turns of `big`, only replies already queued when
+            // the first turn was written may go: `small{n}` was posted while
+            // frame `n` of the order was written.
+            let mut last_big = None;
+            for (index, id) in order.iter().enumerate() {
+                if id == "big" {
+                    last_big = Some(index);
+                } else if let Some(turn) = last_big {
+                    let n: usize = id["small".len()..].parse().unwrap();
+                    assert!(n <= turn + 1, "{id} overtook big: {order:?}");
+                }
+            }
+            assert_eq!(
+                order.iter().filter(|id| *id == "big").count(),
+                3,
+                "{order:?}"
+            );
+        });
+    }
 }
