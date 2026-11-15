@@ -643,6 +643,30 @@ droid = "off"
 claude = "on"
 ```
 
+## 窗格围栏 (Linux)
+
+窗格围栏防止智能体以及它们运行的测试和脚本修改不应修改的文件。启用后，herdr 会在围栏内启动每个新窗格的进程：
+
+- deny 列表中的路径及其下的所有内容都是只读的；
+- 被 deny 的目录中的 `fence.allow` 路径保持可写，但这些路径本身不能被删除或重命名；
+- 会在围栏外执行操作的套接字 (systemd、D-Bus、Docker、containerd) 拒绝连接；
+- 窗格不能挂载、卸载、进入其他命名空间、加载内核模块、重启、跟踪其他进程或写入块设备。
+
+窗格的用户保持不变，因此 deny 列表之外的一切照常工作。围栏作用于窗格的整个进程树，以及更改之后启动的窗格；正在运行的窗格保留启动时的围栏。
+
+```toml
+[fence]
+enabled = true
+deny = ["/usr", "/etc", "~/.ssh", "/srv/shared"]
+allow = ["/srv/shared/my-project"]
+```
+
+省略 `deny` 和 `mask_sockets` 即使用内置列表 (参见 [配置参考](/docs/config-reference/))。herdr 自己的配置目录在围栏内始终只读；它的套接字仍可连接，所以 `herdr` CLI 照常可用。围栏内的窗格会设置 `HERDR_FENCE`。
+
+如果无法建立围栏，窗格会显示错误，其命令不会启动。要关闭围栏，设置 `enabled = false`，运行 `herdr server reload-config`，然后重启相关窗格。
+
+围栏内的窗格无法连接 systemd，因此请在围栏之外启动和停止长期运行的服务 (例如 systemd 单元)，而不是在窗格中手动运行。
+
 ## 高级配置
 
 在[配置参考](/docs/config-reference/)中搜索回滚缓冲区限制、嵌套启动以及其他高级或实验性设置。启用窗格屏幕历史前，请参阅[会话状态与恢复](/docs/session-state/)；该指南说明了保存窗格内容带来的安全取舍。

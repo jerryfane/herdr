@@ -88,6 +88,12 @@ build:
 build:
     python scripts/package_windows_conpty.py build-local
 
+# Pane fence end-to-end test in a throwaway Docker container (Linux, needs docker).
+# Never runs fence mounts on the host itself; see scripts/fence/container-test.sh.
+[linux]
+fence-test: build
+    scripts/fence/run-in-container.sh "${CARGO_TARGET_DIR:-target}/release/herdr"
+
 # Non-gating full-render scaling profile for background workspaces and active panes
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1

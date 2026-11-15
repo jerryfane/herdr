@@ -648,6 +648,30 @@ droid = "off"
 claude = "on"
 ```
 
+## Pane fence (Linux)
+
+The pane fence stops agents, and the tests and scripts they run, from changing files they should not touch. When it is on, herdr starts every new pane process inside a fence:
+
+- the deny list is read-only, including everything below it;
+- `fence.allow` paths inside a denied directory stay writable, and cannot themselves be deleted or renamed;
+- sockets that would run work outside the fence (systemd, D-Bus, Docker, containerd) refuse connections;
+- the pane cannot mount, unmount, enter other namespaces, load kernel modules, reboot, trace other processes, or write block devices.
+
+The pane keeps its user, so everything outside the deny list works as before. The fence applies to the whole process tree of the pane and to panes started after the change; running panes keep the fence they started with.
+
+```toml
+[fence]
+enabled = true
+deny = ["/usr", "/etc", "~/.ssh", "/srv/shared"]
+allow = ["/srv/shared/my-project"]
+```
+
+Leave out `deny` and `mask_sockets` to use the built-in lists (see the [Config reference](/docs/config-reference/)). Herdr's own config directory is always read-only inside the fence; its sockets still accept connections, so the `herdr` CLI keeps working. Inside a fenced pane, `HERDR_FENCE` is set.
+
+If the fence cannot be set up, the pane shows the error and its command does not start. To switch the fence off, set `enabled = false`, run `herdr server reload-config`, and restart the affected panes.
+
+A fenced pane cannot reach systemd, so start and stop long-running services (for example systemd units) from outside the fence, not by hand in a pane.
+
 ## Advanced configuration
 
 Search the [Config reference](/docs/config-reference/) for scrollback limits, nested launches, and other advanced or experimental settings. See [Session state and restore](/docs/session-state/) before enabling pane screen history; that guide explains the security trade-off of saving pane contents.
