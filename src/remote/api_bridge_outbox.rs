@@ -16,16 +16,25 @@
 //! the bytes a cancelled reply already sent; its `cancelled` error follows as
 //! a reply of its own.
 //!
-//! Producers (the request reader and the workers) hand over one reply at a
-//! time and wait until it has been written or cancelled, so the bridge never
-//! buffers more than one reply per worker, the same bound the old whole-line
-//! writer had.
+//! Workers hand over one reply at a time and wait until it has been written
+//! or cancelled, so the bridge never buffers more than one reply per worker,
+//! the same bound the old whole-line writer had. The request reader never
+//! waits on output, so it always reads the next `bridge.cancel`: it posts its
+//! own small replies (errors, `busy`, cancel answers) without waiting, as does
+//! a worker its `cancelled` error, at most [`MAX_POSTED`] of them pending;
+//! past that a posted reply is dropped.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::remote::API_BRIDGE_FRAME_BYTES as FRAME_BYTES;
+
+/// Replies the request reader may have waiting to be written at once. They
+/// are one short line each; a client flooding the bridge with more requests
+/// than it can answer loses the excess replies rather than stalling the
+/// reader.
+pub(super) const MAX_POSTED: usize = 64;
 
 /// How one reply left the bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +66,8 @@ struct State {
     finished: HashMap<u64, Delivery>,
     next_key: RequestKey,
     active: HashMap<RequestKey, Active>,
+    /// Posted replies in `queue` (nobody waits for them).
+    posted: usize,
     /// No producer is left; the writer drains the queue and returns.
     closed: bool,
     /// Writing failed; nothing more can be delivered.
@@ -86,6 +97,8 @@ struct Reply {
     cancelled: bool,
     /// The `bridge.hello` reply that switches to frames once written.
     switches_to_frames: bool,
+    /// Posted by the request reader: nobody waits for its delivery.
+    posted: bool,
 }
 
 impl Reply {
@@ -202,7 +215,7 @@ impl Outbox {
                 if index < state.cursor {
                     state.cursor -= 1;
                 }
-                state.finished.insert(reply.ticket, Delivery::Cancelled);
+                state.finish(&reply, Delivery::Cancelled);
             }
         }
         self.changed.notify_all();
@@ -226,6 +239,24 @@ impl Outbox {
         self.enqueue(None, id, line, true)
     }
 
+    /// Queues `line` (one reply, without its newline) for `id` without
+    /// waiting for it to be written. Returns `false`, dropping it, when
+    /// [`MAX_POSTED`] posted replies are already waiting. Fails once output
+    /// has failed.
+    pub(super) fn post(&self, id: &str, line: Vec<u8>) -> io::Result<bool> {
+        let mut state = self.state();
+        if state.failed {
+            return Err(output_gone());
+        }
+        if state.posted >= MAX_POSTED {
+            return Ok(false);
+        }
+        state.posted += 1;
+        state.push(None, id, line, false, true);
+        self.changed.notify_all();
+        Ok(true)
+    }
+
     fn enqueue(
         &self,
         key: Option<RequestKey>,
@@ -245,18 +276,7 @@ impl Outbox {
         }) {
             return Ok(Delivery::Cancelled);
         }
-        let ticket = state.next_ticket;
-        state.next_ticket += 1;
-        state.queue.push(Reply {
-            ticket,
-            key,
-            id: id.to_owned(),
-            bytes,
-            sent: 0,
-            in_write: 0,
-            cancelled: false,
-            switches_to_frames,
-        });
+        let ticket = state.push(key, id, bytes, switches_to_frames, false);
         self.changed.notify_all();
         loop {
             if let Some(delivery) = state.finished.remove(&ticket) {
@@ -308,9 +328,9 @@ impl Outbox {
                 if reply.cancelled {
                     // Started and framed: tell the client to drop it.
                     push_header(&mut buf, &reply.id, 0, true, true);
-                    state.queue.remove(index);
+                    let reply = state.queue.remove(index);
                     state.cursor = index;
-                    state.finished.insert(ticket, Delivery::Cancelled);
+                    state.finish(&reply, Delivery::Cancelled);
                     self.changed.notify_all();
                     drop(state);
                     if let Err(err) = out.write_all(&buf).and_then(|()| out.flush()) {
@@ -363,7 +383,7 @@ impl Outbox {
                 if reply.switches_to_frames {
                     state.framed = true;
                 }
-                state.finished.insert(ticket, Delivery::Written);
+                state.finish(&reply, Delivery::Written);
             }
             self.changed.notify_all();
         }
@@ -373,6 +393,7 @@ impl Outbox {
         let mut state = self.state();
         state.failed = true;
         state.queue.clear();
+        state.posted = 0;
         drop(state);
         self.changed.notify_all();
         err
@@ -380,6 +401,41 @@ impl Outbox {
 }
 
 impl State {
+    /// Queues a reply and returns its ticket.
+    fn push(
+        &mut self,
+        key: Option<RequestKey>,
+        id: &str,
+        bytes: Vec<u8>,
+        switches_to_frames: bool,
+        posted: bool,
+    ) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.queue.push(Reply {
+            ticket,
+            key,
+            id: id.to_owned(),
+            bytes,
+            sent: 0,
+            in_write: 0,
+            cancelled: false,
+            switches_to_frames,
+            posted,
+        });
+        ticket
+    }
+
+    /// Records how `reply`, just taken off the queue, left the bridge, for
+    /// the producer waiting on it (a posted reply has none).
+    fn finish(&mut self, reply: &Reply, delivery: Delivery) {
+        if reply.posted {
+            self.posted -= 1;
+        } else {
+            self.finished.insert(reply.ticket, delivery);
+        }
+    }
+
     /// The next reply to write from, round robin from `cursor`, skipping a
     /// reply that waits behind an earlier one with the same id.
     fn next_index(&self) -> Option<usize> {

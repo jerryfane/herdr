@@ -704,7 +704,11 @@ report `capabilities.api_bridge_multi: true` from `ping`):
   connection, up to 16 at a time; up to 16 more wait for a free slot. The bridge
   never stops reading stdin: a request arriving while 16 run and 16 wait gets a
   `busy` error at once (retry it once a response arrives), so `bridge.cancel`
-  is always read promptly.
+  is always read promptly, even while stdout is backed up. The bridge's own
+  short replies (`busy` and other errors, cancel answers, `cancelled`) never
+  hold up reading; if more than 64 of them are waiting for stdout, further
+  ones are dropped. A `busy` reply for an id whose earlier reply is still being
+  sent follows that reply.
 - Every response line is written to stdout whole and unchanged. Responses can
   arrive out of order, so match them by `id`.
 - `events.subscribe`, `pane.stream`, `pane.input.stream`, `gram.upload.stream`
