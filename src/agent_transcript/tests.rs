@@ -1271,27 +1271,41 @@ fn max_bytes_pages_keep_each_plan_in_one_place() {
     assert_eq!(walked, whole);
 }
 
-/// Sizing renders each record once: many todo updates of a big plan cost
-/// about what the unbudgeted page does, not a re-render per trimmed record.
+/// Sizing renders each record once: a page over many todo updates of a big
+/// plan renders no record twice, not a re-render per trimmed record.
 #[test]
 fn max_bytes_sizes_a_long_plan_turn_in_one_pass() {
     let mut session = Fixture::new("max-bytes-many-todos");
     session.user("long plan");
-    for update in 0..500 {
+    let updates = 50;
+    for update in 0..updates {
         todo_update(&mut session, &format!("t{update}"), "in_progress", 2_000);
     }
-    let started = std::time::Instant::now();
-    let whole = session.newest();
-    let unbudgeted = started.elapsed();
-    let started = std::time::Instant::now();
+    let records = 1 + 2 * updates;
+    RECORD_RENDERS.with(|renders| renders.set(0));
     let page = budget_page(&session, None, 300);
-    let budgeted = started.elapsed();
+    let renders = RECORD_RENDERS.with(|renders| renders.get());
     assert!(!page.entries.is_empty());
-    assert!(!whole.entries.is_empty());
     assert!(
-        budgeted <= unbudgeted * 20 + std::time::Duration::from_millis(100),
-        "budgeted {budgeted:?} vs unbudgeted {unbudgeted:?}"
+        renders <= records,
+        "{renders} record renders for a session of {records} records"
     );
+}
+
+/// An empty active branch gives an empty page under a budget too: a
+/// zero-byte file, a header-only session, and a session just after a reset.
+#[test]
+fn max_bytes_on_an_empty_branch_is_an_empty_page() {
+    let empty = Fixture::new("max-bytes-zero-byte");
+    std::fs::write(&empty.path, "").unwrap();
+    let header_only = Fixture::new("max-bytes-header-only");
+    let mut reset = Fixture::new("max-bytes-after-reset");
+    reset.user("before the reset");
+    reset.push(json!({"type": "reset_boundary"}));
+    for session in [&empty, &header_only, &reset] {
+        let page = budget_page(session, None, 300);
+        assert!(page.entries.is_empty(), "{:?}", page.entries);
+    }
 }
 
 #[test]

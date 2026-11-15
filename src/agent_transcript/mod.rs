@@ -33,6 +33,13 @@ use normalize::{AssistantLine, NoteLine, ResultLine, StampLine, UserLine, SUMMAR
 pub(crate) use origin::PENDING_PROMPT_LIMIT;
 pub(crate) use origin::{OtherPrompt, OtherPromptLog, PromptOutcome, TooManyPendingPrompts};
 
+#[cfg(test)]
+thread_local! {
+    /// Records rendered on this thread, so tests can see sizing render each
+    /// record once.
+    pub(crate) static RECORD_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) const DEFAULT_TURNS: u32 = 20;
 pub(crate) const MAX_TURNS: u32 = 50;
 /// Rendered entries one page reads at most. A turn longer than this (hours of
@@ -984,6 +991,10 @@ impl View<'_> {
         others: &[(usize, String)],
         entries: &mut Vec<TranscriptEntry>,
     ) -> Result<usize, TranscriptError> {
+        if start == end {
+            // An empty branch has no turn to resolve.
+            return Ok(start);
+        }
         let mut owners = HashSet::new();
         let mut turn_has_plan = false;
         for position in self.turn_start(start)..end {
@@ -1030,6 +1041,8 @@ impl View<'_> {
     ) -> Result<(), TranscriptError> {
         let mut planned = HashSet::new();
         for position in start..end {
+            #[cfg(test)]
+            RECORD_RENDERS.with(|renders| renders.set(renders.get() + 1));
             let record = self.branch[position];
             let id = &*self.index.record(record).id;
             match self.kind(position) {
