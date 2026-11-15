@@ -217,11 +217,26 @@ pub struct GramUploadStreamParams {
 /// bytes are inline base64 and can be as large as 100 MiB. For a remote relay,
 /// and for bounded new clients, use `gram.get_file_chunk` instead. Owner (no
 /// caller pane) may download any file; an agent may only download one it can see.
+///
+/// With `thumbnail`, the reply is instead a small JPEG preview of an image
+/// attachment (`gram_file_thumbnail`), or `thumbnail_unavailable`. Servers
+/// that do this advertise `capabilities.gram_thumbnails`; older ones ignore
+/// the field and return the whole file (`gram_file_content`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramGetFileParams {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<GramThumbnailParams>,
+}
+
+/// The preview `gram.get_file` returns for `thumbnail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramThumbnailParams {
+    /// Longest edge of the preview in pixels, clamped to 16..=1024. An image
+    /// already that small keeps its size.
+    pub max_px: u32,
 }
 /// Bounded file read. A response contains at most 512 KiB of decoded bytes.
 /// `offset == size` returns an empty chunk; a deleted file returns `not_found`.

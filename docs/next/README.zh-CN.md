@@ -83,3 +83,5 @@ just check       # 格式检查、测试和维护性检查
 ## 许可证
 
 herdr 基于 [Apache License 2.0](LICENSE) 许可证发布。
+
+Gram 图片预览使用 [jpeg-encoder](https://github.com/vstroebel/jpeg-encoder) crate,其 DCT 源自 libjpeg:this software is based in part on the work of the Independent JPEG Group(本软件部分基于 Independent JPEG Group 的工作)。

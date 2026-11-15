@@ -141,4 +141,9 @@ pub struct ServerCapabilities {
     /// frame of one marked `"enc":"gzip"`. The hello reply is authoritative.
     #[serde(default)]
     pub compressed_replies: bool,
+    /// `gram.get_file` accepts `thumbnail: {max_px}` and answers it with a
+    /// small JPEG (`gram_file_thumbnail`). Older servers ignore the field and
+    /// send the whole file.
+    #[serde(default)]
+    pub gram_thumbnails: bool,
 }

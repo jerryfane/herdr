@@ -1202,6 +1202,7 @@ fn success_response_round_trips() {
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
                 compressed_replies: false,
+                gram_thumbnails: false,
             }),
         },
     };
