@@ -10,6 +10,8 @@
 mod form;
 mod selector;
 
+pub(crate) use form::ask_panel_body;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -300,6 +302,14 @@ fn omp_session_path(agent: &AgentInfo) -> Option<PathBuf> {
     let session = agent.agent_session.as_ref()?;
     (session.kind == AgentSessionRefKind::Path && !session.value.is_empty())
         .then(|| PathBuf::from(&session.value))
+}
+
+/// The omp agent's session still waits on an ask: with omp's ask panel on
+/// its screen ([`ask_panel_body`]), the guest gate's evidence that the ask
+/// dialog is open.
+pub(crate) fn omp_ask_pending(agent: &AgentInfo) -> bool {
+    omp_session_path(agent)
+        .is_some_and(|path| matches!(crate::agent_transcript::pending_ask(&path), Ok(Some(_))))
 }
 
 /// Look for the ask's tool result: `answered` once it records exactly

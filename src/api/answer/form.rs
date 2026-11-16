@@ -626,6 +626,14 @@ impl Panel {
     }
 }
 
+/// The ask panel's rows under its title bar, when `screen` shows the panel.
+/// The title is left out: its countdown ticks on its own while the form waits.
+pub(crate) fn ask_panel_body(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let panel = panel(&lines)?;
+    Some(lines[panel.top + 1..=panel.bottom].join("\n"))
+}
+
 /// The form panel's title (`DEFAULT_TITLE`, dialog.ts:124).
 const ASK_TITLE: &str = "Ask";
 

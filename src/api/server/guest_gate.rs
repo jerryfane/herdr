@@ -1,9 +1,11 @@
 //! Guest principal gate: an explicit allowlist bound to one agent grant.
 //! Everything else answers `guest_forbidden`. Prompts are labeled, and a guest
 //! answers the agent's questions as the owner can: `agent.answer` for an ask,
-//! and menu keys (arrows, Enter, Tab, Escape, Space, 1-9, y, n) through
-//! `pane.send_keys` only while the agent awaits menu input; a choosing key ends
-//! its batch, and no more keys are taken until a new menu is seen. The terminal
+//! `agent.answer_form` for an omp form ask, and menu keys (arrows, Enter, Tab,
+//! Escape, Space, 1-9, y, n) through `pane.send_keys` only while the agent
+//! awaits menu input; a choosing key ends its batch, and no more keys are
+//! taken until a new menu is seen, or omp's ask dialog showed it took the key
+//! and is still open (see `menu_still_open`). The terminal
 //! takes no other input: no text, no other keys, nothing while the agent is not
 //! awaiting a menu, so a guest can never type into a shell. A guest may watch
 //! the terminal, read its scrollback and, while watching, resize it for
@@ -431,12 +433,13 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
     else {
         return None;
     };
-    // Only what this gate itself serves; the owner's capability set stays private.
+    // Only what this gate itself serves; the owner's capability set stays
+    // private. `ask_form`: a guest answers form asks with `agent.answer_form`.
     Some(serde_json::json!({
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true},
     }))
 }
 
@@ -534,10 +537,12 @@ fn awaits_menu_input(agent: &AgentInfo) -> bool {
     }
 }
 
-/// Per guest store and granted terminal, the agent's `state_change_seq` when
-/// a guest batch last committed a menu choice. Until detection has seen the
-/// agent change state since, the menu on record may already be gone, so no
-/// guest keys are accepted.
+/// Per guest store and granted terminal, what a guest batch that last
+/// committed a menu choice left on record ([`MenuCommitted`]). Until
+/// detection has seen the agent change state since, the menu on record may
+/// already be gone, so no guest keys are accepted, with one exception: an
+/// omp ask dialog that took the key and is still open (see
+/// [`menu_still_open`]).
 ///
 /// Each terminal has its own lock, held by a batch from its check through
 /// its write, so a concurrent batch for that terminal sees this one's commit.
@@ -547,8 +552,58 @@ static MENU_COMMITS: Mutex<Option<HashMap<MenuMarker, MenuCommit>>> = Mutex::new
 
 type MenuMarker = (std::path::PathBuf, String);
 
-/// One terminal's last committed `state_change_seq`, if any.
-type MenuCommit = Arc<Mutex<Option<u64>>>;
+/// One terminal's last menu commit, if any.
+type MenuCommit = Arc<Mutex<Option<MenuCommitted>>>;
+
+/// A guest batch that ended with a committing key.
+struct MenuCommitted {
+    /// The agent's `state_change_seq` when it was written.
+    seq: u64,
+    /// omp's ask panel as the screen showed it just before the write, when
+    /// the agent's session waited on an ask ([`open_omp_ask_panel`]).
+    omp_ask_panel: Option<String>,
+}
+
+/// Whether a menu a guest committed in, with no agent state change since,
+/// is still up. omp keeps one `ask` call, and its `blocked` state, across a
+/// whole form: Enter on a radio picks it and moves to the next field, so the
+/// state never changes between the fields' keys. The dialog counts as open
+/// only when all of these hold now: the session still waits on an ask
+/// (Submit and Escape write the ask's result), the screen shows omp's ask
+/// panel (closing it takes the panel off), and the panel differs from what
+/// it showed before the committing key (omp has taken that key; until then
+/// the key may still close it). Any other agent, or a commit made with no
+/// omp ask on screen, waits for a state change as before.
+fn menu_still_open(commit: &MenuCommitted, panel_now: Option<&str>) -> bool {
+    matches!(
+        (commit.omp_ask_panel.as_deref(), panel_now),
+        (Some(before), Some(now)) if before != now
+    )
+}
+
+/// omp's ask panel on the granted pane's screen (its rows under the title
+/// bar) while the agent's session waits on an ask; `None` otherwise, without
+/// reading the screen when no omp ask is pending.
+fn open_omp_ask_panel(id: &str, agent: &AgentInfo, api_tx: &ApiRequestSender) -> Option<String> {
+    if !crate::api::answer::omp_ask_pending(agent) {
+        return None;
+    }
+    let request = Request {
+        id: format!("{id}:ask-panel"),
+        method: Method::PaneRead(PaneReadParams {
+            pane_id: agent.pane_id.clone(),
+            source: ReadSource::Visible,
+            lines: None,
+            format: crate::api::schema::ReadFormat::Text,
+            strip_ansi: true,
+            intent: ReadIntent::Passive,
+        }),
+    };
+    let response = dispatch_to_app_with_timeout(request, api_tx, None);
+    let mut value: serde_json::Value = serde_json::from_str(&response).ok()?;
+    let text = value["result"]["read"]["text"].take();
+    crate::api::answer::ask_panel_body(text.as_str()?)
+}
 
 /// The commit record for `marker`, created on first use.
 fn menu_commit(marker: MenuMarker) -> MenuCommit {
@@ -1205,14 +1260,23 @@ fn serve_request(
             let commit = menu_commit((guest.dir.clone(), guest.grant.terminal_id.clone()));
             // Held through the write, so a concurrent guest batch for this
             // terminal sees this one's commit.
-            let mut committed_at = commit
+            let mut last_commit = commit
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let stale = committed_at.is_some_and(|seq| agent.state_change_seq <= seq);
-            if stale || !awaits_menu_input(&agent) {
+            if !awaits_menu_input(&agent) {
                 return forbidden(stream);
             }
-            *committed_at = None;
+            let mut panel = None;
+            if let Some(committed) = last_commit
+                .as_ref()
+                .filter(|committed| agent.state_change_seq <= committed.seq)
+            {
+                panel = open_omp_ask_panel(&id, &agent, api_tx);
+                if !menu_still_open(committed, panel.as_deref()) {
+                    return forbidden(stream);
+                }
+            }
+            *last_commit = None;
             guest.audit(
                 GuestAuditEvent::Prompt,
                 Some(method),
@@ -1220,6 +1284,9 @@ fn serve_request(
                 None,
             );
             let commits_choice = keys.last().is_some_and(|key| commits_menu(key));
+            if commits_choice && panel.is_none() {
+                panel = open_omp_ask_panel(&id, &agent, api_tx);
+            }
             let request = Request {
                 id: id.clone(),
                 method: Method::PaneSendKeys(PaneSendKeysParams {
@@ -1230,7 +1297,10 @@ fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             if commits_choice {
-                *committed_at = Some(agent.state_change_seq);
+                *last_commit = Some(MenuCommitted {
+                    seq: agent.state_change_seq,
+                    omp_ask_panel: panel,
+                });
             }
             write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
@@ -2094,6 +2164,7 @@ mod tests {
     use crate::guest::{admit_in, Admission};
 
     type Control = Box<dyn FnOnce(&mut App) + Send>;
+    type PtyHook = Box<dyn FnMut(&mut App, usize, &[u8]) + Send>;
     type PtyView = ((u16, u16), Vec<(String, u16, u16, Duration)>);
 
     /// A real `App` on its own thread with two named agents: the granted
@@ -2109,6 +2180,9 @@ mod tests {
         /// Runs once on the app thread just before it applies the next
         /// `pane.set_pty_size`.
         before_resize: Arc<Mutex<Option<Control>>>,
+        /// Sees every write to an agent's terminal on the app thread, before
+        /// `pty` does: a fake program answering its keys.
+        pty_hook: Arc<Mutex<Option<PtyHook>>>,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -2130,6 +2204,8 @@ mod tests {
         let app_running = Arc::clone(&running);
         let before_resize: Arc<Mutex<Option<Control>>> = Arc::default();
         let app_before_resize = Arc::clone(&before_resize);
+        let pty_hook: Arc<Mutex<Option<PtyHook>>> = Arc::default();
+        let app_pty_hook = Arc::clone(&pty_hook);
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -2191,6 +2267,13 @@ mod tests {
                 }
                 for (index, rx) in ptys.iter_mut().enumerate() {
                     while let Ok(bytes) = rx.try_recv() {
+                        if let Some(hook) = app_pty_hook
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_mut()
+                        {
+                            hook(&mut app, index, &bytes);
+                        }
                         let _ = pty_tx.send((index, bytes));
                     }
                 }
@@ -2228,6 +2311,7 @@ mod tests {
             pane_ids,
             dir: TempDir::new(tag),
             before_resize,
+            pty_hook,
             thread: Some(thread),
         }
     }
@@ -2933,6 +3017,312 @@ mod tests {
             Some(r#"{"db":{"options":["pg"]}}"#)
         );
         assert!(harness.pty_text(1, Duration::from_millis(50)).is_empty());
+    }
+
+    /// The shape of the form guest nike was asked on 16 Nov (herdr#455):
+    /// three single-select fieldsets, each with omp's Other row.
+    const THREE_FIELD_FORM: &str = r#"<form><fieldset><legend>Automatic no</legend>
+<label><input type="radio" name="auto_reject" value="yes" checked> Reject automatically</label>
+<label><input type="radio" name="auto_reject" value="no"> Leave them waiting</label></fieldset>
+<fieldset><legend>Moratorium laws</legend>
+<label><input type="radio" name="moratorium" value="sardinia_only" checked> Only Sardinia</label>
+<label><input type="radio" name="moratorium" value="all_found"> Every regional law</label></fieldset>
+<fieldset><legend>Crops</legend>
+<label><input type="radio" name="crop" value="trim" checked> Only the confirmed crops</label>
+<label><input type="radio" name="crop" value="all_or_nothing"> Nothing until all are confirmed</label></fieldset></form>"#;
+
+    /// `(name, legend, [(value, label); 2])` of [`THREE_FIELD_FORM`].
+    type FormField = (&'static str, &'static str, [(&'static str, &'static str); 2]);
+    const THREE_FIELDS: [FormField; 3] = [
+        (
+            "auto_reject",
+            "Automatic no",
+            [("yes", "Reject automatically"), ("no", "Leave them waiting")],
+        ),
+        (
+            "moratorium",
+            "Moratorium laws",
+            [
+                ("sardinia_only", "Only Sardinia"),
+                ("all_found", "Every regional law"),
+            ],
+        ),
+        (
+            "crop",
+            "Crops",
+            [
+                ("trim", "Only the confirmed crops"),
+                ("all_or_nothing", "Nothing until all are confirmed"),
+            ],
+        ),
+    ];
+    /// The Submit stop: each field has two options and Other before it.
+    const SUBMIT_STOP: usize = 9;
+
+    /// omp's terminal form for [`THREE_FIELD_FORM`] in the granted pane, as
+    /// omp 18.20's html-form dialog behaves: ↑/↓ move one stop, Tab goes to
+    /// the next field, Space picks, Enter picks and moves to the next field,
+    /// Enter on Submit writes the ask's result and closes the dialog. While
+    /// `frozen` it has not read its input yet.
+    struct OmpForm {
+        session: crate::agent_transcript::tests::Fixture,
+        ask_id: &'static str,
+        focus: usize,
+        picks: [usize; 3],
+        submitted: bool,
+        frozen: bool,
+    }
+
+    impl OmpForm {
+        fn screen(&self) -> String {
+            if self.submitted {
+                return "agent: applying the three decisions\n".to_owned();
+            }
+            let cursor = |stop: usize| if self.focus == stop { "❯ " } else { "  " };
+            let mut screen = String::from("agent: three decisions\n╭─ Ask ─╮\n");
+            for (field, (_, legend, options)) in THREE_FIELDS.iter().enumerate() {
+                screen.push_str(&format!(" {legend}\n"));
+                for (option, (_, label)) in options.iter().enumerate() {
+                    let marker = if self.picks[field] == option {
+                        "◉"
+                    } else {
+                        "○"
+                    };
+                    let stop = field * 3 + option;
+                    screen.push_str(&format!("│ {}{marker} {label}\n", cursor(stop)));
+                }
+                let other = cursor(field * 3 + 2);
+                screen.push_str(&format!("│ {other}○ Other: type your own\n"));
+            }
+            screen.push_str(&format!("│ {}Submit\n╰───────╯\n", cursor(SUBMIT_STOP)));
+            screen
+        }
+
+        fn press(&mut self, key: &str) {
+            if self.submitted {
+                return;
+            }
+            let next_field = (self.focus / 3 + 1) * 3;
+            match key {
+                "up" => self.focus = self.focus.saturating_sub(1),
+                "down" => self.focus = (self.focus + 1).min(SUBMIT_STOP),
+                "tab" => self.focus = next_field.min(SUBMIT_STOP),
+                "space" if self.focus < SUBMIT_STOP && self.focus % 3 < 2 => {
+                    self.picks[self.focus / 3] = self.focus % 3;
+                }
+                "enter" if self.focus == SUBMIT_STOP => self.submit(),
+                "enter" => {
+                    if self.focus % 3 < 2 {
+                        self.picks[self.focus / 3] = self.focus % 3;
+                    }
+                    self.focus = next_field;
+                }
+                _ => {}
+            }
+        }
+
+        fn submit(&mut self) {
+            self.submitted = true;
+            let mut data = serde_json::Map::new();
+            let mut answers = Vec::new();
+            for (field, (name, legend, options)) in THREE_FIELDS.iter().enumerate() {
+                let (value, label) = options[self.picks[field]];
+                data.insert((*name).to_owned(), json!(value));
+                answers.push(json!({"name": name, "question": legend, "answer": label}));
+            }
+            let data = Value::Object(data);
+            self.session.push(json!({"type": "message", "message": {
+                "role": "toolResult", "toolCallId": self.ask_id, "toolName": "ask", "isError": false,
+                "content": [{"type": "text", "text": format!("User answers:\n{data:#}")}],
+                "details": {"answers": answers}, "timestamp": 1_792_000_000_000_u64,
+            }}));
+        }
+
+        /// Draw the form (or what replaced it) on the granted pane.
+        fn render(&self, app: &mut App) {
+            let workspace = &app.state.workspaces[0];
+            let pane = workspace.tabs[0].root_pane;
+            let screen = self.screen().replace('\n', "\r\n");
+            workspace.test_runtimes[&pane]
+                .test_process_pty_bytes(format!("\x1b[H\x1b[2J{screen}").as_bytes());
+        }
+    }
+
+    /// The keys a terminal write carries, in `pane.send_keys` names.
+    fn written_keys(mut bytes: &[u8]) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        while let Some(&first) = bytes.first() {
+            let (key, len) = match bytes {
+                [0x1b, b'[' | b'O', b'A', ..] => ("up", 3),
+                [0x1b, b'[' | b'O', b'B', ..] => ("down", 3),
+                _ => match first {
+                    b'\r' => ("enter", 1),
+                    b'\t' => ("tab", 1),
+                    b' ' => ("space", 1),
+                    0x05 => ("ctrl+e", 1),
+                    0x15 => ("ctrl+u", 1),
+                    _ => ("other", 1),
+                },
+            };
+            keys.push(key);
+            bytes = &bytes[len..];
+        }
+        keys
+    }
+
+    /// The granted agent is omp, blocked on [`THREE_FIELD_FORM`] (ask
+    /// `ask_id`), with the form drawn in its pane and answering its keys.
+    /// Call before admitting the guest, so the grant names an omp agent.
+    fn omp_form_on_screen(harness: &Harness, ask_id: &'static str) -> Arc<Mutex<OmpForm>> {
+        use crate::agent_transcript::tests::{call, Fixture};
+        let mut session = Fixture::new("guest-gate-form");
+        session.user("Nicola needs to decide three things");
+        session.assistant(
+            vec![call(
+                ask_id,
+                "ask",
+                Some("Asking three data decisions"),
+                json!({"html": THREE_FIELD_FORM}),
+            )],
+            "toolUse",
+        );
+        let path = session.path.to_string_lossy().into_owned();
+        harness.with_granted_terminal(move |terminal| {
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::Omp),
+                crate::detect::AgentState::Blocked,
+            );
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(path).unwrap(),
+            });
+        });
+        let form = Arc::new(Mutex::new(OmpForm {
+            session,
+            ask_id,
+            focus: 0,
+            picks: [0; 3],
+            submitted: false,
+            frozen: false,
+        }));
+        let hook_form = Arc::clone(&form);
+        *harness.pty_hook.lock().unwrap() = Some(Box::new(move |app, index, bytes| {
+            let mut form = hook_form.lock().unwrap();
+            if index != 0 || form.frozen {
+                return;
+            }
+            for key in written_keys(bytes) {
+                form.press(key);
+            }
+            form.render(app);
+        }));
+        redraw(harness, &form);
+        form
+    }
+
+    fn redraw(harness: &Harness, form: &Arc<Mutex<OmpForm>>) {
+        let form = Arc::clone(form);
+        let (done_tx, done_rx) = std_mpsc::channel();
+        harness
+            .control
+            .send(Box::new(move |app: &mut App| {
+                form.lock().unwrap().render(app);
+                let _ = done_tx.send(());
+            }))
+            .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    /// A guest's app learns from the gate's ping that form asks are
+    /// answerable, sees the three-field form as answerable in the
+    /// transcript, and answers it with `agent.answer_form`, which drives
+    /// omp's dialog field by field (herdr#455).
+    #[test]
+    fn a_guest_answers_a_three_field_form_ask() {
+        let harness = start("answer-three-fields");
+        let form = omp_form_on_screen(&harness, "ask-three-fields");
+        let guest = harness.admit();
+
+        let pong = harness.call(&guest, json!({"id": "p", "method": "ping", "params": {}}));
+        assert_eq!(
+            pong[0]["result"]["capabilities"]["ask_form"], true,
+            "the guest's app shows the form's controls only when ask_form is advertised: {pong:?}"
+        );
+        let page = harness.call(&guest, transcript("llm-opt"));
+        let pending = &page[0]["result"]["pending_ask"];
+        assert_eq!(pending["id"], "ask-three-fields", "{page:?}");
+        assert_eq!(pending["form_answerable"], true, "{pending:?}");
+        assert_eq!(pending["form"]["fields"].as_array().map(Vec::len), Some(3));
+
+        let lines = harness.call(
+            &guest,
+            json!({"id": "f", "method": "agent.answer_form", "params": {
+                "target": "llm-opt", "ask_id": "ask-three-fields", "values": {
+                    "auto_reject": {"options": ["no"]},
+                    "moratorium": {"options": ["all_found"]},
+                    "crop": {"options": ["trim"]},
+                },
+            }}),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let result = &lines[0]["result"];
+        assert_eq!(result["type"], "ask_form_answered", "{lines:?}");
+        assert_eq!(result["status"], "answered", "{lines:?}");
+        assert_eq!(
+            result["answers"][1],
+            json!({"name": "moratorium", "question": "Moratorium laws", "answer": "Every regional law"})
+        );
+        let form = form.lock().unwrap();
+        assert!(form.submitted);
+        assert_eq!(form.picks, [1, 1, 0]);
+    }
+
+    /// Enter inside omp's form picks an option and moves to the next field
+    /// while omp stays blocked in the same ask, so detection sees no new
+    /// state. The guest keeps answering as long as omp took the key and its
+    /// ask is still open; once a choosing key may have closed it, nothing
+    /// lands (herdr#455, guest nike's refused keys).
+    #[test]
+    fn a_guest_answers_an_omp_form_field_by_field_with_menu_keys() {
+        let harness = start("menu-keys-omp-form");
+        let form = omp_form_on_screen(&harness, "ask-form-keys");
+        let guest = harness.admit();
+        let pane = harness.pane_ids[0].clone();
+        let ok = |keys: Value| {
+            let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
+            assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{keys} -> {lines:?}");
+        };
+        let refused = |keys: Value| {
+            let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
+            assert_eq!(code(&lines), "guest_forbidden", "{keys} -> {lines:?}");
+        };
+
+        // Field 1 keeps its default; field 2 takes its second option.
+        ok(json!(["enter"]));
+        ok(json!(["down"]));
+        ok(json!(["enter"]));
+        assert_eq!(form.lock().unwrap().focus, 6, "on the third field");
+
+        // omp has not read the next Enter yet: it may close the dialog, so
+        // nothing more is taken until the form shows it took the key.
+        form.lock().unwrap().frozen = true;
+        ok(json!(["enter"]));
+        refused(json!(["down"]));
+        {
+            let mut form = form.lock().unwrap();
+            form.frozen = false;
+            form.press("enter");
+        }
+        redraw(&harness, &form);
+        assert_eq!(form.lock().unwrap().focus, SUBMIT_STOP);
+
+        // Submit closes the dialog and records the answer: no key after it.
+        ok(json!(["enter"]));
+        assert!(form.lock().unwrap().submitted);
+        assert_eq!(form.lock().unwrap().picks, [0, 1, 0]);
+        refused(json!(["down"]));
+        refused(json!(["enter"]));
     }
 
     /// Folders and stars are the owner's: a guest can neither read nor change
@@ -4314,7 +4704,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true}),
             "only what the gate serves"
         );
 
