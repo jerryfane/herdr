@@ -8416,8 +8416,10 @@ mod federation_tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
 
-        // Read nothing for longer than the 5 s write timeout.
-        std::thread::sleep(Duration::from_secs(7));
+        // Read nothing for longer than two 5 s write timeouts: a blocked write
+        // that already copied part of a frame returns that count after the
+        // first, so only the next write call fails.
+        std::thread::sleep(Duration::from_secs(12));
 
         let mut lines = Vec::new();
         while let Some(line) = next_stream_line(&mut reader) {
