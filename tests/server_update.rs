@@ -1116,6 +1116,57 @@ fn update_apply_aborts_inside_a_systemd_notify_unit_when_the_manager_does_not_co
     assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
 }
 
+/// The manager takes `MAINPID=<new server>` but stops answering who its main
+/// process is (a test fault). Under `NotifyAccess=main` the old server can't take
+/// the main pid back either, so the new server may be the unit's main process
+/// and stopping it could end the unit. The switch commits instead: the new
+/// server keeps serving the pane in the same activation and the old one exits.
+#[test]
+fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_inside_a_systemd_notify_unit()
+{
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(
+        &["Type=notify", "NotifyAccess=main"],
+        &[("HERDR_TEST_SYSTEMD_HANDOVER_FAIL", "unknown")],
+    );
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let invocation = fixture.unit().show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+
+    assert_eq!(
+        attempt["outcome"],
+        "updated",
+        "{attempt}\n{}",
+        fixture.guard_log()
+    );
+    let unit = fixture.unit();
+    assert_eq!(unit.show("ActiveState"), "active");
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    let new_pid = serving_pid(&fixture.api_socket);
+    assert_ne!(new_pid, old_pid, "the old server still serves");
+    assert!(!alive(old_pid), "the old server did not exit");
+    assert_eq!(
+        unit.main_pid(),
+        new_pid,
+        "systemd does not follow the new server"
+    );
+    assert_eq!(
+        file_sha256(Path::new(&format!("/proc/{new_pid}/exe"))),
+        build.sha256
+    );
+    assert!(alive(shell_pid), "the pane's process did not survive");
+    assert!(unit.contains(shell_pid));
+    assert!(pane_ids(&fixture).contains(&pane_id));
+}
+
 /// A `Type=simple` unit can't follow a new main process, so the update is
 /// refused before anything is touched, as before, and so is a plain handoff.
 #[test]

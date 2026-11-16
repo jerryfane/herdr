@@ -256,35 +256,74 @@ impl HeadlessServer {
         }
         // The manager must name the replacement as the unit's main process BEFORE the
         // commit: up to here the handoff is still reversible, after it the old pane
-        // runtimes are gone. A manager that does not confirm aborts the handoff.
+        // runtimes are gone. Only a manager that follows another process aborts it;
+        // see `supervision::hand_over_main_pid` for why an unknown owner commits.
         if hand_over_main_pid {
-            if let Err(err) = self.confirm_main_pid_handover(child_pid) {
-                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-                let restored = self.wait_then_restore_public_sockets_after_failed_handoff();
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(match restored {
-                    Ok(()) => err,
-                    Err(restore_err) => io::Error::other(format!(
-                        "{err}; old server could not restore public sockets: {restore_err}"
-                    )),
-                });
+            use crate::server::supervision::MainPidOwner;
+            let owner = with_handoff_manager(|manager| {
+                crate::server::supervision::hand_over_main_pid(
+                    child_pid,
+                    std::process::id(),
+                    manager,
+                )
+            });
+            match owner {
+                MainPidOwner::Replacement => info!(
+                    pid = child_pid,
+                    "systemd follows the replacement as the unit's main process"
+                ),
+                MainPidOwner::Unknown(err) => tracing::error!(
+                    pid = child_pid,
+                    err = %err,
+                    "systemd may already follow the replacement as main process and won't say; committing, since stopping it could end the unit and every pane"
+                ),
+                MainPidOwner::Ours(err) => {
+                    warn!(
+                        pid = child_pid,
+                        err = %err,
+                        "systemd does not follow the replacement; aborting the handoff"
+                    );
+                    crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                    let restored = self.wait_then_restore_public_sockets_after_failed_handoff();
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(match restored {
+                        Ok(()) => err,
+                        Err(restore_err) => io::Error::other(format!(
+                            "{err}; old server could not restore public sockets: {restore_err}"
+                        )),
+                    });
+                }
             }
         }
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
-            // The manager follows the replacement by now; name this process again
-            // before stopping it, or that stop would be the unit's main process exiting.
-            if hand_over_main_pid {
-                if let Err(restore_err) =
-                    crate::server::supervision::hand_over_main_pid(std::process::id())
-                {
+            // The same rule as before the commit: the replacement is stopped only when
+            // the manager follows another process, or stopping it could be the unit's
+            // main process dying.
+            let owner = hand_over_main_pid.then(|| {
+                with_handoff_manager(|manager| {
+                    crate::server::supervision::take_main_pid_back(
+                        child_pid,
+                        std::process::id(),
+                        manager,
+                        io::Error::new(err.kind(), format!("commit failed: {err}")),
+                    )
+                })
+            });
+            match owner {
+                Some(owner) if !owner.allows_stopping_the_replacement() => {
                     tracing::error!(
                         pid = child_pid,
-                        err = %restore_err,
-                        "commit failed and systemd did not take this process back as main process"
+                        ?owner,
+                        "commit failed while systemd may follow the replacement as main process; not stopping it"
                     );
+                    // It never gets the commit, so it gives up and exits on its own
+                    // (no signal from here); reap it when it does.
+                    std::thread::spawn(move || {
+                        let _ = import_child.wait();
+                    });
                 }
+                _ => crate::server::handoff::cleanup_failed_import_child(&mut import_child),
             }
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
@@ -308,45 +347,6 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
         Ok(())
-    }
-
-    /// Make the import child the unit's main process, or leave this one as it, before
-    /// anything irreversible happens. Err means this process is still the main one
-    /// (or the manager can't say) and the handoff must abort.
-    #[cfg(unix)]
-    fn confirm_main_pid_handover(&self, child_pid: u32) -> io::Result<()> {
-        // Test fault: MAINPID= reaches the manager but its confirmation goes missing,
-        // so this process has to take the main pid back before it aborts.
-        let unconfirmed =
-            std::env::var("HERDR_TEST_SYSTEMD_HANDOVER_FAIL").as_deref() == Ok("unconfirmed");
-        let hand_over = |pid: u32| {
-            let handed = crate::server::supervision::hand_over_main_pid(pid);
-            if unconfirmed && pid == child_pid && handed.is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "test: systemd's confirmation of the replacement went missing",
-                ));
-            }
-            handed
-        };
-        let result = crate::server::supervision::hand_over_main_pid_or_restore(
-            child_pid,
-            std::process::id(),
-            hand_over,
-            crate::server::supervision::unit_main_pid,
-        );
-        match &result {
-            Ok(()) => info!(
-                pid = child_pid,
-                "systemd follows the replacement as the unit's main process"
-            ),
-            Err(err) => warn!(
-                pid = child_pid,
-                err = %err,
-                "systemd did not confirm the replacement; aborting the handoff"
-            ),
-        }
-        result
     }
 
     pub(super) fn finish_live_handoff_shutdown(&mut self) {
@@ -530,4 +530,29 @@ pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Res
         io::ErrorKind::TimedOut,
         "old server sockets did not close before handoff import bind",
     ))
+}
+
+/// The systemd manager a live handoff talks to, with the test faults applied.
+/// `HERDR_TEST_SYSTEMD_HANDOVER_FAIL`: `unconfirmed` loses the first `MainPID`
+/// read-back, the one that would confirm the replacement; `unknown` loses every
+/// read-back, as a manager that takes notifications but stops answering queries.
+#[cfg(unix)]
+fn with_handoff_manager<R>(
+    handover: impl FnOnce(crate::server::supervision::Manager<'_>) -> R,
+) -> R {
+    let fault = std::env::var("HERDR_TEST_SYSTEMD_HANDOVER_FAIL").ok();
+    let read_backs = std::cell::Cell::new(0usize);
+    let main_pid = |deadline: std::time::Instant| {
+        let n = read_backs.get();
+        read_backs.set(n + 1);
+        match fault.as_deref() {
+            Some("unconfirmed") if n == 0 => None,
+            Some("unknown") => None,
+            _ => crate::server::supervision::invocation_main_pid(deadline),
+        }
+    };
+    handover(crate::server::supervision::Manager {
+        main_pid: &main_pid,
+        ..crate::server::supervision::Manager::systemd()
+    })
 }

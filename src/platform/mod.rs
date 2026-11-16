@@ -59,8 +59,11 @@ fn monitor_host_power(
     None
 }
 
+// systemd stubs for the other Unix targets. Their only caller,
+// `server::supervision`, is Unix-only, so Windows has neither.
+
 /// Only Linux runs under systemd: no unit to describe.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn show_own_systemd_unit(
     _properties: &[&str],
     _deadline: std::time::Instant,
@@ -68,7 +71,7 @@ pub(crate) fn show_own_systemd_unit(
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn systemd_notify(
     _socket: &str,
     _message: &str,
@@ -80,7 +83,7 @@ pub(crate) fn systemd_notify(
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn systemd_notify_barrier(
     socket: &str,
     deadline: std::time::Instant,

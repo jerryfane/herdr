@@ -26,7 +26,11 @@ fn unit_from_cgroup(cgroup: &str) -> Option<CgroupUnit> {
                 .lines()
                 .find_map(|line| line.split_once(":name=systemd:").map(|(_, path)| path))
         })?;
-    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(cgroup_unescape)
+        .collect();
     let unit_index = components
         .iter()
         .rposition(|part| part.ends_with(".service"))?;
@@ -42,11 +46,16 @@ fn unit_from_cgroup(cgroup: &str) -> Option<CgroupUnit> {
     })
 }
 
-/// `systemctl show` output (`Key=Value` lines) for `properties` of the unit this
-/// process runs in, from the manager that runs it, or `None` by `deadline`.
-pub(crate) fn show_own_systemd_unit(properties: &[&str], deadline: Instant) -> Option<String> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let unit = unit_from_cgroup(&cgroup)?;
+/// systemd's `cg_unescape`: a cgroup component that could clash with a kernel
+/// attribute, or starts with `_` or `.`, gets one `_` in front, so the unit
+/// `_herdr.service` lives in the cgroup `__herdr.service`.
+fn cgroup_unescape(component: &str) -> &str {
+    component.strip_prefix('_').unwrap_or(component)
+}
+
+/// `systemctl [--user] show --no-pager -p … -- <unit>`. The `--` keeps a unit whose
+/// name starts with `-` from reading as an option.
+fn show_command(unit: &CgroupUnit, properties: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new("systemctl");
     if let Some(uid) = unit.user_manager {
         // The user manager's private socket lives in its own runtime dir, which a
@@ -55,10 +64,20 @@ pub(crate) fn show_own_systemd_unit(properties: &[&str], deadline: Instant) -> O
             .arg("--user")
             .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
     }
-    command.args(["show", "--no-pager", &unit.name]);
+    command.args(["show", "--no-pager"]);
     for property in properties {
         command.args(["-p", property]);
     }
+    command.args(["--", &unit.name]);
+    command
+}
+
+/// `systemctl show` output (`Key=Value` lines) for `properties` of the unit this
+/// process runs in, from the manager that runs it, or `None` by `deadline`.
+pub(crate) fn show_own_systemd_unit(properties: &[&str], deadline: Instant) -> Option<String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let unit = unit_from_cgroup(&cgroup)?;
+    let mut command = show_command(&unit, properties);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -292,6 +311,55 @@ mod tests {
         assert_eq!(
             unit_from_cgroup("0::/user.slice/user-0.slice/session-3.scope\n"),
             None
+        );
+    }
+
+    /// systemd escapes a cgroup component that starts with `_` by putting one more
+    /// `_` in front: the unit `_herdr.service` runs in `__herdr.service`.
+    #[test]
+    fn an_escaped_cgroup_component_names_the_unescaped_unit() {
+        assert_eq!(
+            unit_from_cgroup("0::/system.slice/__herdr.service\n"),
+            Some(CgroupUnit {
+                name: "_herdr.service".into(),
+                user_manager: None,
+            })
+        );
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/__herdr.service\n"
+            ),
+            Some(CgroupUnit {
+                name: "_herdr.service".into(),
+                user_manager: Some(1000),
+            })
+        );
+    }
+
+    /// A unit name is an operand, never an option: `-herdr.service` is a valid unit,
+    /// and without `--` systemctl reads it as flags and prints its help.
+    #[test]
+    fn systemctl_gets_the_unit_after_the_end_of_options() {
+        let unit = CgroupUnit {
+            name: "-herdr.service".into(),
+            user_manager: Some(1000),
+        };
+        let command = show_command(&unit, &["MainPID", "Type"]);
+        assert_eq!(command.get_program(), "systemctl");
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "show",
+                "--no-pager",
+                "-p",
+                "MainPID",
+                "-p",
+                "Type",
+                "--",
+                "-herdr.service"
+            ]
         );
     }
 
