@@ -64,6 +64,7 @@ impl App {
     }
 
     /// The terminal whose pane process runs in `mount_namespace`.
+    #[cfg(unix)]
     fn terminal_in_mount_namespace(&self, mount_namespace: u64) -> Option<String> {
         self.terminal_runtimes
             .iter()
@@ -72,6 +73,14 @@ impl App {
                 (crate::platform::process_mount_namespace(pid) == Some(mount_namespace))
                     .then(|| terminal_id.as_str().to_owned())
             })
+    }
+}
+
+/// Fenced callers exist only on Linux; elsewhere no pane can own a request.
+#[cfg(not(unix))]
+impl App {
+    fn terminal_in_mount_namespace(&self, _mount_namespace: u64) -> Option<String> {
+        None
     }
 }
 

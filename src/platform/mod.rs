@@ -650,6 +650,8 @@ pub(crate) enum FencePeer {
     /// Not fenced: the owner's shell, an ssh session, a system service.
     Unfenced,
     /// Inside a fence; the mount namespace identifies the pane spawn it came from.
+    // Only Linux classifies a peer as fenced; elsewhere the fence does not exist.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Fenced { mount_namespace: u64 },
     /// The process could not be inspected (already gone, or /proc unreadable).
     Unknown,

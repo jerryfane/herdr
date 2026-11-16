@@ -1008,6 +1008,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_entries_are_pinned_not_only_their_targets() {
         // Merged-/usr: /bin is a symlink to usr/bin. Denying /bin must also pin the
@@ -1030,6 +1031,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolution_failures_other_than_absence_fail_the_plan() {
         // A symlink loop cannot be resolved (ELOOP). Unlike a missing path, the
