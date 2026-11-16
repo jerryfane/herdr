@@ -261,11 +261,7 @@ impl HeadlessServer {
         if hand_over_main_pid {
             use crate::server::supervision::MainPidOwner;
             let owner = with_handoff_manager(|manager| {
-                crate::server::supervision::hand_over_main_pid(
-                    child_pid,
-                    std::process::id(),
-                    manager,
-                )
+                crate::server::supervision::hand_over_main_pid(child_pid, manager)
             });
             match owner {
                 MainPidOwner::Replacement => info!(
@@ -533,26 +529,30 @@ pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Res
 }
 
 /// The systemd manager a live handoff talks to, with the test faults applied.
-/// `HERDR_TEST_SYSTEMD_HANDOVER_FAIL`: `unconfirmed` loses the first `MainPID`
-/// read-back, the one that would confirm the replacement; `unknown` loses every
-/// read-back, as a manager that takes notifications but stops answering queries.
+/// `HERDR_TEST_SYSTEMD_HANDOVER_FAIL`: `refused` drops `MAINPID=` for any other
+/// process, so the manager processes the barrier but keeps this process as main,
+/// as one that refuses the replacement does; `unknown` loses every read-back, as a
+/// manager that takes notifications but stops answering queries.
 #[cfg(unix)]
 fn with_handoff_manager<R>(
     handover: impl FnOnce(crate::server::supervision::Manager<'_>) -> R,
 ) -> R {
     let fault = std::env::var("HERDR_TEST_SYSTEMD_HANDOVER_FAIL").ok();
-    let read_backs = std::cell::Cell::new(0usize);
-    let main_pid = |deadline: std::time::Instant| {
-        let n = read_backs.get();
-        read_backs.set(n + 1);
-        match fault.as_deref() {
-            Some("unconfirmed") if n == 0 => None,
-            Some("unknown") => None,
-            _ => crate::server::supervision::invocation_main_pid(deadline),
+    let systemd = crate::server::supervision::Manager::systemd();
+    let ours = format!("MAINPID={}", std::process::id());
+    let send = |message: &str, deadline: std::time::Instant| {
+        if fault.as_deref() == Some("refused") && message != ours {
+            return Ok(());
         }
+        (systemd.send)(message, deadline)
+    };
+    let main_pid = |deadline: std::time::Instant| match fault.as_deref() {
+        Some("unknown") => None,
+        _ => (systemd.main_pid)(deadline),
     };
     handover(crate::server::supervision::Manager {
+        send: &send,
         main_pid: &main_pid,
-        ..crate::server::supervision::Manager::systemd()
+        ..systemd
     })
 }

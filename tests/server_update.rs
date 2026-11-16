@@ -1064,19 +1064,20 @@ fn update_guard_hands_back_inside_a_systemd_notify_unit() {
     assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
 }
 
-/// The manager's confirmation that the new server is the unit's main process
-/// goes missing (a test fault). The old server names itself main again and
-/// aborts before the commit: it keeps serving the same pane in the same
-/// activation, the new server is stopped, and nothing is installed.
+/// The manager processes `MAINPID=<new server>` but keeps the old server as its
+/// main process (a test fault drops that one notification, so the manager never
+/// takes it). The old server aborts before the commit: it keeps serving the same
+/// pane as the main process of the same activation, the new server is stopped,
+/// and nothing is installed.
 #[test]
-fn update_apply_aborts_inside_a_systemd_notify_unit_when_the_manager_does_not_confirm() {
+fn update_apply_aborts_inside_a_systemd_notify_unit_when_the_manager_refuses_the_new_server() {
     if !user_systemd_available() {
         return;
     }
     let mut fixture = Fixture::new();
     fixture.start_server_in_unit(
         &["Type=notify", "NotifyAccess=all"],
-        &[("HERDR_TEST_SYSTEMD_HANDOVER_FAIL", "unconfirmed")],
+        &[("HERDR_TEST_SYSTEMD_HANDOVER_FAIL", "refused")],
     );
     let (pane_id, shell_pid) = open_pane(&fixture);
     let build = fixture.publish_build(protocol(&fixture));
@@ -1100,7 +1101,7 @@ fn update_apply_aborts_inside_a_systemd_notify_unit_when_the_manager_does_not_co
     assert_eq!(
         unit.main_pid(),
         old_pid,
-        "systemd does not follow the old server again"
+        "systemd does not follow the old server"
     );
     assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
     // Whatever else runs in the unit (the pane's shell loop) is not the new build.
@@ -1117,19 +1118,17 @@ fn update_apply_aborts_inside_a_systemd_notify_unit_when_the_manager_does_not_co
 }
 
 /// The manager takes `MAINPID=<new server>` but stops answering who its main
-/// process is (a test fault). Under `NotifyAccess=main` the old server can't take
-/// the main pid back either, so the new server may be the unit's main process
-/// and stopping it could end the unit. The switch commits instead: the new
-/// server keeps serving the pane in the same activation and the old one exits.
-#[test]
-fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_inside_a_systemd_notify_unit()
-{
+/// process is (a test fault), with the unit's `NotifyAccess=` given. The old
+/// server sends no other `MAINPID=`, so the new server is the unit's main process
+/// and stopping it would end the unit. The switch commits: the new server keeps
+/// serving the pane in the same activation and the old one exits.
+fn the_new_server_stays_when_the_manager_stops_answering(notify_access: &str) {
     if !user_systemd_available() {
         return;
     }
     let mut fixture = Fixture::new();
     fixture.start_server_in_unit(
-        &["Type=notify", "NotifyAccess=main"],
+        &["Type=notify", notify_access],
         &[("HERDR_TEST_SYSTEMD_HANDOVER_FAIL", "unknown")],
     );
     let (pane_id, shell_pid) = open_pane(&fixture);
@@ -1165,6 +1164,20 @@ fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_inside_a_s
     assert!(alive(shell_pid), "the pane's process did not survive");
     assert!(unit.contains(shell_pid));
     assert!(pane_ids(&fixture).contains(&pane_id));
+}
+
+/// Under `NotifyAccess=main` the old server could not even take the main pid back.
+#[test]
+fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_inside_a_systemd_notify_unit()
+{
+    the_new_server_stays_when_the_manager_stops_answering("NotifyAccess=main");
+}
+
+/// Under `NotifyAccess=all` a `MAINPID=<old server>` sent after an unanswered
+/// read-back would be taken, and the old server's exit would then end the unit.
+#[test]
+fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_with_notify_access_all() {
+    the_new_server_stays_when_the_manager_stops_answering("NotifyAccess=all");
 }
 
 /// A `Type=simple` unit can't follow a new main process, so the update is

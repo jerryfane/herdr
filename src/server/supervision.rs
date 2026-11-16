@@ -268,18 +268,18 @@ fn own_notify_socket() -> std::io::Result<&'static str> {
     })
 }
 
-/// Who the manager follows as the unit's main process once a handover was tried.
+/// Who the manager follows as the unit's main process once a `MAINPID=` was tried.
 /// Exactly one answer lets the replacement be stopped: stopping the unit's main
 /// process deactivates the unit and kills every pane with it.
 #[derive(Debug)]
 pub(crate) enum MainPidOwner {
     /// The manager names the replacement.
     Replacement,
-    /// The manager names a process other than the replacement (this one, normally),
-    /// or `MAINPID=<replacement>` never reached it. Why the handover failed.
+    /// The manager processed the last `MAINPID=` and names a process other than the
+    /// replacement (this one, normally), or the forward `MAINPID=` never left this
+    /// process. Why the handover failed.
     Ours(std::io::Error),
-    /// `MAINPID=<replacement>` reached the manager and nothing shows it was refused
-    /// or undone: the replacement may be the main process.
+    /// The manager did not say. The replacement may be the main process.
     Unknown(std::io::Error),
 }
 
@@ -290,17 +290,18 @@ impl MainPidOwner {
     }
 }
 
-/// One `MAINPID=` handover and what the manager said about it.
+/// One `MAINPID=` notification and what the manager said after it.
 #[derive(Debug)]
 enum Attempt {
     /// The message never left this process, so nothing changed.
     NotSent(std::io::Error),
-    /// The manager names `pid`.
-    Taken,
-    /// The manager names this other process.
-    Refused(u32),
-    /// Sent, but the manager did not say who it follows by the deadline.
-    Unanswered(std::io::Error),
+    /// The message is in the manager's queue.
+    Sent {
+        /// `BARRIER=1` closed: the manager has processed it, accepted or not.
+        processed: bool,
+        /// The unit's `MainPID` read back afterwards, if the manager answered.
+        main_pid: Option<u32>,
+    },
 }
 
 /// Send `MAINPID=<pid>`, wait on `BARRIER=1`, and read the unit's `MainPID` back.
@@ -308,20 +309,51 @@ enum Attempt {
 /// `BARRIER=1` proves the manager processed the datagrams before it, not that it
 /// ACCEPTED `MAINPID=`: systemd answers barriers before it checks `NotifyAccess=`, so
 /// a rejected `MAINPID=` still closes the barrier. Only the manager's own `MainPID`
-/// read back afterwards says who the unit's main process is. One deadline bounds
-/// every step, the sends included, so a stalled manager can't hold the server.
+/// read back afterwards says who the unit's main process is, so a read-back that
+/// failed is asked once more. One deadline bounds every step, the sends included,
+/// so a stalled manager can't hold the server.
 fn attempt_main_pid(pid: u32, manager: Manager<'_>) -> Attempt {
     let deadline = std::time::Instant::now() + MANAGER_TIMEOUT;
     if let Err(err) = (manager.send)(&format!("MAINPID={pid}"), deadline) {
         return Attempt::NotSent(err);
     }
-    if let Err(err) = (manager.barrier)(deadline) {
-        return Attempt::Unanswered(err);
+    let processed = match (manager.barrier)(deadline) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(%err, "systemd did not process MAINPID={pid} in time");
+            false
+        }
+    };
+    Attempt::Sent {
+        processed,
+        main_pid: (manager.main_pid)(deadline).or_else(|| (manager.main_pid)(deadline)),
     }
-    match (manager.main_pid)(deadline) {
-        Some(main) if main == pid => Attempt::Taken,
-        Some(main) => Attempt::Refused(main),
-        None => Attempt::Unanswered(std::io::Error::new(
+}
+
+/// Whom the manager follows after the `MAINPID=` of `attempt`, as far as it said.
+/// A `MainPID` other than `child` counts only once the manager has processed the
+/// message: before that it may still take it.
+fn owner_after(attempt: Attempt, child: u32) -> MainPidOwner {
+    match attempt {
+        Attempt::NotSent(err) => MainPidOwner::Unknown(err),
+        Attempt::Sent {
+            main_pid: Some(main),
+            ..
+        } if main == child => MainPidOwner::Replacement,
+        Attempt::Sent {
+            processed: true,
+            main_pid: Some(main),
+        } => MainPidOwner::Ours(std::io::Error::other(format!(
+            "systemd does not follow the replacement {child}: the unit's main process is {main}"
+        ))),
+        Attempt::Sent {
+            main_pid: Some(main),
+            ..
+        } => MainPidOwner::Unknown(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("systemd had not processed MAINPID= yet; the unit's main process was {main}"),
+        )),
+        Attempt::Sent { main_pid: None, .. } => MainPidOwner::Unknown(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "systemd did not say who the unit's main process is",
         )),
@@ -333,56 +365,51 @@ fn attempt_main_pid(pid: u32, manager: Manager<'_>) -> Attempt {
 /// [`MainPidOwner::Replacement`]: commit. [`MainPidOwner::Ours`]: abort, stop the
 /// replacement and keep serving. [`MainPidOwner::Unknown`]: commit anyway.
 ///
-/// Once `MAINPID=child` has reached the manager, the replacement may be the unit's
-/// main process, and stopping it then ends the unit and every pane. Under
-/// `NotifyAccess=main` this process can't take the main pid back then either: only
-/// the replacement may send `MAINPID=`. So an unknown owner is never resolved by
-/// stopping the replacement. It is ready and authorized, and letting it finish
-/// taking over is the only direction that can't be the main process dying. That
-/// is also the likely truth: preflight confirmed this process as main with a
-/// `NotifyAccess=` that accepts `MAINPID=` from it. The one case it gets wrong (the
-/// manager refused `MAINPID=` AND stopped answering) can't be told apart from here.
-pub(crate) fn hand_over_main_pid(child: u32, ours: u32, manager: Manager<'_>) -> MainPidOwner {
+/// Exactly one `MAINPID=` is sent here, and ownership never moves back before the
+/// commit. So whatever the manager makes of it, the last ownership change asked for
+/// is the replacement's, and an unknown owner means the replacement: it is ready and
+/// authorized, and preflight confirmed this process as main with a `NotifyAccess=`
+/// that accepts `MAINPID=` from it. Sending `MAINPID=<self>` after an unanswered
+/// read-back would split that: under `NotifyAccess=all` it moves the main pid back,
+/// under `main` it is refused once the replacement is main, and with no read-back
+/// this process could not tell which, so either committing or stopping the
+/// replacement could be the unit's main process dying. Only a manager that has
+/// processed `MAINPID=<replacement>` and names another process (or a `MAINPID=` that
+/// never left this process) aborts, and the main pid then never moved. The one case
+/// this gets wrong (the manager refused `MAINPID=` AND stopped answering) can't be
+/// told apart from here.
+pub(crate) fn hand_over_main_pid(child: u32, manager: Manager<'_>) -> MainPidOwner {
     match attempt_main_pid(child, manager) {
-        Attempt::Taken => MainPidOwner::Replacement,
         Attempt::NotSent(err) => MainPidOwner::Ours(err),
-        Attempt::Refused(main) => MainPidOwner::Ours(std::io::Error::other(format!(
-            "systemd did not accept MAINPID={child}: the unit's main process is still {main}"
-        ))),
-        Attempt::Unanswered(err) => take_main_pid_back(child, ours, manager, err),
+        sent => owner_after(sent, child),
     }
 }
 
-/// Ask the manager to follow this process (`ours`) again instead of `child`, and
-/// find out whom it follows. `why` is the failure that made this necessary.
+/// After a failed commit: ask the manager to follow this process (`ours`) again
+/// instead of `child`, and find out whom it follows. `why` is the failure.
 ///
-/// Under `NotifyAccess=main` the manager refuses this once it follows `child`, and
-/// says so; under `all` it takes this process back. Whatever it can't confirm is
-/// [`MainPidOwner::Unknown`], never [`MainPidOwner::Ours`].
+/// This process keeps serving whatever the answer, so only stopping the replacement
+/// is at stake, under the same rule as before the commit: only
+/// [`MainPidOwner::Ours`] allows it. Under `NotifyAccess=all` this takes the main pid
+/// back; under `main` the manager refuses it once it follows `child`.
 pub(crate) fn take_main_pid_back(
     child: u32,
     ours: u32,
     manager: Manager<'_>,
     why: std::io::Error,
 ) -> MainPidOwner {
-    let restore_err = match attempt_main_pid(ours, manager) {
-        Attempt::Taken => return MainPidOwner::Ours(why),
-        Attempt::Refused(main) if main == child => return MainPidOwner::Replacement,
-        Attempt::Refused(_) => return MainPidOwner::Ours(why),
-        Attempt::NotSent(err) | Attempt::Unanswered(err) => err,
-    };
-    match (manager.main_pid)(std::time::Instant::now() + MANAGER_TIMEOUT) {
-        Some(main) if main == child => MainPidOwner::Replacement,
-        Some(_) => MainPidOwner::Ours(why),
-        None => MainPidOwner::Unknown(std::io::Error::other(format!(
-            "{why}; restoring MAINPID={ours} was not confirmed either: {restore_err}"
+    match owner_after(attempt_main_pid(ours, manager), child) {
+        MainPidOwner::Ours(_) => MainPidOwner::Ours(why),
+        MainPidOwner::Unknown(err) => MainPidOwner::Unknown(std::io::Error::other(format!(
+            "{why}; restoring MAINPID={ours} was not confirmed: {err}"
         ))),
+        MainPidOwner::Replacement => MainPidOwner::Replacement,
     }
 }
 
 /// The unit's `MainPID` by `deadline`, provided the manager still runs this process'
 /// own invocation of it: a `MainPID` of any other invocation confirms nothing.
-pub(crate) fn invocation_main_pid(deadline: std::time::Instant) -> Option<u32> {
+fn invocation_main_pid(deadline: std::time::Instant) -> Option<u32> {
     let invocation_id = std::env::var("INVOCATION_ID").ok()?;
     query_unit(deadline)
         .filter(|unit| unit.invocation_id == invocation_id)
@@ -639,7 +666,7 @@ mod tests {
     const CHILD: u32 = 4242;
 
     /// Who may send `MAINPID=`; every message here comes from this process (`OURS`).
-    #[derive(Clone, Copy, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     enum Access {
         /// `MAINPID=` is refused, as when `NotifyAccess=` changed to `none`.
         Refused,
@@ -649,15 +676,18 @@ mod tests {
         All,
     }
 
-    /// A manager that follows `main` and answers the `n`th `MainPID` query only when
-    /// `answers(n)`. Every barrier closes.
+    /// A manager that follows `main`. It processes each notification as it arrives,
+    /// or, when `stalled`, queues it and fails every barrier until [`Self::settle`].
+    /// The `n`th `MainPID` query is answered only when `answers(n)`.
     struct FakeManager {
         main: std::cell::Cell<u32>,
         access: Access,
+        stalled: bool,
         sends_fail: bool,
         answers: fn(usize) -> bool,
         queries: std::cell::Cell<usize>,
         sent: std::cell::RefCell<Vec<String>>,
+        queued: std::cell::RefCell<Vec<u32>>,
     }
 
     impl FakeManager {
@@ -665,10 +695,12 @@ mod tests {
             Self {
                 main: std::cell::Cell::new(OURS),
                 access,
+                stalled: false,
                 sends_fail: false,
                 answers,
                 queries: std::cell::Cell::new(0),
                 sent: std::cell::RefCell::new(Vec::new()),
+                queued: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -681,6 +713,15 @@ mod tests {
             }
             self.sent.borrow_mut().push(message.to_string());
             let pid = message.strip_prefix("MAINPID=").unwrap().parse().unwrap();
+            if self.stalled {
+                self.queued.borrow_mut().push(pid);
+            } else {
+                self.process(pid);
+            }
+            Ok(())
+        }
+
+        fn process(&self, pid: u32) {
             let accepted = match self.access {
                 Access::Refused => false,
                 Access::Main => self.main.get() == OURS,
@@ -688,6 +729,15 @@ mod tests {
             };
             if accepted {
                 self.main.set(pid);
+            }
+        }
+
+        fn barrier(&self) -> std::io::Result<()> {
+            if self.stalled {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "systemd did not confirm the notification in time",
+                ));
             }
             Ok(())
         }
@@ -698,9 +748,17 @@ mod tests {
             (self.answers)(n).then(|| self.main.get())
         }
 
+        /// Whom the manager follows once it has processed everything it was sent.
+        fn settle(&self) -> u32 {
+            for pid in self.queued.take() {
+                self.process(pid);
+            }
+            self.main.get()
+        }
+
         fn with<R>(&self, f: impl FnOnce(Manager<'_>) -> R) -> R {
             let send = |message: &str, _: std::time::Instant| self.send(message);
-            let barrier = |_: std::time::Instant| -> std::io::Result<()> { Ok(()) };
+            let barrier = |_: std::time::Instant| self.barrier();
             let main_pid = |_: std::time::Instant| self.main_pid();
             f(Manager {
                 send: &send,
@@ -726,58 +784,17 @@ mod tests {
         n > 0
     }
 
-    /// F2: an unconfirmed handover names this process again, and the manager
-    /// confirming that is what lets the handoff abort and stop the replacement.
-    #[test]
-    fn an_unconfirmed_handover_restores_this_process_and_aborts() {
-        let manager = FakeManager::new(Access::All, after_the_first);
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
-        assert!(matches!(owner, MainPidOwner::Ours(_)), "{owner:?}");
-        assert!(owner.allows_stopping_the_replacement());
-        assert_eq!(manager.sent(), ["MAINPID=4242", "MAINPID=17"]);
-        assert_eq!(manager.main.get(), OURS);
+    type Answers = fn(usize) -> bool;
 
-        // A MAINPID= that never left this process changed nothing.
-        let manager = FakeManager {
-            sends_fail: true,
-            ..FakeManager::new(Access::Main, always)
-        };
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
-        assert!(owner.allows_stopping_the_replacement(), "{owner:?}");
-    }
+    const ANSWERING: [(&str, Answers); 3] = [
+        ("always", always),
+        ("never", never),
+        ("after the first query", after_the_first),
+    ];
 
-    /// P1 of review 2: once MAINPID=<replacement> reached the manager, only the
-    /// manager naming another process lets the replacement be stopped. Under
-    /// NotifyAccess=main it now follows the replacement and refuses this process'
-    /// MAINPID=; if it also stops answering, stopping the replacement would be the
-    /// unit's main process dying, so the owner is unknown and the handoff commits.
-    #[test]
-    fn an_unknown_owner_after_a_delivered_main_pid_never_stops_the_replacement() {
-        let manager = FakeManager::new(Access::Main, never);
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
-        assert!(matches!(owner, MainPidOwner::Unknown(_)), "{owner:?}");
-        assert!(!owner.allows_stopping_the_replacement());
-        assert_eq!(manager.sent(), ["MAINPID=4242", "MAINPID=17"]);
-        assert_eq!(manager.main.get(), CHILD, "the replacement is main");
-
-        // Answering late: the manager refuses this process and names the replacement.
-        let manager = FakeManager::new(Access::Main, after_the_first);
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
-        assert!(matches!(owner, MainPidOwner::Replacement), "{owner:?}");
-
-        // A failed commit asks the same question before the replacement is stopped.
-        let why = || std::io::Error::other("commit failed");
-        for (access, answers, stop) in [
-            (Access::Main, never as fn(usize) -> bool, false),
-            (Access::Main, always, false),
-            (Access::All, always, true),
-            (Access::All, never, false),
-        ] {
-            let manager = FakeManager::new(access, answers);
-            manager.main.set(CHILD);
-            let owner = manager.with(|m| take_main_pid_back(CHILD, OURS, m, why()));
-            assert_eq!(owner.allows_stopping_the_replacement(), stop, "{owner:?}");
-        }
+    /// The handover before the commit, as the server runs it.
+    fn hand_over(manager: &FakeManager) -> MainPidOwner {
+        manager.with(|m| hand_over_main_pid(CHILD, m))
     }
 
     /// F1: a closed barrier is not an accepted `MAINPID=`; the manager's own
@@ -785,13 +802,128 @@ mod tests {
     #[test]
     fn a_main_pid_the_manager_did_not_take_refuses_the_exit() {
         let manager = FakeManager::new(Access::Refused, always);
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
+        let owner = hand_over(&manager);
         assert!(matches!(owner, MainPidOwner::Ours(_)), "{owner:?}");
         assert_eq!(manager.sent(), ["MAINPID=4242"]);
 
         let manager = FakeManager::new(Access::Main, always);
-        let owner = manager.with(|m| hand_over_main_pid(CHILD, OURS, m));
+        let owner = hand_over(&manager);
         assert!(matches!(owner, MainPidOwner::Replacement), "{owner:?}");
         assert_eq!(manager.sent(), ["MAINPID=4242"]);
+
+        // A MAINPID= that never left this process changed nothing.
+        let manager = FakeManager {
+            sends_fail: true,
+            ..FakeManager::new(Access::Main, always)
+        };
+        let owner = hand_over(&manager);
+        assert!(matches!(owner, MainPidOwner::Ours(_)), "{owner:?}");
+    }
+
+    /// P1 of review 2: once MAINPID=<replacement> reached the manager, only the
+    /// manager naming another process after processing it lets the replacement be
+    /// stopped. Under NotifyAccess=main the manager follows the replacement; if it
+    /// stops answering, the owner is unknown and the handoff commits.
+    #[test]
+    fn an_unknown_owner_after_a_delivered_main_pid_never_stops_the_replacement() {
+        let manager = FakeManager::new(Access::Main, never);
+        let owner = hand_over(&manager);
+        assert!(matches!(owner, MainPidOwner::Unknown(_)), "{owner:?}");
+        assert!(!owner.allows_stopping_the_replacement());
+        assert_eq!(manager.settle(), CHILD, "the replacement is main");
+
+        // Not processed yet: a MainPID naming this process does not count.
+        let manager = FakeManager {
+            stalled: true,
+            ..FakeManager::new(Access::Main, always)
+        };
+        let owner = hand_over(&manager);
+        assert!(matches!(owner, MainPidOwner::Unknown(_)), "{owner:?}");
+        assert_eq!(manager.settle(), CHILD, "the replacement is main");
+    }
+
+    /// P1 of review 3: with NotifyAccess=all and no read-back answering, the old
+    /// server must not send MAINPID=<self> behind the replacement's and then commit:
+    /// the manager would follow the old server again, and its exit would end the
+    /// unit. One notification, the replacement's, and the manager follows it.
+    #[test]
+    fn with_notify_access_all_and_no_read_back_the_predecessor_never_exits_as_main() {
+        let manager = FakeManager::new(Access::All, never);
+        let owner = hand_over(&manager);
+        let exits = !owner.allows_stopping_the_replacement();
+        let main = manager.settle();
+        assert!(
+            !(exits && main == OURS),
+            "the old server exits as the unit's main process: {owner:?}, sent {:?}",
+            manager.sent()
+        );
+        assert_eq!(manager.sent(), ["MAINPID=4242"]);
+        assert_eq!(main, CHILD);
+    }
+
+    /// Every manager this process can meet: the handoff commits (and the old server
+    /// exits) only when the manager ends up following the replacement, and aborts
+    /// (and stops the replacement) only when it ends up following this process. The
+    /// one exception is documented on `hand_over_main_pid`: a manager that refuses
+    /// `MAINPID=` and also doesn't say so.
+    #[test]
+    fn the_decision_follows_the_manager_in_every_case() {
+        for access in [Access::Refused, Access::Main, Access::All] {
+            for stalled in [false, true] {
+                for sends_fail in [false, true] {
+                    for (answering, answers) in ANSWERING {
+                        let manager = FakeManager {
+                            stalled,
+                            sends_fail,
+                            ..FakeManager::new(access, answers)
+                        };
+                        let owner = hand_over(&manager);
+                        let main = manager.settle();
+                        let case = format!(
+                            "{access:?}, stalled {stalled}, sends fail {sends_fail}, \
+                             answering {answering}: {owner:?}, main {main}, sent {:?}",
+                            manager.sent()
+                        );
+                        if owner.allows_stopping_the_replacement() {
+                            assert_eq!(main, OURS, "{case}");
+                        } else if access != Access::Refused {
+                            assert_eq!(main, CHILD, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A failed commit names this process again. Only a manager that has processed
+    /// that and names this process lets the replacement be stopped; the old server
+    /// keeps serving either way.
+    #[test]
+    fn a_failed_commit_stops_the_replacement_only_when_the_manager_follows_this_process() {
+        let why = || std::io::Error::other("commit failed");
+        for access in [Access::Refused, Access::Main, Access::All] {
+            for stalled in [false, true] {
+                for (answering, answers) in ANSWERING {
+                    let manager = FakeManager {
+                        stalled,
+                        ..FakeManager::new(access, answers)
+                    };
+                    manager.main.set(CHILD);
+                    let owner = manager.with(|m| take_main_pid_back(CHILD, OURS, m, why()));
+                    let main = manager.settle();
+                    let case = format!(
+                        "{access:?}, stalled {stalled}, answering {answering}: {owner:?}, \
+                         main {main}"
+                    );
+                    // Without a processed MAINPID=<self> and an answer, it can't know.
+                    let knowable = !stalled && answering != "never";
+                    assert_eq!(
+                        owner.allows_stopping_the_replacement(),
+                        knowable && main == OURS,
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 }
