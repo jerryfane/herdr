@@ -33,7 +33,8 @@ mod power;
 pub(crate) use power::monitor_host_power;
 mod fence;
 pub(crate) use fence::{
-    fence_exec, fence_peer, process_mount_namespace, FENCE_HELPER_PROGRAM, FENCE_SUPPORTED,
+    fence_exec, fence_peer, fenced_path_read_only, process_mount_namespace, FENCE_HELPER_PROGRAM,
+    FENCE_SUPPORTED,
 };
 mod systemd;
 pub(crate) use systemd::{show_own_systemd_unit, systemd_notify, systemd_notify_barrier};

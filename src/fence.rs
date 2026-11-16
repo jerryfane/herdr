@@ -860,14 +860,27 @@ pub(crate) fn fence_pane_command(
     if !crate::platform::FENCE_SUPPORTED || !fences(&config, identity) {
         return Ok(());
     }
-    let home = std::env::var_os("HOME")
+    let plan = pane_plan(&config)?;
+    let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
+    wrap_command(cmd, &plan_json)?;
+    FENCED_PANES_EXIST.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn server_home() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("pane fence: HOME is not set; not starting the pane"))?;
+        .ok_or_else(|| io::Error::other("pane fence: HOME is not set; not starting the pane"))
+}
+
+/// The plan a fenced pane started now gets.
+fn pane_plan(config: &FenceConfig) -> io::Result<FencePlan> {
+    let home = server_home()?;
     // Herdr's own settings, and the config file actually in use (HERDR_CONFIG_PATH
     // may point outside the config directory), are always read-only.
     let always_protected = [crate::config::config_dir(), crate::config::config_path()];
-    let mut plan = resolve_plan(&config, &home, &always_protected)?;
+    let mut plan = resolve_plan(config, &home, &always_protected)?;
     // The private TUI client socket attaches to any pane and types into it; agents
     // never need it. It sits below the read-only config dir, so its mask is applied
     // after every other mount (docs/next/design/pane-fence.md, section 8).
@@ -879,10 +892,186 @@ pub(crate) fn fence_pane_command(
             plan.mounts.push(mask);
         }
     }
-    let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
-    wrap_command(cmd, &plan_json)?;
-    FENCED_PANES_EXIST.store(true, Ordering::Release);
-    Ok(())
+    Ok(plan)
+}
+
+/// What `herdr fence explain` reports for one pane (docs/next/design/pane-fence.md,
+/// section 9). `config_*` fields describe the current config, which a restart of
+/// the pane would get; `running_fenced` and `PathExplanation::enforced_read_only`
+/// describe the process that runs now, which may have started under an older config.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Explanation {
+    pub agent: Option<String>,
+    pub running_fenced: Option<bool>,
+    pub config_fences: bool,
+    pub deny_count: Option<usize>,
+    pub missing: Vec<String>,
+    pub path: Option<PathExplanation>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PathExplanation {
+    pub path: String,
+    pub resolved: PathBuf,
+    pub access: Access,
+    pub rule: String,
+    pub pinned: bool,
+    /// From the running pane's mount table; `None` when it cannot be read.
+    pub enforced_read_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    Writable,
+    ReadOnly,
+    Masked,
+}
+
+pub(crate) fn explain(
+    identity: &FenceIdentity,
+    pid: Option<u32>,
+    path: Option<&str>,
+) -> io::Result<Explanation> {
+    let config = loaded_policy()?;
+    let config_fences = crate::platform::FENCE_SUPPORTED && fences(&config, identity);
+    let plan = if config_fences {
+        Some(pane_plan(&config)?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let running_fenced = pid.and_then(|pid| match crate::platform::fence_peer(pid) {
+        crate::platform::FencePeer::Unfenced => Some(false),
+        crate::platform::FencePeer::Fenced { .. } => Some(true),
+        crate::platform::FencePeer::Unknown => None,
+    });
+    #[cfg(not(unix))]
+    let running_fenced = pid.map(|_| false);
+    let path = match path {
+        Some(path) => {
+            if !path.starts_with('/') && path != "~" && !path.starts_with("~/") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path must be absolute or start with ~/",
+                ));
+            }
+            let resolved = resolve_for_explain(&lexical(path, Some(&server_home()?)))?;
+            let verdict = match &plan {
+                Some(plan) => path_verdict(plan, &resolved),
+                None => PathVerdict {
+                    access: Access::Writable,
+                    rule: "not fenced: the current config does not fence this pane".into(),
+                    pinned: false,
+                },
+            };
+            Some(PathExplanation {
+                path: path.to_string(),
+                enforced_read_only: pid
+                    .and_then(|pid| crate::platform::fenced_path_read_only(pid, &resolved)),
+                resolved,
+                access: verdict.access,
+                rule: verdict.rule,
+                pinned: verdict.pinned,
+            })
+        }
+        None => None,
+    };
+    Ok(Explanation {
+        agent: match identity {
+            FenceIdentity::Agent(name) => Some(name.clone()),
+            FenceIdentity::Anonymous => None,
+        },
+        running_fenced,
+        config_fences,
+        deny_count: plan.as_ref().map(FencePlan::deny_count),
+        missing: plan.map(|plan| plan.skipped).unwrap_or_default(),
+        path,
+    })
+}
+
+/// Resolve `path` as the kernel would when the pane opens it: symlinks in its
+/// deepest existing ancestor are followed, and the missing rest is appended, so
+/// `/bin/newtool` on a merged-/usr host is judged as `/usr/bin/newtool`.
+fn resolve_for_explain(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(resolved) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(resolved, |acc: PathBuf, part| acc.join(part)))
+            }
+            Err(err) if is_absent(&err) => {}
+            Err(err) => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "fence explain: cannot resolve {}: {err}",
+                        existing.display()
+                    ),
+                ))
+            }
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return Ok(path.to_path_buf()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PathVerdict {
+    access: Access,
+    rule: String,
+    pinned: bool,
+}
+
+/// The access a plan gives `path` (already resolved): the deepest deny, allow or mask
+/// at or above it decides, the later one on a tie, because mounts are applied
+/// shallow first and a later mount covers an earlier one at the same place.
+fn path_verdict(plan: &FencePlan, path: &Path) -> PathVerdict {
+    let mut deciding: Option<&FenceMount> = None;
+    for mount in &plan.mounts {
+        let at = match mount {
+            FenceMount::Deny(at) | FenceMount::Allow(at) | FenceMount::Mask(at) => at,
+            FenceMount::Anchor(_) => continue,
+        };
+        if !covers(at, path) {
+            continue;
+        }
+        let deeper_or_same = match deciding {
+            Some(
+                FenceMount::Deny(current) | FenceMount::Allow(current) | FenceMount::Mask(current),
+            ) => depth(at) >= depth(current),
+            _ => true,
+        };
+        if deeper_or_same {
+            deciding = Some(mount);
+        }
+    }
+    let (access, rule) = match deciding {
+        Some(FenceMount::Deny(at)) => (Access::ReadOnly, format!("deny {}", at.display())),
+        Some(FenceMount::Allow(at)) => (Access::Writable, format!("allow {}", at.display())),
+        Some(FenceMount::Mask(at)) => (Access::Masked, format!("mask {}", at.display())),
+        _ => (Access::Writable, "not denied".into()),
+    };
+    // A mount point cannot be removed or renamed from inside the pane.
+    let pinned = plan.mounts.iter().any(|mount| match mount {
+        FenceMount::Anchor(at)
+        | FenceMount::Deny(at)
+        | FenceMount::Allow(at)
+        | FenceMount::Mask(at) => at == path,
+    });
+    PathVerdict {
+        access,
+        rule,
+        pinned,
+    }
 }
 
 fn wrap_command(cmd: &mut CommandBuilder, plan_json: &str) -> io::Result<()> {
@@ -979,7 +1168,7 @@ fn setup_notice(plan: &FencePlan) -> String {
     if !plan.skipped.is_empty() {
         notice.push_str(&format!(", {} entries not present", plan.skipped.len()));
     }
-    notice.push(')');
+    notice.push_str("); `herdr fence explain <pane> <path>` shows why a path is read-only");
     notice
 }
 
@@ -1033,6 +1222,78 @@ mod tests {
 
     fn agent(name: &str) -> FenceIdentity {
         FenceIdentity::Agent(name.into())
+    }
+
+    /// `fence explain` must name the rule the kernel applies: the deepest mount at or
+    /// above the path, the later one at the same place.
+    #[test]
+    fn path_verdict_names_the_deciding_rule() {
+        use Access as FenceAccess;
+        let p = PathBuf::from;
+        let plan = FencePlan {
+            mounts: vec![
+                FenceMount::Anchor(p("/home/u/.gitmoot")),
+                FenceMount::Deny(p("/home/u/.gitmoot/config.toml")),
+                FenceMount::Deny(p("/srv")),
+                FenceMount::Allow(p("/srv/app/data")),
+                FenceMount::Deny(p("/srv/app/data/secrets")),
+                FenceMount::Mask(p("/run/docker.sock")),
+                FenceMount::Deny(p("/cfg")),
+                FenceMount::Deny(p("/cfg/x")),
+                FenceMount::Allow(p("/cfg/x")),
+            ],
+            ..FencePlan::default()
+        };
+        let v = |path: &str| path_verdict(&plan, Path::new(path));
+        assert_eq!(
+            (v("/srv/app/x").access, v("/srv/app/x").rule),
+            (FenceAccess::ReadOnly, "deny /srv".into())
+        );
+        assert_eq!(v("/srv/app/data/db").access, FenceAccess::Writable);
+        assert_eq!(v("/srv/app/data/db").rule, "allow /srv/app/data");
+        assert_eq!(v("/srv/app/data/secrets/k").access, FenceAccess::ReadOnly);
+        assert_eq!(v("/srvx").rule, "not denied", "component prefix only");
+        assert_eq!(v("/run/docker.sock").access, FenceAccess::Masked);
+        assert_eq!(
+            v("/cfg/x/y").access,
+            FenceAccess::Writable,
+            "later mount wins a tie"
+        );
+        let pinned = v("/home/u/.gitmoot");
+        assert_eq!(
+            (pinned.access, pinned.pinned),
+            (FenceAccess::Writable, true)
+        );
+        assert!(!v("/home/u/.gitmoot/gitmoot.db-wal").pinned);
+        assert_eq!(
+            v("/home/u/.gitmoot/config.toml").access,
+            FenceAccess::ReadOnly
+        );
+    }
+
+    /// A path that does not exist yet must still be judged through its parent's
+    /// symlinks, as the kernel resolves it (merged-/usr `/bin/newtool`).
+    #[cfg(unix)]
+    #[test]
+    fn explain_resolves_missing_paths_through_existing_symlinks() {
+        let root = temp_root("explain-resolve");
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        assert_eq!(
+            resolve_for_explain(&root.join("bin/newtool/sub")).unwrap(),
+            root.join("usr/bin/newtool/sub")
+        );
+        assert_eq!(
+            resolve_for_explain(&root.join("bin")).unwrap(),
+            root.join("usr/bin")
+        );
+        let plan = FencePlan {
+            mounts: vec![FenceMount::Deny(root.join("usr"))],
+            ..FencePlan::default()
+        };
+        let resolved = resolve_for_explain(&root.join("bin/newtool")).unwrap();
+        assert_eq!(path_verdict(&plan, &resolved).access, Access::ReadOnly);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

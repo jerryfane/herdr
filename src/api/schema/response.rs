@@ -300,6 +300,9 @@ pub enum ResponseResult {
     AgentExplain {
         explain: serde_json::Value,
     },
+    FenceExplain {
+        explain: super::FenceExplanation,
+    },
     SubscriptionStarted {
         /// Entries an `events_v2` request skipped because their pane does not
         /// exist. Omitted when every entry was subscribed.

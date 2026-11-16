@@ -938,6 +938,60 @@ impl App {
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }
 
+    /// `fence.explain`: the pane's fence identity, whether its process runs fenced,
+    /// what the current config would give it, and the rule for one path.
+    pub(super) fn handle_fence_explain(
+        &mut self,
+        id: String,
+        params: crate::api::schema::FenceExplainParams,
+    ) -> String {
+        let resolved = match self.resolve_terminal_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal) = self.state.terminals.get(resolved.terminal_id.as_str()) else {
+            return agent_not_found(id, &params.target);
+        };
+        let pid = self
+            .terminal_runtimes
+            .get(&terminal.id)
+            .and_then(|runtime| runtime.child_pid());
+        let explain =
+            match crate::fence::explain(&terminal.fence_identity, pid, params.path.as_deref()) {
+                Ok(explain) => explain,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                    return encode_error(id, "invalid_fence_path", err.to_string())
+                }
+                Err(err) => return encode_error(id, "fence_explain_failed", err.to_string()),
+            };
+        let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        let explain = crate::api::schema::FenceExplanation {
+            pane_id,
+            agent: explain.agent,
+            running_fenced: explain.running_fenced,
+            config_fences: explain.config_fences,
+            deny_count: explain.deny_count,
+            missing: explain.missing,
+            path: explain
+                .path
+                .map(|path| crate::api::schema::FencePathExplanation {
+                    path: path.path,
+                    resolved: path.resolved.display().to_string(),
+                    access: match path.access {
+                        crate::fence::Access::Writable => crate::api::schema::FenceAccess::Writable,
+                        crate::fence::Access::ReadOnly => crate::api::schema::FenceAccess::ReadOnly,
+                        crate::fence::Access::Masked => crate::api::schema::FenceAccess::Masked,
+                    },
+                    rule: path.rule,
+                    pinned: path.pinned,
+                    enforced_read_only: path.enforced_read_only,
+                }),
+        };
+        encode_success(id, ResponseResult::FenceExplain { explain })
+    }
+
     pub(super) fn handle_agent_send_keys(
         &mut self,
         id: String,

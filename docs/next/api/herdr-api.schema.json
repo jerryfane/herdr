@@ -3095,6 +3095,26 @@
           ],
           "type": "object"
         },
+        "FenceExplainParams": {
+          "description": "`fence.explain`: how the pane fence treats a pane, and optionally one path in it.",
+          "properties": {
+            "path": {
+              "description": "An absolute path, or one starting with `~/` (the server's home).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "description": "A pane id, or an agent name or label.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "FsListDirParams": {
           "description": "Parameters for `fs.list_dir` — list a single directory's entries, for an app\nfolder picker. `path` is absolute; a leading `~` is expanded and `None`\ndefaults to `$HOME`. Read-only; never writes or traverses recursively.",
           "properties": {
@@ -7638,6 +7658,23 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "How the pane fence treats a pane and, optionally, one path. Local only.",
+          "properties": {
+            "method": {
+              "const": "fence.explain",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/FenceExplainParams"
             }
           },
           "required": [
@@ -13858,6 +13895,116 @@
           ],
           "type": "string"
         },
+        "FenceAccess": {
+          "oneOf": [
+            {
+              "enum": [
+                "writable",
+                "read_only"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "masked",
+              "description": "A socket hidden behind an empty read-only file.",
+              "type": "string"
+            }
+          ]
+        },
+        "FenceExplanation": {
+          "properties": {
+            "agent": {
+              "description": "The `[fence.agents]` name the pane is fenced as; absent for a plain pane.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "config_fences": {
+              "description": "Whether the current config fences this pane when it next starts.",
+              "type": "boolean"
+            },
+            "deny_count": {
+              "description": "Read-only paths in the current config's plan, when it fences this pane.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "missing": {
+              "description": "Configured entries that match nothing on this host.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "path": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/FencePathExplanation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "running_fenced": {
+              "description": "Whether the pane's process runs inside a fence now. Absent when it cannot be\ninspected.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "config_fences"
+          ],
+          "type": "object"
+        },
+        "FencePathExplanation": {
+          "properties": {
+            "access": {
+              "$ref": "#/schemas/success_response/$defs/FenceAccess",
+              "description": "Access under the current config."
+            },
+            "enforced_read_only": {
+              "description": "Whether the running pane's mount table makes the path read-only. Absent when\nit cannot be read.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "pinned": {
+              "description": "The path is a mount point inside the fence, so it cannot be deleted or renamed.",
+              "type": "boolean"
+            },
+            "resolved": {
+              "description": "The path after `~` expansion and symlink resolution on the host.",
+              "type": "string"
+            },
+            "rule": {
+              "description": "The rule that decides `access`, such as `deny /etc` or `not denied`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "resolved",
+            "access",
+            "rule",
+            "pinned"
+          ],
+          "type": "object"
+        },
         "GramDirection": {
           "description": "Direction of a gram message on the wire. Mirrors\n[`crate::persist::gram::GramDirection`]; the handler maps between them so the\nstorage record and the public contract can evolve independently.",
           "enum": [
@@ -17704,6 +17851,22 @@
                 "explain": true,
                 "type": {
                   "const": "agent_explain",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "explain"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "explain": {
+                  "$ref": "#/schemas/success_response/$defs/FenceExplanation"
+                },
+                "type": {
+                  "const": "fence_explain",
                   "type": "string"
                 }
               },

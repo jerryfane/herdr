@@ -23,6 +23,7 @@ mod accounts;
 pub(crate) mod agent;
 mod api;
 mod completion;
+mod fence;
 mod gram;
 mod guest;
 mod integration;
@@ -139,6 +140,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "gram" => gram::run_gram_command(&args[2..])?,
         "guest" => guest::run_guest_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
+        "fence" => fence::run_fence_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pair" => pair::run_pair_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,

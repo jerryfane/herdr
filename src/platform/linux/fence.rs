@@ -556,6 +556,60 @@ pub(crate) fn process_mount_namespace(pid: u32) -> Option<u64> {
     namespace_inode(&pid.to_string(), "mnt")
 }
 
+/// Whether `path` is read-only in the mount table of process `pid`: the mount with
+/// the longest mount point at or above `path` decides. `None` when the table cannot
+/// be read. Reads one `/proc` file; used only by `herdr fence explain`.
+pub(crate) fn fenced_path_read_only(pid: u32, path: &Path) -> Option<bool> {
+    let mountinfo = std::fs::read(format!("/proc/{pid}/mountinfo")).ok()?;
+    mountinfo_read_only(&mountinfo, path)
+}
+
+/// See [`fenced_path_read_only`]. Later lines win a tie, because a later mount on
+/// the same point covers the earlier one. Bytes, not UTF-8: mount points need not be.
+fn mountinfo_read_only(mountinfo: &[u8], path: &Path) -> Option<bool> {
+    let mut best: Option<(usize, bool)> = None;
+    for line in mountinfo.split(|&b| b == b'\n') {
+        // `id parent major:minor root mount_point options ...`
+        let mut fields = line.split(|&b| b == b' ');
+        let (Some(mount_point), Some(options)) = (fields.nth(4), fields.next()) else {
+            continue;
+        };
+        let mount_point = PathBuf::from(unescape_mountinfo(mount_point));
+        if !path.starts_with(&mount_point) {
+            continue;
+        }
+        let depth = mount_point.components().count();
+        let read_only = options.split(|&b| b == b',').any(|option| option == b"ro");
+        if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
+            best = Some((depth, read_only));
+        }
+    }
+    best.map(|(_, read_only)| read_only)
+}
+
+/// Mount points escape space, tab, newline and backslash as `\ooo` octal.
+fn unescape_mountinfo(bytes: &[u8]) -> OsString {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(digits) = bytes.get(i + 1..i + 4).filter(|_| bytes[i] == b'\\') {
+            if digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+                if let Ok(byte) = u8::try_from(value) {
+                    out.push(byte);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    OsString::from(OsStr::from_bytes(&out))
+}
+
 const CAP_SYS_ADMIN: u32 = 21;
 
 /// `/proc/<pid>/ns/<kind>` links read `<kind>:[<inode>]`.
@@ -575,4 +629,40 @@ fn bounding_set(pid: u32) -> Option<u64> {
         .lines()
         .find_map(|line| line.strip_prefix("CapBnd:"))?;
     u64::from_str_radix(hex.trim(), 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mountinfo_read_only_uses_the_deepest_covering_mount() {
+        let mut table = b"\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 8:1 /etc /etc ro,relatime - ext4 /dev/sda1 rw
+41 40 8:1 /etc/app/data /etc/app/data rw,relatime - ext4 /dev/sda1 rw
+42 22 8:1 /my\\040dir /my\\040dir ro - ext4 /dev/sda1 rw
+43 22 8:1 /usr /usr rw - ext4 /dev/sda1 rw
+44 43 8:1 /usr /usr ro - ext4 /dev/sda1 rw
+"
+        .to_vec();
+        // A mount point that is not UTF-8 must not hide the rest of the table.
+        table.extend_from_slice(b"45 22 8:1 /x\xff /x\xff ro - ext4 /dev/sda1 rw\n");
+        let ro = |p: &str| mountinfo_read_only(&table, Path::new(p));
+        assert_eq!(ro("/etc/passwd"), Some(true));
+        assert_eq!(ro("/etc/app/data/db"), Some(false), "allow below a deny");
+        assert_eq!(
+            ro("/etcetera"),
+            Some(false),
+            "component prefix, not string prefix"
+        );
+        assert_eq!(ro("/my dir/x"), Some(true), "octal-escaped mount point");
+        assert_eq!(
+            ro("/usr/bin/sh"),
+            Some(true),
+            "a later mount on the same point wins"
+        );
+        assert_eq!(ro("/home/x"), Some(false));
+        assert_eq!(mountinfo_read_only(b"", Path::new("/x")), None);
+    }
 }
