@@ -1667,6 +1667,58 @@
           "description": "Deliver through the APNs sandbox host instead of production."
         }
       ]
+    },
+    {
+      "id": "fence",
+      "title": "Pane fence",
+      "keys": [
+        {
+          "key": "fence.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Linux only. Start every new pane process inside the pane fence: a private mount namespace in which the deny list is read-only, sockets that run work outside the fence are masked, block devices are `nodev`, a Landlock domain isolates the pane from other processes, and capabilities such as `CAP_SYS_ADMIN`, `CAP_SYS_MODULE` and `CAP_SYS_PTRACE` are removed from every set including the bounding set. Applies to panes started after the change (`herdr server reload-config`); running panes keep the fence they started with. If the fence cannot be set up the pane shows the error and its command does not start. On other platforms `true` logs a warning and panes start unfenced."
+        },
+        {
+          "key": "fence.deny",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Paths that are read-only inside fenced panes, recursively. Absolute or starting with `~/`; a `*` inside a path component matches siblings when the pane starts (for example `/var/lib/sandboxd*`). Missing paths are skipped, never created. Setting the key replaces the built-in list (OS directories such as `/usr`, `/etc` and `/boot`, package and service state, `/sys`, `~/.local/bin`, `~/.config/herdr`, `~/.config/systemd`, `~/.ssh`, and gitmoot's config, credentials, runtimes, plugins, scripts, review checkouts and database backups under `~/.gitmoot`). Herdr's own config directory is always denied. Unix sockets on a denied path can still be connected to."
+        },
+        {
+          "key": "fence.allow",
+          "type": "array of strings",
+          "default": "[]",
+          "description": "Paths that stay writable inside a denied parent. Each entry must lie below a `fence.deny` entry, otherwise the whole `[fence]` section is rejected. The allowed path is a mount point inside the pane, so the path itself cannot be deleted or renamed from the pane; files inside it can."
+        },
+        {
+          "key": "fence.mask_sockets",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Unix sockets hidden from fenced panes, so `connect()` fails. Setting the key replaces the built-in list: the systemd private socket, system and user D-Bus, user systemd managers, Docker, containerd, Podman and snapd."
+        },
+        {
+          "key": "fence.pin",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Paths that stay writable inside fenced panes but cannot be deleted or renamed there: each is bound onto itself. Same path syntax as `fence.deny`. Setting the key replaces the built-in list (`~/.gitmoot` and `~/.gitmoot/gitmoot.db`). Do not pin files that their program deletes and recreates, such as SQLite `-wal` and `-shm` files."
+        },
+        {
+          "key": "fence.scope",
+          "type": "enum",
+          "default": "\"all\"",
+          "description": "Which panes `fence.enabled` fences. `all`: every pane, except agents listed in `fence.agents` with `profile = \"unfenced\"`. `agents`: only agents listed in `fence.agents` with the default profile; every other pane, including panes those agents create, starts unfenced and a fenced agent cannot create panes.",
+          "values": [
+            "all",
+            "agents"
+          ]
+        },
+        {
+          "key": "fence.agents",
+          "type": "table",
+          "default": "{}",
+          "description": "Per-agent entries, `[fence.agents.<name>]`, keyed by the name an agent was started with (`herdr agent start <NAME>`). Each entry needs a non-empty `reason` and may set `profile` to `\"default\"` (the `[fence]` settings) or `\"unfenced\"`. The entry follows the agent through `agent restart`, `agent archive`/`unarchive` and session restore; renaming the agent does not change it. `agent start` restarts the pane's shell first when the shell is not under the agent's fence."
+        }
+      ]
     }
   ]
 }

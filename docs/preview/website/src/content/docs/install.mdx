@@ -153,9 +153,46 @@ When both servers support agent-status transfer, live handoff preserves hook-rep
 
 Live handoff does not apply to Homebrew, mise, or Nix package-manager updates. For those installs, update with the package manager, then run Herdr again to reconnect with the updated client. The compatible old server keeps running. Restart it later with `herdr server stop` or `herdr session stop <name>` only when you want server-side changes from the new release.
 
-A running server can also refuse a live handoff. Handoff works by starting a replacement and then letting the old process exit, so Herdr declines it when that exit would take the replacement down too — most importantly when Herdr is the main process of a systemd unit, where the main process exiting deactivates the unit and kills every pane in its control group. The request fails with an explicit error and nothing is torn down.
+A running server can also refuse a live handoff. Handoff works by starting a replacement and then letting the old process exit, so Herdr declines it when that exit would take the replacement down too — most importantly when Herdr is the main process of a systemd unit that can't follow the replacement, where the main process exiting deactivates the unit and kills every pane in its control group. The request fails with an explicit error and nothing is torn down.
 
-Deploy to a supervised install by replacing the binary and restarting the service instead. Note that restarting the service alone does not pick up a staged build: the swap that a handoff would have performed never happens, so the unit re-runs the same file. Move the staged binary over the live path first — a rename rather than a copy, since the running image is busy — and then restart the service.
+### Run the server under systemd
+
+A `Type=notify` unit can follow a live handoff. Once the replacement owns the panes, the old server tells systemd that the replacement is the unit's main process, waits until systemd has taken that in, and only then exits. The unit stays active in the same activation, so in-app updates (`server.update_apply`) and `herdr update --handoff` switch builds without stopping a pane. This needs Linux with systemd 246 or newer.
+
+Recommended user unit, `~/.config/systemd/user/herdr.service`:
+
+```ini
+[Unit]
+Description=Herdr server
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`NotifyAccess=all` works too; `main` is enough because only the server that is the unit's main process sends notifications, and it keeps pane processes from sending them. Keep the default `KillMode=control-group`: a real `systemctl --user stop` must stop the panes with the server, and `KillMode=process` or `mixed` would leave them running, orphaned from any server.
+
+Herdr checks the unit before every handoff. Under a unit that isn't `Type=notify`, or whose `NotifyAccess=` is `none`, it keeps refusing (`server.update_check` reports `mode: restart_required`, reason `systemd_main_process`). Install such a unit by replacing the binary and restarting the service instead. Restarting the service alone does not pick up a staged build: the swap that a handoff would have performed never happens, so the unit re-runs the same file. Move the staged binary over the live path first — a rename rather than a copy, since the running image is busy — and then restart the service.
+
+To move an existing `Type=simple` unit over:
+
+1. Update Herdr to a build that supports this, so the server sends systemd its readiness. An older server under `Type=notify` never reports ready, and systemd stops it when `TimeoutStartSec=` runs out.
+2. Add a drop-in and reload systemd:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user/herdr.service.d
+   printf '[Service]\nType=notify\nNotifyAccess=main\n' > ~/.config/systemd/user/herdr.service.d/live-update.conf
+   systemctl --user daemon-reload
+   systemctl --user show -p Type -p NotifyAccess herdr.service
+   ```
+
+3. Restart the service once, when stopping the panes is acceptable: `systemctl --user restart herdr.service`. The running server was started without a notification socket, so it can't hand off until then.
+4. Confirm: `server.update_check` reports `mode: live`. After each later update, `systemctl --user show -p MainPID herdr.service` names the new server process, and `systemctl --user status herdr.service` shows the unit active since the restart in step 3.
 
 ## Requirements
 
