@@ -560,17 +560,17 @@ pub(crate) fn process_mount_namespace(pid: u32) -> Option<u64> {
 /// the longest mount point at or above `path` decides. `None` when the table cannot
 /// be read. Reads one `/proc` file; used only by `herdr fence explain`.
 pub(crate) fn fenced_path_read_only(pid: u32, path: &Path) -> Option<bool> {
-    let mountinfo = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
+    let mountinfo = std::fs::read(format!("/proc/{pid}/mountinfo")).ok()?;
     mountinfo_read_only(&mountinfo, path)
 }
 
 /// See [`fenced_path_read_only`]. Later lines win a tie, because a later mount on
-/// the same point covers the earlier one.
-fn mountinfo_read_only(mountinfo: &str, path: &Path) -> Option<bool> {
+/// the same point covers the earlier one. Bytes, not UTF-8: mount points need not be.
+fn mountinfo_read_only(mountinfo: &[u8], path: &Path) -> Option<bool> {
     let mut best: Option<(usize, bool)> = None;
-    for line in mountinfo.lines() {
+    for line in mountinfo.split(|&b| b == b'\n') {
         // `id parent major:minor root mount_point options ...`
-        let mut fields = line.split(' ');
+        let mut fields = line.split(|&b| b == b' ');
         let (Some(mount_point), Some(options)) = (fields.nth(4), fields.next()) else {
             continue;
         };
@@ -579,7 +579,7 @@ fn mountinfo_read_only(mountinfo: &str, path: &Path) -> Option<bool> {
             continue;
         }
         let depth = mount_point.components().count();
-        let read_only = options.split(',').any(|option| option == "ro");
+        let read_only = options.split(|&b| b == b',').any(|option| option == b"ro");
         if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
             best = Some((depth, read_only));
         }
@@ -588,8 +588,7 @@ fn mountinfo_read_only(mountinfo: &str, path: &Path) -> Option<bool> {
 }
 
 /// Mount points escape space, tab, newline and backslash as `\ooo` octal.
-fn unescape_mountinfo(field: &str) -> OsString {
-    let bytes = field.as_bytes();
+fn unescape_mountinfo(bytes: &[u8]) -> OsString {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -638,15 +637,18 @@ mod tests {
 
     #[test]
     fn mountinfo_read_only_uses_the_deepest_covering_mount() {
-        let table = "\
+        let mut table = b"\
 22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
 40 22 8:1 /etc /etc ro,relatime - ext4 /dev/sda1 rw
 41 40 8:1 /etc/app/data /etc/app/data rw,relatime - ext4 /dev/sda1 rw
 42 22 8:1 /my\\040dir /my\\040dir ro - ext4 /dev/sda1 rw
 43 22 8:1 /usr /usr rw - ext4 /dev/sda1 rw
 44 43 8:1 /usr /usr ro - ext4 /dev/sda1 rw
-";
-        let ro = |p: &str| mountinfo_read_only(table, Path::new(p));
+"
+        .to_vec();
+        // A mount point that is not UTF-8 must not hide the rest of the table.
+        table.extend_from_slice(b"45 22 8:1 /x\xff /x\xff ro - ext4 /dev/sda1 rw\n");
+        let ro = |p: &str| mountinfo_read_only(&table, Path::new(p));
         assert_eq!(ro("/etc/passwd"), Some(true));
         assert_eq!(ro("/etc/app/data/db"), Some(false), "allow below a deny");
         assert_eq!(
@@ -661,6 +663,6 @@ mod tests {
             "a later mount on the same point wins"
         );
         assert_eq!(ro("/home/x"), Some(false));
-        assert_eq!(mountinfo_read_only("", Path::new("/x")), None);
+        assert_eq!(mountinfo_read_only(b"", Path::new("/x")), None);
     }
 }

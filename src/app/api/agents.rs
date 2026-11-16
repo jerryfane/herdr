@@ -956,7 +956,7 @@ impl App {
             .terminal_runtimes
             .get(&terminal.id)
             .and_then(|runtime| runtime.child_pid());
-        let mut explain =
+        let explain =
             match crate::fence::explain(&terminal.fence_identity, pid, params.path.as_deref()) {
                 Ok(explain) => explain,
                 Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
@@ -964,9 +964,31 @@ impl App {
                 }
                 Err(err) => return encode_error(id, "fence_explain_failed", err.to_string()),
             };
-        explain.pane_id = self
-            .public_pane_id(resolved.ws_idx, resolved.pane_id)
-            .unwrap_or_default();
+        let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        let explain = crate::api::schema::FenceExplanation {
+            pane_id,
+            agent: explain.agent,
+            running_fenced: explain.running_fenced,
+            config_fences: explain.config_fences,
+            deny_count: explain.deny_count,
+            missing: explain.missing,
+            path: explain
+                .path
+                .map(|path| crate::api::schema::FencePathExplanation {
+                    path: path.path,
+                    resolved: path.resolved.display().to_string(),
+                    access: match path.access {
+                        crate::fence::Access::Writable => crate::api::schema::FenceAccess::Writable,
+                        crate::fence::Access::ReadOnly => crate::api::schema::FenceAccess::ReadOnly,
+                        crate::fence::Access::Masked => crate::api::schema::FenceAccess::Masked,
+                    },
+                    rule: path.rule,
+                    pinned: path.pinned,
+                    enforced_read_only: path.enforced_read_only,
+                }),
+        };
         encode_success(id, ResponseResult::FenceExplain { explain })
     }
 
