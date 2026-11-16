@@ -39,18 +39,47 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
+        self.perform_supervised_live_handoff(params, crate::server::supervision::detect())
+    }
+
+    /// [`Self::perform_live_handoff`] for a caller that already asked how this
+    /// process is supervised. The single choke point for every handoff, however
+    /// it was requested: refuses before a socket is opened or a child spawned
+    /// when this process' exit would take the replacement down with it.
+    #[cfg(unix)]
+    pub(super) fn perform_supervised_live_handoff(
+        &mut self,
+        params: crate::api::schema::ServerLiveHandoffParams,
+        supervision: crate::server::supervision::Supervision,
+    ) -> io::Result<()> {
+        if supervision.forbids_process_handoff() {
+            warn!(
+                ?supervision,
+                pid = std::process::id(),
+                "refusing live handoff: exiting would deactivate the supervising unit and kill the panes"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::server::supervision::HANDOFF_REFUSAL,
+            ));
+        }
+        info!(?supervision, "live handoff allowed");
         drop(self.guest_link.take());
-        let result = self.export_live_handoff(params);
+        let result = self.export_live_handoff(params, supervision.hands_over_main_pid());
         if result.is_err() {
             self.start_guest_link();
         }
         result
     }
 
+    /// `hand_over_main_pid`: this is the main process of a `Type=notify` unit, so
+    /// the replacement gets the notification socket, and once it owns the panes
+    /// systemd is told it is the unit's main process before this one exits.
     #[cfg(unix)]
     fn export_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
+        hand_over_main_pid: bool,
     ) -> io::Result<()> {
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
@@ -144,6 +173,7 @@ impl HeadlessServer {
             import_exe.as_deref(),
             &socket_path,
             &token,
+            hand_over_main_pid,
         ) {
             Ok(child) => child,
             Err(err) => {
@@ -207,25 +237,125 @@ impl HeadlessServer {
             let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, &self.client_socket_identity);
-        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            match self.wait_then_restore_public_sockets_after_failed_handoff() {
-                Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+        let ready = match crate::server::handoff::wait_ready(&mut stream) {
+            Ok(ready) => ready,
+            Err(err) => {
+                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                    Ok(()) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    }
+                    Err(restore_err) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                        return Err(io::Error::other(format!(
+                            "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
+                        )));
+                    }
                 }
-                Err(restore_err) => {
+                return Err(io::Error::other(format!(
+                    "handoff replacement server did not become ready: {err}"
+                )));
+            }
+        };
+        // A replacement that can't hand the main pid back after a lost commit (an
+        // older build) must never get it: its exit would end the unit. No MAINPID=
+        // was sent yet, so stopping it is safe and the handoff is refused as before.
+        if hand_over_main_pid && !ready.main_pid_recovery {
+            warn!(
+                pid = child_pid,
+                "the new build can't hand the systemd main pid back; refusing the live handoff"
+            );
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            let restored = self.wait_then_restore_public_sockets_after_failed_handoff();
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            let refusal = crate::server::supervision::HANDOFF_REFUSAL_OLD_IMPORTER;
+            return Err(match restored {
+                Ok(()) => io::Error::new(io::ErrorKind::Unsupported, refusal),
+                Err(restore_err) => io::Error::other(format!(
+                    "{refusal}; old server could not restore public sockets: {restore_err}"
+                )),
+            });
+        }
+        // The manager must name the replacement as the unit's main process BEFORE the
+        // commit: up to here the handoff is still reversible, after it the old pane
+        // runtimes are gone. Only a manager that follows another process aborts it;
+        // see `supervision::hand_over_main_pid` for why an unknown owner commits.
+        if hand_over_main_pid {
+            use crate::server::supervision::MainPidOwner;
+            let owner = with_handoff_manager(|manager| {
+                crate::server::supervision::hand_over_main_pid(child_pid, manager)
+            });
+            match owner {
+                MainPidOwner::Replacement => info!(
+                    pid = child_pid,
+                    "systemd follows the replacement as the unit's main process"
+                ),
+                MainPidOwner::Unknown(err) => tracing::error!(
+                    pid = child_pid,
+                    err = %err,
+                    "systemd may already follow the replacement as main process and won't say; committing, since stopping it could end the unit and every pane"
+                ),
+                MainPidOwner::Ours(err) => {
+                    warn!(
+                        pid = child_pid,
+                        err = %err,
+                        "systemd does not follow the replacement; aborting the handoff"
+                    );
+                    crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                    let restored = self.wait_then_restore_public_sockets_after_failed_handoff();
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
-                    )));
+                    return Err(match restored {
+                        Ok(()) => err,
+                        Err(restore_err) => io::Error::other(format!(
+                            "{err}; old server could not restore public sockets: {restore_err}"
+                        )),
+                    });
                 }
             }
-            return Err(io::Error::other(format!(
-                "handoff replacement server did not become ready: {err}"
-            )));
         }
-        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+        // Test fault: the commit write fails and the replacement sees the stream end.
+        let committed = if std::env::var_os("HERDR_TEST_HANDOFF_COMMIT_FAIL").is_some() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test: the handoff commit write failed",
+            ))
+        } else {
+            crate::server::handoff::report_committed(&mut stream)
+        };
+        if let Err(err) = committed {
+            // End the stream so the replacement learns at once that no commit comes:
+            // it then drops everything it imported, closes its sockets and, if the
+            // manager follows it, names this process main again before it exits.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            // The same rule as before the commit: the replacement is stopped only when
+            // the manager follows another process, or stopping it could be the unit's
+            // main process dying.
+            let owner = hand_over_main_pid.then(|| {
+                with_handoff_manager(|manager| {
+                    crate::server::supervision::take_main_pid_back(
+                        child_pid,
+                        std::process::id(),
+                        manager,
+                        io::Error::new(err.kind(), format!("commit failed: {err}")),
+                    )
+                })
+            });
+            match owner {
+                Some(owner) if !owner.allows_stopping_the_replacement() => {
+                    tracing::error!(
+                        pid = child_pid,
+                        ?owner,
+                        "commit failed while systemd may follow the replacement as main process; not stopping it"
+                    );
+                    // It hands the main pid back to this process and exits on its own
+                    // (no signal from here); reap it when it does.
+                    std::thread::spawn(move || {
+                        let _ = import_child.wait();
+                    });
+                }
+                _ => crate::server::handoff::cleanup_failed_import_child(&mut import_child),
+            }
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
@@ -248,7 +378,6 @@ impl HeadlessServer {
             runtime.preserve_for_handoff();
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
-
         Ok(())
     }
 
@@ -433,4 +562,33 @@ pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Res
         io::ErrorKind::TimedOut,
         "old server sockets did not close before handoff import bind",
     ))
+}
+
+/// The systemd manager a live handoff talks to, with the test faults applied.
+/// `HERDR_TEST_SYSTEMD_HANDOVER_FAIL`: `refused` drops `MAINPID=` for any other
+/// process, so the manager processes the barrier but keeps this process as main,
+/// as one that refuses the replacement does; `unknown` loses every read-back, as a
+/// manager that takes notifications but stops answering queries.
+#[cfg(unix)]
+fn with_handoff_manager<R>(
+    handover: impl FnOnce(crate::server::supervision::Manager<'_>) -> R,
+) -> R {
+    let fault = std::env::var("HERDR_TEST_SYSTEMD_HANDOVER_FAIL").ok();
+    let systemd = crate::server::supervision::Manager::systemd();
+    let ours = format!("MAINPID={}", std::process::id());
+    let send = |message: &str, deadline: std::time::Instant| {
+        if fault.as_deref() == Some("refused") && message != ours {
+            return Ok(());
+        }
+        (systemd.send)(message, deadline)
+    };
+    let main_pid = |deadline: std::time::Instant| match fault.as_deref() {
+        Some("unknown") => None,
+        _ => (systemd.main_pid)(deadline),
+    };
+    handover(crate::server::supervision::Manager {
+        send: &send,
+        main_pid: &main_pid,
+        ..systemd
+    })
 }

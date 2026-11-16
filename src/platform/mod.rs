@@ -59,6 +59,38 @@ fn monitor_host_power(
     None
 }
 
+// systemd stubs for the other Unix targets. Their only caller,
+// `server::supervision`, is Unix-only, so Windows has neither.
+
+/// Only Linux runs under systemd: no unit to describe.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn show_own_systemd_unit(
+    _properties: &[&str],
+    _deadline: std::time::Instant,
+) -> Option<String> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn systemd_notify(
+    _socket: &str,
+    _message: &str,
+    _deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "systemd notifications are only supported on Linux",
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn systemd_notify_barrier(
+    socket: &str,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    systemd_notify(socket, "BARRIER=1", deadline)
+}
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -223,7 +255,7 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+    classify_child_exit, poll_fd_readable, process_alive, read_fd, shared_ssh_control_path,
 };
 
 // Tests inject their own probe because the recorded hangup is process-global.

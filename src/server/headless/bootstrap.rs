@@ -2,6 +2,9 @@ use super::*;
 
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
+    // Before any thread starts or child spawns: only this process may notify systemd.
+    #[cfg(unix)]
+    crate::server::supervision::take_systemd_environment();
     let launcher_warning = crate::platform::leave_launcher_job();
     crate::platform::ignore_server_hangup();
     let args: Vec<String> = std::env::args().collect();
@@ -115,6 +118,9 @@ pub fn run_server() -> io::Result<()> {
             "herdr server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
+        // A `Type=notify` unit counts as started only now, with both sockets bound.
+        #[cfg(unix)]
+        crate::server::supervision::notify_ready();
         #[cfg(unix)]
         server.start_guest_link();
         server.app.run_plugin_startup_hooks();
@@ -162,6 +168,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
+    // The server that handed off, should this process have to give the unit's main
+    // pid back to it.
+    let predecessor = crate::platform::unix_stream_peer_pid(&received.stream);
+    let commit_lost = std::cell::Cell::new(false);
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
@@ -228,8 +238,14 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server
             .host_shutdown_intent
             .set(received.manifest.host_shutdown_intent);
-        crate::server::handoff::report_ready(&mut received.stream)?;
-        crate::server::handoff::wait_committed(&mut received.stream)?;
+        // Test fault: answer like a build without lost-commit recovery.
+        let main_pid_recovery = crate::server::supervision::is_main_pid_successor()
+            && std::env::var_os("HERDR_TEST_HANDOFF_NO_MAIN_PID_RECOVERY").is_none();
+        crate::server::handoff::report_ready(&mut received.stream, main_pid_recovery)?;
+        if let Err(err) = crate::server::handoff::wait_committed(&mut received.stream) {
+            commit_lost.set(true);
+            return Err(err);
+        }
         server.app.assume_handoff_ownership();
         // Before commit a stop signal still kills this importer so the old
         // server rolls back; once it owns the panes, stop cleanly instead.
@@ -248,6 +264,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
+    if commit_lost.get() {
+        // Serving nothing by now: the server and every runtime were dropped above.
+        drop(received.stream);
+        crate::server::supervision::release_main_pid_before_exit_after_lost_commit(predecessor);
+    }
     crate::logging::shutdown("server");
     result
 }
