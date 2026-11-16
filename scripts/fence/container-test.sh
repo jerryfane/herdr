@@ -24,7 +24,18 @@ echo cfg > /fleet/protected/config.toml
 echo data > /fleet/protected/db/data.db
 echo keep > /fleet/protected/sub/keep
 export HOME=/root XDG_CONFIG_HOME=/root/.config
-CFG_DIR=$XDG_CONFIG_HOME/herdr
+# Debug builds read `herdr-dev` instead of `herdr`. Ask the binary: an unparsable
+# config under `herdr/` is only reported by a build that reads that directory.
+probe=$(mktemp -d)
+mkdir -p "$probe/herdr" && echo '[[[' > "$probe/herdr/config.toml"
+if XDG_CONFIG_HOME=$probe "$HERDR" config check 2>&1 | grep -q 'config: ok'; then
+  APP_DIR=herdr-dev
+else
+  APP_DIR=herdr
+fi
+case $probe in /tmp/?*) rm -rf -- "$probe" ;; esac
+export APP_DIR
+CFG_DIR=$XDG_CONFIG_HOME/$APP_DIR
 mkdir -p "$CFG_DIR"
 cat > "$CFG_DIR/config.toml" <<'EOF'
 [fence]
