@@ -83,7 +83,7 @@ fn explain_text(explain: &serde_json::Value) -> String {
         None => out.push_str(&format!("pane {pane}\n")),
     }
     out.push_str(&format!(
-        "  fenced now:          {}\n",
+        "  fenced now:           {}\n",
         yes_no(&explain["running_fenced"])
     ));
     out.push_str(&format!(
@@ -96,7 +96,7 @@ fn explain_text(explain: &serde_json::Value) -> String {
     out.push('\n');
     if let Some(missing) = explain["missing"].as_array().filter(|m| !m.is_empty()) {
         out.push_str(&format!(
-            "  not on this host:    {} entries\n",
+            "  not on this host:     {} entries\n",
             missing.len()
         ));
     }
@@ -111,15 +111,15 @@ fn explain_text(explain: &serde_json::Value) -> String {
         out.push('\n');
         let access = path["access"].as_str().unwrap_or("?").replace('_', "-");
         out.push_str(&format!(
-            "  after restart: {access} ({})\n",
+            "  after restart:        {access} ({})\n",
             path["rule"].as_str().unwrap_or("?")
         ));
         if path["pinned"].as_bool() == Some(true) {
-            out.push_str("  pinned: cannot be deleted or renamed from the pane\n");
+            out.push_str("  pinned:               cannot be deleted or renamed from the pane\n");
         }
         if let Some(read_only) = path["enforced_read_only"].as_bool() {
             out.push_str(&format!(
-                "  now:           {}\n",
+                "  now:                  {}\n",
                 if read_only { "read-only" } else { "writable" }
             ));
         }
