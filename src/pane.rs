@@ -174,6 +174,7 @@ impl PaneLaunchEnv {
             extra,
             clear_vars: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
+            fence: crate::fence::FenceIdentity::Anonymous,
         }
     }
 
@@ -184,6 +185,7 @@ impl PaneLaunchEnv {
             extra: account_env.vars,
             clear_vars: account_env.clear_vars,
             identity: PaneLaunchIdentity::Inherit,
+            fence: crate::fence::FenceIdentity::Anonymous,
         }
     }
 
