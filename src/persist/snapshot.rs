@@ -1029,7 +1029,10 @@ mod tests {
             r#"{"cwd":"/w","agent_name":"exempt","fence":{"agent":"reviewer"}}"#,
         )
         .unwrap();
-        assert_eq!(pinned.fence_identity(), FenceIdentity::Agent("reviewer".into()));
+        assert_eq!(
+            pinned.fence_identity(),
+            FenceIdentity::Agent("reviewer".into())
+        );
     }
 
     #[test]

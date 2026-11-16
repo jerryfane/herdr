@@ -1077,9 +1077,18 @@ reason = "coordinator"
     fn agent_entries_need_a_reason_and_a_known_profile() {
         for (toml, needle) in [
             ("[fence.agents.a]\nprofile = \"default\"\n", "reason"),
-            ("[fence.agents.a]\nreason = \"  \"\n", "reason must not be empty"),
-            ("[fence.agents.a]\nprofile = \"loose\"\nreason = \"x\"\n", "loose"),
-            ("[fence.agents.a]\nreason = \"x\"\nallow = [\"/x\"]\n", "allow"),
+            (
+                "[fence.agents.a]\nreason = \"  \"\n",
+                "reason must not be empty",
+            ),
+            (
+                "[fence.agents.a]\nprofile = \"loose\"\nreason = \"x\"\n",
+                "loose",
+            ),
+            (
+                "[fence.agents.a]\nreason = \"x\"\nallow = [\"/x\"]\n",
+                "allow",
+            ),
             ("[fence]\nscope = \"some\"\n", "some"),
         ] {
             let toml = if toml.starts_with("[fence]") {

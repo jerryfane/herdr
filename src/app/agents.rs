@@ -1161,7 +1161,9 @@ impl App {
             .get_mut(terminal_id)
             .ok_or_else(|| AgentStartError::Fence("the pane's terminal is gone".into()))?;
         let previous = std::mem::replace(&mut terminal.fence_identity, fence);
-        let spawned = self.spawn_pane_shell(pane_id).map(|(_, _, spawned)| spawned);
+        let spawned = self
+            .spawn_pane_shell(pane_id)
+            .map(|(_, _, spawned)| spawned);
         let runtime = match spawned {
             Some(Ok(runtime)) => runtime,
             failed => {
