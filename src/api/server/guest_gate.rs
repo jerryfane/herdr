@@ -3032,12 +3032,19 @@ mod tests {
 <label><input type="radio" name="crop" value="all_or_nothing"> Nothing until all are confirmed</label></fieldset></form>"#;
 
     /// `(name, legend, [(value, label); 2])` of [`THREE_FIELD_FORM`].
-    type FormField = (&'static str, &'static str, [(&'static str, &'static str); 2]);
+    type FormField = (
+        &'static str,
+        &'static str,
+        [(&'static str, &'static str); 2],
+    );
     const THREE_FIELDS: [FormField; 3] = [
         (
             "auto_reject",
             "Automatic no",
-            [("yes", "Reject automatically"), ("no", "Leave them waiting")],
+            [
+                ("yes", "Reject automatically"),
+                ("no", "Leave them waiting"),
+            ],
         ),
         (
             "moratorium",
@@ -3192,6 +3199,8 @@ mod tests {
                 Some(crate::detect::Agent::Omp),
                 crate::detect::AgentState::Blocked,
             );
+            // A new agent kind drops the name: the grant names the agent.
+            terminal.set_agent_name("llm-opt".into());
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "herdr".into(),
                 agent: "omp".into(),
@@ -3291,7 +3300,11 @@ mod tests {
         let pane = harness.pane_ids[0].clone();
         let ok = |keys: Value| {
             let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
-            assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{keys} -> {lines:?}");
+            assert_eq!(
+                lines[0]["result"],
+                json!({"type": "ok"}),
+                "{keys} -> {lines:?}"
+            );
         };
         let refused = |keys: Value| {
             let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
