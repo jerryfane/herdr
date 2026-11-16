@@ -122,18 +122,8 @@ fn serve_with_open_timeout(
 
     // Open handshake: validate the pane exists (and reject an unknown pane) before
     // upgrading the connection into a held-open frame loop.
-    // The open is checked as a send to the same pane, which is what each frame is.
-    let open_method = match fenced {
-        Some(_) => scoped(
-            Method::PaneSendText(PaneSendTextParams {
-                pane_id: pane_id.clone(),
-                text: String::new(),
-                input_source,
-            }),
-            fenced,
-        ),
-        None => Method::PaneInputStreamOpen(params),
-    };
+    // For a fenced caller the open also checks that the pane is the caller's own.
+    let open_method = scoped(Method::PaneInputStreamOpen(params), fenced);
     let open_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
@@ -548,6 +538,61 @@ mod tests {
             api_rx.try_recv().is_err(),
             "no dispatch for the malformed frame"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fenced_stream_open_and_frames_are_own_pane_scoped_without_writing() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_thread = std::thread::spawn(move || {
+            serve(
+                ApiStream::Local(server),
+                "in_1".into(),
+                PaneInputStreamParams {
+                    pane_id: "w1:p2".into(),
+                    input_source: None,
+                },
+                Some(42),
+                &api_tx,
+                &server_running,
+            )
+        });
+
+        // The open is the real open handshake, wrapped for the own-pane check; it
+        // must not be a write to the pane.
+        let open = api_rx.blocking_recv().unwrap();
+        match &open.request.method {
+            Method::FenceScoped(scoped) => {
+                assert_eq!(scoped.mount_namespace, 42);
+                assert!(
+                    matches!(scoped.method.as_ref(), Method::PaneInputStreamOpen(p) if p.pane_id == "w1:p2"),
+                    "{:?}",
+                    scoped.method
+                );
+            }
+            other => panic!("expected a scoped open, got {other:?}"),
+        }
+        respond_ok(open);
+        let _ack = read_response_line(&mut client);
+
+        // Every frame is scoped too.
+        client.write_all(br#"{"seq":1,"text":"ls"}"#).unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let frame = api_rx.blocking_recv().unwrap();
+        assert!(
+            matches!(&frame.request.method, Method::FenceScoped(s) if s.mount_namespace == 42),
+            "{:?}",
+            frame.request.method
+        );
+        respond_ok(frame);
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        assert!(server_thread.join().unwrap().is_ok());
     }
 
     #[test]

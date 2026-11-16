@@ -317,14 +317,22 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
     // Resolved the same way as at pane start, for allows written through a symlink
     // alias or below a wildcard that only exists on disk.
     let resolved_deny: Vec<PathBuf> = match &home {
-        Some(home) => resolve_entries(
-            &deny_entries,
-            home,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "deny",
-        )
-        .unwrap_or_default(),
+        Some(home) => {
+            match resolve_entries(
+                &deny_entries,
+                home,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                "deny",
+            ) {
+                Ok(paths) => paths,
+                // Reported, not read as "no denies": the plan would fail the same way.
+                Err(err) => {
+                    errors.push(format!("fence.deny: {err}"));
+                    Vec::new()
+                }
+            }
+        }
         None => Vec::new(),
     };
     for entry in &config.allow {
@@ -336,23 +344,28 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
         let lexically_below = deny_entries
             .iter()
             .any(|deny| pattern_covers(&lexical(deny, home.as_deref()), &path));
-        let resolved_below = || match &home {
+        if lexically_below {
+            continue;
+        }
+        let resolved = match &home {
             Some(home) => resolve_entries(
                 std::slice::from_ref(entry),
                 home,
                 &mut Vec::new(),
                 &mut Vec::new(),
                 "allow",
-            )
-            .unwrap_or_default()
-            .iter()
-            .any(|allow| resolved_deny.iter().any(|deny| covers(deny, allow))),
-            None => false,
+            ),
+            None => Ok(Vec::new()),
         };
-        if !lexically_below && !resolved_below() {
-            errors.push(format!(
+        match resolved {
+            Ok(allows)
+                if allows
+                    .iter()
+                    .any(|allow| resolved_deny.iter().any(|deny| covers(deny, allow))) => {}
+            Ok(_) => errors.push(format!(
                 "fence.allow entry {entry:?} is not below any fence.deny entry"
-            ));
+            )),
+            Err(err) => errors.push(format!("fence.allow entry {entry:?}: {err}")),
         }
     }
     errors
@@ -949,6 +962,33 @@ mod tests {
                 &FenceMount::Deny(root.join("state-a")),
                 &FenceMount::Deny(root.join("state-b")),
             ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_validation_reports_unresolvable_paths() {
+        // An allow below a deny that cannot be resolved (a symlink loop) must be
+        // reported as a resolution failure, not as "not below any deny".
+        let root = temp_root("validate-loop");
+        std::os::unix::fs::symlink(root.join("loop"), root.join("loop")).unwrap();
+        let deny = root.join("loop");
+        let allow = root.join("loop/db");
+        let errors = validate_config(&config(
+            &[deny.to_str().unwrap()],
+            &[allow.to_str().unwrap()],
+            &[],
+        ));
+        // The allow is lexically below the deny, so it is valid; the deny's
+        // resolution failure is reported on its own.
+        assert!(
+            errors.iter().any(|e| e.starts_with("fence.deny:")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("not below any")),
+            "{errors:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

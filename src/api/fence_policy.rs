@@ -63,6 +63,9 @@ pub(crate) fn fenced_access(method: &Method) -> FencedAccess {
         Method::AgentAvatarSet(p) => Own(Agent(p.target.clone())),
         Method::AgentFocus(p) => Own(Agent(p.target.clone())),
         Method::PaneInputStream(_) => FencedAccess::OwnStream,
+        // The internal open handshake of a fenced input stream is checked as an
+        // own-pane request (it validates the pane without writing to it).
+        Method::PaneInputStreamOpen(p) => Own(Pane(Some(p.pane_id.clone()))),
         other => access_by_name(other.operation().name),
     }
 }

@@ -2,7 +2,7 @@
 //! or agent (docs/next/design/pane-fence.md, section 8).
 
 use crate::api::fence_policy::{fenced_access, FencedAccess, OwnTarget};
-use crate::api::schema::{FenceScopedParams, Request};
+use crate::api::schema::{FenceScopedParams, Method, Request};
 
 use super::responses::encode_error;
 use crate::app::App;
@@ -57,10 +57,27 @@ impl App {
                 "targets a pane that is not the caller's own",
             );
         }
+        if let Some(why) = self.fenced_close_reaches_beyond_pane(&method) {
+            return refused(id, method.operation().name, why);
+        }
         self.handle_api_request_after_internal_events_drained(Request {
             id,
             method: *method,
         })
+    }
+
+    /// `pane.close` of the caller's own pane is allowed only when it closes nothing
+    /// else. Closing the last pane of a workspace closes the workspace, and when that
+    /// workspace leads a worktree group (and `confirm_close` is off) the linked
+    /// workspaces with all their panes go too.
+    fn fenced_close_reaches_beyond_pane(&self, method: &Method) -> Option<&'static str> {
+        let Method::PaneClose(target) = method else {
+            return None;
+        };
+        let (ws_idx, pane_id) = self.parse_pane_id(&target.pane_id)?;
+        (self.state.close_pane_would_close_workspace(ws_idx, pane_id)
+            && self.state.workspace_close_indices(ws_idx) != [ws_idx])
+        .then_some("would also close other workspaces in its worktree group")
     }
 
     /// The terminal whose pane process runs in `mount_namespace`.
@@ -130,6 +147,46 @@ mod tests {
         );
         assert!(response.contains("fence_refused"), "{response}");
         assert!(response.contains("no longer belongs"), "{response}");
+    }
+
+    fn close(app: &App, ws_idx: usize) -> Method {
+        let pane = app.state.workspaces[ws_idx].tabs[0].root_pane;
+        let pane_id = app.pane_info(ws_idx, pane).expect("pane").pane_id;
+        Method::PaneClose(crate::api::schema::PaneTarget { pane_id })
+    }
+
+    fn worktree(checkout: &str, linked: bool) -> crate::workspace::WorktreeSpaceMembership {
+        crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: checkout.into(),
+            is_linked_worktree: linked,
+        }
+    }
+
+    #[test]
+    fn closing_the_last_pane_of_a_worktree_group_parent_is_refused() {
+        let mut app = app();
+        let mut parent = crate::workspace::Workspace::test_new("parent");
+        parent.worktree_space = Some(worktree("/repo/herdr", false));
+        let mut child = crate::workspace::Workspace::test_new("child");
+        child.worktree_space = Some(worktree("/repo/herdr-child", true));
+        let plain = crate::workspace::Workspace::test_new("plain");
+        app.state.workspaces = vec![parent, child, plain];
+        app.state.ensure_test_terminals();
+
+        // The parent's only pane: closing it would close the linked child workspace too.
+        assert!(app
+            .fenced_close_reaches_beyond_pane(&close(&app, 0))
+            .is_some());
+        // Control: the last pane of a workspace outside any group closes only itself.
+        assert_eq!(app.fenced_close_reaches_beyond_pane(&close(&app, 2)), None);
+        // Other methods are not affected.
+        assert_eq!(
+            app.fenced_close_reaches_beyond_pane(&Method::ServerReloadConfig(Default::default())),
+            None
+        );
     }
 
     #[test]
