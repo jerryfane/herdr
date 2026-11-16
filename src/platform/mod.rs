@@ -654,16 +654,19 @@ pub(crate) enum FencePeer {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Fenced { mount_namespace: u64 },
     /// The process could not be inspected (already gone, or /proc unreadable).
+    // Windows peers are always unfenced; only Unix peers can be uninspectable.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Unknown,
 }
 
-/// Elsewhere nothing is fenced, so every peer is unfenced.
-#[cfg(not(target_os = "linux"))]
+/// Elsewhere nothing is fenced, so every peer is unfenced. (Windows identifies
+/// peers through named pipes and never asks.)
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn fence_peer(_pid: u32) -> FencePeer {
     FencePeer::Unfenced
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn process_mount_namespace(_pid: u32) -> Option<u64> {
     None
 }

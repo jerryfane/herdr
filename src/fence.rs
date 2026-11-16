@@ -205,6 +205,7 @@ pub(crate) fn new_panes_are_fenced() -> bool {
 
 /// Record a pane process this server adopted (live handoff) or started, so the API
 /// gate stays on while a fenced one may be alive.
+#[cfg(unix)]
 pub(crate) fn note_pane_process(pid: u32) {
     if crate::platform::FENCE_SUPPORTED
         && !FENCED_PANES_EXIST.load(Ordering::Acquire)
