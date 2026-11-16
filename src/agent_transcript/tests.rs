@@ -204,6 +204,7 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         after: after.map(str::to_owned),
         limit,
         max_bytes: None,
+        held_from: None,
         subagent: None,
     }
 }
@@ -2393,6 +2394,206 @@ fn every_user_entry_marked_after_it_was_sent_is_resent_on_the_next_after_page() 
     // Nothing changed since: they are not sent again.
     let again = read_page(&session.path, &request(Some(&next.after), delivered)).unwrap();
     assert!(user_origins(&again).is_empty(), "{:?}", again.entries);
+}
+
+/// A long-running agent shared with a guest: the client loaded only the
+/// newest turn. When the guest's next prompt is delivered, the fingerprint
+/// changes; the `after` page must not re-send the guest's older prompts from
+/// history the client never loaded, or the client appends them after its
+/// newest turn as prompts without replies.
+#[test]
+fn an_after_page_resends_marked_entries_only_from_the_clients_window() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-floor");
+    let old_at = session.ms(session.next + 1);
+    session.user("guest: old question");
+    session.assistant(vec![text("old answer")], "stop");
+    let held_at = session.ms(session.next + 1);
+    session.user("guest: held question");
+    session.assistant(vec![text("held answer")], "stop");
+    let request =
+        |after: Option<&str>, limit: Option<u32>, prompts: Vec<OtherPrompt>| PageRequest {
+            after: after.map(str::to_owned),
+            limit,
+            other_prompts: prompts,
+            ..PageRequest::default()
+        };
+    let served = vec![OtherPrompt::new("guest: old question", old_at)];
+    let first = read_page(&session.path, &request(None, Some(1), served)).unwrap();
+    assert_eq!(
+        user_origins(&first),
+        vec![("guest: held question".into(), None)]
+    );
+
+    let new_at = session.ms(session.next + 1);
+    session.user("guest: new question");
+    session.assistant(vec![text("new answer")], "stop");
+    let delivered = vec![
+        OtherPrompt::new("guest: old question", old_at),
+        OtherPrompt::new("guest: held question", held_at),
+        OtherPrompt::new("guest: new question", new_at),
+    ];
+    let next = read_page(
+        &session.path,
+        &request(Some(&first.after), None, delivered.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&next),
+        vec![
+            ("guest: held question".into(), Some(TurnOrigin::Other)),
+            ("guest: new question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+
+    // The floor stays with the window the next `after` page extends.
+    let last_at = session.ms(session.next + 1);
+    session.user("guest: last question");
+    let mut all = delivered;
+    all.push(OtherPrompt::new("guest: last question", last_at));
+    let later = read_page(&session.path, &request(Some(&next.after), None, all)).unwrap();
+    assert_eq!(
+        user_origins(&later),
+        vec![
+            ("guest: held question".into(), Some(TurnOrigin::Other)),
+            ("guest: new question".into(), Some(TurnOrigin::Other)),
+            ("guest: last question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+}
+
+/// The client read the newest turn, then scrolled in the older one while
+/// both prompts were still unconfirmed. Once both are delivered, its next
+/// `after` poll (on the newest page's cursor, saying it holds the session
+/// from its start) gets both entries back marked, not only the newest.
+#[test]
+fn scrolled_history_receives_late_origin_updates() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-scrolled");
+    let first_at = session.ms(session.next + 1);
+    session.user("guest: first question");
+    session.assistant(vec![text("first answer")], "stop");
+    let second_at = session.ms(session.next + 1);
+    session.user("guest: second question");
+    session.assistant(vec![text("second answer")], "stop");
+    let newest = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    let older = read_page(
+        &session.path,
+        &PageRequest {
+            before: newest.before.clone(),
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&older),
+        vec![("guest: first question".into(), None)]
+    );
+    assert_eq!(older.before, None, "the client now holds the whole session");
+
+    let delivered = vec![
+        OtherPrompt::new("guest: first question", first_at),
+        OtherPrompt::new("guest: second question", second_at),
+    ];
+    let next = read_page(
+        &session.path,
+        &PageRequest {
+            after: Some(newest.after.clone()),
+            held_from: Some(older.before.clone().unwrap_or_default()),
+            other_prompts: delivered,
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&next),
+        vec![
+            ("guest: first question".into(), Some(TurnOrigin::Other)),
+            ("guest: second question".into(), Some(TurnOrigin::Other)),
+        ]
+    );
+}
+
+/// #434: the client scrolled in guest 2's older turn while its prompt was
+/// unconfirmed, but its next `after` poll left before the scroll landed and
+/// still said it held only the newest page. That poll consumed the changed
+/// fingerprint. The poll after it, saying it holds the whole session with the
+/// same prompts, must still bring the newly held entry's late mark, once.
+#[test]
+fn a_widened_floor_replays_late_origins_of_newly_held_history() {
+    use crate::terminal::TurnOrigin;
+
+    let mut session = Fixture::new("origin-widened");
+    let older_at = session.ms(session.next + 1);
+    session.user("guest 2: older question");
+    session.assistant(vec![text("older answer")], "stop");
+    let newer_at = session.ms(session.next + 1);
+    session.user("guest: newer question");
+    session.assistant(vec![text("newer answer")], "stop");
+    let newest = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    let older = read_page(
+        &session.path,
+        &PageRequest {
+            before: newest.before.clone(),
+            limit: Some(1),
+            ..PageRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        user_origins(&older),
+        vec![("guest 2: older question".into(), None)]
+    );
+    assert_eq!(older.before, None);
+
+    let delivered = vec![
+        OtherPrompt::new("guest 2: older question", older_at),
+        OtherPrompt::new("guest: newer question", newer_at),
+    ];
+    let poll = |after: &str, held_from: Option<String>| {
+        read_page(
+            &session.path,
+            &PageRequest {
+                after: Some(after.to_owned()),
+                held_from,
+                other_prompts: delivered.clone(),
+                ..PageRequest::default()
+            },
+        )
+        .unwrap()
+    };
+    // In flight before the older page landed: the newest page's window only.
+    let first = poll(&newest.after, newest.before.clone());
+    assert_eq!(
+        user_origins(&first),
+        vec![("guest: newer question".into(), Some(TurnOrigin::Other))]
+    );
+    // Same prompts, wider window: the newly held entry gets its mark.
+    let widened = poll(&first.after, Some(String::new()));
+    assert_eq!(
+        user_origins(&widened),
+        vec![("guest 2: older question".into(), Some(TurnOrigin::Other))]
+    );
+    // Nothing more once the window and the prompts are both as served.
+    let settled = poll(&widened.after, Some(String::new()));
+    assert!(user_origins(&settled).is_empty(), "{:?}", settled.entries);
 }
 
 #[test]

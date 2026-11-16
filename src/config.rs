@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+mod fence;
 mod io;
 mod keybinds;
 mod model;
@@ -11,6 +12,7 @@ mod window_title;
 mod write;
 
 pub use self::{
+    fence::FenceConfig,
     io::{
         append_accounts_block, config_diagnostic_summary, config_dir, config_path,
         load_live_config, remove_accounts_block, remove_keybinding_config_sections,

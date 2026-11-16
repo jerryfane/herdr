@@ -222,6 +222,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
+        // Only where a frame write can time out: Windows named pipes cannot.
+        pane_stream_resync: cfg!(unix),
         compressed_replies: true,
         gram_thumbnails: true,
     })
@@ -3717,6 +3719,7 @@ mod tests {
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
+                pane_stream_resync: false,
                 compressed_replies: false,
                 gram_thumbnails: false,
             }),
@@ -4536,6 +4539,10 @@ mod tests {
             true
         );
         assert_eq!(value["result"]["capabilities"]["api_bridge_frames"], true);
+        assert_eq!(
+            value["result"]["capabilities"]["pane_stream_resync"],
+            cfg!(unix)
+        );
         assert_eq!(value["result"]["capabilities"]["compressed_replies"], true);
     }
 

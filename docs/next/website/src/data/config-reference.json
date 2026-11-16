@@ -1667,6 +1667,36 @@
           "description": "Deliver through the APNs sandbox host instead of production."
         }
       ]
+    },
+    {
+      "id": "fence",
+      "title": "Pane fence",
+      "keys": [
+        {
+          "key": "fence.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Linux only. Start every new pane process inside the pane fence: a private mount namespace in which the deny list is read-only, sockets that run work outside the fence are masked, block devices are `nodev`, a Landlock domain isolates the pane from other processes, and capabilities such as `CAP_SYS_ADMIN`, `CAP_SYS_MODULE` and `CAP_SYS_PTRACE` are removed from every set including the bounding set. Applies to panes started after the change (`herdr server reload-config`); running panes keep the fence they started with. If the fence cannot be set up the pane shows the error and its command does not start. On other platforms `true` logs a warning and panes start unfenced."
+        },
+        {
+          "key": "fence.deny",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Paths that are read-only inside fenced panes, recursively. Absolute or starting with `~/`; a `*` inside a path component matches siblings when the pane starts (for example `/var/lib/sandboxd*`). Missing paths are skipped, never created. Setting the key replaces the built-in list (OS directories such as `/usr`, `/etc` and `/boot`, package and service state, `/sys`, `~/.local/bin`, `~/.config/herdr`, `~/.config/systemd`, `~/.ssh`). Herdr's own config directory is always denied. Unix sockets on a denied path can still be connected to."
+        },
+        {
+          "key": "fence.allow",
+          "type": "array of strings",
+          "default": "[]",
+          "description": "Paths that stay writable inside a denied parent. Each entry must lie below a `fence.deny` entry, otherwise the whole `[fence]` section is rejected. The allowed path is a mount point inside the pane, so the path itself cannot be deleted or renamed from the pane; files inside it can."
+        },
+        {
+          "key": "fence.mask_sockets",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Unix sockets hidden from fenced panes, so `connect()` fails. Setting the key replaces the built-in list: the systemd private socket, system and user D-Bus, user systemd managers, Docker, containerd, Podman and snapd."
+        }
+      ]
     }
   ]
 }
