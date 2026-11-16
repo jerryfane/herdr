@@ -291,7 +291,21 @@ impl HeadlessServer {
                 }
             }
         }
-        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
+        // Test fault: the commit write fails and the replacement sees the stream end.
+        let committed = if std::env::var_os("HERDR_TEST_HANDOFF_COMMIT_FAIL").is_some() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test: the handoff commit write failed",
+            ))
+        } else {
+            crate::server::handoff::report_committed(&mut stream)
+        };
+        if let Err(err) = committed {
+            // End the stream so the replacement learns at once that no commit comes:
+            // it then drops everything it imported, closes its sockets and, if the
+            // manager follows it, names this process main again before it exits.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             // The same rule as before the commit: the replacement is stopped only when
             // the manager follows another process, or stopping it could be the unit's
             // main process dying.
@@ -312,7 +326,7 @@ impl HeadlessServer {
                         ?owner,
                         "commit failed while systemd may follow the replacement as main process; not stopping it"
                     );
-                    // It never gets the commit, so it gives up and exits on its own
+                    // It hands the main pid back to this process and exits on its own
                     // (no signal from here); reap it when it does.
                     std::thread::spawn(move || {
                         let _ = import_child.wait();

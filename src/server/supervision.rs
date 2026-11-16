@@ -407,6 +407,103 @@ pub(crate) fn take_main_pid_back(
     }
 }
 
+/// Why a handoff replacement that never got the commit may exit now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LostCommitExit {
+    /// The manager follows this other process: this exit is not the unit's.
+    NotMain(u32),
+    /// This process named its predecessor main again, and the manager confirmed it.
+    HandedBack,
+    /// The predecessor is gone while this process may still be the main one: the
+    /// exit can't be avoided.
+    PredecessorGone,
+}
+
+/// Run by a handoff replacement (`ours`) whose commit never came, before it exits.
+///
+/// Its predecessor sent `MAINPID=<ours>` before the commit and, if the manager
+/// followed it, can't take the main pid back under `NotifyAccess=main`: only the
+/// main process may send `MAINPID=`. The predecessor never committed, so it still
+/// owns the panes and keeps serving; this process' exit would be the unit's and kill
+/// them. So this process, the one the manager now listens to, names `predecessor`
+/// main again (`MAINPID=<predecessor>`, then `BARRIER=1` and a read-back), and
+/// returns only once the manager follows another process. While the manager can't
+/// say, it waits (`pause`), serving nothing, and asks again; it gives up only when
+/// the predecessor is gone, since then nobody is left to follow. It needs no new
+/// handoff message: the predecessor's pid is the peer of the handoff socket.
+pub(crate) fn release_main_pid_after_lost_commit(
+    ours: u32,
+    predecessor: u32,
+    manager: Manager<'_>,
+    predecessor_alive: &dyn Fn() -> bool,
+    pause: &dyn Fn(),
+) -> LostCommitExit {
+    loop {
+        match (manager.main_pid)(std::time::Instant::now() + MANAGER_TIMEOUT) {
+            Some(main) if main != ours => return LostCommitExit::NotMain(main),
+            Some(_) => {
+                if let Attempt::Sent {
+                    processed,
+                    main_pid: Some(main),
+                } = attempt_main_pid(predecessor, manager)
+                {
+                    if main == predecessor {
+                        return LostCommitExit::HandedBack;
+                    }
+                    if processed && main != ours {
+                        return LostCommitExit::NotMain(main);
+                    }
+                }
+            }
+            None => {}
+        }
+        if !predecessor_alive() {
+            return match (manager.main_pid)(std::time::Instant::now() + MANAGER_TIMEOUT) {
+                Some(main) if main != ours => LostCommitExit::NotMain(main),
+                _ => LostCommitExit::PredecessorGone,
+            };
+        }
+        pause();
+    }
+}
+
+/// [`release_main_pid_after_lost_commit`] against the real manager, for a process
+/// started as the replacement that takes the unit's main pid over. Any other process
+/// returns at once: its exit was never the unit's.
+pub(crate) fn release_main_pid_before_exit_after_lost_commit(predecessor: Option<u32>) {
+    let invocation_id = std::env::var("INVOCATION_ID").ok();
+    let exec_pid = std::env::var(EXEC_PID_ENV).ok();
+    if notify_socket().is_none()
+        || main_process_invocation(&current_env(&invocation_id, &exec_pid)).is_none()
+    {
+        return;
+    }
+    let ours = std::process::id();
+    let Some(predecessor) = predecessor else {
+        tracing::error!(
+            "the handoff commit was lost and the predecessor's pid is unknown; exiting"
+        );
+        return;
+    };
+    tracing::warn!(
+        predecessor,
+        "the handoff commit was lost; handing the unit's main pid back before exiting"
+    );
+    let alive = || crate::update::state::process_alive(predecessor);
+    let pause = || std::thread::sleep(std::time::Duration::from_secs(1));
+    match release_main_pid_after_lost_commit(ours, predecessor, Manager::systemd(), &alive, &pause) {
+        LostCommitExit::NotMain(main) => tracing::info!(main, "systemd follows another process; exiting"),
+        LostCommitExit::HandedBack => tracing::info!(
+            predecessor,
+            "systemd follows the predecessor again; exiting"
+        ),
+        LostCommitExit::PredecessorGone => tracing::error!(
+            predecessor,
+            "the predecessor is gone and systemd may still follow this process; exiting ends the unit"
+        ),
+    }
+}
+
 /// The unit's `MainPID` by `deadline`, provided the manager still runs this process'
 /// own invocation of it: a `MainPID` of any other invocation confirms nothing.
 fn invocation_main_pid(deadline: std::time::Instant) -> Option<u32> {
@@ -683,6 +780,8 @@ mod tests {
         main: std::cell::Cell<u32>,
         access: Access,
         stalled: bool,
+        /// The process every notification comes from.
+        sender: u32,
         sends_fail: bool,
         answers: fn(usize) -> bool,
         queries: std::cell::Cell<usize>,
@@ -696,6 +795,7 @@ mod tests {
                 main: std::cell::Cell::new(OURS),
                 access,
                 stalled: false,
+                sender: OURS,
                 sends_fail: false,
                 answers,
                 queries: std::cell::Cell::new(0),
@@ -724,7 +824,7 @@ mod tests {
         fn process(&self, pid: u32) {
             let accepted = match self.access {
                 Access::Refused => false,
-                Access::Main => self.main.get() == OURS,
+                Access::Main => self.main.get() == self.sender,
                 Access::All => true,
             };
             if accepted {
@@ -791,6 +891,82 @@ mod tests {
         ("never", never),
         ("after the first query", after_the_first),
     ];
+
+    /// The replacement's side of a lost commit, run as the replacement (`CHILD`)
+    /// that took the main pid over from `OURS`. The predecessor lives for `alive_for`
+    /// pauses. Returns the exit decision and how many pauses it waited.
+    fn release_after_lost_commit(
+        manager: &FakeManager,
+        alive_for: usize,
+    ) -> (LostCommitExit, usize) {
+        let pauses = std::cell::Cell::new(0);
+        let alive = || pauses.get() < alive_for;
+        let pause = || {
+            pauses.set(pauses.get() + 1);
+            assert!(pauses.get() < 1000, "never returned");
+        };
+        let exit =
+            manager.with(|m| release_main_pid_after_lost_commit(CHILD, OURS, m, &alive, &pause));
+        (exit, pauses.get())
+    }
+
+    fn lost_commit_manager(access: Access, answers: Answers) -> FakeManager {
+        let manager = FakeManager {
+            sender: CHILD,
+            ..FakeManager::new(access, answers)
+        };
+        manager.main.set(CHILD);
+        manager
+    }
+
+    /// P1 of review 4: under NotifyAccess=main the predecessor can't take the main
+    /// pid back after a lost commit, so the replacement, which the manager follows,
+    /// names the predecessor main again and exits only once that is confirmed.
+    #[test]
+    fn a_replacement_that_lost_the_commit_hands_the_main_pid_back_before_it_exits() {
+        let manager = lost_commit_manager(Access::Main, always);
+        let (exit, pauses) = release_after_lost_commit(&manager, usize::MAX);
+        assert_eq!(exit, LostCommitExit::HandedBack);
+        assert_eq!(manager.sent(), ["MAINPID=17"]);
+        assert_eq!(manager.settle(), OURS);
+        assert_eq!(pauses, 0);
+
+        // The predecessor took it back already: nothing to send.
+        let manager = lost_commit_manager(Access::All, always);
+        manager.main.set(OURS);
+        let (exit, _) = release_after_lost_commit(&manager, usize::MAX);
+        assert_eq!(exit, LostCommitExit::NotMain(OURS));
+        assert!(manager.sent().is_empty());
+    }
+
+    /// While the manager can't say who its main process is, the replacement stays
+    /// (it returns only once that is confirmed), and gives up only when the
+    /// predecessor is gone.
+    #[test]
+    fn a_replacement_that_lost_the_commit_does_not_exit_while_it_may_be_main() {
+        fn late(n: usize) -> bool {
+            n >= 5
+        }
+        let manager = lost_commit_manager(Access::Main, late);
+        let (exit, pauses) = release_after_lost_commit(&manager, usize::MAX);
+        assert_eq!(pauses, 5, "it returned while the manager could not say");
+        assert_eq!(exit, LostCommitExit::HandedBack);
+        assert_eq!(manager.settle(), OURS);
+
+        // A queue that never drains: the MAINPID= is not confirmed, so it waits.
+        let manager = FakeManager {
+            stalled: true,
+            ..lost_commit_manager(Access::Main, always)
+        };
+        let (exit, pauses) = release_after_lost_commit(&manager, 3);
+        assert_eq!(pauses, 3);
+        assert_eq!(exit, LostCommitExit::PredecessorGone);
+
+        let manager = lost_commit_manager(Access::Main, never);
+        let (exit, pauses) = release_after_lost_commit(&manager, 7);
+        assert_eq!(pauses, 7);
+        assert_eq!(exit, LostCommitExit::PredecessorGone);
+    }
 
     /// The handover before the commit, as the server runs it.
     fn hand_over(manager: &FakeManager) -> MainPidOwner {

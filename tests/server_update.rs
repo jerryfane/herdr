@@ -1180,6 +1180,70 @@ fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_with_notif
     the_new_server_stays_when_the_manager_stops_answering("NotifyAccess=all");
 }
 
+/// The new server became the unit's main process, then the commit write to it
+/// fails (a test fault). Under `NotifyAccess=main` the old server can't take the
+/// main pid back, and it still owns the panes, so the new server must not exit
+/// as the main process: it names the old server main again first. The unit stays
+/// up in the same activation, the old server serves the pane as the main process,
+/// and nothing is installed.
+#[test]
+fn update_apply_keeps_the_old_server_main_when_the_commit_is_lost_inside_a_systemd_notify_unit() {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(
+        &["Type=notify", "NotifyAccess=main"],
+        &[("HERDR_TEST_HANDOFF_COMMIT_FAIL", "1")],
+    );
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let invocation = fixture.unit().show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+    let before = install_identity(&fixture.install);
+
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+
+    assert_eq!(
+        attempt["outcome"],
+        "failed_no_change",
+        "{attempt}\n{}",
+        fixture.guard_log()
+    );
+    let unit = fixture.unit();
+    // The new server hands the main pid back and exits on its own.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let new_build_runs = unit.pids().into_iter().any(|pid| {
+            fs::read(format!("/proc/{pid}/exe"))
+                .is_ok_and(|exe| hex(&sha2::Sha256::digest(&exe)) == build.sha256)
+        });
+        if !new_build_runs {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new server still runs in the unit"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(unit.show("ActiveState"), "active", "the unit went down");
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    assert_eq!(
+        unit.main_pid(),
+        old_pid,
+        "systemd does not follow the old server"
+    );
+    assert_eq!(serving_pid(&fixture.api_socket), old_pid);
+    assert!(alive(shell_pid), "the pane's process did not survive");
+    assert!(unit.contains(shell_pid));
+    assert!(pane_ids(&fixture).contains(&pane_id));
+    let after = install_identity(&fixture.install);
+    assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
+}
+
 /// A `Type=simple` unit can't follow a new main process, so the update is
 /// refused before anything is touched, as before, and so is a plain handoff.
 #[test]
