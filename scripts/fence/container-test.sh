@@ -16,6 +16,8 @@ mkdir -p "$OUT"
 
 # Fixture: protected tree with a carve-out, a spare dir, herdr config.
 mkdir -p /fleet/protected/sub /fleet/protected/db /fleet/protected/spare
+# A symlink alias to a denied dir, like /bin -> usr/bin on merged-/usr hosts (#441).
+mkdir -p /fleet/real-bin && ln -s real-bin /fleet/bin
 echo cfg > /fleet/protected/config.toml
 echo data > /fleet/protected/db/data.db
 echo keep > /fleet/protected/sub/keep
@@ -25,7 +27,7 @@ mkdir -p "$CFG_DIR"
 cat > "$CFG_DIR/config.toml" <<'EOF'
 [fence]
 enabled = true
-deny = ["/fleet/protected"]
+deny = ["/fleet/protected", "/fleet/bin"]
 allow = ["/fleet/protected/db", "/fleet/protected/spare"]
 EOF
 # A system bus stand-in so the mask has something to hide.
@@ -92,7 +94,7 @@ expect() { # expect <check> <fenced result> <unfenced result>
     echo "FAIL $1: fenced=$got_f (want $2) unfenced=$got_c (want $3)"; fail=1
   fi
 }
-for c in write_denied overwrite_denied rm_denied_tree rm_herdr_config rmdir_carveout rename_ancestor \
+for c in write_denied overwrite_denied rm_denied_tree rm_herdr_config rmdir_carveout rename_ancestor unlink_symlink_alias \
          remount_denied_rw umount_denied nsenter_init write_via_proc_root read_init_environ mknod_block \
          connect_masked_socket cap_sys_admin cap_sys_boot cap_sys_ptrace cap_mknod \
          cap_dac_read_search mount_tmpfs; do

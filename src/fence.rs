@@ -316,7 +316,14 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
     // Resolved the same way as at pane start, for allows written through a symlink
     // alias or below a wildcard that only exists on disk.
     let resolved_deny: Vec<PathBuf> = match &home {
-        Some(home) => resolve_entries(&deny_entries, home, &mut Vec::new(), "deny"),
+        Some(home) => resolve_entries(
+            &deny_entries,
+            home,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            "deny",
+        )
+        .unwrap_or_default(),
         None => Vec::new(),
     };
     for entry in &config.allow {
@@ -329,11 +336,16 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
             .iter()
             .any(|deny| pattern_covers(&lexical(deny, home.as_deref()), &path));
         let resolved_below = || match &home {
-            Some(home) => {
-                resolve_entries(std::slice::from_ref(entry), home, &mut Vec::new(), "allow")
-                    .iter()
-                    .any(|allow| resolved_deny.iter().any(|deny| covers(deny, allow)))
-            }
+            Some(home) => resolve_entries(
+                std::slice::from_ref(entry),
+                home,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                "allow",
+            )
+            .unwrap_or_default()
+            .iter()
+            .any(|allow| resolved_deny.iter().any(|deny| covers(deny, allow))),
             None => false,
         };
         if !lexically_below && !resolved_below() {
@@ -408,22 +420,41 @@ fn covers(parent: &Path, path: &Path) -> bool {
 /// config directory and the config file actually loaded) is read-only whatever
 /// the deny and allow lists say: its binds go after every carve-out, and carve-outs
 /// inside it are dropped.
+///
+/// A path entry may reach its target through symlinks (`/bin` on merged-/usr hosts,
+/// a symlinked config directory). Those symlink entries are anchored too: otherwise
+/// the pane could unlink or replace the alias the host uses, even though the
+/// target is read-only. A path that cannot be resolved for any reason other than
+/// being absent fails the whole plan, so no protection is silently dropped.
 pub(crate) fn resolve_plan(
     config: &FenceConfig,
     home: &Path,
     always_protected: &[PathBuf],
-) -> FencePlan {
+) -> io::Result<FencePlan> {
     let mut skipped = Vec::new();
+    // Every path as written (after `~` and `*` expansion); its symlink components
+    // are anchored below.
+    let mut lexical_paths: Vec<PathBuf> = Vec::new();
 
     let deny_entries: Vec<String> = match &config.deny {
         Some(entries) => entries.clone(),
         None => DEFAULT_DENY.iter().map(|e| (*e).to_string()).collect(),
     };
-    let deny = resolve_entries(&deny_entries, home, &mut skipped, "deny");
+    let deny = resolve_entries(
+        &deny_entries,
+        home,
+        &mut skipped,
+        &mut lexical_paths,
+        "deny",
+    )?;
     let mut protected: Vec<PathBuf> = Vec::new();
     for path in always_protected {
-        if let Ok(real) = path.canonicalize() {
-            protected.push(real);
+        match canonicalize_if_present(path)? {
+            Some(real) => {
+                lexical_paths.push(path.clone());
+                protected.push(real);
+            }
+            None => skipped.push(format!("protect {}: not present", path.display())),
         }
     }
     protected.sort_by_key(|path| depth(path));
@@ -433,23 +464,29 @@ pub(crate) fn resolve_plan(
             mandatory.push(path);
         }
     }
-    let allow: Vec<PathBuf> = resolve_entries(&config.allow, home, &mut skipped, "allow")
-        .into_iter()
-        .filter(|path| {
-            if mandatory.iter().any(|m| covers(m, path)) {
-                skipped.push(format!(
-                    "allow {}: inside herdr's own config, which stays read-only",
-                    path.display()
-                ));
-                return false;
-            }
-            let below = deny.iter().any(|d| covers(d, path));
-            if !below {
-                skipped.push(format!("allow {}: not below a denied path", path.display()));
-            }
-            below
-        })
-        .collect();
+    let allow: Vec<PathBuf> = resolve_entries(
+        &config.allow,
+        home,
+        &mut skipped,
+        &mut lexical_paths,
+        "allow",
+    )?
+    .into_iter()
+    .filter(|path| {
+        if mandatory.iter().any(|m| covers(m, path)) {
+            skipped.push(format!(
+                "allow {}: inside herdr's own config, which stays read-only",
+                path.display()
+            ));
+            return false;
+        }
+        let below = deny.iter().any(|d| covers(d, path));
+        if !below {
+            skipped.push(format!("allow {}: not below a denied path", path.display()));
+        }
+        below
+    })
+    .collect();
     let mask_entries: Vec<String> = match &config.mask_sockets {
         Some(entries) => entries.clone(),
         None => DEFAULT_MASK_SOCKETS
@@ -457,7 +494,13 @@ pub(crate) fn resolve_plan(
             .map(|e| (*e).to_string())
             .collect(),
     };
-    let mask = resolve_entries(&mask_entries, home, &mut skipped, "mask");
+    let mask = resolve_entries(
+        &mask_entries,
+        home,
+        &mut skipped,
+        &mut lexical_paths,
+        "mask",
+    )?;
 
     // Anchors: every ancestor of a fenced path that stays writable in the pane
     // (outside every deny, or inside a carve-out), so renaming the ancestor cannot
@@ -495,6 +538,24 @@ pub(crate) fn resolve_plan(
             }
         }
     }
+    // Symlink components of the paths as written: binding a symlink onto itself
+    // pins its directory entry (unlink, rename and replace fail with EBUSY) while
+    // lookups still follow it. One inside a read-only tree cannot be changed anyway.
+    for path in &lexical_paths {
+        for prefix in path.ancestors() {
+            if prefix == Path::new("/") || prefix.as_os_str().is_empty() {
+                continue;
+            }
+            let is_symlink = match std::fs::symlink_metadata(prefix) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(err) if is_absent(&err) => false,
+                Err(err) => return Err(path_error("inspect", prefix, err)),
+            };
+            if is_symlink && !read_only(prefix) && !anchors.iter().any(|a| a == prefix) {
+                anchors.push(prefix.to_path_buf());
+            }
+        }
+    }
 
     // Shallow paths first; at equal depth anchors, then denies, then allows, so an
     // allow re-opens a deny of the same path and a deeper deny closes an allow.
@@ -518,11 +579,11 @@ pub(crate) fn resolve_plan(
     }
     mounts.sort_by_key(|(depth, order, _)| (*depth, *order));
 
-    FencePlan {
+    Ok(FencePlan {
         mounts: mounts.into_iter().map(|(_, _, mount)| mount).collect(),
         skipped,
         drop_caps: DROPPED_CAPS.iter().map(|(cap, _, _)| *cap).collect(),
-    }
+    })
 }
 
 fn depth(path: &Path) -> usize {
@@ -539,33 +600,62 @@ fn resolve_entries(
     entries: &[String],
     home: &Path,
     skipped: &mut Vec<String>,
+    lexical_paths: &mut Vec<PathBuf>,
     kind: &str,
-) -> Vec<PathBuf> {
+) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in entries {
         let expanded = lexical(entry, Some(home));
-        let matches = expand_wildcards(&expanded);
         let mut found = false;
-        for candidate in matches {
-            match candidate.canonicalize() {
-                Ok(real) if real != Path::new("/") => {
+        for candidate in expand_wildcards(&expanded)? {
+            match canonicalize_if_present(&candidate)? {
+                Some(real) if real != Path::new("/") => {
                     found = true;
+                    lexical_paths.push(candidate);
                     out.push(real);
                 }
-                Ok(_) => skipped.push(format!("{kind} {entry}: resolves to /")),
-                Err(_) => {}
+                Some(_) => skipped.push(format!("{kind} {entry}: resolves to /")),
+                None => {}
             }
         }
         if !found {
             skipped.push(format!("{kind} {entry}: not present"));
         }
     }
-    out
+    Ok(out)
+}
+
+/// A path that does not exist (or has a non-directory in the middle) is absent
+/// and skipped. Any other failure (permission, I/O, stale handle) means the
+/// protection cannot be established, so the plan fails.
+fn is_absent(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn path_error(action: &str, path: &Path, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!(
+            "pane fence: cannot {action} {}: {err}; not starting the pane",
+            path.display()
+        ),
+    )
+}
+
+fn canonicalize_if_present(path: &Path) -> io::Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(real) => Ok(Some(real)),
+        Err(err) if is_absent(&err) => Ok(None),
+        Err(err) => Err(path_error("resolve", path, err)),
+    }
 }
 
 /// Expand `*` inside path components against the filesystem. Paths without `*`
 /// are returned unchanged (existence is checked by the caller).
-fn expand_wildcards(path: &Path) -> Vec<PathBuf> {
+fn expand_wildcards(path: &Path) -> io::Result<Vec<PathBuf>> {
     let mut current = vec![PathBuf::from("/")];
     for component in path.components() {
         let Component::Normal(name) = component else {
@@ -579,20 +669,26 @@ fn expand_wildcards(path: &Path) -> Vec<PathBuf> {
         };
         let mut next = Vec::new();
         for dir in &current {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(err) if is_absent(&err) => continue,
+                Err(err) => return Err(path_error("list", dir, err)),
             };
-            let mut names: Vec<OsString> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .filter(|name| name.to_str().is_some_and(|n| wildcard_match(pattern, n)))
-                .collect();
+            let mut names = Vec::new();
+            for entry in entries {
+                let name = entry
+                    .map_err(|err| path_error("list", dir, err))?
+                    .file_name();
+                if name.to_str().is_some_and(|n| wildcard_match(pattern, n)) {
+                    names.push(name);
+                }
+            }
             names.sort();
             next.extend(names.into_iter().map(|name| dir.join(name)));
         }
         current = next;
     }
-    current
+    Ok(current)
 }
 
 /// `*` matches any run of characters (including none); everything else is literal.
@@ -631,11 +727,13 @@ pub(crate) fn fence_pane_command(cmd: &mut CommandBuilder) -> io::Result<()> {
     // Herdr's own settings, and the config file actually in use (HERDR_CONFIG_PATH
     // may point outside the config directory), are always read-only.
     let always_protected = [crate::config::config_dir(), crate::config::config_path()];
-    let mut plan = resolve_plan(&config, &home, &always_protected);
+    let mut plan = resolve_plan(&config, &home, &always_protected)?;
     // The private TUI client socket attaches to any pane and types into it; agents
     // never need it. It sits below the read-only config dir, so its mask is applied
     // after every other mount (docs/next/design/pane-fence.md, section 8).
-    if let Ok(client_socket) = crate::server::socket_paths::client_socket_path().canonicalize() {
+    if let Some(client_socket) =
+        canonicalize_if_present(&crate::server::socket_paths::client_socket_path())?
+    {
         let mask = FenceMount::Mask(client_socket);
         if !plan.mounts.contains(&mask) {
             plan.mounts.push(mask);
@@ -806,7 +904,7 @@ mod tests {
             &[root.join("data/db").to_str().unwrap()],
             &[],
         );
-        let plan = resolve_plan(&cfg, &root, &[root.join("herdr")]);
+        let plan = resolve_plan(&cfg, &root, &[root.join("herdr")]).expect("plan");
 
         let anchor = position(&plan, &FenceMount::Anchor(root.clone()));
         let deny = position(&plan, &FenceMount::Deny(data.clone()));
@@ -838,7 +936,7 @@ mod tests {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         let cfg = config(&["~/state*"], &[], &[]);
-        let plan = resolve_plan(&cfg, &root, &[root.join("missing-herdr")]);
+        let plan = resolve_plan(&cfg, &root, &[root.join("missing-herdr")]).expect("plan");
         let denied: Vec<&FenceMount> = plan
             .mounts
             .iter()
@@ -879,7 +977,7 @@ mod tests {
             &[herdr.to_str().unwrap(), herdr.join("sub").to_str().unwrap()],
             &[],
         );
-        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&herdr));
+        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&herdr)).expect("plan");
         assert!(
             !plan
                 .mounts
@@ -903,10 +1001,51 @@ mod tests {
         let srv = root.join("srv");
         let project = root.join("srv/project");
         let cfg = config(&[srv.to_str().unwrap()], &[project.to_str().unwrap()], &[]);
-        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&config_file));
+        let plan = resolve_plan(&cfg, &root, std::slice::from_ref(&config_file)).expect("plan");
         let allow = position(&plan, &FenceMount::Allow(project));
         let file_deny = position(&plan, &FenceMount::Deny(config_file));
         assert!(allow < file_deny, "{:?}", plan.mounts);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn symlink_entries_are_pinned_not_only_their_targets() {
+        // Merged-/usr: /bin is a symlink to usr/bin. Denying /bin must also pin the
+        // symlink itself, or a fenced pane could unlink the alias the host uses.
+        let root = temp_root("symlinks");
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        // A symlinked herdr config dir: replacing the link would redirect the server.
+        std::fs::create_dir_all(root.join("data/herdr")).unwrap();
+        std::fs::create_dir_all(root.join("home/.config")).unwrap();
+        std::os::unix::fs::symlink(root.join("data/herdr"), root.join("home/.config/herdr"))
+            .unwrap();
+
+        let cfg = config(&[root.join("bin").to_str().unwrap()], &[], &[]);
+        let plan = resolve_plan(&cfg, &root, &[root.join("home/.config/herdr")]).expect("plan");
+        position(&plan, &FenceMount::Deny(root.join("usr/bin")));
+        position(&plan, &FenceMount::Anchor(root.join("bin")));
+        position(&plan, &FenceMount::Deny(root.join("data/herdr")));
+        position(&plan, &FenceMount::Anchor(root.join("home/.config/herdr")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolution_failures_other_than_absence_fail_the_plan() {
+        // A symlink loop cannot be resolved (ELOOP). Unlike a missing path, the
+        // protection cannot be established, so the pane must not start without it.
+        let root = temp_root("loop");
+        std::os::unix::fs::symlink(root.join("loop"), root.join("loop")).unwrap();
+        let cfg = config(&[root.join("loop").to_str().unwrap()], &[], &[]);
+        assert!(resolve_plan(&cfg, &root, &[]).is_err());
+        // A missing path is still just skipped.
+        let cfg = config(&[root.join("absent").to_str().unwrap()], &[], &[]);
+        let plan = resolve_plan(&cfg, &root, &[]).expect("absent paths are skipped");
+        assert!(
+            plan.skipped.iter().any(|s| s.contains("absent")),
+            "{:?}",
+            plan.skipped
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
