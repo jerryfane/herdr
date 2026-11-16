@@ -3177,7 +3177,7 @@
           "type": "object"
         },
         "GramGetFileParams": {
-          "description": "`gram.get_file` — legacy one-response download on the local socket. The\nbytes are inline base64 and can be as large as 100 MiB. For a remote relay,\nand for bounded new clients, use `gram.get_file_chunk` instead. Owner (no\ncaller pane) may download any file; an agent may only download one it can see.",
+          "description": "`gram.get_file` — legacy one-response download on the local socket. The\nbytes are inline base64 and can be as large as 100 MiB. For a remote relay,\nand for bounded new clients, use `gram.get_file_chunk` instead. Owner (no\ncaller pane) may download any file; an agent may only download one it can see.\n\nWith `thumbnail`, the reply is instead a small JPEG preview of an image\nattachment (`gram_file_thumbnail`), `thumbnail_unavailable`, or `busy`\nwhile too many previews wait to render (retry shortly). Servers that do\nthis advertise `capabilities.gram_thumbnails`; older ones ignore the field\nand return the whole file (`gram_file_content`).",
           "properties": {
             "caller_pane_id": {
               "type": [
@@ -3187,6 +3187,16 @@
             },
             "id": {
               "type": "string"
+            },
+            "thumbnail": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/GramThumbnailParams"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -3506,6 +3516,21 @@
           },
           "required": [
             "text"
+          ],
+          "type": "object"
+        },
+        "GramThumbnailParams": {
+          "description": "The preview `gram.get_file` returns for `thumbnail`.",
+          "properties": {
+            "max_px": {
+              "description": "Longest edge of the preview in pixels, clamped to 16..=1024. An image\nalready that small keeps its size.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "max_px"
           ],
           "type": "object"
         },
@@ -18493,6 +18518,59 @@
               "type": "object"
             },
             {
+              "description": "`gram.get_file` with `thumbnail`: a JPEG preview of the attachment,\nupright, its longer edge at most `max_px`. `name`, `size`, `mime` and\n`sha256` describe the attachment itself; the preview is\n`width`x`height`, `thumbnail_size` bytes of `image/jpeg`.",
+              "properties": {
+                "data_base64": {
+                  "type": "string"
+                },
+                "height": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "mime": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "thumbnail_size": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "gram_file_thumbnail",
+                  "type": "string"
+                },
+                "width": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "type",
+                "name",
+                "mime",
+                "size",
+                "sha256",
+                "width",
+                "height",
+                "thumbnail_size",
+                "data_base64"
+              ],
+              "type": "object"
+            },
+            {
               "description": "One bounded range of an attachment. `sha256` and `size` describe the\ncomplete committed file, so a downloader can reject truncation/corruption.",
               "properties": {
                 "data_base64": {
@@ -18778,6 +18856,11 @@
             "gram_reachable": {
               "default": false,
               "description": "`agent.list` marks each remote agent with `gram_reachable`, whether\n`gram.post` may name it. Without this, a client cannot tell and should\nkeep offering every live agent.",
+              "type": "boolean"
+            },
+            "gram_thumbnails": {
+              "default": false,
+              "description": "`gram.get_file` accepts `thumbnail: {max_px}` and answers it with a\nsmall JPEG (`gram_file_thumbnail`). Older servers ignore the field and\nsend the whole file.",
               "type": "boolean"
             },
             "gram_upload_stream": {

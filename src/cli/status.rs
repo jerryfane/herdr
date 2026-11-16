@@ -448,6 +448,7 @@ mod tests {
                 api_bridge_frames: false,
                 pane_stream_resync: false,
                 compressed_replies: false,
+                gram_thumbnails: false,
             }),
         }
     }

@@ -225,6 +225,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         // Only where a frame write can time out: Windows named pipes cannot.
         pane_stream_resync: cfg!(unix),
         compressed_replies: true,
+        gram_thumbnails: true,
     })
 }
 
@@ -3820,6 +3821,7 @@ mod tests {
                 api_bridge_frames: false,
                 pane_stream_resync: false,
                 compressed_replies: false,
+                gram_thumbnails: false,
             }),
             None,
             None,
@@ -4642,6 +4644,26 @@ mod tests {
             cfg!(unix)
         );
         assert_eq!(value["result"]["capabilities"]["compressed_replies"], true);
+    }
+
+    /// Clients check this before asking `gram.get_file` for a `thumbnail`,
+    /// which older servers ignore (they send the whole file).
+    #[test]
+    fn ping_advertises_gram_thumbnails() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["capabilities"]["gram_thumbnails"], true);
     }
 
     /// Callers check this before sending `agent.rename` preconditions, which

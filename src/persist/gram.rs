@@ -20,6 +20,7 @@
 //! staging is bounded separately (a per-upload size cap, an aggregate cap, and a
 //! TTL sweep) in [`crate::persist::gram_files`].
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,17 +252,66 @@ fn update_in_checked<T>(
     with_registry_lock_in(dir, || {
         let path = registry_path_in(dir);
         let mut items = load_from_path_strict(&path)?;
+        let ids_before: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+        let held_before = attachment_hashes(&items);
         let (result, changed) = mutation(&mut items);
         if changed {
-            let files_to_remove = normalize(&mut items);
+            let mut files_to_remove: HashSet<String> = normalize(&mut items).into_iter().collect();
             save_json_to_path(&path, &items)?;
+            // A message the mutation removed (a delete) takes its bytes along, under
+            // this lock: a render let in before the delete that reads only after it
+            // finds none.
+            let ids_after: HashSet<&str> = items.iter().map(|item| item.id.as_str()).collect();
+            files_to_remove.extend(
+                ids_before
+                    .into_iter()
+                    .filter(|id| !ids_after.contains(id.as_str())),
+            );
             // Only after the dropped or expired records are durable do we remove the
             // bytes, so a failed save never leaves a message pointing at a deleted file.
             for id in &files_to_remove {
                 crate::persist::gram_files::remove_message_files_in(dir, id);
             }
+            // Then the previews of an attachment no message holds any more. One is
+            // cached only under this lock while a message holds it
+            // ([`while_attachment_held`]), so no render, in this daemon or another
+            // sharing the store, puts one back.
+            let held_after = attachment_hashes(&items);
+            for sha256 in held_before.difference(&held_after) {
+                crate::persist::gram_thumbs::forget(sha256);
+            }
         }
         Ok((result, items))
+    })
+}
+
+/// The SHA-256 of every attachment the store still holds bytes for.
+fn attachment_hashes(items: &[GramItem]) -> HashSet<String> {
+    items
+        .iter()
+        .filter_map(|item| item.file.as_ref().map(|file| file.sha256.clone()))
+        .collect()
+}
+
+/// Runs `operation` under the store lock if a message still holds an attachment
+/// with hash `sha256`, and says whether it ran. A change to the store drops the
+/// bytes of a message it removes, and the previews of an attachment no message
+/// holds any more, under the same lock ([`update_if_changed`]). So a preview
+/// `operation` caches cannot outlive the attachment, whichever daemon sharing
+/// the store deletes it.
+pub fn while_attachment_held(
+    sha256: &str,
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let dir = config_base();
+    with_registry_lock_in(&dir, || {
+        let held = load_from_path_strict(&registry_path_in(&dir))?
+            .iter()
+            .any(|item| item.file.as_ref().is_some_and(|file| file.sha256 == sha256));
+        if held {
+            operation()?;
+        }
+        Ok(held)
     })
 }
 
