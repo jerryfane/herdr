@@ -23,6 +23,9 @@ pub struct FenceConfig {
     /// Unix sockets masked inside fenced panes, so `connect()` fails. Unset means
     /// the built-in default list.
     pub mask_sockets: Option<Vec<String>>,
+    /// Paths that stay writable but cannot be deleted or renamed inside fenced
+    /// panes (each is bound onto itself). Unset means the built-in list.
+    pub pin: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,6 +35,7 @@ struct RawFenceConfig {
     deny: Option<Vec<String>>,
     allow: Vec<String>,
     mask_sockets: Option<Vec<String>>,
+    pin: Option<Vec<String>>,
 }
 
 impl TryFrom<RawFenceConfig> for FenceConfig {
@@ -43,6 +47,7 @@ impl TryFrom<RawFenceConfig> for FenceConfig {
             deny: raw.deny,
             allow: raw.allow,
             mask_sockets: raw.mask_sockets,
+            pin: raw.pin,
         };
         let errors = crate::fence::validate_config(&config);
         if errors.is_empty() {

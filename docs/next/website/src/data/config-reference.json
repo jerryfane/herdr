@@ -1682,7 +1682,7 @@
           "key": "fence.deny",
           "type": "array of strings",
           "default": "built-in list",
-          "description": "Paths that are read-only inside fenced panes, recursively. Absolute or starting with `~/`; a `*` inside a path component matches siblings when the pane starts (for example `/var/lib/sandboxd*`). Missing paths are skipped, never created. Setting the key replaces the built-in list (OS directories such as `/usr`, `/etc` and `/boot`, package and service state, `/sys`, `~/.local/bin`, `~/.config/herdr`, `~/.config/systemd`, `~/.ssh`). Herdr's own config directory is always denied. Unix sockets on a denied path can still be connected to."
+          "description": "Paths that are read-only inside fenced panes, recursively. Absolute or starting with `~/`; a `*` inside a path component matches siblings when the pane starts (for example `/var/lib/sandboxd*`). Missing paths are skipped, never created. Setting the key replaces the built-in list (OS directories such as `/usr`, `/etc` and `/boot`, package and service state, `/sys`, `~/.local/bin`, `~/.config/herdr`, `~/.config/systemd`, `~/.ssh`, and gitmoot's config, credentials, runtimes, plugins, scripts, review checkouts and database backups under `~/.gitmoot`). Herdr's own config directory is always denied. Unix sockets on a denied path can still be connected to."
         },
         {
           "key": "fence.allow",
@@ -1695,6 +1695,12 @@
           "type": "array of strings",
           "default": "built-in list",
           "description": "Unix sockets hidden from fenced panes, so `connect()` fails. Setting the key replaces the built-in list: the systemd private socket, system and user D-Bus, user systemd managers, Docker, containerd, Podman and snapd."
+        },
+        {
+          "key": "fence.pin",
+          "type": "array of strings",
+          "default": "built-in list",
+          "description": "Paths that stay writable inside fenced panes but cannot be deleted or renamed there: each is bound onto itself. Same path syntax as `fence.deny`. Setting the key replaces the built-in list (`~/.gitmoot` and `~/.gitmoot/gitmoot.db`). Do not pin files that their program deletes and recreates, such as SQLite `-wal` and `-shm` files."
         }
       ]
     }

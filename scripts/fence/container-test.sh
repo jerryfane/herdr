@@ -18,6 +18,8 @@ mkdir -p "$OUT"
 mkdir -p /fleet/protected/sub /fleet/protected/db /fleet/protected/spare
 # A symlink alias to a denied dir, like /bin -> usr/bin on merged-/usr hosts (#441).
 mkdir -p /fleet/real-bin && ln -s real-bin /fleet/bin
+# A gitmoot-like data dir (#419): pinned dir and database, read-only config.
+mkdir -p /fleet/gm/runtimes && echo db > /fleet/gm/gitmoot.db && echo cfg > /fleet/gm/config.toml
 echo cfg > /fleet/protected/config.toml
 echo data > /fleet/protected/db/data.db
 echo keep > /fleet/protected/sub/keep
@@ -27,7 +29,8 @@ mkdir -p "$CFG_DIR"
 cat > "$CFG_DIR/config.toml" <<'EOF'
 [fence]
 enabled = true
-deny = ["/fleet/protected", "/fleet/bin"]
+deny = ["/fleet/protected", "/fleet/bin", "/fleet/gm/config.toml", "/fleet/gm/runtimes"]
+pin = ["/fleet/gm", "/fleet/gm/gitmoot.db"]
 allow = ["/fleet/protected/db", "/fleet/protected/spare"]
 EOF
 # A system bus stand-in so the mask has something to hide.
@@ -95,12 +98,13 @@ expect() { # expect <check> <fenced result> <unfenced result>
   fi
 }
 for c in write_denied overwrite_denied rm_denied_tree rm_herdr_config rmdir_carveout rename_ancestor unlink_symlink_alias \
+         rm_pinned_db rename_pinned_dir write_gm_config \
          remount_denied_rw umount_denied nsenter_init write_via_proc_root read_init_environ mknod_block \
          connect_masked_socket cap_sys_admin cap_sys_boot cap_sys_ptrace cap_mknod \
          cap_dac_read_search mount_tmpfs; do
   expect "$c" blocked ok
 done
-for c in write_carveout write_outside_deny rename_across_dirs; do
+for c in write_carveout write_outside_deny rename_across_dirs write_pinned_db write_in_pinned_dir; do
   expect "$c" ok ok
 done
 # userns: blocked in the pane; in the control it depends on the host's AppArmor userns policy.

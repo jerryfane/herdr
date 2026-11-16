@@ -372,7 +372,7 @@ behavior there; the pilot will show whether it matters.
 | `/root/.local/bin` | the herdr and gitmoot binaries the server and services execute |
 | `~/.config/herdr` | herdr settings, sockets (still connectable, probe P-04), update binaries |
 | `~/.config/systemd` | user units would start outside the fence on next login or boot |
-| `~/.gitmoot` | gitmoot data, with the carve-outs of section 5 |
+| `~/.gitmoot/{config.toml*,*.env*,daemon.json,gitmoot.db.bak*,runtimes,toolchains,execbackends,plugins,scripts,skillopt,review-pins,checkouts,worktrees}` | gitmoot config, credentials, executed code, backups, review checkouts. The rest of `~/.gitmoot` stays writable (every CLI call chmods it and opens the database read-write, traced in #419); `~/.gitmoot` and `gitmoot.db` are **pinned** (`[fence] pin`): writable, cannot be deleted or renamed |
 | `~/.ssh` | ssh keys and `authorized_keys` |
 | `/mnt/storagebox-workspaces` | shared workspaces; added only together with the per-seat carve-outs of section 10 (Q10) |
 
