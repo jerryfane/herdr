@@ -4,8 +4,7 @@
 //! `agent.answer_form` for an omp form ask, and menu keys (arrows, Enter, Tab,
 //! Escape, Space, 1-9, y, n) through `pane.send_keys` only while the agent
 //! awaits menu input; a choosing key ends its batch, and no more keys are
-//! taken until a new menu is seen, or omp's ask dialog showed it took the key
-//! and is still open (see `menu_still_open`). The terminal
+//! taken until a new menu is seen. The terminal
 //! takes no other input: no text, no other keys, nothing while the agent is not
 //! awaiting a menu, so a guest can never type into a shell. A guest may watch
 //! the terminal, read its scrollback and, while watching, resize it for
@@ -537,12 +536,10 @@ fn awaits_menu_input(agent: &AgentInfo) -> bool {
     }
 }
 
-/// Per guest store and granted terminal, what a guest batch that last
-/// committed a menu choice left on record ([`MenuCommitted`]). Until
-/// detection has seen the agent change state since, the menu on record may
-/// already be gone, so no guest keys are accepted, with one exception: an
-/// omp ask dialog that took the key and is still open (see
-/// [`menu_still_open`]).
+/// Per guest store and granted terminal, the agent's `state_change_seq` when
+/// a guest batch last committed a menu choice. Until detection has seen the
+/// agent change state since, the menu on record may already be gone, so no
+/// guest keys are accepted.
 ///
 /// Each terminal has its own lock, held by a batch from its check through
 /// its write, so a concurrent batch for that terminal sees this one's commit.
@@ -552,58 +549,8 @@ static MENU_COMMITS: Mutex<Option<HashMap<MenuMarker, MenuCommit>>> = Mutex::new
 
 type MenuMarker = (std::path::PathBuf, String);
 
-/// One terminal's last menu commit, if any.
-type MenuCommit = Arc<Mutex<Option<MenuCommitted>>>;
-
-/// A guest batch that ended with a committing key.
-struct MenuCommitted {
-    /// The agent's `state_change_seq` when it was written.
-    seq: u64,
-    /// omp's ask panel as the screen showed it just before the write, when
-    /// the agent's session waited on an ask ([`open_omp_ask_panel`]).
-    omp_ask_panel: Option<String>,
-}
-
-/// Whether a menu a guest committed in, with no agent state change since,
-/// is still up. omp keeps one `ask` call, and its `blocked` state, across a
-/// whole form: Enter on a radio picks it and moves to the next field, so the
-/// state never changes between the fields' keys. The dialog counts as open
-/// only when all of these hold now: the session still waits on an ask
-/// (Submit and Escape write the ask's result), the screen shows omp's ask
-/// panel (closing it takes the panel off), and the panel differs from what
-/// it showed before the committing key (omp has taken that key; until then
-/// the key may still close it). Any other agent, or a commit made with no
-/// omp ask on screen, waits for a state change as before.
-fn menu_still_open(commit: &MenuCommitted, panel_now: Option<&str>) -> bool {
-    matches!(
-        (commit.omp_ask_panel.as_deref(), panel_now),
-        (Some(before), Some(now)) if before != now
-    )
-}
-
-/// omp's ask panel on the granted pane's screen (its rows under the title
-/// bar) while the agent's session waits on an ask; `None` otherwise, without
-/// reading the screen when no omp ask is pending.
-fn open_omp_ask_panel(id: &str, agent: &AgentInfo, api_tx: &ApiRequestSender) -> Option<String> {
-    if !crate::api::answer::omp_ask_pending(agent) {
-        return None;
-    }
-    let request = Request {
-        id: format!("{id}:ask-panel"),
-        method: Method::PaneRead(PaneReadParams {
-            pane_id: agent.pane_id.clone(),
-            source: ReadSource::Visible,
-            lines: None,
-            format: crate::api::schema::ReadFormat::Text,
-            strip_ansi: true,
-            intent: ReadIntent::Passive,
-        }),
-    };
-    let response = dispatch_to_app_with_timeout(request, api_tx, None);
-    let mut value: serde_json::Value = serde_json::from_str(&response).ok()?;
-    let text = value["result"]["read"]["text"].take();
-    crate::api::answer::ask_panel_body(text.as_str()?)
-}
+/// One terminal's last committed `state_change_seq`, if any.
+type MenuCommit = Arc<Mutex<Option<u64>>>;
 
 /// The commit record for `marker`, created on first use.
 fn menu_commit(marker: MenuMarker) -> MenuCommit {
@@ -1260,23 +1207,14 @@ fn serve_request(
             let commit = menu_commit((guest.dir.clone(), guest.grant.terminal_id.clone()));
             // Held through the write, so a concurrent guest batch for this
             // terminal sees this one's commit.
-            let mut last_commit = commit
+            let mut committed_at = commit
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !awaits_menu_input(&agent) {
+            let stale = committed_at.is_some_and(|seq| agent.state_change_seq <= seq);
+            if stale || !awaits_menu_input(&agent) {
                 return forbidden(stream);
             }
-            let mut panel = None;
-            if let Some(committed) = last_commit
-                .as_ref()
-                .filter(|committed| agent.state_change_seq <= committed.seq)
-            {
-                panel = open_omp_ask_panel(&id, &agent, api_tx);
-                if !menu_still_open(committed, panel.as_deref()) {
-                    return forbidden(stream);
-                }
-            }
-            *last_commit = None;
+            *committed_at = None;
             guest.audit(
                 GuestAuditEvent::Prompt,
                 Some(method),
@@ -1284,9 +1222,6 @@ fn serve_request(
                 None,
             );
             let commits_choice = keys.last().is_some_and(|key| commits_menu(key));
-            if commits_choice && panel.is_none() {
-                panel = open_omp_ask_panel(&id, &agent, api_tx);
-            }
             let request = Request {
                 id: id.clone(),
                 method: Method::PaneSendKeys(PaneSendKeysParams {
@@ -1297,10 +1232,7 @@ fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             if commits_choice {
-                *last_commit = Some(MenuCommitted {
-                    seq: agent.state_change_seq,
-                    omp_ask_panel: panel,
-                });
+                *committed_at = Some(agent.state_change_seq);
             }
             write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
@@ -3069,15 +3001,13 @@ mod tests {
     /// omp's terminal form for [`THREE_FIELD_FORM`] in the granted pane, as
     /// omp 18.20's html-form dialog behaves: ↑/↓ move one stop, Tab goes to
     /// the next field, Space picks, Enter picks and moves to the next field,
-    /// Enter on Submit writes the ask's result and closes the dialog. While
-    /// `frozen` it has not read its input yet.
+    /// Enter on Submit writes the ask's result and closes the dialog.
     struct OmpForm {
         session: crate::agent_transcript::tests::Fixture,
         ask_id: &'static str,
         focus: usize,
         picks: [usize; 3],
         submitted: bool,
-        frozen: bool,
     }
 
     impl OmpForm {
@@ -3213,12 +3143,11 @@ mod tests {
             focus: 0,
             picks: [0; 3],
             submitted: false,
-            frozen: false,
         }));
         let hook_form = Arc::clone(&form);
         *harness.pty_hook.lock().unwrap() = Some(Box::new(move |app, index, bytes| {
             let mut form = hook_form.lock().unwrap();
-            if index != 0 || form.frozen {
+            if index != 0 {
                 return;
             }
             for key in written_keys(bytes) {
@@ -3287,55 +3216,39 @@ mod tests {
         assert_eq!(form.picks, [1, 1, 0]);
     }
 
-    /// Enter inside omp's form picks an option and moves to the next field
-    /// while omp stays blocked in the same ask, so detection sees no new
-    /// state. The guest keeps answering as long as omp took the key and its
-    /// ask is still open; once a choosing key may have closed it, nothing
-    /// lands (herdr#455, guest nike's refused keys).
+    /// Guard: inside omp's form a guest's keys keep the commit-seq rule.
+    /// Enter picks an option and moves to the next field while omp stays
+    /// blocked in the same ask, so detection sees no new state, and the
+    /// gate cannot tell the form took that Enter: the next batch is refused
+    /// and reaches nothing (as guest nike's did on 16 Nov). The guest answers
+    /// the form in the chat instead, through `agent.answer_form`
+    /// (`a_guest_answers_a_three_field_form_ask`).
     #[test]
-    fn a_guest_answers_an_omp_form_field_by_field_with_menu_keys() {
+    fn guest_keys_after_a_choice_in_an_omp_form_wait_for_a_new_state() {
         let harness = start("menu-keys-omp-form");
         let form = omp_form_on_screen(&harness, "ask-form-keys");
         let guest = harness.admit();
         let pane = harness.pane_ids[0].clone();
-        let ok = |keys: Value| {
-            let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
-            assert_eq!(
-                lines[0]["result"],
-                json!({"type": "ok"}),
-                "{keys} -> {lines:?}"
-            );
-        };
-        let refused = |keys: Value| {
+
+        let lines = harness.call(&guest, send_keys(&pane, json!(["enter"])));
+        assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
+        assert_eq!(harness.pty_text(0, Duration::from_millis(300)), "\r");
+        assert_eq!(form.lock().unwrap().focus, 3, "on the second field");
+
+        for keys in [json!(["down"]), json!(["enter"])] {
             let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
             assert_eq!(code(&lines), "guest_forbidden", "{keys} -> {lines:?}");
-        };
-
-        // Field 1 keeps its default; field 2 takes its second option.
-        ok(json!(["enter"]));
-        ok(json!(["down"]));
-        ok(json!(["enter"]));
-        assert_eq!(form.lock().unwrap().focus, 6, "on the third field");
-
-        // omp has not read the next Enter yet: it may close the dialog, so
-        // nothing more is taken until the form shows it took the key.
-        form.lock().unwrap().frozen = true;
-        ok(json!(["enter"]));
-        refused(json!(["down"]));
-        {
-            let mut form = form.lock().unwrap();
-            form.frozen = false;
-            form.press("enter");
         }
-        redraw(&harness, &form);
-        assert_eq!(form.lock().unwrap().focus, SUBMIT_STOP);
+        assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
+        assert_eq!(
+            form.lock().unwrap().focus,
+            3,
+            "the refused keys reached nothing"
+        );
 
-        // Submit closes the dialog and records the answer: no key after it.
-        ok(json!(["enter"]));
-        assert!(form.lock().unwrap().submitted);
-        assert_eq!(form.lock().unwrap().picks, [0, 1, 0]);
-        refused(json!(["down"]));
-        refused(json!(["enter"]));
+        new_menu_observed(&harness, 1);
+        let lines = harness.call(&guest, send_keys(&pane, json!(["down"])));
+        assert_eq!(lines[0]["result"], json!({"type": "ok"}), "{lines:?}");
     }
 
     /// Folders and stars are the owner's: a guest can neither read nor change
