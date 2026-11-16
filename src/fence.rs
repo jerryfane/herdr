@@ -1139,8 +1139,11 @@ mod tests {
         ] {
             std::fs::write(gm.join(file), "").unwrap();
         }
+        // Only the deny and pin defaults are under test. The socket defaults live in
+        // directories a non-root runner cannot read (/run/podman).
         let cfg = FenceConfig {
             enabled: true,
+            mask_sockets: Some(Vec::new()),
             ..FenceConfig::default()
         };
         let plan = resolve_plan(&cfg, &home, &[]).expect("plan");
@@ -1183,6 +1186,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolution_failures_other_than_absence_fail_the_plan() {
         // A symlink loop cannot be resolved (ELOOP). Unlike a missing path, the
