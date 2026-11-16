@@ -17,13 +17,16 @@
 //! succeed, and the process is killed a moment later by the supervisor. So the check has
 //! to happen BEFORE anything is torn down.
 //!
-//! A `Type=notify` unit can follow the handoff instead. Once the replacement owns the
-//! panes, the OLD process — still the unit's main process, so any `NotifyAccess=` other
-//! than `none` accepts it — sends `MAINPID=<replacement>` and waits on `BARRIER=1` until
-//! the manager has processed it. Only then does it exit, and its exit is no longer the
-//! unit's: the replacement is the main process, the cgroup survives, and `KillMode=`
-//! still stops every pane on a real stop. The process that decided the switch was safe is
-//! the one that makes it safe, so it never depends on what the new build does.
+//! A `Type=notify` unit can follow the handoff instead. Once the replacement is ready,
+//! and while the handoff can still be undone, the OLD process — still the unit's main
+//! process, so any `NotifyAccess=` other than `none` accepts it — sends
+//! `MAINPID=<replacement>`, waits on `BARRIER=1`, and reads the unit's `MainPID` back.
+//! Only once the manager names the replacement does the handoff commit and the old
+//! process exit, and its exit is no longer the unit's: the replacement is the main
+//! process, the cgroup survives, and `KillMode=` still stops every pane on a real stop.
+//! The process that decided the switch was safe is the one that makes it safe, so it
+//! never depends on what the new build does. How to reach the manager is the
+//! platform's (`crate::platform::systemd_notify` and friends); this module decides.
 
 /// How this process is being supervised, as far as it can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +158,9 @@ fn current_env<'a>(
 pub(crate) fn detect() -> Supervision {
     let invocation_id = std::env::var("INVOCATION_ID").ok();
     let exec_pid = std::env::var(EXEC_PID_ENV).ok();
-    detect_from(&current_env(&invocation_id, &exec_pid), query_unit)
+    detect_from(&current_env(&invocation_id, &exec_pid), || {
+        query_unit(std::time::Instant::now() + MANAGER_TIMEOUT)
+    })
 }
 
 /// The decision, split out from the environment and the manager so it can be tested
@@ -215,66 +220,118 @@ pub(crate) fn notify_ready() {
     let Some(socket) = notify_socket() else {
         return;
     };
-    if let Err(err) = notify::send(socket, "READY=1") {
+    let deadline = std::time::Instant::now() + MANAGER_TIMEOUT;
+    if let Err(err) = crate::platform::systemd_notify(socket, "READY=1", deadline) {
         tracing::warn!(%err, "could not tell systemd the server is ready");
     }
 }
 
-/// Make `pid` the unit's main process and wait until the manager has processed it, so
-/// this process' exit afterwards is no longer the unit's.
+/// Make `pid` the unit's main process, and return only once the manager confirms it.
+///
+/// `BARRIER=1` proves the manager processed the datagrams before it, not that it
+/// ACCEPTED `MAINPID=`: systemd answers barriers before it checks `NotifyAccess=`, so
+/// a rejected `MAINPID=` still closes the barrier. Only the manager's own `MainPID`
+/// read back afterwards says this process' exit is no longer the unit's. One deadline
+/// bounds every step, the sends included, so a stalled manager can't hold the server.
 pub(crate) fn hand_over_main_pid(pid: u32) -> std::io::Result<()> {
-    let socket = notify_socket().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no systemd notification socket",
-        )
-    })?;
-    notify::send(socket, &format!("MAINPID={pid}"))?;
-    notify::barrier(socket, MANAGER_TIMEOUT)
+    hand_over_main_pid_with(
+        pid,
+        std::time::Instant::now() + MANAGER_TIMEOUT,
+        |message, deadline| {
+            let socket = notify_socket().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no systemd notification socket",
+                )
+            })?;
+            crate::platform::systemd_notify(socket, message, deadline)?;
+            crate::platform::systemd_notify_barrier(socket, deadline)
+        },
+        invocation_main_pid,
+    )
+}
+
+/// [`hand_over_main_pid`] with the manager split out: `notify` sends one message and
+/// waits on a barrier, `main_pid` reads the unit's `MainPID`, both by `deadline`.
+pub(crate) fn hand_over_main_pid_with(
+    pid: u32,
+    deadline: std::time::Instant,
+    notify: impl FnOnce(&str, std::time::Instant) -> std::io::Result<()>,
+    main_pid: impl FnOnce(std::time::Instant) -> Option<u32>,
+) -> std::io::Result<()> {
+    notify(&format!("MAINPID={pid}"), deadline)?;
+    match main_pid(deadline) {
+        Some(main) if main == pid => Ok(()),
+        Some(main) => Err(std::io::Error::other(format!(
+            "systemd did not accept MAINPID={pid}: the unit's main process is still {main}"
+        ))),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "systemd did not confirm the unit's new main process in time",
+        )),
+    }
+}
+
+/// The unit's `MainPID` as the manager reports it now, within [`MANAGER_TIMEOUT`].
+pub(crate) fn unit_main_pid() -> Option<u32> {
+    invocation_main_pid(std::time::Instant::now() + MANAGER_TIMEOUT)
+}
+
+/// The unit's `MainPID` by `deadline`, provided the manager still runs this process'
+/// own invocation of it: a `MainPID` of any other invocation confirms nothing.
+fn invocation_main_pid(deadline: std::time::Instant) -> Option<u32> {
+    let invocation_id = std::env::var("INVOCATION_ID").ok()?;
+    query_unit(deadline)
+        .filter(|unit| unit.invocation_id == invocation_id)
+        .and_then(|unit| unit.main_pid)
+}
+
+/// Hand the unit's main pid to `child` before the handoff commits, or put it back.
+///
+/// Ok: the manager confirmed `child`, so the commit may go ahead. Err: abort the
+/// handoff and keep serving. `MAINPID=child` may have landed even when it was not
+/// confirmed, so on failure this process names itself again (`ours`) and has that
+/// confirmed too. If that also fails while the manager plainly names `child`, the
+/// commit goes ahead after all: stopping the replacement would then be the unit's
+/// main process exiting, which deactivates the unit and kills every pane, whereas
+/// committing leaves the manager following the process that owns them.
+pub(crate) fn hand_over_main_pid_or_restore(
+    child: u32,
+    ours: u32,
+    hand_over: impl Fn(u32) -> std::io::Result<()>,
+    main_pid: impl FnOnce() -> Option<u32>,
+) -> std::io::Result<()> {
+    let Err(err) = hand_over(child) else {
+        return Ok(());
+    };
+    match hand_over(ours) {
+        Ok(()) => Err(err),
+        Err(restore_err) => {
+            if main_pid() == Some(child) {
+                tracing::error!(
+                    pid = child,
+                    %err,
+                    %restore_err,
+                    "systemd took the replacement as main process late and won't take this one back; committing so the unit keeps its panes"
+                );
+                return Ok(());
+            }
+            tracing::error!(
+                pid = child,
+                %err,
+                %restore_err,
+                "systemd confirmed neither the replacement nor this process as main process; aborting the handoff"
+            );
+            Err(std::io::Error::other(format!(
+                "{err}; restoring MAINPID={ours} failed too: {restore_err}"
+            )))
+        }
+    }
 }
 
 const MANAGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The unit named by this process' cgroup, and whether a user manager runs it.
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CgroupUnit {
-    pub(crate) name: String,
-    pub(crate) user_manager: Option<u32>,
-}
-
-/// Parse `/proc/self/cgroup`: the unified (`0::`) hierarchy, or systemd's own named
-/// one on a legacy or hybrid layout. The unit is the innermost `.service`; a
-/// `user@<uid>.service` above it means the user manager of `<uid>` runs it.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn unit_from_cgroup(cgroup: &str) -> Option<CgroupUnit> {
-    let path = cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .filter(|path| path.contains(".service"))
-        .or_else(|| {
-            cgroup
-                .lines()
-                .find_map(|line| line.split_once(":name=systemd:").map(|(_, path)| path))
-        })?;
-    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let unit_index = components
-        .iter()
-        .rposition(|part| part.ends_with(".service"))?;
-    let user_manager = components[..unit_index].iter().find_map(|part| {
-        part.strip_prefix("user@")?
-            .strip_suffix(".service")?
-            .parse::<u32>()
-            .ok()
-    });
-    Some(CgroupUnit {
-        name: components[unit_index].to_string(),
-        user_manager,
-    })
-}
-
 /// Parse `systemctl show` output (`Key=Value` lines).
-#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_unit_properties(text: &str) -> Option<UnitProperties> {
     let mut invocation_id = None;
     let mut main_pid = None;
@@ -302,205 +359,16 @@ pub(crate) fn parse_unit_properties(text: &str) -> Option<UnitProperties> {
 }
 
 /// Ask the manager that runs this process' unit for the properties the decision needs.
-#[cfg(target_os = "linux")]
-fn query_unit() -> Option<UnitProperties> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let unit = unit_from_cgroup(&cgroup)?;
-    let mut command = std::process::Command::new("systemctl");
-    if let Some(uid) = unit.user_manager {
-        // The user manager's private socket lives in its own runtime dir, which a
-        // server started with a different XDG_RUNTIME_DIR would otherwise miss.
-        command
-            .arg("--user")
-            .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
-    }
-    command
-        .args(["show", "--no-pager", &unit.name])
-        .args([
-            "-p",
-            "InvocationID",
-            "-p",
-            "MainPID",
-            "-p",
-            "Type",
-            "-p",
-            "NotifyAccess",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().ok()?;
-    let deadline = std::time::Instant::now() + MANAGER_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) | Err(_) => return None,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-    let mut output = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut output).ok()?;
+fn query_unit(deadline: std::time::Instant) -> Option<UnitProperties> {
+    let output = crate::platform::show_own_systemd_unit(
+        &["InvocationID", "MainPID", "Type", "NotifyAccess"],
+        deadline,
+    )?;
     let properties = parse_unit_properties(&output);
     if properties.is_none() {
-        tracing::warn!(unit = %unit.name, "systemd did not describe the server's unit");
+        tracing::warn!("systemd did not describe the server's unit");
     }
     properties
-}
-
-#[cfg(not(target_os = "linux"))]
-fn query_unit() -> Option<UnitProperties> {
-    None
-}
-
-/// The `sd_notify` wire protocol: one datagram per message to `NOTIFY_SOCKET`, and
-/// `BARRIER=1` with a pipe the manager closes once it has processed everything before.
-#[cfg(target_os = "linux")]
-mod notify {
-    use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::time::Duration;
-
-    pub(super) fn send(socket: &str, message: &str) -> io::Result<()> {
-        send_with_fd(socket, message, None)
-    }
-
-    pub(super) fn barrier(socket: &str, timeout: Duration) -> io::Result<()> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: pipe2 succeeded, so both descriptors are open and owned here.
-        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        send_with_fd(socket, "BARRIER=1", Some(write.as_raw_fd()))?;
-        drop(write);
-        let mut poll = libc::pollfd {
-            fd: read.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        loop {
-            // SAFETY: `poll` points at one valid pollfd.
-            let ready = unsafe { libc::poll(&mut poll, 1, millis) };
-            if ready > 0 {
-                return Ok(());
-            }
-            if ready == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "systemd did not confirm the notification in time",
-                ));
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
-    }
-
-    fn send_with_fd(socket: &str, message: &str, fd: Option<RawFd>) -> io::Result<()> {
-        let (address, address_len) = address(socket)?;
-        // SAFETY: plain socket(2) call; the result is checked before use.
-        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: socket(2) succeeded, so `raw` is an open descriptor owned here.
-        let sock = unsafe { OwnedFd::from_raw_fd(raw) };
-        let iov = [libc::iovec {
-            iov_base: message.as_ptr() as *mut libc::c_void,
-            iov_len: message.len(),
-        }];
-        let fd_bytes = std::mem::size_of::<RawFd>();
-        // SAFETY: CMSG_SPACE only computes a size.
-        let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize }];
-        // SAFETY: an all-zero msghdr is a valid empty message.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = &address as *const libc::sockaddr_un as *mut libc::c_void;
-        msg.msg_namelen = address_len;
-        msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
-        msg.msg_iovlen = iov.len() as _;
-        if let Some(fd) = fd {
-            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = control.len() as _;
-            // SAFETY: the control buffer is CMSG_SPACE(one fd) bytes long, so the first
-            // header and its data fit.
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                if cmsg.is_null() {
-                    return Err(io::Error::other("failed to allocate fd control message"));
-                }
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
-                std::ptr::copy_nonoverlapping(
-                    (&fd as *const RawFd).cast::<u8>(),
-                    libc::CMSG_DATA(cmsg),
-                    fd_bytes,
-                );
-            }
-        }
-        // SAFETY: `msg` points at live buffers for the duration of the call.
-        if unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// `NOTIFY_SOCKET` names a filesystem socket (`/…`) or an abstract one (`@…`).
-    fn address(socket: &str) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-        let bytes = socket.as_bytes();
-        let (prefix, path) = match bytes.first() {
-            Some(b'/') => (0, bytes),
-            Some(b'@') => (1, &bytes[1..]),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("unsupported systemd notification socket {socket:?}"),
-                ))
-            }
-        };
-        // SAFETY: an all-zero sockaddr_un is valid; the family and path are set below.
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        // Room for the abstract prefix or the filesystem path's terminating NUL.
-        if path.len() + 1 > address.sun_path.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "systemd notification socket path is too long",
-            ));
-        }
-        for (slot, byte) in address.sun_path[prefix..].iter_mut().zip(path) {
-            *slot = *byte as libc::c_char;
-        }
-        let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-        // A filesystem path counts its NUL; an abstract name counts its leading NUL.
-        let len = path_offset + path.len() + 1;
-        Ok((address, len as libc::socklen_t))
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-mod notify {
-    use std::io;
-    use std::time::Duration;
-
-    pub(super) fn send(_socket: &str, _message: &str) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "systemd notifications are only supported on Linux",
-        ))
-    }
-
-    pub(super) fn barrier(socket: &str, _timeout: Duration) -> io::Result<()> {
-        send(socket, "BARRIER=1")
-    }
 }
 
 #[cfg(test)]
@@ -684,39 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_comes_from_the_innermost_service_cgroup() {
-        assert_eq!(
-            unit_from_cgroup(
-                "0::/user.slice/user-0.slice/user@0.service/app.slice/herdr.service\n"
-            ),
-            Some(CgroupUnit {
-                name: "herdr.service".into(),
-                user_manager: Some(0),
-            })
-        );
-        assert_eq!(
-            unit_from_cgroup("0::/system.slice/herdr.service\n"),
-            Some(CgroupUnit {
-                name: "herdr.service".into(),
-                user_manager: None,
-            })
-        );
-        assert_eq!(
-            unit_from_cgroup(
-                "12:pids:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/run-u7.service\n0::/\n"
-            ),
-            Some(CgroupUnit {
-                name: "run-u7.service".into(),
-                user_manager: Some(1000),
-            })
-        );
-        assert_eq!(
-            unit_from_cgroup("0::/user.slice/user-0.slice/session-3.scope\n"),
-            None
-        );
-    }
-
-    #[test]
     fn systemctl_show_output_parses() {
         let text = "Type=notify\nNotifyAccess=all\nMainPID=4242\nInvocationID=9e2980d4c2cd414d9ce86697755e9d10\n";
         assert_eq!(
@@ -740,31 +575,54 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    /// F2: an unconfirmed handover aborts the handoff after naming this process
+    /// again; only a manager that plainly follows the replacement lets it commit.
     #[test]
-    fn notifications_reach_the_socket_and_the_barrier_waits_for_its_close() {
-        use std::os::unix::net::UnixDatagram;
-        let dir = std::env::temp_dir().join(format!("herdr-notify-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("notify");
-        let manager = UnixDatagram::bind(&path).unwrap();
-        let socket = path.to_str().unwrap().to_string();
+    fn an_unconfirmed_handover_restores_this_process_and_aborts() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refuse_child = |pid: u32| {
+            asked.borrow_mut().push(pid);
+            if pid == 4242 {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "barrier"))
+            } else {
+                Ok(())
+            }
+        };
+        let aborted = hand_over_main_pid_or_restore(4242, 17, refuse_child, || Some(17));
+        assert!(aborted.is_err());
+        assert_eq!(*asked.borrow(), [4242, 17]);
 
-        notify::send(&socket, "MAINPID=4242").unwrap();
-        let mut buf = [0u8; 64];
-        let len = manager.recv(&mut buf).unwrap();
-        assert_eq!(&buf[..len], b"MAINPID=4242");
+        let refuse_all = |_: u32| Err(std::io::Error::other("stalled"));
+        assert!(hand_over_main_pid_or_restore(4242, 17, refuse_all, || None).is_err());
+        assert!(hand_over_main_pid_or_restore(4242, 17, refuse_all, || Some(17)).is_err());
+        // Moved late and stuck there: stopping the replacement would end the unit.
+        assert!(hand_over_main_pid_or_restore(4242, 17, refuse_all, || Some(4242)).is_ok());
 
-        // The manager closes the barrier fd as soon as it has read the datagram; the
-        // fd arrives as SCM_RIGHTS, and dropping the receiving socket closes it.
-        let reader = std::thread::spawn(move || {
-            let len = manager.recv(&mut buf).unwrap();
-            assert_eq!(&buf[..len], b"BARRIER=1");
-            drop(manager);
-        });
-        notify::barrier(&socket, std::time::Duration::from_secs(5)).unwrap();
-        reader.join().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(hand_over_main_pid_or_restore(4242, 17, |_| Ok(()), || None).is_ok());
+    }
+
+    /// F1: a closed barrier is not an accepted `MAINPID=`; the manager's own
+    /// `MainPID` decides, and anything but the replacement keeps this process.
+    #[test]
+    fn a_main_pid_the_manager_did_not_take_refuses_the_exit() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut sent = Vec::new();
+        let kept = hand_over_main_pid_with(
+            4242,
+            deadline,
+            |message, _| {
+                sent.push(message.to_string());
+                Ok(())
+            },
+            |_| Some(17),
+        );
+        assert!(kept.is_err(), "{kept:?}");
+        assert_eq!(sent, ["MAINPID=4242"]);
+
+        let unknown = hand_over_main_pid_with(4242, deadline, |_, _| Ok(()), |_| None);
+        assert_eq!(unknown.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        let taken = hand_over_main_pid_with(4242, deadline, |_, _| Ok(()), |_| Some(4242));
+        assert!(taken.is_ok(), "{taken:?}");
     }
 }

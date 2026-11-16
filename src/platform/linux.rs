@@ -35,6 +35,8 @@ mod fence;
 pub(crate) use fence::{
     fence_exec, fence_peer, process_mount_namespace, FENCE_HELPER_PROGRAM, FENCE_SUPPORTED,
 };
+mod systemd;
+pub(crate) use systemd::{show_own_systemd_unit, systemd_notify, systemd_notify_barrier};
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";

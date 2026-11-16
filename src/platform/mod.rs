@@ -59,6 +59,35 @@ fn monitor_host_power(
     None
 }
 
+/// Only Linux runs under systemd: no unit to describe.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn show_own_systemd_unit(
+    _properties: &[&str],
+    _deadline: std::time::Instant,
+) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn systemd_notify(
+    _socket: &str,
+    _message: &str,
+    _deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "systemd notifications are only supported on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn systemd_notify_barrier(
+    socket: &str,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    systemd_notify(socket, "BARRIER=1", deadline)
+}
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }

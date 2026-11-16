@@ -136,8 +136,6 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
         #[cfg(unix)]
-        main_pid_successor: None,
-        #[cfg(unix)]
         guest_link: None,
         should_quit,
         server_stop,

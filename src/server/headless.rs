@@ -248,10 +248,6 @@ pub struct HeadlessServer {
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
-    /// A replacement that owns the panes while systemd still names this process
-    /// the unit's main one: this process stays until it exits.
-    #[cfg(unix)]
-    main_pid_successor: Option<std::process::Child>,
     /// The guest relay link. Runs only while this process owns the panes: a
     /// live handoff stops it before the replacement starts its own.
     #[cfg(unix)]
@@ -419,8 +415,6 @@ impl HeadlessServer {
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
-            #[cfg(unix)]
-            main_pid_successor: None,
             #[cfg(unix)]
             guest_link: None,
             should_quit,
