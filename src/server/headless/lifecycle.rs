@@ -237,22 +237,44 @@ impl HeadlessServer {
             let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, &self.client_socket_identity);
-        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            match self.wait_then_restore_public_sockets_after_failed_handoff() {
-                Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+        let ready = match crate::server::handoff::wait_ready(&mut stream) {
+            Ok(ready) => ready,
+            Err(err) => {
+                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                    Ok(()) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    }
+                    Err(restore_err) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                        return Err(io::Error::other(format!(
+                            "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
+                        )));
+                    }
                 }
-                Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
-                    )));
-                }
+                return Err(io::Error::other(format!(
+                    "handoff replacement server did not become ready: {err}"
+                )));
             }
-            return Err(io::Error::other(format!(
-                "handoff replacement server did not become ready: {err}"
-            )));
+        };
+        // A replacement that can't hand the main pid back after a lost commit (an
+        // older build) must never get it: its exit would end the unit. No MAINPID=
+        // was sent yet, so stopping it is safe and the handoff is refused as before.
+        if hand_over_main_pid && !ready.main_pid_recovery {
+            warn!(
+                pid = child_pid,
+                "the new build can't hand the systemd main pid back; refusing the live handoff"
+            );
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            let restored = self.wait_then_restore_public_sockets_after_failed_handoff();
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            let refusal = crate::server::supervision::HANDOFF_REFUSAL_OLD_IMPORTER;
+            return Err(match restored {
+                Ok(()) => io::Error::new(io::ErrorKind::Unsupported, refusal),
+                Err(restore_err) => io::Error::other(format!(
+                    "{refusal}; old server could not restore public sockets: {restore_err}"
+                )),
+            });
         }
         // The manager must name the replacement as the unit's main process BEFORE the
         // commit: up to here the handoff is still reversible, after it the old pane

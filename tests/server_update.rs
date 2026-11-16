@@ -1244,6 +1244,60 @@ fn update_apply_keeps_the_old_server_main_when_the_commit_is_lost_inside_a_syste
     assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
 }
 
+/// The new build can't hand the unit's main pid back after a lost commit (a test
+/// fault makes it answer `ready` like an older build). Under systemd the old server
+/// must not give it the main pid, so it refuses the switch before sending any
+/// `MAINPID=`: the old server keeps serving as the main process of the same
+/// activation, and nothing is installed.
+#[test]
+fn update_apply_refuses_a_new_build_that_cannot_hand_the_main_pid_back_inside_a_systemd_notify_unit(
+) {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(
+        &["Type=notify", "NotifyAccess=main"],
+        &[("HERDR_TEST_HANDOFF_NO_MAIN_PID_RECOVERY", "1")],
+    );
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let invocation = fixture.unit().show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+    let before = install_identity(&fixture.install);
+
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+
+    let log = fixture.guard_log();
+    assert_eq!(attempt["outcome"], "failed_no_change", "{attempt}\n{log}");
+    assert!(
+        attempt["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("can't take over safely under systemd")),
+        "{attempt}"
+    );
+    let unit = fixture.unit();
+    assert_eq!(unit.show("ActiveState"), "active", "the unit went down");
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    assert_eq!(
+        unit.main_pid(),
+        old_pid,
+        "systemd does not follow the old server"
+    );
+    assert_eq!(serving_pid(&fixture.api_socket), old_pid);
+    let new_build_runs = unit.pids().into_iter().any(|pid| {
+        fs::read(format!("/proc/{pid}/exe"))
+            .is_ok_and(|exe| hex(&sha2::Sha256::digest(&exe)) == build.sha256)
+    });
+    assert!(!new_build_runs, "the new server still runs in the unit");
+    assert!(alive(shell_pid), "the pane's process did not survive");
+    assert!(pane_ids(&fixture).contains(&pane_id));
+    let after = install_identity(&fixture.install);
+    assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
+}
+
 /// A `Type=simple` unit can't follow a new main process, so the update is
 /// refused before anything is touched, as before, and so is a plain handoff.
 #[test]

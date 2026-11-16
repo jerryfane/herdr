@@ -371,41 +371,6 @@ fn settle_restart_later(dirs: &UpdateDirs, running_build_id: Option<&str>) -> io
     Ok(changed)
 }
 
-#[cfg(unix)]
-pub(crate) fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the process exists.
-    let exists = unsafe { libc::kill(pid, 0) } == 0
-        || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    exists && !is_zombie(pid)
-}
-
-#[cfg(target_os = "linux")]
-fn is_zombie(pid: libc::pid_t) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            let rest = stat.get(stat.rfind(')')? + 2..)?;
-            rest.chars().next()
-        })
-        .is_some_and(|state| state == 'Z')
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn is_zombie(pid: libc::pid_t) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .is_some_and(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .starts_with('Z')
-        })
-}
-
 /// The on-disk binary an update replaces. After a live switch the server runs
 /// from `updates/<build_id>/herdr`, so its own path is not the install; the
 /// attempt that started it recorded the real one.

@@ -210,14 +210,39 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
     Ok(())
 }
 
+/// What an import server says it can do, on its `ready` line after the word
+/// `ready`: it hands a systemd unit's main pid back if the commit never comes
+/// (`supervision::release_main_pid_after_lost_commit`).
+///
+/// Only an importer told to take the main pid over (`HERDR_SYSTEMD_TAKES_MAIN_PID`,
+/// which only a server with this check sets) sends it, so an older server, which
+/// wants the line to be exactly `ready`, never sees it. A newer server ignores
+/// words it doesn't know.
 #[cfg(unix)]
-pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
+pub(crate) const MAIN_PID_RECOVERY: &str = "main-pid-recovery";
+
+#[cfg(unix)]
+/// An import server's `ready` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ready {
+    pub(crate) main_pid_recovery: bool,
+}
+
+#[cfg(unix)]
+/// `ready`, then words naming what the importer supports; unknown words are ignored.
+pub(crate) fn parse_ready(line: &str) -> Option<Ready> {
+    let mut words = line.split_whitespace();
+    (words.next()? == "ready").then_some(())?;
+    Some(Ready {
+        main_pid_recovery: words.any(|word| word == MAIN_PID_RECOVERY),
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<Ready> {
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
     let ready = read_line_unbuffered(&mut *stream)?;
-    if ready.trim_end() != "ready" {
-        return Err(io::Error::other("handoff import did not report ready"));
-    }
-    Ok(())
+    parse_ready(&ready).ok_or_else(|| io::Error::other("handoff import did not report ready"))
 }
 
 #[cfg(unix)]
@@ -300,8 +325,12 @@ pub(crate) fn report_restored(stream: &mut UnixStream) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn report_ready(stream: &mut UnixStream) -> io::Result<()> {
-    stream.write_all(b"ready\n")?;
+pub(crate) fn report_ready(stream: &mut UnixStream, main_pid_recovery: bool) -> io::Result<()> {
+    if main_pid_recovery {
+        stream.write_all(format!("ready {MAIN_PID_RECOVERY}\n").as_bytes())?;
+    } else {
+        stream.write_all(b"ready\n")?;
+    }
     stream.flush()
 }
 
@@ -563,6 +592,26 @@ mod tests {
             collapsed_space_keys: Default::default(),
             archived_agents: Vec::new(),
         }
+    }
+
+    /// Review 5: only an importer that says it can hand a systemd unit's main pid back
+    /// may get it. The plain `ready` of an older build says it can't; a newer word
+    /// this build doesn't know is ignored rather than failing the handoff.
+    #[test]
+    fn the_ready_line_says_whether_the_importer_can_hand_the_main_pid_back() {
+        let old = parse_ready("ready\n").unwrap();
+        assert!(!old.main_pid_recovery);
+        let new = parse_ready(&format!("ready {MAIN_PID_RECOVERY}\n")).unwrap();
+        assert!(new.main_pid_recovery);
+        let newer = parse_ready(&format!("ready some-future-word {MAIN_PID_RECOVERY}\n")).unwrap();
+        assert!(newer.main_pid_recovery);
+        assert!(
+            !parse_ready("ready some-future-word\n")
+                .unwrap()
+                .main_pid_recovery
+        );
+        assert_eq!(parse_ready("restored\n"), None);
+        assert_eq!(parse_ready(""), None);
     }
 
     #[test]

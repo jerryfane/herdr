@@ -255,7 +255,7 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+    classify_child_exit, poll_fd_readable, process_alive, read_fd, shared_ssh_control_path,
 };
 
 // Tests inject their own probe because the recorded hangup is process-global.

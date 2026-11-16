@@ -238,7 +238,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server
             .host_shutdown_intent
             .set(received.manifest.host_shutdown_intent);
-        crate::server::handoff::report_ready(&mut received.stream)?;
+        // Test fault: answer like a build without lost-commit recovery.
+        let main_pid_recovery = crate::server::supervision::is_main_pid_successor()
+            && std::env::var_os("HERDR_TEST_HANDOFF_NO_MAIN_PID_RECOVERY").is_none();
+        crate::server::handoff::report_ready(&mut received.stream, main_pid_recovery)?;
         if let Err(err) = crate::server::handoff::wait_committed(&mut received.stream) {
             commit_lost.set(true);
             return Err(err);

@@ -13,35 +13,50 @@ struct CgroupUnit {
     user_manager: Option<u32>,
 }
 
-/// Parse `/proc/self/cgroup`: the unified (`0::`) hierarchy, or systemd's own named
-/// one on a legacy or hybrid layout. The unit is the innermost `.service`; a
-/// `user@<uid>.service` above it means the user manager of `<uid>` runs it.
+/// Parse `/proc/self/cgroup`: the unified hierarchy (`0::<path>`), or systemd's own
+/// named one (`<id>:<controllers>:<path>` with `name=systemd` among the
+/// comma-separated controllers) on a legacy or hybrid layout.
 fn unit_from_cgroup(cgroup: &str) -> Option<CgroupUnit> {
-    let path = cgroup
+    let records: Vec<(&str, &str, &str)> = cgroup
         .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .filter(|path| path.contains(".service"))
-        .or_else(|| {
-            cgroup
-                .lines()
-                .find_map(|line| line.split_once(":name=systemd:").map(|(_, path)| path))
-        })?;
-    let components: Vec<&str> = path
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            Some((fields.next()?, fields.next()?, fields.next()?))
+        })
+        .collect();
+    let unified = records
+        .iter()
+        .find(|(id, controllers, _)| *id == "0" && controllers.is_empty())
+        .and_then(|(_, _, path)| unit_from_cgroup_path(path));
+    unified.or_else(|| {
+        records
+            .iter()
+            .find(|(_, controllers, _)| controllers.split(',').any(|c| c == "name=systemd"))
+            .and_then(|(_, _, path)| unit_from_cgroup_path(path))
+    })
+}
+
+/// The unit that owns a cgroup path: the first component after the slices. A
+/// `user@<uid>.service` there is the user manager of `<uid>`, and the unit is the
+/// first component after the slices below it. Anything deeper is the unit's own,
+/// such as a `DelegateSubgroup=` (`herdr.service/payload.service`). Only a
+/// `.service` is a unit this process can be the main process of.
+fn unit_from_cgroup_path(path: &str) -> Option<CgroupUnit> {
+    let mut units = path
         .split('/')
         .filter(|part| !part.is_empty())
         .map(cgroup_unescape)
-        .collect();
-    let unit_index = components
-        .iter()
-        .rposition(|part| part.ends_with(".service"))?;
-    let user_manager = components[..unit_index].iter().find_map(|part| {
-        part.strip_prefix("user@")?
-            .strip_suffix(".service")?
-            .parse::<u32>()
-            .ok()
-    });
-    Some(CgroupUnit {
-        name: components[unit_index].to_string(),
+        .filter(|part| !part.ends_with(".slice"));
+    let mut unit = units.next()?;
+    let user_manager = unit
+        .strip_prefix("user@")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .and_then(|uid| uid.parse::<u32>().ok());
+    if user_manager.is_some() {
+        unit = units.next()?;
+    }
+    unit.ends_with(".service").then(|| CgroupUnit {
+        name: unit.to_string(),
         user_manager,
     })
 }
@@ -282,7 +297,7 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
 
     #[test]
-    fn the_unit_comes_from_the_innermost_service_cgroup() {
+    fn the_unit_comes_from_the_first_cgroup_after_the_slices() {
         assert_eq!(
             unit_from_cgroup(
                 "0::/user.slice/user-0.slice/user@0.service/app.slice/herdr.service\n"
@@ -310,6 +325,52 @@ mod tests {
         );
         assert_eq!(
             unit_from_cgroup("0::/user.slice/user-0.slice/session-3.scope\n"),
+            None
+        );
+    }
+
+    /// `Delegate=yes` with `DelegateSubgroup=payload.service` puts the main process
+    /// in a subgroup of its unit. The unit is the first one after the slices, for a
+    /// system unit and for one a user manager runs, never the delegated subgroup.
+    #[test]
+    fn a_delegated_subgroup_is_not_the_unit() {
+        assert_eq!(
+            unit_from_cgroup("0::/system.slice/herdr.service/payload.service\n"),
+            Some(CgroupUnit {
+                name: "herdr.service".into(),
+                user_manager: None,
+            })
+        );
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/herdr.service/payload.service\n"
+            ),
+            Some(CgroupUnit {
+                name: "herdr.service".into(),
+                user_manager: Some(1000),
+            })
+        );
+        // The user manager's own processes are not in a unit it runs.
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/init.scope\n"),
+            None
+        );
+    }
+
+    /// A legacy hierarchy can list several controllers with systemd's own name:
+    /// `name=systemd` is one comma-separated element of the controller field.
+    #[test]
+    fn a_legacy_record_with_several_controllers_names_the_unit() {
+        assert_eq!(
+            unit_from_cgroup("3:memory:/\n2:cpu,name=systemd:/system.slice/herdr.service\n"),
+            Some(CgroupUnit {
+                name: "herdr.service".into(),
+                user_manager: None,
+            })
+        );
+        // A controller merely ending in the name is not systemd's.
+        assert_eq!(
+            unit_from_cgroup("2:cpu,xname=systemd:/system.slice/herdr.service\n"),
             None
         );
     }

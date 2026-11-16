@@ -63,6 +63,12 @@ pub(crate) const HANDOFF_REFUSAL: &str = "refusing a live handoff: this process 
      NotifyAccess=main or all), so exiting after the handoff would deactivate the unit and kill \
      the replacement and every pane with it";
 
+/// Why a live handoff under systemd was refused once the new build turned out unable
+/// to hand the unit's main pid back after a lost commit (an older build).
+pub(crate) const HANDOFF_REFUSAL_OLD_IMPORTER: &str = "refusing a live handoff: the new build \
+     can't take over safely under systemd (it can't hand the unit's main process back if \
+     the switch fails), so the unit needs a restart to run it";
+
 /// What the manager reports about the unit this process runs in
 /// (`systemctl show -p InvocationID -p MainPID -p Type -p NotifyAccess`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +121,18 @@ pub(crate) fn take_systemd_environment() {
     if std::env::var_os(TAKES_MAIN_PID_ENV).is_some() {
         std::env::remove_var(TAKES_MAIN_PID_ENV);
         std::env::set_var(EXEC_PID_ENV, std::process::id().to_string());
+        MAIN_PID_SUCCESSOR.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+static MAIN_PID_SUCCESSOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process was started as a handoff replacement that takes the unit's
+/// main pid over. Only such a process tells its predecessor that it can hand the main
+/// pid back after a lost commit ([`crate::server::handoff::MAIN_PID_RECOVERY`]).
+pub(crate) fn is_main_pid_successor() -> bool {
+    MAIN_PID_SUCCESSOR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The unit's notification socket, if the supervisor gave this process one.
@@ -489,7 +506,7 @@ pub(crate) fn release_main_pid_before_exit_after_lost_commit(predecessor: Option
         predecessor,
         "the handoff commit was lost; handing the unit's main pid back before exiting"
     );
-    let alive = || crate::update::state::process_alive(predecessor);
+    let alive = || crate::platform::process_alive(predecessor);
     let pause = || std::thread::sleep(std::time::Duration::from_secs(1));
     match release_main_pid_after_lost_commit(ours, predecessor, Manager::systemd(), &alive, &pause) {
         LostCommitExit::NotMain(main) => tracing::info!(main, "systemd follows another process; exiting"),

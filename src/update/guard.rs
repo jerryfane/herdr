@@ -30,10 +30,9 @@ use crate::api::schema::{
 };
 
 use super::apply::{MANIFEST_FILE, SIGNATURE_FILE};
-use super::state::{
-    process_alive, AttemptLock, AttemptRecord, UpdateDirs, BINARY_NAME, PREVIOUS_DIR,
-};
+use super::state::{AttemptLock, AttemptRecord, UpdateDirs, BINARY_NAME, PREVIOUS_DIR};
 use super::verify;
+use crate::platform::process_alive;
 
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OBSERVE_TOTAL: Duration = Duration::from_secs(180);
