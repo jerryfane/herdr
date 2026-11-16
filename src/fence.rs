@@ -1201,9 +1201,16 @@ mod tests {
         assert_eq!(v("/srv/app/data/secrets/k").access, FenceAccess::ReadOnly);
         assert_eq!(v("/srvx").rule, "not denied", "component prefix only");
         assert_eq!(v("/run/docker.sock").access, FenceAccess::Masked);
-        assert_eq!(v("/cfg/x/y").access, FenceAccess::Writable, "later mount wins a tie");
+        assert_eq!(
+            v("/cfg/x/y").access,
+            FenceAccess::Writable,
+            "later mount wins a tie"
+        );
         let pinned = v("/home/u/.gitmoot");
-        assert_eq!((pinned.access, pinned.pinned), (FenceAccess::Writable, true));
+        assert_eq!(
+            (pinned.access, pinned.pinned),
+            (FenceAccess::Writable, true)
+        );
         assert!(!v("/home/u/.gitmoot/gitmoot.db-wal").pinned);
         assert_eq!(
             v("/home/u/.gitmoot/config.toml").access,

@@ -95,7 +95,10 @@ fn explain_text(explain: &serde_json::Value) -> String {
     }
     out.push('\n');
     if let Some(missing) = explain["missing"].as_array().filter(|m| !m.is_empty()) {
-        out.push_str(&format!("  not on this host:    {} entries\n", missing.len()));
+        out.push_str(&format!(
+            "  not on this host:    {} entries\n",
+            missing.len()
+        ));
     }
     let path = &explain["path"];
     if path.is_object() {

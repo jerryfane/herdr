@@ -649,9 +649,17 @@ mod tests {
         let ro = |p: &str| mountinfo_read_only(table, Path::new(p));
         assert_eq!(ro("/etc/passwd"), Some(true));
         assert_eq!(ro("/etc/app/data/db"), Some(false), "allow below a deny");
-        assert_eq!(ro("/etcetera"), Some(false), "component prefix, not string prefix");
+        assert_eq!(
+            ro("/etcetera"),
+            Some(false),
+            "component prefix, not string prefix"
+        );
         assert_eq!(ro("/my dir/x"), Some(true), "octal-escaped mount point");
-        assert_eq!(ro("/usr/bin/sh"), Some(true), "a later mount on the same point wins");
+        assert_eq!(
+            ro("/usr/bin/sh"),
+            Some(true),
+            "a later mount on the same point wins"
+        );
         assert_eq!(ro("/home/x"), Some(false));
         assert_eq!(mountinfo_read_only("", Path::new("/x")), None);
     }
