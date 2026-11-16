@@ -6264,12 +6264,13 @@ mod tests {
             .clone();
         let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
         let started: serde_json::Value = serde_json::from_str(&app.handle_agent_start(
             "req".into(),
             AgentStartParams {
                 name: "reviewer".into(),
                 kind: "pi".into(),
-                pane_id: app.pane_info(0, root).unwrap().pane_id,
+                pane_id: pane_id.clone(),
                 args: Vec::new(),
                 timeout_ms: Some(4_000),
                 account: None,
@@ -6290,7 +6291,7 @@ mod tests {
         let renamed: serde_json::Value = serde_json::from_str(&app.handle_agent_rename(
             "req".into(),
             AgentRenameParams {
-                target: "reviewer".into(),
+                target: pane_id,
                 name: Some("exempt".into()),
                 expected_name: None,
                 expect_inactive: None,
