@@ -643,6 +643,47 @@ droid = "off"
 claude = "on"
 ```
 
+## 窗格围栏 (Linux)
+
+窗格围栏防止智能体以及它们运行的测试和脚本修改不应修改的文件。启用后，herdr 会在围栏内启动每个新窗格的进程：
+
+- deny 列表中的路径及其下的所有内容都是只读的；
+- 被 deny 的目录中的 `fence.allow` 路径保持可写，但这些路径本身不能被删除或重命名；
+- 会在围栏外执行操作的套接字 (systemd、D-Bus、Docker、containerd) 拒绝连接；
+- 窗格不能挂载、卸载、进入其他命名空间、加载内核模块、重启、跟踪其他进程或写入块设备。
+
+窗格的用户保持不变，因此 deny 列表之外的一切照常工作。围栏作用于窗格的整个进程树，以及更改之后启动的窗格；正在运行的窗格保留启动时的围栏。
+
+```toml
+[fence]
+enabled = true
+deny = ["/usr", "/etc", "~/.ssh", "/srv/shared"]
+allow = ["/srv/shared/my-project"]
+```
+
+`pin` 列出在围栏内的窗格中保持可写、但不能被删除或重命名的路径，例如数据库及其目录。省略 `deny`、`mask_sockets` 和 `pin` 即使用内置列表 (参见 [配置参考](/docs/config-reference/))。herdr 自己的配置目录在围栏内始终只读；它的套接字仍可连接，所以 `herdr` CLI 照常可用。围栏内的窗格会设置 `HERDR_FENCE`。
+
+在围栏内的窗格中，`herdr` CLI 可以读取所有内容、与智能体对话 (`agent prompt`)，并操作自己的窗格和智能体：发送输入、重命名、关闭、报告智能体状态。它不能在围栏外操作：向其他窗格发送输入、启动或重启智能体、`server reload-config`、更新、停止服务器、插件、工作树和账户都会以 `fence_refused` 错误拒绝。只有在新窗格会在围栏内启动时，它才能创建窗格、标签页和工作区。围栏内的窗格无法连接私有的 TUI 客户端套接字。
+
+如果无法建立围栏，窗格会显示错误，其命令不会启动。要关闭围栏，设置 `enabled = false`，运行 `herdr server reload-config`，然后重启相关窗格。
+
+围栏内的窗格无法连接 systemd，因此请在围栏之外启动和停止长期运行的服务 (例如 systemd 单元)，而不是在窗格中手动运行。
+
+### 只为部分智能体启用围栏
+
+`[fence.agents.<name>]` 按智能体启动时的名称 (`herdr agent start <NAME>`) 为单个智能体设置围栏。每个条目都需要 `reason`。设置 `scope = "agents"` 时，只有列出的智能体会被围住，其他窗格照常启动，就像没有围栏一样；默认的 `scope = "all"` 会围住所有窗格，`profile = "unfenced"` 可让某个智能体例外。
+
+```toml
+[fence]
+enabled = true
+scope = "agents"
+
+[fence.agents.reviewer]
+reason = "runs untrusted test suites"
+```
+
+`herdr agent start` 会先在智能体的围栏下重启窗格的 shell，再启动智能体。智能体经过 `agent restart`、归档与取消归档以及会话恢复后，即使改了名称，也保持同一围栏。要让已在运行的智能体使用新条目，请用 `herdr agent restart <NAME>` 重启它。
+
 ## 高级配置
 
 在[配置参考](/docs/config-reference/)中搜索回滚缓冲区限制、嵌套启动以及其他高级或实验性设置。启用窗格屏幕历史前，请参阅[会话状态与恢复](/docs/session-state/)；该指南说明了保存窗格内容带来的安全取舍。
