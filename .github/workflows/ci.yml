@@ -255,6 +255,15 @@ jobs:
           | test(a_guest_sees_subagents_without_assignments_and_cannot_page_one)
           | test(agent_transcript_projection_maps_cursors_and_limit)'
 
+      # Pane fence end-to-end (#423). It creates mount namespaces only inside a throwaway
+      # Docker container on this disposable runner, and compares the runner's mount table
+      # before and after. Every blocked check has an unfenced positive control.
+      - name: Pane fence end-to-end
+        if: runner.os == 'Linux'
+        run: |
+          CARGO_INCREMENTAL=1 cargo build --locked --bin herdr
+          scripts/fence/run-in-container.sh target/debug/herdr
+
       - name: Run macOS checks
         if: runner.os == 'macOS'
         run: CARGO_INCREMENTAL=1 just ci '${{ matrix.nextest_filter }}'

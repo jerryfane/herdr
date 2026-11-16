@@ -552,10 +552,12 @@ the host, fenced panes keep the old (dead) connection until they restart (sectio
 - Every test asserts the container's outer mount table is unchanged afterwards. On the live host the
   whole-table diff is noisy (other seats' containers and probes change it; appendix A saw both), so the
   host check filters to the paths the plan touches.
-- New tests are proven red with the fence disabled (`test-check prove`).
-- CI: the hetzner2 runner's rootless container (label `h2-ci`) if it can grant `CAP_SYS_ADMIN` inside a
-  user namespace; otherwise the suite is a documented `just fence-test` recipe that refuses to run outside a
-  container.
+- New tests are proven red: `test-check prove` does not support Rust, so unit tests use mutants, and the
+  container e2e is run against a binary without the change (its paired unfenced controls also catch a check
+  that passes by doing nothing).
+- CI (#423): the Linux `check` job builds the debug binary and runs `scripts/fence/run-in-container.sh` on
+  the GitHub-hosted runner, a disposable VM. The fork has no self-hosted `h2-ci` runner registered. Locally
+  the same suite is `just fence-test`; it only ever starts a container and never mounts on the host.
 
 ## 12. What must keep working (pilot acceptance)
 
