@@ -1701,6 +1701,22 @@
           "type": "array of strings",
           "default": "built-in list",
           "description": "Paths that stay writable inside fenced panes but cannot be deleted or renamed there: each is bound onto itself. Same path syntax as `fence.deny`. Setting the key replaces the built-in list (`~/.gitmoot` and `~/.gitmoot/gitmoot.db`). Do not pin files that their program deletes and recreates, such as SQLite `-wal` and `-shm` files."
+        },
+        {
+          "key": "fence.scope",
+          "type": "enum",
+          "default": "\"all\"",
+          "description": "Which panes `fence.enabled` fences. `all`: every pane, except agents listed in `fence.agents` with `profile = \"unfenced\"`. `agents`: only agents listed in `fence.agents` with the default profile; every other pane, including panes those agents create, starts unfenced and a fenced agent cannot create panes.",
+          "values": [
+            "all",
+            "agents"
+          ]
+        },
+        {
+          "key": "fence.agents",
+          "type": "table",
+          "default": "{}",
+          "description": "Per-agent entries, `[fence.agents.<name>]`, keyed by the name an agent was started with (`herdr agent start <NAME>`). Each entry needs a non-empty `reason` and may set `profile` to `\"default\"` (the `[fence]` settings) or `\"unfenced\"`. The entry follows the agent through `agent restart`, `agent archive`/`unarchive` and session restore; renaming the agent does not change it. `agent start` restarts the pane's shell first when the shell is not under the agent's fence."
         }
       ]
     }

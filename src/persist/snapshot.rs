@@ -147,10 +147,25 @@ pub struct PaneSnapshot {
     /// simply restores to the default, which is the old behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_account: Option<String>,
+    /// Who this pane's processes are fenced as (`[fence.agents]`). Kept apart from
+    /// `agent_name` so a renamed agent restores under the fence it started with.
+    /// Additive: an old snapshot falls back to `agent_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::fence::FenceIdentity>,
     /// Digests of the last brokered prompts that were not the owner's, oldest
     /// first, so `agent.transcript` keeps marking their turns after a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other_prompts: Vec<crate::agent_transcript::OtherPrompt>,
+}
+
+impl PaneSnapshot {
+    /// Who this pane is fenced as on restore. A snapshot written before the field
+    /// existed falls back to the agent name.
+    pub(crate) fn fence_identity(&self) -> crate::fence::FenceIdentity {
+        self.fence.clone().unwrap_or_else(|| {
+            crate::fence::FenceIdentity::from_agent_name(self.agent_name.clone())
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +233,18 @@ pub struct ArchivedAgentSnapshot {
     /// The pane's user-facing label at archive time (what `pane.rename` sets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_label: Option<String>,
+    /// Who the agent was fenced as, so an unarchive restores the same fence even
+    /// after a rename. Absent in older records, which fall back to `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::fence::FenceIdentity>,
+}
+
+impl ArchivedAgentSnapshot {
+    pub(crate) fn fence_identity(&self) -> crate::fence::FenceIdentity {
+        self.fence
+            .clone()
+            .unwrap_or_else(|| crate::fence::FenceIdentity::from_agent_name(self.name.clone()))
+    }
 }
 
 /// The `archived { at, by, reason }` provenance block on an [`ArchivedAgentSnapshot`].
@@ -532,6 +559,7 @@ fn capture_tab(
                     .map(|terminal| terminal.occupant_generation)
                     .unwrap_or(0),
                 agent_account,
+                fence: terminal.map(|terminal| terminal.fence_identity.clone()),
                 other_prompts: terminal
                     .map(|terminal| terminal.other_prompts.delivered())
                     .unwrap_or_default(),
@@ -970,6 +998,7 @@ mod tests {
                 origin_workspace_id: Some("w1".into()),
                 origin_tab_id: Some("w1:t2".into()),
                 pane_label: Some("reviewer".into()),
+                fence: None,
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -981,6 +1010,29 @@ mod tests {
         assert_eq!(record.agent_session.value, "sess-123");
         assert_eq!(record.archived.by, "tester");
         assert_eq!(record.parked_work, vec![serde_json::json!({"pr": 42})]);
+    }
+
+    /// Snapshots written before `fence` existed (the first restart onto a fence-aware
+    /// server) restore the agent under its name, so `[fence.agents]` applies to it.
+    #[test]
+    fn pane_snapshot_without_fence_falls_back_to_the_agent_name() {
+        use crate::fence::FenceIdentity;
+        let legacy: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/w","agent_name":"real-estate"}"#).unwrap();
+        assert_eq!(
+            legacy.fence_identity(),
+            FenceIdentity::Agent("real-estate".into())
+        );
+        let plain: PaneSnapshot = serde_json::from_str(r#"{"cwd":"/w"}"#).unwrap();
+        assert_eq!(plain.fence_identity(), FenceIdentity::Anonymous);
+        let pinned: PaneSnapshot = serde_json::from_str(
+            r#"{"cwd":"/w","agent_name":"exempt","fence":{"agent":"reviewer"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.fence_identity(),
+            FenceIdentity::Agent("reviewer".into())
+        );
     }
 
     #[test]
@@ -1022,6 +1074,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                fence: None,
             },
         );
         panes.insert(
@@ -1038,6 +1091,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                fence: None,
             },
         );
 
@@ -2001,6 +2055,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                fence: None,
             },
         );
         panes.insert(
@@ -2019,6 +2074,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                fence: None,
             },
         );
 

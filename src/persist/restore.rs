@@ -459,6 +459,7 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        terminal.fence_identity = pane.fence_identity();
         // The transcript stays readable, so keep marking its non-owner turns.
         terminal.other_prompts =
             crate::agent_transcript::OtherPromptLog::restored(pane.other_prompts.iter().cloned());
@@ -553,6 +554,9 @@ fn restore_tab(
         // rebuilt from the account registry when the agent is next spawned, so nothing
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
+        let saved_fence = saved_pane
+            .map(super::snapshot::PaneSnapshot::fence_identity)
+            .unwrap_or_default();
         let saved_other_prompts = crate::agent_transcript::OtherPromptLog::restored(
             saved_pane
                 .map(|p| p.other_prompts.clone())
@@ -591,13 +595,15 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
-                    workspace_id.to_string(),
-                    crate::workspace::public_tab_id_for_number(workspace_id, number),
-                    pane_id.to_string(),
-                )
+                PaneLaunchEnv::from_extra(Vec::new())
+                    .with_identity(
+                        workspace_id.to_string(),
+                        crate::workspace::public_tab_id_for_number(workspace_id, number),
+                        pane_id.to_string(),
+                    )
+                    .with_fence_identity(saved_fence.clone())
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| PaneLaunchEnv::default().with_fence_identity(saved_fence.clone()));
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
         #[cfg(unix)]
@@ -625,6 +631,7 @@ fn restore_tab(
             // Restore account routing. Without this the pane comes back on the harness
             // default and writes to the WRONG account's transcript, which reads as lost work.
             terminal.agent_account = saved_agent_account.clone();
+            terminal.fence_identity = saved_fence.clone();
             terminal.other_prompts = saved_other_prompts.clone();
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
@@ -740,6 +747,7 @@ fn restore_tab(
                     terminal.set_manual_label(label);
                 }
                 terminal.agent_account = saved_agent_account.clone();
+                terminal.fence_identity = saved_fence.clone();
                 terminal.other_prompts = saved_other_prompts.clone();
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
@@ -1114,6 +1122,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            fence: None,
                         },
                     )]),
                     zoomed: false,
@@ -1407,6 +1416,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: Some("claudecrazy".into()),
+                            fence: None,
                         },
                     )]),
                     zoomed: false,
@@ -1862,6 +1872,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            fence: None,
                         },
                     )]),
                     zoomed: false,
@@ -1943,6 +1954,7 @@ mod tests {
                             terminal_id: Some("term_persisted_boot1".into()),
                             occupant_generation: 7,
                             agent_account: None,
+                            fence: None,
                         },
                     )]),
                     zoomed: false,
@@ -2032,6 +2044,7 @@ mod tests {
                                 terminal_id: None,
                                 occupant_generation: 0,
                                 agent_account: None,
+                                fence: None,
                             },
                         ),
                         (
@@ -2048,6 +2061,7 @@ mod tests {
                                 terminal_id: None,
                                 occupant_generation: 0,
                                 agent_account: None,
+                                fence: None,
                             },
                         ),
                     ]),
@@ -2107,6 +2121,7 @@ mod tests {
                     terminal_id: None,
                     occupant_generation: 0,
                     agent_account: None,
+                    fence: None,
                 },
             )
         };
@@ -2127,6 +2142,7 @@ mod tests {
             terminal_id: None,
             occupant_generation: 0,
             agent_account: None,
+            fence: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2292,6 +2308,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            fence: None,
                         },
                     )]),
                     zoomed: false,
@@ -2604,6 +2621,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                fence: None,
             },
         );
         let mut history = SessionHistorySnapshot {

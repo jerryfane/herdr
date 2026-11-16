@@ -361,6 +361,9 @@ pub struct TerminalState {
     /// keeps the same account; an explicit swap overrides it. Independent of the
     /// session-ref churn from hook reports.
     pub agent_account: Option<String>,
+    /// Who this terminal's processes are fenced as. Set by `agent.start`, restore and
+    /// unarchive; a rename leaves it alone. Every respawn of the pane reuses it.
+    pub fence_identity: crate::fence::FenceIdentity,
     /// Set when a resume was REFUSED because `agent_account` no longer resolves to a
     /// registered account. Holds the unresolved account id.
     ///
@@ -437,6 +440,7 @@ impl TerminalState {
             pending_launch_env: Vec::new(),
             account_resume_blocked: None,
             agent_account: None,
+            fence_identity: crate::fence::FenceIdentity::Anonymous,
             session_transfer: None,
             restore_error: None,
         }

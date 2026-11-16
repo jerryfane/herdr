@@ -19,7 +19,7 @@ use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::config::FenceConfig;
+use crate::config::{FenceConfig, FenceProfile, FenceScope};
 
 /// Environment variable that carries the resolved plan from the server to `fence-exec`.
 /// `fence-exec` removes it before running the pane command.
@@ -193,6 +193,69 @@ impl FencePlan {
     }
 }
 
+/// Which `[fence.agents]` entry a terminal's processes are fenced as. `agent.start`,
+/// a session restore and an unarchive set it; renaming an agent does not change it,
+/// so an agent cannot rename itself out of its fence before a respawn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceIdentity {
+    /// Not started as a named agent: a plain shell or a created pane.
+    #[default]
+    Anonymous,
+    Agent(String),
+}
+
+impl FenceIdentity {
+    pub(crate) fn from_agent_name(name: Option<String>) -> Self {
+        name.map_or(Self::Anonymous, Self::Agent)
+    }
+}
+
+/// Whether `config` fences a pane started as `identity` (platform support aside).
+fn fences(config: &FenceConfig, identity: &FenceIdentity) -> bool {
+    if !config.enabled {
+        return false;
+    }
+    let entry = match identity {
+        FenceIdentity::Agent(name) => config.agents.get(name),
+        FenceIdentity::Anonymous => None,
+    };
+    match entry {
+        Some(agent) => agent.profile == FenceProfile::Default,
+        None => config.scope == FenceScope::All,
+    }
+}
+
+/// Whether a pane started now as `identity` runs inside the fence. An error when
+/// `[fence]` failed to load, which refuses every pane start.
+fn pane_fenced_as(identity: &FenceIdentity) -> io::Result<bool> {
+    let config = loaded_policy()?;
+    Ok(crate::platform::FENCE_SUPPORTED && fences(&config, identity))
+}
+
+/// Whether the shell process `pid` must be replaced before an agent that is fenced
+/// as `identity` is typed into it: it is outside the fence the agent needs, or
+/// inside a fence the agent is exempt from. A shell that cannot be inspected is
+/// replaced whenever the agent needs the fence.
+pub(crate) fn shell_needs_respawn(pid: Option<u32>, identity: &FenceIdentity) -> io::Result<bool> {
+    let fenced = pane_fenced_as(identity)?;
+    #[cfg(unix)]
+    {
+        use crate::platform::FencePeer;
+        Ok(match pid.map(crate::platform::fence_peer) {
+            Some(FencePeer::Unfenced) => fenced,
+            Some(FencePeer::Fenced { .. }) => !fenced,
+            Some(FencePeer::Unknown) | None => fenced,
+        })
+    }
+    // No fence exists here, so `fenced` is false.
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(fenced)
+    }
+}
+
 /// The fence policy pane spawns use; replaced at startup and on config reload.
 /// `Err` means config.toml asks for a fence that could not be loaded: every pane
 /// spawn is refused until a valid `[fence]` is reloaded (fail closed).
@@ -225,10 +288,11 @@ pub(crate) fn api_gate_active() -> bool {
         || current_policy().map_or(true, |config| config.enabled)
 }
 
-/// True when panes started now are fenced, so a fenced caller may create panes:
-/// the new pane cannot be looser than the caller's.
+/// True when panes created now are fenced, so a fenced caller may create panes:
+/// the new pane cannot be looser than the caller's. Created panes are anonymous.
 pub(crate) fn new_panes_are_fenced() -> bool {
-    crate::platform::FENCE_SUPPORTED && current_policy().is_ok_and(|config| config.enabled)
+    crate::platform::FENCE_SUPPORTED
+        && current_policy().is_ok_and(|config| fences(&config, &FenceIdentity::Anonymous))
 }
 
 /// Record a pane process this server adopted (live handoff) or started, so the API
@@ -323,6 +387,14 @@ fn current_policy() -> Policy {
         .clone()
 }
 
+fn loaded_policy() -> io::Result<Arc<FenceConfig>> {
+    current_policy().map_err(|err| {
+        io::Error::other(format!(
+            "pane fence: {err}; not starting the pane. Fix [fence] in config.toml and run `herdr server reload-config`"
+        ))
+    })
+}
+
 /// Config-time checks. Every message names the offending entry.
 pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
     let mut errors = Vec::new();
@@ -340,6 +412,11 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
     for entry in config.pin.as_deref().into_iter().flatten() {
         if let Err(err) = check_path_syntax(entry) {
             errors.push(format!("fence.pin entry {entry:?}: {err}"));
+        }
+    }
+    for (name, agent) in &config.agents {
+        if agent.reason.trim().is_empty() {
+            errors.push(format!("fence.agents.{name}: reason must not be empty"));
         }
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -771,16 +848,16 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
     rest.ends_with(last)
 }
 
-/// Rewrite a pane command so it starts inside the fence. A no-op when the fence is
-/// off or unsupported on this platform; an error (the pane does not start) when the
-/// fence is on but the plan cannot be built, or when `[fence]` failed to load.
-pub(crate) fn fence_pane_command(cmd: &mut CommandBuilder) -> io::Result<()> {
-    let config = current_policy().map_err(|err| {
-        io::Error::other(format!(
-            "pane fence: {err}; not starting the pane. Fix [fence] in config.toml and run `herdr server reload-config`"
-        ))
-    })?;
-    if !config.enabled || !crate::platform::FENCE_SUPPORTED {
+/// Rewrite a pane command so it starts inside the fence. A no-op when `identity` is
+/// not fenced (fence off, not in scope, or unsupported on this platform); an error
+/// (the pane does not start) when the plan cannot be built, or when `[fence]` failed
+/// to load.
+pub(crate) fn fence_pane_command(
+    cmd: &mut CommandBuilder,
+    identity: &FenceIdentity,
+) -> io::Result<()> {
+    let config = loaded_policy()?;
+    if !crate::platform::FENCE_SUPPORTED || !fences(&config, identity) {
         return Ok(());
     }
     let home = std::env::var_os("HOME")
@@ -942,6 +1019,85 @@ mod tests {
             allow: allow.iter().map(|s| (*s).to_string()).collect(),
             mask_sockets: Some(mask.iter().map(|s| (*s).to_string()).collect()),
             pin: Some(Vec::new()),
+            ..FenceConfig::default()
+        }
+    }
+
+    fn parse_fence(toml: &str) -> Result<FenceConfig, String> {
+        let table: toml::Table = toml.parse().map_err(|err| format!("{err}"))?;
+        table["fence"]
+            .clone()
+            .try_into::<FenceConfig>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn agent(name: &str) -> FenceIdentity {
+        FenceIdentity::Agent(name.into())
+    }
+
+    #[test]
+    fn agents_scope_fences_only_listed_agents() {
+        let config = parse_fence(
+            r#"[fence]
+enabled = true
+scope = "agents"
+[fence.agents.real-estate]
+reason = "pilot"
+[fence.agents.jarvis]
+profile = "unfenced"
+reason = "coordinator"
+"#,
+        )
+        .expect("valid");
+        assert!(fences(&config, &agent("real-estate")));
+        assert!(!fences(&config, &agent("jarvis")));
+        assert!(!fences(&config, &agent("drivekey")));
+        assert!(!fences(&config, &FenceIdentity::Anonymous));
+
+        let off = FenceConfig {
+            enabled: false,
+            ..config
+        };
+        assert!(!fences(&off, &agent("real-estate")));
+    }
+
+    #[test]
+    fn all_scope_fences_everyone_but_unfenced_agents() {
+        let config = parse_fence(
+            "[fence]\nenabled = true\n[fence.agents.fleetup]\nprofile = \"unfenced\"\nreason = \"installer\"\n",
+        )
+        .expect("valid");
+        assert_eq!(config.scope, FenceScope::All);
+        assert!(fences(&config, &FenceIdentity::Anonymous));
+        assert!(fences(&config, &agent("real-estate")));
+        assert!(!fences(&config, &agent("fleetup")));
+    }
+
+    #[test]
+    fn agent_entries_need_a_reason_and_a_known_profile() {
+        for (toml, needle) in [
+            ("[fence.agents.a]\nprofile = \"default\"\n", "reason"),
+            (
+                "[fence.agents.a]\nreason = \"  \"\n",
+                "reason must not be empty",
+            ),
+            (
+                "[fence.agents.a]\nprofile = \"loose\"\nreason = \"x\"\n",
+                "loose",
+            ),
+            (
+                "[fence.agents.a]\nreason = \"x\"\nallow = [\"/x\"]\n",
+                "allow",
+            ),
+            ("[fence]\nscope = \"some\"\n", "some"),
+        ] {
+            let toml = if toml.starts_with("[fence]") {
+                toml.to_string()
+            } else {
+                format!("[fence]\n{toml}")
+            };
+            let err = parse_fence(&toml).expect_err(&toml);
+            assert!(err.contains(needle), "{toml}: {err}");
         }
     }
 

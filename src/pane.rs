@@ -152,6 +152,8 @@ pub(crate) struct PaneLaunchEnv {
     /// still needing a conflicting global token cleared.
     clear_vars: Vec<String>,
     identity: PaneLaunchIdentity,
+    /// Who the pane's processes are fenced as.
+    fence: crate::fence::FenceIdentity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,6 +174,7 @@ impl PaneLaunchEnv {
             extra,
             clear_vars: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
+            fence: crate::fence::FenceIdentity::Anonymous,
         }
     }
 
@@ -182,6 +185,7 @@ impl PaneLaunchEnv {
             extra: account_env.vars,
             clear_vars: account_env.clear_vars,
             identity: PaneLaunchIdentity::Inherit,
+            fence: crate::fence::FenceIdentity::Anonymous,
         }
     }
 
@@ -201,6 +205,11 @@ impl PaneLaunchEnv {
 
     pub(crate) fn without_pane_identity(mut self) -> Self {
         self.identity = PaneLaunchIdentity::OmitPane;
+        self
+    }
+
+    pub(crate) fn with_fence_identity(mut self, fence: crate::fence::FenceIdentity) -> Self {
+        self.fence = fence;
         self
     }
 }
@@ -270,11 +279,13 @@ struct PendingAgentRelease {
     until: std::time::Instant,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Who the pane is fenced as.
+    fence: &'a crate::fence::FenceIdentity,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2588,6 +2599,7 @@ impl PaneRuntime {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
+                fence: &launch_env.fence,
             },
             AgentDetection::Enabled,
         )
@@ -2626,7 +2638,12 @@ impl PaneRuntime {
             render_dirty,
             cmd,
             "failed to spawn command pane",
-            SpawnInitialState::default(),
+            SpawnInitialState {
+                detected_agent: None,
+                history_ansi: None,
+                windows_powershell_prompt_cwd_reporting: false,
+                fence: &launch_env.fence,
+            },
             agent_detection,
         )
     }
@@ -2673,7 +2690,12 @@ impl PaneRuntime {
             render_dirty,
             cmd,
             "failed to spawn argv command pane",
-            SpawnInitialState::default(),
+            SpawnInitialState {
+                detected_agent: None,
+                history_ansi: None,
+                windows_powershell_prompt_cwd_reporting: false,
+                fence: &launch_env.fence,
+            },
             agent_detection,
         )
     }
@@ -2919,7 +2941,7 @@ impl PaneRuntime {
         // Every pane process starts here; with [fence] enabled the command is
         // rewritten to run inside the fence, and a plan failure keeps the pane from
         // starting (fail closed).
-        crate::fence::fence_pane_command(&mut cmd)
+        crate::fence::fence_pane_command(&mut cmd, initial_state.fence)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;

@@ -81,6 +81,52 @@ kill "$SERVER"; wait "$SERVER" 2>/dev/null || true
 sleep 0.3
 findmnt -R -n -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION / | sort > "$OUT/mounts-after"
 
+# Per-agent scope (#445): only the listed agent is fenced. A plain pane stays unfenced
+# (positive control), and `agent start` restarts that pane's unfenced shell under the
+# agent's fence before the agent runs. The agent is a stub `pi` that probes and waits.
+mkdir -p /fleet/pilot
+cat > /usr/bin/pi <<'EOF'
+#!/bin/sh
+# touch, not `: >`: a failed redirection on a special builtin ends a non-interactive sh.
+if touch /fleet/pilot/agent-write 2>/dev/null; then w=ok; else w=blocked; fi
+echo "agent_fence ${HERDR_FENCE:-0} agent_write $w" > /tmp/fence-out/agent.txt
+exec sleep 600
+EOF
+chmod +x /usr/bin/pi
+cat > "$CFG_DIR/config.toml" <<'EOF'
+[fence]
+enabled = true
+scope = "agents"
+deny = ["/fleet/pilot"]
+
+[fence.agents.pilot]
+reason = "e2e: the one fenced agent"
+EOF
+"$HERDR" server > "$OUT/server-agents.log" 2>&1 &
+SERVER=$!
+i=0
+until "$HERDR" pane list >/dev/null 2>&1; do
+  i=$((i + 1)); [ $i -lt 100 ] || { cat "$OUT/server-agents.log"; echo "agents-scope server did not start"; exit 1; }
+  sleep 0.1
+done
+"$HERDR" workspace create --cwd /tmp --label agents-scope >/dev/null
+APANE=$(pane_ids | head -n1)
+"$HERDR" pane run "$APANE" "if : > /fleet/pilot/plain-write 2>/dev/null; then w=ok; else w=blocked; fi; echo \"plain_fence \${HERDR_FENCE:-0} plain_write \$w\" > $OUT/plain.txt" >/dev/null
+i=0
+until [ -s "$OUT/plain.txt" ]; do
+  i=$((i + 1)); [ $i -lt 100 ] || { echo "plain pane probe timed out"; break; }
+  sleep 0.1
+done
+"$HERDR" agent start pilot --kind pi --pane "$APANE" > "$OUT/agent-start.txt" 2>&1 || true
+i=0
+until [ -s "$OUT/agent.txt" ]; do
+  i=$((i + 1)); [ $i -lt 100 ] || { cat "$OUT/agent-start.txt"; "$HERDR" pane read "$APANE" --source recent --lines 20 || true; echo "agent probe timed out"; break; }
+  sleep 0.1
+done
+APANE_AFTER=$(pane_ids | head -n1)
+kill "$SERVER"; wait "$SERVER" 2>/dev/null || true
+sleep 0.3
+
 # Positive control: same checks, no fence, after the server is gone. The mount table
 # was already compared, so give remount/umount a real bind to act on, as in the pane.
 mount --bind /fleet/protected /fleet/protected
@@ -90,6 +136,13 @@ echo "== fenced vs unfenced"
 paste -d' ' "$OUT/fenced.txt" "$OUT/control.txt" | awk '{printf "%-24s fenced=%-8s unfenced=%s\n", $1, $2, $4}'
 
 fail=0
+echo "== per-agent scope"
+cat "$OUT/plain.txt" "$OUT/agent.txt" 2>/dev/null
+grep -qx "plain_fence 0 plain_write ok" "$OUT/plain.txt" 2>/dev/null \
+  || { echo "FAIL scope=agents fenced a pane that is not a listed agent"; fail=1; }
+grep -qx "agent_fence 1 agent_write blocked" "$OUT/agent.txt" 2>/dev/null \
+  || { echo "FAIL the listed agent did not start inside the fence"; cat "$OUT/agent-start.txt"; fail=1; }
+[ "$APANE" = "$APANE_AFTER" ] || { echo "FAIL agent start changed the pane id ($APANE -> $APANE_AFTER)"; fail=1; }
 expect() { # expect <check> <fenced result> <unfenced result>
   got_f=$(awk -v n="$1" '$1==n{print $2}' "$OUT/fenced.txt")
   got_c=$(awk -v n="$1" '$1==n{print $2}' "$OUT/control.txt")
