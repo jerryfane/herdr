@@ -1146,32 +1146,20 @@ impl App {
         Ok((agent, argv))
     }
 
-    /// Replace the pane's shell with one started under `fence`. The old shell keeps
-    /// running until the new one has started, so a failed spawn leaves the pane as it
-    /// was.
+    /// Replace the pane's shell with one started under `fence`, and record `fence` as
+    /// the terminal's identity once the new shell runs. The old shell keeps running
+    /// until then, so a failed spawn leaves the pane and its identity as they were.
     fn respawn_shell_with_fence(
         &mut self,
         pane_id: crate::layout::PaneId,
         terminal_id: &crate::terminal::TerminalId,
         fence: crate::fence::FenceIdentity,
     ) -> Result<(), AgentStartError> {
-        let terminal = self
-            .state
-            .terminals
-            .get_mut(terminal_id)
-            .ok_or_else(|| AgentStartError::Fence("the pane's terminal is gone".into()))?;
-        let previous = std::mem::replace(&mut terminal.fence_identity, fence);
-        let spawned = self
-            .spawn_pane_shell(pane_id)
-            .map(|(_, _, spawned)| spawned);
-        let runtime = match spawned {
-            Some(Ok(runtime)) => runtime,
+        let runtime = match self.spawn_pane_shell(pane_id, Some(fence.clone())) {
+            Some((_, _, Ok(runtime))) => runtime,
             failed => {
-                if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
-                    terminal.fence_identity = previous;
-                }
                 let reason = match failed {
-                    Some(Err(err)) => err.to_string(),
+                    Some((_, _, Err(err))) => err.to_string(),
                     _ => "the pane is gone".into(),
                 };
                 return Err(AgentStartError::Fence(format!(
@@ -1181,6 +1169,9 @@ impl App {
         };
         self.shutdown_terminal_runtime(terminal_id.clone());
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.fence_identity = fence;
+        }
         Ok(())
     }
 

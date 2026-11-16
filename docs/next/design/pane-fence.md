@@ -300,10 +300,11 @@ Rules:
   no way for a profile to add capabilities beyond root's. `pid_namespace` is the one switch a profile may
   set either way, so the pilot can turn it on for one agent.
 - **`reason` is required** on every profile and every agent entry; a missing reason is a config error.
-- **Agent identity** is the herdr agent name the pane runs (`[fence.agents.<name>]`). Panes without an
-  agent, and agents without an entry, get the base fence (profile `default`). Built-in profile names:
-  `default` (the base) and `unfenced`. `{agent}` in a path expands to the agent name; a pane without an
-  agent gets no `{agent}` carve-out.
+- **Agent identity** is the herdr agent name the pane was started as (`[fence.agents.<name>]`). Panes without
+  an agent, and agents without an entry, follow `scope` (below): fenced with the base fence (profile
+  `default`) under `scope = "all"`, unfenced under `scope = "agents"`. Built-in profile names: `default` (the
+  base) and `unfenced`. `{agent}` in a path expands to the agent name; a pane without an agent gets no
+  `{agent}` carve-out.
 - **The name is not known when a pane's shell spawns.** `agent.start` types the agent command into a shell
   that already exists (`App::start_agent` in `src/app/agents.rs`). So when the shell is outside the fence the
   agent needs, or inside one it is exempt from (`fence::shell_needs_respawn`, judged from the shell's mount

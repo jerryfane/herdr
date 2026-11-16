@@ -853,7 +853,7 @@ impl App {
         pane_id: crate::layout::PaneId,
         focus_pane: bool,
     ) -> bool {
-        let Some((ws_idx, terminal_id, spawned)) = self.spawn_pane_shell(pane_id) else {
+        let Some((ws_idx, terminal_id, spawned)) = self.spawn_pane_shell(pane_id, None) else {
             return false;
         };
         let runtime = match spawned {
@@ -881,12 +881,14 @@ impl App {
         true
     }
 
-    /// Start a fresh shell for an existing pane, with its cwd, size, armed account env
-    /// and fence identity. The caller installs the runtime. `None` when the pane or
-    /// its terminal is gone.
+    /// Start a fresh shell for an existing pane, with its cwd, size and armed account
+    /// env. It runs under `fence`, or under the terminal's own fence identity when
+    /// `None`. The caller installs the runtime. `None` when the pane or its terminal
+    /// is gone.
     pub(super) fn spawn_pane_shell(
         &self,
         pane_id: crate::layout::PaneId,
+        fence: Option<crate::fence::FenceIdentity>,
     ) -> Option<(
         usize,
         crate::terminal::TerminalId,
@@ -915,6 +917,10 @@ impl App {
                     })
             });
         let launch_env = self.pane_launch_env(ws_idx, pane_id, account_env)?;
+        let launch_env = match fence {
+            Some(fence) => launch_env.with_fence_identity(fence),
+            None => launch_env,
+        };
         let spawned = crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
