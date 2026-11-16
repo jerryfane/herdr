@@ -75,6 +75,34 @@ pub(crate) const DEFAULT_DENY: &[&str] = &[
     "~/.config/systemd",
     // SSH keys and authorized_keys.
     "~/.ssh",
+    // gitmoot: config, credentials, runtimes and toolchains it executes, plugins
+    // and scripts, review pins, and database backups. The rest of ~/.gitmoot stays
+    // writable: every gitmoot CLI call chmods the directory and some subdirectories
+    // and opens the database read-write (traced; see DEFAULT_PIN).
+    "~/.gitmoot/config.toml*",
+    "~/.gitmoot/*.env*",
+    "~/.gitmoot/daemon.json",
+    "~/.gitmoot/gitmoot.db.bak*",
+    "~/.gitmoot/runtimes",
+    "~/.gitmoot/toolchains",
+    "~/.gitmoot/execbackends",
+    "~/.gitmoot/plugins",
+    "~/.gitmoot/scripts",
+    "~/.gitmoot/skillopt",
+    "~/.gitmoot/review-pins",
+    // gitmoot's review checkouts and worktrees; its daemon writes them, not agents.
+    "~/.gitmoot/checkouts",
+    "~/.gitmoot/worktrees",
+];
+
+/// Writable inside fenced panes, but bound onto themselves so they cannot be
+/// deleted or renamed, unless `[fence] pin` replaces the list.
+pub(crate) const DEFAULT_PIN: &[&str] = &[
+    // gitmoot's data directory: `rm -rf ~/.gitmoot` must not take the database.
+    "~/.gitmoot",
+    // The database file. Its -wal and -shm files are not pinned: SQLite deletes and
+    // recreates them, and a pane holding an old inode would write where no one reads.
+    "~/.gitmoot/gitmoot.db",
 ];
 
 /// Sockets that run work outside the fence. Masked unless `[fence] mask_sockets`
@@ -309,6 +337,11 @@ pub(crate) fn validate_config(config: &FenceConfig) -> Vec<String> {
             errors.push(format!("fence.mask_sockets entry {entry:?}: {err}"));
         }
     }
+    for entry in config.pin.as_deref().into_iter().flatten() {
+        if let Err(err) = check_path_syntax(entry) {
+            errors.push(format!("fence.pin entry {entry:?}: {err}"));
+        }
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let deny_entries: Vec<String> = match deny {
         Some(entries) => entries.to_vec(),
@@ -515,6 +548,11 @@ pub(crate) fn resolve_plan(
         &mut lexical_paths,
         "mask",
     )?;
+    let pin_entries: Vec<String> = match &config.pin {
+        Some(entries) => entries.clone(),
+        None => DEFAULT_PIN.iter().map(|e| (*e).to_string()).collect(),
+    };
+    let pins = resolve_entries(&pin_entries, home, &mut skipped, &mut lexical_paths, "pin")?;
 
     // Anchors: every ancestor of a fenced path that stays writable in the pane
     // (outside every deny, or inside a carve-out), so renaming the ancestor cannot
@@ -539,7 +577,18 @@ pub(crate) fn resolve_plan(
         best.is_some_and(|(_, order)| order != 2)
     };
     let mut anchors: Vec<PathBuf> = Vec::new();
-    for path in deny.iter().chain(&mandatory).chain(&allow).chain(&mask) {
+    for pin in &pins {
+        if !anchors.iter().any(|a| a == pin) {
+            anchors.push(pin.clone());
+        }
+    }
+    for path in deny
+        .iter()
+        .chain(&mandatory)
+        .chain(&allow)
+        .chain(&mask)
+        .chain(&pins)
+    {
         for ancestor in path.ancestors().skip(1) {
             if ancestor == Path::new("/") || ancestor.as_os_str().is_empty() {
                 continue;
@@ -892,6 +941,7 @@ mod tests {
             deny: Some(deny.iter().map(|s| (*s).to_string()).collect()),
             allow: allow.iter().map(|s| (*s).to_string()).collect(),
             mask_sockets: Some(mask.iter().map(|s| (*s).to_string()).collect()),
+            pin: Some(Vec::new()),
         }
     }
 
@@ -1073,6 +1123,66 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn default_gitmoot_rules_keep_the_database_writable_and_undeletable() {
+        let home = temp_root("gitmoot");
+        let gm = home.join(".gitmoot");
+        for dir in ["runtimes", "logs", "workspaces", "evals/blobs"] {
+            std::fs::create_dir_all(gm.join(dir)).unwrap();
+        }
+        for file in [
+            "gitmoot.db",
+            "gitmoot.db-wal",
+            "config.toml",
+            "config.toml.bak-1",
+            "runtime-auth.env",
+        ] {
+            std::fs::write(gm.join(file), "").unwrap();
+        }
+        let cfg = FenceConfig {
+            enabled: true,
+            ..FenceConfig::default()
+        };
+        let plan = resolve_plan(&cfg, &home, &[]).expect("plan");
+        // Pinned: writable, but the directory and the database cannot be removed.
+        position(&plan, &FenceMount::Anchor(gm.clone()));
+        position(&plan, &FenceMount::Anchor(gm.join("gitmoot.db")));
+        // Read-only: config (with backups), credentials, code it executes.
+        for denied in [
+            "config.toml",
+            "config.toml.bak-1",
+            "runtime-auth.env",
+            "runtimes",
+        ] {
+            position(&plan, &FenceMount::Deny(gm.join(denied)));
+        }
+        // The CLI writes these: they must not be read-only, and the -wal file must
+        // not be pinned (SQLite replaces it).
+        for writable in [
+            "",
+            "logs",
+            "workspaces",
+            "evals",
+            "evals/blobs",
+            "gitmoot.db",
+            "gitmoot.db-wal",
+        ] {
+            let path = if writable.is_empty() {
+                gm.clone()
+            } else {
+                gm.join(writable)
+            };
+            assert!(
+                !plan.mounts.contains(&FenceMount::Deny(path.clone())),
+                "{path:?} denied"
+            );
+        }
+        assert!(!plan
+            .mounts
+            .contains(&FenceMount::Anchor(gm.join("gitmoot.db-wal"))));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn resolution_failures_other_than_absence_fail_the_plan() {
         // A symlink loop cannot be resolved (ELOOP). Unlike a missing path, the

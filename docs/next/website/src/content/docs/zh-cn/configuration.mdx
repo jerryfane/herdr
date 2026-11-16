@@ -661,7 +661,7 @@ deny = ["/usr", "/etc", "~/.ssh", "/srv/shared"]
 allow = ["/srv/shared/my-project"]
 ```
 
-省略 `deny` 和 `mask_sockets` 即使用内置列表 (参见 [配置参考](/docs/config-reference/))。herdr 自己的配置目录在围栏内始终只读；它的套接字仍可连接，所以 `herdr` CLI 照常可用。围栏内的窗格会设置 `HERDR_FENCE`。
+`pin` 列出在围栏内的窗格中保持可写、但不能被删除或重命名的路径，例如数据库及其目录。省略 `deny` 和 `mask_sockets` 即使用内置列表 (参见 [配置参考](/docs/config-reference/))。herdr 自己的配置目录在围栏内始终只读；它的套接字仍可连接，所以 `herdr` CLI 照常可用。围栏内的窗格会设置 `HERDR_FENCE`。
 
 在围栏内的窗格中，`herdr` CLI 可以读取所有内容、与智能体对话 (`agent prompt`)，并操作自己的窗格和智能体：发送输入、重命名、关闭、报告智能体状态。它不能在围栏外操作：向其他窗格发送输入、启动或重启智能体、`server reload-config`、更新、停止服务器、插件、工作树和账户都会以 `fence_refused` 错误拒绝。它创建的新窗格、标签页和工作区同样在围栏内启动。围栏内的窗格无法连接私有的 TUI 客户端套接字。
 

@@ -23,6 +23,10 @@ attempt write_carveout        sh -c "echo y >> $F/protected/db/data.db"
 attempt rmdir_carveout        rmdir "$F/protected/spare"
 attempt rename_ancestor       sh -c "mv $F $F.moved && mv $F.moved $F"
 attempt unlink_symlink_alias  sh -c "rm $F/bin && ln -s real-bin $F/bin"
+attempt write_pinned_db       sh -c "echo row >> $F/gm/gitmoot.db"
+attempt write_in_pinned_dir   sh -c "echo x > $F/gm/new-log && rm $F/gm/new-log"
+attempt write_gm_config       sh -c "echo x >> $F/gm/config.toml"
+attempt rename_pinned_dir     sh -c "mv $F/gm $F/gm.moved && mv $F/gm.moved $F/gm"
 attempt write_outside_deny    sh -c "echo ok > /tmp/fence-free && rm /tmp/fence-free"
 attempt rename_across_dirs    sh -c "mkdir -p /tmp/ra /tmp/rb && touch /tmp/ra/f && mv /tmp/ra/f /tmp/rb/f && rm -r /tmp/ra /tmp/rb"
 attempt mount_tmpfs           sh -c "mkdir -p /tmp/fence-mnt && mount -t tmpfs t /tmp/fence-mnt && umount /tmp/fence-mnt"
@@ -41,6 +45,7 @@ attempt cap_sys_boot          cap_bit 22
 attempt cap_sys_ptrace        cap_bit 19
 attempt cap_mknod             cap_bit 27
 attempt cap_dac_read_search   cap_bit 2
+attempt rm_pinned_db          sh -c "cp $F/gm/gitmoot.db /tmp/gm.db && rm $F/gm/gitmoot.db && cp /tmp/gm.db $F/gm/gitmoot.db"
 # Last: the 2026-11-15 herdr config wipe. The control run destroys the fixture config.
 attempt rm_herdr_config       sh -c "set -e; d=\$(ls -d \"\$XDG_CONFIG_HOME\"/herdr*); rm -rf \"\$d\"/config.toml"
 echo "fence_env ${HERDR_FENCE:-unset}"
