@@ -138,6 +138,7 @@ fn transcript_response(
                 plan: page.plan,
                 recap: page.recap,
                 subagents: page.subagents,
+                resent: page.resent,
             },
         ),
         Err(error) => encode_error(id, error.code(), error.message()),

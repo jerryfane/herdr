@@ -261,6 +261,11 @@ pub enum ResponseResult {
         /// newest first, at most 20.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagents: Option<Vec<TranscriptSubagent>>,
+        /// On an `after` page: the ids of the entries re-sent from before the
+        /// cursor (origin-mark replays and changed steps), in page order. Every
+        /// other entry was appended since. Absent on newest and `before` pages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resent: Option<Vec<String>>,
     },
     StreamStarted {
         pane_id: String,

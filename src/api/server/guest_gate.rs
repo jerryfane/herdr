@@ -620,6 +620,7 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         plan,
         recap: _,
         subagents,
+        resent,
     } = result
     else {
         return None;
@@ -656,6 +657,13 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
             other => Some(other),
         })
         .collect();
+    // Only the re-sent entries the guest sees.
+    let resent = resent.map(|resent| {
+        resent
+            .into_iter()
+            .filter(|id| entries.iter().any(|entry| entry.id() == id))
+            .collect::<Vec<_>>()
+    });
     let plan = plan.map(|mut items| {
         for item in &mut items {
             item.blocker = None;
@@ -687,6 +695,9 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
     });
     if let Some(subagents) = subagents {
         projected["subagents"] = serde_json::to_value(subagents).ok()?;
+    }
+    if let Some(resent) = resent {
+        projected["resent"] = serde_json::to_value(resent).ok()?;
     }
     Some(projected)
 }
@@ -3668,6 +3679,7 @@ mod tests {
                 result["pending_ask"]["answerable"], true,
                 "the guest answers it too"
             );
+            assert!(result.get("resent").is_none(), "newest pages omit it");
             // The cursor works for the guest's next poll.
             let after = result["after"].as_str().unwrap();
             let poll = harness.call(
@@ -3675,7 +3687,57 @@ mod tests {
                 json!({"id": "t", "method": "agent.transcript", "params": {"target": target, "after": after}}),
             );
             assert_eq!(poll[0]["result"]["entries"], json!([]), "{poll:?}");
+            assert_eq!(poll[0]["result"]["resent"], json!([]), "{poll:?}");
         }
+    }
+
+    #[test]
+    fn guest_transcript_lists_only_the_visible_resent_entries() {
+        use crate::api::schema::{TranscriptAuthor, TranscriptNoteSource};
+        let user = |id: &str| TranscriptEntry::User {
+            id: id.into(),
+            ts_ms: 1,
+            text: "prompt".into(),
+            author: TranscriptAuthor::Owner,
+            author_name: None,
+            origin: None,
+        };
+        let note = TranscriptEntry::Note {
+            id: "note".into(),
+            ts_ms: 1,
+            source: TranscriptNoteSource::Gitmoot,
+            title: "inbox".into(),
+            from: None,
+            body: "owner only".into(),
+        };
+        let page = |resent: Option<Vec<String>>| ResponseResult::AgentTranscript {
+            agent: "a".into(),
+            pane_id: "p".into(),
+            session_id: "s".into(),
+            entries: vec![user("old"), note.clone(), user("new")],
+            before: None,
+            after: "cursor".into(),
+            pending_ask: None,
+            working: None,
+            model: None,
+            plan: None,
+            recap: None,
+            subagents: None,
+            resent,
+        };
+        let projected = project_transcript(page(Some(vec!["old".into(), "note".into()]))).unwrap();
+        assert_eq!(projected["resent"], json!(["old"]));
+        let ids: Vec<&str> = projected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["old", "new"]);
+        let projected = project_transcript(page(Some(Vec::new()))).unwrap();
+        assert_eq!(projected["resent"], json!([]));
+        let projected = project_transcript(page(None)).unwrap();
+        assert!(projected.get("resent").is_none());
     }
 
     #[test]

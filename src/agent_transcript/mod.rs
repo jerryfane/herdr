@@ -79,6 +79,9 @@ pub(crate) struct Page {
     pub(crate) plan: Option<Vec<TranscriptPlanItem>>,
     pub(crate) recap: Option<TranscriptRecap>,
     pub(crate) subagents: Option<Vec<TranscriptSubagent>>,
+    /// On an `after` page, the ids of the entries re-sent from before the
+    /// cursor, in page order; `None` on newest and `before` pages.
+    pub(crate) resent: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -273,6 +276,7 @@ fn unwritten_page(path: &Path, request: &PageRequest) -> Result<Page, Transcript
         plan: None,
         recap: None,
         subagents: None,
+        resent: request.after.as_ref().map(|_| Vec::new()),
     })
 }
 
@@ -671,6 +675,13 @@ impl View<'_> {
         if let Some(seen) = changed_since {
             self.resend_changed(seen, start, &mut entries)?;
         }
+        // Everything rendered so far precedes the new range: it is re-sent.
+        let resent = changed_since.map(|_| {
+            entries
+                .iter()
+                .map(|entry| entry.id().to_owned())
+                .collect::<Vec<_>>()
+        });
         let start = match request.max_bytes {
             Some(max_bytes) if changed_since.is_none() => {
                 let matched = self.other_user_turns(other_prompts)?;
@@ -743,6 +754,7 @@ impl View<'_> {
             plan: self.current_plan()?,
             recap: self.current_recap()?,
             subagents: self.current_subagents()?,
+            resent,
         })
     }
 
