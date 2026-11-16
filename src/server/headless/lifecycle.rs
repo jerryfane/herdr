@@ -177,6 +177,7 @@ impl HeadlessServer {
             listener,
             &socket_path,
             &token,
+            child_pid,
             &manifest,
         ) {
             Ok(stream) => stream,

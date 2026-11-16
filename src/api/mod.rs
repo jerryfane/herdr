@@ -5,6 +5,7 @@ pub(crate) mod federation;
 pub mod federation_manager;
 mod federation_relay;
 pub mod federation_store;
+pub(crate) mod fence_policy;
 #[cfg(unix)]
 pub(crate) mod gram_gateway;
 pub(crate) mod gram_relay;
@@ -58,7 +59,11 @@ pub(crate) fn server_boot_id() -> &'static str {
 }
 
 pub(crate) fn request_changes_ui(request: &Request) -> bool {
-    request.method.operation().changes_ui
+    match &request.method {
+        // A fenced caller's request changes the UI exactly when the wrapped one does.
+        schema::Method::FenceScoped(params) => params.method.operation().changes_ui,
+        method => method.operation().changes_ui,
+    }
 }
 
 pub struct ApiRequestMessage {

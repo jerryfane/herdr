@@ -2736,6 +2736,9 @@ impl PaneRuntime {
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
+        // A pane adopted from the previous server may be fenced even when the fence is
+        // now off; the API must keep checking callers while it runs.
+        crate::fence::note_pane_process(child_pid);
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
         let cwd_process_exited = Arc::new(AtomicBool::new(false));

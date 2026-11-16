@@ -110,6 +110,7 @@ mod tests {
 
     const SCHEMA_HIDDEN_OPERATIONS: &[&str] = &[
         "guest.agent_probe",
+        "fence.scoped",
         "pane.stream",
         "pane.stream.open",
         "pane.stream.close",

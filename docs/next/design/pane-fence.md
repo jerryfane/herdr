@@ -488,6 +488,23 @@ gateways and the federation listener apply the same classification to local peer
 
 **Events.** `events.subscribe` stays open to fenced callers; events carry no capability.
 
+**As implemented (#420).**
+- **When callers are checked:** while `[fence] enabled` is on (or failed to load), or once this server has
+  started or adopted a fenced pane process. Otherwise the API is unchanged and the check costs one atomic
+  load per request.
+- **Classification** (`platform::fence_peer`): unfenced means the same user namespace as the server and
+  `CAP_SYS_ADMIN` still in the bounding set. A fenced pane dropped that capability for good, and a new user
+  namespace would show a full bounding set again, so the user namespace is compared too.
+- **Own-pane requests:** wrapped by the server into an internal `fence.scoped` request. The app resolves
+  the caller's pane on every request by comparing mount namespaces with each pane's current process, so a
+  respawned pane is no longer owned by leftovers of the old one. `pane.input.stream` checks every frame
+  the same way.
+- **Allow list:** `src/api/fence_policy.rs`.
+- **Not in #420:** the `coordinator` profile arrives with the per-agent profiles in #419; until then
+  every fenced caller gets the default policy. Pane creation is allowed only while new panes start fenced
+  (one global fence, so a new pane is never looser than its creator); per-plan inheritance comes with
+  #419.
+
 ## 9. Visibility (#421)
 
 - `herdr agent get`, `agent list --json`, `pane get`: field `fence`: `{enabled, profile, deny_count,

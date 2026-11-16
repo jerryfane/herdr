@@ -4,6 +4,7 @@ pub(crate) mod accounts;
 mod agent_view;
 pub(super) mod agents;
 mod env;
+mod fence;
 mod gram;
 #[cfg(unix)]
 pub(crate) use gram::gram_push_notification;
@@ -1611,6 +1612,7 @@ impl App {
                 return self.handle_gram_get_file_chunk(request.id, params);
             }
             Method::GramRelayStatus(_) => return self.handle_gram_relay_status(request.id),
+            Method::FenceScoped(params) => return self.handle_fence_scoped(request.id, params),
             #[cfg(unix)]
             Method::GuestAgentProbe(params) => {
                 return self.handle_guest_agent_probe(request.id, params);
