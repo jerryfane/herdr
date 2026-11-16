@@ -8359,7 +8359,7 @@ mod federation_tests {
     #[cfg(unix)]
     #[test]
     fn proxy_waits_out_a_reader_that_stalls_past_the_write_timeout() {
-        const FRAMES: usize = 32;
+        const FRAMES: usize = 128;
         let started = serde_json::to_string(&SuccessResponse {
             id: "slow".into(),
             result: ResponseResult::StreamStarted {
@@ -8372,8 +8372,9 @@ mod federation_tests {
             },
         })
         .unwrap();
-        // 32 frames of 256 KiB base64 each: far more than the socket buffers
-        // between the home and its client hold.
+        // 128 frames of 256 KiB base64 each (32 MiB): far more than the
+        // loopback socket buffers between the home and its client hold, so
+        // the home's writes block while the client is not reading.
         let payload = "A".repeat(256 * 1024);
         let peer = start_proxy_peer(move |_request, mut sock| {
             writeln!(sock, "{started}").expect("peer writes stream_started");
