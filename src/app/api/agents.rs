@@ -6277,6 +6277,16 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(started["result"]["type"], "agent_started", "{started}");
+        // The agent came up and went idle, so it may be renamed.
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(crate::detect::Agent::Pi), AgentState::Idle);
+            assert!(terminal.reconcile_managed_agent_at(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                false
+            ));
+            assert!(!terminal.managed_agent_launch_pending());
+        }
         let renamed: serde_json::Value = serde_json::from_str(&app.handle_agent_rename(
             "req".into(),
             AgentRenameParams {
