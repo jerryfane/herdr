@@ -8356,6 +8356,9 @@ mod federation_tests {
     /// #443: a federated stream's reader that reads nothing for longer than the
     /// connection's 5 s write timeout is waited out like a local one: every
     /// frame arrives afterwards, whole, and the stream ends only with the peer.
+    /// The client is on a local socket, as a local API client is: there a
+    /// blocked write times out cleanly instead of trickling into a growing
+    /// loopback TCP window.
     #[cfg(unix)]
     #[test]
     fn proxy_waits_out_a_reader_that_stalls_past_the_write_timeout() {
@@ -8373,8 +8376,8 @@ mod federation_tests {
         })
         .unwrap();
         // 128 frames of 256 KiB base64 each (32 MiB): far more than the
-        // loopback socket buffers between the home and its client hold, so
-        // the home's writes block while the client is not reading.
+        // socket buffers between the home and its client hold, so the home's
+        // writes block while the client is not reading.
         let payload = "A".repeat(256 * 1024);
         let peer = start_proxy_peer(move |_request, mut sock| {
             writeln!(sock, "{started}").expect("peer writes stream_started");
@@ -8395,26 +8398,49 @@ mod federation_tests {
             .expect("peer writes exited");
             let _ = sock.flush();
         });
-        let registry = HashMap::from([(
-            "remote".to_string(),
-            ConnectionTarget::Tcp {
-                addr: peer.addr,
-                token: Some("tok".into()),
-            },
-        )]);
-        let mut home = drive_home(registry);
-        let mut reader = home_stream_reader(
-            &mut home,
-            serde_json::json!({
-                "id": "slow",
-                "method": "pane.stream",
-                "params": { "pane_id": "remote/screen" },
-            }),
-        );
-        reader
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(30)))
+        use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+        let path = std::env::temp_dir().join(format!("hfs443-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.incoming().next().unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let running = Arc::new(AtomicBool::new(true));
+        let home = {
+            let running = Arc::clone(&running);
+            std::thread::spawn(move || {
+                let registry = HashMap::from([(
+                    "remote".to_string(),
+                    PeerRoute::for_test(ConnectionTarget::Tcp {
+                        addr: peer.addr,
+                        token: Some("tok".into()),
+                    }),
+                )]);
+                let _ = handle_connection_with_stop(
+                    ApiStream::Local(server),
+                    &api_tx,
+                    &EventHub::default(),
+                    &running,
+                    None,
+                    None,
+                    None,
+                    &registry,
+                    None,
+                );
+            })
+        };
+        let request = serde_json::json!({
+            "id": "slow",
+            "method": "pane.stream",
+            "params": { "pane_id": "remote/screen" },
+        });
+        let mut client = client;
+        writeln!(client, "{request}").expect("write home request");
+        client
+            .set_recv_timeout(Some(Duration::from_secs(30)))
             .unwrap();
+        let mut reader = BufReader::new(client);
 
         // Read nothing for longer than two 5 s write timeouts: a blocked write
         // that already copied part of a frame returns that count after the
@@ -8422,8 +8448,13 @@ mod federation_tests {
         std::thread::sleep(Duration::from_secs(12));
 
         let mut lines = Vec::new();
-        while let Some(line) = next_stream_line(&mut reader) {
-            let value: serde_json::Value = serde_json::from_str(&line)
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line).expect("stream read") == 0 {
+                break;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&line)
                 .unwrap_or_else(|err| panic!("truncated frame ({err}): {} bytes", line.len()));
             lines.push(value);
         }
@@ -8434,6 +8465,9 @@ mod federation_tests {
             assert_eq!(frame["seq"], seq);
         }
         assert_eq!(lines[FRAMES + 1]["frame"], "exited");
+        running.store(false, Ordering::Relaxed);
+        drop(reader);
+        home.join().unwrap();
     }
 
     #[test]
