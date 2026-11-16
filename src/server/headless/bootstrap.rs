@@ -30,9 +30,6 @@ pub fn run_server() -> io::Result<()> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
         return run_handoff_import_server(&socket_path, token);
     }
-    // A `restart_later` update finishes here, when this build starts serving.
-    #[cfg(unix)]
-    crate::update::state::settle_restart_later_on_start();
 
     let loaded_config = config::Config::load();
     #[cfg(windows)]
@@ -105,6 +102,12 @@ pub fn run_server() -> io::Result<()> {
             }
             Err(err) => return Err(err),
         };
+
+        // Both sockets are bound: this build now serves, so a `restart_later`
+        // update for it has finished. Settling any earlier would record
+        // success for a start that then fails (or loses to a running server).
+        #[cfg(unix)]
+        crate::update::state::settle_restart_later_on_start();
 
         info!(
             api_socket = %api::socket_path().display(),

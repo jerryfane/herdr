@@ -38,6 +38,10 @@ pub(crate) const TEST_PUBLIC_KEY_ENV: &str = "HERDR_UPDATE_TEST_PUBLIC_KEY";
 /// downgrade guard, so a test can offer a copy of its own binary as newer.
 #[cfg(debug_assertions)]
 pub(crate) const TEST_RUNNING_COMMIT_ENV: &str = "HERDR_UPDATE_TEST_RUNNING_COMMIT";
+/// Debug builds only: the build id the running server reports, so a test can
+/// make a server the build a `restart_later` attempt downloaded.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_RUNNING_BUILD_ID_ENV: &str = "HERDR_UPDATE_TEST_RUNNING_BUILD_ID";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyError {
@@ -86,15 +90,22 @@ pub(super) struct RunningBuild {
 impl RunningBuild {
     pub(super) fn current() -> Self {
         #[cfg(debug_assertions)]
-        if let Some(commit) = std::env::var(TEST_RUNNING_COMMIT_ENV)
-            .ok()
-            .filter(|commit| !commit.trim().is_empty())
         {
-            return Self {
-                commit: Some(commit.trim().to_string()),
-                build_id: None,
-                commit_time: crate::build_info::commit_time(),
+            let var = |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
             };
+            let commit = var(TEST_RUNNING_COMMIT_ENV);
+            let build_id = var(TEST_RUNNING_BUILD_ID_ENV);
+            if commit.is_some() || build_id.is_some() {
+                return Self {
+                    commit,
+                    build_id,
+                    commit_time: crate::build_info::commit_time(),
+                };
+            }
         }
         Self {
             commit: crate::build_info::commit().map(str::to_string),

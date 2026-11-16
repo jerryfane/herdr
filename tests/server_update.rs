@@ -314,17 +314,73 @@ impl Fixture {
             .unwrap_or_else(|| panic!("no attempt id: {applied}"))
             .to_string()
     }
-}
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        // Whichever server serves now was started by this test.
+    /// Start one more server from the install, as `start_server` does, and
+    /// wait for it to exit: with the sockets taken it must give up.
+    fn start_duplicate_server(&self, extra_env: &[(&str, &str)]) -> portable_pty::ExitStatus {
+        let runtime_dir = self.base.join("runtime");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(&self.install);
+        support::isolate_herdr_test_process(&mut cmd);
+        cmd.arg("server");
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+        cmd.env("HERDR_SOCKET_PATH", &self.api_socket);
+        cmd.env(
+            "HERDR_CLIENT_SOCKET_PATH",
+            runtime_dir.join("herdr-client.sock"),
+        );
+        cmd.env("SHELL", "/bin/sh");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        support::register_spawned_herdr_pid(child.process_id());
+        drop(pair.slave);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                support::stop_spawned_herdr(&mut *child);
+                panic!("a second server kept running beside the first");
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        support::unregister_spawned_herdr_pid(child.process_id());
+        status
+    }
+
+    /// Stop the serving server and wait until its socket refuses connections.
+    fn stop_server(&mut self) {
         let _ = try_request(&self.api_socket, "server.stop", serde_json::json!({}));
         let deadline = Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&self.api_socket).is_ok() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(100));
         }
         self.server.take();
+    }
+
+    /// The outcome `state.json` records for the newest attempt.
+    fn recorded_outcome(&self) -> serde_json::Value {
+        let bytes = fs::read(self.updates().join("state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        state["attempt"]["outcome"].clone()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Whichever server serves now was started by this test.
+        self.stop_server();
         support::cleanup_test_base(&self.base);
     }
 }
@@ -667,6 +723,43 @@ fn update_apply_restart_later_installs_on_disk_without_touching_the_server() {
     assert!(pane_ids(&fixture).contains(&pane_id));
     assert_eq!(file_sha256(&fixture.install), build.sha256);
     assert!(!fixture.guard_log().contains("live handoff to"));
+}
+
+#[test]
+fn restart_later_settles_only_once_its_build_actually_serves() {
+    let mut fixture = Fixture::new();
+    fixture.start_server(&[]);
+    let build = fixture.publish_build(protocol(&fixture));
+    let attempt_id = fixture.apply(serde_json::json!({
+        "build_id": build.build_id,
+        "restart_later": true
+    }));
+    fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+    assert_eq!(fixture.recorded_outcome(), "downloaded_restart_required");
+
+    // The downloaded build starts while the old server still holds the
+    // sockets: it never serves, so the attempt is still pending.
+    let running_build = [(
+        "HERDR_UPDATE_TEST_RUNNING_BUILD_ID",
+        build.build_id.as_str(),
+    )];
+    let status = fixture.start_duplicate_server(&running_build);
+    assert!(!status.success(), "a duplicate server start must fail");
+    assert_eq!(fixture.recorded_outcome(), "downloaded_restart_required");
+
+    // Once it does serve, the attempt is settled.
+    fixture.stop_server();
+    fixture.start_server(&running_build);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fixture.recorded_outcome() != "updated" {
+        assert!(
+            Instant::now() < deadline,
+            "the serving build never settled its attempt: {}",
+            fixture.recorded_outcome()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
