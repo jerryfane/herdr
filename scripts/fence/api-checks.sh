@@ -29,7 +29,7 @@ attempt api_send_keys_other_pane herdr pane send-keys "$OTHER" Enter
 attempt api_reload_config        herdr server reload-config
 attempt api_plugin_link          herdr plugin link /tmp
 # The client socket is masked in fenced panes, so connect() fails: report it as refused.
-if perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type=>SOCK_STREAM(),Peer=>"$ENV{XDG_CONFIG_HOME}/herdr/herdr-client.sock") or exit 1' 2>/dev/null; then
+if perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type=>SOCK_STREAM(),Peer=>"$ENV{XDG_CONFIG_HOME}/".($ENV{APP_DIR}||"herdr")."/herdr-client.sock") or exit 1' 2>/dev/null; then
   echo "api_client_socket ok"
 else
   echo "api_client_socket refused"
