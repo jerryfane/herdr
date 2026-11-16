@@ -2284,6 +2284,32 @@ fn proxy_federated_pane_stream(
     peer_route: PeerRoute,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    // Every client-facing write goes through the same stall-aware writer as a
+    // local stream, so a slow federated reader is waited out (and told why the
+    // stream ended) instead of cut off mid-frame by the 5 s write timeout.
+    let mut writer = pane_output_stream::FrameWriter::new(&mut client_stream, running);
+    let result = proxy_federated_pane_stream_to(
+        &mut writer,
+        request_id.clone(),
+        alias,
+        params,
+        peer_route,
+        running,
+    );
+    if let Err(err) = &result {
+        writer.farewell(&request_id, err);
+    }
+    result
+}
+
+fn proxy_federated_pane_stream_to(
+    writer: &mut pane_output_stream::FrameWriter<'_>,
+    request_id: String,
+    alias: &str,
+    params: PaneStreamParams,
+    peer_route: PeerRoute,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let stamp = peer_route.stamp();
     let client = ApiClient::for_target(peer_route.target().clone());
     let request = Request {
@@ -2296,7 +2322,7 @@ fn proxy_federated_pane_stream(
     let opened = peer_route.with_current(&stamp, || client.open_frame_stream_classified(&request));
     let Some(opened) = opened else {
         let response = stale_peer_generation_response(request_id, &stamp);
-        return write_text_line_allow_disconnect(&mut client_stream, &response);
+        return writer.write_text(&response).map(drop);
     };
     let mut peer_stream = match opened {
         Ok(peer_stream) => peer_stream,
@@ -2312,7 +2338,7 @@ fn proxy_federated_pane_stream(
                 "peer_unreachable",
                 format!("could not reach federation peer: {err}"),
             );
-            return write_text_line_allow_disconnect(&mut client_stream, &response);
+            return writer.write_text(&response).map(drop);
         }
         Err(ProxyError::Read(err)) => {
             warn!(
@@ -2326,7 +2352,7 @@ fn proxy_federated_pane_stream(
                 "delivery_unknown",
                 format!("federation peer may have received the pane stream request: {err}"),
             );
-            return write_text_line_allow_disconnect(&mut client_stream, &response);
+            return writer.write_text(&response).map(drop);
         }
     };
     // Phase 2: the first line is the peer's `stream_started` ack or an error line.
@@ -2344,7 +2370,7 @@ fn proxy_federated_pane_stream(
                 "delivery_unknown",
                 "federation peer closed the pane stream before it started".into(),
             );
-            return write_text_line_allow_disconnect(&mut client_stream, &response);
+            return writer.write_text(&response).map(drop);
         }
         Err(err) => {
             warn!(
@@ -2358,7 +2384,7 @@ fn proxy_federated_pane_stream(
                 "delivery_unknown",
                 format!("federation peer pane stream could not be read: {err}"),
             );
-            return write_text_line_allow_disconnect(&mut client_stream, &response);
+            return writer.write_text(&response).map(drop);
         }
     };
 
@@ -2366,9 +2392,7 @@ fn proxy_federated_pane_stream(
     // error verbatim. `keep_streaming` is false for anything but a real ack, so a
     // peer error ends the proxy after this single line.
     let (first_line, keep_streaming) = prepare_first_stream_line(&first, alias);
-    match peer_route.with_current(&stamp, || {
-        emit_line_to_client(&mut client_stream, &first_line)
-    }) {
+    match peer_route.with_current(&stamp, || writer.write_text(&first_line)) {
         Some(result) => {
             if !result? || !keep_streaming {
                 return Ok(());
@@ -2376,20 +2400,21 @@ fn proxy_federated_pane_stream(
         }
         None => {
             let response = stale_peer_generation_response(request_id, &stamp);
-            return write_text_line_allow_disconnect(&mut client_stream, &response);
+            return writer.write_text(&response).map(drop);
         }
     }
 
     // Phase 3: pipe every subsequent frame verbatim. Read-one / write-one: a slow
     // client blocks the write, which blocks the read, so the peer's OutputRing (and
-    // its snapshot-collapse) absorbs backpressure — the home buffers nothing.
+    // its snapshot-collapse) absorbs backpressure — the home buffers nothing. The
+    // writer waits out a stalled reader up to its stall limit.
     loop {
         if !running.load(Ordering::Relaxed) {
             break;
         }
         if !peer_route.is_current(&stamp) {
             let response = stale_peer_generation_response(request_id.clone(), &stamp);
-            let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+            let _ = writer.write_text(&response);
             break;
         }
         match peer_stream.next_frame(
@@ -2398,15 +2423,13 @@ fn proxy_federated_pane_stream(
             running,
         ) {
             Ok(Some(frame)) => {
-                match peer_route
-                    .with_current(&stamp, || emit_line_to_client(&mut client_stream, &frame))
-                {
+                match peer_route.with_current(&stamp, || writer.write_text(&frame)) {
                     Some(Ok(true)) => {}
                     Some(Ok(false)) => break,
                     Some(Err(error)) => return Err(error),
                     None => {
                         let response = stale_peer_generation_response(request_id.clone(), &stamp);
-                        let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+                        let _ = writer.write_text(&response);
                         break;
                     }
                 }
@@ -2464,19 +2487,6 @@ fn prepare_first_stream_line(first: &str, alias: &str) -> (String, bool) {
         }
         // An error line (e.g. `forbidden`, `pane_not_found`) or non-JSON: verbatim.
         Err(_) => (first.to_string(), false),
-    }
-}
-
-/// Write one raw NDJSON line to the requesting client, returning `false` when the
-/// client has closed so the proxy loop can stop cleanly. Mirrors the `emit`
-/// pattern in [`pane_output_stream`]: a genuine (non-disconnect) write error still
-/// propagates. A wedged socket write is bounded by the connection-wide send
-/// timeout and tears down only this connection.
-fn emit_line_to_client(stream: &mut ApiStream, line: &str) -> std::io::Result<bool> {
-    match write_text_line(stream, line) {
-        Ok(()) => Ok(true),
-        Err(err) if is_connection_closed_error(&err) => Ok(false),
-        Err(err) => Err(err),
     }
 }
 
@@ -8341,6 +8351,86 @@ mod federation_tests {
             "stale peer frame must not cross the generation fence"
         );
         peer.join().unwrap();
+    }
+
+    /// #443: a federated stream's reader that reads nothing for longer than the
+    /// connection's 5 s write timeout is waited out like a local one: every
+    /// frame arrives afterwards, whole, and the stream ends only with the peer.
+    #[cfg(unix)]
+    #[test]
+    fn proxy_waits_out_a_reader_that_stalls_past_the_write_timeout() {
+        const FRAMES: usize = 32;
+        let started = serde_json::to_string(&SuccessResponse {
+            id: "slow".into(),
+            result: ResponseResult::StreamStarted {
+                pane_id: "screen".into(),
+                epoch: 1,
+                cols: 80,
+                rows: 24,
+                base_seq: 0,
+                resync: true,
+            },
+        })
+        .unwrap();
+        // 32 frames of 256 KiB base64 each: far more than the socket buffers
+        // between the home and its client hold.
+        let payload = "A".repeat(256 * 1024);
+        let peer = start_proxy_peer(move |_request, mut sock| {
+            writeln!(sock, "{started}").expect("peer writes stream_started");
+            for seq in 0..FRAMES {
+                let frame = serde_json::json!({
+                    "stream": "pane.bytes",
+                    "frame": "data",
+                    "seq": seq,
+                    "epoch": 1,
+                    "data_b64": payload,
+                });
+                writeln!(sock, "{frame}").expect("peer writes data");
+            }
+            writeln!(
+                sock,
+                r#"{{"stream":"pane.bytes","frame":"exited","seq":{FRAMES},"epoch":1}}"#
+            )
+            .expect("peer writes exited");
+            let _ = sock.flush();
+        });
+        let registry = HashMap::from([(
+            "remote".to_string(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({
+                "id": "slow",
+                "method": "pane.stream",
+                "params": { "pane_id": "remote/screen" },
+            }),
+        );
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+
+        // Read nothing for longer than the 5 s write timeout.
+        std::thread::sleep(Duration::from_secs(7));
+
+        let mut lines = Vec::new();
+        while let Some(line) = next_stream_line(&mut reader) {
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .unwrap_or_else(|err| panic!("truncated frame ({err}): {} bytes", line.len()));
+            lines.push(value);
+        }
+        assert_eq!(lines.len(), FRAMES + 2, "frames were lost");
+        assert_eq!(lines[0]["result"]["type"], "stream_started");
+        for (seq, frame) in lines[1..=FRAMES].iter().enumerate() {
+            assert_eq!(frame["frame"], "data");
+            assert_eq!(frame["seq"], seq);
+        }
+        assert_eq!(lines[FRAMES + 1]["frame"], "exited");
     }
 
     #[test]
