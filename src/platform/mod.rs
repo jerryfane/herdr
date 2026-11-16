@@ -644,6 +644,46 @@ pub(crate) fn fence_exec(
     std::io::Error::other("the pane fence is Linux-only")
 }
 
+/// The process on the other end of a herdr socket, as the pane fence sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FencePeer {
+    /// Not fenced: the owner's shell, an ssh session, a system service.
+    Unfenced,
+    /// Inside a fence; the mount namespace identifies the pane spawn it came from.
+    Fenced { mount_namespace: u64 },
+    /// The process could not be inspected (already gone, or /proc unreadable).
+    Unknown,
+}
+
+/// Elsewhere nothing is fenced, so every peer is unfenced.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fence_peer(_pid: u32) -> FencePeer {
+    FencePeer::Unfenced
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_mount_namespace(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Classify the peer of a connected local socket for the pane fence.
+#[cfg(unix)]
+pub(crate) fn local_stream_fence_peer(stream: &crate::ipc::LocalStream) -> FencePeer {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    match socket_peer_pid(socket.as_fd().as_raw_fd()) {
+        Some(pid) => fence_peer(pid),
+        None => FencePeer::Unknown,
+    }
+}
+
+/// Named pipes cannot carry a fenced peer: the fence is Linux-only.
+#[cfg(not(unix))]
+pub(crate) fn local_stream_fence_peer(_stream: &crate::ipc::LocalStream) -> FencePeer {
+    FencePeer::Unfenced
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

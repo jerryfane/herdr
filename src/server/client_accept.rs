@@ -21,6 +21,16 @@ pub(crate) fn accept_pending_client_connections(
         }
         match listener.accept() {
             Ok(stream) => {
+                // The private client socket attaches to any pane and types into it.
+                // Fenced panes have it masked; refuse them here too, in case they
+                // reach it another way (docs/next/design/pane-fence.md, section 8).
+                if crate::fence::api_gate_active()
+                    && crate::platform::local_stream_fence_peer(&stream)
+                        != crate::platform::FencePeer::Unfenced
+                {
+                    warn!("refusing client connection from a fenced or unidentified process");
+                    continue;
+                }
                 let client_id = *next_client_id;
                 *next_client_id = next_client_id.saturating_add(1);
 

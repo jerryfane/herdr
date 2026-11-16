@@ -13,6 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::fence::{FenceMount, FencePlan};
+use crate::platform::FencePeer;
 
 /// `/proc` entries made read-only in every fenced pane (Docker's default list).
 const PROC_READ_ONLY: &[&str] = &[
@@ -523,4 +524,55 @@ pub(crate) fn fence_exec(
     // SAFETY: NUL-terminated program and argv array; execvp only returns on failure.
     unsafe { libc::execvp(program_c.as_ptr(), argv_ptrs.as_ptr()) };
     step_error("exec", Some(Path::new(program)), io::Error::last_os_error())
+}
+
+/// Classify the process on the other end of a herdr socket
+/// (docs/next/design/pane-fence.md, section 8). A process is unfenced only when it
+/// shares the server's user namespace and still has `CAP_SYS_ADMIN` in its bounding
+/// set: a fenced pane dropped it for good, and a new user namespace (which would
+/// show a full bounding set again) is a different namespace. The mount namespace
+/// then names the pane spawn the caller belongs to.
+pub(crate) fn fence_peer(pid: u32) -> FencePeer {
+    let (Some(own_user), Some(peer_user)) = (
+        namespace_inode("self", "user"),
+        namespace_inode(&pid.to_string(), "user"),
+    ) else {
+        return FencePeer::Unknown;
+    };
+    let Some(bounding) = bounding_set(pid) else {
+        return FencePeer::Unknown;
+    };
+    if own_user == peer_user && bounding & (1u64 << CAP_SYS_ADMIN) != 0 {
+        return FencePeer::Unfenced;
+    }
+    match namespace_inode(&pid.to_string(), "mnt") {
+        Some(mount_namespace) => FencePeer::Fenced { mount_namespace },
+        None => FencePeer::Unknown,
+    }
+}
+
+/// The mount namespace of a process, as the inode number of `/proc/<pid>/ns/mnt`.
+pub(crate) fn process_mount_namespace(pid: u32) -> Option<u64> {
+    namespace_inode(&pid.to_string(), "mnt")
+}
+
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// `/proc/<pid>/ns/<kind>` links read `<kind>:[<inode>]`.
+fn namespace_inode(pid: &str, kind: &str) -> Option<u64> {
+    let link = std::fs::read_link(format!("/proc/{pid}/ns/{kind}")).ok()?;
+    let text = link.to_str()?;
+    text.strip_prefix(kind)?
+        .strip_prefix(":[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+fn bounding_set(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapBnd:"))?;
+    u64::from_str_radix(hex.trim(), 16).ok()
 }

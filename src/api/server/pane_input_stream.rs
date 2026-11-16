@@ -74,10 +74,14 @@ struct InputFrameError {
     error: ErrorBody,
 }
 
+/// `fenced` is the caller's mount namespace when the caller is inside a pane
+/// fence: the open and every frame then go through the own-pane check, so a
+/// stream cannot outlive the caller's ownership of the pane.
 pub(super) fn serve(
     stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
+    fenced: Option<u64>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
@@ -85,16 +89,29 @@ pub(super) fn serve(
         stream,
         request_id,
         params,
+        fenced,
         api_tx,
         running,
         APP_RESPONSE_TIMEOUT,
     )
 }
 
+/// Wrap a request for a fenced caller so the app checks it targets the caller's pane.
+fn scoped(method: Method, fenced: Option<u64>) -> Method {
+    match fenced {
+        Some(mount_namespace) => Method::FenceScoped(crate::api::schema::FenceScopedParams {
+            mount_namespace,
+            method: Box::new(method),
+        }),
+        None => method,
+    }
+}
+
 fn serve_with_open_timeout(
     mut stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
+    fenced: Option<u64>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     open_timeout: Duration,
@@ -105,10 +122,22 @@ fn serve_with_open_timeout(
 
     // Open handshake: validate the pane exists (and reject an unknown pane) before
     // upgrading the connection into a held-open frame loop.
+    // The open is checked as a send to the same pane, which is what each frame is.
+    let open_method = match fenced {
+        Some(_) => scoped(
+            Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane_id.clone(),
+                text: String::new(),
+                input_source,
+            }),
+            fenced,
+        ),
+        None => Method::PaneInputStreamOpen(params),
+    };
     let open_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
-            method: Method::PaneInputStreamOpen(params),
+            method: open_method,
         },
         api_tx,
         Some(open_timeout),
@@ -137,6 +166,7 @@ fn serve_with_open_timeout(
         &request_id,
         &pane_id,
         input_source,
+        fenced,
         api_tx,
         running,
         &stream_active,
@@ -150,6 +180,7 @@ fn serve_frames(
     request_id: &str,
     pane_id: &str,
     input_source: Option<crate::api::schema::InputSource>,
+    fenced: Option<u64>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
@@ -232,7 +263,7 @@ fn serve_frames(
         let response = dispatch_to_app_with_timeout(
             Request {
                 id: format!("{request_id}:frame:{seq}"),
-                method,
+                method: scoped(method, fenced),
             },
             api_tx,
             Some(APP_RESPONSE_TIMEOUT),

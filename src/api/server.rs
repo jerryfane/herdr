@@ -1629,6 +1629,39 @@ fn handle_principal_connection(
         }
     }
 
+    // Pane fence gate (docs/next/design/pane-fence.md, section 8). Only local
+    // owner connections are checked, and only while a fence can exist: with the
+    // fence off and no fenced pane alive this costs one atomic load.
+    let mut fenced_stream_namespace = None;
+    if matches!(principal, ConnectionPrincipal::Owner) && crate::fence::api_gate_active() {
+        let peer = match &stream {
+            ApiStream::Local(local) => crate::platform::local_stream_fence_peer(local),
+            ApiStream::Tcp(_) => crate::platform::FencePeer::Unfenced,
+        };
+        match fence_gate(&mut request, peer, federation_peers) {
+            FenceGate::Pass => {}
+            FenceGate::Stream(mount_namespace) => fenced_stream_namespace = Some(mount_namespace),
+            FenceGate::Refuse(message) => {
+                warn!(method, "api request refused by pane fence");
+                crate::logging::api_request_started(&request_id, method, changes_ui);
+                let response = error_response_json(request_id.clone(), "fence_refused", message);
+                let result = write_text_line_allow_disconnect(&mut stream, &response);
+                match &result {
+                    Ok(()) => crate::logging::api_request_completed(
+                        &request_id,
+                        method,
+                        "fence_refused",
+                        changes_ui,
+                    ),
+                    Err(err) => {
+                        crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                    }
+                }
+                return result;
+            }
+        }
+    }
+
     crate::logging::api_request_started(&request_id, method, changes_ui);
     // Remote Gram is opt-in on the remote daemon too. Its local clients keep
     // using the ordinary Gram API, but requests go to the coordinator's
@@ -1771,8 +1804,14 @@ fn handle_principal_connection(
             result
         }
         Method::PaneInputStream(params) => {
-            let result =
-                pane_input_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            let result = pane_input_stream::serve(
+                stream,
+                request_id.clone(),
+                params,
+                fenced_stream_namespace,
+                api_tx,
+                running,
+            );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -2037,6 +2076,67 @@ fn federated_split<'a, T>(
 /// request's own id is preserved so the peer echoes it and the originating client
 /// correlates the reply. Owns the completed/failed request logging for the
 /// proxied path.
+enum FenceGate {
+    /// Unfenced caller, or an allowed request (possibly rewritten to its scoped form).
+    Pass,
+    /// `pane.input.stream` from a fenced caller: every frame is checked against the
+    /// caller's own pane in this mount namespace.
+    Stream(u64),
+    Refuse(String),
+}
+
+/// Decide a request from a local connection while the pane fence is active.
+fn fence_gate<T>(
+    request: &mut Request,
+    peer: crate::platform::FencePeer,
+    federation_peers: &HashMap<String, T>,
+) -> FenceGate {
+    use crate::api::fence_policy::{fenced_access, FencedAccess};
+    use crate::platform::FencePeer;
+
+    let mount_namespace = match peer {
+        FencePeer::Unfenced => return FenceGate::Pass,
+        FencePeer::Unknown => {
+            return FenceGate::Refuse(
+                "refused by pane fence: the calling process could not be identified".into(),
+            );
+        }
+        FencePeer::Fenced { mount_namespace } => mount_namespace,
+    };
+    let name = api_method_name(&request.method);
+    // `input_source: "app"` speaks for the owner.
+    request.method.clear_input_source();
+    let remote = {
+        let mut probe = request.method.clone();
+        routable_target_mut(&mut probe)
+            .is_some_and(|target| federated_split(target, federation_peers).is_some())
+    };
+    let refuse = |why: &str| {
+        FenceGate::Refuse(format!(
+            "refused by pane fence: {name} {why}; see herdr fence explain"
+        ))
+    };
+    match fenced_access(&request.method) {
+        FencedAccess::Read => FenceGate::Pass,
+        _ if remote => refuse("acts on another machine, which a fenced pane may only read"),
+        FencedAccess::Talk => FenceGate::Pass,
+        FencedAccess::Create if crate::fence::new_panes_are_fenced() => FenceGate::Pass,
+        FencedAccess::Create => refuse("would start a pane outside the fence (the fence is now off)"),
+        FencedAccess::Own(_) => {
+            let method = std::mem::replace(&mut request.method, Method::Ping(Default::default()));
+            request.method = Method::FenceScoped(crate::api::schema::FenceScopedParams {
+                mount_namespace,
+                method: Box::new(method),
+            });
+            FenceGate::Pass
+        }
+        FencedAccess::OwnStream => FenceGate::Stream(mount_namespace),
+        FencedAccess::Denied => refuse(
+            "acts outside this pane (other panes, server, config, plugins, worktrees and accounts are owner-only)",
+        ),
+    }
+}
+
 fn maybe_route_to_peer(
     stream: &mut ApiStream,
     request: &mut Request,
@@ -5130,6 +5230,7 @@ mod federation_tests {
             ("guest.update", Denied),
             ("guest.audit", Denied),
             ("guest.agent_probe", Denied),
+            ("fence.scoped", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
             ("client_shell.surface.set", Denied),
@@ -7198,6 +7299,126 @@ mod federation_tests {
                  <alias>/pane target resolves locally and fails (#181)"
             );
         }
+    }
+
+    fn fence_request(json: &str) -> Request {
+        serde_json::from_str(json).unwrap_or_else(|err| panic!("{json}: {err}"))
+    }
+
+    #[test]
+    fn fence_gate_lets_unfenced_callers_through_unchanged() {
+        let peers: HashMap<String, ()> = HashMap::new();
+        let mut request =
+            fence_request(r#"{"id":"1","method":"server.reload_config","params":{}}"#);
+        let before = request.clone();
+        assert!(matches!(
+            fence_gate(&mut request, crate::platform::FencePeer::Unfenced, &peers),
+            FenceGate::Pass
+        ));
+        assert_eq!(request, before);
+    }
+
+    #[test]
+    fn fence_gate_refuses_unidentified_callers() {
+        let peers: HashMap<String, ()> = HashMap::new();
+        let mut request = fence_request(r#"{"id":"1","method":"pane.list","params":{}}"#);
+        assert!(matches!(
+            fence_gate(&mut request, crate::platform::FencePeer::Unknown, &peers),
+            FenceGate::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn fence_gate_classifies_fenced_requests() {
+        let fenced = crate::platform::FencePeer::Fenced {
+            mount_namespace: 4026532000,
+        };
+        let mut peers = HashMap::new();
+        peers.insert("w1".to_string(), ());
+
+        // Owner-only methods are refused, naming the method.
+        for json in [
+            r#"{"id":"1","method":"server.reload_config","params":{}}"#,
+            r#"{"id":"1","method":"server.stop","params":{}}"#,
+            r#"{"id":"1","method":"plugin.link","params":{"path":"/tmp"}}"#,
+        ] {
+            let mut request = fence_request(json);
+            match fence_gate(&mut request, fenced, &peers) {
+                FenceGate::Refuse(message) => {
+                    assert!(message.contains("refused by pane fence"), "{message}")
+                }
+                _ => panic!("{json} must be refused"),
+            }
+        }
+
+        // Reads pass untouched, also on another machine.
+        let mut read =
+            fence_request(r#"{"id":"1","method":"agent.read","params":{"target":"w1/builder"}}"#);
+        assert!(matches!(
+            fence_gate(&mut read, fenced, &peers),
+            FenceGate::Pass
+        ));
+        assert!(matches!(read.method, Method::AgentRead(_)));
+
+        // Talking to a local agent passes; to an agent on another machine it does not.
+        let mut local_prompt = fence_request(
+            r#"{"id":"1","method":"agent.prompt","params":{"target":"builder","text":"hi"}}"#,
+        );
+        assert!(matches!(
+            fence_gate(&mut local_prompt, fenced, &peers),
+            FenceGate::Pass
+        ));
+        let mut remote_prompt = fence_request(
+            r#"{"id":"1","method":"agent.prompt","params":{"target":"w1/builder","text":"hi"}}"#,
+        );
+        assert!(matches!(
+            fence_gate(&mut remote_prompt, fenced, &peers),
+            FenceGate::Refuse(_)
+        ));
+
+        // Own-pane requests are wrapped so the app checks the target against the caller.
+        let mut send = fence_request(
+            r#"{"id":"1","method":"pane.send_text","params":{"pane_id":"w2:p1","text":"ls","input_source":"app"}}"#,
+        );
+        assert!(matches!(
+            fence_gate(&mut send, fenced, &peers),
+            FenceGate::Pass
+        ));
+        match &send.method {
+            Method::FenceScoped(scoped) => {
+                assert_eq!(scoped.mount_namespace, 4026532000);
+                match scoped.method.as_ref() {
+                    // A fenced caller cannot speak for the owner's app.
+                    Method::PaneSendText(params) => assert_eq!(params.input_source, None),
+                    other => panic!("unexpected inner method {other:?}"),
+                }
+            }
+            other => panic!("expected a scoped request, got {other:?}"),
+        }
+
+        // An input stream is checked per frame.
+        let mut stream = fence_request(
+            r#"{"id":"1","method":"pane.input.stream","params":{"pane_id":"w2:p1"}}"#,
+        );
+        assert!(matches!(
+            fence_gate(&mut stream, fenced, &peers),
+            FenceGate::Stream(4026532000)
+        ));
+    }
+
+    #[test]
+    fn fence_gate_refuses_pane_creation_while_new_panes_start_unfenced() {
+        // With the fence off, a new pane would not be fenced, so a fenced caller
+        // (a pane left from before) must not create one.
+        crate::fence::set_config(&crate::config::FenceConfig::default());
+        let peers: HashMap<String, ()> = HashMap::new();
+        let fenced = crate::platform::FencePeer::Fenced { mount_namespace: 7 };
+        let mut split =
+            fence_request(r#"{"id":"1","method":"pane.split","params":{"direction":"right"}}"#);
+        assert!(matches!(
+            fence_gate(&mut split, fenced, &peers),
+            FenceGate::Refuse(_)
+        ));
     }
 
     #[test]

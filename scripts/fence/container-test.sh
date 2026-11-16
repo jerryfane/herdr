@@ -10,6 +10,7 @@ set -eu
 
 HERDR=/usr/local/bin/herdr
 CHECKS=/fence/checks.sh
+API_CHECKS=/fence/api-checks.sh
 OUT=/tmp/fence-out
 mkdir -p "$OUT"
 
@@ -61,6 +62,16 @@ until [ -f "$OUT/fenced.done" ]; do
   sleep 0.1
 done
 
+# API escape checks (#420): from the fenced pane, then the same calls unfenced from
+# this shell while the server still runs (positive control).
+"$HERDR" pane run "$PANE" "OTHER=$FIRST SELF=$PANE sh $API_CHECKS > $OUT/fenced-api.txt 2>&1; echo done > $OUT/api.done" >/dev/null
+i=0
+until [ -f "$OUT/api.done" ]; do
+  i=$((i + 1)); [ $i -lt 300 ] || { "$HERDR" pane read "$PANE" --source recent --lines 40 || true; echo "fenced api run timed out"; exit 1; }
+  sleep 0.1
+done
+OTHER=$FIRST SELF=$PANE sh "$API_CHECKS" > "$OUT/control-api.txt" 2>&1
+
 kill "$SERVER"; wait "$SERVER" 2>/dev/null || true
 sleep 0.3
 findmnt -R -n -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION / | sort > "$OUT/mounts-after"
@@ -100,6 +111,21 @@ expect_fenced cap_sys_module blocked
 grep -qx "fence_env 1" "$OUT/fenced.txt" || { echo "FAIL fenced pane has no HERDR_FENCE"; fail=1; }
 [ -e /fleet/protected/cwd-rel ] && { echo "FAIL relative write via the inherited cwd landed in the denied dir"; fail=1; }
 [ -f /fleet/protected/sub/keep ] || echo "note: control run removed the fixture as expected"
+
+echo "== API: fenced vs unfenced"
+paste -d' ' "$OUT/fenced-api.txt" "$OUT/control-api.txt" | awk '{printf "%-24s fenced=%-8s unfenced=%s\n", $1, $2, $4}'
+api() { # api <check> <fenced result>: the unfenced control must not be refused
+  got_f=$(awk -v n="$1" '$1==n{print $2}' "$OUT/fenced-api.txt")
+  got_c=$(awk -v n="$1" '$1==n{print $2}' "$OUT/control-api.txt")
+  if [ "$got_f" != "$2" ] || [ -z "$got_c" ] || [ "$got_c" = refused ]; then
+    echo "FAIL $1: fenced=$got_f (want $2) unfenced=$got_c (want not refused)"; fail=1
+  fi
+}
+for c in api_run_in_other_pane api_send_keys_other_pane api_rename_other_pane api_reload_config api_plugin_link api_client_socket; do
+  api "$c" refused
+done
+api api_read_panes ok
+api api_rename_own_pane ok
 
 if ! diff "$OUT/mounts-before" "$OUT/mounts-after"; then
   echo "FAIL container root mount table changed"; fail=1

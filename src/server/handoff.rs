@@ -152,9 +152,20 @@ pub(crate) fn accept_and_validate_on(
     listener: UnixListener,
     socket_path: &Path,
     token: &str,
+    import_pid: u32,
     manifest: &HandoffManifest,
 ) -> io::Result<UnixStream> {
     let (mut stream, _) = accept_with_timeout(&listener, READY_TIMEOUT)?;
+    // The token is in the importer's argv, which any process of the same user can
+    // read from /proc. Only the importer this server spawned may receive the pane
+    // fds (docs/next/design/pane-fence.md, B22).
+    let peer = crate::platform::unix_stream_peer_pid(&stream);
+    if peer != Some(import_pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("handoff socket peer {peer:?} is not the import server {import_pid}"),
+        ));
+    }
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
     stream.set_write_timeout(Some(READY_TIMEOUT))?;

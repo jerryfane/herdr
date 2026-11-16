@@ -32,7 +32,9 @@ pub(crate) use shutdown::monitor_host_shutdown;
 mod power;
 pub(crate) use power::monitor_host_power;
 mod fence;
-pub(crate) use fence::{fence_exec, FENCE_HELPER_PROGRAM, FENCE_SUPPORTED};
+pub(crate) use fence::{
+    fence_exec, fence_peer, process_mount_namespace, FENCE_HELPER_PROGRAM, FENCE_SUPPORTED,
+};
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";

@@ -5,6 +5,7 @@ pub mod agents;
 pub mod commands;
 pub mod common;
 pub mod events;
+pub mod fence;
 pub mod fs;
 pub mod gram;
 pub mod guest;
@@ -27,6 +28,7 @@ pub use agents::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
+pub use fence::*;
 pub use fs::*;
 pub use gram::*;
 pub use guest::*;
@@ -218,6 +220,10 @@ operations::define_operations! {
     #[serde(skip)]
     #[schemars(skip)]
     GramUploadStreamOpen(GramUploadStreamParams) => "gram.upload.stream.open", false, false;
+    /// Internal only: a fenced caller's request that may act only on its own pane.
+    #[serde(skip)]
+    #[schemars(skip)]
+    FenceScoped(FenceScopedParams) => "fence.scoped", false, false;
     PaneReportAgent(PaneReportAgentParams) => "pane.report_agent", true, false;
     PaneReportAgentSession(PaneReportAgentSessionParams) => "pane.report_agent_session", true, false;
     PaneReportMetadata(PaneReportMetadataParams) => "pane.report_metadata", true, false;

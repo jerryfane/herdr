@@ -12,6 +12,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use portable_pty::CommandBuilder;
@@ -177,6 +178,40 @@ fn install(policy: Policy) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = policy;
+}
+
+/// Set once this server has started (or adopted, after a live handoff) a fenced
+/// pane process. Together with `[fence] enabled` it decides whether the API checks
+/// callers at all: with the fence off and no fenced pane alive, the API behaves
+/// exactly as without the fence. It is never cleared, because a fenced pane keeps
+/// its fence after the fence is switched off.
+static FENCED_PANES_EXIST: AtomicBool = AtomicBool::new(false);
+
+/// True when API callers must be classified: the fence is on (or failed to load,
+/// which is treated as on), or a fenced pane may still be running.
+pub(crate) fn api_gate_active() -> bool {
+    if !crate::platform::FENCE_SUPPORTED {
+        return false;
+    }
+    FENCED_PANES_EXIST.load(Ordering::Acquire)
+        || current_policy().map_or(true, |config| config.enabled)
+}
+
+/// True when panes started now are fenced, so a fenced caller may create panes:
+/// the new pane cannot be looser than the caller's.
+pub(crate) fn new_panes_are_fenced() -> bool {
+    crate::platform::FENCE_SUPPORTED && current_policy().is_ok_and(|config| config.enabled)
+}
+
+/// Record a pane process this server adopted (live handoff) or started, so the API
+/// gate stays on while a fenced one may be alive.
+pub(crate) fn note_pane_process(pid: u32) {
+    if crate::platform::FENCE_SUPPORTED
+        && !FENCED_PANES_EXIST.load(Ordering::Acquire)
+        && crate::platform::fence_peer(pid) != crate::platform::FencePeer::Unfenced
+    {
+        FENCED_PANES_EXIST.store(true, Ordering::Release);
+    }
 }
 
 /// Install a validated `[fence]` (startup, reload) for pane spawns from now on.
@@ -596,9 +631,20 @@ pub(crate) fn fence_pane_command(cmd: &mut CommandBuilder) -> io::Result<()> {
     // Herdr's own settings, and the config file actually in use (HERDR_CONFIG_PATH
     // may point outside the config directory), are always read-only.
     let always_protected = [crate::config::config_dir(), crate::config::config_path()];
-    let plan = resolve_plan(&config, &home, &always_protected);
+    let mut plan = resolve_plan(&config, &home, &always_protected);
+    // The private TUI client socket attaches to any pane and types into it; agents
+    // never need it. It sits below the read-only config dir, so its mask is applied
+    // after every other mount (docs/next/design/pane-fence.md, section 8).
+    if let Ok(client_socket) = crate::server::socket_paths::client_socket_path().canonicalize() {
+        let mask = FenceMount::Mask(client_socket);
+        if !plan.mounts.contains(&mask) {
+            plan.mounts.push(mask);
+        }
+    }
     let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
-    wrap_command(cmd, &plan_json)
+    wrap_command(cmd, &plan_json)?;
+    FENCED_PANES_EXIST.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn wrap_command(cmd: &mut CommandBuilder, plan_json: &str) -> io::Result<()> {
