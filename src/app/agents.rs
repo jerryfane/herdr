@@ -435,6 +435,7 @@ impl App {
         // Fleet tooling binds a role to its pane by this label, which is why losing it
         // silently unhooks a restored agent from the channel that addresses it.
         let pane_label = terminal.manual_label.clone();
+        let fence = terminal.fence_identity.clone();
         let cwd = terminal.cwd.clone();
         let occupant_generation = terminal.occupant_generation;
         let kind = terminal
@@ -464,6 +465,7 @@ impl App {
                 origin_workspace_id: Some(info.workspace_id.clone()),
                 origin_tab_id: Some(info.tab_id.clone()),
                 pane_label,
+                fence: Some(fence),
             });
 
         // Release the pane's process, then remove the now-empty pane. The session
@@ -602,6 +604,7 @@ impl App {
         let mut terminal =
             crate::terminal::TerminalState::new(terminal_id.clone(), record.cwd.clone())
                 .with_occupant_generation(record.occupant_generation);
+        terminal.fence_identity = record.fence_identity();
         if let Some((persisted, plan)) = resume {
             terminal = terminal.with_pending_agent_resume_plan(plan);
             terminal.set_persisted_agent_session(persisted);
@@ -1066,6 +1069,12 @@ impl App {
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
+        // The agent runs under its own `[fence.agents]` entry. Its command is typed into
+        // the pane's shell, so a shell outside the fence the agent needs (or inside one
+        // it is exempt from) is replaced first (docs/next/design/pane-fence.md, section 4).
+        let fence = crate::fence::FenceIdentity::Agent(name.clone());
+        let respawn_shell = crate::fence::shell_needs_respawn(runtime.child_pid(), &fence)
+            .map_err(|err| AgentStartError::Fence(err.to_string()))?;
 
         // Resolve an optional credential/config-home account for this agent. The
         // pane's shell already exists, so the account env is prepended to the
@@ -1088,7 +1097,6 @@ impl App {
         );
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
-        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
             params
                 .timeout_ms
@@ -1098,6 +1106,14 @@ impl App {
             return Err(AgentStartError::InvalidTimeout);
         }
 
+        if respawn_shell {
+            self.respawn_shell_with_fence(pane_id, &terminal_id, fence.clone())?;
+        }
+        let runtime = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
+        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         runtime
             .validate_input_submission(&bytes)
             .map_err(|err| AgentStartError::InputFailed(err.to_string()))?;
@@ -1109,6 +1125,7 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        terminal.fence_identity = fence;
         if let Some((account_id, _)) = &account_env {
             terminal.agent_account = Some(account_id.clone());
         }
@@ -1127,6 +1144,42 @@ impl App {
             .agent_info(ws_idx, pane_id)
             .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
         Ok((agent, argv))
+    }
+
+    /// Replace the pane's shell with one started under `fence`. The old shell keeps
+    /// running until the new one has started, so a failed spawn leaves the pane as it
+    /// was.
+    fn respawn_shell_with_fence(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        terminal_id: &crate::terminal::TerminalId,
+        fence: crate::fence::FenceIdentity,
+    ) -> Result<(), AgentStartError> {
+        let terminal = self
+            .state
+            .terminals
+            .get_mut(terminal_id)
+            .ok_or_else(|| AgentStartError::Fence("the pane's terminal is gone".into()))?;
+        let previous = std::mem::replace(&mut terminal.fence_identity, fence);
+        let spawned = self.spawn_pane_shell(pane_id).map(|(_, _, spawned)| spawned);
+        let runtime = match spawned {
+            Some(Ok(runtime)) => runtime,
+            failed => {
+                if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                    terminal.fence_identity = previous;
+                }
+                let reason = match failed {
+                    Some(Err(err)) => err.to_string(),
+                    _ => "the pane is gone".into(),
+                };
+                return Err(AgentStartError::Fence(format!(
+                    "could not restart the pane's shell under the agent's fence: {reason}"
+                )));
+            }
+        };
+        self.shutdown_terminal_runtime(terminal_id.clone());
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        Ok(())
     }
 
     pub(super) fn agent_start_error_body(
@@ -1164,6 +1217,10 @@ impl App {
             },
             AgentStartError::InputFailed(message) => crate::api::schema::ErrorBody {
                 code: "agent_start_input_failed".into(),
+                message,
+            },
+            AgentStartError::Fence(message) => crate::api::schema::ErrorBody {
+                code: "agent_start_fence_failed".into(),
                 message,
             },
             AgentStartError::UnknownAccount(account) => crate::api::schema::ErrorBody {
@@ -1532,6 +1589,9 @@ pub(super) enum AgentStartError {
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),
+    /// `[fence]` failed to load, or the pane's shell could not be restarted under the
+    /// agent's fence. The agent is not started.
+    Fence(String),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,

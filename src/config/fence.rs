@@ -4,6 +4,8 @@
 //! `[fence]` table is rejected by `herdr server reload-config` without applying
 //! half of it, and the previous fence settings stay in force.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 /// The pane fence: every process started in a pane runs with a read-only deny
@@ -26,6 +28,42 @@ pub struct FenceConfig {
     /// Paths that stay writable but cannot be deleted or renamed inside fenced
     /// panes (each is bound onto itself). Unset means the built-in list.
     pub pin: Option<Vec<String>>,
+    /// Which panes are fenced: every pane, or only the agents listed in `agents`.
+    pub scope: FenceScope,
+    /// Per-agent entries, keyed by the herdr agent name a pane was started as.
+    pub agents: BTreeMap<String, FenceAgent>,
+}
+
+/// `[fence] scope`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceScope {
+    /// Every pane, except agents listed with `profile = "unfenced"`.
+    #[default]
+    All,
+    /// Only agents listed with `profile = "default"`; every other pane is unfenced.
+    Agents,
+}
+
+/// `[fence.agents.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FenceAgent {
+    #[serde(default)]
+    pub profile: FenceProfile,
+    /// Why this agent has an entry. Required.
+    pub reason: String,
+}
+
+/// The fence an agent entry selects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceProfile {
+    /// The `[fence]` settings.
+    #[default]
+    Default,
+    /// No fence for this agent.
+    Unfenced,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,6 +74,8 @@ struct RawFenceConfig {
     allow: Vec<String>,
     mask_sockets: Option<Vec<String>>,
     pin: Option<Vec<String>>,
+    scope: FenceScope,
+    agents: BTreeMap<String, FenceAgent>,
 }
 
 impl TryFrom<RawFenceConfig> for FenceConfig {
@@ -48,6 +88,8 @@ impl TryFrom<RawFenceConfig> for FenceConfig {
             allow: raw.allow,
             mask_sockets: raw.mask_sockets,
             pin: raw.pin,
+            scope: raw.scope,
+            agents: raw.agents,
         };
         let errors = crate::fence::validate_config(&config);
         if errors.is_empty() {

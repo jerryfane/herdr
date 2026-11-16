@@ -47,13 +47,17 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
         let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
+        // A respawn keeps the fence the terminal was started under.
+        let fence = ws
+            .terminal_id(pane_id)
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+            .map(|terminal| terminal.fence_identity.clone())
+            .unwrap_or_default();
         let pane_id = self.public_pane_id(ws_idx, pane_id)?;
         Some(
-            crate::pane::PaneLaunchEnv::from_account(account_env).with_identity(
-                workspace_id,
-                tab_id,
-                pane_id,
-            ),
+            crate::pane::PaneLaunchEnv::from_account(account_env)
+                .with_identity(workspace_id, tab_id, pane_id)
+                .with_fence_identity(fence),
         )
     }
 

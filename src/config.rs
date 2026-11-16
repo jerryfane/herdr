@@ -12,7 +12,7 @@ mod window_title;
 mod write;
 
 pub use self::{
-    fence::FenceConfig,
+    fence::{FenceAgent, FenceConfig, FenceProfile, FenceScope},
     io::{
         append_accounts_block, config_diagnostic_summary, config_dir, config_path,
         load_live_config, remove_accounts_block, remove_keybinding_config_sections,

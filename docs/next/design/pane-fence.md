@@ -305,14 +305,21 @@ Rules:
   `default` (the base) and `unfenced`. `{agent}` in a path expands to the agent name; a pane without an
   agent gets no `{agent}` carve-out.
 - **The name is not known when a pane's shell spawns.** `agent.start` types the agent command into a shell
-  that already exists (`App::start_agent` in `src/app/agents.rs`). So when the agent's resolved plan
-  differs from the plan the pane's shell is running under, `agent.start` first respawns the pane's shell
-  with the agent's plan through the existing launch-pane respawn path (`respawn_shell_for_launch_pane`,
-  `src/app/api.rs`), keeping pane id, cwd and launch env, then types the command. Paths that rebuild a
-  known agent (session restore, `agent.unarchive`, `agent.restart`) hold the agent name in the terminal
-  state before the pane is placed (for example `restore_managed_agent` in `agent.unarchive`,
-  `src/app/agents.rs`), so they build the plan up front; #418 confirms each path. The plan travels to the
-  spawn site in `PaneLaunchEnv`.
+  that already exists (`App::start_agent` in `src/app/agents.rs`). So when the shell is outside the fence the
+  agent needs, or inside one it is exempt from (`fence::shell_needs_respawn`, judged from the shell's mount
+  namespace), `agent.start` first replaces the pane's shell with one started under the agent's identity
+  (`App::spawn_pane_shell`, `src/app/api.rs`), keeping pane id, cwd and launch env, then types the command.
+  The new shell is spawned before the old one is stopped, so a failed spawn leaves the pane as it was.
+- **The identity is sticky (#445).** Each terminal carries a `FenceIdentity` (`Anonymous` or `Agent(name)`),
+  set only by `agent.start`, session restore and `agent.unarchive`, persisted in the pane snapshot and the
+  archive record (`fence`; older records fall back to the agent name), and carried to every spawn site in
+  `PaneLaunchEnv`. Every respawn of the pane (`agent.restart`, a launch-pane shell respawn, a deferred
+  resume) reuses it. `agent.rename` does not change it: an agent renaming itself (an own-pane right, section
+  8) to an exempt name keeps its fence across the next restart.
+- **`scope` (#445).** `scope = "all"` (default) fences every pane except agents whose entry selects
+  `unfenced`; `scope = "agents"` fences only agents whose entry selects `default`. Created panes are
+  anonymous, so under `scope = "agents"` they start unfenced and a fenced caller may not create panes
+  (`new_panes_are_fenced`). This lets a pilot fence one agent without touching any other pane.
 - **Paths** are resolved with `realpath` when the plan is built. On merged-/usr systems `/bin`, `/sbin`,
   `/lib`, `/lib64` resolve into `/usr` and are deduplicated. A deny of `/` is a config error.
 - **Validation is all-or-nothing.** `[fence]` is loaded as one live section (`load_live_section`,

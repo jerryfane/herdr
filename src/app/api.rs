@@ -853,49 +853,10 @@ impl App {
         pane_id: crate::layout::PaneId,
         focus_pane: bool,
     ) -> bool {
-        let Some((ws_idx, pane_state)) = self.find_pane(pane_id) else {
+        let Some((ws_idx, terminal_id, spawned)) = self.spawn_pane_shell(pane_id) else {
             return false;
         };
-        let terminal_id = pane_state.attached_terminal_id.clone();
-        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
-            return false;
-        };
-
-        let cwd = terminal.cwd.clone();
-        // Reuse any account config-home env armed for this pane so a bare-shell
-        // fallback keeps the same account. Empty for an ordinary launch-pane
-        // respawn, so that path stays byte-identical.
-        let account_env = crate::config::AccountLaunchEnv::from_resolved_vars(
-            terminal.pending_launch_env.clone(),
-        );
-        let (rows, cols) = self
-            .terminal_runtimes
-            .get(&terminal_id)
-            .map(|runtime| runtime.current_size())
-            .unwrap_or_else(|| {
-                self.state
-                    .new_pane_size(crate::ui::NewPanePlacement::Existing {
-                        ws_idx,
-                        pane: pane_id,
-                    })
-            });
-        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, account_env) else {
-            return false;
-        };
-        let runtime = match crate::terminal::TerminalRuntime::spawn(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            self.state.pane_scrollback_limit_bytes,
-            self.state.host_terminal_theme,
-            self.pane_host_terminal_appearance(),
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
-            &launch_env,
-            self.event_tx.clone(),
-            self.render_notify.clone(),
-            self.render_dirty.clone(),
-        ) {
+        let runtime = match spawned {
             Ok(runtime) => runtime,
             Err(err) => {
                 tracing::warn!(
@@ -918,6 +879,57 @@ impl App {
         }
         self.schedule_session_save();
         true
+    }
+
+    /// Start a fresh shell for an existing pane, with its cwd, size, armed account env
+    /// and fence identity. The caller installs the runtime. `None` when the pane or
+    /// its terminal is gone.
+    pub(super) fn spawn_pane_shell(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<(
+        usize,
+        crate::terminal::TerminalId,
+        std::io::Result<crate::terminal::TerminalRuntime>,
+    )> {
+        let (ws_idx, pane_state) = self.find_pane(pane_id)?;
+        let terminal_id = pane_state.attached_terminal_id.clone();
+        let terminal = self.state.terminals.get(&terminal_id)?;
+
+        let cwd = terminal.cwd.clone();
+        // Reuse any account config-home env armed for this pane so a bare-shell
+        // fallback keeps the same account. Empty for an ordinary launch-pane
+        // respawn, so that path stays byte-identical.
+        let account_env = crate::config::AccountLaunchEnv::from_resolved_vars(
+            terminal.pending_launch_env.clone(),
+        );
+        let (rows, cols) = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .map(|runtime| runtime.current_size())
+            .unwrap_or_else(|| {
+                self.state
+                    .new_pane_size(crate::ui::NewPanePlacement::Existing {
+                        ws_idx,
+                        pane: pane_id,
+                    })
+            });
+        let launch_env = self.pane_launch_env(ws_idx, pane_id, account_env)?;
+        let spawned = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.pane_host_terminal_appearance(),
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            &launch_env,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        );
+        Some((ws_idx, terminal_id, spawned))
     }
 
     pub(crate) fn claim_worktree_runtime_restore_failure(

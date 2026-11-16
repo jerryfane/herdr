@@ -5453,6 +5453,7 @@ mod tests {
                 origin_workspace_id: None,
                 origin_tab_id: None,
                 pane_label: None,
+                fence: None,
             });
     }
 
@@ -5847,6 +5848,7 @@ mod tests {
                 origin_workspace_id: None,
                 origin_tab_id: None,
                 pane_label: None,
+                fence: None,
             });
 
         let agents = app.collect_agent_infos();
@@ -6246,6 +6248,66 @@ mod tests {
                 "by_start={by_start}"
             );
         }
+    }
+
+    /// The fence follows the name an agent was STARTED as. A fenced agent may rename
+    /// itself (own-pane right), so a rename must not move it to another
+    /// `[fence.agents]` entry at its next respawn or after a save and restore.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fence_identity_is_the_started_name_through_rename_and_save() {
+        use crate::fence::FenceIdentity;
+        let mut app = app_with_agent();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let started: serde_json::Value = serde_json::from_str(&app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                pane_id: app.pane_info(0, root).unwrap().pane_id,
+                args: Vec::new(),
+                timeout_ms: Some(4_000),
+                account: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(started["result"]["type"], "agent_started", "{started}");
+        let renamed: serde_json::Value = serde_json::from_str(&app.handle_agent_rename(
+            "req".into(),
+            AgentRenameParams {
+                target: "reviewer".into(),
+                name: Some("exempt".into()),
+                expected_name: None,
+                expect_inactive: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(renamed["result"]["agent"]["name"], "exempt", "{renamed}");
+
+        let started_as = FenceIdentity::Agent("reviewer".into());
+        assert_eq!(app.state.terminals[&terminal_id].fence_identity, started_as);
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            &app.state.archived_agents,
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: crate::persist::SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let pane = reloaded.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("pane snapshot");
+        assert_eq!(pane.agent_name.as_deref(), Some("exempt"));
+        assert_eq!(pane.fence_identity(), started_as);
     }
 
     #[tokio::test]
