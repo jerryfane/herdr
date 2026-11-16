@@ -2396,6 +2396,95 @@ fn every_user_entry_marked_after_it_was_sent_is_resent_on_the_next_after_page() 
     assert!(user_origins(&again).is_empty(), "{:?}", again.entries);
 }
 
+/// An `after` page lists the entries it re-sent from before the cursor (the
+/// late-marked prompt and the step whose status changed), and nothing that
+/// was appended since, whatever its origin or clock.
+#[test]
+fn an_after_page_lists_its_resent_entries() {
+    let mut session = Fixture::new("resent");
+    let automation_at = session.ms(session.next + 1);
+    let automation = session.user("automation");
+    let message = session.assistant(
+        vec![call("c1", "bash", Some("Building"), json!({}))],
+        "toolUse",
+    );
+    let request =
+        |before: Option<&str>, after: Option<&str>, prompts: Vec<OtherPrompt>| PageRequest {
+            before: before.map(str::to_owned),
+            after: after.map(str::to_owned),
+            other_prompts: prompts,
+            ..PageRequest::default()
+        };
+    let first = read_page(&session.path, &request(None, None, Vec::new())).unwrap();
+    assert_eq!(first.resent, None, "newest pages omit it");
+
+    session.result("c1", "bash", false, json!({}));
+    let reply = session.assistant(vec![text("built")], "stop");
+    let guest = session.user("guest prompt");
+    let delivered = vec![OtherPrompt::new("automation\r\n", automation_at)];
+    let next = read_page(
+        &session.path,
+        &request(None, Some(&first.after), delivered.clone()),
+    )
+    .unwrap();
+    let step = format!("{message}:c1");
+    assert_eq!(next.resent, Some(vec![automation.clone(), step.clone()]));
+    assert_eq!(
+        &ids(&next.entries)[..2],
+        &[automation, step],
+        "re-sent entries come first"
+    );
+    let all = ids(&next.entries);
+    assert!(all.contains(&guest), "{all:?}");
+    assert!(all.iter().any(|id| id.starts_with(&reply)), "{all:?}");
+
+    let tail = read_page(
+        &session.path,
+        &PageRequest {
+            limit: Some(1),
+            ..request(None, None, delivered.clone())
+        },
+    )
+    .unwrap();
+    let older = read_page(
+        &session.path,
+        &request(Some(tail.before.as_deref().unwrap()), None, delivered),
+    )
+    .unwrap();
+    assert_eq!(older.resent, None, "before pages omit it");
+}
+
+/// A step whose status changed is re-sent by itself and listed.
+#[test]
+fn a_changed_step_is_listed_as_resent() {
+    let mut session = Fixture::new("resent-step");
+    session.user("go");
+    let message = session.assistant(
+        vec![call("c1", "bash", Some("Building"), json!({}))],
+        "toolUse",
+    );
+    let first = session.newest();
+    session.result("c1", "bash", false, json!({}));
+    let update = session.page(None, Some(&first.after), None);
+    assert_eq!(update.resent, Some(vec![format!("{message}:c1")]));
+}
+
+/// An `after` page that re-sent nothing says so with an empty list.
+#[test]
+fn an_after_page_with_only_new_entries_has_an_empty_resent() {
+    let mut session = Fixture::new("resent-none");
+    session.user("go");
+    session.assistant(vec![text("ok")], "stop");
+    let first = session.newest();
+    let idle = session.page(None, Some(&first.after), None);
+    assert_eq!(idle.resent, Some(Vec::new()));
+    session.user("again");
+    session.assistant(vec![text("done")], "stop");
+    let next = session.page(None, Some(&first.after), None);
+    assert!(!next.entries.is_empty());
+    assert_eq!(next.resent, Some(Vec::new()));
+}
+
 /// A long-running agent shared with a guest: the client loaded only the
 /// newest turn. When the guest's next prompt is delivered, the fingerprint
 /// changes; the `after` page must not re-send the guest's older prompts from

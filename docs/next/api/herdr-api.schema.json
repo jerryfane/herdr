@@ -17492,6 +17492,16 @@
                     }
                   ]
                 },
+                "resent": {
+                  "description": "On an `after` page: the ids of the entries re-sent from before the\ncursor (origin-mark replays and changed steps), in page order. Every\nother entry was appended since. Absent on newest and `before` pages.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
                 "session_id": {
                   "type": "string"
                 },
