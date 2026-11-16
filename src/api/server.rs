@@ -7353,12 +7353,12 @@ mod federation_tests {
 
         // Reads pass untouched, also on another machine.
         let mut read =
-            fence_request(r#"{"id":"1","method":"agent.read","params":{"target":"w1/builder"}}"#);
+            fence_request(r#"{"id":"1","method":"agent.get","params":{"target":"w1/builder"}}"#);
         assert!(matches!(
             fence_gate(&mut read, fenced, &peers),
             FenceGate::Pass
         ));
-        assert!(matches!(read.method, Method::AgentRead(_)));
+        assert!(matches!(read.method, Method::AgentGet(_)));
 
         // Talking to a local agent passes; to an agent on another machine it does not.
         let mut local_prompt = fence_request(

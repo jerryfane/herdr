@@ -668,6 +668,8 @@ allow = ["/srv/shared/my-project"]
 
 Leave out `deny` and `mask_sockets` to use the built-in lists (see the [Config reference](/docs/config-reference/)). Herdr's own config directory is always read-only inside the fence; its sockets still accept connections, so the `herdr` CLI keeps working. Inside a fenced pane, `HERDR_FENCE` is set.
 
+Inside a fenced pane the `herdr` CLI can read everything, talk to agents (`agent prompt`), and act on its own pane and agent: send input, rename it, close it, report agent state. It cannot act outside the fence: sending input to other panes, starting or restarting agents, `server reload-config`, updates, stopping the server, plugins, worktrees and accounts are refused with a `fence_refused` error. New panes, tabs and workspaces it creates are fenced too. The private TUI client socket is not reachable from a fenced pane.
+
 If the fence cannot be set up, the pane shows the error and its command does not start. To switch the fence off, set `enabled = false`, run `herdr server reload-config`, and restart the affected panes.
 
 A fenced pane cannot reach systemd, so start and stop long-running services (for example systemd units) from outside the fence, not by hand in a pane.
