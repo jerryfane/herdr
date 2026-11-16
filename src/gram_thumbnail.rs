@@ -14,7 +14,7 @@
 //! rendered waits for that render instead of reading the file again.
 
 use std::collections::BTreeMap;
-use std::io::{self, Cursor};
+use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use base64::Engine as _;
@@ -116,9 +116,6 @@ fn file_thumbnail_with<S: AsRef<[u8]>>(
     let thumbnail = match cached {
         Some(thumbnail) => thumbnail,
         None => renderer.run((file.sha256.clone(), max_px), || {
-            // Taken before the read: once the attachment is deleted, what
-            // this render read can no longer be cached.
-            let lease = cache.then(|| crate::persist::gram_thumbs::lease(&file.sha256));
             let source = load().map_err(|err| {
                 Failure::Unread(ErrorBody {
                     code: "gram_file_error".into(),
@@ -135,8 +132,10 @@ fn file_thumbnail_with<S: AsRef<[u8]>>(
                     message,
                 })
             })?;
-            if let Some(lease) = lease {
-                lease.put(max_px, &thumbnail.jpeg);
+            if cache {
+                // Cached only if a message still holds the image: once it is
+                // deleted, what this render read is not kept.
+                crate::persist::gram_thumbs::put(&file.sha256, max_px, &thumbnail.jpeg);
             }
             Ok(thumbnail)
         })?,
@@ -359,36 +358,71 @@ fn decode_jpeg(source: &[u8], max_px: u32) -> Result<(Rgb, u8), String> {
     Ok((image, orientation))
 }
 
-fn decode_png(source: &[u8], max_px: u32) -> Result<Rgb, String> {
+fn decode_png(source: impl io::Read, max_px: u32) -> Result<Rgb, String> {
+    let unreadable = |err: png::DecodingError| format!("unreadable PNG: {err}");
     let mut decoder = png::Decoder::new_with_limits(
-        Cursor::new(source),
+        source,
         png::Limits {
             // Four 8-bit channels at the pixel limit.
             bytes: (MAX_SOURCE_PIXELS * 4) as usize,
         },
     );
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder
-        .read_info()
-        .map_err(|err| format!("unreadable PNG: {err}"))?;
-    let (width, height) = {
-        let info = reader.info();
-        (info.width, info.height)
-    };
+    // An ICC profile is inflated as it is read, up to the limit above; it is
+    // not used.
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(unreadable)?;
+    // The first frame, which an APNG's `fcTL` before it may make smaller
+    // than the image.
+    let info = reader.info();
+    let (width, height) = info
+        .frame_control
+        .map_or((info.width, info.height), |frame| {
+            (frame.width, frame.height)
+        });
+    let interlaced = info.interlaced;
     check_size(u64::from(width), u64::from(height))?;
-    let mut buffer = vec![0; reader.output_buffer_size()];
-    let frame = reader
-        .next_frame(&mut buffer)
-        .map_err(|err| format!("unreadable PNG: {err}"))?;
-    buffer.truncate(frame.buffer_size());
-    let (width, height) = (frame.width as usize, frame.height as usize);
+    let (color_type, bit_depth) = reader.output_color_type();
+    let line_size = reader.output_line_size(width);
+    let mut buffer = vec![0; line_size * height as usize];
+    // Row by row, never past the last: reading on, as `next_frame` and
+    // `finish` do, inflates all the image data that follows the rows, which
+    // a few hundred kilobytes can make gigabytes of.
+    let too_few_rows = || "unreadable PNG: too few rows".to_string();
+    if interlaced {
+        let bits_per_pixel = color_type.samples() as u8 * bit_depth as u8;
+        for _ in 0..adam7_rows(width, height) {
+            let row = reader
+                .next_interlaced_row()
+                .map_err(unreadable)?
+                .ok_or_else(too_few_rows)?;
+            if let png::InterlaceInfo::Adam7(pass) = row.interlace() {
+                png::expand_interlaced_row(
+                    &mut buffer,
+                    line_size,
+                    row.data(),
+                    pass,
+                    bits_per_pixel,
+                );
+            }
+        }
+    } else {
+        for line in buffer.chunks_exact_mut(line_size) {
+            let row = reader
+                .next_row()
+                .map_err(unreadable)?
+                .ok_or_else(too_few_rows)?;
+            line.copy_from_slice(row.data());
+        }
+    }
+    let (width, height) = (width as usize, height as usize);
     // After EXPAND and STRIP_16 every sample is 8 bits; transparency is
     // composited over white.
     let over_white = |value: u8, alpha: u8| -> u8 {
         let (value, alpha) = (u32::from(value), u32::from(alpha));
         ((value * alpha + 255 * (255 - alpha) + 127) / 255) as u8
     };
-    let image = match frame.color_type {
+    let image = match color_type {
         png::ColorType::Rgb => downscale(width, height, 3, &buffer, max_px, |px| {
             [px[0], px[1], px[2]]
         }),
@@ -406,6 +440,27 @@ fn decode_png(source: &[u8], max_px: u32) -> Result<Rgb, String> {
         png::ColorType::Indexed => return Err("unreadable PNG: palette not expanded".into()),
     };
     Ok(image)
+}
+
+/// The rows an Adam7-interlaced `width`x`height` image is stored in: those of
+/// each of its seven passes that has any column.
+fn adam7_rows(width: u32, height: u32) -> u32 {
+    // Each pass's first column, column step, first row and row step.
+    const PASSES: [(u32, u32, u32, u32); 7] = [
+        (0, 8, 0, 8),
+        (4, 8, 0, 8),
+        (0, 4, 4, 8),
+        (2, 4, 0, 4),
+        (0, 2, 2, 4),
+        (1, 2, 0, 2),
+        (0, 1, 1, 2),
+    ];
+    let count = |size: u32, first: u32, step: u32| size.saturating_sub(first).div_ceil(step);
+    PASSES
+        .iter()
+        .filter(|&&(column, column_step, _, _)| count(width, column, column_step) > 0)
+        .map(|&(_, _, row, row_step)| count(height, row, row_step))
+        .sum()
 }
 
 /// The output size for a `width`x`height` source: the longer edge becomes
@@ -711,6 +766,169 @@ pub(crate) mod tests {
         let mut truncated = jpeg_of(64, 64);
         truncated.truncate(40);
         assert!(render(&truncated, 64).is_err());
+    }
+
+    /// Bits packed least significant first, as deflate stores them.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        len: usize,
+    }
+
+    impl Bits {
+        fn put(&mut self, value: u32, count: usize) {
+            for at in 0..count {
+                if self.len.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                let bit = (value >> at) as u8 & 1;
+                *self.bytes.last_mut().unwrap() |= bit << (self.len % 8);
+                self.len += 1;
+            }
+        }
+
+        /// A Huffman code, which deflate stores most significant bit first.
+        fn code(&mut self, code: u32, count: usize) {
+            self.put(code.reverse_bits() >> (32 - count), count);
+        }
+
+        /// `byte` as a fixed-Huffman literal.
+        fn literal(&mut self, byte: u8) {
+            match byte {
+                0..=143 => self.code(0x30 + u32::from(byte), 8),
+                _ => self.code(0x190 + u32::from(byte - 144), 9),
+            }
+        }
+    }
+
+    /// A zlib stream of `data` and then `zeros` zero bytes, in one
+    /// fixed-Huffman block: the zeros mostly as copies of 258 bytes, 13 bits
+    /// each.
+    fn zlib(data: &[u8], zeros: usize) -> Vec<u8> {
+        let mut bits = Bits::default();
+        // The last block, of fixed Huffman codes.
+        bits.put(0b011, 3);
+        for &byte in data {
+            bits.literal(byte);
+        }
+        if zeros > 0 {
+            bits.literal(0);
+            for _ in 0..(zeros - 1) / 258 {
+                // Length 258 (code 285) at distance 1 (code 0).
+                bits.code(0b1100_0101, 8);
+                bits.code(0, 5);
+            }
+            for _ in 0..(zeros - 1) % 258 {
+                bits.literal(0);
+            }
+        }
+        // End of block.
+        bits.code(0, 7);
+        let (mut a, mut b) = (1u64, 0u64);
+        for &byte in data {
+            a = (a + u64::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        b = (b + (zeros as u64 % 65521) * a) % 65521;
+        let mut stream = vec![0x78, 0x01];
+        stream.extend(bits.bytes);
+        stream.extend((((b << 16) | a) as u32).to_be_bytes());
+        stream
+    }
+
+    /// A PNG of `width`x`height` 8-bit `color` pixels whose image data is the
+    /// zlib stream `idat`, as given.
+    fn png_with_idat(
+        width: u32,
+        height: u32,
+        color: png::ColorType,
+        interlaced: bool,
+        idat: &[u8],
+    ) -> Vec<u8> {
+        let mut info = png::Info::with_size(width, height);
+        info.color_type = color;
+        info.bit_depth = png::BitDepth::Eight;
+        info.interlaced = interlaced;
+        let mut bytes = Vec::new();
+        let mut writer = png::Encoder::with_info(&mut bytes, info)
+            .unwrap()
+            .write_header()
+            .unwrap();
+        writer.write_chunk(png::chunk::IDAT, idat).unwrap();
+        writer.finish().unwrap();
+        bytes
+    }
+
+    /// png's `next_frame` inflates all the image data after the rows as well:
+    /// one pixel followed by 256 MiB of zeros, compressed into 1.7 MB, cost
+    /// 256 MiB of inflating. Only the rows are read now.
+    #[test]
+    fn a_png_is_inflated_only_as_far_as_its_rows_go() {
+        struct Counted<'a> {
+            source: &'a [u8],
+            read: usize,
+        }
+        impl io::Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let read = io::Read::read(&mut self.source, buf)?;
+                self.read += read;
+                Ok(read)
+            }
+        }
+        // One gray pixel: its row's filter byte, then its value.
+        let idat = zlib(&[0, 200], 256 << 20);
+        let source = png_with_idat(1, 1, png::ColorType::Grayscale, false, &idat);
+        assert!(source.len() > 1_500_000, "{}", source.len());
+        let mut counted = Counted {
+            source: &source,
+            read: 0,
+        };
+        let image = decode_png(&mut counted, 64).unwrap();
+        assert_eq!(
+            (image.width, image.height, image.pixels),
+            (1, 1, vec![200; 3])
+        );
+        assert!(
+            counted.read <= 64 * 1024,
+            "read {} of {} bytes",
+            counted.read,
+            source.len()
+        );
+    }
+
+    #[test]
+    fn an_interlaced_png_renders() {
+        let color = |x: u32, y: u32| [(x * 20) as u8, (y * 30) as u8, (x + y) as u8];
+        for (width, height) in [(11, 7), (8, 8), (3, 2), (1, 1)] {
+            // Adam7: each pass's first column, column step, first row and
+            // row step. A pass without a column has no rows.
+            let mut raw = Vec::new();
+            for (x0, dx, y0, dy) in [
+                (0, 8, 0, 8),
+                (4, 8, 0, 8),
+                (0, 4, 4, 8),
+                (2, 4, 0, 4),
+                (0, 2, 2, 4),
+                (1, 2, 0, 2),
+                (0, 1, 1, 2),
+            ] {
+                if x0 >= width {
+                    continue;
+                }
+                for y in (y0..height).step_by(dy) {
+                    // Filter type none.
+                    raw.push(0);
+                    raw.extend((x0..width).step_by(dx).flat_map(|x| color(x, y)));
+                }
+            }
+            let source = png_with_idat(width, height, png::ColorType::Rgb, true, &zlib(&raw, 0));
+            let image = decode_png(&source[..], 64).unwrap();
+            let expected: Vec<u8> = (0..height)
+                .flat_map(|y| (0..width).flat_map(move |x| color(x, y)))
+                .collect();
+            assert_eq!((image.width, image.height), (width, height));
+            assert_eq!(image.pixels, expected, "{width}x{height}");
+        }
     }
 
     /// A TIFF header with one IFD0 entry: orientation `value`.

@@ -71,9 +71,9 @@ enum GrabError {
 
 /// The result of a delete attempt, decided under the store lock.
 enum DeleteOutcome {
-    /// The message was removed. Carries its id so the handler can also delete any
-    /// attached file bytes on disk once file attachments exist.
-    Deleted(String),
+    /// The message was removed. The store dropped its attachment bytes with it, so
+    /// a secret (a temporary API key sent as a file) does not outlive the record.
+    Deleted,
     /// No message with that id.
     NotFound,
     /// The message exists but the calling agent is not involved in it.
@@ -772,12 +772,7 @@ impl App {
         });
 
         match outcome {
-            Ok((DeleteOutcome::Deleted(removed_id), _)) => {
-                // Remove the attachment bytes too, so a secret (a temporary API key
-                // sent as a file) does not outlive the record it was deleted with.
-                crate::persist::gram_files::remove_message_files(&removed_id);
-                encode_success(id, ResponseResult::Ok {})
-            }
+            Ok((DeleteOutcome::Deleted, _)) => encode_success(id, ResponseResult::Ok {}),
             Ok((DeleteOutcome::NotFound, _)) => {
                 encode_error(id, "not_found", "no gram message with that id")
             }
@@ -1476,8 +1471,8 @@ fn apply_delete(
             return (DeleteOutcome::Forbidden, false);
         }
     }
-    let removed = items.remove(pos);
-    (DeleteOutcome::Deleted(removed.id), true)
+    items.remove(pos);
+    (DeleteOutcome::Deleted, true)
 }
 
 /// Whether a message belongs in an agent's view: the shared ungrabbed queue, an
@@ -1675,19 +1670,11 @@ mod tests {
         assert!(!agent_may_delete(&sent, "beta"));
     }
 
-    /// Deleted-id label used by `apply_delete` on success.
-    fn deleted_id(outcome: &DeleteOutcome) -> Option<&str> {
-        match outcome {
-            DeleteOutcome::Deleted(id) => Some(id.as_str()),
-            _ => None,
-        }
-    }
-
     #[test]
     fn apply_delete_owner_removes_any_message() {
         let mut items = vec![owner_shared("a"), owner_shared("b")];
         let (outcome, changed) = apply_delete(&mut items, "a", None);
-        assert_eq!(deleted_id(&outcome), Some("a"));
+        assert!(matches!(outcome, DeleteOutcome::Deleted));
         assert!(changed);
         assert_eq!(
             items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
@@ -1709,7 +1696,7 @@ mod tests {
 
         // A message addressed to the agent: removed.
         let (outcome, changed) = apply_delete(&mut items, "direct", Some("alpha"));
-        assert_eq!(deleted_id(&outcome), Some("direct"));
+        assert!(matches!(outcome, DeleteOutcome::Deleted));
         assert!(changed);
         assert_eq!(
             items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
@@ -2092,7 +2079,7 @@ mod tests {
             "gram_file_error"
         );
         // An out-of-range size is clamped, onto the cached 16 px minimum here.
-        crate::persist::gram_thumbs::lease(&sha256).put(16, &jpeg);
+        crate::persist::gram_thumbs::put(&sha256, 16, &jpeg);
         assert_eq!(
             thumbnail(&mut app, &message_id, 1)["result"]["type"],
             "gram_file_thumbnail"
@@ -2143,6 +2130,160 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Runs `test` on an app whose config and state dirs are a fresh temp dir,
+    /// under the env lock.
+    fn with_gram_dirs(tag: &str, test: impl FnOnce(&mut App)) {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("herdr-gram-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let prev: Vec<_> = [("XDG_CONFIG_HOME", "config"), ("XDG_STATE_HOME", "state")]
+            .into_iter()
+            .map(|(key, dir)| {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, tmp.join(dir));
+                (key, prev)
+            })
+            .collect();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        test(&mut app);
+        for (key, prev) in prev {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Posts `image` as the owner's attachment: its message id, and its file.
+    fn post_image(app: &mut App, upload_id: &str, image: &[u8]) -> (String, GramFile) {
+        let raw = app.handle_gram_upload_chunk(
+            "u".into(),
+            serde_json::from_value(serde_json::json!({
+                "upload_id": upload_id,
+                "offset": 0,
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(image),
+            }))
+            .unwrap(),
+        );
+        assert!(raw.contains("\"ok\""), "{raw}");
+        let raw = app.handle_gram_post(
+            "p".into(),
+            serde_json::from_value(serde_json::json!({
+                "text": "",
+                "file": {"upload_id": upload_id, "name": "photo.jpg", "mime": "image/jpeg"},
+            }))
+            .unwrap(),
+        );
+        let reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let message_id = reply["result"]["message"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let file = crate::persist::gram::load()
+            .into_iter()
+            .find(|item| item.id == message_id)
+            .and_then(|item| item.file)
+            .unwrap();
+        (message_id, file)
+    }
+
+    fn cached_preview(sha256: &str, max_px: u32) -> std::path::PathBuf {
+        crate::config::state_dir()
+            .join("gram-thumbs")
+            .join(sha256)
+            .join(format!("{max_px}.jpg"))
+    }
+
+    /// Named daemons share the Gram store and the preview cache. A render that
+    /// read an image before another daemon deleted it caches no preview after.
+    #[test]
+    fn a_render_caches_no_preview_of_an_image_another_daemon_deleted_meanwhile() {
+        const DELETE: &str = "HERDR_GRAM_THUMBNAIL_TEST_DELETE";
+        if let Some(message_id) = std::env::var_os(DELETE) {
+            // The other daemon: its own process, on the dirs the test set.
+            let message_id = message_id.into_string().unwrap();
+            let (outcome, _) = crate::persist::gram::update_if_changed(|items| {
+                apply_delete(items, &message_id, None)
+            })
+            .unwrap();
+            assert!(matches!(outcome, DeleteOutcome::Deleted));
+            println!("deleted by another process");
+            return;
+        }
+        with_gram_dirs("thumbnail-daemons", |app| {
+            let photo = crate::gram_thumbnail::tests::jpeg_of(640, 480);
+            let (message_id, file) = post_image(app, "up-photo", &photo);
+            let read = || crate::persist::gram_files::read_message_file(&message_id, &file.name);
+            assert!(crate::gram_thumbnail::file_thumbnail(&file, 128, read, true).is_ok());
+            assert!(cached_preview(&file.sha256, 128).exists());
+
+            let read_then_delete_elsewhere = || {
+                let bytes = read();
+                let other = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "app::api::gram::tests::a_render_caches_no_preview_of_an_image_another_daemon_deleted_meanwhile",
+                        "--nocapture",
+                    ])
+                    .env(DELETE, &message_id)
+                    .output()
+                    .unwrap();
+                assert!(other.status.success(), "{other:?}");
+                assert!(
+                    String::from_utf8_lossy(&other.stdout).contains("deleted by another process")
+                );
+                bytes
+            };
+            let reply =
+                crate::gram_thumbnail::file_thumbnail(&file, 256, read_then_delete_elsewhere, true);
+            assert!(reply.is_ok(), "{reply:?}");
+            assert!(!cached_preview(&file.sha256, 128).exists());
+            assert!(
+                !cached_preview(&file.sha256, 256).exists(),
+                "a deleted image leaves no preview behind"
+            );
+
+            // Posted again, the same image is cached again.
+            let (message_id, file) = post_image(app, "up-again", &photo);
+            let read = || crate::persist::gram_files::read_message_file(&message_id, &file.name);
+            assert!(crate::gram_thumbnail::file_thumbnail(&file, 256, read, true).is_ok());
+            assert!(cached_preview(&file.sha256, 256).exists());
+        });
+    }
+
+    /// A delete drops the bytes under the store lock with the message, so a
+    /// render let in before the delete that reads only after it finds no image
+    /// and caches nothing.
+    #[test]
+    fn a_render_reading_after_a_delete_finds_no_image_and_caches_nothing() {
+        with_gram_dirs("thumbnail-delete-order", |app| {
+            let photo = crate::gram_thumbnail::tests::jpeg_of(640, 480);
+            let (message_id, file) = post_image(app, "up-photo", &photo);
+            // The store update `gram.delete` makes.
+            let (outcome, _) = crate::persist::gram::update_if_changed(|items| {
+                apply_delete(items, &message_id, None)
+            })
+            .unwrap();
+            assert!(matches!(outcome, DeleteOutcome::Deleted));
+            let read = || crate::persist::gram_files::read_message_file(&message_id, &file.name);
+            assert!(read().is_err(), "the bytes go with the message");
+            let reply = crate::gram_thumbnail::file_thumbnail(&file, 256, read, true);
+            assert!(
+                matches!(&reply, Err(error) if error.code == "gram_file_error"),
+                "{reply:?}"
+            );
+            assert!(!cached_preview(&file.sha256, 256).exists());
+        });
     }
 
     /// The digest must be a function of the ANSWER, so an unchanged store yields the

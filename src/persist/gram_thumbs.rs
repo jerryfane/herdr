@@ -11,15 +11,16 @@
 //! ([`crate::persist::gram_files`]), the previews of an attachment go when the
 //! last message holding it is deleted or loses it to the store's file budget
 //! ([`forget`], called by [`crate::persist::gram`]), so a deleted secret leaves
-//! no picture of itself behind. A render that read the attachment before such
-//! a delete holds a [`Lease`] the delete revoked, so it cannot put the preview
-//! back afterwards. Directories are `0o700`, files `0o600`.
+//! no picture of itself behind. A preview is only cached under the store's
+//! lock while a message still holds the attachment ([`put`]), the lock a
+//! delete holds while it drops the message, its bytes and the previews. So a
+//! render that read the attachment before the delete cannot put the preview
+//! back afterwards, whichever daemon sharing the store deleted it.
+//! Directories are `0o700`, files `0o600`.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 /// Cap on all cached previews together. At 20-60 KB each that is over a
@@ -46,77 +47,18 @@ pub fn get(sha256: &str, max_px: u32) -> Option<Vec<u8>> {
     get_in(&cache_dir(), sha256, max_px)
 }
 
-/// The right to cache previews of the attachment `sha256` rendered from bytes
-/// read after it was taken: [`forget`] revokes every lease on the hash it
-/// drops. Take it before reading the attachment.
-pub fn lease(sha256: &str) -> Lease {
-    let mut leases = leases();
-    let held = leases.entry(sha256.to_owned()).or_default();
-    held.count += 1;
-    Lease {
-        sha256: sha256.to_owned(),
-        generation: held.generation,
+/// Caches `jpeg` as the preview of the attachment `sha256` at `max_px`,
+/// unless no message holds the attachment any more, then trims the cache to
+/// [`MAX_CACHE_BYTES`]. A failure only costs a later re-render.
+pub fn put(sha256: &str, max_px: u32, jpeg: &[u8]) {
+    let root = cache_dir();
+    match crate::persist::gram::while_attachment_held(sha256, || {
+        put_in(&root, sha256, max_px, jpeg)
+    }) {
+        Ok(true) => trim_in(&root, MAX_CACHE_BYTES),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "could not cache a gram thumbnail"),
     }
-}
-
-/// See [`lease`].
-#[derive(Debug)]
-pub struct Lease {
-    sha256: String,
-    generation: u64,
-}
-
-impl Lease {
-    /// Caches `jpeg` as the preview at `max_px`, unless the attachment was
-    /// forgotten since the lease was taken, then trims the cache to
-    /// [`MAX_CACHE_BYTES`]. A failure only costs a later re-render.
-    pub fn put(&self, max_px: u32, jpeg: &[u8]) {
-        let root = cache_dir();
-        match self.put_in(&root, max_px, jpeg) {
-            Ok(true) => trim_in(&root, MAX_CACHE_BYTES),
-            Ok(false) => {}
-            Err(err) => tracing::warn!(err = %err, "could not cache a gram thumbnail"),
-        }
-    }
-
-    /// Whether `jpeg` was cached.
-    fn put_in(&self, root: &Path, max_px: u32, jpeg: &[u8]) -> io::Result<bool> {
-        // Held across the write, so a forget runs wholly before or after it.
-        let leases = leases();
-        let live = leases
-            .get(&self.sha256)
-            .is_some_and(|held| held.generation == self.generation);
-        if live {
-            put_in(root, &self.sha256, max_px, jpeg)?;
-        }
-        Ok(live)
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let mut leases = leases();
-        if let Some(held) = leases.get_mut(&self.sha256) {
-            held.count -= 1;
-            if held.count == 0 {
-                leases.remove(&self.sha256);
-            }
-        }
-    }
-}
-
-/// The leases out on one hash.
-#[derive(Debug, Default)]
-struct Held {
-    /// Bumped by each forget; a lease from an older one is revoked.
-    generation: u64,
-    count: usize,
-}
-
-/// Hashes with leases out; a hash goes with its last lease.
-fn leases() -> MutexGuard<'static, BTreeMap<String, Held>> {
-    static LEASES: Mutex<BTreeMap<String, Held>> = Mutex::new(BTreeMap::new());
-    LEASES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Drops every cached preview of the attachment `sha256`.
@@ -155,14 +97,9 @@ fn put_in(root: &Path, sha256: &str, max_px: u32, jpeg: &[u8]) -> io::Result<()>
 }
 
 fn forget_in(root: &Path, sha256: &str) {
-    if !is_sha256_hex(sha256) {
-        return;
+    if is_sha256_hex(sha256) {
+        let _ = fs::remove_dir_all(root.join(sha256));
     }
-    let mut leases = leases();
-    if let Some(held) = leases.get_mut(sha256) {
-        held.generation += 1;
-    }
-    let _ = fs::remove_dir_all(root.join(sha256));
 }
 
 /// Deletes the least recently used previews until the cache holds at most
@@ -279,32 +216,6 @@ mod tests {
             get_in(&root, &sha('b'), 256).as_deref(),
             Some(&b"other"[..])
         );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_forget_revokes_the_leases_taken_before_it() {
-        let root = temp_root("lease");
-        let hash = sha('d');
-        let before = lease(&hash);
-        forget_in(&root, &hash);
-        let after = lease(&hash);
-        // Its bytes were read before the delete: what it rendered stays out.
-        assert!(!before.put_in(&root, 256, b"deleted").unwrap());
-        assert_eq!(get_in(&root, &hash, 256), None);
-        // Read after it (the image came back in a new message): cached.
-        assert!(after.put_in(&root, 256, b"posted again").unwrap());
-        assert_eq!(
-            get_in(&root, &hash, 256).as_deref(),
-            Some(&b"posted again"[..])
-        );
-        drop((before, after));
-        assert!(
-            !leases().contains_key(&hash),
-            "a hash goes with its last lease"
-        );
-        forget_in(&root, &hash);
-        assert!(!root.join(&hash).exists());
         let _ = fs::remove_dir_all(&root);
     }
 
