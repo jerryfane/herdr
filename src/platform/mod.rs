@@ -703,6 +703,12 @@ pub(crate) fn process_mount_namespace(_pid: u32) -> Option<u64> {
     None
 }
 
+/// No pane fence exists here, so no mount table to read.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fenced_path_read_only(_pid: u32, _path: &std::path::Path) -> Option<bool> {
+    None
+}
+
 /// Classify the peer of a connected local socket for the pane fence.
 #[cfg(unix)]
 pub(crate) fn local_stream_fence_peer(stream: &crate::ipc::LocalStream) -> FencePeer {

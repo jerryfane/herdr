@@ -135,6 +135,8 @@ operations::define_operations! {
     AgentRead(AgentReadParams) => "agent.read", false, false;
     AgentTranscript(AgentTranscriptParams) => "agent.transcript", false, false;
     AgentExplain(AgentTarget) => "agent.explain", false, false;
+    /// How the pane fence treats a pane and, optionally, one path. Local only.
+    FenceExplain(FenceExplainParams) => "fence.explain", false, false;
     AgentSendKeys(AgentSendKeysParams) => "agent.send_keys", true, false;
     AgentRename(AgentRenameParams) => "agent.rename", true, false;
     AgentAvatarSet(AgentAvatarSetParams) => "agent.avatar.set", false, false;

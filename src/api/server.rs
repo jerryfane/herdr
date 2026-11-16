@@ -5293,6 +5293,7 @@ mod federation_tests {
             ("agent.read", AllowedAt(Observe)),
             ("agent.transcript", AllowedAt(Observe)),
             ("agent.explain", AllowedAt(Observe)),
+            ("fence.explain", Denied),
             ("agent.send_keys", AllowedAt(Interact)),
             ("agent.rename", AllowedAt(Admin)),
             ("agent.avatar.set", AllowedAt(Admin)),

@@ -44,6 +44,7 @@ pub(super) fn command() -> Command {
         .subcommand(gram_command())
         .subcommand(guest_command())
         .subcommand(agent_command())
+        .subcommand(super::fence::command())
         .subcommand(pane_command())
         .subcommand(pair_command())
         .subcommand(terminal_command())

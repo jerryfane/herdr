@@ -79,6 +79,7 @@ const READ: &[&str] = &[
     "agent.read",
     "agent.transcript",
     "agent.explain",
+    "fence.explain",
     "agent.avatar.get",
     "agent.groups.get",
     "agent.kinds",

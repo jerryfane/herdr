@@ -860,14 +860,27 @@ pub(crate) fn fence_pane_command(
     if !crate::platform::FENCE_SUPPORTED || !fences(&config, identity) {
         return Ok(());
     }
-    let home = std::env::var_os("HOME")
+    let plan = pane_plan(&config)?;
+    let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
+    wrap_command(cmd, &plan_json)?;
+    FENCED_PANES_EXIST.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn server_home() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("pane fence: HOME is not set; not starting the pane"))?;
+        .ok_or_else(|| io::Error::other("pane fence: HOME is not set; not starting the pane"))
+}
+
+/// The plan a fenced pane started now gets.
+fn pane_plan(config: &FenceConfig) -> io::Result<FencePlan> {
+    let home = server_home()?;
     // Herdr's own settings, and the config file actually in use (HERDR_CONFIG_PATH
     // may point outside the config directory), are always read-only.
     let always_protected = [crate::config::config_dir(), crate::config::config_path()];
-    let mut plan = resolve_plan(&config, &home, &always_protected)?;
+    let mut plan = resolve_plan(config, &home, &always_protected)?;
     // The private TUI client socket attaches to any pane and types into it; agents
     // never need it. It sits below the read-only config dir, so its mask is applied
     // after every other mount (docs/next/design/pane-fence.md, section 8).
@@ -879,10 +892,133 @@ pub(crate) fn fence_pane_command(
             plan.mounts.push(mask);
         }
     }
-    let plan_json = serde_json::to_string(&plan).map_err(io::Error::other)?;
-    wrap_command(cmd, &plan_json)?;
-    FENCED_PANES_EXIST.store(true, Ordering::Release);
-    Ok(())
+    Ok(plan)
+}
+
+/// What `herdr fence explain` reports for one pane (docs/next/design/pane-fence.md,
+/// section 9). `config_*` fields describe the current config, which a restart of
+/// the pane would get; `running_fenced` and `enforced_read_only` describe the
+/// process that runs now, which may have started under an older config.
+pub(crate) fn explain(
+    identity: &FenceIdentity,
+    pid: Option<u32>,
+    path: Option<&str>,
+) -> io::Result<crate::api::schema::FenceExplanation> {
+    use crate::api::schema::{FenceExplanation, FencePathExplanation};
+
+    let config = loaded_policy()?;
+    let config_fences = crate::platform::FENCE_SUPPORTED && fences(&config, identity);
+    let plan = if config_fences {
+        Some(pane_plan(&config)?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let running_fenced = pid.and_then(|pid| match crate::platform::fence_peer(pid) {
+        crate::platform::FencePeer::Unfenced => Some(false),
+        crate::platform::FencePeer::Fenced { .. } => Some(true),
+        crate::platform::FencePeer::Unknown => None,
+    });
+    #[cfg(not(unix))]
+    let running_fenced = pid.map(|_| false);
+    let path = match path {
+        Some(path) => {
+            if !path.starts_with('/') && path != "~" && !path.starts_with("~/") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path must be absolute or start with ~/",
+                ));
+            }
+            let written = lexical(path, Some(&server_home()?));
+            let resolved = canonicalize_if_present(&written)?.unwrap_or(written);
+            let verdict = match &plan {
+                Some(plan) => path_verdict(plan, &resolved),
+                None => PathVerdict {
+                    access: crate::api::schema::FenceAccess::Writable,
+                    rule: "not fenced: the current config does not fence this pane".into(),
+                    pinned: false,
+                },
+            };
+            let enforced_read_only = match (running_fenced, pid) {
+                (Some(true), Some(pid)) => crate::platform::fenced_path_read_only(pid, &resolved),
+                (Some(false), _) => Some(false),
+                _ => None,
+            };
+            Some(FencePathExplanation {
+                path: path.to_string(),
+                resolved: resolved.display().to_string(),
+                access: verdict.access,
+                rule: verdict.rule,
+                pinned: verdict.pinned,
+                enforced_read_only,
+            })
+        }
+        None => None,
+    };
+    Ok(FenceExplanation {
+        pane_id: String::new(),
+        agent: match identity {
+            FenceIdentity::Agent(name) => Some(name.clone()),
+            FenceIdentity::Anonymous => None,
+        },
+        running_fenced,
+        config_fences,
+        deny_count: plan.as_ref().map(FencePlan::deny_count),
+        missing: plan.map(|plan| plan.skipped).unwrap_or_default(),
+        path,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PathVerdict {
+    access: crate::api::schema::FenceAccess,
+    rule: String,
+    pinned: bool,
+}
+
+/// The access a plan gives `path` (already resolved): the deepest deny, allow or mask
+/// at or above it decides, the later one on a tie, because mounts are applied
+/// shallow first and a later mount covers an earlier one at the same place.
+fn path_verdict(plan: &FencePlan, path: &Path) -> PathVerdict {
+    use crate::api::schema::FenceAccess;
+
+    let mut deciding: Option<&FenceMount> = None;
+    for mount in &plan.mounts {
+        let at = match mount {
+            FenceMount::Deny(at) | FenceMount::Allow(at) | FenceMount::Mask(at) => at,
+            FenceMount::Anchor(_) => continue,
+        };
+        if !covers(at, path) {
+            continue;
+        }
+        let deeper_or_same = match deciding {
+            Some(
+                FenceMount::Deny(current) | FenceMount::Allow(current) | FenceMount::Mask(current),
+            ) => depth(at) >= depth(current),
+            _ => true,
+        };
+        if deeper_or_same {
+            deciding = Some(mount);
+        }
+    }
+    let (access, rule) = match deciding {
+        Some(FenceMount::Deny(at)) => (FenceAccess::ReadOnly, format!("deny {}", at.display())),
+        Some(FenceMount::Allow(at)) => (FenceAccess::Writable, format!("allow {}", at.display())),
+        Some(FenceMount::Mask(at)) => (FenceAccess::Masked, format!("mask {}", at.display())),
+        _ => (FenceAccess::Writable, "not denied".into()),
+    };
+    // A mount point cannot be removed or renamed from inside the pane.
+    let pinned = plan.mounts.iter().any(|mount| match mount {
+        FenceMount::Anchor(at)
+        | FenceMount::Deny(at)
+        | FenceMount::Allow(at)
+        | FenceMount::Mask(at) => at == path,
+    });
+    PathVerdict {
+        access,
+        rule,
+        pinned,
+    }
 }
 
 fn wrap_command(cmd: &mut CommandBuilder, plan_json: &str) -> io::Result<()> {
@@ -979,7 +1115,7 @@ fn setup_notice(plan: &FencePlan) -> String {
     if !plan.skipped.is_empty() {
         notice.push_str(&format!(", {} entries not present", plan.skipped.len()));
     }
-    notice.push(')');
+    notice.push_str("); `herdr fence explain <pane> <path>` shows why a path is read-only");
     notice
 }
 
@@ -1033,6 +1169,46 @@ mod tests {
 
     fn agent(name: &str) -> FenceIdentity {
         FenceIdentity::Agent(name.into())
+    }
+
+    /// `fence explain` must name the rule the kernel applies: the deepest mount at or
+    /// above the path, the later one at the same place.
+    #[test]
+    fn path_verdict_names_the_deciding_rule() {
+        use crate::api::schema::FenceAccess;
+        let p = PathBuf::from;
+        let plan = FencePlan {
+            mounts: vec![
+                FenceMount::Anchor(p("/home/u/.gitmoot")),
+                FenceMount::Deny(p("/home/u/.gitmoot/config.toml")),
+                FenceMount::Deny(p("/srv")),
+                FenceMount::Allow(p("/srv/app/data")),
+                FenceMount::Deny(p("/srv/app/data/secrets")),
+                FenceMount::Mask(p("/run/docker.sock")),
+                FenceMount::Deny(p("/cfg")),
+                FenceMount::Deny(p("/cfg/x")),
+                FenceMount::Allow(p("/cfg/x")),
+            ],
+            ..FencePlan::default()
+        };
+        let v = |path: &str| path_verdict(&plan, Path::new(path));
+        assert_eq!(
+            (v("/srv/app/x").access, v("/srv/app/x").rule),
+            (FenceAccess::ReadOnly, "deny /srv".into())
+        );
+        assert_eq!(v("/srv/app/data/db").access, FenceAccess::Writable);
+        assert_eq!(v("/srv/app/data/db").rule, "allow /srv/app/data");
+        assert_eq!(v("/srv/app/data/secrets/k").access, FenceAccess::ReadOnly);
+        assert_eq!(v("/srvx").rule, "not denied", "component prefix only");
+        assert_eq!(v("/run/docker.sock").access, FenceAccess::Masked);
+        assert_eq!(v("/cfg/x/y").access, FenceAccess::Writable, "later mount wins a tie");
+        let pinned = v("/home/u/.gitmoot");
+        assert_eq!((pinned.access, pinned.pinned), (FenceAccess::Writable, true));
+        assert!(!v("/home/u/.gitmoot/gitmoot.db-wal").pinned);
+        assert_eq!(
+            v("/home/u/.gitmoot/config.toml").access,
+            FenceAccess::ReadOnly
+        );
     }
 
     #[test]

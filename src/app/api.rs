@@ -1788,6 +1788,7 @@ impl App {
             }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
+            Method::FenceExplain(params) => return self.handle_fence_explain(request.id, params),
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params);
             }

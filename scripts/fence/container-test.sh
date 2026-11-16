@@ -76,6 +76,10 @@ until [ -f "$OUT/api.done" ]; do
   sleep 0.1
 done
 OTHER=$FIRST SELF=$PANE sh "$API_CHECKS" > "$OUT/control-api.txt" 2>&1
+# fence explain (#421), for the fenced pane: config rule and the pane's real mount table.
+"$HERDR" fence explain "$PANE" /fleet/protected/sub/keep --json > "$OUT/explain-denied.json" 2>&1 || true
+"$HERDR" fence explain "$PANE" /fleet/protected/db/data.db --json > "$OUT/explain-allowed.json" 2>&1 || true
+"$HERDR" fence explain "$PANE" /fleet/protected/sub/keep > "$OUT/explain-text.txt" 2>&1 || true
 
 kill "$SERVER"; wait "$SERVER" 2>/dev/null || true
 sleep 0.3
@@ -185,6 +189,17 @@ for c in api_run_in_other_pane api_send_keys_other_pane api_rename_other_pane ap
 done
 api api_read_panes ok
 api api_rename_own_pane ok
+
+echo "== fence explain"
+cat "$OUT/explain-text.txt"
+has() { grep -q "$2" "$OUT/$1" || { echo "FAIL $1 lacks $2"; cat "$OUT/$1"; fail=1; }; }
+has explain-denied.json '"running_fenced":true'
+has explain-denied.json '"access":"read_only"'
+has explain-denied.json '"rule":"deny /fleet/protected"'
+has explain-denied.json '"enforced_read_only":true'
+has explain-allowed.json '"access":"writable"'
+has explain-allowed.json '"rule":"allow /fleet/protected/db"'
+has explain-allowed.json '"enforced_read_only":false'
 
 if ! diff "$OUT/mounts-before" "$OUT/mounts-after"; then
   echo "FAIL container root mount table changed"; fail=1
