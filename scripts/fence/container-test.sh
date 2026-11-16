@@ -87,7 +87,8 @@ findmnt -R -n -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION / | sort > "$OUT/mount
 mkdir -p /fleet/pilot
 cat > /usr/bin/pi <<'EOF'
 #!/bin/sh
-if : > /fleet/pilot/agent-write 2>/dev/null; then w=ok; else w=blocked; fi
+# touch, not `: >`: a failed redirection on a special builtin ends a non-interactive sh.
+if touch /fleet/pilot/agent-write 2>/dev/null; then w=ok; else w=blocked; fi
 echo "agent_fence ${HERDR_FENCE:-0} agent_write $w" > /tmp/fence-out/agent.txt
 exec sleep 600
 EOF
