@@ -321,6 +321,56 @@ fn status_from(state: &UpdateState, running: bool) -> Option<UpdateAttempt> {
     Some(attempt)
 }
 
+/// Server start: a `restart_later` attempt whose build is now the one running
+/// has finished, so record it as `updated`. Without this the record would
+/// report a pending restart forever. Errors are logged, never fatal.
+#[cfg(unix)]
+pub(crate) fn settle_restart_later_on_start() {
+    let running = super::verify::RunningBuild::current();
+    if let Err(err) = settle_restart_later(&UpdateDirs::current(), running.build_id.as_deref()) {
+        tracing::warn!("could not settle the pending update record: {err}");
+    }
+}
+
+/// Rewrite a `DownloadedRestartRequired` attempt for `running_build_id` as
+/// `Updated`. A record for any other build (the install was replaced, or
+/// rolled back) is left alone, and so is everything while an attempt holds
+/// the lock. Returns whether the record changed.
+#[cfg(unix)]
+fn settle_restart_later(dirs: &UpdateDirs, running_build_id: Option<&str>) -> io::Result<bool> {
+    let Some(running_build_id) = running_build_id else {
+        return Ok(false);
+    };
+    let pending = |state: &UpdateState| {
+        state.attempt.as_ref().is_some_and(|record| {
+            record.public.outcome == Some(UpdateOutcome::DownloadedRestartRequired)
+                && record.public.build_id == running_build_id
+        })
+    };
+    // Cheap check first: most starts have nothing to settle and must not
+    // create the updates dir or lock file.
+    if !pending(&dirs.load()) {
+        return Ok(false);
+    }
+    let Some(_lock) = dirs.acquire_lock()? else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    dirs.update(|state| {
+        if !pending(state) {
+            return;
+        }
+        if let Some(record) = state.attempt.as_mut() {
+            record.public.outcome = Some(UpdateOutcome::Updated);
+            record.public.message = Some(format!(
+                "build {running_build_id} took over when herdr restarted"
+            ));
+            changed = true;
+        }
+    })?;
+    Ok(changed)
+}
+
 #[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -480,6 +530,56 @@ mod tests {
         };
         let done = status_from(&finished, false).unwrap();
         assert_eq!(done.outcome, Some(UpdateOutcome::Updated));
+    }
+
+    #[cfg(unix)]
+    fn pending_restart(dirs: &UpdateDirs) -> UpdateState {
+        let mut attempt = record(Some(UpdateOutcome::DownloadedRestartRequired));
+        attempt.public.restart_later = true;
+        let state = UpdateState {
+            attempt: Some(attempt),
+            rolled_back: Vec::new(),
+        };
+        dirs.store(&state).unwrap();
+        state
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_later_attempt_settles_once_its_build_is_running() {
+        let dirs = temp_dirs("settle-running");
+        pending_restart(&dirs);
+        assert!(settle_restart_later(&dirs, Some("2026-10-28-0123456789ab")).unwrap());
+        let status = status_from(&dirs.load(), false).unwrap();
+        assert_eq!(status.outcome, Some(UpdateOutcome::Updated));
+        assert!(status.message.unwrap().contains("took over"));
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_later_attempt_for_another_build_stays_pending() {
+        let dirs = temp_dirs("settle-other");
+        let state = pending_restart(&dirs);
+        for running in [Some("2026-10-27-8a02b834abcd"), None] {
+            assert!(!settle_restart_later(&dirs, running).unwrap());
+            assert_eq!(dirs.load(), state);
+        }
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_leaves_a_restart_later_attempt_alone() {
+        let dirs = temp_dirs("settle-locked");
+        let state = pending_restart(&dirs);
+        let holder = hold_in_child(dirs.acquire_lock().unwrap().unwrap());
+        let settled = settle_restart_later(&dirs, Some("2026-10-28-0123456789ab")).unwrap();
+        let after = dirs.load();
+        kill(holder);
+        assert!(!settled);
+        assert_eq!(after, state);
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
     }
 
     /// Hand `lock` to a child process the way the server hands it to the
