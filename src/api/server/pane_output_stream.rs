@@ -174,7 +174,7 @@ const FAREWELL_STALL_LIMIT: Duration = Duration::from_secs(2);
 
 /// Writes a stream's frame lines, waiting out a slow reader rather than
 /// failing on the connection's 5 s write timeout.
-struct FrameWriter<'a, W: std::io::Write = ApiStream> {
+pub(super) struct FrameWriter<'a, W: std::io::Write = ApiStream> {
     stream: &'a mut W,
     running: &'a AtomicBool,
     stall_limit: Duration,
@@ -186,7 +186,7 @@ struct FrameWriter<'a, W: std::io::Write = ApiStream> {
 }
 
 impl<'a> FrameWriter<'a> {
-    fn new(stream: &'a mut ApiStream, running: &'a AtomicBool) -> Self {
+    pub(super) fn new(stream: &'a mut ApiStream, running: &'a AtomicBool) -> Self {
         // Windows named pipes have no write timeout, so there a slow reader
         // still blocks the write and `pane_stream_resync` is not advertised.
         if let Err(err) = stream.set_send_timeout(Some(STALL_POLL)) {
@@ -210,7 +210,7 @@ impl<W: std::io::Write> FrameWriter<'_, W> {
         self.write_line(&line)
     }
 
-    fn write_text(&mut self, text: &str) -> std::io::Result<bool> {
+    pub(super) fn write_text(&mut self, text: &str) -> std::io::Result<bool> {
         let mut line = Vec::with_capacity(text.len() + 1);
         line.extend_from_slice(text.as_bytes());
         line.push(b'\n');
@@ -275,7 +275,7 @@ impl<W: std::io::Write> FrameWriter<'_, W> {
     /// stall cut off, then writes a `stream_stalled` (no progress for the
     /// stall limit) or `stream_failed` error line, each within a short stall
     /// budget. A reader that is gone gets nothing, as before.
-    fn farewell(&mut self, request_id: &str, err: &std::io::Error) {
+    pub(super) fn farewell(&mut self, request_id: &str, err: &std::io::Error) {
         let code = if err.kind() == std::io::ErrorKind::TimedOut {
             "stream_stalled"
         } else {
