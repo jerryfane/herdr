@@ -30,6 +30,9 @@ pub fn run_server() -> io::Result<()> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
         return run_handoff_import_server(&socket_path, token);
     }
+    // A `restart_later` update finishes here, when this build starts serving.
+    #[cfg(unix)]
+    crate::update::state::settle_restart_later_on_start();
 
     let loaded_config = config::Config::load();
     #[cfg(windows)]
