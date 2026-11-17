@@ -671,8 +671,10 @@ fn adjacent_markdown_spans_coalesce() {
     assert_eq!(markdown("<b>Fast</b><b>Safe</b>"), "**FastSafe**");
     assert_eq!(markdown("<i>Fast</i><i>Safe</i>"), "*FastSafe*");
     assert_eq!(markdown("<code>foo</code><code>bar</code>"), "`foobar`");
-    assert_eq!(markdown("<b>Fast</b> <b>Safe</b>"), "**Fast Safe**");
-    assert_eq!(markdown("<b>a</b><b><i>b</i></b>"), "**a*b***");
+    // The space between was not bold, and no delimiter between two letters
+    // reads one way only.
+    assert_eq!(markdown("<b>Fast</b> <b>Safe</b>"), "**Fast** **Safe**");
+    assert_eq!(markdown("<b>a</b><b><i>b</i></b>"), "**ab**");
     assert_eq!(markdown("<code>x</code><b>y</b>"), "`x`**y**");
     assert_eq!(markdown("<b>y</b><code>x</code>"), "**y**`x`");
 }
@@ -687,5 +689,208 @@ fn markdown_escapes_ampersands() {
     assert_eq!(
         wire.intro_markdown.as_deref(),
         Some("Use \\&lt;name\\&gt; and \\&rarr;")
+    );
+}
+
+fn intro_markdown(html: &str) -> String {
+    parse(&format!("<form><p>{html}</p><input name=\"z\"></form>"))
+        .to_wire()
+        .intro_markdown
+        .unwrap()
+}
+
+/// #468: emphasis that changes between two letters has no delimiter
+/// CommonMark reads one way only, so it goes rather than show as `*`;
+/// with spaces between, every span keeps its marks.
+#[test]
+fn mixed_emphasis_never_leaves_literal_delimiters() {
+    assert_eq!(intro_markdown("<b>a</b><i>b</i><b><i>c</i></b>"), "abc");
+    assert_eq!(
+        intro_markdown("<b>a</b> <i>b</i> <b><i>c</i></b>"),
+        "**a** *b* ***c***"
+    );
+}
+
+/// #469: code spans with different marks stay apart, each with its own.
+#[test]
+fn code_spans_keep_their_own_emphasis() {
+    assert_eq!(
+        intro_markdown("<b><code>left</code></b> <code>right</code>"),
+        "**`left`** `right`"
+    );
+}
+
+/// Every sequence of 1 to 4 segments, each a text with a mix of bold,
+/// italic and code, reads back from `intro_markdown` (by a CommonMark
+/// parser) as exactly the plain `intro`, and no character gains a mark it
+/// did not have in the HTML (losing one is allowed).
+#[test]
+fn markdown_reads_back_as_the_plain_text_without_gaining_marks() {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    type Set = [bool; 3]; // bold, italic, code
+    const MARKS: [(&str, &str, Set); 7] = [
+        ("", "", [false, false, false]),
+        ("<b>", "</b>", [true, false, false]),
+        ("<i>", "</i>", [false, true, false]),
+        ("<b><i>", "</i></b>", [true, true, false]),
+        ("<code>", "</code>", [false, false, true]),
+        ("<b><code>", "</code></b>", [true, false, true]),
+        ("<i><code>", "</code></i>", [false, true, true]),
+    ];
+    const TEXTS: [&str; 4] = ["a", "a b", " a", "a "];
+
+    /// The laid-out text: whitespace runs become one space that may carry
+    /// any mark one of its characters had; the ends are trimmed.
+    fn expected(source: &[(char, Set)]) -> Vec<(char, Set)> {
+        let mut out: Vec<(char, Set)> = Vec::new();
+        let mut space: Option<Set> = None;
+        for &(ch, marks) in source {
+            if ch == ' ' {
+                let union = space.unwrap_or_default();
+                space = Some(std::array::from_fn(|index| union[index] || marks[index]));
+            } else {
+                if let Some(marks) = space.take() {
+                    if !out.is_empty() {
+                        out.push((' ', marks));
+                    }
+                }
+                out.push((ch, marks));
+            }
+        }
+        out
+    }
+
+    /// The text a CommonMark reader gets from `markdown`, with its marks,
+    /// and the events it read.
+    fn read_back(markdown: &str) -> (Vec<(char, Set)>, Vec<String>) {
+        let mut depth = [0usize; 2];
+        let mut text = Vec::new();
+        let mut events = Vec::new();
+        for event in Parser::new(markdown) {
+            events.push(format!("{event:?}"));
+            let marks = |code: bool| [depth[0] > 0, depth[1] > 0, code];
+            match event {
+                Event::Start(Tag::Strong) => depth[0] += 1,
+                Event::End(TagEnd::Strong) => depth[0] -= 1,
+                Event::Start(Tag::Emphasis) => depth[1] += 1,
+                Event::End(TagEnd::Emphasis) => depth[1] -= 1,
+                Event::Text(chunk) => text.extend(chunk.chars().map(|ch| (ch, marks(false)))),
+                Event::Code(chunk) => text.extend(chunk.chars().map(|ch| (ch, marks(true)))),
+                Event::SoftBreak | Event::HardBreak => text.push((' ', marks(false))),
+                _ => {}
+            }
+        }
+        (text, events)
+    }
+
+    /// The failure report for one case, `None` when it passes.
+    fn check(segments: &[usize]) -> Option<String> {
+        let mut html = String::new();
+        let mut source = Vec::new();
+        for &segment in segments {
+            let (open, close, marks) = MARKS[segment / TEXTS.len()];
+            let text = TEXTS[segment % TEXTS.len()];
+            html.push_str(open);
+            html.push_str(text);
+            html.push_str(close);
+            source.extend(text.chars().map(|ch| (ch, marks)));
+        }
+        let wire = parse(&format!("<form><p>{html}</p><input name=\"z\"></form>")).to_wire();
+        let plain = wire.intro.unwrap_or_default().replace('\n', " ");
+        let markdown = wire.intro_markdown.unwrap_or_default();
+        let allowed = expected(&source);
+        let (read, events) = read_back(&markdown);
+        let read_text: String = read.iter().map(|(ch, _)| ch).collect();
+        let allowed_text: String = allowed.iter().map(|(ch, _)| ch).collect();
+        let gained = read
+            .iter()
+            .zip(&allowed)
+            .any(|((_, got), (_, had))| (0..3).any(|mark| got[mark] && !had[mark]));
+        (read_text != plain || allowed_text != plain || gained).then(|| {
+            format!(
+                "\nhtml: {html:?}\nplain: {plain:?}\nmarkdown: {markdown:?}\nread: {read_text:?}\nevents: {events:?}\n"
+            )
+        })
+    }
+
+    // Case `index` of all sequences of 1 to 4 of the 28 segments, shortest
+    // first; split over threads, as the 637 420 cases take a minute alone.
+    let options = MARKS.len() * TEXTS.len();
+    let cases: usize = (1..=4).map(|length| options.pow(length)).sum();
+    let segments = |mut index: usize| {
+        let mut length = 1;
+        while index >= options.pow(length) {
+            index -= options.pow(length);
+            length += 1;
+        }
+        (0..length)
+            .map(|_| {
+                let segment = index % options;
+                index /= options;
+                segment
+            })
+            .collect::<Vec<_>>()
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get().min(8));
+    let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|thread| {
+                scope.spawn(move || {
+                    let range = cases * thread / threads..cases * (thread + 1) / threads;
+                    let mut failed = 0;
+                    let mut first = Vec::new();
+                    for index in range {
+                        if let Some(report) = check(&segments(index)) {
+                            failed += 1;
+                            if first.len() < 10 {
+                                first.push(report);
+                            }
+                        }
+                    }
+                    (failed, first)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect()
+    });
+    let failed: usize = results.iter().map(|(failed, _)| failed).sum();
+    let report: String = results
+        .iter()
+        .flat_map(|(_, first)| first)
+        .take(10)
+        .map(String::as_str)
+        .collect();
+    assert_eq!(cases, 637_420);
+    assert_eq!(
+        failed, 0,
+        "{failed} of {cases} cases failed; the first:{report}"
+    );
+}
+
+/// PR #470 review: settling the marks is linear. 6,400 `<b>a</b><i>b</i>`
+/// pairs (100 KB, every span unsafe) took 53 s when each dropped span
+/// restarted an all-pairs scan; parsing runs while the session index is
+/// locked. Linear takes ~85 ms in a debug build (~270 ms beside the threaded
+/// exhaustive test); the quadratic-or-worse shapes take minutes, so 10 s
+/// separates them on any CI runner.
+#[test]
+fn settling_many_unsafe_spans_takes_linear_time() {
+    let html = format!(
+        "<form><p>{}</p><input name=\"z\"></form>",
+        "<b>a</b><i>b</i>".repeat(6400)
+    );
+    let started = std::time::Instant::now();
+    let wire = parse(&html).to_wire();
+    let elapsed = started.elapsed();
+    eprintln!("6400 pairs: {elapsed:?}");
+    let expected = "ab".repeat(6400);
+    assert_eq!(wire.intro_markdown.as_deref(), Some(expected.as_str()));
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "6400 pairs took {elapsed:?}"
     );
 }

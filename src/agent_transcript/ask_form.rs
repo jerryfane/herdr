@@ -996,166 +996,286 @@ fn plain_text(runs: &[Run]) -> String {
     normalize(&raw)
 }
 
-/// One laid-out character, or the edge of a mark.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Token {
-    Char(char),
-    Open(Mark),
-    Close(Mark),
+/// Which marks a character carries, indexed by `Mark as usize`.
+type Marks = [bool; 3];
+
+const STRONG: usize = Mark::Strong as usize;
+const EM: usize = Mark::Em as usize;
+const CODE: usize = Mark::Code as usize;
+
+fn both(a: Marks, b: Marks) -> Marks {
+    std::array::from_fn(|index| a[index] && b[index])
 }
 
 /// `runs` as Markdown: the same text as [`plain_text`], with its marks as
 /// `**strong**`, `*em*` and `` `code` `` and Markdown syntax escaped.
+///
+/// Each character keeps the marks it had in the HTML. Characters with the
+/// same mark set form one span (`<b>a</b><b>b</b>` is `**ab**`). Emphasis
+/// that CommonMark could not read back exactly where it sits is dropped
+/// rather than risk literal `*` in the text: see [`settle_marks`].
 fn inline_markdown(runs: &[Run]) -> String {
-    let mut chars = marked_chars(&layout_tokens(runs));
+    let mut chars = layout_chars(runs);
     settle_marks(&mut chars);
     render_marked(&chars)
 }
 
-/// Lay out `runs` exactly as [`normalize`] does, keeping the marks in place
-/// (closing any left open, dropping a close without its open).
-fn layout_tokens(runs: &[Run]) -> Vec<Token> {
-    let mut tokens = Vec::new();
-    let mut open: Vec<Mark> = Vec::new();
-    let mut pending_space = false;
-    let mut after_break = false;
+/// Lay out `runs` exactly as [`normalize`] does, each character with its
+/// marks. A collapsed space keeps only the marks every whitespace character
+/// it replaces had.
+fn layout_chars(runs: &[Run]) -> Vec<(char, Marks)> {
+    let mut chars: Vec<(char, Marks)> = Vec::new();
+    let mut depth = [0usize; 3];
+    let mut pending: Option<Marks> = None;
     for run in runs {
         match run {
+            Run::Open(mark) => depth[*mark as usize] += 1,
+            Run::Close(mark) => depth[*mark as usize] = depth[*mark as usize].saturating_sub(1),
             Run::Text(text) => {
                 for ch in text.chars() {
+                    let marks = depth.map(|open| open > 0);
                     if ch == '\n' {
-                        pending_space = false;
-                        after_break = true;
-                        tokens.push(Token::Char('\n'));
-                    } else if is_js_space(ch) {
-                        pending_space = true;
-                    } else {
-                        if pending_space && !after_break {
-                            tokens.push(Token::Char(' '));
+                        pending = None;
+                        if chars.last().is_some_and(|(last, _)| *last == ' ') {
+                            chars.pop();
                         }
-                        pending_space = false;
-                        after_break = false;
-                        tokens.push(Token::Char(ch));
+                        chars.push(('\n', marks));
+                    } else if is_js_space(ch) {
+                        pending = Some(pending.map_or(marks, |space| both(space, marks)));
+                    } else {
+                        if let Some(space) = pending.take() {
+                            if chars.last().is_none_or(|(last, _)| *last != '\n') {
+                                chars.push((' ', space));
+                            }
+                        }
+                        chars.push((ch, marks));
                     }
                 }
             }
-            Run::Open(mark) => {
-                open.push(*mark);
-                tokens.push(Token::Open(*mark));
-            }
-            Run::Close(mark) => {
-                if open.last() == Some(mark) {
-                    open.pop();
-                    tokens.push(Token::Close(*mark));
-                }
-            }
         }
     }
-    tokens.extend(open.into_iter().rev().map(Token::Close));
-    let visible = |token: &Token| matches!(token, Token::Char(ch) if !is_js_space(*ch));
-    let (Some(first), Some(last)) = (
-        tokens.iter().position(visible),
-        tokens.iter().rposition(visible),
-    ) else {
-        return Vec::new();
-    };
-    // Trim the ends like `normalize`: spaces and breaks before the first and
-    // after the last visible character go, marks stay.
-    let mut index = 0;
-    tokens.retain(|token| {
-        let keep = (first..=last).contains(&index) || !matches!(token, Token::Char(_));
-        index += 1;
-        keep
-    });
-    tokens
-}
-
-/// Which marks are open, indexed by `Mark as usize`.
-type Marks = [bool; 3];
-
-/// Each laid-out character with the marks around it.
-fn marked_chars(tokens: &[Token]) -> Vec<(char, Marks)> {
-    let mut depth = [0usize; 3];
-    let mut chars = Vec::new();
-    for token in tokens {
-        match *token {
-            Token::Open(mark) => depth[mark as usize] += 1,
-            Token::Close(mark) => depth[mark as usize] -= 1,
-            Token::Char(ch) => chars.push((ch, depth.map(|open| open > 0))),
-        }
-    }
+    // Trim the ends like `normalize`.
+    let end = chars
+        .iter()
+        .rposition(|(ch, _)| !is_js_space(*ch))
+        .map_or(0, |last| last + 1);
+    chars.truncate(end);
+    let start = chars
+        .iter()
+        .position(|(ch, _)| !is_js_space(*ch))
+        .unwrap_or(chars.len());
+    chars.drain(..start);
     chars
 }
 
-/// Settle the marks so CommonMark reads them as written: a code span is
-/// one piece, so across a run of code characters the other marks are the
-/// ones they all share; and a space or break carries only the marks of both
-/// its neighbours, so no mark starts or ends on whitespace (empty marks are
-/// gone, as marks live on characters).
+/// Drop marks until every span can be written so CommonMark reads it back
+/// as written. Marks only ever go, and the work is linear in the text:
+///
+/// 1. A space or break keeps only the marks of its whole whitespace run and
+///    of the two characters around it, so no span starts or ends on
+///    whitespace. Later steps drop whole maximal spans, so they never undo
+///    this, and code marks (which decide a character's [`flank`]) are final
+///    from here on.
+/// 2. Unsafe emphasis spans lose their mark (see [`unsafe_spans`]).
 fn settle_marks(chars: &mut [(char, Marks)]) {
-    let shared =
-        |a: Marks, b: Marks| -> Marks { std::array::from_fn(|index| a[index] && b[index]) };
-    let code = Mark::Code as usize;
-    loop {
-        let mut changed = false;
-        let mut start = 0;
-        while start < chars.len() {
-            let mut end = start + 1;
-            if chars[start].1[code] {
-                while end < chars.len() && chars[end].1[code] {
-                    end += 1;
-                }
-                let common = chars[start..end]
-                    .iter()
-                    .fold([true; 3], |common, (_, marks)| shared(common, *marks));
-                for (_, marks) in &mut chars[start..end] {
-                    changed |= *marks != common;
-                    *marks = common;
-                }
-            }
-            start = end;
+    let blank = |ch: char| matches!(ch, ' ' | '\n');
+    let mut start = 0;
+    while start < chars.len() {
+        if !blank(chars[start].0) {
+            start += 1;
+            continue;
         }
-        for index in 0..chars.len() {
-            if !matches!(chars[index].0, ' ' | '\n') {
-                continue;
-            }
-            let before = index.checked_sub(1).map(|before| chars[before].1);
-            let after = chars.get(index + 1).map(|after| after.1);
-            let common = shared(before.unwrap_or_default(), after.unwrap_or_default());
-            changed |= chars[index].1 != common;
-            chars[index].1 = common;
+        let end = chars[start..]
+            .iter()
+            .position(|(ch, _)| !blank(*ch))
+            .map_or(chars.len(), |offset| start + offset);
+        let before = start.checked_sub(1).map_or([false; 3], |at| chars[at].1);
+        let after = chars.get(end).map_or([false; 3], |(_, marks)| *marks);
+        let marks = chars[start..end]
+            .iter()
+            .fold(both(before, after), |marks, (_, own)| both(marks, *own));
+        for (_, own) in &mut chars[start..end] {
+            *own = marks;
         }
-        if !changed {
-            return;
+        start = end;
+    }
+    for (mark, span) in unsafe_spans(chars) {
+        for (_, marks) in &mut chars[span] {
+            marks[mark] = false;
         }
     }
 }
 
-/// Write settled characters as Markdown. Adjacent characters with the same
-/// marks share one span, so `<b>a</b><b>b</b>` is `**ab**`, never the
-/// literal `**a****b**`. Marks open in a fixed order (code innermost) and
-/// close innermost first.
+/// Maximal ranges of characters carrying `mark`.
+fn mark_spans(chars: &[(char, Marks)], mark: usize) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, (_, marks)) in chars.iter().enumerate() {
+        match (marks[mark], start) {
+            (true, None) => start = Some(index),
+            (false, Some(from)) => {
+                spans.push(from..index);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    spans.extend(start.map(|from| from..chars.len()));
+    spans
+}
+
+/// The emphasis spans `*` delimiters cannot mark safely, with their marks.
+///
+/// Written with `*` only, a span is safe when its opening delimiter run can
+/// only open and its closing run can only close (CommonMark's left- and
+/// right-flanking rules): then every closer pairs with the nearest opener and
+/// the rule of 3 never applies. Three ordered sweeps over the spans, each
+/// deciding for good:
+/// 1. an italic span that crosses the edge of a bold span goes (spans must
+///    nest). Bold spans are disjoint and in order, so one pointer walks the
+///    ones each italic span overlaps.
+/// 2. a bold span goes when a delimiter at its edge could both open and
+///    close, or not do its job (as between two letters, `a**b`, or two code
+///    spans), or when it opens where a remaining italic span closes (the two
+///    would share one delimiter run that both closes and opens).
+/// 3. the same for the remaining italic spans, against the bold spans that
+///    stay.
+///
+/// Dropping a span never makes another one unsafe (it only removes a shared
+/// delimiter run, and edges' classes depend on code marks alone), so no
+/// sweep has to be repeated.
+fn unsafe_spans(chars: &[(char, Marks)]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let strong = mark_spans(chars, STRONG);
+    let em = mark_spans(chars, EM);
+    let mut dropped = Vec::new();
+
+    let mut first = 0;
+    let mut em_kept = Vec::with_capacity(em.len());
+    for span in em {
+        while strong.get(first).is_some_and(|bold| bold.end <= span.start) {
+            first += 1;
+        }
+        let crosses = strong[first..]
+            .iter()
+            .take_while(|bold| bold.start < span.end)
+            // Overlapping, and neither holds the other.
+            .any(|bold| {
+                (bold.start < span.start && bold.end < span.end)
+                    || (span.start < bold.start && span.end < bold.end)
+            });
+        if crosses {
+            dropped.push((EM, span));
+        } else {
+            em_kept.push(span);
+        }
+    }
+
+    let around = |at: usize| {
+        let before = at
+            .checked_sub(1)
+            .map_or(Flank::Space, |before| flank(chars[before]));
+        let after = chars.get(at).map_or(Flank::Space, |after| flank(*after));
+        (before, after)
+    };
+    let delimitable = |span: &std::ops::Range<usize>| {
+        let (before, after) = around(span.start);
+        let (last, next) = around(span.end);
+        one_sided(before, after, true) && one_sided(last, next, false)
+    };
+    // Whether a span in `spans` (in order) ends at `at`; `at` never decreases.
+    fn ends_at(spans: &[std::ops::Range<usize>], next: &mut usize, at: usize) -> bool {
+        while spans.get(*next).is_some_and(|span| span.end < at) {
+            *next += 1;
+        }
+        spans.get(*next).is_some_and(|span| span.end == at)
+    }
+
+    let mut next = 0;
+    let mut strong_kept = Vec::with_capacity(strong.len());
+    for span in strong {
+        if delimitable(&span) && !ends_at(&em_kept, &mut next, span.start) {
+            strong_kept.push(span);
+        } else {
+            dropped.push((STRONG, span));
+        }
+    }
+    let mut next = 0;
+    for span in em_kept {
+        if !delimitable(&span) || ends_at(&strong_kept, &mut next, span.start) {
+            dropped.push((EM, span));
+        }
+    }
+    dropped
+}
+
+/// A character's class for CommonMark's flanking rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flank {
+    /// Whitespace, or the start or end of the text.
+    Space,
+    Punct,
+    /// Letters and digits.
+    Other,
+    /// Punctuation to some readers and not to others (non-ASCII symbols and
+    /// punctuation, whose class depends on the reader's Unicode tables and
+    /// CommonMark version).
+    Either,
+}
+
+/// The class of the Markdown character a laid-out character puts next to a
+/// delimiter: a code span's edge is its backtick fence, an escaped
+/// character's is its backslash (both punctuation, like every escaped one).
+fn flank((ch, marks): (char, Marks)) -> Flank {
+    if marks[CODE] {
+        return Flank::Punct;
+    }
+    match ch {
+        ' ' | '\n' => Flank::Space,
+        _ if ch.is_ascii_punctuation() => Flank::Punct,
+        // Circled and squared letters are alphabetic yet symbols (So).
+        '\u{24B6}'..='\u{24E9}' | '\u{1F130}'..='\u{1F189}' => Flank::Either,
+        _ if ch.is_alphanumeric() => Flank::Other,
+        _ => Flank::Either,
+    }
+}
+
+/// Whether a `*` delimiter run between `before` and `after` can only open
+/// (`opening`) or only close, however a reader classes the characters.
+fn one_sided(before: Flank, after: Flank, opening: bool) -> bool {
+    fn readings(class: Flank) -> &'static [Flank] {
+        match class {
+            Flank::Either => &[Flank::Punct, Flank::Other],
+            Flank::Space => &[Flank::Space],
+            Flank::Punct => &[Flank::Punct],
+            Flank::Other => &[Flank::Other],
+        }
+    }
+    let quiet = |class: Flank| matches!(class, Flank::Space | Flank::Punct);
+    readings(before).iter().all(|&before| {
+        readings(after).iter().all(|&after| {
+            let left = after != Flank::Space && (after != Flank::Punct || quiet(before));
+            let right = before != Flank::Space && (before != Flank::Punct || quiet(after));
+            if opening {
+                left && !right
+            } else {
+                right && !left
+            }
+        })
+    })
+}
+
+/// Write settled characters as Markdown: between two characters whose marks
+/// differ, the code span closes, emphasis closes or opens (never both, see
+/// [`unsafe_span`]), and a code span opens.
 fn render_marked(chars: &[(char, Marks)]) -> String {
-    const ORDER: [Mark; 3] = [Mark::Strong, Mark::Em, Mark::Code];
     let mut writer = MarkdownWriter::default();
-    let mut stack: Vec<Mark> = Vec::new();
+    let mut previous = [false; 3];
     for &(ch, marks) in chars {
-        while stack.iter().any(|mark| !marks[*mark as usize]) {
-            if let Some(mark) = stack.pop() {
-                writer.close(mark);
-            }
-        }
-        for mark in ORDER {
-            if marks[mark as usize] && !stack.contains(&mark) {
-                writer.open(mark);
-                stack.push(mark);
-            }
-        }
+        writer.boundary(previous, marks);
         writer.char(ch);
+        previous = marks;
     }
-    while let Some(mark) = stack.pop() {
-        writer.close(mark);
-    }
+    writer.boundary(previous, [false; 3]);
     writer.out
 }
 
@@ -1180,25 +1300,22 @@ impl Default for MarkdownWriter {
 }
 
 impl MarkdownWriter {
-    fn open(&mut self, mark: Mark) {
-        match mark {
-            Mark::Strong => self.out.push_str("**"),
-            Mark::Em => self.out.push('*'),
-            Mark::Code => self.code = Some(String::new()),
+    fn boundary(&mut self, before: Marks, after: Marks) {
+        if before == after {
+            return;
         }
-    }
-
-    fn close(&mut self, mark: Mark) {
-        match mark {
-            Mark::Strong => self.out.push_str("**"),
-            Mark::Em => self.out.push('*'),
-            Mark::Code => {
-                if let Some(code) = self.code.take() {
-                    push_code_span(&code, &mut self.out);
-                }
-                self.line_start = false;
-                self.leading_digits = false;
-            }
+        if let Some(code) = self.code.take() {
+            push_code_span(&code, &mut self.out);
+            self.line_start = false;
+            self.leading_digits = false;
+        }
+        let weight = |marks: Marks, other: Marks| {
+            2 * usize::from(marks[STRONG] && !other[STRONG]) + usize::from(marks[EM] && !other[EM])
+        };
+        let delimiters = weight(before, after) + weight(after, before);
+        self.out.extend(std::iter::repeat_n('*', delimiters));
+        if after[CODE] {
+            self.code = Some(String::new());
         }
     }
 
