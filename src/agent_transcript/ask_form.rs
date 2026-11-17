@@ -1069,31 +1069,37 @@ fn layout_chars(runs: &[Run]) -> Vec<(char, Marks)> {
 }
 
 /// Drop marks until every span can be written so CommonMark reads it back
-/// as written. Marks only ever go, so this ends.
+/// as written. Marks only ever go, and the work is linear in the text:
 ///
-/// - A space or break keeps only the marks of both its neighbours, so no
-///   span starts or ends on whitespace.
-/// - Then one unsafe emphasis span at a time loses its mark (see
-///   [`unsafe_span`]).
+/// 1. A space or break keeps only the marks of its whole whitespace run and
+///    of the two characters around it, so no span starts or ends on
+///    whitespace. Later steps drop whole maximal spans, so they never undo
+///    this, and code marks (which decide a character's [`flank`]) are final
+///    from here on.
+/// 2. Unsafe emphasis spans lose their mark (see [`unsafe_spans`]).
 fn settle_marks(chars: &mut [(char, Marks)]) {
-    loop {
-        let mut changed = false;
-        for index in 0..chars.len() {
-            if !matches!(chars[index].0, ' ' | '\n') {
-                continue;
-            }
-            let before = index.checked_sub(1).map_or([false; 3], |at| chars[at].1);
-            let after = chars.get(index + 1).map_or([false; 3], |(_, marks)| *marks);
-            let marks = both(chars[index].1, both(before, after));
-            changed |= marks != chars[index].1;
-            chars[index].1 = marks;
-        }
-        if changed {
+    let blank = |ch: char| matches!(ch, ' ' | '\n');
+    let mut start = 0;
+    while start < chars.len() {
+        if !blank(chars[start].0) {
+            start += 1;
             continue;
         }
-        let Some((mark, span)) = unsafe_span(chars) else {
-            return;
-        };
+        let end = chars[start..]
+            .iter()
+            .position(|(ch, _)| !blank(*ch))
+            .map_or(chars.len(), |offset| start + offset);
+        let before = start.checked_sub(1).map_or([false; 3], |at| chars[at].1);
+        let after = chars.get(end).map_or([false; 3], |(_, marks)| *marks);
+        let marks = chars[start..end]
+            .iter()
+            .fold(both(before, after), |marks, (_, own)| both(marks, *own));
+        for (_, own) in &mut chars[start..end] {
+            *own = marks;
+        }
+        start = end;
+    }
+    for (mark, span) in unsafe_spans(chars) {
         for (_, marks) in &mut chars[span] {
             marks[mark] = false;
         }
@@ -1118,37 +1124,52 @@ fn mark_spans(chars: &[(char, Marks)], mark: usize) -> Vec<std::ops::Range<usize
     spans
 }
 
-/// The first emphasis span `*` delimiters cannot mark safely, with its mark.
+/// The emphasis spans `*` delimiters cannot mark safely, with their marks.
 ///
 /// Written with `*` only, a span is safe when its opening delimiter run can
 /// only open and its closing run can only close (CommonMark's left- and
 /// right-flanking rules): then every closer pairs with the nearest opener and
-/// the rule of 3 never applies. So a span is unsafe when
-/// - it is italic and crosses the edge of a bold span (spans must nest);
-/// - it opens where another span closes (the two would share one delimiter
-///   run that both closes and opens);
-/// - a delimiter at its edge could both open and close, or not do its job,
-///   as between two letters (`a**b`) or two code spans.
-fn unsafe_span(chars: &[(char, Marks)]) -> Option<(usize, std::ops::Range<usize>)> {
+/// the rule of 3 never applies. Three ordered sweeps over the spans, each
+/// deciding for good:
+/// 1. an italic span that crosses the edge of a bold span goes (spans must
+///    nest). Bold spans are disjoint and in order, so one pointer walks the
+///    ones each italic span overlaps.
+/// 2. a bold span goes when a delimiter at its edge could both open and
+///    close, or not do its job (as between two letters, `a**b`, or two code
+///    spans), or when it opens where a remaining italic span closes (the two
+///    would share one delimiter run that both closes and opens).
+/// 3. the same for the remaining italic spans, against the bold spans that
+///    stay.
+///
+/// Dropping a span never makes another one unsafe (it only removes a shared
+/// delimiter run, and edges' classes depend on code marks alone), so no
+/// sweep has to be repeated.
+fn unsafe_spans(chars: &[(char, Marks)]) -> Vec<(usize, std::ops::Range<usize>)> {
     let strong = mark_spans(chars, STRONG);
     let em = mark_spans(chars, EM);
-    for span in &em {
-        let crosses = strong.iter().any(|bold| {
-            bold.start < span.end
-                && span.start < bold.end
-                && !(bold.start <= span.start && span.end <= bold.end)
-                && !(span.start <= bold.start && bold.end <= span.end)
-        });
+    let mut dropped = Vec::new();
+
+    let mut first = 0;
+    let mut em_kept = Vec::with_capacity(em.len());
+    for span in em {
+        while strong.get(first).is_some_and(|bold| bold.end <= span.start) {
+            first += 1;
+        }
+        let crosses = strong[first..]
+            .iter()
+            .take_while(|bold| bold.start < span.end)
+            // Overlapping, and neither holds the other.
+            .any(|bold| {
+                (bold.start < span.start && bold.end < span.end)
+                    || (span.start < bold.start && span.end < bold.end)
+            });
         if crosses {
-            return Some((EM, span.clone()));
+            dropped.push((EM, span));
+        } else {
+            em_kept.push(span);
         }
     }
-    let spans = || {
-        strong
-            .iter()
-            .map(|span| (STRONG, span))
-            .chain(em.iter().map(|span| (EM, span)))
-    };
+
     let around = |at: usize| {
         let before = at
             .checked_sub(1)
@@ -1156,18 +1177,35 @@ fn unsafe_span(chars: &[(char, Marks)]) -> Option<(usize, std::ops::Range<usize>
         let after = chars.get(at).map_or(Flank::Space, |after| flank(*after));
         (before, after)
     };
-    for (mark, span) in spans() {
+    let delimitable = |span: &std::ops::Range<usize>| {
         let (before, after) = around(span.start);
-        let shared = spans().any(|(_, other)| other.end == span.start);
-        if shared || !one_sided(before, after, true) {
-            return Some((mark, span.clone()));
+        let (last, next) = around(span.end);
+        one_sided(before, after, true) && one_sided(last, next, false)
+    };
+    // Whether a span in `spans` (in order) ends at `at`; `at` never decreases.
+    fn ends_at(spans: &[std::ops::Range<usize>], next: &mut usize, at: usize) -> bool {
+        while spans.get(*next).is_some_and(|span| span.end < at) {
+            *next += 1;
         }
-        let (before, after) = around(span.end);
-        if !one_sided(before, after, false) {
-            return Some((mark, span.clone()));
+        spans.get(*next).is_some_and(|span| span.end == at)
+    }
+
+    let mut next = 0;
+    let mut strong_kept = Vec::with_capacity(strong.len());
+    for span in strong {
+        if delimitable(&span) && !ends_at(&em_kept, &mut next, span.start) {
+            strong_kept.push(span);
+        } else {
+            dropped.push((STRONG, span));
         }
     }
-    None
+    let mut next = 0;
+    for span in em_kept {
+        if !delimitable(&span) || ends_at(&strong_kept, &mut next, span.start) {
+            dropped.push((EM, span));
+        }
+    }
+    dropped
 }
 
 /// A character's class for CommonMark's flanking rules.
