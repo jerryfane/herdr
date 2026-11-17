@@ -487,16 +487,16 @@ impl<'a> Builder<'a> {
         if SKIPPED.contains(&tag) {
             return;
         }
+        if let Some(mark) = inline_mark(tag) {
+            self.inline.push(Run::Open(mark));
+            self.open.push(mark);
+            self.children(node);
+            self.open.pop();
+            self.inline.push(Run::Close(mark));
+            return;
+        }
         match tag {
             "br" => self.inline.push(Run::Text("\n".to_owned())),
-            "b" | "strong" | "i" | "em" | "code" => {
-                let mark = inline_mark(tag);
-                self.inline.push(Run::Open(mark));
-                self.open.push(mark);
-                self.children(node);
-                self.open.pop();
-                self.inline.push(Run::Close(mark));
-            }
             "hr" => self.flush(false),
             "input" | "select" | "textarea" => self.control(node, None),
             "label" => self.label(node),
@@ -945,7 +945,7 @@ fn span_runs(element: &Dom<'_>) -> Vec<Run> {
         if BLOCK.contains(&tag) || HEADING.contains(&tag) {
             out.push(Run::Text(" ".to_owned()));
         }
-        let mark = matches!(tag, "b" | "strong" | "i" | "em" | "code").then(|| inline_mark(tag));
+        let mark = inline_mark(tag);
         out.extend(mark.map(Run::Open));
         for child in node.children() {
             visit(&child, out);
@@ -973,12 +973,14 @@ fn inline_of(element: &Dom<'_>) -> Inline {
     }
 }
 
-/// `b`/`strong`, `i`/`em` or `code`.
-fn inline_mark(tag: &str) -> Mark {
+/// The mark of an inline formatting element: `b`/`strong`, `i`/`em` or
+/// `code`; `None` for every other tag.
+fn inline_mark(tag: &str) -> Option<Mark> {
     match tag {
-        "b" | "strong" => Mark::Strong,
-        "i" | "em" => Mark::Em,
-        _ => Mark::Code,
+        "b" | "strong" => Some(Mark::Strong),
+        "i" | "em" => Some(Mark::Em),
+        "code" => Some(Mark::Code),
+        _ => None,
     }
 }
 
@@ -1005,9 +1007,9 @@ enum Token {
 /// `runs` as Markdown: the same text as [`plain_text`], with its marks as
 /// `**strong**`, `*em*` and `` `code` `` and Markdown syntax escaped.
 fn inline_markdown(runs: &[Run]) -> String {
-    let mut tokens = layout_tokens(runs);
-    hug_marks(&mut tokens);
-    render_tokens(&tokens)
+    let mut chars = marked_chars(&layout_tokens(runs));
+    settle_marks(&mut chars);
+    render_marked(&chars)
 }
 
 /// Lay out `runs` exactly as [`normalize`] does, keeping the marks in place
@@ -1068,31 +1070,60 @@ fn layout_tokens(runs: &[Run]) -> Vec<Token> {
     tokens
 }
 
-/// Make every mark hug non-whitespace, as CommonMark needs for emphasis:
-/// spaces and breaks move out of the marks, and empty marks go.
-fn hug_marks(tokens: &mut Vec<Token>) {
-    let blank = |token: Token| matches!(token, Token::Char(' ' | '\n'));
+/// Which marks are open, indexed by `Mark as usize`.
+type Marks = [bool; 3];
+
+/// Each laid-out character with the marks around it.
+fn marked_chars(tokens: &[Token]) -> Vec<(char, Marks)> {
+    let mut depth = [0usize; 3];
+    let mut chars = Vec::new();
+    for token in tokens {
+        match *token {
+            Token::Open(mark) => depth[mark as usize] += 1,
+            Token::Close(mark) => depth[mark as usize] -= 1,
+            Token::Char(ch) => chars.push((ch, depth.map(|open| open > 0))),
+        }
+    }
+    chars
+}
+
+/// Settle the marks so CommonMark reads them as written: a code span is
+/// one piece, so across a run of code characters the other marks are the
+/// ones they all share; and a space or break carries only the marks of both
+/// its neighbours, so no mark starts or ends on whitespace (empty marks are
+/// gone, as marks live on characters).
+fn settle_marks(chars: &mut [(char, Marks)]) {
+    let shared =
+        |a: Marks, b: Marks| -> Marks { std::array::from_fn(|index| a[index] && b[index]) };
+    let code = Mark::Code as usize;
     loop {
         let mut changed = false;
-        let mut index = 0;
-        while index + 1 < tokens.len() {
-            match (tokens[index], tokens[index + 1]) {
-                (Token::Open(open), Token::Close(close)) if open == close => {
-                    tokens.drain(index..index + 2);
-                    changed = true;
-                    continue;
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = start + 1;
+            if chars[start].1[code] {
+                while end < chars.len() && chars[end].1[code] {
+                    end += 1;
                 }
-                (Token::Open(_), next) if blank(next) => {
-                    tokens.swap(index, index + 1);
-                    changed = true;
+                let common = chars[start..end]
+                    .iter()
+                    .fold([true; 3], |common, (_, marks)| shared(common, *marks));
+                for (_, marks) in &mut chars[start..end] {
+                    changed |= *marks != common;
+                    *marks = common;
                 }
-                (previous, Token::Close(_)) if blank(previous) => {
-                    tokens.swap(index, index + 1);
-                    changed = true;
-                }
-                _ => {}
             }
-            index += 1;
+            start = end;
+        }
+        for index in 0..chars.len() {
+            if !matches!(chars[index].0, ' ' | '\n') {
+                continue;
+            }
+            let before = index.checked_sub(1).map(|before| chars[before].1);
+            let after = chars.get(index + 1).map(|after| after.1);
+            let common = shared(before.unwrap_or_default(), after.unwrap_or_default());
+            changed |= chars[index].1 != common;
+            chars[index].1 = common;
         }
         if !changed {
             return;
@@ -1100,61 +1131,99 @@ fn hug_marks(tokens: &mut Vec<Token>) {
     }
 }
 
-/// Write laid-out tokens as Markdown. A mark nested in the same mark adds
-/// nothing, and inside code the other marks are dropped.
-fn render_tokens(tokens: &[Token]) -> String {
-    let mut out = String::new();
-    let mut depth = [0usize; 3];
-    let mut code = String::new();
-    let mut line_start = true;
-    let mut leading_digits = false;
-    for token in tokens {
-        match *token {
-            Token::Open(mark) | Token::Close(mark)
-                if depth[Mark::Code as usize] > 0 && mark != Mark::Code => {}
-            Token::Open(mark) => {
-                depth[mark as usize] += 1;
-                if depth[mark as usize] == 1 {
-                    match mark {
-                        Mark::Strong => out.push_str("**"),
-                        Mark::Em => out.push('*'),
-                        Mark::Code => code.clear(),
-                    }
-                }
+/// Write settled characters as Markdown. Adjacent characters with the same
+/// marks share one span, so `<b>a</b><b>b</b>` is `**ab**`, never the
+/// literal `**a****b**`. Marks open in a fixed order (code innermost) and
+/// close innermost first.
+fn render_marked(chars: &[(char, Marks)]) -> String {
+    const ORDER: [Mark; 3] = [Mark::Strong, Mark::Em, Mark::Code];
+    let mut writer = MarkdownWriter::default();
+    let mut stack: Vec<Mark> = Vec::new();
+    for &(ch, marks) in chars {
+        while stack.iter().any(|mark| !marks[*mark as usize]) {
+            if let Some(mark) = stack.pop() {
+                writer.close(mark);
             }
-            Token::Close(mark) => {
-                depth[mark as usize] -= 1;
-                if depth[mark as usize] == 0 {
-                    match mark {
-                        Mark::Strong => out.push_str("**"),
-                        Mark::Em => out.push('*'),
-                        Mark::Code => {
-                            push_code_span(&code, &mut out);
-                            line_start = false;
-                            leading_digits = false;
-                        }
-                    }
-                }
+        }
+        for mark in ORDER {
+            if marks[mark as usize] && !stack.contains(&mark) {
+                writer.open(mark);
+                stack.push(mark);
             }
-            Token::Char(ch) if depth[Mark::Code as usize] > 0 => {
-                code.push(if ch == '\n' { ' ' } else { ch });
-            }
-            Token::Char(ch) => {
-                // What would start a block at the start of a line: a heading,
-                // a list item, a setext underline, an ordered item (`1.`).
-                let block_start = (line_start && matches!(ch, '#' | '-' | '+' | '='))
-                    || (leading_digits && matches!(ch, '.' | ')'));
-                if block_start || matches!(ch, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '>' | '~')
-                {
-                    out.push('\\');
+        }
+        writer.char(ch);
+    }
+    while let Some(mark) = stack.pop() {
+        writer.close(mark);
+    }
+    writer.out
+}
+
+/// Markdown output with the state escaping needs.
+struct MarkdownWriter {
+    out: String,
+    /// The content of the open code span, if one is open.
+    code: Option<String>,
+    line_start: bool,
+    leading_digits: bool,
+}
+
+impl Default for MarkdownWriter {
+    fn default() -> Self {
+        Self {
+            out: String::new(),
+            code: None,
+            line_start: true,
+            leading_digits: false,
+        }
+    }
+}
+
+impl MarkdownWriter {
+    fn open(&mut self, mark: Mark) {
+        match mark {
+            Mark::Strong => self.out.push_str("**"),
+            Mark::Em => self.out.push('*'),
+            Mark::Code => self.code = Some(String::new()),
+        }
+    }
+
+    fn close(&mut self, mark: Mark) {
+        match mark {
+            Mark::Strong => self.out.push_str("**"),
+            Mark::Em => self.out.push('*'),
+            Mark::Code => {
+                if let Some(code) = self.code.take() {
+                    push_code_span(&code, &mut self.out);
                 }
-                out.push(ch);
-                leading_digits = ch.is_ascii_digit() && (line_start || leading_digits);
-                line_start = ch == '\n';
+                self.line_start = false;
+                self.leading_digits = false;
             }
         }
     }
-    out
+
+    fn char(&mut self, ch: char) {
+        if let Some(code) = &mut self.code {
+            code.push(if ch == '\n' { ' ' } else { ch });
+            return;
+        }
+        // What would start a block at the start of a line: a heading, a list
+        // item, a setext underline, an ordered item (`1.`).
+        let block_start = (self.line_start && matches!(ch, '#' | '-' | '+' | '='))
+            || (self.leading_digits && matches!(ch, '.' | ')'));
+        // `&` would start an entity reference, decoding the text a second time.
+        if block_start
+            || matches!(
+                ch,
+                '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '>' | '~' | '&'
+            )
+        {
+            self.out.push('\\');
+        }
+        self.out.push(ch);
+        self.leading_digits = ch.is_ascii_digit() && (self.line_start || self.leading_digits);
+        self.line_start = ch == '\n';
+    }
 }
 
 /// A code span whose fence is longer than any backtick run in `code`.
