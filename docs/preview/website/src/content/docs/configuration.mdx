@@ -674,6 +674,8 @@ If the fence cannot be set up, the pane shows the error and its command does not
 
 A fenced pane cannot reach systemd, so start and stop long-running services (for example systemd units) from outside the fence, not by hand in a pane.
 
+To find out why a path is read-only, run `herdr fence explain <pane or agent> <path>`. It shows whether the pane runs fenced now, whether the current config fences it after a restart, the rule that decides the path (for example `deny /etc` or `allow ~/.gitmoot`), whether the path is pinned, and whether the running pane's mount table actually makes it read-only. Add `--json` for the API response (`fence.explain`). It works from inside a fenced pane too.
+
 ### Fencing some agents
 
 `[fence.agents.<name>]` sets the fence for one agent, by the name it was started with (`herdr agent start <NAME>`). Every entry needs a `reason`. With `scope = "agents"`, only the listed agents are fenced and every other pane starts as it would without the fence; with the default `scope = "all"`, every pane is fenced and `profile = "unfenced"` exempts an agent.
