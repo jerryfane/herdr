@@ -83,6 +83,11 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 # Zero dependencies; legacy (non-prehashed) signatures are refused by the caller.
 minisign-verify = "0.3"
 
+[dev-dependencies]
+# Reads the Markdown that omp form asks serve back as CommonMark in tests
+# (`src/agent_transcript/ask_form/tests.rs`); never a runtime dependency.
+pulldown-cmark = { version = "0.13", default-features = false }
+
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
 
