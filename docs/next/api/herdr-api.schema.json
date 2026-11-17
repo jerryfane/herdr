@@ -12565,6 +12565,13 @@
                 "string",
                 "null"
               ]
+            },
+            "intro_markdown": {
+              "description": "The same context blocks as `intro`, as Markdown: inline bold, italic\nand code, lists, GFM pipe tables and fenced code; present exactly\nwhen `intro` is.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -12599,6 +12606,13 @@
             "description": {
               "default": null,
               "description": "Plain text of the context blocks in this field's section before it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description_markdown": {
+              "description": "The same context blocks as `description`, as Markdown (like the form's\n`intro_markdown`); present exactly when `description` is.",
               "type": [
                 "string",
                 "null"

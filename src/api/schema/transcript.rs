@@ -162,6 +162,11 @@ pub struct AskForm {
     /// paragraphs are separated by a blank line.
     #[serde(default)]
     pub intro: Option<String>,
+    /// The same context blocks as `intro`, as Markdown: inline bold, italic
+    /// and code, lists, GFM pipe tables and fenced code; present exactly
+    /// when `intro` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intro_markdown: Option<String>,
     /// The answerable fields in document (and terminal focus) order.
     pub fields: Vec<AskFormField>,
 }
@@ -187,6 +192,10 @@ pub struct AskFormField {
     /// Plain text of the context blocks in this field's section before it.
     #[serde(default)]
     pub description: Option<String>,
+    /// The same context blocks as `description`, as Markdown (like the form's
+    /// `intro_markdown`); present exactly when `description` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_markdown: Option<String>,
     /// A checkbox group or `<select multiple>`.
     #[serde(default)]
     pub multi: bool,
