@@ -64,16 +64,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
-      # the binary's embedded build id equals the published manifest's.
+      # The identity preview.yml publishes, so the binary's embedded build id
+      # equals the manifest's.
       - name: Stamp build identity
         shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
-            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
-          } >> "$GITHUB_ENV"
+        run: bash scripts/build-identity.sh >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -164,16 +159,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
-      # the binary's embedded build id equals the published manifest's.
+      # The identity preview.yml publishes, so the binary's embedded build id
+      # equals the manifest's.
       - name: Stamp build identity
         shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
-            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
-          } >> "$GITHUB_ENV"
+        run: bash scripts/build-identity.sh >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -229,16 +219,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
-      # the binary's embedded build id equals the published manifest's.
+      # The identity preview.yml publishes, so the binary's embedded build id
+      # equals the manifest's.
       - name: Stamp build identity
         shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
-            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
-          } >> "$GITHUB_ENV"
+        run: bash scripts/build-identity.sh >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1

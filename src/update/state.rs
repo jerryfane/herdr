@@ -384,9 +384,9 @@ fn settle_restart_later(
 
 /// Whether `record_build_id` (`<date>-<12-char sha>`) names the running build.
 /// The embedded build id decides when there is one. Without it the running
-/// commit decides: a full commit's first 12 chars, or a git `--short` one (at
-/// least 7 chars, as `RunningBuild::is_build` requires), must start the id's
-/// sha suffix.
+/// commit's first 12 chars must equal the id's whole 12-char sha suffix. A
+/// shorter commit (build.rs's `git rev-parse --short` fallback) never matches:
+/// its prefix can name another build, so the record stays pending.
 #[cfg(unix)]
 fn is_running_build(
     record_build_id: &str,
@@ -396,17 +396,13 @@ fn is_running_build(
     if let Some(running_build_id) = running_build_id {
         return record_build_id == running_build_id;
     }
-    let Some(commit) = running_commit else {
+    let Some(commit) = running_commit.and_then(|commit| commit.get(..12)) else {
         return false;
     };
-    let Some((_, sha)) = record_build_id.rsplit_once('-') else {
-        return false;
-    };
-    let commit = commit.get(..commit.len().min(sha.len())).unwrap_or(commit);
-    sha.len() == 12
-        && commit.len() >= 7
+    record_build_id
+        .rsplit_once('-')
+        .is_some_and(|(_, sha)| sha == commit)
         && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && sha.starts_with(commit)
 }
 
 /// The on-disk binary an update replaces. After a live switch the server runs
@@ -593,12 +589,34 @@ mod tests {
             dirs.load().attempt.unwrap().public.outcome,
             Some(UpdateOutcome::Updated)
         );
-        // A git `--short` commit, as a local build stamps it, settles too.
+        // A commit of exactly the id's 12 chars settles too.
         pending_restart(&dirs);
-        assert!(settle_restart_later(&dirs, None, Some("0123456")).unwrap());
+        assert!(settle_restart_later(&dirs, None, Some("0123456789ab")).unwrap());
         let status = status_from(&dirs.load(), false).unwrap();
         assert_eq!(status.outcome, Some(UpdateOutcome::Updated));
         assert!(status.message.unwrap().contains("2026-10-28-0123456789ab"));
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// A git `--short` commit (build.rs's fallback) cannot tell apart builds
+    /// that share its prefix: `7c5e760` names both real commits below, so the
+    /// record stays pending.
+    #[cfg(unix)]
+    #[test]
+    fn a_short_commit_leaves_a_restart_later_attempt_pending() {
+        let dirs = temp_dirs("settle-short");
+        let mut attempt = record(Some(UpdateOutcome::DownloadedRestartRequired));
+        attempt.public.restart_later = true;
+        attempt.public.build_id = "2026-11-17-7c5e760fd2b2".into();
+        let state = UpdateState {
+            attempt: Some(attempt),
+            rolled_back: Vec::new(),
+        };
+        dirs.store(&state).unwrap();
+        for commit in ["7c5e760", "7c5e760684c7bfda7c21153a4e246aaa179af15f"] {
+            assert!(!settle_restart_later(&dirs, None, Some(commit)).unwrap());
+            assert_eq!(dirs.load(), state);
+        }
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
     }
 
