@@ -874,7 +874,9 @@ fn markdown_reads_back_as_the_plain_text_without_gaining_marks() {
 /// PR #470 review: settling the marks is linear. 6,400 `<b>a</b><i>b</i>`
 /// pairs (100 KB, every span unsafe) took 53 s when each dropped span
 /// restarted an all-pairs scan; parsing runs while the session index is
-/// locked.
+/// locked. Linear takes ~85 ms in a debug build (~270 ms beside the threaded
+/// exhaustive test); the quadratic-or-worse shapes take minutes, so 10 s
+/// separates them on any CI runner.
 #[test]
 fn settling_many_unsafe_spans_takes_linear_time() {
     let html = format!(
@@ -888,7 +890,7 @@ fn settling_many_unsafe_spans_takes_linear_time() {
     let expected = "ab".repeat(6400);
     assert_eq!(wire.intro_markdown.as_deref(), Some(expected.as_str()));
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
+        elapsed < std::time::Duration::from_secs(10),
         "6400 pairs took {elapsed:?}"
     );
 }
