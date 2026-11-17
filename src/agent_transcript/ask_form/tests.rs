@@ -657,3 +657,35 @@ fn a_decision_matrix_keeps_its_row_lines_in_markdown() {
         Some("*Slow*")
     );
 }
+
+/// #465: adjacent spans with the same marks share one span, so no
+/// delimiter is left between them for a renderer to show.
+#[test]
+fn adjacent_markdown_spans_coalesce() {
+    let markdown = |html: &str| {
+        parse(&format!("<form><p>{html}</p><input name=\"z\"></form>"))
+            .to_wire()
+            .intro_markdown
+            .unwrap()
+    };
+    assert_eq!(markdown("<b>Fast</b><b>Safe</b>"), "**FastSafe**");
+    assert_eq!(markdown("<i>Fast</i><i>Safe</i>"), "*FastSafe*");
+    assert_eq!(markdown("<code>foo</code><code>bar</code>"), "`foobar`");
+    assert_eq!(markdown("<b>Fast</b> <b>Safe</b>"), "**Fast Safe**");
+    assert_eq!(markdown("<b>a</b><b><i>b</i></b>"), "**a*b***");
+    assert_eq!(markdown("<code>x</code><b>y</b>"), "`x`**y**");
+    assert_eq!(markdown("<b>y</b><code>x</code>"), "**y**`x`");
+}
+
+/// #466: `&` in the text is escaped, so Markdown does not decode an entity
+/// the HTML already decoded once.
+#[test]
+fn markdown_escapes_ampersands() {
+    let wire = parse("<form><p>Use &amp;lt;name&amp;gt; and &rarr;</p><input name=\"z\"></form>")
+        .to_wire();
+    assert_eq!(wire.intro.as_deref(), Some("Use &lt;name&gt; and &rarr;"));
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some("Use \\&lt;name\\&gt; and \\&rarr;")
+    );
+}
