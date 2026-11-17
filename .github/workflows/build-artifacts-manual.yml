@@ -57,11 +57,23 @@ jobs:
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
+      HERDR_BUILD_CHANNEL: preview
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
+      # the binary's embedded build id equals the published manifest's.
+      - name: Stamp build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
+            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -145,11 +157,23 @@ jobs:
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
+      HERDR_BUILD_CHANNEL: preview
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
+      # the binary's embedded build id equals the published manifest's.
+      - name: Stamp build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
+            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -198,11 +222,23 @@ jobs:
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
+      HERDR_BUILD_CHANNEL: preview
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      # Same identity preview.yml stamps: `<commit date>-<12-char sha>`, so
+      # the binary's embedded build id equals the published manifest's.
+      - name: Stamp build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "HERDR_BUILD_COMMIT=$(git rev-parse HEAD)"
+            echo "HERDR_BUILD_ID=$(git show -s --format=%cs HEAD)-$(git rev-parse --short=12 HEAD)"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
