@@ -71,10 +71,12 @@ jobs:
             exit 0
           fi
           git checkout --detach "$commit"
-          short_sha="$(git rev-parse --short=12 HEAD)"
-          day="$(git show -s --format=%cs HEAD)"
+          # scripts/build-identity.sh is the one identity definition; the
+          # manual artifact builds embed the same one.
+          identity="$(bash scripts/build-identity.sh)"
+          build_id="$(sed -n 's/^HERDR_BUILD_ID=//p' <<<"$identity")"
+          short_sha="${build_id##*-}"
           built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          build_id="$day-$short_sha"
           tag="preview-$build_id"
           if [ "$GITHUB_REF_NAME" != "$tag" ]; then
             echo "error: expected preview tag $tag; use just preview" >&2

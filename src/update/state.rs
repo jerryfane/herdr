@@ -327,24 +327,34 @@ fn status_from(state: &UpdateState, running: bool) -> Option<UpdateAttempt> {
 #[cfg(unix)]
 pub(crate) fn settle_restart_later_on_start() {
     let running = super::verify::RunningBuild::current();
-    if let Err(err) = settle_restart_later(&UpdateDirs::current(), running.build_id.as_deref()) {
+    if let Err(err) = settle_restart_later(
+        &UpdateDirs::current(),
+        running.build_id.as_deref(),
+        running.commit.as_deref(),
+    ) {
         tracing::warn!("could not settle the pending update record: {err}");
     }
 }
 
-/// Rewrite a `DownloadedRestartRequired` attempt for `running_build_id` as
-/// `Updated`. A record for any other build (the install was replaced, or
-/// rolled back) is left alone, and so is everything while an attempt holds
-/// the lock. Returns whether the record changed.
+/// Rewrite a `DownloadedRestartRequired` attempt as `Updated` when its build
+/// is the one running: the running build id matches, or, for a build without
+/// an embedded id (manual artifact builds), the running commit matches the
+/// record build id's 12-char sha suffix. A record for any other build (the
+/// install was replaced, or rolled back) is left alone, and so is everything
+/// while an attempt holds the lock. Returns whether the record changed.
 #[cfg(unix)]
-fn settle_restart_later(dirs: &UpdateDirs, running_build_id: Option<&str>) -> io::Result<bool> {
-    let Some(running_build_id) = running_build_id else {
+fn settle_restart_later(
+    dirs: &UpdateDirs,
+    running_build_id: Option<&str>,
+    running_commit: Option<&str>,
+) -> io::Result<bool> {
+    if running_build_id.is_none() && running_commit.is_none() {
         return Ok(false);
-    };
+    }
     let pending = |state: &UpdateState| {
         state.attempt.as_ref().is_some_and(|record| {
             record.public.outcome == Some(UpdateOutcome::DownloadedRestartRequired)
-                && record.public.build_id == running_build_id
+                && is_running_build(&record.public.build_id, running_build_id, running_commit)
         })
     };
     // Cheap check first: most starts have nothing to settle and must not
@@ -363,12 +373,36 @@ fn settle_restart_later(dirs: &UpdateDirs, running_build_id: Option<&str>) -> io
         if let Some(record) = state.attempt.as_mut() {
             record.public.outcome = Some(UpdateOutcome::Updated);
             record.public.message = Some(format!(
-                "build {running_build_id} took over when herdr restarted"
+                "build {} took over when herdr restarted",
+                record.public.build_id
             ));
             changed = true;
         }
     })?;
     Ok(changed)
+}
+
+/// Whether `record_build_id` (`<date>-<12-char sha>`) names the running build.
+/// The embedded build id decides when there is one. Without it the running
+/// commit's first 12 chars must equal the id's whole 12-char sha suffix. A
+/// shorter commit (build.rs's `git rev-parse --short` fallback) never matches:
+/// its prefix can name another build, so the record stays pending.
+#[cfg(unix)]
+fn is_running_build(
+    record_build_id: &str,
+    running_build_id: Option<&str>,
+    running_commit: Option<&str>,
+) -> bool {
+    if let Some(running_build_id) = running_build_id {
+        return record_build_id == running_build_id;
+    }
+    let Some(commit) = running_commit.and_then(|commit| commit.get(..12)) else {
+        return false;
+    };
+    record_build_id
+        .rsplit_once('-')
+        .is_some_and(|(_, sha)| sha == commit)
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// The on-disk binary an update replaces. After a live switch the server runs
@@ -514,7 +548,7 @@ mod tests {
     fn a_restart_later_attempt_settles_once_its_build_is_running() {
         let dirs = temp_dirs("settle-running");
         pending_restart(&dirs);
-        assert!(settle_restart_later(&dirs, Some("2026-10-28-0123456789ab")).unwrap());
+        assert!(settle_restart_later(&dirs, Some("2026-10-28-0123456789ab"), None).unwrap());
         let status = status_from(&dirs.load(), false).unwrap();
         assert_eq!(status.outcome, Some(UpdateOutcome::Updated));
         assert!(status.message.unwrap().contains("took over"));
@@ -526,8 +560,61 @@ mod tests {
     fn a_restart_later_attempt_for_another_build_stays_pending() {
         let dirs = temp_dirs("settle-other");
         let state = pending_restart(&dirs);
-        for running in [Some("2026-10-27-8a02b834abcd"), None] {
-            assert!(!settle_restart_later(&dirs, running).unwrap());
+        for (build_id, commit) in [
+            (Some("2026-10-27-8a02b834abcd"), None),
+            // An embedded id decides even when the commit would match.
+            (Some("2026-10-27-8a02b834abcd"), Some(RECORD_COMMIT)),
+            (None, None),
+            // A build without an embedded id, from a different commit.
+            (None, Some("8a02b834abcdef0123456789abcdef0123456789")),
+            (None, Some("012345")),
+        ] {
+            assert!(!settle_restart_later(&dirs, build_id, commit).unwrap());
+            assert_eq!(dirs.load(), state);
+        }
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// The full commit of the record's build `2026-10-28-0123456789ab`.
+    #[cfg(unix)]
+    const RECORD_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_later_attempt_settles_on_its_commit_without_a_build_id() {
+        let dirs = temp_dirs("settle-commit");
+        pending_restart(&dirs);
+        assert!(settle_restart_later(&dirs, None, Some(RECORD_COMMIT)).unwrap());
+        assert_eq!(
+            dirs.load().attempt.unwrap().public.outcome,
+            Some(UpdateOutcome::Updated)
+        );
+        // A commit of exactly the id's 12 chars settles too.
+        pending_restart(&dirs);
+        assert!(settle_restart_later(&dirs, None, Some("0123456789ab")).unwrap());
+        let status = status_from(&dirs.load(), false).unwrap();
+        assert_eq!(status.outcome, Some(UpdateOutcome::Updated));
+        assert!(status.message.unwrap().contains("2026-10-28-0123456789ab"));
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// A git `--short` commit (build.rs's fallback) cannot tell apart builds
+    /// that share its prefix: `7c5e760` names both real commits below, so the
+    /// record stays pending.
+    #[cfg(unix)]
+    #[test]
+    fn a_short_commit_leaves_a_restart_later_attempt_pending() {
+        let dirs = temp_dirs("settle-short");
+        let mut attempt = record(Some(UpdateOutcome::DownloadedRestartRequired));
+        attempt.public.restart_later = true;
+        attempt.public.build_id = "2026-11-17-7c5e760fd2b2".into();
+        let state = UpdateState {
+            attempt: Some(attempt),
+            rolled_back: Vec::new(),
+        };
+        dirs.store(&state).unwrap();
+        for commit in ["7c5e760", "7c5e760684c7bfda7c21153a4e246aaa179af15f"] {
+            assert!(!settle_restart_later(&dirs, None, Some(commit)).unwrap());
             assert_eq!(dirs.load(), state);
         }
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
@@ -539,7 +626,7 @@ mod tests {
         let dirs = temp_dirs("settle-locked");
         let state = pending_restart(&dirs);
         let holder = hold_in_child(dirs.acquire_lock().unwrap().unwrap());
-        let settled = settle_restart_later(&dirs, Some("2026-10-28-0123456789ab")).unwrap();
+        let settled = settle_restart_later(&dirs, Some("2026-10-28-0123456789ab"), None).unwrap();
         let after = dirs.load();
         kill(holder);
         assert!(!settled);
