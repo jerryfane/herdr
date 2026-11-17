@@ -497,3 +497,163 @@ fn attributes_split_on_ecmascript_whitespace() {
     let form = parse("<form><input name=account\u{85}id value=ok></form>");
     assert_eq!(form.fields[0].name, "account\u{85}id");
 }
+
+/// The owner's question with a comparison table (#ask-markdown): the plain
+/// `intro` stays as it was, and `intro_markdown` keeps the table, the bold
+/// lead and the bold-labelled list.
+#[test]
+fn context_is_served_as_markdown_too() {
+    let form = parse(
+        "<form><p><b>Searching past deals for Nicola's usefulness test.</b> enyo-research estimated how many Italian renewable events since 2021 are public, and what a full search costs:</p>\n\
+         <table><tr><th></th><th>Sales / acquisitions</th><th>Energisations (≥ 5 MW)</th></tr>\n\
+         <tr><td>Expected to find</td><td>600–900 deals</td><td>250–400 with a dated public source</td></tr>\n\
+         <tr><td>Time</td><td>about 2–2.5 days</td><td>about 1–1.5 days</td></tr></table>\n\
+         <p><b>Limits from the 20-row samples:</b></p>\n\
+         <ul><li><b>Sales:</b> the date is stated in 16 of 20.</li><li><b>Energisations:</b> only 4 of 20.</li></ul>\n\
+         <fieldset><legend>What to search</legend><label><input type=\"radio\" name=\"scope\" value=\"full\" checked> Full</label><label><input type=\"radio\" name=\"scope\" value=\"first\"> First step</label></fieldset></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!(
+        wire.intro.as_deref(),
+        Some(
+            "Searching past deals for Nicola's usefulness test. enyo-research estimated how many Italian renewable events since 2021 are public, and what a full search costs:\n\n\
+             \u{20}· Sales / acquisitions · Energisations (≥ 5 MW)\n\
+             Expected to find · 600–900 deals · 250–400 with a dated public source\n\
+             Time · about 2–2.5 days · about 1–1.5 days\n\n\
+             Limits from the 20-row samples:\n\n\
+             • Sales: the date is stated in 16 of 20.\n\
+             • Energisations: only 4 of 20."
+        )
+    );
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some(
+            "**Searching past deals for Nicola's usefulness test.** enyo-research estimated how many Italian renewable events since 2021 are public, and what a full search costs:\n\n\
+             |  | Sales / acquisitions | Energisations (≥ 5 MW) |\n\
+             | --- | --- | --- |\n\
+             | Expected to find | 600–900 deals | 250–400 with a dated public source |\n\
+             | Time | about 2–2.5 days | about 1–1.5 days |\n\n\
+             **Limits from the 20-row samples:**\n\n\
+             - **Sales:** the date is stated in 16 of 20.\n\
+             - **Energisations:** only 4 of 20."
+        )
+    );
+    assert_eq!(wire.fields[0].description, None);
+    assert_eq!(wire.fields[0].description_markdown, None);
+    let json = serde_json::to_value(&wire).unwrap();
+    assert!(json["fields"][0].get("description_markdown").is_none());
+}
+
+#[test]
+fn markdown_escapes_literal_syntax() {
+    let form = parse(
+        "<form><p>2 * 3 = 6_000 \\ [link] a~b</p><p># not a heading</p><p>1. not a list</p>\
+         <p>- dash<br>+ plus<br>12) paren</p>\
+         <table><tr><th>a|b</th><th>c</th></tr><tr><td>x</td></tr></table><input name=\"z\"></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!(
+        wire.intro.as_deref(),
+        Some(
+            "2 * 3 = 6_000 \\ [link] a~b\n\n# not a heading\n\n1. not a list\n\n\
+             - dash\n+ plus\n12) paren\n\na|b · c\nx"
+        )
+    );
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some(
+            "2 \\* 3 = 6\\_000 \\\\ \\[link\\] a\\~b\n\n\\# not a heading\n\n1\\. not a list\n\n\
+             \\- dash\n\\+ plus\n12\\) paren\n\n\
+             | a\\|b | c |\n| --- | --- |\n| x |  |"
+        )
+    );
+}
+
+#[test]
+fn markdown_emphasis_hugs_its_text() {
+    let form = parse(
+        "<form><p><b>Sales: </b>x <i> spaced </i>y <b></b>z <code>a`b</code> \
+         <strong>out <em>in</em></strong></p><input name=\"z\"></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!(
+        wire.intro.as_deref(),
+        Some("Sales: x spaced y z a`b out in")
+    );
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some("**Sales:** x *spaced* y z ``a`b`` **out *in***")
+    );
+}
+
+#[test]
+fn markdown_fences_preformatted_text_past_its_backticks() {
+    let form = parse("<form><pre>run ```sh\nls\n```</pre><input name=\"z\"></form>");
+    let wire = form.to_wire();
+    assert_eq!(wire.intro.as_deref(), Some("run ```sh\nls\n```"));
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some("````\nrun ```sh\nls\n```\n````")
+    );
+}
+
+#[test]
+fn a_field_description_with_a_table_has_markdown_too() {
+    let form = parse(
+        "<form><fieldset><legend>Pick</legend><p>Compare:</p>\
+         <table><tr><th>Plan</th><th>Cost</th></tr><tr><td><b>A</b></td><td>$5</td></tr></table>\
+         <label><input type=\"radio\" name=\"p\" value=\"a\"> A</label>\
+         <label><input type=\"radio\" name=\"p\" value=\"b\"> B</label></fieldset></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!((wire.intro, wire.intro_markdown), (None, None));
+    let field = &wire.fields[0];
+    assert_eq!(
+        field.description.as_deref(),
+        Some("Compare:\n\nPlan · Cost\nA · $5")
+    );
+    assert_eq!(
+        field.description_markdown.as_deref(),
+        Some("Compare:\n\n| Plan | Cost |\n| --- | --- |\n| **A** | $5 |")
+    );
+}
+
+#[test]
+fn every_context_block_has_markdown() {
+    let form = parse(
+        "<form><h2>Plan</h2><ol><li>one<li><i>two</i></ol><pre>\n  code\n</pre>\
+         <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\
+         <img src=\"x.png\" alt=\"chart_1\"><img alt=\"no src\">\
+         <p>a <b>bold</b>\n   move<br> next</p><input name=\"z\"></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!(
+        wire.intro.as_deref(),
+        Some("Plan\n\n1. one\n2. two\n\n  code\n\nA · B\n1 · 2\n\nchart_1\n\na bold\nmove\nnext")
+    );
+    assert_eq!(
+        wire.intro_markdown.as_deref(),
+        Some(
+            "**Plan**\n\n1. one\n2. *two*\n\n```\n  code\n```\n\n\
+             | A | B |\n| --- | --- |\n| 1 | 2 |\n\nchart\\_1\n\na **bold**\nmove\nnext"
+        )
+    );
+}
+
+/// A decision matrix keeps its row lines as text in both forms.
+#[test]
+fn a_decision_matrix_keeps_its_row_lines_in_markdown() {
+    let form = parse(
+        "<form><table><tr><th>Option</th><th>Pick</th></tr>\
+         <tr><td><b>Fast</b> path</td><td><input type=\"checkbox\" name=\"fast\"></td></tr>\
+         <tr><td><i>Slow</i></td><td><input type=\"checkbox\" name=\"slow\"></td></tr></table></form>",
+    );
+    let wire = form.to_wire();
+    assert_eq!(wire.intro.as_deref(), Some("Fast path"));
+    assert_eq!(wire.intro_markdown.as_deref(), Some("**Fast** path"));
+    assert_eq!(wire.fields[1].description.as_deref(), Some("Slow"));
+    assert_eq!(
+        wire.fields[1].description_markdown.as_deref(),
+        Some("*Slow*")
+    );
+}

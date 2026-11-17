@@ -5,8 +5,10 @@
 //! same fields, options, defaults and "Other" answers omp's terminal shows,
 //! and can predict the `details.answers` omp records for given values.
 //!
-//! Context text is kept as plain text: inline emphasis (`<b>`, `<code>`) only
-//! matters for drawing, and every consumer here wants strings.
+//! Context text is kept twice: as plain text, and as Markdown that keeps the
+//! inline emphasis (`<b>`, `<i>`, `<code>`), lists, tables and preformatted
+//! blocks, for clients that can draw it (`intro_markdown`,
+//! `description_markdown`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,20 +45,45 @@ pub(crate) struct Section {
 pub(crate) enum Block {
     Text {
         text: String,
+        markdown: String,
         heading: bool,
     },
     List {
-        items: Vec<String>,
+        items: Vec<Inline>,
         ordered: bool,
     },
     Pre(String),
-    Table(Vec<Vec<String>>),
+    Table(Vec<Vec<Inline>>),
     /// An `<img>` or inline `<svg>`: only its alt text survives.
     Picture {
         alt: String,
     },
     /// Index into [`ParsedForm::fields`].
     Field(usize),
+}
+
+/// Inline content (a list item, a table cell) as plain text and as Markdown.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Inline {
+    pub text: String,
+    pub markdown: String,
+}
+
+/// Inline formatting that survives into Markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Strong,
+    Em,
+    Code,
+}
+
+/// Inline content in document order: text (a `<br>` is "\n") and the edges
+/// of `<b>`/`<strong>`, `<i>`/`<em>` and `<code>`.
+#[derive(Debug, Clone, PartialEq)]
+enum Run {
+    Text(String),
+    Open(Mark),
+    Close(Mark),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,7 +402,9 @@ struct Builder<'a> {
     groups: HashMap<(String, String), usize>,
     /// `<label for>` elements by the id of the control they name.
     label_for: HashMap<String, Dom<'a>>,
-    inline: String,
+    inline: Vec<Run>,
+    /// Inline marks open around the walk's position; a flush reopens them.
+    open: Vec<Mark>,
     fieldset_depth: usize,
 }
 
@@ -391,7 +420,8 @@ impl<'a> Builder<'a> {
             hidden: Vec::new(),
             groups: HashMap::new(),
             label_for: HashMap::new(),
-            inline: String::new(),
+            inline: Vec::new(),
+            open: Vec::new(),
             fieldset_depth: 0,
         }
     }
@@ -448,7 +478,7 @@ impl<'a> Builder<'a> {
     fn walk(&mut self, node: &Dom<'a>) {
         let tag = match node.value() {
             Node::Text(text) => {
-                self.inline.push_str(text);
+                self.inline.push(Run::Text(text.clone()));
                 return;
             }
             Node::Element(element) => element.name(),
@@ -458,7 +488,15 @@ impl<'a> Builder<'a> {
             return;
         }
         match tag {
-            "br" => self.inline.push('\n'),
+            "br" => self.inline.push(Run::Text("\n".to_owned())),
+            "b" | "strong" | "i" | "em" | "code" => {
+                let mark = inline_mark(tag);
+                self.inline.push(Run::Open(mark));
+                self.open.push(mark);
+                self.children(node);
+                self.open.pop();
+                self.inline.push(Run::Close(mark));
+            }
             "hr" => self.flush(false),
             "input" | "select" | "textarea" => self.control(node, None),
             "label" => self.label(node),
@@ -509,10 +547,22 @@ impl<'a> Builder<'a> {
 
     /// Emit buffered inline content as a text block.
     fn flush(&mut self, heading: bool) {
-        let text = normalize(&std::mem::take(&mut self.inline));
-        if !text.is_empty() {
-            self.section().blocks.push(Block::Text { text, heading });
+        let reopened = self.open.iter().map(|mark| Run::Open(*mark)).collect();
+        let mut runs = std::mem::replace(&mut self.inline, reopened);
+        let text = plain_text(&runs);
+        if text.is_empty() {
+            return;
         }
+        if heading {
+            runs.insert(0, Run::Open(Mark::Strong));
+            runs.push(Run::Close(Mark::Strong));
+        }
+        let markdown = inline_markdown(&runs);
+        self.section().blocks.push(Block::Text {
+            text,
+            markdown,
+            heading,
+        });
     }
 
     fn label(&mut self, label: &Dom<'a>) {
@@ -583,10 +633,10 @@ impl<'a> Builder<'a> {
             self.flush(false);
             return;
         }
-        let items: Vec<String> = element_children(list)
+        let items: Vec<Inline> = element_children(list)
             .filter(|child| tag(child) == Some("li"))
-            .map(|item| spans_of(&item))
-            .filter(|text| !text.is_empty())
+            .map(|item| inline_of(&item))
+            .filter(|item| !item.text.is_empty())
             .collect();
         if !items.is_empty() {
             self.section().blocks.push(Block::List { items, ordered });
@@ -606,9 +656,9 @@ impl<'a> Builder<'a> {
         };
         let has_control = |node: &Dom<'a>| !descendants_named(node, is_control).is_empty();
         if !has_control(table) {
-            let cells: Vec<Vec<String>> = rows
+            let cells: Vec<Vec<Inline>> = rows
                 .iter()
-                .map(|row| cells_of(row).iter().map(spans_of).collect())
+                .map(|row| cells_of(row).iter().map(inline_of).collect())
                 .collect();
             if cells.iter().any(|row| !row.is_empty()) {
                 self.section().blocks.push(Block::Table(cells));
@@ -624,16 +674,19 @@ impl<'a> Builder<'a> {
                 header = cells.iter().map(spans_of).collect();
                 continue;
             }
-            let text = cells
+            let texts: Vec<Inline> = cells
                 .iter()
                 .filter(|cell| !has_control(cell))
-                .map(spans_of)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            if !text.is_empty() {
+                .map(inline_of)
+                .filter(|cell| !cell.text.is_empty())
+                .collect();
+            if !texts.is_empty() {
+                let join = |part: fn(&Inline) -> &str| {
+                    texts.iter().map(part).collect::<Vec<_>>().join(" · ")
+                };
                 self.section().blocks.push(Block::Text {
-                    text,
+                    text: join(|cell| &cell.text),
+                    markdown: join(|cell| &cell.markdown),
                     heading: false,
                 });
             }
@@ -865,13 +918,13 @@ fn svg_title(svg: &Dom<'_>) -> String {
         .unwrap_or_default()
 }
 
-/// Inline text of `element`, skipping controls (their label is the text
+/// Inline content of `element`, skipping controls (their label is the text
 /// around them).
-fn spans_of(element: &Dom<'_>) -> String {
-    fn visit(node: &Dom<'_>, out: &mut String) {
+fn span_runs(element: &Dom<'_>) -> Vec<Run> {
+    fn visit(node: &Dom<'_>, out: &mut Vec<Run>) {
         let tag = match node.value() {
             Node::Text(text) => {
-                out.push_str(text);
+                out.push(Run::Text(text.clone()));
                 return;
             }
             Node::Element(element) => element.name(),
@@ -881,26 +934,250 @@ fn spans_of(element: &Dom<'_>) -> String {
             return;
         }
         if tag == "br" {
-            out.push('\n');
+            out.push(Run::Text("\n".to_owned()));
             return;
         }
         // Labels stay text: a picture inside one reads as its alt text.
         if tag == "img" {
-            out.push_str(attr(node, "alt").unwrap_or_default());
+            out.push(Run::Text(attr(node, "alt").unwrap_or_default().to_owned()));
             return;
         }
         if BLOCK.contains(&tag) || HEADING.contains(&tag) {
-            out.push(' ');
+            out.push(Run::Text(" ".to_owned()));
         }
+        let mark = matches!(tag, "b" | "strong" | "i" | "em" | "code").then(|| inline_mark(tag));
+        out.extend(mark.map(Run::Open));
         for child in node.children() {
             visit(&child, out);
         }
+        out.extend(mark.map(Run::Close));
     }
-    let mut out = String::new();
+    let mut out = Vec::new();
     for child in element.children() {
         visit(&child, &mut out);
     }
-    normalize(&out)
+    out
+}
+
+/// Plain inline text of `element` (see [`span_runs`]).
+fn spans_of(element: &Dom<'_>) -> String {
+    plain_text(&span_runs(element))
+}
+
+/// Inline content of `element` as plain text and as Markdown.
+fn inline_of(element: &Dom<'_>) -> Inline {
+    let runs = span_runs(element);
+    Inline {
+        text: plain_text(&runs),
+        markdown: inline_markdown(&runs),
+    }
+}
+
+/// `b`/`strong`, `i`/`em` or `code`.
+fn inline_mark(tag: &str) -> Mark {
+    match tag {
+        "b" | "strong" => Mark::Strong,
+        "i" | "em" => Mark::Em,
+        _ => Mark::Code,
+    }
+}
+
+/// The text of `runs`, laid out by [`normalize`].
+fn plain_text(runs: &[Run]) -> String {
+    let raw: String = runs
+        .iter()
+        .filter_map(|run| match run {
+            Run::Text(text) => Some(text.as_str()),
+            Run::Open(_) | Run::Close(_) => None,
+        })
+        .collect();
+    normalize(&raw)
+}
+
+/// One laid-out character, or the edge of a mark.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Token {
+    Char(char),
+    Open(Mark),
+    Close(Mark),
+}
+
+/// `runs` as Markdown: the same text as [`plain_text`], with its marks as
+/// `**strong**`, `*em*` and `` `code` `` and Markdown syntax escaped.
+fn inline_markdown(runs: &[Run]) -> String {
+    let mut tokens = layout_tokens(runs);
+    hug_marks(&mut tokens);
+    render_tokens(&tokens)
+}
+
+/// Lay out `runs` exactly as [`normalize`] does, keeping the marks in place
+/// (closing any left open, dropping a close without its open).
+fn layout_tokens(runs: &[Run]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut open: Vec<Mark> = Vec::new();
+    let mut pending_space = false;
+    let mut after_break = false;
+    for run in runs {
+        match run {
+            Run::Text(text) => {
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        pending_space = false;
+                        after_break = true;
+                        tokens.push(Token::Char('\n'));
+                    } else if is_js_space(ch) {
+                        pending_space = true;
+                    } else {
+                        if pending_space && !after_break {
+                            tokens.push(Token::Char(' '));
+                        }
+                        pending_space = false;
+                        after_break = false;
+                        tokens.push(Token::Char(ch));
+                    }
+                }
+            }
+            Run::Open(mark) => {
+                open.push(*mark);
+                tokens.push(Token::Open(*mark));
+            }
+            Run::Close(mark) => {
+                if open.last() == Some(mark) {
+                    open.pop();
+                    tokens.push(Token::Close(*mark));
+                }
+            }
+        }
+    }
+    tokens.extend(open.into_iter().rev().map(Token::Close));
+    let visible = |token: &Token| matches!(token, Token::Char(ch) if !is_js_space(*ch));
+    let (Some(first), Some(last)) = (
+        tokens.iter().position(visible),
+        tokens.iter().rposition(visible),
+    ) else {
+        return Vec::new();
+    };
+    // Trim the ends like `normalize`: spaces and breaks before the first and
+    // after the last visible character go, marks stay.
+    let mut index = 0;
+    tokens.retain(|token| {
+        let keep = (first..=last).contains(&index) || !matches!(token, Token::Char(_));
+        index += 1;
+        keep
+    });
+    tokens
+}
+
+/// Make every mark hug non-whitespace, as CommonMark needs for emphasis:
+/// spaces and breaks move out of the marks, and empty marks go.
+fn hug_marks(tokens: &mut Vec<Token>) {
+    let blank = |token: Token| matches!(token, Token::Char(' ' | '\n'));
+    loop {
+        let mut changed = false;
+        let mut index = 0;
+        while index + 1 < tokens.len() {
+            match (tokens[index], tokens[index + 1]) {
+                (Token::Open(open), Token::Close(close)) if open == close => {
+                    tokens.drain(index..index + 2);
+                    changed = true;
+                    continue;
+                }
+                (Token::Open(_), next) if blank(next) => {
+                    tokens.swap(index, index + 1);
+                    changed = true;
+                }
+                (previous, Token::Close(_)) if blank(previous) => {
+                    tokens.swap(index, index + 1);
+                    changed = true;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// Write laid-out tokens as Markdown. A mark nested in the same mark adds
+/// nothing, and inside code the other marks are dropped.
+fn render_tokens(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    let mut depth = [0usize; 3];
+    let mut code = String::new();
+    let mut line_start = true;
+    let mut leading_digits = false;
+    for token in tokens {
+        match *token {
+            Token::Open(mark) | Token::Close(mark)
+                if depth[Mark::Code as usize] > 0 && mark != Mark::Code => {}
+            Token::Open(mark) => {
+                depth[mark as usize] += 1;
+                if depth[mark as usize] == 1 {
+                    match mark {
+                        Mark::Strong => out.push_str("**"),
+                        Mark::Em => out.push('*'),
+                        Mark::Code => code.clear(),
+                    }
+                }
+            }
+            Token::Close(mark) => {
+                depth[mark as usize] -= 1;
+                if depth[mark as usize] == 0 {
+                    match mark {
+                        Mark::Strong => out.push_str("**"),
+                        Mark::Em => out.push('*'),
+                        Mark::Code => {
+                            push_code_span(&code, &mut out);
+                            line_start = false;
+                            leading_digits = false;
+                        }
+                    }
+                }
+            }
+            Token::Char(ch) if depth[Mark::Code as usize] > 0 => {
+                code.push(if ch == '\n' { ' ' } else { ch });
+            }
+            Token::Char(ch) => {
+                // What would start a block at the start of a line: a heading,
+                // a list item, a setext underline, an ordered item (`1.`).
+                let block_start = (line_start && matches!(ch, '#' | '-' | '+' | '='))
+                    || (leading_digits && matches!(ch, '.' | ')'));
+                if block_start || matches!(ch, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '>' | '~')
+                {
+                    out.push('\\');
+                }
+                out.push(ch);
+                leading_digits = ch.is_ascii_digit() && (line_start || leading_digits);
+                line_start = ch == '\n';
+            }
+        }
+    }
+    out
+}
+
+/// A code span whose fence is longer than any backtick run in `code`.
+fn push_code_span(code: &str, out: &mut String) {
+    let fence = "`".repeat(longest_run(code, '`') + 1);
+    let pad = if code.starts_with('`') || code.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    out.push_str(&fence);
+    out.push_str(pad);
+    out.push_str(code);
+    out.push_str(pad);
+    out.push_str(&fence);
+}
+
+/// The longest run of `ch` in `text`.
+fn longest_run(text: &str, ch: char) -> usize {
+    text.split(|other| other != ch)
+        .map(|run| run.chars().count())
+        .max()
+        .unwrap_or(0)
 }
 
 impl ParsedForm {
@@ -1008,8 +1285,9 @@ impl ParsedForm {
 
     /// The form as `agent.transcript` serves it.
     pub(crate) fn to_wire(&self) -> AskForm {
-        let mut intro: Vec<String> = Vec::new();
-        let mut pending: Vec<String> = Vec::new();
+        // Context blocks as (plain text, Markdown).
+        let mut intro: Vec<(String, String)> = Vec::new();
+        let mut pending: Vec<(String, String)> = Vec::new();
         let mut seen_field = false;
         let mut fields = Vec::new();
         for section in &self.sections {
@@ -1023,14 +1301,14 @@ impl ParsedForm {
                 .count();
             for block in &section.blocks {
                 let Block::Field(index) = block else {
-                    pending.extend(block_text(block));
+                    pending.extend(block_context(block));
                     continue;
                 };
                 if !seen_field && section.title.is_empty() {
                     intro.append(&mut pending);
                 }
                 seen_field = true;
-                let description = joined(std::mem::take(&mut pending));
+                let (description, description_markdown) = joined(std::mem::take(&mut pending));
                 let field = &self.fields[*index];
                 if field.name.is_empty() {
                     continue;
@@ -1043,11 +1321,13 @@ impl ParsedForm {
                     } else {
                         None
                     };
-                fields.push(wire_field(field, title, description));
+                fields.push(wire_field(field, title, description, description_markdown));
             }
         }
+        let (intro, intro_markdown) = joined(intro);
         AskForm {
-            intro: joined(intro),
+            intro,
+            intro_markdown,
             fields,
         }
     }
@@ -1107,8 +1387,70 @@ impl ParsedForm {
     }
 }
 
-fn joined(parts: Vec<String>) -> Option<String> {
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+/// Context blocks joined into the wire's plain text and Markdown; paragraphs
+/// are separated by a blank line.
+fn joined(parts: Vec<(String, String)>) -> (Option<String>, Option<String>) {
+    if parts.is_empty() {
+        return (None, None);
+    }
+    let (text, markdown): (Vec<String>, Vec<String>) = parts.into_iter().unzip();
+    (Some(text.join("\n\n")), Some(markdown.join("\n\n")))
+}
+
+/// A context block as plain text and as Markdown; `None` when its plain text
+/// is empty (a field, a picture without alt text).
+fn block_context(block: &Block) -> Option<(String, String)> {
+    let text = block_text(block)?;
+    let markdown = match block {
+        Block::Text { markdown, .. } => markdown.clone(),
+        Block::Pre(code) => {
+            // A fence of at least three backticks, longer than any run inside.
+            let fence = "`".repeat(longest_run(code, '`').max(2) + 1);
+            format!("{fence}\n{code}\n{fence}")
+        }
+        Block::List { items, ordered } => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let marker = if *ordered {
+                    format!("{}. ", index + 1)
+                } else {
+                    "- ".to_owned()
+                };
+                // Continuation lines line up with the item's text.
+                let indent = format!("\n{}", " ".repeat(marker.len()));
+                format!("{marker}{}", item.markdown.replace('\n', &indent))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Block::Table(rows) => table_markdown(rows),
+        Block::Picture { alt } => inline_markdown(&[Run::Text(alt.clone())]),
+        Block::Field(_) => return None,
+    };
+    Some((text, markdown))
+}
+
+/// A GFM pipe table: the first row is the header, every row is padded to the
+/// widest one, and a cell stays on one line with its `|` escaped.
+fn table_markdown(rows: &[Vec<Inline>]) -> String {
+    let rows: Vec<&Vec<Inline>> = rows.iter().filter(|row| !row.is_empty()).collect();
+    let columns = rows.iter().map(|row| row.len()).max().unwrap_or(1);
+    let line = |cells: Vec<String>| format!("| {} |", cells.join(" | "));
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    for (index, row) in rows.iter().enumerate() {
+        let cells = (0..columns)
+            .map(|column| {
+                row.get(column)
+                    .map(|cell| cell.markdown.replace('\n', " ").replace('|', "\\|"))
+                    .unwrap_or_default()
+            })
+            .collect();
+        lines.push(line(cells));
+        if index == 0 {
+            lines.push(line(vec!["---".to_owned(); columns]));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Plain text of a context block; pictures without alt text drop.
@@ -1119,6 +1461,7 @@ fn block_text(block: &Block) -> Option<String> {
             .iter()
             .enumerate()
             .map(|(index, item)| {
+                let item = &item.text;
                 if *ordered {
                     format!("{}. {item}", index + 1)
                 } else {
@@ -1129,7 +1472,12 @@ fn block_text(block: &Block) -> Option<String> {
             .join("\n"),
         Block::Table(rows) => rows
             .iter()
-            .map(|row| row.join(" · "))
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
             .filter(|row| !row.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1154,12 +1502,18 @@ fn wire_length(value: Option<f64>) -> Option<u64> {
         .map(|value| value.ceil() as u64)
 }
 
-fn wire_field(field: &Field, title: Option<String>, description: Option<String>) -> AskFormField {
+fn wire_field(
+    field: &Field,
+    title: Option<String>,
+    description: Option<String>,
+    description_markdown: Option<String>,
+) -> AskFormField {
     let mut wire = AskFormField {
         name: field.name.clone(),
         kind: AskFormFieldKind::Choice,
         title,
         description,
+        description_markdown,
         multi: false,
         select: false,
         other: false,
