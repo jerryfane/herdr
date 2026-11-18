@@ -756,6 +756,12 @@ report `capabilities.api_bridge_multi: true` from `ping`):
   that request gets a `transport_error`. The bridge keeps running either way.
 - When stdin closes, the bridge exits after in-flight requests finish. If
   stdout's reader goes away first, in-flight requests are cancelled.
+- The bridge is a process of its own. A server restart or live handoff does
+  not replace it: it keeps the binary and bridge features it started with,
+  while its requests reach the new server. To pick up a new build, start a new
+  bridge once `agent.list` reports a new `origin_boot_id`, and close the old
+  one's stdin after its requests are answered. A federation coordinator does
+  this for its peers by itself.
 
 By default a big response holds up every response behind it until it has all
 been written. A client on a slow link can ask the bridge to interleave them

@@ -14,6 +14,8 @@ mod saved;
 mod ssh_agent;
 
 pub(crate) use api_bridge::run_api_client_bridge;
+#[cfg(all(test, unix))]
+pub(crate) use api_bridge::run_multi_bridge;
 pub(crate) use args::*;
 pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
