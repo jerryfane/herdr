@@ -285,33 +285,48 @@ impl PeerRoute {
         (!self.state.retired.load(Ordering::Acquire) && self.stamp_unlocked() == *stamp).then(write)
     }
 
+    /// Record the boot the peer's latest answer came from. A changed boot is a
+    /// restarted peer server, perhaps on another build: replies from the old
+    /// boot are fenced, and the peer channel is recycled because its remote
+    /// bridge outlives the server it was started next to (#463).
     pub(crate) fn observe_remote_boot(&self, remote_boot_id: Option<&str>) {
         let Some(remote_boot_id) = remote_boot_id else {
             return;
         };
-        let _lifecycle = self
-            .state
-            .lifecycle
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut current = self
-            .state
-            .remote_boot_id
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if current.as_deref() == Some(remote_boot_id) {
-            return;
+        let restarted = {
+            let _lifecycle = self
+                .state
+                .lifecycle
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut current = self
+                .state
+                .remote_boot_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current.as_deref() == Some(remote_boot_id) {
+                return;
+            }
+            let restarted = current.is_some();
+            if restarted {
+                let generation = self.state.generation_clock.fetch_add(1, Ordering::AcqRel) + 1;
+                self.state.generation.store(generation, Ordering::Release);
+                // A restarted peer may run another version; wait for its next poll.
+                self.state
+                    .rename_preconditions
+                    .store(false, Ordering::Release);
+                self.state.ask_form.store(false, Ordering::Release);
+            }
+            *current = Some(remote_boot_id.to_owned());
+            restarted
+        };
+        // Outside the route locks: recycling can wait for a channel open in
+        // progress, and stopping an idle bridge joins its reader.
+        if restarted {
+            if let Some(channel) = &self.peer_channel {
+                channel.recycle();
+            }
         }
-        if current.is_some() {
-            let generation = self.state.generation_clock.fetch_add(1, Ordering::AcqRel) + 1;
-            self.state.generation.store(generation, Ordering::Release);
-            // A restarted peer may run another version; wait for its next poll.
-            self.state
-                .rename_preconditions
-                .store(false, Ordering::Release);
-            self.state.ask_form.store(false, Ordering::Release);
-        }
-        *current = Some(remote_boot_id.to_owned());
     }
 
     #[cfg(test)]

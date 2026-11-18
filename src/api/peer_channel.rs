@@ -21,6 +21,13 @@
 //! channel dying, leaves delivery unknown, and the channel never re-sends it.
 //! A dead channel is replaced for a later request, after a bounded backoff
 //! when it keeps failing.
+//!
+//! The remote bridge is a process of its own: it keeps running the binary it
+//! started with when the peer's server is restarted or live-updated, and its
+//! per-request socket connections reach the new server. The route therefore
+//! [recycles](PeerChannel::recycle) the channel when the peer's boot changes
+//! (#463): requests already on the old bridge finish there, and the next one
+//! starts the binary the peer runs now.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -113,6 +120,22 @@ impl PeerChannel {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.drop_connection();
+    }
+
+    /// Stop handing out the open connection, without cutting it off. Requests
+    /// that already hold it finish on it, and once the last of them ends its
+    /// stdin closes and its process is stopped, so the bridge never has a
+    /// request taken from it. The next lease opens a new bridge at once.
+    pub(crate) fn recycle(&self) {
+        let retired = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .connection
+            .take();
+        // Outside the lock: with no lease holding it, dropping it stops the
+        // bridge and joins its reader here.
+        drop(retired);
     }
 
     fn drop_connection(&self) {

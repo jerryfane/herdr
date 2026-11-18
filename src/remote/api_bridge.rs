@@ -44,7 +44,7 @@ pub(super) fn connect_stopped() -> io::Error {
 pub(crate) fn run_api_client_bridge(args: &[String]) -> io::Result<()> {
     let encoded_request = match args {
         [] => None,
-        [flag] if flag == "--multi" => return run_multi_bridge(),
+        [flag] if flag == "--multi" => return run_multi_bridge(&crate::api::socket_path()),
         [encoded] => Some(encoded.as_str()),
         _ => {
             return Err(io::Error::new(
@@ -197,7 +197,9 @@ fn error_envelope(id: &str, code: &str, message: &str) -> String {
     .to_string()
 }
 
-fn run_multi_bridge() -> io::Result<()> {
+/// `api-bridge --multi` on this process's stdin and stdout, forwarding to the
+/// API socket at `socket_path`.
+pub(crate) fn run_multi_bridge(socket_path: &Path) -> io::Result<()> {
     let teardown = std::sync::Arc::new(Teardown::default());
     // Same contract as the single-shot bridge: when the app's channel goes
     // away, wake every in-flight read (an `agent.wait` could otherwise hold
@@ -210,12 +212,7 @@ fn run_multi_bridge() -> io::Result<()> {
             transport::wait_for_output_hangup();
             watcher.hang_up();
         })?;
-    run_multi(
-        io::stdin().lock(),
-        io::stdout(),
-        &crate::api::socket_path(),
-        &teardown,
-    )
+    run_multi(io::stdin().lock(), io::stdout(), socket_path, &teardown)
 }
 
 /// Live `--multi` connections, so a lost output peer can shut them all down.
