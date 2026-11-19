@@ -218,9 +218,8 @@ impl PeerRoute {
         self.state.rename_preconditions.load(Ordering::Acquire)
     }
 
-    /// Whether the peer is known to serve `agent.topics.*` and `topic` on
-    /// `agent.transcript`. An unpolled peer, or one whose boot changed since
-    /// its last poll, is not.
+    /// Whether the peer is known to serve `agent.topics.*`. An unpolled peer,
+    /// or one whose boot changed since its last poll, is not.
     pub(crate) fn agent_topics(&self) -> bool {
         self.state.agent_topics.load(Ordering::Acquire)
     }

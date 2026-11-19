@@ -438,7 +438,7 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true, "agent_transcript_topic": true},
     }))
 }
 
@@ -4736,7 +4736,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true, "agent_transcript_topic": true}),
             "only what the gate serves"
         );
 
