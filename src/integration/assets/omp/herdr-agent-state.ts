@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=12
+// HERDR_INTEGRATION_VERSION=13
 // @ts-nocheck
 
 import net from "node:net";
@@ -185,6 +185,81 @@ function reportSession(sessionStartSource = "startup"): Promise<void> {
   });
 }
 
+type AgentControl = { socketPath: string; token: string; protocol: number };
+
+// omp's getter for the topics control socket it serves this process's host
+// (`pi.pi.currentTopicsControl()`, absent on older omp). The `topics:control`
+// bus event only says it changed: any extension can emit on the bus, so its
+// payload is never read.
+const TOPICS_CONTROL_GETTER = "currentTopicsControl";
+
+// The token acts for the agent: it goes only to the Herdr socket, never into
+// a request id or a log.
+let controlReported = false;
+// A replaced Herdr server (`server.update_apply`, live handoff) keeps the
+// control socket in memory only and starts without it, and an idle agent
+// reports nothing else. While a socket is offered it is re-sent this often;
+// Herdr takes an identical report as a no-op.
+const controlRefreshMs = parseDurationEnv("HERDR_OMP_CONTROL_REFRESH_MS", 30_000);
+let controlRefresh: ReturnType<typeof setInterval> | undefined;
+
+export function parseAgentControl(data: unknown): AgentControl | undefined {
+  if (typeof data !== "object" || data === null) {
+    return undefined;
+  }
+  const { socketPath, token, protocol, pid } = data as Record<string, unknown>;
+  if (
+    typeof socketPath !== "string" ||
+    !path.isAbsolute(socketPath) ||
+    typeof token !== "string" ||
+    token.length < 32 ||
+    protocol !== 1 ||
+    (pid !== undefined && pid !== process.pid)
+  ) {
+    return undefined;
+  }
+  return { socketPath, token, protocol };
+}
+
+/** Hand omp's current control socket to Herdr, or clear the one it has. */
+function reportControl(pi: unknown, shutdown = false): Promise<void> {
+  // `pi.pi` is omp's own API object; older omp builds lack it or the getter.
+  const host = (pi as { pi?: Record<string, unknown> } | undefined)?.pi;
+  const getter = host?.[TOPICS_CONTROL_GETTER];
+  let control: AgentControl | undefined;
+  if (!shutdown && typeof getter === "function") {
+    try {
+      control = parseAgentControl(getter.call(host));
+    } catch {
+      control = undefined;
+    }
+  }
+  if (control && !controlRefresh && controlRefreshMs > 0) {
+    controlRefresh = setInterval(() => void reportControl(pi), controlRefreshMs);
+    controlRefresh.unref?.();
+  } else if (!control && controlRefresh) {
+    clearInterval(controlRefresh);
+    controlRefresh = undefined;
+  }
+  if (!control && !controlReported) {
+    return Promise.resolve();
+  }
+  controlReported = !!control;
+  return sendRequest({
+    id: `${source}:control:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    method: "pane.report_agent_control",
+    params: {
+      pane_id: paneId,
+      source,
+      agent: "omp",
+      agent_process_pid: process.pid,
+      ...(control
+        ? { socket_path: control.socketPath, token: control.token, protocol: control.protocol }
+        : {}),
+    },
+  });
+}
+
 function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -352,9 +427,17 @@ export default function (pi) {
     if (ctx?.hasUI !== true) {
       return false;
     }
+    const firstActivation = !rootSession;
     rootSession = true;
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
+    // Herdr accepts the control socket only after the session report named
+    // this process; the request queue keeps that order.
+    void reportControl(pi);
+    if (firstActivation) {
+      // Ask omp to signal its socket again in case it did before we listened.
+      pi.events?.emit?.("topics:control:request");
+    }
     return true;
   }
 
@@ -393,6 +476,13 @@ export default function (pi) {
     activateBlocked(data.label);
   });
 
+  // A change signal only: the socket and token come from omp's getter.
+  pi.events.on("topics:control", () => {
+    if (rootSession) {
+      void reportControl(pi);
+    }
+  });
+
   pi.on("session_start", (_event, ctx) => {
     if (!activateRootSession(ctx)) {
       return;
@@ -426,6 +516,8 @@ export default function (pi) {
     }
     updateSessionRef(ctx);
     void reportSession();
+    // A replaced Herdr server (update, handoff) starts without the socket.
+    void reportControl(pi);
     clearPendingTimers();
     clearFailureState();
     agentActive = true;
@@ -500,6 +592,7 @@ export default function (pi) {
   pi.on("session_shutdown", () => {
     if (rootSession) {
       clearPendingTimers();
+      void reportControl(pi, true);
     }
   });
 }

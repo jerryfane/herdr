@@ -206,6 +206,7 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         max_bytes: None,
         held_from: None,
         subagent: None,
+        topic: None,
     }
 }
 

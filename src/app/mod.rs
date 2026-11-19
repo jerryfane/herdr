@@ -140,6 +140,11 @@ pub struct App {
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) policy: AppPolicy,
+    /// The control sockets omp agents offered their panes, by terminal
+    /// (`pane.report_agent_control`). Memory only: never persisted, exported
+    /// in a handoff, or returned by the API; a new process starts empty.
+    #[cfg(unix)]
+    pub(crate) agent_controls: crate::agent_topics::AgentControls,
     /// Agent profile pictures by terminal id (`agent.avatar.*`). Under the
     /// config dir when the session persists; a throwaway temp root otherwise
     /// (tests), so a test never touches the real store.
@@ -761,6 +766,8 @@ impl App {
             api_rx,
             event_hub,
             last_focus,
+            #[cfg(unix)]
+            agent_controls: Default::default(),
             agent_avatars: crate::persist::agent_avatars::AgentAvatarStore::open(
                 if policy.persist_session {
                     crate::persist::agent_avatars::AgentAvatarStore::default_root()

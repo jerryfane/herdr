@@ -175,6 +175,11 @@ impl App {
                 workspace_id,
                 ..
             }
+            | EventData::AgentTopicsChanged {
+                pane_id,
+                workspace_id,
+                ..
+            }
             | EventData::PaneAgentStatusChanged {
                 pane_id,
                 workspace_id,

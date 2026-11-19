@@ -126,6 +126,10 @@ struct PeerRouteState {
     rename_preconditions: AtomicBool,
     /// The peer's latest poll advertised `ask_form`.
     ask_form: AtomicBool,
+    /// The peer's latest poll advertised `agent_topics`.
+    agent_topics: AtomicBool,
+    /// The peer's latest poll advertised `agent_transcript_topic`.
+    agent_transcript_topic: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -146,6 +150,8 @@ impl PeerRoute {
                 identity_validation_required: requires_identity_validation,
                 rename_preconditions: AtomicBool::new(false),
                 ask_form: AtomicBool::new(false),
+                agent_topics: AtomicBool::new(false),
+                agent_transcript_topic: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -189,6 +195,14 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.ask_form),
             Ordering::Release,
         );
+        self.state.agent_topics.store(
+            capabilities.is_some_and(|capabilities| capabilities.agent_topics),
+            Ordering::Release,
+        );
+        self.state.agent_transcript_topic.store(
+            capabilities.is_some_and(|capabilities| capabilities.agent_transcript_topic),
+            Ordering::Release,
+        );
     }
 
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
@@ -202,6 +216,17 @@ impl PeerRoute {
     /// unpolled peer, or one whose boot changed since its last poll, is not.
     pub(crate) fn rename_preconditions(&self) -> bool {
         self.state.rename_preconditions.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to serve `agent.topics.*`. An unpolled peer,
+    /// or one whose boot changed since its last poll, is not.
+    pub(crate) fn agent_topics(&self) -> bool {
+        self.state.agent_topics.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to honour `topic` on `agent.transcript`.
+    pub(crate) fn agent_transcript_topic(&self) -> bool {
+        self.state.agent_transcript_topic.load(Ordering::Acquire)
     }
 
     /// Whether the peer is known to serve `agent.answer_form`. An unpolled
@@ -316,6 +341,10 @@ impl PeerRoute {
                     .rename_preconditions
                     .store(false, Ordering::Release);
                 self.state.ask_form.store(false, Ordering::Release);
+                self.state.agent_topics.store(false, Ordering::Release);
+                self.state
+                    .agent_transcript_topic
+                    .store(false, Ordering::Release);
             }
             *current = Some(remote_boot_id.to_owned());
             restarted

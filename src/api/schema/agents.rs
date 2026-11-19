@@ -694,6 +694,11 @@ pub struct AgentInfo {
         deserialize_with = "lenient_avatar"
     )]
     pub avatar: Option<AgentAvatar>,
+    /// An omp agent's topic transcripts in its current session, read from the
+    /// session file on disk; listed whether or not the agent can be reached
+    /// (`agent.list`, `agent.get` on servers advertising `agent_topics`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_sessions: Option<Vec<super::topics::AgentTopicSession>>,
 }
 
 fn lenient_avatar<'de, D>(deserializer: D) -> Result<Option<AgentAvatar>, D::Error>

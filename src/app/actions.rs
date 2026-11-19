@@ -1752,6 +1752,8 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeReadFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
+            #[cfg(unix)]
+            AppEvent::AgentTopicsChanged { .. } => Vec::new(),
             AppEvent::UsageRefreshed { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
             // The server-owned App wrapper intercepts transfer worker results

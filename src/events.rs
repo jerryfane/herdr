@@ -253,6 +253,14 @@ pub enum AppEvent {
         segment_index: usize,
         result: Result<Option<String>, String>,
     },
+    /// One topic of an omp agent changed, read from endpoint `generation` of
+    /// the terminal's control socket (`agent.topics.changed`).
+    #[cfg(unix)]
+    AgentTopicsChanged {
+        terminal_id: String,
+        generation: u64,
+        change: crate::agent_topics::control::TopicChange,
+    },
     /// A background live account-usage fetch finished. `usage` is `None` on any
     /// failure/timeout: the handler then leaves the cache untouched and clears
     /// the in-flight marker so a later `accounts.list` can retry.

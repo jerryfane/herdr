@@ -14,6 +14,7 @@ mod origin;
 mod subagents;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod topics;
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -58,8 +59,11 @@ pub(crate) struct PageRequest {
     pub(crate) max_bytes: Option<u32>,
     /// Page this subagent's own session file instead of the agent's.
     pub(crate) subagent: Option<String>,
+    /// Page this topic's own session file instead of the agent's; with
+    /// `subagent`, that topic's subagent.
+    pub(crate) topic: Option<String>,
     /// The pane's remembered non-owner prompts, oldest first; their user
-    /// turns are marked `origin: "other"`. Ignored for subagent pages.
+    /// turns are marked `origin: "other"`. Ignored for subagent and topic pages.
     pub(crate) other_prompts: Vec<OtherPrompt>,
     /// With `after`: the `before` cursor of the oldest page the client holds,
     /// or `""` when it holds the session from its start. Origin marks that
@@ -94,6 +98,8 @@ pub(crate) enum TranscriptError {
     InvalidRequest(&'static str),
     /// No subagent of this session has that id.
     SubagentNotFound,
+    /// The session records no topic with that id.
+    TopicNotFound,
 }
 
 impl TranscriptError {
@@ -103,6 +109,7 @@ impl TranscriptError {
             Self::CursorExpired => "cursor_expired",
             Self::InvalidRequest(_) => "invalid_request",
             Self::SubagentNotFound => "subagent_not_found",
+            Self::TopicNotFound => "topic_not_found",
         }
     }
 
@@ -114,6 +121,7 @@ impl TranscriptError {
             }
             Self::InvalidRequest(message) => (*message).into(),
             Self::SubagentNotFound => "no subagent of this agent has that id".into(),
+            Self::TopicNotFound => "no topic of this agent has that id".into(),
         }
     }
 }
@@ -174,8 +182,8 @@ fn with_index<T>(
     read(&view)
 }
 
-/// One page of `path`'s conversation, as the owner sees it, or of its
-/// subagent `request.subagent`'s own conversation.
+/// One page of `path`'s conversation, as the owner sees it, or of its topic
+/// `request.topic`'s, or of the subagent `request.subagent` of either.
 pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptError> {
     if request.before.is_some() && request.after.is_some() {
         return Err(TranscriptError::InvalidRequest(
@@ -183,15 +191,21 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         ));
     }
     let limit = request.limit.unwrap_or(DEFAULT_TURNS).clamp(1, MAX_TURNS) as usize;
+    let topic_path;
+    let (path, other_prompts) = match request.topic.as_deref() {
+        Some(id) => {
+            topic_path = topics::topic_session(path, id).ok_or(TranscriptError::TopicNotFound)?;
+            (topic_path.as_path(), &[][..])
+        }
+        None => (path, request.other_prompts.as_slice()),
+    };
     match request.subagent.as_deref() {
         Some(id) => {
             let child =
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
             with_index(&child, |view| view.page(request, limit, &[]))
         }
-        None => match with_index(path, |view| {
-            view.page(request, limit, &request.other_prompts)
-        }) {
+        None => match with_index(path, |view| view.page(request, limit, other_prompts)) {
             Err(TranscriptError::Unavailable(error)) if not_written_yet(path, &error) => {
                 unwritten_page(path, request)
             }

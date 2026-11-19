@@ -12,6 +12,8 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 ];
 
 mod agent_resume;
+#[cfg(unix)]
+mod agent_topics;
 mod agent_transcript;
 mod agent_view_eval;
 mod api;

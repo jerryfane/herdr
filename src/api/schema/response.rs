@@ -19,6 +19,7 @@ use super::plugins::{
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
+use super::topics::{AgentTopicInfo, AgentTopicSendMode};
 use super::transcript::{
     AskFormAnswer, PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem,
     TranscriptRecap, TranscriptSubagent, TranscriptWorking,
@@ -266,6 +267,32 @@ pub enum ResponseResult {
         /// other entry was appended since. Absent on newest and `before` pages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resent: Option<Vec<String>>,
+    },
+    /// `agent.topics.list`: the agent's topics, live from the agent; empty
+    /// when it has none (an unreachable agent is an error instead).
+    AgentTopics {
+        agent: String,
+        pane_id: String,
+        topics: Vec<AgentTopicInfo>,
+    },
+    /// `agent.topics.new`: the topic the agent started.
+    AgentTopicCreated {
+        agent: String,
+        pane_id: String,
+        topic_id: String,
+    },
+    /// `agent.topics.send`: how the agent took the message.
+    AgentTopicSent {
+        agent: String,
+        pane_id: String,
+        topic_id: String,
+        mode: AgentTopicSendMode,
+    },
+    /// `agent.topics.close`, `agent.topics.reopen`, `agent.topics.rename`.
+    AgentTopicUpdated {
+        agent: String,
+        pane_id: String,
+        topic_id: String,
     },
     StreamStarted {
         pane_id: String,

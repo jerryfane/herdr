@@ -1016,15 +1016,101 @@ fn agent_read(params: AgentReadParams) -> std::io::Result<i32> {
 }
 
 fn agent_transcript(params: AgentTranscriptParams) -> std::io::Result<i32> {
-    super::print_response(&super::send_request(&Request {
+    let response = transcript_request(params, super::send_request, |request, supported| {
+        super::send_request_if_supported(request, supported)
+    })?;
+    super::print_response(&response)
+}
+
+/// Whether a server's capabilities allow a request.
+type CapabilityCheck = fn(&crate::api::schema::ServerCapabilities) -> bool;
+
+/// Send `agent.transcript`. With `topic`, only to a server that advertises
+/// `agent_transcript_topic`: an older one ignores `topic` and would answer
+/// with the agent's main conversation as if it were the topic's.
+fn transcript_request(
+    params: AgentTranscriptParams,
+    send: impl FnOnce(&Request) -> std::io::Result<serde_json::Value>,
+    send_if_supported: impl FnOnce(
+        &Request,
+        CapabilityCheck,
+    ) -> std::io::Result<Option<serde_json::Value>>,
+) -> std::io::Result<serde_json::Value> {
+    let wants_topic = params.topic.is_some();
+    let request = Request {
         id: "cli:agent:transcript".into(),
         method: Method::AgentTranscript(params),
-    })?)
+    };
+    if !wants_topic {
+        return send(&request);
+    }
+    if let Some(response) =
+        send_if_supported(&request, |capabilities| capabilities.agent_transcript_topic)?
+    {
+        return Ok(response);
+    }
+    serde_json::to_value(ErrorResponse {
+        id: request.id,
+        error: ErrorBody {
+            code: "topics_unsupported".into(),
+            message: format!(
+                "the server at {} does not support --topic (it would page the main conversation); update it",
+                super::target::socket_label()
+            ),
+        },
+    })
+    .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transcript_params(topic: Option<&str>) -> AgentTranscriptParams {
+        serde_json::from_value(serde_json::json!({"target": "builder", "topic": topic})).unwrap()
+    }
+
+    /// Asks `supported` against a server whose `agent_transcript_topic` is `advertised`.
+    fn server(
+        advertised: bool,
+    ) -> impl FnOnce(&Request, CapabilityCheck) -> std::io::Result<Option<serde_json::Value>> {
+        move |_, supported| {
+            let mut capabilities = crate::api::default_capabilities().unwrap();
+            capabilities.agent_transcript_topic = advertised;
+            Ok(supported(&capabilities).then(|| serde_json::json!({"result": "topic page"})))
+        }
+    }
+
+    #[test]
+    fn transcript_topic_is_refused_by_a_server_without_the_capability() {
+        let response = transcript_request(
+            transcript_params(Some("Plan")),
+            |_| panic!("a topic request must never fall back to the main conversation"),
+            server(false),
+        )
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "topics_unsupported",
+            "{response}"
+        );
+
+        let response = transcript_request(
+            transcript_params(Some("Plan")),
+            |_| panic!("a topic request goes through the capability gate"),
+            server(true),
+        )
+        .unwrap();
+        assert_eq!(response["result"], "topic page");
+
+        // Without `--topic` nothing is gated.
+        let response = transcript_request(
+            transcript_params(None),
+            |_| Ok(serde_json::json!({"result": "main page"})),
+            |_, _| panic!("no gate without a topic"),
+        )
+        .unwrap();
+        assert_eq!(response["result"], "main page");
+    }
 
     /// AXIS — ROUND-3 FINDING 4: BOTH arms of the lossy `--yes` refusal.
     ///

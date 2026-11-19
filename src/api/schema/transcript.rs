@@ -18,6 +18,13 @@ cli_params! {
         pub limit: Option<u32> => Field::new(None).input(bindings::transcript_limit()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub subagent: Option<String> => Field::new(None).input(bindings::transcript_subagent()),
+        /// Page this topic's own conversation instead of the agent's (an id
+        /// from `agent.topics.list` or the agent's `topic_sessions`). With
+        /// `subagent`, pages that topic's subagent. Honoured by servers that
+        /// advertise `capabilities.agent_transcript_topic`; older ones ignore
+        /// it and page the main conversation, so never send it to them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub topic: Option<String> => Field::new(None).input(bindings::transcript_topic()),
         /// Byte budget for a newest or `before` page: the page keeps only its
         /// newest entries whose JSON fits, and at least one record's entries.
         /// Its `before` cursor pages the rest. Honoured by servers that

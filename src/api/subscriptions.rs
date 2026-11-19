@@ -316,6 +316,9 @@ impl ActiveSubscription {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }
             Subscription::LayoutUpdated {} => Ok(event_subscription(EventKind::LayoutUpdated)),
+            Subscription::AgentTopicsChanged {} => {
+                Ok(event_subscription(EventKind::AgentTopicsChanged))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

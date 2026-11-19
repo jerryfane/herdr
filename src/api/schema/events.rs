@@ -105,6 +105,9 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    /// An omp agent's topic changed (servers advertising `agent_topics`).
+    #[serde(rename = "agent.topics.changed")]
+    AgentTopicsChanged {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -242,6 +245,7 @@ pub enum EventKind {
     PaneAgentStatusChanged,
     PaneTurnCompleted,
     LayoutUpdated,
+    AgentTopicsChanged,
 }
 
 impl EventKind {
@@ -274,6 +278,7 @@ impl EventKind {
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::PaneTurnCompleted => "pane.turn_completed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::AgentTopicsChanged => "agent.topics.changed",
         }
     }
 }
@@ -307,6 +312,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentStatusChanged,
     EventKind::PaneTurnCompleted,
     EventKind::LayoutUpdated,
+    EventKind::AgentTopicsChanged,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -692,5 +698,14 @@ pub enum EventData {
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
+    },
+    /// One of an omp agent's topics changed (`agent.topics.changed`).
+    AgentTopicsChanged {
+        pane_id: String,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        topic_id: String,
+        reason: super::topics::AgentTopicChangeReason,
     },
 }

@@ -28,6 +28,9 @@ impl App {
     }
 
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
+        // The agent process goes with its terminal, and its control socket too.
+        #[cfg(unix)]
+        self.agent_controls.remove(terminal_id.as_str());
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
             if let Some(pane_id) = self.state.workspaces.iter().find_map(|workspace| {
                 workspace.tabs.iter().find_map(|tab| {

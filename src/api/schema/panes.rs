@@ -584,6 +584,57 @@ crate::cli::projection::cli_params! {
     }
 }
 
+/// The secret an agent's control socket asks for. It acts for the agent, so
+/// `Debug` never prints it; it serializes as a plain string only for the wire.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct AgentControlToken(String);
+
+impl AgentControlToken {
+    #[cfg(test)]
+    pub(crate) fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AgentControlToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AgentControlToken(<redacted>)")
+    }
+}
+
+/// `pane.report_agent_control`: the agent integration running inside the
+/// pane's agent process hands over the control socket that process offers,
+/// or clears it when `socket_path` is absent. Accepted only from the agent
+/// process Herdr tracks for the pane (see `agent_process_pid`). Deliberately
+/// no CLI projection: the token must not reach a command line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportAgentControlParams {
+    pub pane_id: String,
+    pub source: String,
+    pub agent: String,
+    /// The reporting agent process; must be the one its session report named.
+    pub agent_process_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<AgentControlToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    /// The process on the other end of the API connection, stamped by the
+    /// server when the socket tells it; never read from the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    // Read by the Unix-only control handler; elsewhere topics do not exist.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) reporter_pid: Option<u32>,
+}
+
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneReportMetadataParams => PaneMetadataProjection {

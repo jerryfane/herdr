@@ -1433,6 +1433,9 @@ impl App {
                 .as_ref()
                 .map(|transfer| transfer.info()),
             avatar,
+            // Filled from disk by `agent.list` and `agent.get` only, so the
+            // other readers of agent info never touch the session file.
+            topic_sessions: None,
         })
     }
 
@@ -1728,6 +1731,7 @@ fn archived_agent_info(
         restore_error: None,
         session_transfer: None,
         avatar: avatars.get(&record.terminal_id).cloned(),
+        topic_sessions: None,
     }
 }
 

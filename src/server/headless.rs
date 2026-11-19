@@ -3271,6 +3271,13 @@ impl HeadlessServer {
                 .handle_deferred_agent_api_request(msg.request, msg.respond_to);
             return changed | deferred_changed;
         }
+        #[cfg(unix)]
+        if msg.request.method.is_agent_topics() {
+            // The agent answers on its control socket, from a worker thread.
+            self.app
+                .handle_deferred_topics_request(msg.request, msg.respond_to);
+            return changed;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentTranscript(_)) {
             // Read-only: the page is answered from a worker thread.
             self.app

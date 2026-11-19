@@ -1123,6 +1123,7 @@ mod tests {
             parked_work: Vec::new(),
             session_transfer: None,
             avatar: None,
+            topic_sessions: None,
         }
     }
 

@@ -42,7 +42,7 @@ static CHILD_TAILS: LazyLock<Mutex<HashMap<PathBuf, (u64, ChildTail)>>> =
 
 /// The session file path of `parent`'s subagent `id`, when the id is a plain
 /// omp agent id (no separators, so the path stays in `parent`'s directory).
-fn child_path(parent: &Path, id: &str) -> Option<PathBuf> {
+pub(super) fn child_path(parent: &Path, id: &str) -> Option<PathBuf> {
     let plain = !id.is_empty()
         && id
             .bytes()

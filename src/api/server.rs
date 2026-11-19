@@ -219,6 +219,10 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         turn_origin: true,
         rename_preconditions: true,
         ask_form: true,
+        // The control socket client is Unix-only.
+        agent_topics: cfg!(unix),
+        // Topic pages are read from the session files on disk, on every platform.
+        agent_transcript_topic: true,
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -1486,6 +1490,16 @@ pub(crate) enum ConnectionPrincipal {
     Guest(crate::guest::GuestPrincipal),
 }
 
+/// Stamp `pane.report_agent_control` with the connection's peer pid, the
+/// kernel's word for who sent it. Every other request, agent session and
+/// state reports included, is left as sent: their `agent_process_pid` may
+/// name another process (`--agent-process-pid`, a reporting helper).
+fn stamp_agent_reporter(method: &mut Method, peer_pid: Option<u32>) {
+    if let Method::PaneReportAgentControl(params) = method {
+        params.reporter_pid = peer_pid;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_connection_with_stop(
     stream: ApiStream,
@@ -1579,6 +1593,15 @@ fn handle_principal_connection(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    // `pane.report_agent_control` is accepted only from the pane's omp
+    // process: the socket names the caller, the request body cannot.
+    if matches!(request.method, Method::PaneReportAgentControl(_)) {
+        let peer_pid = match &stream {
+            ApiStream::Local(local) => crate::platform::local_stream_peer_pid(local),
+            ApiStream::Tcp(_) => None,
+        };
+        stamp_agent_reporter(&mut request.method, peer_pid);
+    }
 
     // A guest never reaches the owner or federation paths below: its gate is
     // an explicit allowlist bound to one agent.
@@ -1997,6 +2020,15 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::AgentGet(params) => Some(&mut params.target),
         Method::AgentRead(params) => Some(&mut params.target),
         Method::AgentTranscript(params) => Some(&mut params.target),
+        // A remote agent's topics are served by its own Herdr, which reaches
+        // the agent's control socket locally; the socket never crosses machines.
+        Method::AgentTopicsList(params) => Some(&mut params.target),
+        Method::AgentTopicsNew(params) => Some(&mut params.target),
+        Method::AgentTopicsSend(params) => Some(&mut params.target),
+        Method::AgentTopicsClose(params) | Method::AgentTopicsReopen(params) => {
+            Some(&mut params.target)
+        }
+        Method::AgentTopicsRename(params) => Some(&mut params.target),
         Method::AgentExplain(params) => Some(&mut params.target),
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
@@ -2188,6 +2220,40 @@ fn maybe_route_to_peer(
                 request_id,
                 method,
                 "precondition_unsupported",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
+    // A peer without topics would refuse `agent.topics.*`; one that does not
+    // honour `topic` on `agent.transcript` would page the agent's own
+    // conversation instead, as a success.
+    let unsupported = if request.method.is_agent_topics() && !peer_target.agent_topics() {
+        Some("agent_topics")
+    } else if matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some())
+        && !peer_target.agent_transcript_topic()
+    {
+        Some("agent_transcript_topic")
+    } else {
+        None
+    };
+    if let Some(capability) = unsupported {
+        let response = ErrorResponse {
+            id: request_id.to_owned(),
+            error: ErrorBody {
+                code: "topics_unsupported".into(),
+                message: format!(
+                    "machine {alias} has not advertised {capability}, so it cannot serve topics; update Herdr there"
+                ),
+            },
+        };
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "topics_unsupported",
                 changes_ui,
             ),
             Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
@@ -3826,6 +3892,8 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                agent_topics: false,
+                agent_transcript_topic: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
@@ -5292,6 +5360,12 @@ mod federation_tests {
             ("agent.get", AllowedAt(Observe)),
             ("agent.read", AllowedAt(Observe)),
             ("agent.transcript", AllowedAt(Observe)),
+            ("agent.topics.list", AllowedAt(Observe)),
+            ("agent.topics.new", AllowedAt(Interact)),
+            ("agent.topics.send", AllowedAt(Interact)),
+            ("agent.topics.close", AllowedAt(Admin)),
+            ("agent.topics.reopen", AllowedAt(Admin)),
+            ("agent.topics.rename", AllowedAt(Admin)),
             ("agent.explain", AllowedAt(Observe)),
             ("fence.explain", Denied),
             ("agent.send_keys", AllowedAt(Interact)),
@@ -5363,6 +5437,7 @@ mod federation_tests {
             ("gram.upload.stream.open", Denied),
             ("pane.report_agent", Denied),
             ("pane.report_agent_session", Denied),
+            ("pane.report_agent_control", Denied),
             ("pane.report_metadata", Denied),
             ("pane.clear_agent_authority", Denied),
             ("pane.release_agent", Denied),
@@ -7336,6 +7411,29 @@ mod federation_tests {
 
     fn fence_request(json: &str) -> Request {
         serde_json::from_str(json).unwrap_or_else(|err| panic!("{json}: {err}"))
+    }
+
+    #[test]
+    fn only_the_control_report_is_stamped_and_session_reports_may_name_another_process() {
+        // `--agent-process-pid` may name another process than the sender (a
+        // reporting helper): the session report passes exactly as sent.
+        let mut session = fence_request(
+            r#"{"id":"1","method":"pane.report_agent_session","params":{"pane_id":"w1:p1","source":"herdr:omp","agent":"omp","agent_session_path":"/tmp/s.jsonl","agent_process_pid":41}}"#,
+        )
+        .method;
+        let before = session.clone();
+        stamp_agent_reporter(&mut session, Some(77));
+        assert_eq!(session, before);
+
+        let mut control = fence_request(
+            r#"{"id":"1","method":"pane.report_agent_control","params":{"pane_id":"w1:p1","source":"herdr:omp","agent":"omp","agent_process_pid":41}}"#,
+        )
+        .method;
+        stamp_agent_reporter(&mut control, Some(41));
+        let Method::PaneReportAgentControl(params) = control else {
+            unreachable!()
+        };
+        assert_eq!(params.reporter_pid, Some(41));
     }
 
     #[test]

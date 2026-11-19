@@ -9,6 +9,7 @@ const originalArgv = process.argv;
 const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
+  HERDR_OMP_CONTROL_REFRESH_MS: process.env.HERDR_OMP_CONTROL_REFRESH_MS,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
@@ -333,6 +334,104 @@ test("OMP reports the exact path, active leaf, and process on tree changes", asy
     .toBe("leaf-two");
   expect(isRecord(second) && isRecord(second.params) ? second.params.session_start_source : null)
     .toBe("select");
+});
+
+test("OMP hands omp's topics control socket to Herdr after the session report and clears it", async () => {
+  const requests = await startRecordingServer("omp-control");
+  const { handlers, eventHandlers, pi } = createExtensionHarness();
+  const emitted: string[] = [];
+  pi.events.emit = (event: string) => emitted.push(event);
+  const token = "t".repeat(40);
+  let offered: unknown = { socketPath: "/tmp/omp-c/c.sock", token, protocol: 1, pid: process.pid };
+  pi.pi = { currentTopicsControl: () => offered };
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-control.jsonl",
+      getSessionId: () => "omp-control",
+      getLeafId: () => "leaf",
+    },
+  };
+  const controls = () =>
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_control");
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => controls().length === 1);
+  expect(emitted).toEqual(["topics:control:request"]);
+  const methods = requests.filter(isRecord).map((request) => request.method);
+  expect(methods.indexOf("pane.report_agent_session")).toBeLessThan(methods.indexOf("pane.report_agent_control"));
+  const control = controls()[0];
+  expect(isRecord(control) && isRecord(control.params) ? control.params : null).toMatchObject({
+    socket_path: "/tmp/omp-c/c.sock",
+    token,
+    protocol: 1,
+    agent_process_pid: process.pid,
+  });
+  expect(String(isRecord(control) ? control.id : "")).not.toContain(token);
+
+  // The bus event is only a signal: a payload from another extension is ignored.
+  offered = undefined;
+  eventHandlers.get("topics:control")?.({ changed: true, socketPath: "/tmp/evil.sock", token: "e".repeat(40), protocol: 1 });
+  await waitFor(() => controls().length === 2);
+  const cleared = controls()[1];
+  expect(isRecord(cleared) && isRecord(cleared.params) ? cleared.params.socket_path : "set").toBeUndefined();
+  expect(JSON.stringify(requests)).not.toContain("/tmp/evil.sock");
+});
+
+test("OMP reports no control socket when omp has no getter", async () => {
+  const requests = await startRecordingServer("omp-no-getter");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  handlers.get("session_start")?.({ reason: "startup" }, {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: { getSessionFile: () => "/tmp/omp-nogetter.jsonl", getSessionId: () => "x", getLeafId: () => "l" },
+  });
+  // The state report is queued behind the session report; by its socket
+  // round trip the getter lookup has long settled.
+  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent"));
+  expect(requests.some((request) => isRecord(request) && request.method === "pane.report_agent_control")).toBe(false);
+});
+
+test("OMP re-offers its control socket so a replaced Herdr server gets it back", async () => {
+  const requests = await startRecordingServer("omp-control-refresh");
+  process.env.HERDR_OMP_CONTROL_REFRESH_MS = "10";
+  const { handlers, pi } = createExtensionHarness();
+  const token = "r".repeat(40);
+  pi.pi = { currentTopicsControl: () => ({ socketPath: "/tmp/omp-r/c.sock", token, protocol: 1, pid: process.pid }) };
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: { getSessionFile: () => "/tmp/omp-refresh.jsonl", getSessionId: () => "r", getLeafId: () => "l" },
+  };
+  const controls = () =>
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_control");
+  // One report at start, then repeats with no agent activity at all.
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => controls().length >= 3);
+  for (const control of controls()) {
+    expect(isRecord(control) && isRecord(control.params) ? control.params.socket_path : null).toBe("/tmp/omp-r/c.sock");
+  }
+  handlers.get("session_shutdown")?.({}, context);
+  await waitFor(() => {
+    const last = controls().at(-1);
+    return isRecord(last) && isRecord(last.params) && last.params.socket_path === undefined;
+  });
+});
+
+test("OMP ignores a control socket another process offers", async () => {
+  const { parseAgentControl } = await importFresh("./omp/herdr-agent-state.ts");
+  const token = "t".repeat(40);
+  expect(parseAgentControl({ socketPath: "/tmp/c.sock", token, protocol: 1, pid: process.pid })).toBeDefined();
+  expect(parseAgentControl({ socketPath: "/tmp/c.sock", token, protocol: 1, pid: process.pid + 1 })).toBeUndefined();
+  expect(parseAgentControl({ socketPath: "relative.sock", token, protocol: 1 })).toBeUndefined();
+  expect(parseAgentControl({ socketPath: "/tmp/c.sock", token: "short", protocol: 1 })).toBeUndefined();
+  expect(parseAgentControl(null)).toBeUndefined();
 });
 
 test("Pi reports idle only after the agent settles", async () => {

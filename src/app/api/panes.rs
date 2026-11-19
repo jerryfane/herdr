@@ -1977,6 +1977,8 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
+        #[cfg(unix)]
+        self.reconcile_agent_control(ws_idx, pane_id);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -2038,6 +2040,8 @@ impl App {
                 ),
             },
         );
+        #[cfg(unix)]
+        self.reconcile_agent_control(ws_idx, pane_id);
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(

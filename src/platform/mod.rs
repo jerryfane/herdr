@@ -727,6 +727,21 @@ pub(crate) fn local_stream_fence_peer(_stream: &crate::ipc::LocalStream) -> Fenc
     FencePeer::Unfenced
 }
 
+/// The pid of the process on the other end of a connected local API socket,
+/// when the platform tells it.
+#[cfg(unix)]
+pub(crate) fn local_stream_peer_pid(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    socket_peer_pid(socket.as_fd().as_raw_fd())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_pid(_stream: &crate::ipc::LocalStream) -> Option<u32> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
