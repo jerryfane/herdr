@@ -78,24 +78,26 @@ mod control {
     }
 
     impl App {
-        /// The omp process Herdr tracks for a terminal from the agent's own
-        /// session reports, while the terminal's agent is a live omp.
-        pub(crate) fn tracked_omp_pid(terminal: &crate::terminal::TerminalState) -> Option<u32> {
-            if terminal.effective_known_agent() != Some(crate::detect::Agent::Omp) {
+        /// The omp process herdr's own foreground probe identifies in front of
+        /// the pane, while the pane's agent is omp. This is the only anchor for
+        /// a control socket: an agent's reports name pids in its own words
+        /// (`--agent-process-pid` may even name another process), the probe
+        /// does not.
+        pub(crate) fn live_omp_pid(
+            &self,
+            ws_idx: usize,
+            pane_id: crate::layout::PaneId,
+        ) -> Option<u32> {
+            let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+            if self
+                .state
+                .terminals
+                .get(terminal_id)?
+                .effective_known_agent()
+                != Some(crate::detect::Agent::Omp)
+            {
                 return None;
             }
-            let (source, agent, session_ref) = Self::terminal_resume_source(terminal)?;
-            if crate::detect::parse_agent_label(&agent) != Some(crate::detect::Agent::Omp) {
-                return None;
-            }
-            terminal
-                .reported_agent_session_runtime_for(&source, &agent, &session_ref)?
-                .process_pid
-        }
-
-        /// The omp process herdr's own foreground probe finds in the pane (the
-        /// one its detection identified as omp), never an agent's word for it.
-        fn inspected_omp_pid(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<u32> {
             #[cfg(test)]
             if let Some(inspected) = self.agent_controls.inspected_pid_for_test {
                 return inspected;
@@ -105,11 +107,10 @@ mod control {
             (agent == crate::detect::Agent::Omp).then_some(pid)
         }
 
-        /// `pane.report_agent_control`. Accepted only for a pane whose agent is
-        /// the omp process herdr itself identified there, from that very
-        /// process: the reported `agent_process_pid`, the pid omp's session
-        /// report named, the connection's peer, and the process herdr's own
-        /// probe identified as omp must all be the same.
+        /// `pane.report_agent_control`. Accepted only from the omp process
+        /// herdr's own probe identifies in the pane: its pid, the connection's
+        /// peer pid (kernel-reported) and the report's `agent_process_pid` must
+        /// be one process. Session reports play no part.
         pub(in crate::app) fn handle_pane_report_agent_control(
             &mut self,
             id: String,
@@ -142,25 +143,15 @@ mod control {
             {
                 return refused(id, "only omp agents offer a control socket");
             }
-            let Some(tracked) = self
-                .state
-                .terminals
-                .get(&terminal_id)
-                .and_then(Self::tracked_omp_pid)
-            else {
-                return refused(id, "the pane runs no omp process that reported its session");
+            let Some(omp) = self.live_omp_pid(ws_idx, pane_id) else {
+                return refused(id, "herdr identifies no omp process in the pane");
             };
             // A local caller always has a peer pid; a request without one
             // (TCP, a relay, an in-process sender) never registers a control.
-            if params.agent_process_pid != tracked || params.reporter_pid != Some(tracked) {
-                return refused(id, "the report does not come from the pane's omp process");
-            }
-            // Session reports are the agent's own word; a process in the pane
-            // can make a self-consistent one. The anchor is what herdr sees.
-            if self.inspected_omp_pid(ws_idx, pane_id) != Some(tracked) {
+            if params.reporter_pid != Some(omp) || params.agent_process_pid != omp {
                 return refused(
                     id,
-                    "the pane's omp process, as herdr identifies it, is another process",
+                    "the report does not come from the pane's omp process, as herdr identifies it",
                 );
             }
             let Some(socket_path) = params.socket_path else {
@@ -193,15 +184,15 @@ mod control {
                 ControlEndpoint {
                     socket_path,
                     token,
-                    pid: tracked,
+                    pid: omp,
                 },
             );
             encode_success(id, ResponseResult::Ok {})
         }
 
-        /// Drop the pane's control endpoint unless the omp process Herdr now
-        /// tracks there is the one that offered it (it exited, or a session
-        /// report named another process).
+        /// Drop the pane's control endpoint unless herdr's own probe still
+        /// identifies the process that offered it as the pane's omp (it exited
+        /// or was replaced).
         pub(in crate::app) fn reconcile_agent_control(
             &mut self,
             ws_idx: usize,
@@ -218,12 +209,7 @@ mod control {
             let Some(pid) = self.agent_controls.pid(terminal_id.as_str()) else {
                 return;
             };
-            let tracked = self
-                .state
-                .terminals
-                .get(terminal_id)
-                .and_then(Self::tracked_omp_pid);
-            if tracked != Some(pid) {
+            if self.live_omp_pid(ws_idx, pane_id) != Some(pid) {
                 self.agent_controls.remove(terminal_id.as_str());
             }
         }
@@ -236,19 +222,16 @@ mod control {
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
             };
-            let terminal = self
-                .state
-                .terminals
-                .get(resolved.terminal_id.as_str())
-                .ok_or_else(not_found)?;
-            let tracked = Self::tracked_omp_pid(terminal).ok_or_else(|| ErrorBody {
-                code: "topics_unsupported".into(),
-                message: "topics are served by live omp agents only".into(),
-            })?;
+            let omp = self
+                .live_omp_pid(resolved.ws_idx, resolved.pane_id)
+                .ok_or_else(|| ErrorBody {
+                    code: "topics_unsupported".into(),
+                    message: "topics are served by live omp agents only".into(),
+                })?;
             let control = self
                 .agent_controls
                 .handle(&resolved.terminal_id)
-                .filter(|control| control.endpoint.pid == tracked)
+                .filter(|control| control.endpoint.pid == omp)
                 .ok_or_else(|| ErrorBody {
                     code: "topics_unreachable".into(),
                     message: "the agent has not offered its topics (omp needs `topics.enabled` and the current Herdr integration)".into(),

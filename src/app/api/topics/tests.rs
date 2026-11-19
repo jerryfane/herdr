@@ -129,15 +129,19 @@ fn a_report_from_any_process_but_the_panes_omp_is_refused() {
 }
 
 #[test]
-fn a_pane_without_a_reported_omp_process_accepts_no_control() {
+fn a_pane_where_herdr_detects_no_omp_accepts_no_control() {
     let session = Fixture::new("topics-no-omp");
-    let (mut app, pane, terminal) = omp_app(&session.path, 4242);
-    let terminal_state = app.state.terminals.get_mut(terminal.as_str()).unwrap();
-    // The pane's omp claim is gone: no session report names a process.
-    terminal_state.forget_inactive_agent_claim();
+    let omp = std::process::id();
+    let (mut app, pane, terminal) = omp_app(&session.path, omp);
+    // herdr's detection no longer sees omp in the pane, whatever it reports.
+    app.state
+        .terminals
+        .get_mut(terminal.as_str())
+        .unwrap()
+        .set_detected_state(None, AgentState::Unknown);
     let response = send(
         &mut app,
-        Method::PaneReportAgentControl(report(&pane, Some(&session.path), 4242, None)),
+        Method::PaneReportAgentControl(report(&pane, Some(&session.path), omp, Some(omp))),
     );
     assert_eq!(
         response["error"]["code"], "agent_control_refused",
@@ -264,7 +268,7 @@ fn topic_sessions_are_read_from_disk_whether_or_not_the_socket_answers() {
 }
 
 #[test]
-fn the_control_is_dropped_on_clear_and_when_omp_reports_another_process() {
+fn the_control_is_dropped_on_clear_and_when_herdr_finds_another_omp_process() {
     let session = Fixture::new("topics-lifetime");
     let omp = std::process::id();
     let (mut app, pane, terminal) = omp_app(&session.path, omp);
@@ -284,16 +288,11 @@ fn the_control_is_dropped_on_clear_and_when_omp_reports_another_process() {
     assert!(app.agent_controls.handle(&terminal).is_none(), "cleared");
 
     register(&mut app);
-    // omp restarted in the pane: its session report names a new process.
-    let session_ref =
-        crate::agent_resume::AgentSessionRef::path(session.path.display().to_string()).unwrap();
-    app.state
-        .terminals
-        .get_mut(terminal.as_str())
-        .unwrap()
-        .set_reported_agent_session_runtime("herdr:omp", "omp", &session_ref, None, Some(omp + 1));
+    // omp restarted in the pane: herdr's probe now finds another process.
+    app.agent_controls.inspected_pid_for_test = Some(Some(omp + 1));
     let pane_id = app.state.workspaces[0].tabs[0].root_pane;
     app.reconcile_agent_control(0, pane_id);
+    app.agent_controls.inspected_pid_for_test = Some(Some(omp));
     assert!(
         app.agent_controls.handle(&terminal).is_none(),
         "new process"
@@ -466,4 +465,35 @@ fn the_real_omp_identified_reported_and_connected_as_one_process_is_accepted() {
         app.agent_controls.handle(&terminal).unwrap().endpoint.pid,
         omp
     );
+}
+
+#[test]
+fn a_session_report_naming_another_process_is_accepted_and_moves_no_control() {
+    let session = Fixture::new("topics-helper-pid");
+    let omp = std::process::id();
+    let (mut app, pane, terminal) = omp_app(&session.path, omp);
+    let fake = FakeControl::start("helper-pid", empty_topics);
+    send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+    // `herdr pane report-agent-session --agent-process-pid` names another
+    // process (a helper, or a process claiming to be omp): still accepted.
+    let request: Request = serde_json::from_value(json!({
+        "id": "s", "method": "pane.report_agent_session", "params": {
+            "pane_id": pane, "source": "herdr:omp", "agent": "omp",
+            "agent_session_path": session.path.display().to_string(),
+            "agent_process_pid": omp + 1, "seq": u64::MAX / 2,
+        },
+    }))
+    .unwrap();
+    let response = send(&mut app, request.method);
+    assert!(response.get("result").is_some(), "{response}");
+    // The control stays with the omp process herdr identifies.
+    assert_eq!(
+        app.agent_controls.handle(&terminal).unwrap().endpoint.pid,
+        omp
+    );
+    let listed = topics(&app, list(&pane));
+    assert_eq!(listed["result"]["topics"], json!([]), "{listed}");
 }
