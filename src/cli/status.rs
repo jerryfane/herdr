@@ -444,6 +444,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 agent_topics: false,
+                agent_transcript_topic: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,

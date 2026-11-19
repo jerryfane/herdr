@@ -21,8 +21,8 @@ cli_params! {
         /// Page this topic's own conversation instead of the agent's (an id
         /// from `agent.topics.list` or the agent's `topic_sessions`). With
         /// `subagent`, pages that topic's subagent. Honoured by servers that
-        /// advertise `capabilities.agent_topics`; older ones would ignore it,
-        /// so do not send it to them.
+        /// advertise `capabilities.agent_transcript_topic`; older ones ignore
+        /// it and page the main conversation, so never send it to them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub topic: Option<String> => Field::new(None).input(bindings::transcript_topic()),
         /// Byte budget for a newest or `before` page: the page keeps only its

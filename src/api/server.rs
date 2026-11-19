@@ -221,6 +221,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ask_form: true,
         // The control socket client is Unix-only.
         agent_topics: cfg!(unix),
+        // Topic pages are read from the session files on disk, on every platform.
+        agent_transcript_topic: true,
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -2213,17 +2215,25 @@ fn maybe_route_to_peer(
         }
         return Some(result);
     }
-    // A peer without topics would refuse `agent.topics.*` and, worse, page the
-    // agent's own conversation for a `topic` it ignores.
-    let wants_topics = request.method.is_agent_topics()
-        || matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some());
-    if wants_topics && !peer_target.agent_topics() {
+    // A peer without topics would refuse `agent.topics.*`; one that does not
+    // honour `topic` on `agent.transcript` would page the agent's own
+    // conversation instead, as a success.
+    let unsupported = if request.method.is_agent_topics() && !peer_target.agent_topics() {
+        Some("agent_topics")
+    } else if matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some())
+        && !peer_target.agent_transcript_topic()
+    {
+        Some("agent_transcript_topic")
+    } else {
+        None
+    };
+    if let Some(capability) = unsupported {
         let response = ErrorResponse {
             id: request_id.to_owned(),
             error: ErrorBody {
                 code: "topics_unsupported".into(),
                 message: format!(
-                    "machine {alias} has not advertised agent_topics, so it cannot serve topics; update Herdr there"
+                    "machine {alias} has not advertised {capability}, so it cannot serve topics; update Herdr there"
                 ),
             },
         };
@@ -3872,6 +3882,7 @@ mod tests {
                 rename_preconditions: false,
                 ask_form: false,
                 agent_topics: false,
+                agent_transcript_topic: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,

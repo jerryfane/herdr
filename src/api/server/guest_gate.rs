@@ -1043,6 +1043,8 @@ fn serve_request(
         // `topic`. Guests have no event stream (`events.*` stays owner-only),
         // so a guest polls `agent.topics.list` instead of receiving
         // `agent.topics.changed`.
+        // Owner decision (2026-11-19, #474): a guest gets the same topic
+        // access as the owner, close/reopen/rename included, not read-only.
         mut topics @ (Method::AgentTopicsList(_)
         | Method::AgentTopicsNew(_)
         | Method::AgentTopicsSend(_)

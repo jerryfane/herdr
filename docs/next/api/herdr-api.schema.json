@@ -2383,7 +2383,7 @@
               "type": "string"
             },
             "topic": {
-              "description": "Page this topic's own conversation instead of the agent's (an id\nfrom `agent.topics.list` or the agent's `topic_sessions`). With\n`subagent`, pages that topic's subagent. Honoured by servers that\nadvertise `capabilities.agent_topics`; older ones would ignore it,\nso do not send it to them.",
+              "description": "Page this topic's own conversation instead of the agent's (an id\nfrom `agent.topics.list` or the agent's `topic_sessions`). With\n`subagent`, pages that topic's subagent. Honoured by servers that\nadvertise `capabilities.agent_transcript_topic`; older ones ignore\nit and page the main conversation, so never send it to them.",
               "type": [
                 "string",
                 "null"
@@ -19696,12 +19696,17 @@
             },
             "agent_topics": {
               "default": false,
-              "description": "Serves `agent.topics.*`, the `agent.topics.changed` event, `topic` on\n`agent.transcript`, and `topic_sessions` on `agent.list`/`agent.get`.",
+              "description": "Serves `agent.topics.*`, the `agent.topics.changed` event and\n`topic_sessions` on `agent.list`/`agent.get`.",
               "type": "boolean"
             },
             "agent_transcript": {
               "default": false,
               "description": "Serves `agent.transcript`: an omp agent's conversation as chat entries.",
+              "type": "boolean"
+            },
+            "agent_transcript_topic": {
+              "default": false,
+              "description": "`agent.transcript` honours `topic` (pages a topic's own conversation).\nA server without it ignores the field and pages the agent's main\nconversation, so clients must not send `topic` to it.",
               "type": "boolean"
             },
             "api_bridge_frames": {
