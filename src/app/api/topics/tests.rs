@@ -354,3 +354,65 @@ fn a_topic_change_from_the_agent_becomes_an_agent_topics_changed_event() {
     assert_eq!(emitted[0]["data"]["topic_id"], "Plan");
     assert_eq!(emitted[0]["data"]["reason"], "spawned");
 }
+
+#[test]
+fn a_report_without_a_peer_pid_is_refused() {
+    let session = Fixture::new("topics-no-peer");
+    let omp = std::process::id();
+    let (mut app, pane, terminal) = omp_app(&session.path, omp);
+    let fake = FakeControl::start("no-peer", empty_topics);
+    // The right pid in the body, but no socket that names the caller (TCP,
+    // a relayed request).
+    let response = send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, None)),
+    );
+    assert_eq!(
+        response["error"]["code"], "agent_control_refused",
+        "{response}"
+    );
+    assert!(app.agent_controls.handle(&terminal).is_none());
+}
+
+#[test]
+fn after_a_handoff_the_agents_re_report_restores_its_topics_idempotently() {
+    let session = Fixture::new("topics-handoff");
+    let omp = std::process::id();
+    let (mut old, pane, terminal) = omp_app(&session.path, omp);
+    let fake = FakeControl::start("handoff", empty_topics);
+    let offer = report(&pane, Some(&fake.path), omp, Some(omp));
+    send(&mut old, Method::PaneReportAgentControl(offer.clone()));
+    assert!(old.agent_controls.handle(&terminal).is_some());
+
+    // The replacement server imports the session state; the control map is
+    // memory only and does not travel.
+    let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(
+        &Config::default(),
+        crate::app::AppPolicy::TEST,
+        None,
+        api_rx,
+        crate::api::EventHub::default(),
+    );
+    app.state = std::mem::replace(&mut old.state, crate::app::AppState::test_new());
+    drop(old);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["error"]["code"], "topics_unreachable",
+        "{response}"
+    );
+
+    // The extension's periodic re-report hands the socket over again.
+    let response = send(&mut app, Method::PaneReportAgentControl(offer.clone()));
+    assert!(response.get("result").is_some(), "{response}");
+    let generation = app.agent_controls.handle(&terminal).unwrap().generation;
+    let response = topics(&app, list(&pane));
+    assert_eq!(response["result"]["topics"], json!([]), "{response}");
+
+    // The same offer again changes nothing and announces nothing.
+    let events_before = app.event_hub.events_after(0).len();
+    let response = send(&mut app, Method::PaneReportAgentControl(offer));
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(app.agent_controls.is_current(&terminal, generation));
+    assert_eq!(app.event_hub.events_after(0).len(), events_before);
+}

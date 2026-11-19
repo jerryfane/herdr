@@ -43,6 +43,11 @@ impl App {
     }
 }
 
+// The control client speaks to a Unix socket and checks its peer with
+// `SO_PEERCRED`/`LOCAL_PEERPID`, so topics exist on Unix only: elsewhere
+// `capabilities.agent_topics` is false, `pane.report_agent_control` and
+// `agent.topics.*` answer `not_implemented`, and only `topic_sessions` (read
+// from disk) remains.
 #[cfg(unix)]
 mod control {
     use std::path::PathBuf;
@@ -127,9 +132,9 @@ mod control {
             else {
                 return refused(id, "the pane runs no omp process that reported its session");
             };
-            if params.agent_process_pid != tracked
-                || params.reporter_pid.is_some_and(|pid| pid != tracked)
-            {
+            // A local caller always has a peer pid; a request without one
+            // (TCP, a relay, an in-process sender) never registers a control.
+            if params.agent_process_pid != tracked || params.reporter_pid != Some(tracked) {
                 return refused(id, "the report does not come from the pane's omp process");
             }
             let Some(socket_path) = params.socket_path else {

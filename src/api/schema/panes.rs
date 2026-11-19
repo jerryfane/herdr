@@ -596,6 +596,7 @@ impl AgentControlToken {
         Self(token.into())
     }
 
+    #[cfg(unix)]
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
@@ -629,6 +630,8 @@ pub struct PaneReportAgentControlParams {
     /// server when the socket tells it; never read from the wire.
     #[serde(skip)]
     #[schemars(skip)]
+    // Read by the Unix-only control handler; elsewhere topics do not exist.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) reporter_pid: Option<u32>,
 }
 

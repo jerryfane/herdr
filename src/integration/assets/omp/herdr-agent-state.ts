@@ -196,6 +196,12 @@ const TOPICS_CONTROL_GETTER = "currentTopicsControl";
 // The token acts for the agent: it goes only to the Herdr socket, never into
 // a request id or a log.
 let controlReported = false;
+// A replaced Herdr server (`server.update_apply`, live handoff) keeps the
+// control socket in memory only and starts without it, and an idle agent
+// reports nothing else. While a socket is offered it is re-sent this often;
+// Herdr takes an identical report as a no-op.
+const controlRefreshMs = parseDurationEnv("HERDR_OMP_CONTROL_REFRESH_MS", 30_000);
+let controlRefresh: ReturnType<typeof setInterval> | undefined;
 
 export function parseAgentControl(data: unknown): AgentControl | undefined {
   if (typeof data !== "object" || data === null) {
@@ -227,6 +233,13 @@ function reportControl(pi: unknown, shutdown = false): Promise<void> {
     } catch {
       control = undefined;
     }
+  }
+  if (control && !controlRefresh && controlRefreshMs > 0) {
+    controlRefresh = setInterval(() => void reportControl(pi), controlRefreshMs);
+    controlRefresh.unref?.();
+  } else if (!control && controlRefresh) {
+    clearInterval(controlRefresh);
+    controlRefresh = undefined;
   }
   if (!control && !controlReported) {
     return Promise.resolve();

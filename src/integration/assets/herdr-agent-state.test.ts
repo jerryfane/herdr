@@ -9,6 +9,7 @@ const originalArgv = process.argv;
 const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
+  HERDR_OMP_CONTROL_REFRESH_MS: process.env.HERDR_OMP_CONTROL_REFRESH_MS,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
@@ -393,6 +394,34 @@ test("OMP reports no control socket when omp has no getter", async () => {
   // round trip the getter lookup has long settled.
   await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent"));
   expect(requests.some((request) => isRecord(request) && request.method === "pane.report_agent_control")).toBe(false);
+});
+
+test("OMP re-offers its control socket so a replaced Herdr server gets it back", async () => {
+  const requests = await startRecordingServer("omp-control-refresh");
+  process.env.HERDR_OMP_CONTROL_REFRESH_MS = "10";
+  const { handlers, pi } = createExtensionHarness();
+  const token = "r".repeat(40);
+  pi.pi = { currentTopicsControl: () => ({ socketPath: "/tmp/omp-r/c.sock", token, protocol: 1, pid: process.pid }) };
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: { getSessionFile: () => "/tmp/omp-refresh.jsonl", getSessionId: () => "r", getLeafId: () => "l" },
+  };
+  const controls = () =>
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_control");
+  // One report at start, then repeats with no agent activity at all.
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => controls().length >= 3);
+  for (const control of controls()) {
+    expect(isRecord(control) && isRecord(control.params) ? control.params.socket_path : null).toBe("/tmp/omp-r/c.sock");
+  }
+  handlers.get("session_shutdown")?.({}, context);
+  await waitFor(() => {
+    const last = controls().at(-1);
+    return isRecord(last) && isRecord(last.params) && last.params.socket_path === undefined;
+  });
 });
 
 test("OMP ignores a control socket another process offers", async () => {
