@@ -1490,6 +1490,25 @@ pub(crate) enum ConnectionPrincipal {
     Guest(crate::guest::GuestPrincipal),
 }
 
+/// Stamp `pane.report_agent_control` with the connection's peer pid. False
+/// for an agent report whose `agent_process_pid` names another process than
+/// its sender (when the socket tells the sender).
+fn stamp_agent_reporter(method: &mut Method, peer_pid: Option<u32>) -> bool {
+    let reported = match method {
+        Method::PaneReportAgentControl(params) => {
+            params.reporter_pid = peer_pid;
+            return true;
+        }
+        Method::PaneReportAgentSession(params) => params.agent_process_pid,
+        Method::PaneReportAgent(params) => params.agent_process_pid,
+        _ => return true,
+    };
+    match (reported, peer_pid) {
+        (Some(reported), Some(peer)) => reported == peer,
+        _ => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_connection_with_stop(
     stream: ApiStream,
@@ -1583,13 +1602,33 @@ fn handle_principal_connection(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
-    // `pane.report_agent_control` is accepted only from the pane's agent
-    // process: the socket names the caller, the request body cannot.
-    if let Method::PaneReportAgentControl(params) = &mut request.method {
-        params.reporter_pid = match &stream {
-            ApiStream::Local(local) => crate::platform::local_stream_peer_pid(local),
-            ApiStream::Tcp(_) => None,
-        };
+    // The pane's agent process is named by the socket, not by the request
+    // body: `pane.report_agent_control` is accepted only from it, and an agent
+    // report whose `agent_process_pid` is not its sender is refused, so a
+    // process in the pane cannot move the agent's identity to itself.
+    let peer_pid = match &stream {
+        ApiStream::Local(local) => crate::platform::local_stream_peer_pid(local),
+        ApiStream::Tcp(_) => None,
+    };
+    if !stamp_agent_reporter(&mut request.method, peer_pid) {
+        warn!(method, "agent report naming another process refused");
+        crate::logging::api_request_started(&request_id, method, changes_ui);
+        let response = error_response_json(
+            request_id.clone(),
+            "agent_process_mismatch",
+            "agent_process_pid must be the reporting process".into(),
+        );
+        let result = write_text_line_allow_disconnect(&mut stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                &request_id,
+                method,
+                "agent_process_mismatch",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(&request_id, method, &err.to_string()),
+        }
+        return result;
     }
 
     // A guest never reaches the owner or federation paths below: its gate is
@@ -7400,6 +7439,33 @@ mod federation_tests {
 
     fn fence_request(json: &str) -> Request {
         serde_json::from_str(json).unwrap_or_else(|err| panic!("{json}: {err}"))
+    }
+
+    #[test]
+    fn an_agent_session_report_naming_another_process_than_its_sender_is_refused() {
+        let session = |pid: u32| {
+            fence_request(&format!(
+                r#"{{"id":"1","method":"pane.report_agent_session","params":{{"pane_id":"w1:p1","source":"herdr:omp","agent":"omp","agent_session_path":"/tmp/s.jsonl","agent_process_pid":{pid}}}}}"#
+            ))
+            .method
+        };
+        // A process in the pane claims to be the omp session with its own pid
+        // while the real omp is 41: its socket names it, so only its own pid
+        // passes, and it cannot name omp's.
+        assert!(stamp_agent_reporter(&mut session(77), Some(77)));
+        assert!(!stamp_agent_reporter(&mut session(41), Some(77)));
+        // No peer pid (TCP, Windows pipes): nothing to compare.
+        assert!(stamp_agent_reporter(&mut session(41), None));
+
+        let mut control = fence_request(
+            r#"{"id":"1","method":"pane.report_agent_control","params":{"pane_id":"w1:p1","source":"herdr:omp","agent":"omp","agent_process_pid":41}}"#,
+        )
+        .method;
+        assert!(stamp_agent_reporter(&mut control, Some(41)));
+        let Method::PaneReportAgentControl(params) = control else {
+            unreachable!()
+        };
+        assert_eq!(params.reporter_pid, Some(41));
     }
 
     #[test]

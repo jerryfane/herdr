@@ -1007,6 +1007,18 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 }
 
 #[cfg(unix)]
+/// The agent in front of the pane whose shell is `shell_pid`, and the process
+/// that identified as it: the same foreground probe the detector runs, for a
+/// caller that must not take an agent's word for its own pid.
+pub(crate) fn identified_foreground_agent(shell_pid: u32) -> Option<(Agent, u32)> {
+    let probe = probe_foreground_process(
+        shell_pid,
+        crate::detect::foreground_process_group_id(shell_pid),
+    );
+    Some((probe.agent?, probe.agent_pid?))
+}
+
+#[cfg(unix)]
 // Handoff detection needs both the write-bracketed text revision and detection epoch.
 #[allow(clippy::too_many_arguments)]
 fn spawn_basic_detection_task(

@@ -93,21 +93,39 @@ mod control {
                 .process_pid
         }
 
+        /// The omp process herdr's own foreground probe finds in the pane (the
+        /// one its detection identified as omp), never an agent's word for it.
+        fn inspected_omp_pid(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<u32> {
+            #[cfg(test)]
+            if let Some(inspected) = self.agent_controls.inspected_pid_for_test {
+                return inspected;
+            }
+            let (runtime, _) = self.lookup_runtime(ws_idx, pane_id)?;
+            let (agent, pid) = crate::pane::identified_foreground_agent(runtime.child_pid()?)?;
+            (agent == crate::detect::Agent::Omp).then_some(pid)
+        }
+
         /// `pane.report_agent_control`. Accepted only for a pane whose agent is
-        /// the omp process Herdr tracks, from that very process: the reported
-        /// `agent_process_pid` and, when the API socket tells it, the
-        /// connection's peer must both be the pid omp's session report named.
+        /// the omp process herdr itself identified there, from that very
+        /// process: the reported `agent_process_pid`, the pid omp's session
+        /// report named, the connection's peer, and the process herdr's own
+        /// probe identified as omp must all be the same.
         pub(in crate::app) fn handle_pane_report_agent_control(
             &mut self,
             id: String,
             params: PaneReportAgentControlParams,
         ) -> String {
-            let Some(terminal_id) = self
+            let Some((ws_idx, pane_id, terminal_id)) = self
                 .parse_pane_id(&params.pane_id)
                 .and_then(|(ws_idx, pane_id)| {
-                    self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)
+                    let terminal_id = self
+                        .state
+                        .workspaces
+                        .get(ws_idx)?
+                        .terminal_id(pane_id)?
+                        .clone();
+                    Some((ws_idx, pane_id, terminal_id))
                 })
-                .cloned()
             else {
                 return encode_error(
                     id,
@@ -136,6 +154,14 @@ mod control {
             // (TCP, a relay, an in-process sender) never registers a control.
             if params.agent_process_pid != tracked || params.reporter_pid != Some(tracked) {
                 return refused(id, "the report does not come from the pane's omp process");
+            }
+            // Session reports are the agent's own word; a process in the pane
+            // can make a self-consistent one. The anchor is what herdr sees.
+            if self.inspected_omp_pid(ws_idx, pane_id) != Some(tracked) {
+                return refused(
+                    id,
+                    "the pane's omp process, as herdr identifies it, is another process",
+                );
             }
             let Some(socket_path) = params.socket_path else {
                 self.agent_controls.remove(terminal_id.as_str());

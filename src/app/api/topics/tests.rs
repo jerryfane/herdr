@@ -39,6 +39,8 @@ fn omp_app(session: &std::path::Path, pid: u32) -> (App, String, String) {
         session_ref: session_ref.clone(),
     });
     terminal.set_reported_agent_session_runtime("herdr:omp", "omp", &session_ref, None, Some(pid));
+    // herdr's own probe finds the same omp process in front of the pane.
+    app.agent_controls.inspected_pid_for_test = Some(Some(pid));
     (app, public_pane_id, terminal_id.as_str().to_owned())
 }
 
@@ -395,6 +397,7 @@ fn after_a_handoff_the_agents_re_report_restores_its_topics_idempotently() {
         crate::api::EventHub::default(),
     );
     app.state = std::mem::replace(&mut old.state, crate::app::AppState::test_new());
+    app.agent_controls.inspected_pid_for_test = Some(Some(omp));
     drop(old);
     let response = topics(&app, list(&pane));
     assert_eq!(
@@ -415,4 +418,52 @@ fn after_a_handoff_the_agents_re_report_restores_its_topics_idempotently() {
     assert!(response.get("result").is_some(), "{response}");
     assert!(app.agent_controls.is_current(&terminal, generation));
     assert_eq!(app.event_hub.events_after(0).len(), events_before);
+}
+
+#[test]
+fn a_self_consistent_impostor_is_refused_because_herdr_identifies_another_omp() {
+    let session = Fixture::new("topics-impostor");
+    let impostor = std::process::id();
+    // A process in the pane reported the omp session with its own pid, and
+    // reports the control from its own socket, so every self-report agrees.
+    let (mut app, pane, terminal) = omp_app(&session.path, impostor);
+    // herdr's own foreground probe identifies the real omp, another process.
+    app.agent_controls.inspected_pid_for_test = Some(Some(impostor + 1));
+    let fake = FakeControl::start("impostor", empty_topics);
+    let response = send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), impostor, Some(impostor))),
+    );
+    assert_eq!(
+        response["error"]["code"], "agent_control_refused",
+        "{response}"
+    );
+    assert!(app.agent_controls.handle(&terminal).is_none());
+    // Nor when herdr's probe identifies no omp at all.
+    app.agent_controls.inspected_pid_for_test = Some(None);
+    let response = send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), impostor, Some(impostor))),
+    );
+    assert_eq!(
+        response["error"]["code"], "agent_control_refused",
+        "{response}"
+    );
+}
+
+#[test]
+fn the_real_omp_identified_reported_and_connected_as_one_process_is_accepted() {
+    let session = Fixture::new("topics-real");
+    let omp = std::process::id();
+    let (mut app, pane, terminal) = omp_app(&session.path, omp);
+    let fake = FakeControl::start("real", empty_topics);
+    let response = send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+    assert!(response.get("result").is_some(), "{response}");
+    assert_eq!(
+        app.agent_controls.handle(&terminal).unwrap().endpoint.pid,
+        omp
+    );
 }

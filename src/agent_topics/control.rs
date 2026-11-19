@@ -510,7 +510,6 @@ pub(crate) mod tests {
                         for line in BufReader::new(stream).lines() {
                             let Ok(line) = line else { return };
                             let frame: Value = serde_json::from_str(&line).unwrap();
-                            let _ = frames_tx.send(frame.clone());
                             let answer = if !authenticated {
                                 if frame["type"] == "hello" && frame["token"] == TOKEN {
                                     authenticated = true;
@@ -521,6 +520,7 @@ pub(crate) mod tests {
                                         "{}",
                                         json!({"type": "error", "error": "Unauthorized."})
                                     );
+                                    let _ = frames_tx.send(frame);
                                     return;
                                 }
                             } else if frame["type"] == "subscribe" {
@@ -536,6 +536,9 @@ pub(crate) mod tests {
                                 answer["command"] = frame["type"].clone();
                                 answer
                             };
+                            // Recorded once handled: a test that sees `subscribe`
+                            // knows its stream already gets every update.
+                            let _ = frames_tx.send(frame);
                             if writeln!(writer, "{answer}").is_err() {
                                 return;
                             }

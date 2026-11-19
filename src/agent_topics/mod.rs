@@ -45,6 +45,10 @@ pub(crate) struct ControlHandle {
 pub(crate) struct AgentControls {
     entries: HashMap<TerminalId, Registered>,
     next_generation: u64,
+    /// Tests stand in for herdr's foreground probe: `Some(pid)` is what it
+    /// identifies as the pane's omp process.
+    #[cfg(test)]
+    pub(crate) inspected_pid_for_test: Option<Option<u32>>,
 }
 
 struct Registered {
