@@ -3798,6 +3798,9 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_start\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_end\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"session_shutdown\""));
+    assert!(OMP_EXTENSION_ASSET.contains("pane.report_agent_control"));
+    assert!(OMP_EXTENSION_ASSET.contains("pi.events.on(\"topics:control\""));
+    assert!(OMP_EXTENSION_ASSET.contains("const TOPICS_CONTROL_GETTER = \"currentTopicsControl\""));
     assert!(
         CLAUDE_HOOK_ASSET.contains("agent_session_id")
             || CLAUDE_HOOK_ASSET.contains("--agent-session-id")
