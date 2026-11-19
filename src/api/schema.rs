@@ -18,6 +18,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod topics;
 pub mod transcript;
 pub mod update;
 pub mod workspaces;
@@ -40,6 +41,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use topics::*;
 pub use transcript::*;
 pub use update::*;
 pub use workspaces::*;
@@ -250,9 +252,32 @@ operations::define_operations! {
     PluginPaneOpen(PluginPaneOpenParams) => "plugin.pane.open", true, false;
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
+    /// The omp integration hands over the control socket its agent offers
+    /// (or clears it). Herdr keeps it in memory only.
+    PaneReportAgentControl(PaneReportAgentControlParams) => "pane.report_agent_control", false, false;
+    /// An omp agent's topics, live from the agent (`capabilities.agent_topics`).
+    AgentTopicsList(AgentTarget) => "agent.topics.list", false, false;
+    AgentTopicsNew(AgentTopicsNewParams) => "agent.topics.new", false, false;
+    AgentTopicsSend(AgentTopicsSendParams) => "agent.topics.send", false, false;
+    AgentTopicsClose(AgentTopicTarget) => "agent.topics.close", false, false;
+    AgentTopicsReopen(AgentTopicTarget) => "agent.topics.reopen", false, false;
+    AgentTopicsRename(AgentTopicsRenameParams) => "agent.topics.rename", false, false;
 }
 
 impl Method {
+    /// One of the `agent.topics.*` methods.
+    pub(crate) fn is_agent_topics(&self) -> bool {
+        matches!(
+            self,
+            Self::AgentTopicsList(_)
+                | Self::AgentTopicsNew(_)
+                | Self::AgentTopicsSend(_)
+                | Self::AgentTopicsClose(_)
+                | Self::AgentTopicsReopen(_)
+                | Self::AgentTopicsRename(_)
+        )
+    }
+
     /// Forget the request's `input_source` claim. Only the owner's own
     /// connection may say a write acts for the owner; guests and federation
     /// peers never can.

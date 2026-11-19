@@ -47,6 +47,9 @@ impl App {
         // cached remote directory, while federation pollers explicitly request
         // local-only state so peers cannot recursively re-export aggregates.
         let mut agents = self.collect_agent_infos();
+        for agent in &mut agents {
+            self.fill_topic_sessions(agent);
+        }
         if !params.local_only {
             let store = self
                 .federation
@@ -148,6 +151,8 @@ impl App {
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
 
+        let mut agent = agent;
+        self.fill_topic_sessions(&mut agent);
         encode_success(id, ResponseResult::AgentInfo { agent })
     }
 

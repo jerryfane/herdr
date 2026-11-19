@@ -219,6 +219,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         turn_origin: true,
         rename_preconditions: true,
         ask_form: true,
+        // The control socket client is Unix-only.
+        agent_topics: cfg!(unix),
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -1579,6 +1581,14 @@ fn handle_principal_connection(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    // `pane.report_agent_control` is accepted only from the pane's agent
+    // process: the socket names the caller, the request body cannot.
+    if let Method::PaneReportAgentControl(params) = &mut request.method {
+        params.reporter_pid = match &stream {
+            ApiStream::Local(local) => crate::platform::local_stream_peer_pid(local),
+            ApiStream::Tcp(_) => None,
+        };
+    }
 
     // A guest never reaches the owner or federation paths below: its gate is
     // an explicit allowlist bound to one agent.
@@ -1997,6 +2007,15 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::AgentGet(params) => Some(&mut params.target),
         Method::AgentRead(params) => Some(&mut params.target),
         Method::AgentTranscript(params) => Some(&mut params.target),
+        // A remote agent's topics are served by its own Herdr, which reaches
+        // the agent's control socket locally; the socket never crosses machines.
+        Method::AgentTopicsList(params) => Some(&mut params.target),
+        Method::AgentTopicsNew(params) => Some(&mut params.target),
+        Method::AgentTopicsSend(params) => Some(&mut params.target),
+        Method::AgentTopicsClose(params) | Method::AgentTopicsReopen(params) => {
+            Some(&mut params.target)
+        }
+        Method::AgentTopicsRename(params) => Some(&mut params.target),
         Method::AgentExplain(params) => Some(&mut params.target),
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
@@ -2188,6 +2207,32 @@ fn maybe_route_to_peer(
                 request_id,
                 method,
                 "precondition_unsupported",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
+    // A peer without topics would refuse `agent.topics.*` and, worse, page the
+    // agent's own conversation for a `topic` it ignores.
+    let wants_topics = request.method.is_agent_topics()
+        || matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some());
+    if wants_topics && !peer_target.agent_topics() {
+        let response = ErrorResponse {
+            id: request_id.to_owned(),
+            error: ErrorBody {
+                code: "topics_unsupported".into(),
+                message: format!(
+                    "machine {alias} has not advertised agent_topics, so it cannot serve topics; update Herdr there"
+                ),
+            },
+        };
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "topics_unsupported",
                 changes_ui,
             ),
             Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
@@ -3826,6 +3871,7 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                agent_topics: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
@@ -5292,6 +5338,12 @@ mod federation_tests {
             ("agent.get", AllowedAt(Observe)),
             ("agent.read", AllowedAt(Observe)),
             ("agent.transcript", AllowedAt(Observe)),
+            ("agent.topics.list", AllowedAt(Observe)),
+            ("agent.topics.new", AllowedAt(Interact)),
+            ("agent.topics.send", AllowedAt(Interact)),
+            ("agent.topics.close", AllowedAt(Admin)),
+            ("agent.topics.reopen", AllowedAt(Admin)),
+            ("agent.topics.rename", AllowedAt(Admin)),
             ("agent.explain", AllowedAt(Observe)),
             ("fence.explain", Denied),
             ("agent.send_keys", AllowedAt(Interact)),
@@ -5363,6 +5415,7 @@ mod federation_tests {
             ("gram.upload.stream.open", Denied),
             ("pane.report_agent", Denied),
             ("pane.report_agent_session", Denied),
+            ("pane.report_agent_control", Denied),
             ("pane.report_metadata", Denied),
             ("pane.clear_agent_authority", Denied),
             ("pane.release_agent", Denied),

@@ -1198,6 +1198,7 @@ fn success_response_round_trips() {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                agent_topics: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,

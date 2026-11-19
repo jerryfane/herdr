@@ -55,6 +55,9 @@ pub(crate) fn fenced_access(method: &Method) -> FencedAccess {
         }
         Method::PaneReportAgent(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneReportAgentSession(p) => Own(Pane(Some(p.pane_id.clone()))),
+        Method::PaneReportAgentControl(p) => Own(Pane(Some(p.pane_id.clone()))),
+        Method::AgentTopicsClose(p) | Method::AgentTopicsReopen(p) => Own(Agent(p.target.clone())),
+        Method::AgentTopicsRename(p) => Own(Agent(p.target.clone())),
         Method::PaneReportMetadata(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneClearAgentAuthority(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneReleaseAgent(p) => Own(Pane(Some(p.pane_id.clone()))),
@@ -78,6 +81,7 @@ const READ: &[&str] = &[
     "agent.get",
     "agent.read",
     "agent.transcript",
+    "agent.topics.list",
     "agent.explain",
     "fence.explain",
     "agent.avatar.get",
@@ -125,7 +129,13 @@ const READ: &[&str] = &[
     "gram.get_file_chunk",
 ];
 
-const TALK: &[&str] = &["agent.prompt", "agent.answer", "agent.answer_form"];
+const TALK: &[&str] = &[
+    "agent.prompt",
+    "agent.answer",
+    "agent.answer_form",
+    "agent.topics.new",
+    "agent.topics.send",
+];
 
 const CREATE: &[&str] = &["pane.split", "tab.create", "workspace.create"];
 
@@ -225,5 +235,58 @@ mod tests {
             )),
             FencedAccess::OwnStream
         );
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+    use crate::api::schema::Request;
+
+    fn access(json: &str) -> FencedAccess {
+        fenced_access(
+            &serde_json::from_str::<Request>(json)
+                .unwrap_or_else(|err| panic!("{json}: {err}"))
+                .method,
+        )
+    }
+
+    #[test]
+    fn fence_classifies_agent_control_and_topics_like_their_agent_peers() {
+        assert_eq!(
+            access(
+                r#"{"id":"1","method":"pane.report_agent_control","params":{"pane_id":"w1:p2","source":"herdr:omp","agent":"omp","agent_process_pid":7}}"#
+            ),
+            FencedAccess::Own(OwnTarget::Pane(Some("w1:p2".into())))
+        );
+        assert_eq!(
+            access(r#"{"id":"1","method":"agent.topics.list","params":{"target":"builder"}}"#),
+            FencedAccess::Read
+        );
+        for (method, extra) in [
+            ("agent.topics.new", r#","title":"t","message":"m""#),
+            ("agent.topics.send", r#","topic_id":"T","message":"m""#),
+        ] {
+            assert_eq!(
+                access(&format!(
+                    r#"{{"id":"1","method":"{method}","params":{{"target":"builder"{extra}}}}}"#
+                )),
+                FencedAccess::Talk,
+                "{method}"
+            );
+        }
+        for (method, extra) in [
+            ("agent.topics.close", r#","topic_id":"T""#),
+            ("agent.topics.reopen", r#","topic_id":"T""#),
+            ("agent.topics.rename", r#","topic_id":"T","title":"t""#),
+        ] {
+            assert_eq!(
+                access(&format!(
+                    r#"{{"id":"1","method":"{method}","params":{{"target":"builder"{extra}}}}}"#
+                )),
+                FencedAccess::Own(OwnTarget::Agent("builder".into())),
+                "{method}"
+            );
+        }
     }
 }

@@ -18,6 +18,7 @@ pub(super) mod responses;
 mod session;
 mod session_transfer;
 mod tabs;
+mod topics;
 pub(crate) mod transcript;
 pub(crate) mod usage_fetch;
 mod workspaces;
@@ -59,6 +60,15 @@ impl App {
                 segment_index,
                 result,
             } => self.handle_tab_bar_command_finished(generation, segment_index, result),
+            #[cfg(unix)]
+            AppEvent::AgentTopicsChanged {
+                terminal_id,
+                generation,
+                change,
+            } => {
+                self.handle_agent_topics_changed(&terminal_id, generation, change);
+                false
+            }
             AppEvent::UsageRefreshed { account_id, usage } => {
                 self.handle_usage_refreshed(account_id, usage);
                 // Live usage is surfaced only through the `accounts.list` API,
@@ -399,6 +409,17 @@ impl App {
         } = ev
         {
             let _ = self.handle_tab_bar_command_finished(generation, segment_index, result);
+            return Vec::new();
+        }
+
+        #[cfg(unix)]
+        if let AppEvent::AgentTopicsChanged {
+            terminal_id,
+            generation,
+            change,
+        } = ev
+        {
+            self.handle_agent_topics_changed(&terminal_id, generation, change);
             return Vec::new();
         }
 
@@ -1019,6 +1040,11 @@ impl App {
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
+        // The agent that offered a control socket exited or changed: forget it.
+        #[cfg(unix)]
+        if update.agent_released || update.previous_agent_label != update.agent_label {
+            self.reconcile_agent_control(update.ws_idx, update.pane_id);
+        }
         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
             return;
         };
@@ -1882,6 +1908,23 @@ impl App {
             }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
+            }
+            #[cfg(unix)]
+            Method::PaneReportAgentControl(params) => {
+                return self.handle_pane_report_agent_control(request.id, params);
+            }
+            #[cfg(unix)]
+            Method::AgentTopicsList(_)
+            | Method::AgentTopicsNew(_)
+            | Method::AgentTopicsSend(_)
+            | Method::AgentTopicsClose(_)
+            | Method::AgentTopicsReopen(_)
+            | Method::AgentTopicsRename(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "agent.topics.* is handled asynchronously by the app runtime",
+                );
             }
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);

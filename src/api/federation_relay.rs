@@ -735,6 +735,11 @@ pub(crate) fn qualify_remote_event(
             workspace_id,
             ..
         }
+        | EventData::AgentTopicsChanged {
+            pane_id,
+            workspace_id,
+            ..
+        }
         | EventData::PaneAgentStatusChanged {
             pane_id,
             workspace_id,
@@ -898,6 +903,10 @@ mod tests {
                 "panes": [{"pane_id": "w1:p1", "focused": true, "rect": rect}],
                 "splits": [{"id": "split_0_root", "direction": "right", "ratio": 0.5, "rect": rect}],
             }}),
+            EventKind::AgentTopicsChanged => json!({
+                "type": "agent_topics_changed", "pane_id": "w1:p1", "workspace_id": "w1",
+                "agent": "omp", "topic_id": "Plan", "reason": "turn_settled",
+            }),
         };
         EventEnvelope {
             event: kind,

@@ -438,8 +438,35 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true},
     }))
+}
+
+/// A guest's `agent.topics.*` reply: the agent's topics or the outcome of
+/// one command, as the owner sees them.
+fn project_topics(result: ResponseResult) -> Option<serde_json::Value> {
+    match result {
+        ResponseResult::AgentTopics { .. }
+        | ResponseResult::AgentTopicCreated { .. }
+        | ResponseResult::AgentTopicSent { .. }
+        | ResponseResult::AgentTopicUpdated { .. } => serde_json::to_value(result).ok(),
+        _ => None,
+    }
+}
+
+/// The target of a guest's `agent.topics.*` request and, when it carries one,
+/// the message it sends to a topic.
+fn topics_fields(method: &mut Method) -> Option<(&mut String, Option<&mut String>)> {
+    match method {
+        Method::AgentTopicsList(params) => Some((&mut params.target, None)),
+        Method::AgentTopicsNew(params) => Some((&mut params.target, Some(&mut params.message))),
+        Method::AgentTopicsSend(params) => Some((&mut params.target, Some(&mut params.message))),
+        Method::AgentTopicsClose(params) | Method::AgentTopicsReopen(params) => {
+            Some((&mut params.target, None))
+        }
+        Method::AgentTopicsRename(params) => Some((&mut params.target, None)),
+        _ => None,
+    }
 }
 
 fn project_avatar_image(result: ResponseResult) -> Option<serde_json::Value> {
@@ -1011,6 +1038,56 @@ fn serve_request(
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_history))
+        }
+        // The granted agent's topics; a topic's chat is `agent.transcript` with
+        // `topic`. Guests have no event stream (`events.*` stays owner-only),
+        // so a guest polls `agent.topics.list` instead of receiving
+        // `agent.topics.changed`.
+        mut topics @ (Method::AgentTopicsList(_)
+        | Method::AgentTopicsNew(_)
+        | Method::AgentTopicsSend(_)
+        | Method::AgentTopicsClose(_)
+        | Method::AgentTopicsReopen(_)
+        | Method::AgentTopicsRename(_)) => {
+            let Some((target, message)) = topics_fields(&mut topics) else {
+                return forbidden(stream);
+            };
+            if message
+                .as_ref()
+                .is_some_and(|message| message.len() > PROMPT_MAX_BYTES)
+            {
+                return write_text_line_allow_disconnect(
+                    stream,
+                    &error_response_json(
+                        id,
+                        "invalid_params",
+                        "guest messages are limited to 32 KiB".into(),
+                    ),
+                );
+            }
+            let state = grant_state(guest, api_tx);
+            if !names_grant(target.as_str(), guest, state.pane_id()) {
+                return forbidden(stream);
+            }
+            let GrantState::Live(agent) = state else {
+                return paused(stream);
+            };
+            if let Some(message) = message {
+                guest.audit(
+                    GuestAuditEvent::Prompt,
+                    Some(method),
+                    Some(message.clone()),
+                    None,
+                );
+                *message = format!("{}{}", guest.label(), message);
+            }
+            *target = agent.pane_id;
+            let request = Request {
+                id: id.clone(),
+                method: topics,
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_topics))
         }
         Method::AgentTranscript(params) => {
             let state = grant_state(guest, api_tx);
@@ -2215,6 +2292,9 @@ mod tests {
                     }
                     Ok(message) if matches!(message.request.method, Method::AgentTranscript(_)) => {
                         app.handle_deferred_transcript_request(message.request, message.respond_to);
+                    }
+                    Ok(message) if message.request.method.is_agent_topics() => {
+                        app.handle_deferred_topics_request(message.request, message.respond_to);
                     }
                     Ok(message) => {
                         if matches!(message.request.method, Method::PaneSetPtySize(_)) {
@@ -3427,6 +3507,29 @@ mod tests {
         assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
     }
 
+    #[test]
+    fn a_guest_reaches_the_granted_agents_topics_only() {
+        let harness = start("topics");
+        let guest = harness.admit();
+        // Granted: the request passes the gate and the app answers for the
+        // agent (which offers no control socket here).
+        let lines = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.topics.list", "params": {"target": "llm-opt"}}),
+        );
+        let granted = code(&lines);
+        assert!(
+            granted.starts_with("topics_"),
+            "the gate let the request through: {lines:?}"
+        );
+        // Any other agent's topics stay closed.
+        let lines = harness.call(
+            &guest,
+            json!({"id": "s", "method": "agent.topics.send", "params": {"target": "someone-else", "topic_id": "T", "message": "hi"}}),
+        );
+        assert_eq!(code(&lines), "guest_forbidden");
+    }
+
     /// Open the granted stream and read up to its `stream_started` ack.
     fn open_stream(
         harness: &Harness,
@@ -3948,6 +4051,7 @@ mod tests {
                     max_bytes: None,
                     held_from: None,
                     subagent: None,
+                    topic: None,
                 }),
             },
             &harness.api_tx,
@@ -4630,7 +4734,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true}),
             "only what the gate serves"
         );
 

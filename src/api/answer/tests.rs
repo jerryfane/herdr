@@ -197,6 +197,7 @@ fn harness(questions: Value) -> Harness {
         parked_work: Vec::new(),
         session_transfer: None,
         avatar: None,
+        topic_sessions: None,
     };
     Harness {
         omp: Arc::new(Mutex::new(omp)),

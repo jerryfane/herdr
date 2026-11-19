@@ -79,6 +79,32 @@
           ],
           "type": "string"
         },
+        "AgentTopicChangeReason": {
+          "description": "Why a topic changed (`agent.topics.changed`).",
+          "oneOf": [
+            {
+              "enum": [
+                "spawned",
+                "turn_started",
+                "turn_settled",
+                "closed",
+                "reopened",
+                "retitled"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "restored",
+              "description": "The agent restored the topic with its session (startup, session switch).",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A reason this server does not know yet.",
+              "type": "string"
+            }
+          ]
+        },
         "ComposerAuthor": {
           "oneOf": [
             {
@@ -947,6 +973,41 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "$ref": "#/schemas/event/$defs/AgentTopicChangeReason"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topics_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "topic_id",
+                "reason"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -978,7 +1039,8 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "pane_turn_completed",
-            "layout_updated"
+            "layout_updated",
+            "agent_topics_changed"
           ],
           "type": "string"
         },
@@ -1876,6 +1938,10 @@
           ],
           "type": "object"
         },
+        "AgentControlToken": {
+          "description": "The secret an agent's control socket asks for. It acts for the agent, so\n`Debug` never prints it; it serializes as a plain string only for the wire.",
+          "type": "string"
+        },
         "AgentForgetParams": {
           "description": "`agent.forget` — permanently drop an archived agent's record (issue #291).\nOnly herdr's resume pointer is removed; the harness transcript and session\nfiles on disk are left untouched. Live agents are refused.",
           "properties": {
@@ -2194,6 +2260,81 @@
           ],
           "type": "object"
         },
+        "AgentTopicTarget": {
+          "description": "One topic of one agent (`agent.topics.close`, `agent.topics.reopen`).",
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "topic_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "topic_id"
+          ],
+          "type": "object"
+        },
+        "AgentTopicsNewParams": {
+          "properties": {
+            "message": {
+              "description": "The topic's first message.",
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "title": {
+              "description": "The topic's owner-facing title.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "title",
+            "message"
+          ],
+          "type": "object"
+        },
+        "AgentTopicsRenameParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "topic_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "topic_id",
+            "title"
+          ],
+          "type": "object"
+        },
+        "AgentTopicsSendParams": {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "topic_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "topic_id",
+            "message"
+          ],
+          "type": "object"
+        },
         "AgentTranscriptParams": {
           "properties": {
             "after": {
@@ -2240,6 +2381,13 @@
             },
             "target": {
               "type": "string"
+            },
+            "topic": {
+              "description": "Page this topic's own conversation instead of the agent's (an id\nfrom `agent.topics.list` or the agent's `topic_sessions`). With\n`subagent`, pages that topic's subagent. Honoured by servers that\nadvertise `capabilities.agent_topics`; older ones would ignore it,\nso do not send it to them.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -4577,6 +4725,57 @@
           ],
           "type": "object"
         },
+        "PaneReportAgentControlParams": {
+          "description": "`pane.report_agent_control`: the agent integration running inside the\npane's agent process hands over the control socket that process offers,\nor clears it when `socket_path` is absent. Accepted only from the agent\nprocess Herdr tracks for the pane (see `agent_process_pid`). Deliberately\nno CLI projection: the token must not reach a command line.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_process_pid": {
+              "description": "The reporting agent process; must be the one its session report named.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "socket_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            },
+            "token": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentControlToken"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "source",
+            "agent",
+            "agent_process_pid"
+          ],
+          "type": "object"
+        },
         "PaneReportAgentParams": {
           "properties": {
             "agent": {
@@ -6145,6 +6344,19 @@
               "properties": {
                 "type": {
                   "const": "layout.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An omp agent's topic changed (servers advertising `agent_topics`).",
+              "properties": {
+                "type": {
+                  "const": "agent.topics.changed",
                   "type": "string"
                 }
               },
@@ -8994,6 +9206,120 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "description": "The omp integration hands over the control socket its agent offers\n(or clears it). Herdr keeps it in memory only.",
+          "properties": {
+            "method": {
+              "const": "pane.report_agent_control",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentControlParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An omp agent's topics, live from the agent (`capabilities.agent_topics`).",
+          "properties": {
+            "method": {
+              "const": "agent.topics.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.new",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicsNewParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.send",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicsSendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.reopen",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.rename",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicsRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -9826,6 +10152,32 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "AgentTopicChangeReason": {
+          "description": "Why a topic changed (`agent.topics.changed`).",
+          "oneOf": [
+            {
+              "enum": [
+                "spawned",
+                "turn_started",
+                "turn_settled",
+                "closed",
+                "reopened",
+                "retitled"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "restored",
+              "description": "The agent restored the topic with its session (startup, session switch).",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A reason this server does not know yet.",
+              "type": "string"
+            }
+          ]
         },
         "ComposerAuthor": {
           "oneOf": [
@@ -10695,6 +11047,41 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/AgentTopicChangeReason"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topics_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "topic_id",
+                "reason"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -10741,7 +11128,8 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "pane_turn_completed",
-            "layout_updated"
+            "layout_updated",
+            "agent_topics_changed"
           ],
           "type": "string"
         },
@@ -12253,6 +12641,16 @@
               },
               "type": "object"
             },
+            "topic_sessions": {
+              "description": "An omp agent's topic transcripts in its current session, read from the\nsession file on disk; listed whether or not the agent can be reached\n(`agent.list`, `agent.get` on servers advertising `agent_topics`).",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AgentTopicSession"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "turn": {
               "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
               "format": "uint64",
@@ -12547,6 +12945,162 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "AgentTopicChangeReason": {
+          "description": "Why a topic changed (`agent.topics.changed`).",
+          "oneOf": [
+            {
+              "enum": [
+                "spawned",
+                "turn_started",
+                "turn_settled",
+                "closed",
+                "reopened",
+                "retitled"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "restored",
+              "description": "The agent restored the topic with its session (startup, session switch).",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A reason this server does not know yet.",
+              "type": "string"
+            }
+          ]
+        },
+        "AgentTopicInfo": {
+          "description": "One topic as `agent.topics.list` reports it, live from the agent.",
+          "properties": {
+            "created_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_activity": {
+              "description": "The topic's newest step, in the agent's words.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_activity_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "queued": {
+              "description": "Messages waiting for the topic's current turn to end.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/AgentTopicState"
+            },
+            "title": {
+              "type": "string"
+            },
+            "topic_id": {
+              "type": "string"
+            },
+            "turns": {
+              "description": "Turns the topic has run.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "topic_id",
+            "title",
+            "state",
+            "turns",
+            "queued",
+            "created_unix_ms",
+            "last_activity_unix_ms"
+          ],
+          "type": "object"
+        },
+        "AgentTopicSendMode": {
+          "description": "How `agent.topics.send` delivered a message.",
+          "oneOf": [
+            {
+              "const": "steered",
+              "description": "Steered into the topic's running turn.",
+              "type": "string"
+            },
+            {
+              "const": "queued",
+              "description": "Queued behind the topic's running turn.",
+              "type": "string"
+            },
+            {
+              "const": "turn",
+              "description": "Started a new turn.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A delivery this server does not know yet.",
+              "type": "string"
+            }
+          ]
+        },
+        "AgentTopicSession": {
+          "description": "One topic transcript of an omp agent's current session, read from the\nsession file on disk (`agent.list`, `agent.get`): it is listed whether or\nnot the agent can be reached.",
+          "properties": {
+            "created_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "The topic's own session file.",
+              "type": "string"
+            },
+            "title": {
+              "description": "The newest owner-facing title the session file records.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "topic_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "topic_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        "AgentTopicState": {
+          "description": "Where a topic's worker is.",
+          "oneOf": [
+            {
+              "enum": [
+                "starting",
+                "running",
+                "idle",
+                "dead",
+                "closed"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A state this server does not know yet.",
+              "type": "string"
+            }
+          ]
         },
         "AskForm": {
           "description": "An omp (≥ 18.18.3) `ask` HTML form, reduced the way omp's terminal form\ndraws it (upstream `packages/tui/src/html-form/parse.ts`). Hidden inputs\nare left out: omp submits them itself.",
@@ -13850,6 +14404,41 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "$ref": "#/schemas/success_response/$defs/AgentTopicChangeReason"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topics_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "topic_id",
+                "reason"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -13896,7 +14485,8 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "pane_turn_completed",
-            "layout_updated"
+            "layout_updated",
+            "agent_topics_changed"
           ],
           "type": "string"
         },
@@ -17702,6 +18292,113 @@
               "type": "object"
             },
             {
+              "description": "`agent.topics.list`: the agent's topics, live from the agent; empty\nwhen it has none (an unreachable agent is an error instead).",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "topics": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentTopicInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_topics",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "topics"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.new`: the topic the agent started.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topic_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "topic_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.send`: how the agent took the message.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "mode": {
+                  "$ref": "#/schemas/success_response/$defs/AgentTopicSendMode"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topic_sent",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "topic_id",
+                "mode"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.close`, `agent.topics.reopen`, `agent.topics.rename`.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topic_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "topic_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "base_seq": {
                   "format": "uint64",
@@ -18996,6 +19693,11 @@
                 "$ref": "#/schemas/success_response/$defs/AgentSessionTransferHarness"
               },
               "type": "array"
+            },
+            "agent_topics": {
+              "default": false,
+              "description": "Serves `agent.topics.*`, the `agent.topics.changed` event, `topic` on\n`agent.transcript`, and `topic_sessions` on `agent.list`/`agent.get`.",
+              "type": "boolean"
             },
             "agent_transcript": {
               "default": false,

@@ -135,6 +135,11 @@ pub(crate) fn transcript_subagent() -> Input<Option<String>> {
         .help("Page this subagent's own conversation (an id from a page's `subagents`)")
 }
 
+pub(crate) fn transcript_topic() -> Input<Option<String>> {
+    optional_text("topic", "ID")
+        .help("Page this topic's own conversation (a topic id from the agent's `topic_sessions`)")
+}
+
 pub(crate) fn keys() -> Input<Vec<String>> {
     Input::<Vec<String>>::positional("key", 1, |slot, value| {
         slot.push(value.to_owned());

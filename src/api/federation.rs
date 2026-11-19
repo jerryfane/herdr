@@ -142,9 +142,9 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         // Observe methods whose target can be owned by a remote peer.
         // `workspace.get`/`tab.get`/`tab.list` route an `<alias>/…` workspace or
         // tab id to its owning peer; a bare `tab.list` stays local.
-        "agent.get" | "agent.read" | "agent.transcript" | "agent.explain" | "agent.avatar.get"
-        | "pane.read" | "pane.history" | "pane.turns" | "pane.stream" | "workspace.get"
-        | "tab.list" | "tab.get" => (AllowedAt(Observe), true),
+        "agent.get" | "agent.read" | "agent.transcript" | "agent.topics.list" | "agent.explain"
+        | "agent.avatar.get" | "pane.read" | "pane.history" | "pane.turns" | "pane.stream"
+        | "workspace.get" | "tab.list" | "tab.get" => (AllowedAt(Observe), true),
         // Other read-only inspection stays local when called at the home.
         "ping"
         | "agent.list"
@@ -165,12 +165,21 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "worktree.list"
         | "layout.export" => (AllowedAt(Observe), false),
         // Interact methods with an explicit remote-owned target.
-        "agent.prompt" | "agent.send_keys" | "pane.send_text" | "pane.send_keys" => {
-            (AllowedAt(Interact), true)
-        }
+        "agent.prompt" | "agent.send_keys" | "agent.topics.new" | "agent.topics.send"
+        | "pane.send_text" | "pane.send_keys" => (AllowedAt(Interact), true),
         // Admin methods with an explicit remote-owned target.
-        "agent.focus" | "agent.rename" | "agent.avatar.set" | "agent.restart" | "agent.answer"
-        | "agent.answer_form" | "pane.send_input" | "pane.input.set" | "pane.rename"
+        "agent.focus"
+        | "agent.rename"
+        | "agent.avatar.set"
+        | "agent.restart"
+        | "agent.answer"
+        | "agent.topics.close"
+        | "agent.topics.reopen"
+        | "agent.topics.rename"
+        | "agent.answer_form"
+        | "pane.send_input"
+        | "pane.input.set"
+        | "pane.rename"
         | "pane.set_pty_size" => (AllowedAt(Admin), true),
         // Admin methods whose payload has no remote ownership target.
         "agent.view.set" | "agent.view.clear" => (AllowedAt(Admin), false),
