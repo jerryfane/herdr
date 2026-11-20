@@ -5328,6 +5328,7 @@ mod federation_tests {
             ("guest.list", Denied),
             ("guest.revoke", Denied),
             ("guest.update", Denied),
+            ("guest.remove_device", Denied),
             ("guest.audit", Denied),
             ("guest.agent_probe", Denied),
             ("fence.scoped", Denied),
@@ -5666,8 +5667,8 @@ mod federation_tests {
     #[test]
     fn admin_federation_peers_are_forbidden_every_guest_method() {
         use crate::api::schema::{
-            GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams,
-            GuestUpdateParams,
+            GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRemoveDeviceParams,
+            GuestRevokeParams, GuestUpdateParams,
         };
         let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
         for method in [
@@ -5688,6 +5689,11 @@ mod federation_tests {
             Method::GuestUpdate(GuestUpdateParams {
                 guest_id: "g".into(),
                 share_gram: true,
+                machine: None,
+            }),
+            Method::GuestRemoveDevice(GuestRemoveDeviceParams {
+                guest_id: "g".into(),
+                fingerprint: "SHA256:0000·0000·0000·0000".into(),
                 machine: None,
             }),
             Method::GuestAudit(GuestAuditParams::default()),

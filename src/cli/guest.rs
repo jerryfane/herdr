@@ -1,6 +1,6 @@
 use crate::api::schema::{
-    GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams,
-    GuestUpdateParams, Method, Request,
+    GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRemoveDeviceParams,
+    GuestRevokeParams, GuestUpdateParams, Method, Request,
 };
 
 const HELP: &str = "Usage:
@@ -8,6 +8,8 @@ const HELP: &str = "Usage:
   herdr guest list [--machine ALIAS]
   herdr guest share-gram <guest-id> on|off [--machine ALIAS]
   herdr guest revoke <guest-or-invite-id> [--machine ALIAS]
+  herdr guest revoke --person <person> [--machine ALIAS]
+  herdr guest remove-device <guest-id> <fingerprint> [--machine ALIAS]
   herdr guest log [<guest-id>] [--limit N] [--machine ALIAS]
 
 Share one named, running agent with one outside person through the HerdrUp
@@ -15,8 +17,11 @@ guest relay. The guest can prompt it (labeled \"<name> (via HerdrUp): \") and
 watch its terminal, but cannot type into the terminal or reach any other pane.
 With --share-gram (or share-gram on later) the guest also sees every Gram the
 agent sends from the moment the guest accepted, with its files. Invites work
-once and expire after 24 hours by default. --machine runs the command on that
-saved SSH machine.";
+once and expire after 24 hours by default. A guest may bind the share to their
+HerdrUp account to use it from each of their devices ([guest] accounts):
+revoke --person (the person from guest list) revokes all of a person's shares
+at once, and remove-device drops one of their devices. --machine runs the
+command on that saved SSH machine.";
 
 /// Options that take no value.
 const FLAGS: &[&str] = &["share-gram"];
@@ -27,6 +32,7 @@ pub(super) fn run_guest_command(args: &[String]) -> std::io::Result<i32> {
         Some("list") => list(&args[1..]),
         Some("share-gram") => share_gram(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
+        Some("remove-device") => remove_device(&args[1..]),
         Some("log") => log(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
@@ -177,9 +183,24 @@ fn list(args: &[String]) -> Result<i32, String> {
     .map_err(|err| err.to_string())
 }
 
-/// Revoke by guest id, falling back to an invite id.
+/// Revoke by guest id, falling back to an invite id; or every share of one
+/// person with `--person`.
 fn revoke(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["machine"])?;
+    let parsed = parse(args, &["machine", "person"])?;
+    if let Some(person) = parsed.option("person") {
+        if !parsed.positional.is_empty() {
+            return Err("revoke takes an id or --person, not both".into());
+        }
+        return send(
+            "cli:guest:revoke",
+            Method::GuestRevoke(GuestRevokeParams {
+                person: Some(person),
+                machine: parsed.option("machine"),
+                ..Default::default()
+            }),
+        )
+        .map_err(|err| err.to_string());
+    }
     let [id] = parsed.positional.as_slice() else {
         return Err("revoke takes exactly one id".into());
     };
@@ -188,6 +209,7 @@ fn revoke(args: &[String]) -> Result<i32, String> {
         method: Method::GuestRevoke(GuestRevokeParams {
             guest_id: guest.then(|| id.clone()),
             invite_id: (!guest).then(|| id.clone()),
+            person: None,
             machine: parsed.option("machine"),
         }),
     };
@@ -198,6 +220,23 @@ fn revoke(args: &[String]) -> Result<i32, String> {
         response
     };
     super::print_response(&response).map_err(|err| err.to_string())
+}
+
+/// Drop one device from an account-bound share.
+fn remove_device(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["machine"])?;
+    let [guest_id, fingerprint] = parsed.positional.as_slice() else {
+        return Err("remove-device takes a guest id and a device fingerprint".into());
+    };
+    send(
+        "cli:guest:remove-device",
+        Method::GuestRemoveDevice(GuestRemoveDeviceParams {
+            guest_id: guest_id.clone(),
+            fingerprint: fingerprint.clone(),
+            machine: parsed.option("machine"),
+        }),
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn log(args: &[String]) -> Result<i32, String> {

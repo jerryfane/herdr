@@ -329,8 +329,21 @@ fn guest_command() -> Command {
         )
         .subcommand(
             Command::new("revoke")
-                .about("Revoke a guest or an invite; closes live sessions")
-                .arg(required("id", "ID"))
+                .about(
+                    "Revoke a guest or an invite, or every share of a person; closes live sessions",
+                )
+                .arg(Arg::new("id").value_name("ID"))
+                .arg(
+                    option("person", "PERSON")
+                        .help("A person from guest list: revoke all their shares"),
+                )
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("remove-device")
+                .about("Drop one device from an account-bound share; closes its live sessions")
+                .arg(required("guest-id", "GUEST-ID"))
+                .arg(required("fingerprint", "FINGERPRINT"))
                 .arg(machine()),
         )
         .subcommand(

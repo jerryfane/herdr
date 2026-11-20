@@ -11,7 +11,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::api::schema::{AgentSessionInfo, GuestGrantInfo, GuestInfo, GuestInviteInfo};
+use crate::api::schema::{
+    AgentSessionInfo, GuestDeviceInfo, GuestGrantInfo, GuestInfo, GuestInviteInfo,
+};
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -285,6 +287,34 @@ pub(crate) struct GuestRecord {
     /// guest accepted, whose Grams all count.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub terminal_sessions: Vec<AgentSessionInfo>,
+    /// The guest's pairwise HerdrUp account id on this host when the share is
+    /// bound to their account; `None` for a plain share bound to `device_pub`
+    /// alone. Every connection to an account-bound share proves the account
+    /// with a statement (see [`super::account`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Devices the account added after `device_pub`, which stays the
+    /// redeeming device. A removed entry keeps its key out for good, even
+    /// with a valid statement; it may name `device_pub` itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<AccountDevice>,
+}
+
+/// One more device of an account-bound share's person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AccountDevice {
+    /// b64url X25519 device public key. Never leaves this file.
+    pub device_pub: String,
+    pub fingerprint: String,
+    #[serde(default)]
+    pub device: String,
+    pub added_ms: u64,
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
+    #[serde(default)]
+    pub removed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_ms: Option<u64>,
 }
 
 /// A name the granted agent gave up in a rename. It names the agent only in
@@ -361,7 +391,47 @@ impl GuestRecord {
             last_seen_ms: self.last_seen_ms,
             revoked: self.revoked,
             share_gram: self.share_gram,
+            account_bound: self.account.is_some(),
+            person: self.person().to_owned(),
+            devices: self
+                .devices
+                .iter()
+                .map(|device| GuestDeviceInfo {
+                    fingerprint: device.fingerprint.clone(),
+                    device: device.device.clone(),
+                    added_ms: device.added_ms,
+                    last_seen_ms: device.last_seen_ms,
+                    removed: device.removed,
+                })
+                .collect(),
         }
+    }
+
+    /// Who the share belongs to: the account id when account-bound, else the
+    /// device's fingerprint. `guest.revoke {person}` revokes by it.
+    pub(crate) fn person(&self) -> &str {
+        self.account.as_deref().unwrap_or(&self.fingerprint)
+    }
+
+    /// The device with this fingerprint may use the share now: the redeeming
+    /// device or an added one, and not removed.
+    pub(crate) fn admits_fingerprint(&self, fingerprint: &str) -> bool {
+        let removed = self
+            .devices
+            .iter()
+            .any(|device| device.fingerprint == fingerprint && device.removed);
+        !removed
+            && (self.fingerprint == fingerprint
+                || self
+                    .devices
+                    .iter()
+                    .any(|device| device.fingerprint == fingerprint))
+    }
+
+    /// The share holds this device key: the redeeming device or an added
+    /// one, removed or not.
+    fn holds_device(&self, device: &str) -> bool {
+        self.device_pub == device || self.devices.iter().any(|added| added.device_pub == device)
     }
 }
 
@@ -671,13 +741,15 @@ pub(crate) fn shares_gram(dir: &Path, guest_id: &str) -> bool {
     })
 }
 
-pub(crate) fn is_revoked(dir: &Path, guest_id: &str) -> bool {
+/// The guest was revoked or removed, or the owner removed the device with
+/// `fingerprint` from its account-bound share (or the store cannot be read).
+pub(crate) fn is_revoked(dir: &Path, guest_id: &str, fingerprint: &str) -> bool {
     load_store(dir).map_or(true, |store| {
         store
             .guests
             .iter()
             .find(|guest| guest.guest_id == guest_id)
-            .is_none_or(|guest| guest.revoked)
+            .is_none_or(|guest| guest.revoked || !guest.admits_fingerprint(fingerprint))
     })
 }
 
@@ -746,14 +818,17 @@ pub(crate) fn update_share_gram(
 }
 
 /// The v1 invite JSON: the long links carry it b64url-encoded and the short
-/// link's relay blob carries these exact bytes sealed.
+/// link's relay blob carries these exact bytes sealed. With `accounts`
+/// (`[guest] accounts`) it carries `"acct": 1`: the guest may bind the share
+/// to their HerdrUp account.
 pub(crate) fn invite_payload(
     relay_url: &str,
     host: &HostIdentity,
     host_pub: &[u8; 32],
     invite: &NewInvite,
+    accounts: bool,
 ) -> String {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "v": 1,
         "relay": relay_url.trim_end_matches('/'),
         "host_id": host.host_id,
@@ -765,8 +840,11 @@ pub(crate) fn invite_payload(
         "agent_name": invite.record.grant.agent_name,
         "guest_name": invite.record.name,
         "expires_unix": invite.record.expires_ms / 1000,
-    })
-    .to_string()
+    });
+    if accounts {
+        payload["acct"] = serde_json::json!(1);
+    }
+    payload.to_string()
 }
 
 /// The app link and the long web link, each carrying `payload` b64url-encoded.
@@ -799,17 +877,31 @@ pub(crate) fn set_invite_short(
     })
 }
 
+/// What a hello's `account` statement amounted to. It is checked before the
+/// store is locked, since checking may fetch the issuer's keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccountHello {
+    /// No statement: a plain hello.
+    Absent,
+    Verified(super::account::Verified),
+    /// Refused with this code. A plain share ignores it.
+    Refused(&'static str),
+}
+
 /// Outcome of a Noise message-1 payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdmitOutcome {
     /// `connected` is true when this admission should be audited as a new
-    /// connection (first contact in [`CONNECTED_AUDIT_WINDOW_MS`]).
+    /// connection (first contact in [`CONNECTED_AUDIT_WINDOW_MS`]). `added`
+    /// is a device the person just added to an account-bound share.
     Returning {
         guest: GuestRecord,
         connected: bool,
+        added: Option<AccountDevice>,
     },
-    /// `replaced` lists this device's earlier guest ids, now revoked.
-    /// `short` is the redeemed invite's relay blob, now to be deleted.
+    /// `replaced` lists this device's (or this account's) earlier guest ids
+    /// for the same terminal, now revoked. `short` is the redeemed invite's
+    /// relay blob, now to be deleted.
     Accepted {
         guest: GuestRecord,
         replaced: Vec<String>,
@@ -818,28 +910,59 @@ pub(crate) enum AdmitOutcome {
     Refused(&'static str),
 }
 
+/// The authenticated device a hello came from.
+struct Arriving<'a> {
+    /// b64url key.
+    device: &'a str,
+    fingerprint: &'a str,
+    /// The `device` name it gave, printable and at most 64 characters.
+    name: &'a str,
+}
+
 /// Admit a device. A returning guest sends `{"v":1,"guest_id":"..."}` to select
 /// a grant belonging to its authenticated device key. Omitting `guest_id` works
 /// only for a single active grant; ambiguous hellos get `guest_selection_required`.
 /// A new guest instead sends `invite_id`, `secret` and `device`. The secret is
 /// checked in constant time before the invite's state is revealed.
+///
+/// A hello may also carry `account`, a statement already checked into
+/// `account`. Redeeming with one binds the share to the account; every hello
+/// for an account-bound share needs one for that account, and it may come from
+/// any of the account's devices: one the share has not seen is added to it
+/// (`added`), and a device the owner removed stays out. Plain shares work
+/// exactly as before and ignore `account`.
 pub(crate) fn admit_in(
     dir: &Path,
     device_pub: &[u8; 32],
     hello: &serde_json::Value,
+    account: &AccountHello,
     now: u64,
 ) -> io::Result<AdmitOutcome> {
     if hello.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
         return Ok(AdmitOutcome::Refused("invite_invalid"));
     }
     let device = b64url(device_pub);
+    let device_name: String = hello
+        .get("device")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    let fingerprint = fingerprint(device_pub);
     let Some(invite_id) = hello.get("invite_id") else {
         let guest_id = match hello.get("guest_id") {
             None => None,
             Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.as_str()),
             Some(_) => return Ok(AdmitOutcome::Refused("unknown")),
         };
-        return admit_returning(dir, &device, guest_id, now);
+        let arriving = Arriving {
+            device: &device,
+            fingerprint: &fingerprint,
+            name: &device_name,
+        };
+        return admit_returning(dir, &arriving, guest_id, account, now);
     };
     let (Some(invite_id), Some(secret)) = (
         invite_id.as_str(),
@@ -850,15 +973,6 @@ pub(crate) fn admit_in(
     let secret_hash = b64url_decode(secret)
         .filter(|bytes| bytes.len() == 32)
         .map(|bytes| sha256_hex(&bytes));
-    let device_name: String = hello
-        .get("device")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(64)
-        .collect();
-    let fingerprint = fingerprint(device_pub);
     update_store(dir, |store| {
         let Some(index) = store
             .invites
@@ -883,15 +997,34 @@ pub(crate) fn admit_in(
         if now >= invite.expires_ms {
             return (AdmitOutcome::Refused("invite_expired"), false);
         }
+        // "Add to my account": the invite stays unused when the statement
+        // fails, so the guest can retry or accept for this device only. The
+        // redeeming device is new to the account's share, so it needs keys
+        // fetched within the hour.
+        let bound = match account {
+            AccountHello::Absent => None,
+            AccountHello::Refused(code) => return (AdmitOutcome::Refused(code), false),
+            AccountHello::Verified(verified) if !verified.keys_fresh => {
+                return (
+                    AdmitOutcome::Refused(super::account::codes::KEYS_STALE),
+                    false,
+                )
+            }
+            AccountHello::Verified(verified) => Some(verified.sub.clone()),
+        };
         let guest_id = match random_bytes::<16>() {
             Ok(bytes) => b64url(&bytes),
             Err(_) => return (AdmitOutcome::Refused("invite_invalid"), false),
         };
         // Re-inviting the same terminal replaces that grant, not the device's
-        // independently authorized access to other agents on this host.
+        // (or the account's) independently authorized access to other agents
+        // on this host.
         let mut replaced = Vec::new();
         for existing in store.guests.iter_mut().filter(|guest| {
-            guest.device_pub == device
+            (guest.device_pub == device
+                || bound
+                    .as_ref()
+                    .is_some_and(|sub| guest.account.as_ref() == Some(sub)))
                 && !guest.revoked
                 && guest.grant.terminal_id == invite.grant.terminal_id
         }) {
@@ -917,6 +1050,8 @@ pub(crate) fn admit_in(
             former_names: Vec::new(),
             former_terminals: Vec::new(),
             terminal_sessions: invite.terminal_sessions.clone(),
+            account: bound,
+            devices: Vec::new(),
         };
         store.invites[index].used_by = Some(guest_id);
         let short = store.invites[index].short.take();
@@ -934,15 +1069,25 @@ pub(crate) fn admit_in(
 
 fn admit_returning(
     dir: &Path,
-    device: &str,
+    arriving: &Arriving<'_>,
     guest_id: Option<&str>,
+    account: &AccountHello,
     now: u64,
 ) -> io::Result<AdmitOutcome> {
+    use super::account::codes;
+
     update_store(dir, |store| {
-        // The authenticated Noise device key is always part of the lookup.
-        // A guest id is a selector, never a credential or authority on its own.
+        let sub = match account {
+            AccountHello::Verified(verified) => Some(verified.sub.as_str()),
+            AccountHello::Absent | AccountHello::Refused(_) => None,
+        };
+        // The authenticated Noise device key, or a verified statement for the
+        // share's account from that key, is always part of the lookup. A
+        // guest id is a selector, never a credential or authority on its own.
         let matches = |guest: &&GuestRecord| {
-            guest.device_pub == device && guest_id.is_none_or(|id| guest.guest_id == id)
+            (guest.holds_device(arriving.device)
+                || sub.is_some_and(|sub| guest.account.as_deref() == Some(sub)))
+                && guest_id.is_none_or(|id| guest.guest_id == id)
         };
         let mut live = store
             .guests
@@ -962,6 +1107,57 @@ fn admit_returning(
             return (AdmitOutcome::Refused("guest_selection_required"), false);
         }
         let guest = &mut store.guests[selected];
+        let mut added = None;
+        let mut changed = false;
+        // A plain share was matched by its device key alone, as always.
+        if let Some(bound) = &guest.account {
+            let verified = match account {
+                AccountHello::Absent => return (AdmitOutcome::Refused(codes::REQUIRED), false),
+                AccountHello::Refused(code) => return (AdmitOutcome::Refused(code), false),
+                AccountHello::Verified(verified) => verified,
+            };
+            if verified.sub != *bound {
+                return (AdmitOutcome::Refused(codes::MISMATCH), false);
+            }
+            let known = guest
+                .devices
+                .iter()
+                .position(|device| device.device_pub == arriving.device);
+            match known {
+                Some(index) if guest.devices[index].removed => {
+                    return (AdmitOutcome::Refused(codes::DEVICE_REMOVED), false)
+                }
+                Some(index) => {
+                    let device = &mut guest.devices[index];
+                    if device
+                        .last_seen_ms
+                        .is_none_or(|at| now.saturating_sub(at) >= LAST_SEEN_RESOLUTION_MS)
+                    {
+                        device.last_seen_ms = Some(now);
+                        changed = true;
+                    }
+                }
+                None if guest.device_pub == arriving.device => {}
+                // Adding a device needs keys fetched within the hour.
+                None if !verified.keys_fresh => {
+                    return (AdmitOutcome::Refused(codes::KEYS_STALE), false)
+                }
+                None => {
+                    let device = AccountDevice {
+                        device_pub: arriving.device.to_owned(),
+                        fingerprint: arriving.fingerprint.to_owned(),
+                        device: arriving.name.to_owned(),
+                        added_ms: now,
+                        last_seen_ms: Some(now),
+                        removed: false,
+                        removed_ms: None,
+                    };
+                    guest.devices.push(device.clone());
+                    added = Some(device);
+                    changed = true;
+                }
+            }
+        }
         // The first returning request after acceptance is a connection, and
         // then one per window however often the client polls.
         let connected = guest
@@ -975,31 +1171,68 @@ fn admit_returning(
         if seen {
             guest.last_seen_ms = Some(now);
         }
-        let changed = connected || seen;
+        changed |= connected || seen;
         (
             AdmitOutcome::Returning {
                 guest: guest.clone(),
                 connected,
+                added,
             },
             changed,
         )
     })
 }
 
+/// Whether an admitted account-bound session may go on with a newer statement
+/// for the account (already checked into `verified`): its share is still
+/// active and bound to that account, and `device_pub` was not removed.
+/// `Err` is the code the session closes with.
+pub(crate) fn account_session_holds(
+    dir: &Path,
+    guest_id: &str,
+    device_pub: &[u8; 32],
+    verified: &super::account::Verified,
+) -> Result<(), &'static str> {
+    use super::account::codes;
+
+    let store = load_store(dir).map_err(|_| "revoked")?;
+    let Some(guest) = store
+        .guests
+        .iter()
+        .find(|guest| guest.guest_id == guest_id && !guest.revoked)
+    else {
+        return Err("revoked");
+    };
+    if guest.account.as_deref() != Some(verified.sub.as_str()) {
+        return Err(codes::MISMATCH);
+    }
+    if !guest.holds_device(&b64url(device_pub))
+        || !guest.admits_fingerprint(&fingerprint(device_pub))
+    {
+        return Err(codes::DEVICE_REMOVED);
+    }
+    Ok(())
+}
+
 pub(crate) enum RevokeTarget<'a> {
     Guest(&'a str),
     Invite(&'a str),
+    /// Every share of one person: an account id, or a plain share's device
+    /// fingerprint (see [`GuestRecord::person`]).
+    Person(&'a str),
 }
 
-/// What a revoke removed: the revoked guest record (kept, marked revoked) or
-/// the deleted invite.
+/// What a revoke removed: the revoked guest record (kept, marked revoked),
+/// the deleted invite, or the person's records it revoked now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Revoked {
     Guest(GuestRecord),
     Invite(InviteRecord),
+    Person(Vec<GuestRecord>),
 }
 
-/// Revoke a guest or delete an invite. `None` when the id is unknown.
+/// Revoke a guest, a person's guests, or delete an invite. `None` when the
+/// id (or person) is unknown.
 pub(crate) fn revoke_in(
     dir: &Path,
     target: RevokeTarget<'_>,
@@ -1032,6 +1265,84 @@ pub(crate) fn revoke_in(
                 None => (None, false),
             }
         }
+        RevokeTarget::Person(person) => {
+            let mut known = false;
+            let mut revoked = Vec::new();
+            for guest in store
+                .guests
+                .iter_mut()
+                .filter(|guest| guest.person() == person)
+            {
+                known = true;
+                if !guest.revoked {
+                    guest.revoked = true;
+                    guest.revoked_ms = Some(now);
+                    revoked.push(guest.clone());
+                }
+            }
+            let changed = !revoked.is_empty();
+            (known.then_some(Revoked::Person(revoked)), changed)
+        }
+    })
+}
+
+/// What `guest.remove_device` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeviceRemoval {
+    /// The share after the removal (also when it was removed before).
+    Removed(GuestRecord),
+    UnknownGuest,
+    UnknownDevice,
+    /// A plain share has one device: revoke it instead.
+    PlainShare,
+}
+
+/// Drop one device from an active account-bound share for good: it is marked
+/// removed, so no statement brings it back. The redeeming device can be
+/// removed too.
+pub(crate) fn remove_device_in(
+    dir: &Path,
+    guest_id: &str,
+    fingerprint: &str,
+    now: u64,
+) -> io::Result<DeviceRemoval> {
+    update_store(dir, |store| {
+        let Some(guest) = store
+            .guests
+            .iter_mut()
+            .find(|guest| guest.guest_id == guest_id && !guest.revoked)
+        else {
+            return (DeviceRemoval::UnknownGuest, false);
+        };
+        if guest.account.is_none() {
+            return (DeviceRemoval::PlainShare, false);
+        }
+        if let Some(device) = guest
+            .devices
+            .iter_mut()
+            .find(|device| device.fingerprint == fingerprint)
+        {
+            if device.removed {
+                return (DeviceRemoval::Removed(guest.clone()), false);
+            }
+            device.removed = true;
+            device.removed_ms = Some(now);
+            return (DeviceRemoval::Removed(guest.clone()), true);
+        }
+        if guest.fingerprint != fingerprint {
+            return (DeviceRemoval::UnknownDevice, false);
+        }
+        let redeeming = AccountDevice {
+            device_pub: guest.device_pub.clone(),
+            fingerprint: guest.fingerprint.clone(),
+            device: guest.device.clone(),
+            added_ms: guest.created_ms,
+            last_seen_ms: guest.last_seen_ms,
+            removed: true,
+            removed_ms: Some(now),
+        };
+        guest.devices.push(redeeming);
+        (DeviceRemoval::Removed(guest.clone()), true)
     })
 }
 
@@ -1101,6 +1412,7 @@ pub(crate) mod tests {
             dir,
             device,
             &json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"}),
+            &AccountHello::Absent,
             now,
         )
         .unwrap()
@@ -1169,7 +1481,7 @@ pub(crate) mod tests {
             host_id: "h".repeat(22),
             relay_secret: String::new(),
         };
-        let json = invite_payload("https://relay.test/", &host, &[9; 32], &invite);
+        let json = invite_payload("https://relay.test/", &host, &[9; 32], &invite, false);
         let (app, web) = invite_links("https://relay.test/", &json);
         assert!(
             !web.contains('#'),
@@ -1184,6 +1496,14 @@ pub(crate) mod tests {
         assert_eq!(decoded["secret"], json!(invite.secret));
         assert_eq!(decoded["relay"], json!("https://relay.test"));
         assert_eq!(b64url_decode(payload).unwrap(), json.as_bytes());
+        assert!(
+            decoded.get("acct").is_none(),
+            "plain invites stay as they were"
+        );
+        let accounts = invite_payload("https://relay.test/", &host, &[9; 32], &invite, true);
+        let accounts: serde_json::Value = serde_json::from_str(&accounts).unwrap();
+        assert_eq!(accounts["acct"], json!(1));
+        assert_eq!(accounts["secret"], decoded["secret"]);
     }
 
     /// The short-link blob is recorded only on a pending invite, and handed
@@ -1284,7 +1604,7 @@ pub(crate) mod tests {
         for expected in [&first, &second] {
             let hello = json!({"v": 1, "guest_id": expected.guest_id});
             let AdmitOutcome::Returning { guest, .. } =
-                admit_in(&dir.0, &[7; 32], &hello, at(5_000)).unwrap()
+                admit_in(&dir.0, &[7; 32], &hello, &AccountHello::Absent, at(5_000)).unwrap()
             else {
                 panic!("both agent shares must remain usable")
             };
@@ -1292,13 +1612,20 @@ pub(crate) mod tests {
             assert_eq!(guest.grant, expected.grant);
             assert_eq!(guest.share_gram, expected.share_gram);
             assert_eq!(
-                admit_in(&dir.0, &[8; 32], &hello, at(5_000)).unwrap(),
+                admit_in(&dir.0, &[8; 32], &hello, &AccountHello::Absent, at(5_000)).unwrap(),
                 AdmitOutcome::Refused("unknown"),
                 "a grant id does not authorize another device"
             );
         }
         assert_eq!(
-            admit_in(&dir.0, &[7; 32], &json!({"v": 1}), at(5_000)).unwrap(),
+            admit_in(
+                &dir.0,
+                &[7; 32],
+                &json!({"v": 1}),
+                &AccountHello::Absent,
+                at(5_000)
+            )
+            .unwrap(),
             AdmitOutcome::Refused("guest_selection_required")
         );
 
@@ -1308,6 +1635,7 @@ pub(crate) mod tests {
                 &dir.0,
                 &[7; 32],
                 &json!({"v": 1, "guest_id": first.guest_id}),
+                &AccountHello::Absent,
                 at(7_000)
             )
             .unwrap(),
@@ -1317,6 +1645,7 @@ pub(crate) mod tests {
             &dir.0,
             &[7; 32],
             &json!({"v": 1, "guest_id": second.guest_id}),
+            &AccountHello::Absent,
             at(7_000),
         )
         .unwrap() else {
@@ -1351,6 +1680,7 @@ pub(crate) mod tests {
                 &dir.0,
                 &[7; 32],
                 &json!({"v": 1, "invite_id": invite.record.invite_id, "secret": secret}),
+                &AccountHello::Absent,
                 at(2_000),
             )
             .unwrap();
@@ -1366,6 +1696,7 @@ pub(crate) mod tests {
             &dir.0,
             &[7; 32],
             &json!({"v": 1, "invite_id": invite.record.invite_id, "secret": forged}),
+            &AccountHello::Absent,
             invite.record.expires_ms + 1,
         )
         .unwrap();
@@ -1380,7 +1711,7 @@ pub(crate) mod tests {
         let dir = TempDir::new("returning");
         let hello = json!({"v": 1});
         assert_eq!(
-            admit_in(&dir.0, &[9; 32], &hello, at(1_000)).unwrap(),
+            admit_in(&dir.0, &[9; 32], &hello, &AccountHello::Absent, at(1_000)).unwrap(),
             AdmitOutcome::Refused("unknown")
         );
         let invite = invite(&dir.0, at(1_000));
@@ -1389,7 +1720,7 @@ pub(crate) mod tests {
             panic!("accepts");
         };
         let AdmitOutcome::Returning { guest: back, .. } =
-            admit_in(&dir.0, &[9; 32], &hello, at(3_000)).unwrap()
+            admit_in(&dir.0, &[9; 32], &hello, &AccountHello::Absent, at(3_000)).unwrap()
         else {
             panic!("returning guest admitted");
         };
@@ -1400,10 +1731,10 @@ pub(crate) mod tests {
                 .is_some()
         );
         assert_eq!(
-            admit_in(&dir.0, &[9; 32], &hello, at(4_000)).unwrap(),
+            admit_in(&dir.0, &[9; 32], &hello, &AccountHello::Absent, at(4_000)).unwrap(),
             AdmitOutcome::Refused("revoked")
         );
-        assert!(is_revoked(&dir.0, &guest.guest_id));
+        assert!(is_revoked(&dir.0, &guest.guest_id, &guest.fingerprint));
     }
 
     #[test]
@@ -1420,7 +1751,7 @@ pub(crate) mod tests {
             .map(|tick| tick * 20_000)
             .filter(|offset| {
                 matches!(
-                    admit_in(&dir.0, &[2; 32], &hello, at(*offset)).unwrap(),
+                    admit_in(&dir.0, &[2; 32], &hello, &AccountHello::Absent, at(*offset)).unwrap(),
                     AdmitOutcome::Returning {
                         connected: true,
                         ..
@@ -1457,7 +1788,14 @@ pub(crate) mod tests {
         ));
         assert!(!link_wanted_in(&dir.0, revoked_at + REVOKED_LINK_GRACE_MS));
         assert_eq!(
-            admit_in(&dir.0, &[1; 32], &json!({"v": 1}), revoked_at + 1).unwrap(),
+            admit_in(
+                &dir.0,
+                &[1; 32],
+                &json!({"v": 1}),
+                &AccountHello::Absent,
+                revoked_at + 1
+            )
+            .unwrap(),
             AdmitOutcome::Refused("revoked")
         );
     }
@@ -1498,8 +1836,8 @@ pub(crate) mod tests {
         else {
             panic!("accepts");
         };
-        assert!(is_revoked(&dir.0, &old.guest_id));
-        assert!(!is_revoked(&dir.0, &new.guest_id));
+        assert!(is_revoked(&dir.0, &old.guest_id, &old.fingerprint));
+        assert!(!is_revoked(&dir.0, &new.guest_id, &new.fingerprint));
         assert_eq!(replaced, vec![old.guest_id]);
     }
 

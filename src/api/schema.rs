@@ -103,6 +103,7 @@ operations::define_operations! {
     GuestList(GuestListParams) => "guest.list", false, false;
     GuestRevoke(GuestRevokeParams) => "guest.revoke", false, false;
     GuestUpdate(GuestUpdateParams) => "guest.update", false, false;
+    GuestRemoveDevice(GuestRemoveDeviceParams) => "guest.remove_device", false, false;
     GuestAudit(GuestAuditParams) => "guest.audit", false, false;
     /// Internal only: resolve an agent and its live-agent check for the guest gate.
     #[serde(skip)]

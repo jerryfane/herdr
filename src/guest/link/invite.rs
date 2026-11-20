@@ -4,18 +4,14 @@
 //! messengers cut off), so the relay sees it whenever the link is opened
 //! through it: the stored copy is encrypted, the link is not end-to-end.
 //! Requests are one-shot HTTP/1.1 over the same rustls setup as the host
-//! socket, bounded by [`TIMEOUT`] from DNS to the status line.
+//! socket ([`super::https`]), bounded by [`TIMEOUT`] from DNS to the status line.
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io;
+use std::time::Duration;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, NONCE_LEN};
-use tungstenite::http::Uri;
 
-use super::relay;
+use super::https::{self, Body, Endpoint};
 use crate::guest::store::{b64url, random_bytes, HostIdentity};
 
 /// Random bytes in a blob id: 12 base64url characters.
@@ -27,8 +23,6 @@ const TAG_LEN: usize = 16;
 const MAX_BLOB: usize = 2048;
 /// Whole-request bound: the owner waits on it for the invite reply.
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// The status line must arrive within this many bytes.
-const MAX_RESPONSE_HEAD: usize = 8 * 1024;
 
 /// A sealed invite stored on the relay.
 pub(crate) struct Published {
@@ -127,49 +121,6 @@ pub(crate) fn delete(relay_url: &str, host: &HostIdentity, id: &str) -> Result<(
     }
 }
 
-/// Where `/v1/invite/{id}` lives on the relay. Production relays use TLS;
-/// tests also accept a plain `http://` stub.
-struct Endpoint {
-    tls: bool,
-    /// Host name or address, without IPv6 brackets.
-    host: String,
-    port: u16,
-    authority: String,
-    path: String,
-}
-
-impl Endpoint {
-    fn new(relay_url: &str, id: &str) -> Result<Self, String> {
-        let invalid = || format!("relay_url {relay_url:?} is not an https:// URL");
-        let uri: Uri = relay_url
-            .trim_end_matches('/')
-            .parse()
-            .map_err(|_| invalid())?;
-        let tls = match uri.scheme_str() {
-            Some("https") => true,
-            Some("http") if cfg!(test) => false,
-            _ => return Err(invalid()),
-        };
-        let authority = uri.authority().ok_or_else(invalid)?.as_str().to_owned();
-        if authority.contains('@') || uri.query().is_some() {
-            return Err(invalid());
-        }
-        let host = uri
-            .host()
-            .ok_or_else(invalid)?
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
-        Ok(Self {
-            tls,
-            port: uri.port_u16().unwrap_or(if tls { 443 } else { 80 }),
-            path: format!("{}/v1/invite/{id}", uri.path().trim_end_matches('/')),
-            host,
-            authority,
-        })
-    }
-}
-
 /// One host-authenticated request; the HTTP status.
 fn send(
     relay_url: &str,
@@ -186,7 +137,7 @@ fn send(
     if !is_b64url(&host.host_id) || !is_b64url(&host.relay_secret) {
         return Err("host identity is not base64url".into());
     }
-    let endpoint = Endpoint::new(relay_url, id)?;
+    let endpoint = Endpoint::new("relay_url", relay_url, &format!("/v1/invite/{id}"))?;
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nX-Herdr-Host: {}\r\n",
         endpoint.path, endpoint.authority, host.relay_secret, host.host_id
@@ -200,119 +151,17 @@ fn send(
     ));
     let mut request = request.into_bytes();
     request.extend_from_slice(body);
-    exchange(endpoint, request)
-}
-
-/// Runs the request on a helper thread, since DNS cannot be given a timeout.
-/// A lookup that outlives the deadline finishes in the background and its
-/// result is discarded.
-fn exchange(endpoint: Endpoint, request: Vec<u8>) -> Result<u16, String> {
-    let deadline = Instant::now() + TIMEOUT;
-    let (sender, receiver) = mpsc::channel();
-    thread::Builder::new()
-        .name("herdr-guest-invite".into())
-        .spawn(move || {
-            let _ = sender.send(exchange_blocking(&endpoint, &request, deadline));
-        })
-        .map_err(|error| format!("relay unreachable: {error}"))?;
-    receiver
-        .recv_timeout(TIMEOUT)
-        .unwrap_or_else(|_| Err("relay timed out".into()))
-}
-
-fn exchange_blocking(
-    endpoint: &Endpoint,
-    request: &[u8],
-    deadline: Instant,
-) -> Result<u16, String> {
-    let tcp = relay::connect_blocking(&endpoint.host, endpoint.port, deadline)
-        .map_err(|error| format!("relay unreachable: {error}"))?;
-    let stream = Bounded { tcp, deadline };
-    if !endpoint.tls {
-        return status(stream, request);
-    }
-    let name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())
-        .map_err(|_| "relay host is not a TLS server name".to_string())?;
-    let connection = rustls::ClientConnection::new(relay::tls_config()?, name)
-        .map_err(|error| format!("tls setup: {error}"))?;
-    status(rustls::StreamOwned::new(connection, stream), request)
-}
-
-/// Writes the request and reads up to the status line; the rest of the
-/// response is never read.
-fn status(mut stream: impl Read + Write, request: &[u8]) -> Result<u16, String> {
-    stream
-        .write_all(request)
-        .and_then(|()| stream.flush())
-        .map_err(|error| format!("relay write: {error}"))?;
-    let mut head = Vec::new();
-    let mut buffer = [0u8; 512];
-    loop {
-        if let Some(end) = head.windows(2).position(|pair| pair == b"\r\n") {
-            return parse_status(&head[..end]).ok_or_else(|| "relay sent no HTTP status".into());
-        }
-        if head.len() >= MAX_RESPONSE_HEAD {
-            return Err("relay sent no HTTP status".into());
-        }
-        let read = stream
-            .read(&mut buffer)
-            .map_err(|error| format!("relay read: {error}"))?;
-        if read == 0 {
-            return Err("relay closed the connection".into());
-        }
-        head.extend_from_slice(&buffer[..read]);
-    }
-}
-
-fn parse_status(line: &[u8]) -> Option<u16> {
-    let line = std::str::from_utf8(line).ok()?;
-    let mut parts = line.split(' ');
-    if !parts.next()?.starts_with("HTTP/1.") {
-        return None;
-    }
-    let code = parts.next()?;
-    (code.len() == 3).then(|| code.parse().ok()).flatten()
-}
-
-/// A socket whose every read and write is bounded by what is left of the
-/// request's deadline.
-struct Bounded {
-    tcp: TcpStream,
-    deadline: Instant,
-}
-
-impl Bounded {
-    fn left(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out"))
-    }
-}
-
-impl Read for Bounded {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.tcp.set_read_timeout(Some(self.left()?))?;
-        self.tcp.read(buf)
-    }
-}
-
-impl Write for Bounded {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.tcp.set_write_timeout(Some(self.left()?))?;
-        self.tcp.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.tcp.flush()
-    }
+    https::exchange("relay", endpoint, request, Body::Ignore, TIMEOUT)
+        .map(|response| response.status)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
-    use std::io::{BufRead as _, BufReader};
-    use std::net::TcpListener;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
 
     use super::*;
     use crate::guest::store::b64url_decode;

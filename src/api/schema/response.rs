@@ -366,12 +366,20 @@ pub enum ResponseResult {
         guest_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invite_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<String>,
         /// Live guest streams closed by this revoke.
         closed_streams: usize,
     },
     /// The guest after `guest.update`.
     GuestUpdated {
         guest: super::guest::GuestInfo,
+    },
+    /// The share after `guest.remove_device`.
+    GuestDeviceRemoved {
+        guest: super::guest::GuestInfo,
+        /// Live guest streams of that device closed by the removal.
+        closed_streams: usize,
     },
     GuestAudit {
         entries: Vec<super::guest::GuestAuditEntry>,
