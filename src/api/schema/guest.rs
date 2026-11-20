@@ -48,14 +48,30 @@ pub struct GuestListParams {
     pub machine: Option<String>,
 }
 
-/// `guest.revoke`: exactly one of `guest_id` or `invite_id`. Revoking a guest
-/// closes its live sessions immediately.
+/// `guest.revoke`: exactly one of `guest_id`, `invite_id` or `person`.
+/// Revoking a guest closes its live sessions immediately; `person` revokes
+/// every share of one person at once (a `person` from `guest.list`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestRevokeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// `guest.remove_device`: drop one device from an account-bound share for
+/// good, closing its live sessions. The person's other devices keep the
+/// share, and no statement brings the removed device back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GuestRemoveDeviceParams {
+    pub guest_id: String,
+    /// The device's fingerprint, from `guest.list` (`fingerprint` or a
+    /// `devices[].fingerprint`).
+    pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }
@@ -140,6 +156,29 @@ pub struct GuestInfo {
     /// `created_ms` on, with its files and push notifications.
     #[serde(default)]
     pub share_gram: bool,
+    /// The guest bound this share to their HerdrUp account, so each of their
+    /// devices may use it ("on all my devices").
+    #[serde(default)]
+    pub account_bound: bool,
+    /// Who the share belongs to, for grouping and `guest.revoke {person}`:
+    /// the account's id on this host when account-bound, else `fingerprint`.
+    #[serde(default)]
+    pub person: String,
+    /// Devices the person added to an account-bound share after the one
+    /// that accepted (`fingerprint`, `device`), including removed ones.
+    #[serde(default)]
+    pub devices: Vec<GuestDeviceInfo>,
+}
+
+/// One more device of an account-bound share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GuestDeviceInfo {
+    pub fingerprint: String,
+    pub device: String,
+    pub added_ms: u64,
+    pub last_seen_ms: Option<u64>,
+    /// The owner removed it (`guest.remove_device`); it is refused for good.
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -171,6 +210,11 @@ pub enum GuestAuditEvent {
     Resumed,
     /// The guest opened a shared Gram's file.
     GramFile,
+    /// The person added a device to an account-bound share (`text` is its
+    /// name, `fingerprint` the device's).
+    DeviceAdded,
+    /// The owner removed a device from an account-bound share.
+    DeviceRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

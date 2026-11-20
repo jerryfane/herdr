@@ -1,6 +1,8 @@
 //! Guest sessions: one per relay OPEN. A session thread runs the Noise
 //! responder and admission, then pumps decrypted guest bytes into the API
-//! stream while a second thread encrypts the API's output back out.
+//! stream while a second thread encrypts the API's output back out. An
+//! account-bound session also ends at its statement deadline unless the guest
+//! sends a newer statement in-band (`account.refresh`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -9,15 +11,35 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tracing::debug;
 
 use super::frame;
-use super::host::{Admission, GuestHost};
+use super::host::{AccountSession, Admission, GuestHost};
 use super::noise::{Responder, ResponderKeys, Transport, MAX_MESSAGE, MAX_PLAINTEXT};
 use super::Waker;
+
+/// Largest in-band `account.refresh` message; statements are about 430 bytes.
+const MAX_REFRESH: usize = 8 * 1024;
+
+/// `{"t":"account.refresh","account":"<jws>"}`: one whole transport message
+/// of an account-bound session, never forwarded to the API.
+#[derive(serde::Deserialize)]
+struct Refresh {
+    t: String,
+    account: String,
+}
+
+/// The statement in an in-band refresh message, or `None` for API bytes.
+fn refresh_statement(plaintext: &[u8]) -> Option<String> {
+    if plaintext.len() > MAX_REFRESH || plaintext.first() != Some(&b'{') {
+        return None;
+    }
+    let refresh: Refresh = serde_json::from_slice(plaintext).ok()?;
+    (refresh.t == "account.refresh").then_some(refresh.account)
+}
 
 /// Live sessions per host socket; the relay enforces the same cap.
 pub(super) const MAX_SESSIONS: usize = 32;
@@ -262,8 +284,8 @@ impl<H: GuestHost> Session<H> {
                 return;
             }
         };
-        let (transport, principal) = admitted;
-        if let Err(reason) = self.serve(Arc::new(transport), principal) {
+        let (transport, principal, account) = admitted;
+        if let Err(reason) = self.serve(Arc::new(transport), principal, account) {
             // Close before ending the stream, so the reason wins over the
             // pump's plain close on EOF.
             self.close(reason);
@@ -272,7 +294,7 @@ impl<H: GuestHost> Session<H> {
     }
 
     /// Reads message 1, asks the host, and answers with message 2.
-    fn handshake(&self) -> Result<(Transport, H::Principal), &'static str> {
+    fn handshake(&self) -> Result<(Transport, H::Principal, Option<AccountSession>), &'static str> {
         let message = match self.inbound.recv_timeout(self.handshake_timeout) {
             Ok(message) => message,
             Err(RecvTimeoutError::Timeout) => return Err("handshake_timeout"),
@@ -284,12 +306,16 @@ impl<H: GuestHost> Session<H> {
             error.close_reason()
         })?;
         match self.host.admit(hello.device_pub, &hello.payload) {
-            Admission::Admitted { principal, reply } => {
+            Admission::Admitted {
+                principal,
+                reply,
+                account,
+            } => {
                 let (message, transport) = responder
                     .reply(&reply)
                     .map_err(|error| error.close_reason())?;
                 self.send_data(frame::data(self.id, &message))?;
-                Ok((transport, principal))
+                Ok((transport, principal, account))
             }
             Admission::Refused(code) => {
                 let reply = serde_json::json!({ "ok": false, "error": code });
@@ -309,14 +335,19 @@ impl<H: GuestHost> Session<H> {
         &self,
         transport: Arc<Transport>,
         principal: H::Principal,
+        mut account: Option<AccountSession>,
     ) -> Result<(), &'static str> {
-        let first = match self.inbound.recv_timeout(self.handshake_timeout) {
-            Ok(message) => message,
-            Err(RecvTimeoutError::Timeout) => return Err("request_timeout"),
-            Err(RecvTimeoutError::Disconnected) => return Err("closed"),
-        };
         let mut plaintext = vec![0; MAX_MESSAGE];
-        let len = self.decrypt(&transport, &first, &mut plaintext)?;
+        let len = loop {
+            let Some(message) = self.receive(Some(self.handshake_timeout), account.as_ref())?
+            else {
+                return Err("closed");
+            };
+            let len = self.decrypt(&transport, &message, &mut plaintext)?;
+            if !self.refreshed(&mut account, &plaintext[..len])? {
+                break len;
+            }
+        };
 
         let (mut ours, theirs) = UnixStream::pair().map_err(|_| "internal")?;
         if !self.shared.attach(&ours) {
@@ -348,23 +379,83 @@ impl<H: GuestHost> Session<H> {
             // The API side ended; the pump reports it.
             return Ok(());
         }
-        self.forward(&transport, ours, plaintext)
+        self.forward(&transport, ours, plaintext, account)
     }
 
-    /// Decrypts guest messages into the API stream until either side ends.
+    /// Decrypts guest messages into the API stream until either side ends,
+    /// or an account-bound session reaches its statement deadline.
     fn forward(
         &self,
         transport: &Transport,
         mut ours: UnixStream,
         mut plaintext: Vec<u8>,
+        mut account: Option<AccountSession>,
     ) -> Result<(), &'static str> {
-        for message in &self.inbound {
+        while let Some(message) = self.receive(None, account.as_ref())? {
             let len = self.decrypt(transport, &message, &mut plaintext)?;
+            if self.refreshed(&mut account, &plaintext[..len])? {
+                continue;
+            }
             if ours.write_all(&plaintext[..len]).is_err() {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// The next guest message, waiting at most `wait` (without limit when
+    /// `None`) and never past an account-bound session's deadline, which ends
+    /// it with `statement_expired`. `None` once the relay side is gone.
+    fn receive(
+        &self,
+        wait: Option<Duration>,
+        account: Option<&AccountSession>,
+    ) -> Result<Option<Bytes>, &'static str> {
+        let now = Instant::now();
+        let deadline = account.map(|account| now + account.left());
+        let until = match (wait.map(|wait| now + wait), deadline) {
+            (Some(wait), Some(deadline)) => Some(wait.min(deadline)),
+            (wait, deadline) => wait.or(deadline),
+        };
+        let received = match until {
+            None => self
+                .inbound
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+            Some(until) => self
+                .inbound
+                .recv_timeout(until.saturating_duration_since(Instant::now())),
+        };
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        match received {
+            Ok(_) | Err(RecvTimeoutError::Timeout) if expired() => {
+                Err(crate::guest::account::codes::EXPIRED)
+            }
+            Ok(message) => Ok(Some(message)),
+            Err(RecvTimeoutError::Timeout) => Err("request_timeout"),
+            Err(RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+
+    /// Handles `plaintext` when it is an account-bound session's in-band
+    /// `{"t":"account.refresh","account":"<jws>"}` message, which never
+    /// reaches the API: a valid statement moves the deadline, any other ends
+    /// the session with the host's code. `false` for API bytes.
+    fn refreshed(
+        &self,
+        account: &mut Option<AccountSession>,
+        plaintext: &[u8],
+    ) -> Result<bool, &'static str> {
+        let Some(session) = account.as_mut() else {
+            return Ok(false);
+        };
+        let Some(jws) = refresh_statement(plaintext) else {
+            return Ok(false);
+        };
+        let deadline_ms = self.host.refresh_account(session, &jws)?;
+        session.deadline_ms = deadline_ms;
+        debug!("guest session {}: account statement refreshed", self.id);
+        Ok(true)
     }
 
     /// A message that fails to decrypt (tampered, replayed or reordered) ends

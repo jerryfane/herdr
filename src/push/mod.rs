@@ -42,6 +42,9 @@ pub(crate) enum PushKind {
     Died,
     /// An agent sent the owner a gram message.
     Gram,
+    /// A guest added a device to an account-bound share. A security notice
+    /// for the owner: sent to every registered device, whatever its prefs.
+    GuestDevice,
 }
 
 /// One agent-state transition to deliver as an APNs alert. `pane_id` and
@@ -174,6 +177,7 @@ fn device_wants(device: &RegisteredDevice, kind: PushKind) -> bool {
         PushKind::Finished => device.notify_finishes,
         PushKind::Died => device.notify_dies,
         PushKind::Gram => device.notify_gram,
+        PushKind::GuestDevice => true,
     }
 }
 

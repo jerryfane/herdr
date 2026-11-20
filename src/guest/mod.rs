@@ -1,12 +1,17 @@
 //! Guest access: one outside person uses one shared agent through the HerdrUp
 //! guest relay. This module owns the guest store, invites, admission, the
 //! audit log and the live-session registry. The relay client lives in `link`;
-//! the per-request gate lives in `crate::api::server::guest_gate`.
+//! the per-request gate lives in `crate::api::server::guest_gate`. A guest may
+//! bind a share to their HerdrUp account to use it from each of their devices
+//! ([`account`]).
 //!
 //! The interface functions below are the contract with `link`, which is the
-//! only production caller of `host_info`, `link_wanted`, `admit`, `serve` and
-//! `subscribe_changes`.
+//! only production caller of `host_info`, `link_wanted`, `admit`, `serve`,
+//! `refresh_account` and `subscribe_changes`.
 
+pub(crate) mod account;
+#[cfg(test)]
+mod account_tests;
 pub(crate) mod audit;
 pub(crate) mod gram;
 pub(crate) mod link;
@@ -26,7 +31,7 @@ use crate::api::schema::{
     AgentInfo, GuestAuditEntry, GuestAuditEvent, GuestAuditFile, GuestGrantInfo, GuestInfo,
     GuestInviteInfo, GuestLinkInfo, GuestLinkState,
 };
-use store::{AdmitOutcome, RevokeTarget, Revoked, ShortInvite};
+use store::{AccountHello, AdmitOutcome, DeviceRemoval, RevokeTarget, Revoked, ShortInvite};
 
 pub struct GuestHostInfo {
     pub host_id: String,
@@ -115,13 +120,31 @@ impl GuestPrincipal {
         }
     }
 
+    /// `record` as used from the device with `fingerprint`: the redeeming
+    /// device, or another device of an account-bound share's person.
+    fn on_device(record: &store::GuestRecord, dir: PathBuf, fingerprint: String) -> Self {
+        Self {
+            fingerprint,
+            ..Self::from_record(record, dir)
+        }
+    }
+
     /// This guest with its grant and rename history as stored now, as a new
     /// connection's admission would read them; `None` once the guest was
-    /// revoked or removed, or its record holds another device's key.
+    /// revoked or removed, its record holds another device's key, or the
+    /// owner removed this device from the share.
     pub(crate) fn current(&self) -> Option<Self> {
         let record = store::active_record(&self.dir, &self.guest_id)?;
-        (record.fingerprint == self.fingerprint)
-            .then(|| Self::from_record(&record, self.dir.clone()))
+        record
+            .admits_fingerprint(&self.fingerprint)
+            .then(|| Self::on_device(&record, self.dir.clone(), self.fingerprint.clone()))
+    }
+
+    /// Registers this connection as live, so revoking the guest (or removing
+    /// this device) closes it.
+    pub(crate) fn register_live(&self) -> LiveSession {
+        let device = device_live_key(&self.guest_id, &self.fingerprint);
+        register_live_keys(&[self.guest_id.as_str(), device.as_str()])
     }
 
     /// Whether the guest shares the agent's Gram now. Read from the store on
@@ -387,11 +410,30 @@ pub(crate) fn follow_recreated_agents(
 // Short-lived per-connection value; the contract shape stays unboxed.
 #[allow(clippy::large_enum_variant)]
 pub enum Admission {
+    /// `account` is set for an account-bound share (see [`AccountSession`]).
     Admitted {
         principal: GuestPrincipal,
         reply: serde_json::Value,
+        account: Option<AccountSession>,
     },
     Refused(&'static str),
+}
+
+/// An admitted account-bound session: it ends at `deadline_ms` unless the
+/// guest sends a newer statement in-band ([`refresh_account`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSession {
+    pub(crate) guest_id: String,
+    pub(crate) device_pub: [u8; 32],
+    /// Unix ms: the statement's `exp` plus the allowed skew.
+    pub(crate) deadline_ms: u64,
+}
+
+impl AccountSession {
+    /// Time left until the deadline.
+    pub(crate) fn left(&self) -> Duration {
+        Duration::from_millis(self.deadline_ms.saturating_sub(store::now_ms()))
+    }
 }
 
 /// Message-1 payload in, message-2 payload out.
@@ -400,14 +442,64 @@ pub(crate) fn admit(device_pub: [u8; 32], hello: &serde_json::Value) -> Admissio
 }
 
 pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::Value) -> Admission {
-    let outcome = match store::admit_in(&dir, &device_pub, hello, store::now_ms()) {
+    admit_with(dir, &account::Env::PRODUCTION, device_pub, hello)
+}
+
+/// Checks a hello's `account` statement for this host and device. Absent
+/// for a plain hello, which never reads the account settings or keys.
+fn account_hello(
+    dir: &std::path::Path,
+    env: &account::Env<'_>,
+    device_pub: &[u8; 32],
+    hello: &serde_json::Value,
+    now: u64,
+) -> AccountHello {
+    let jws = match hello.get("account") {
+        None | Some(serde_json::Value::Null) => return AccountHello::Absent,
+        Some(serde_json::Value::String(jws)) => jws,
+        Some(_) => return AccountHello::Refused(account::codes::INVALID),
+    };
+    let settings = (env.settings)();
+    if !settings.enabled {
+        return AccountHello::Refused(account::codes::DISABLED);
+    }
+    let host = match store::load_host(dir) {
+        Ok((host, _)) => host,
+        Err(err) => {
+            tracing::warn!(err = %err, "guest host identity unavailable; refusing statement");
+            return AccountHello::Refused(account::codes::INVALID);
+        }
+    };
+    match account::check(
+        dir,
+        &settings,
+        env.fetch_keys,
+        &host.host_id,
+        device_pub,
+        jws,
+        now,
+    ) {
+        Ok(verified) => AccountHello::Verified(verified),
+        Err(code) => AccountHello::Refused(code),
+    }
+}
+
+pub(crate) fn admit_with(
+    dir: PathBuf,
+    env: &account::Env<'_>,
+    device_pub: [u8; 32],
+    hello: &serde_json::Value,
+) -> Admission {
+    let now = store::now_ms();
+    let statement = account_hello(&dir, env, &device_pub, hello, now);
+    let outcome = match store::admit_in(&dir, &device_pub, hello, &statement, now) {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::warn!(err = %err, "guest store unavailable; refusing guest");
             return Admission::Refused("unknown");
         }
     };
-    let (record, event) = match outcome {
+    let (record, event, added) = match outcome {
         AdmitOutcome::Refused(error) => return Admission::Refused(error),
         AdmitOutcome::Accepted {
             guest,
@@ -424,17 +516,41 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
                 delete_short_invite(&dir, short);
             }
             notify_changes();
-            (guest, Some(GuestAuditEvent::Accepted))
+            (guest, Some(GuestAuditEvent::Accepted), None)
         }
-        AdmitOutcome::Returning { guest, connected } => {
-            (guest, connected.then_some(GuestAuditEvent::Connected))
-        }
+        AdmitOutcome::Returning {
+            guest,
+            connected,
+            added,
+        } => (
+            guest,
+            connected.then_some(GuestAuditEvent::Connected),
+            added,
+        ),
     };
-    let principal = GuestPrincipal::from_record(&record, dir);
+    let principal = GuestPrincipal::on_device(&record, dir, store::fingerprint(&device_pub));
+    if let Some(device) = &added {
+        principal.audit(
+            GuestAuditEvent::DeviceAdded,
+            None,
+            (!device.device.is_empty()).then(|| device.device.clone()),
+            None,
+        );
+        (env.notify_owner)(device_added_alert(&record, device));
+        notify_changes();
+    }
     if let Some(event) = event {
         principal.audit(event, None, None, None);
     }
-    let reply = serde_json::json!({
+    let account = match (&record.account, &statement) {
+        (Some(_), AccountHello::Verified(verified)) => Some(AccountSession {
+            guest_id: record.guest_id.clone(),
+            device_pub,
+            deadline_ms: verified.deadline_ms,
+        }),
+        _ => None,
+    };
+    let mut reply = serde_json::json!({
         "ok": true,
         "guest_id": record.guest_id,
         "name": record.name,
@@ -445,7 +561,67 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
         // reply (see `serve_session` in the API's guest gate).
         "features": {"gram": record.share_gram, "push": true, "multi_request": true},
     });
-    Admission::Admitted { principal, reply }
+    // An account-bound session ends at this deadline unless the guest sends
+    // `{"t":"account.refresh","account":"<jws>"}` before it.
+    if let Some(session) = &account {
+        reply["account"] = serde_json::json!({"deadline_unix": session.deadline_ms / 1000});
+    }
+    Admission::Admitted {
+        principal,
+        reply,
+        account,
+    }
+}
+
+/// The owner's alert for a device a person added to an account-bound share.
+fn device_added_alert(
+    record: &store::GuestRecord,
+    device: &store::AccountDevice,
+) -> crate::push::PushNotification {
+    let agent = record
+        .grant
+        .agent_name
+        .as_deref()
+        .unwrap_or(&record.grant.terminal_id);
+    let device_name = if device.device.is_empty() {
+        "A new device"
+    } else {
+        device.device.as_str()
+    };
+    crate::push::PushNotification {
+        title: format!("{} added a device", record.name),
+        body: format!("{device_name} ({}) can now use {agent}", device.fingerprint),
+        pane_id: String::new(),
+        workspace_id: String::new(),
+        kind: crate::push::PushKind::GuestDevice,
+        guest_scope: None,
+        ask_source: None,
+        ask: None,
+        turn_origin: None,
+    }
+}
+
+/// `account.refresh` on a live account-bound session: the new deadline when
+/// the statement is valid for the session's account and device and the
+/// device is still on the share, else the code that ends the session.
+pub(crate) fn refresh_account(session: &AccountSession, jws: &str) -> Result<u64, &'static str> {
+    refresh_account_in(&store::guest_dir(), &account::Env::PRODUCTION, session, jws)
+}
+
+pub(crate) fn refresh_account_in(
+    dir: &std::path::Path,
+    env: &account::Env<'_>,
+    session: &AccountSession,
+    jws: &str,
+) -> Result<u64, &'static str> {
+    let hello = serde_json::json!({ "account": jws });
+    let verified = match account_hello(dir, env, &session.device_pub, &hello, store::now_ms()) {
+        AccountHello::Verified(verified) => verified,
+        AccountHello::Refused(code) => return Err(code),
+        AccountHello::Absent => return Err(account::codes::REQUIRED),
+    };
+    store::account_session_holds(dir, &session.guest_id, &session.device_pub, &verified)?;
+    Ok(verified.deadline_ms)
 }
 
 /// Run one API connection as `principal`. Blocks until the connection's
@@ -532,15 +708,25 @@ pub(crate) fn subscribe_changes() -> mpsc::Receiver<()> {
     rx
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`notify_changes`] calls made on this thread: subscribers are global,
+    /// so tests running in parallel count their own notifications here.
+    pub(crate) static NOTIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn notify_changes() {
+    #[cfg(test)]
+    NOTIFIED.with(|count| count.set(count.get() + 1));
     SUBSCRIBERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .retain(|subscriber| subscriber.send(()).is_ok());
 }
 
-/// Live guest connections per guest id. Revoke trips every flag; gates and
-/// stream watchers check theirs and close with `guest_revoked`.
+/// Live guest connections per guest id, and per guest device
+/// ([`device_live_key`]). Revoke trips every flag; gates and stream watchers
+/// check theirs and close with `guest_revoked`.
 static LIVE: Mutex<Option<HashMap<String, Vec<Weak<AtomicBool>>>>> = Mutex::new(None);
 
 pub(crate) struct LiveSession {
@@ -553,27 +739,44 @@ impl LiveSession {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn register_live(guest_id: &str) -> LiveSession {
+    register_live_keys(&[guest_id])
+}
+
+/// The live-registry key of one device of a guest.
+fn device_live_key(guest_id: &str, fingerprint: &str) -> String {
+    format!("{guest_id}\n{fingerprint}")
+}
+
+/// One live connection, closed by revoking any of `keys`.
+fn register_live_keys(keys: &[&str]) -> LiveSession {
     let revoked = Arc::new(AtomicBool::new(false));
     let mut live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let sessions = live
-        .get_or_insert_with(HashMap::new)
-        .entry(guest_id.to_string())
-        .or_default();
-    sessions.retain(|session| session.strong_count() > 0);
-    sessions.push(Arc::downgrade(&revoked));
+    let live = live.get_or_insert_with(HashMap::new);
+    // Drop ended connections, and keys (guests, devices) with none left.
+    live.retain(|_, sessions| {
+        sessions.retain(|session| session.strong_count() > 0);
+        !sessions.is_empty()
+    });
+    for key in keys {
+        live.entry((*key).to_string())
+            .or_default()
+            .push(Arc::downgrade(&revoked));
+    }
     LiveSession { revoked }
 }
 
-fn revoke_live(guest_id: &str) -> usize {
+/// Closes the live connections registered under `key`; returns how many.
+fn revoke_live(key: &str) -> usize {
     let mut live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(sessions) = live.as_mut().and_then(|live| live.remove(guest_id)) else {
+    let Some(sessions) = live.as_mut().and_then(|live| live.remove(key)) else {
         return 0;
     };
     sessions
         .iter()
         .filter_map(Weak::upgrade)
-        .inspect(|flag| flag.store(true, Ordering::Release))
+        .filter(|flag| !flag.swap(true, Ordering::AcqRel))
         .count()
 }
 
@@ -584,19 +787,24 @@ fn io_error(err: std::io::Error) -> OwnerError {
     ("guest_store_failed", err.to_string())
 }
 
-/// The relay a new invite's links point at, and how long its short link
-/// waits for the relay link to come up.
+/// The relay a new invite's links point at, how long its short link waits
+/// for the relay link to come up, and whether the invite offers binding the
+/// share to the guest's account (`acct: 1`).
 pub(crate) struct InviteRelay {
     pub url: String,
     pub link_wait: Duration,
+    pub accounts: bool,
 }
 
 impl InviteRelay {
-    /// `[guest] relay_url`, waiting [`SHORT_INVITE_LINK_WAIT`].
+    /// `[guest] relay_url` and `[guest] accounts`, waiting
+    /// [`SHORT_INVITE_LINK_WAIT`].
     pub(crate) fn configured() -> Self {
+        let guest = crate::config::Config::load().config.guest;
         Self {
-            url: crate::config::Config::load().config.guest.relay_url,
+            url: guest.relay_url,
             link_wait: SHORT_INVITE_LINK_WAIT,
+            accounts: guest.accounts,
         }
     }
 }
@@ -656,14 +864,7 @@ pub(crate) fn create_invite(
     )
     .map_err(io_error)?;
     notify_changes();
-    let (url, web_url) = share_links(
-        &dir,
-        &relay.url,
-        &host,
-        &node_secret,
-        &invite,
-        relay.link_wait,
-    );
+    let (url, web_url) = share_links(&dir, relay, &host, &node_secret, &invite);
     Ok((invite.record.info(), url, web_url))
 }
 
@@ -674,14 +875,19 @@ pub(crate) fn create_invite(
 /// for the link to come up.
 fn share_links(
     dir: &std::path::Path,
-    relay_url: &str,
+    relay: &InviteRelay,
     host: &store::HostIdentity,
     node_secret: &[u8; 32],
     invite: &store::NewInvite,
-    link_wait: Duration,
 ) -> (String, String) {
-    let payload =
-        store::invite_payload(relay_url, host, &store::x25519_public(node_secret), invite);
+    let (relay_url, link_wait) = (relay.url.as_str(), relay.link_wait);
+    let payload = store::invite_payload(
+        relay_url,
+        host,
+        &store::x25519_public(node_secret),
+        invite,
+        relay.accounts,
+    );
     let (url, long_web_url) = store::invite_links(relay_url, &payload);
     if !wait_link_up(link_wait) {
         tracing::warn!("guest relay link is not up; trying the short invite link anyway");
@@ -797,19 +1003,21 @@ pub(crate) fn list() -> Result<(Vec<GuestInfo>, Vec<GuestInviteInfo>, GuestLinkI
     ))
 }
 
-/// Revoke a guest or delete an invite. Returns the live connections closed,
-/// or `None` for an unknown id.
+/// Revoke a guest, every share of a person, or delete an invite. Returns the
+/// live connections closed, or `None` for an unknown id or person.
 pub(crate) fn revoke(
     guest_id: Option<&str>,
     invite_id: Option<&str>,
+    person: Option<&str>,
 ) -> Result<Option<usize>, OwnerError> {
-    let target = match (guest_id, invite_id) {
-        (Some(guest_id), None) => RevokeTarget::Guest(guest_id),
-        (None, Some(invite_id)) => RevokeTarget::Invite(invite_id),
+    let target = match (guest_id, invite_id, person) {
+        (Some(guest_id), None, None) => RevokeTarget::Guest(guest_id),
+        (None, Some(invite_id), None) => RevokeTarget::Invite(invite_id),
+        (None, None, Some(person)) => RevokeTarget::Person(person),
         _ => {
             return Err((
                 "invalid_params",
-                "pass exactly one of guest_id or invite_id".into(),
+                "pass exactly one of guest_id, invite_id or person".into(),
             ))
         }
     };
@@ -824,8 +1032,9 @@ pub(crate) fn revoke_at(
         return Ok(None);
     };
     notify_changes();
-    let record = match revoked {
-        Revoked::Guest(record) => record,
+    let records = match revoked {
+        Revoked::Guest(record) => vec![record],
+        Revoked::Person(records) => records,
         Revoked::Invite(invite) => {
             if let Some(short) = invite.short {
                 delete_short_invite(&dir, short);
@@ -833,10 +1042,65 @@ pub(crate) fn revoke_at(
             return Ok(Some(0));
         }
     };
-    let closed = revoke_live(&record.guest_id);
-    forget_guest(&dir, &record.guest_id);
-    GuestPrincipal::from_record(&record, dir).audit(GuestAuditEvent::Revoked, None, None, None);
+    let mut closed = 0;
+    for record in records {
+        closed += revoke_live(&record.guest_id);
+        forget_guest(&dir, &record.guest_id);
+        GuestPrincipal::from_record(&record, dir.clone()).audit(
+            GuestAuditEvent::Revoked,
+            None,
+            None,
+            None,
+        );
+    }
     Ok(Some(closed))
+}
+
+/// `guest.remove_device`: drop one device from an account-bound share for
+/// good and close its live connections. `Ok(None)` when no active guest has
+/// this id.
+pub(crate) fn remove_device(
+    guest_id: &str,
+    fingerprint: &str,
+) -> Result<Option<(GuestInfo, usize)>, OwnerError> {
+    remove_device_at(&store::guest_dir(), guest_id, fingerprint)
+}
+
+/// Removing a device that was removed before answers success again without
+/// another audit entry or change notification.
+pub(crate) fn remove_device_at(
+    dir: &std::path::Path,
+    guest_id: &str,
+    fingerprint: &str,
+) -> Result<Option<(GuestInfo, usize)>, OwnerError> {
+    let removal =
+        store::remove_device_in(dir, guest_id, fingerprint, store::now_ms()).map_err(io_error)?;
+    let record = match removal {
+        DeviceRemoval::Removed(record) => record,
+        DeviceRemoval::AlreadyRemoved(record) => return Ok(Some((record.info(), 0))),
+        DeviceRemoval::UnknownGuest => return Ok(None),
+        DeviceRemoval::UnknownDevice => {
+            return Err((
+                "guest_device_not_found",
+                "this guest has no device with that fingerprint".into(),
+            ))
+        }
+        DeviceRemoval::PlainShare => {
+            return Err((
+                "guest_not_account_bound",
+                "this share is bound to one device; revoke the guest instead".into(),
+            ))
+        }
+    };
+    notify_changes();
+    let closed = revoke_live(&device_live_key(guest_id, fingerprint));
+    GuestPrincipal::on_device(&record, dir.to_path_buf(), fingerprint.to_owned()).audit(
+        GuestAuditEvent::DeviceRemoved,
+        None,
+        None,
+        None,
+    );
+    Ok(Some((record.info(), closed)))
 }
 
 /// Drop a revoked guest's push devices and Gram read marks.
@@ -974,6 +1238,7 @@ mod tests {
         let relay = InviteRelay {
             url: stub.url.clone(),
             link_wait: Duration::ZERO,
+            accounts: false,
         };
         let (invite, url, _) = create_invite(
             &agent(),
@@ -1044,7 +1309,11 @@ mod tests {
         )
         .unwrap();
         let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
-        let Admission::Admitted { principal, reply } = admit_in(dir.0.clone(), [3; 32], &hello)
+        let Admission::Admitted {
+            principal,
+            reply,
+            account: None,
+        } = admit_in(dir.0.clone(), [3; 32], &hello)
         else {
             panic!("accepted");
         };
@@ -1190,7 +1459,12 @@ mod tests {
         link_wait: Duration,
     ) -> (String, String) {
         let (host, node_secret) = store::load_host(dir).unwrap();
-        share_links(dir, relay_url, &host, &node_secret, invite, link_wait)
+        let relay = InviteRelay {
+            url: relay_url.to_owned(),
+            link_wait,
+            accounts: false,
+        };
+        share_links(dir, &relay, &host, &node_secret, invite)
     }
 
     fn link_status(state: &'static str) {

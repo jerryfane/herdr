@@ -29,6 +29,7 @@ pub(super) fn maybe_handle(
         Method::GuestList(params) => params.machine.take(),
         Method::GuestRevoke(params) => params.machine.take(),
         Method::GuestUpdate(params) => params.machine.take(),
+        Method::GuestRemoveDevice(params) => params.machine.take(),
         Method::GuestAudit(params) => params.machine.take(),
         _ => return None,
     };
@@ -137,15 +138,20 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
             })
         }
         Method::GuestRevoke(params) => {
-            match crate::guest::revoke(params.guest_id.as_deref(), params.invite_id.as_deref()) {
+            match crate::guest::revoke(
+                params.guest_id.as_deref(),
+                params.invite_id.as_deref(),
+                params.person.as_deref(),
+            ) {
                 Ok(Some(closed_streams)) => Ok(ResponseResult::GuestRevoked {
                     guest_id: params.guest_id.clone(),
                     invite_id: params.invite_id.clone(),
+                    person: params.person.clone(),
                     closed_streams,
                 }),
                 Ok(None) => Err((
                     "guest_not_found",
-                    "no guest or invite with that id".to_string(),
+                    "no guest, invite or person with that id".to_string(),
                 )),
                 Err(err) => Err(err),
             }
@@ -153,6 +159,19 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
         Method::GuestUpdate(params) => {
             match crate::guest::update(&params.guest_id, params.share_gram) {
                 Ok(Some(guest)) => Ok(ResponseResult::GuestUpdated { guest }),
+                Ok(None) => Err((
+                    "guest_not_found",
+                    "no active guest with that id".to_string(),
+                )),
+                Err(err) => Err(err),
+            }
+        }
+        Method::GuestRemoveDevice(params) => {
+            match crate::guest::remove_device(&params.guest_id, &params.fingerprint) {
+                Ok(Some((guest, closed_streams))) => Ok(ResponseResult::GuestDeviceRemoved {
+                    guest,
+                    closed_streams,
+                }),
                 Ok(None) => Err((
                     "guest_not_found",
                     "no active guest with that id".to_string(),

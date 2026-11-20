@@ -2640,6 +2640,8 @@ fn push_event_text(kind: crate::push::PushKind) -> &'static str {
         // Gram alerts are built in `emit_apns_gram_message`, never from an agent
         // transition, so this arm only keeps the match exhaustive.
         crate::push::PushKind::Gram => "sent a message",
+        // Built in `guest::device_added_alert`, never from an agent.
+        crate::push::PushKind::GuestDevice => "added a device",
     }
 }
 

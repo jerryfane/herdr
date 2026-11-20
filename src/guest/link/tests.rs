@@ -20,7 +20,7 @@ use tungstenite::protocol::CloseFrame;
 use tungstenite::{Message, WebSocket};
 
 use super::frame::{self, Frame};
-use super::host::{Admission, GuestHost, HostInfo, LinkState};
+use super::host::{AccountSession, Admission, GuestHost, HostInfo, LinkState};
 use super::noise::tests::{initiator, public_key};
 use super::noise::{MAX_MESSAGE, MAX_PLAINTEXT};
 use super::relay::host_socket_url;
@@ -45,6 +45,11 @@ fn timing() -> Timing {
 
 type Status = (LinkState, Option<String>);
 
+/// Unix ms `life` from now.
+fn deadline_after(life: Duration) -> u64 {
+    crate::guest::store::now_ms() + u64::try_from(life.as_millis()).unwrap()
+}
+
 struct FakeHost {
     relay_url: String,
     wanted: AtomicBool,
@@ -54,6 +59,10 @@ struct FakeHost {
     subscribers: Mutex<Vec<Sender<()>>>,
     hellos: Mutex<Vec<([u8; 32], Value)>>,
     served: Mutex<Sender<String>>,
+    /// Admit hellos carrying `account` as account-bound sessions whose
+    /// statement lasts this long; refreshes with `"good"` extend it as long.
+    statement_life: Duration,
+    refreshes: Mutex<Vec<String>>,
 }
 
 impl FakeHost {
@@ -68,6 +77,8 @@ impl FakeHost {
             subscribers: Mutex::new(Vec::new()),
             hellos: Mutex::new(Vec::new()),
             served: Mutex::new(served),
+            statement_life: Duration::from_millis(600),
+            refreshes: Mutex::new(Vec::new()),
         });
         (host, ended)
     }
@@ -123,9 +134,15 @@ impl GuestHost for FakeHost {
         if let Some(code) = *self.refusal.lock().unwrap() {
             return Admission::Refused(code);
         }
+        let account = hello.get("account").map(|_| AccountSession {
+            guest_id: "g".into(),
+            device_pub,
+            deadline_ms: deadline_after(self.statement_life),
+        });
         Admission::Admitted {
             principal: "plotarmordev".into(),
             reply: json!({"ok": true, "name": "plotarmordev"}),
+            account,
         }
     }
 
@@ -143,6 +160,15 @@ impl GuestHost for FakeHost {
             }
         }
         let _ = self.served.lock().unwrap().send(principal);
+    }
+
+    fn refresh_account(&self, _: &AccountSession, jws: &str) -> Result<u64, &'static str> {
+        self.refreshes.lock().unwrap().push(jws.to_owned());
+        if jws == "good" {
+            Ok(deadline_after(self.statement_life))
+        } else {
+            Err("statement_invalid")
+        }
     }
 
     fn set_link_status(&self, state: LinkState, last_error: Option<String>) {
@@ -1044,4 +1070,74 @@ fn a_reused_session_id_never_gets_the_old_sessions_output() {
     new.send(&mut relay, "still open\n");
     assert_eq!(new.recv(&mut relay), "plotarmordev: still open\n");
     assert_eq!(host.hellos.lock().unwrap().len(), 2);
+}
+
+/// An account-bound session ends at its statement deadline with
+/// `statement_expired`, even while the guest keeps sending requests.
+#[test]
+fn an_account_bound_session_is_closed_at_the_statement_deadline() {
+    let stub = StubRelay::new();
+    let (_link, host, served) = start(&stub, timing());
+    let mut relay = stub.accept();
+    host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    let (reply, guest) =
+        Device::fake().connect(&mut relay, 3, &json!({"v": 1, "account": "statement"}));
+    let mut guest = guest.unwrap_or_else(|| panic!("refused: {reply}"));
+    guest.send(&mut relay, "hello\n");
+    assert_eq!(guest.recv(&mut relay), "plotarmordev: hello\n");
+    let started = Instant::now();
+    assert_eq!(relay.closed(3), "statement_expired");
+    assert!(
+        started.elapsed() < WAIT,
+        "closed at the deadline, not at an idle timeout"
+    );
+    assert_eq!(served.recv_timeout(WAIT).unwrap(), "plotarmordev");
+
+    // A plain session is never given a deadline.
+    let mut plain = admitted(&mut relay, 4);
+    std::thread::sleep(host.statement_life * 2);
+    plain.send(&mut relay, "still here\n");
+    assert_eq!(plain.recv(&mut relay), "plotarmordev: still here\n");
+}
+
+/// `{"t":"account.refresh"}` moves the deadline without reaching the API; a
+/// bad statement ends the session with the host's code.
+#[test]
+fn an_in_band_refresh_moves_the_deadline_and_a_bad_one_closes() {
+    let stub = StubRelay::new();
+    let (_link, host, _served) = start(&stub, timing());
+    let mut relay = stub.accept();
+    host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    let (reply, guest) =
+        Device::fake().connect(&mut relay, 7, &json!({"v": 1, "account": "statement"}));
+    let mut guest = guest.unwrap_or_else(|| panic!("refused: {reply}"));
+    // A refresh may come first, before any request.
+    guest.send(&mut relay, r#"{"t":"account.refresh","account":"good"}"#);
+    let life = host.statement_life;
+    for round in 0..3 {
+        std::thread::sleep(life / 2);
+        guest.send(&mut relay, r#"{"t":"account.refresh","account":"good"}"#);
+        guest.send(&mut relay, &format!("round {round}\n"));
+        assert_eq!(
+            guest.recv(&mut relay),
+            format!("plotarmordev: round {round}\n"),
+            "refresh frames never reach the API"
+        );
+    }
+    assert!(host.refreshes.lock().unwrap().len() >= 4);
+    guest.send(&mut relay, r#"{"t":"account.refresh","account":"forged"}"#);
+    assert_eq!(relay.closed(7), "statement_invalid");
+
+    // On a plain session the same bytes are ordinary API input.
+    let mut plain = admitted(&mut relay, 8);
+    plain.send(
+        &mut relay,
+        "{\"t\":\"account.refresh\",\"account\":\"good\"}\n",
+    );
+    assert_eq!(
+        plain.recv(&mut relay),
+        "plotarmordev: {\"t\":\"account.refresh\",\"account\":\"good\"}\n"
+    );
 }

@@ -1329,14 +1329,27 @@ pub struct GuestConfig {
     /// links to it only while a guest or an unexpired invite exists.
     #[cfg_attr(not(unix), allow(dead_code))] // Guest access is unix only.
     pub relay_url: String,
+    /// Let guests bind a share to their HerdrUp account, so they can use it
+    /// from each of their devices (invites advertise `acct:1`). Guests then
+    /// prove every connection with a short-lived statement from
+    /// `account_issuer`. Plain shares never depend on it. `false` stops
+    /// offering account binding and suspends account-bound shares.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub accounts: bool,
+    /// The HerdrUp account service whose device statements this host trusts.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub account_issuer: String,
 }
 
 pub const DEFAULT_GUEST_RELAY_URL: &str = "https://guest.herdrup.app";
+pub const DEFAULT_GUEST_ACCOUNT_ISSUER: &str = "https://accounts.herdrup.app";
 
 impl Default for GuestConfig {
     fn default() -> Self {
         Self {
             relay_url: DEFAULT_GUEST_RELAY_URL.to_string(),
+            accounts: true,
+            account_issuer: DEFAULT_GUEST_ACCOUNT_ISSUER.to_string(),
         }
     }
 }

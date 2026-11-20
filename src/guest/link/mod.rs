@@ -3,22 +3,28 @@
 //! Networking exception: Herdr otherwise keeps TLS and internet traffic out of
 //! process (`src/update.rs` and push delivery shell out to curl). Guest
 //! access needs a long-lived, bidirectional socket that curl cannot provide, so
-//! this module, and only this module, links tungstenite, rustls, webpki-roots
-//! and ring. It dials a single configured relay URL (`[guest] relay_url`, https
-//! only), and only while at least one guest or open invite exists. The relay
-//! never sees plaintext: every guest session is end-to-end encrypted with
-//! Noise IK against the node key, and admission happens inside the handshake.
+//! this module, and only this module, opens connections with tungstenite,
+//! rustls and webpki-roots (ring also verifies account statements in
+//! [`crate::guest::account`]). It dials a single configured relay URL
+//! (`[guest] relay_url`, https only), and only while at least one guest or open
+//! invite exists. The relay never sees plaintext: every guest session is
+//! end-to-end encrypted with Noise IK against the node key, and admission
+//! happens inside the handshake.
 //!
 //! One socket carries every session as `OPEN`/`DATA`/`CLOSE` frames
 //! ([`frame`]). Each session runs a Noise responder ([`noise`]); an admitted
 //! guest is served over a `UnixStream::pair()` by [`GuestHost::serve`].
 //!
-//! Short invite links ([`invite`]) make one-shot HTTPS requests to the same
-//! relay with the same TLS setup: the invite sealed with AES-128-GCM is stored
-//! there, and deleted on revoke or redemption.
+//! Short invite links ([`invite`]) make one-shot HTTPS requests ([`https`]) to
+//! the same relay with the same TLS setup: the invite sealed with AES-128-GCM
+//! is stored there, and deleted on revoke or redemption. Account-bound shares
+//! ([`crate::guest::account`]) fetch the account service's public signing
+//! keys (`[guest] account_issuer`, `/.well-known/jwks.json`) the same way,
+//! only when a guest presents an account statement.
 
 mod frame;
 pub(crate) mod host;
+pub(crate) mod https;
 pub(crate) mod invite;
 mod noise;
 mod relay;

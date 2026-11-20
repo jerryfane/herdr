@@ -384,10 +384,11 @@ fn state_view(guest: &GuestPrincipal, state: &GrantState) -> Option<serde_json::
     }
 }
 
-/// Revoked in this process (live registry) or in the store, which another
-/// daemon sharing it may have written.
+/// Revoked (or this device removed) in this process (live registry) or in the
+/// store, which another daemon sharing it may have written.
 fn is_revoked(guest: &GuestPrincipal, live: &crate::guest::LiveSession) -> bool {
-    live.revoked() || crate::guest::store::is_revoked(&guest.dir, &guest.guest_id)
+    live.revoked()
+        || crate::guest::store::is_revoked(&guest.dir, &guest.guest_id, &guest.fingerprint)
 }
 
 fn guest_error(id: &str, code: &str) -> String {
@@ -802,7 +803,7 @@ pub(super) fn serve_session(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let live = crate::guest::register_live(&guest.guest_id);
+    let live = guest.register_live();
     loop {
         // Revoked or removed in the store: the same refusal `serve_request`
         // gives, before anything reads the stale grant.
@@ -2754,7 +2755,8 @@ mod tests {
         assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
         assert!(!crate::guest::store::is_revoked(
             &guest.dir,
-            &guest.guest_id
+            &guest.guest_id,
+            &guest.fingerprint
         ));
     }
 
@@ -4974,6 +4976,19 @@ mod tests {
             );
         }
 
+        fn refresh_account(
+            &self,
+            session: &crate::guest::AccountSession,
+            jws: &str,
+        ) -> Result<u64, &'static str> {
+            crate::guest::refresh_account_in(
+                &self.dir,
+                &crate::guest::account::Env::PRODUCTION,
+                session,
+                jws,
+            )
+        }
+
         fn set_link_status(&self, _: LinkState, _: Option<String>) {}
 
         fn subscribe_changes(&self) -> std_mpsc::Receiver<()> {
@@ -5303,7 +5318,9 @@ mod tests {
     fn readmit(harness: &Harness, guest: &GuestPrincipal) -> (GuestPrincipal, Value) {
         let hello = json!({"v": 1, "guest_id": guest.guest_id});
         match admit_in(harness.dir.0.clone(), [4; 32], &hello) {
-            Admission::Admitted { principal, reply } => (principal, reply),
+            Admission::Admitted {
+                principal, reply, ..
+            } => (principal, reply),
             Admission::Refused(error) => panic!("refused: {error}"),
         }
     }
@@ -5722,7 +5739,9 @@ mod tests {
         rename(&harness, 0, "llm-renamed");
         let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPad"});
         let (guest, reply) = match admit_in(harness.dir.0.clone(), [5; 32], &hello) {
-            Admission::Admitted { principal, reply } => (principal, reply),
+            Admission::Admitted {
+                principal, reply, ..
+            } => (principal, reply),
             Admission::Refused(error) => panic!("refused: {error}"),
         };
         assert_eq!(guest.grant.terminal_id, invite.record.grant.terminal_id);

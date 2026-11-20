@@ -6,6 +6,8 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 
+pub(crate) use crate::guest::AccountSession;
+
 /// Relay credentials and the node's Noise static key.
 #[derive(Clone)]
 pub(crate) struct HostInfo {
@@ -22,9 +24,12 @@ pub(crate) struct HostInfo {
 /// Outcome of checking a guest's message-1 payload.
 pub(crate) enum Admission<P> {
     /// Serve the guest as `principal`; `reply` is the message-2 payload.
+    /// `account` is set for an account-bound share: the session ends at its
+    /// deadline unless the guest refreshes the statement in-band.
     Admitted {
         principal: P,
         reply: serde_json::Value,
+        account: Option<AccountSession>,
     },
     /// Refuse with one of the contract error codes (`unknown`, `revoked`, ...).
     Refused(&'static str),
@@ -67,6 +72,11 @@ pub(crate) trait GuestHost: Send + Sync + 'static {
     /// Runs one API connection as `principal` and returns when `stream` ends.
     fn serve(&self, principal: Self::Principal, stream: UnixStream);
 
+    /// Checks a statement an account-bound session sent in-band
+    /// (`{"t":"account.refresh","account":"<jws>"}`): the session's new
+    /// deadline (unix ms), or the code it closes with.
+    fn refresh_account(&self, session: &AccountSession, jws: &str) -> Result<u64, &'static str>;
+
     fn set_link_status(&self, state: LinkState, last_error: Option<String>);
 
     /// Fires whenever guests or invites change, which may flip `link_wanted`.
@@ -76,9 +86,15 @@ pub(crate) trait GuestHost: Send + Sync + 'static {
 impl From<crate::guest::Admission> for Admission<crate::guest::GuestPrincipal> {
     fn from(admission: crate::guest::Admission) -> Self {
         match admission {
-            crate::guest::Admission::Admitted { principal, reply } => {
-                Self::Admitted { principal, reply }
-            }
+            crate::guest::Admission::Admitted {
+                principal,
+                reply,
+                account,
+            } => Self::Admitted {
+                principal,
+                reply,
+                account,
+            },
             crate::guest::Admission::Refused(code) => Self::Refused(code),
         }
     }
@@ -110,6 +126,10 @@ impl GuestHost for DaemonGuestHost {
 
     fn serve(&self, principal: Self::Principal, stream: UnixStream) {
         crate::guest::serve(principal, stream);
+    }
+
+    fn refresh_account(&self, session: &AccountSession, jws: &str) -> Result<u64, &'static str> {
+        crate::guest::refresh_account(session, jws)
     }
 
     fn set_link_status(&self, state: LinkState, last_error: Option<String>) {

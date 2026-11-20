@@ -57,6 +57,11 @@ pub(super) fn payload_body(notification: &PushNotification) -> String {
     if notification.kind == PushKind::Gram {
         payload["gram"] = serde_json::Value::Bool(true);
     }
+    // A guest added a device: the alert opens the owner's guest list, not a
+    // pane.
+    if notification.kind == PushKind::GuestDevice {
+        payload["guests"] = serde_json::Value::Bool(true);
+    }
     // An answerable question (herdr#309): the phone shows the options as
     // notification actions and answers with `agent.answer`. A form ask
     // offers one "Accept recommendations" action (`agent.answer_form` with
