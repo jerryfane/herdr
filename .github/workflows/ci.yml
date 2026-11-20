@@ -109,7 +109,11 @@ jobs:
           - os: macos-latest
             kind: unix
             nextest_filter: not binary(live_handoff)
-          - os: windows-latest
+          # Not windows-latest: since image 20261116 that is VS 2026 18.12, whose
+          # MSVC 14.52 STL refuses any clang older than 22 (STL1000), and Zig
+          # 0.16.0 builds libghostty-vt's C++ with clang 21. windows-2022's
+          # VS 2022 STL takes it; release builds and the ConPTY job use it too.
+          - os: windows-2022
             kind: windows
     runs-on: ${{ matrix.os }}
     # 15 was sized for the fork's Windows leg, which ran a FILTERED test list via
