@@ -1289,8 +1289,10 @@ pub(crate) fn revoke_in(
 /// What `guest.remove_device` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeviceRemoval {
-    /// The share after the removal (also when it was removed before).
+    /// The share after the removal.
     Removed(Box<GuestRecord>),
+    /// The device was removed before; nothing changed.
+    AlreadyRemoved(Box<GuestRecord>),
     UnknownGuest,
     UnknownDevice,
     /// A plain share has one device: revoke it instead.
@@ -1323,7 +1325,10 @@ pub(crate) fn remove_device_in(
             .find(|device| device.fingerprint == fingerprint)
         {
             if device.removed {
-                return (DeviceRemoval::Removed(Box::new(guest.clone())), false);
+                return (
+                    DeviceRemoval::AlreadyRemoved(Box::new(guest.clone())),
+                    false,
+                );
             }
             device.removed = true;
             device.removed_ms = Some(now);

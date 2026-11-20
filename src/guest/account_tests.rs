@@ -304,6 +304,48 @@ fn a_removed_device_is_refused_even_with_a_valid_statement() {
     );
 }
 
+/// Removing the same device twice succeeds both times but audits and
+/// notifies once.
+#[test]
+fn removing_a_device_twice_audits_and_notifies_once() {
+    let host = Host::new("acct-remove-twice");
+    let (principal, _) = host.accept(&PHONE, Some(SUB));
+    let (laptop, _, _) =
+        admitted(host.returning(&LAPTOP, Some(host.statement(&LAPTOP, SUB)), "MacBook"));
+    let removed_audits = || {
+        host.audit()
+            .iter()
+            .filter(|entry| entry.event == GuestAuditEvent::DeviceRemoved)
+            .count()
+    };
+    let notified = || NOTIFIED.with(std::cell::Cell::get);
+
+    let before = notified();
+    let (first, _) = remove_device_at(&host.dir.0, &principal.guest_id, &laptop.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(notified() - before, 1);
+    assert_eq!(removed_audits(), 1);
+
+    let (second, closed) = remove_device_at(&host.dir.0, &principal.guest_id, &laptop.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second, first, "the repeat answers with the same share");
+    assert_eq!(closed, 0);
+    assert_eq!(notified() - before, 1, "no second notification");
+    assert_eq!(removed_audits(), 1, "no second audit entry");
+
+    // The redeeming device too: its first removal records it, the repeat
+    // changes nothing.
+    for _ in 0..2 {
+        remove_device_at(&host.dir.0, &principal.guest_id, &principal.fingerprint)
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(notified() - before, 2);
+    assert_eq!(removed_audits(), 2);
+}
+
 #[test]
 fn revoke_by_person_closes_every_live_session_of_that_person() {
     let host = Host::new("acct-person");

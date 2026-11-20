@@ -708,7 +708,16 @@ pub(crate) fn subscribe_changes() -> mpsc::Receiver<()> {
     rx
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`notify_changes`] calls made on this thread: subscribers are global,
+    /// so tests running in parallel count their own notifications here.
+    pub(crate) static NOTIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn notify_changes() {
+    #[cfg(test)]
+    NOTIFIED.with(|count| count.set(count.get() + 1));
     SUBSCRIBERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1057,6 +1066,8 @@ pub(crate) fn remove_device(
     remove_device_at(&store::guest_dir(), guest_id, fingerprint)
 }
 
+/// Removing a device that was removed before answers success again without
+/// another audit entry or change notification.
 pub(crate) fn remove_device_at(
     dir: &std::path::Path,
     guest_id: &str,
@@ -1066,6 +1077,7 @@ pub(crate) fn remove_device_at(
         store::remove_device_in(dir, guest_id, fingerprint, store::now_ms()).map_err(io_error)?;
     let record = match removal {
         DeviceRemoval::Removed(record) => record,
+        DeviceRemoval::AlreadyRemoved(record) => return Ok(Some((record.info(), 0))),
         DeviceRemoval::UnknownGuest => return Ok(None),
         DeviceRemoval::UnknownDevice => {
             return Err((
