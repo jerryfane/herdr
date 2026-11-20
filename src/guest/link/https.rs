@@ -18,6 +18,7 @@ const MAX_RESPONSE_HEAD: usize = 8 * 1024;
 
 /// Where a request goes. Production endpoints use TLS; tests also accept a
 /// plain `http://` stub.
+#[derive(Clone)]
 pub(crate) struct Endpoint {
     tls: bool,
     /// Host name or address, without IPv6 brackets.

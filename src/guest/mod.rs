@@ -1526,6 +1526,66 @@ mod tests {
         link_status("off");
     }
 
+    /// A relay that never answers the short invite's PUT gets it once more,
+    /// then the owner gets the long link and the log one warning.
+    #[test]
+    fn a_short_invite_put_without_an_answer_is_retried_once_then_warns_once() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let dir = store::tests::TempDir::new("short-link-retry");
+        let relay = link::invite::tests::StubInviteRelay::start_replying(|| {
+            link::invite::tests::Reply::HangUp
+        });
+        let invite = invite_in(&dir.0, false);
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let (url, web_url) =
+            tracing::subscriber::with_default(subscriber, || links_in(&dir.0, &relay.url, &invite));
+
+        let payload = url.strip_prefix("herdrup://guest-invite#").unwrap();
+        assert_eq!(web_url, format!("{}/i/{payload}", relay.url));
+        let (first, retry) = (relay.next(), relay.next());
+        assert_eq!(
+            (first.method.as_str(), retry.method.as_str()),
+            ("PUT", "PUT")
+        );
+        assert_eq!(retry.body, first.body);
+        assert!(
+            relay
+                .received
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "one retry only"
+        );
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("short invite link unavailable").count(),
+            1,
+            "{log}"
+        );
+    }
+
     fn stored_invite(dir: &std::path::Path, invite_id: &str) -> store::InviteRecord {
         store::load_store(dir)
             .unwrap()

@@ -4,7 +4,8 @@
 //! messengers cut off), so the relay sees it whenever the link is opened
 //! through it: the stored copy is encrypted, the link is not end-to-end.
 //! Requests are one-shot HTTP/1.1 over the same rustls setup as the host
-//! socket ([`super::https`]), bounded by [`TIMEOUT`] from DNS to the status line.
+//! socket ([`super::https`]), each bounded from DNS to the status line: the
+//! store by [`PUT_BUDGETS`], the delete by [`TIMEOUT`].
 
 use std::io;
 use std::time::Duration;
@@ -21,8 +22,11 @@ const KEY_BYTES: usize = 16;
 const TAG_LEN: usize = 16;
 /// Largest blob the relay stores.
 const MAX_BLOB: usize = 2048;
-/// Whole-request bound: the owner waits on it for the invite reply.
+/// Whole-request bound for a delete.
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// The store's bound, then a fresh one for its single retry. The owner waits
+/// on both for the invite reply before falling back to the long link.
+const PUT_BUDGETS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(8)];
 
 /// A sealed invite stored on the relay.
 pub(crate) struct Published {
@@ -89,12 +93,26 @@ pub(crate) fn publish(
     expires_unix: u64,
     payload: &[u8],
 ) -> Result<Published, String> {
+    publish_within(relay_url, host, expires_unix, payload, PUT_BUDGETS)
+}
+
+/// [`publish`] with the PUT sent at most twice, under `budgets` in turn. Only
+/// a PUT without an answer is sent again, byte for byte: the first may have
+/// been stored after all, and the relay takes the same blob again from the
+/// host that stored it. An answer other than 201 is final.
+fn publish_within(
+    relay_url: &str,
+    host: &HostIdentity,
+    expires_unix: u64,
+    payload: &[u8],
+    budgets: [Duration; 2],
+) -> Result<Published, String> {
     let random = |error: io::Error| format!("randomness: {error}");
     let id = b64url(&random_bytes::<ID_BYTES>().map_err(random)?);
     let key = random_bytes::<KEY_BYTES>().map_err(random)?;
     let blob = seal(&key, &id, payload)?;
     let expires = expires_unix.to_string();
-    match send(
+    let (endpoint, put) = request(
         relay_url,
         host,
         "PUT",
@@ -104,7 +122,16 @@ pub(crate) fn publish(
             ("Content-Type", "application/octet-stream"),
         ],
         &blob,
-    )? {
+    )?;
+    let [first, retry] = budgets;
+    // One error for both attempts, so the caller's single warning tells it all.
+    let status = match exchange(endpoint.clone(), put.clone(), first) {
+        Ok(status) => status,
+        Err(first) => {
+            exchange(endpoint, put, retry).map_err(|retry| format!("{first}; retried: {retry}"))?
+        }
+    };
+    match status {
         201 => Ok(Published {
             web_url: short_web_url(relay_url, &id, &b64url(&key)),
             id,
@@ -115,21 +142,22 @@ pub(crate) fn publish(
 
 /// Drop blob `id` from the relay. Already gone counts as deleted.
 pub(crate) fn delete(relay_url: &str, host: &HostIdentity, id: &str) -> Result<(), String> {
-    match send(relay_url, host, "DELETE", id, &[], &[])? {
+    let (endpoint, bytes) = request(relay_url, host, "DELETE", id, &[], &[])?;
+    match exchange(endpoint, bytes, TIMEOUT)? {
         200 | 204 | 404 => Ok(()),
         status => Err(format!("relay answered HTTP {status}")),
     }
 }
 
-/// One host-authenticated request; the HTTP status.
-fn send(
+/// One host-authenticated request: where it goes and its bytes.
+fn request(
     relay_url: &str,
     host: &HostIdentity,
     method: &str,
     id: &str,
     headers: &[(&str, &str)],
     body: &[u8],
-) -> Result<u16, String> {
+) -> Result<(Endpoint, Vec<u8>), String> {
     if !valid_id(id) {
         return Err("invite blob id is not 12 base64url characters".into());
     }
@@ -151,7 +179,12 @@ fn send(
     ));
     let mut request = request.into_bytes();
     request.extend_from_slice(body);
-    https::exchange("relay", endpoint, request, Body::Ignore, TIMEOUT)
+    Ok((endpoint, request))
+}
+
+/// Sends a [`request`] within `timeout`; the HTTP status.
+fn exchange(endpoint: Endpoint, request: Vec<u8>, timeout: Duration) -> Result<u16, String> {
+    https::exchange("relay", endpoint, request, Body::Ignore, timeout)
         .map(|response| response.status)
 }
 
@@ -194,6 +227,15 @@ pub(crate) mod tests {
         pub body: Vec<u8>,
     }
 
+    /// How the stub relay meets one request.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Reply {
+        /// This status, after this long.
+        Late(Duration, u16),
+        /// Closes the connection without an answer.
+        HangUp,
+    }
+
     /// A plain-HTTP relay stub; each request gets the status `respond` picks.
     pub(crate) struct StubInviteRelay {
         pub url: String,
@@ -206,27 +248,47 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn start_with(respond: impl Fn() -> u16 + Send + 'static) -> Self {
+            Self::start_replying(move || Reply::Late(Duration::ZERO, respond()))
+        }
+
+        /// Meets each request as `reply` picks, on its own thread, so a late
+        /// answer holds up no later request.
+        pub(crate) fn start_replying(reply: impl Fn() -> Reply + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let (sender, received) = mpsc::channel();
             thread::spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(stream) = stream else { return };
+                    let Ok(mut stream) = stream else { return };
                     let Some(request) = read_request(&stream) else {
                         continue;
                     };
-                    let mut stream = stream;
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        respond()
-                    );
+                    let reply = reply();
                     if sender.send(request).is_err() {
                         return;
                     }
+                    thread::spawn(move || match reply {
+                        Reply::Late(after, status) => {
+                            thread::sleep(after);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        Reply::HangUp => drop(stream),
+                    });
                 }
             });
             Self { url, received }
+        }
+
+        /// Replies in turn from `replies`, then the last one again.
+        pub(crate) fn start_in_turn(replies: Vec<Reply>) -> Self {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            Self::start_replying(move || {
+                let turn = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                replies[turn.min(replies.len() - 1)]
+            })
         }
 
         pub(crate) fn next(&self) -> Received {
@@ -388,6 +450,88 @@ pub(crate) mod tests {
         drop(closed);
         assert!(publish(&url, &host(), 1_900_000_000, b"{}").is_err());
         assert!(publish("ftp://relay.test", &host(), 1_900_000_000, b"{}").is_err());
+    }
+
+    /// Nothing more reaches `relay` within a beat.
+    fn no_more(relay: &StubInviteRelay) -> bool {
+        relay
+            .received
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    }
+
+    #[test]
+    fn a_put_that_times_out_is_sent_once_more_with_a_fresh_budget() {
+        // The first answer comes past its budget. The retry's comes later than
+        // the first budget too, so only a fresh budget of its own lets it count.
+        let relay = StubInviteRelay::start_in_turn(vec![
+            Reply::Late(Duration::from_millis(600), 201),
+            Reply::Late(Duration::from_millis(400), 201),
+        ]);
+        let budgets = [Duration::from_millis(200), Duration::from_secs(2)];
+        let payload = br#"{"v":1,"secret":"x"}"#;
+        let published = publish_within(&relay.url, &host(), 1_900_000_000, payload, budgets)
+            .expect("the retry stored it");
+        let (first, retry) = (relay.next(), relay.next());
+        assert!(no_more(&relay), "one retry only");
+        for request in [&first, &retry] {
+            assert_eq!(request.method, "PUT");
+            assert_eq!(request.path, format!("/v1/invite/{}", published.id));
+        }
+        assert_eq!(retry.headers, first.headers);
+        // The same sealed bytes: the relay takes them again from the same host.
+        assert_eq!(retry.body, first.body);
+        let key = b64url_decode(&published.web_url[published.web_url.len() - 22..]).unwrap();
+        assert_eq!(
+            open(&key, &published.id, &retry.body).as_deref(),
+            Some(&payload[..])
+        );
+    }
+
+    #[test]
+    fn publish_sends_a_put_left_without_an_answer_once_more() {
+        let relay =
+            StubInviteRelay::start_in_turn(vec![Reply::HangUp, Reply::Late(Duration::ZERO, 201)]);
+        let published = publish(&relay.url, &host(), 1_900_000_000, b"{}").expect("short link");
+        let (first, retry) = (relay.next(), relay.next());
+        assert!(no_more(&relay), "one retry only");
+        assert_eq!(retry.path, format!("/v1/invite/{}", published.id));
+        assert_eq!(retry.body, first.body);
+    }
+
+    #[test]
+    fn a_put_that_times_out_twice_fails_with_both_errors() {
+        let relay = StubInviteRelay::start_in_turn(vec![Reply::Late(Duration::from_secs(1), 201)]);
+        let budgets = [Duration::from_millis(100), Duration::from_millis(200)];
+        let started = std::time::Instant::now();
+        let error = publish_within(&relay.url, &host(), 1_900_000_000, b"{}", budgets)
+            .err()
+            .expect("no answer in either budget");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "both budgets in full"
+        );
+        let (first, retry) = error.split_once("; retried: ").expect(&error);
+        for attempt in [first, retry] {
+            assert!(attempt.starts_with("relay "), "{error}");
+            assert!(!attempt.contains("answered"), "{error}");
+        }
+        relay.next();
+        relay.next();
+        assert!(no_more(&relay), "one retry only");
+    }
+
+    #[test]
+    fn a_relay_refusal_is_final_and_never_retried() {
+        for status in [409, 401, 429, 500] {
+            let relay = StubInviteRelay::start(status);
+            let error = publish(&relay.url, &host(), 1_900_000_000, b"{}")
+                .err()
+                .unwrap_or_else(|| panic!("HTTP {status} is a failure"));
+            assert_eq!(error, format!("relay answered HTTP {status}"));
+            assert_eq!(relay.next().method, "PUT");
+            assert!(no_more(&relay), "HTTP {status} was retried");
+        }
     }
 
     #[test]
