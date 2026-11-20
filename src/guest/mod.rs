@@ -1447,7 +1447,12 @@ mod tests {
         link_wait: Duration,
     ) -> (String, String) {
         let (host, node_secret) = store::load_host(dir).unwrap();
-        share_links(dir, relay_url, &host, &node_secret, invite, link_wait)
+        let relay = InviteRelay {
+            url: relay_url.to_owned(),
+            link_wait,
+            accounts: false,
+        };
+        share_links(dir, &relay, &host, &node_secret, invite)
     }
 
     fn link_status(state: &'static str) {

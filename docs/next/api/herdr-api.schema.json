@@ -3831,8 +3831,31 @@
           },
           "type": "object"
         },
+        "GuestRemoveDeviceParams": {
+          "description": "`guest.remove_device`: drop one device from an account-bound share for\ngood, closing its live sessions. The person's other devices keep the\nshare, and no statement brings the removed device back.",
+          "properties": {
+            "fingerprint": {
+              "description": "The device's fingerprint, from `guest.list` (`fingerprint` or a\n`devices[].fingerprint`).",
+              "type": "string"
+            },
+            "guest_id": {
+              "type": "string"
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "guest_id",
+            "fingerprint"
+          ],
+          "type": "object"
+        },
         "GuestRevokeParams": {
-          "description": "`guest.revoke`: exactly one of `guest_id` or `invite_id`. Revoking a guest\ncloses its live sessions immediately.",
+          "description": "`guest.revoke`: exactly one of `guest_id`, `invite_id` or `person`.\nRevoking a guest closes its live sessions immediately; `person` revokes\nevery share of one person at once (a `person` from `guest.list`).",
           "properties": {
             "guest_id": {
               "type": [
@@ -3847,6 +3870,12 @@
               ]
             },
             "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "person": {
               "type": [
                 "string",
                 "null"
@@ -7390,6 +7419,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GuestUpdateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.remove_device",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestRemoveDeviceParams"
             }
           },
           "required": [
@@ -15067,6 +15112,16 @@
               "const": "gram_file",
               "description": "The guest opened a shared Gram's file.",
               "type": "string"
+            },
+            {
+              "const": "device_added",
+              "description": "The person added a device to an account-bound share (`text` is its\nname, `fingerprint` the device's).",
+              "type": "string"
+            },
+            {
+              "const": "device_removed",
+              "description": "The owner removed a device from an account-bound share.",
+              "type": "string"
             }
           ]
         },
@@ -15088,6 +15143,41 @@
             "name",
             "size",
             "sha256"
+          ],
+          "type": "object"
+        },
+        "GuestDeviceInfo": {
+          "description": "One more device of an account-bound share.",
+          "properties": {
+            "added_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "device": {
+              "type": "string"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "last_seen_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "removed": {
+              "description": "The owner removed it (`guest.remove_device`); it is refused for good.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "fingerprint",
+            "device",
+            "added_ms",
+            "removed"
           ],
           "type": "object"
         },
@@ -15122,6 +15212,11 @@
         },
         "GuestInfo": {
           "properties": {
+            "account_bound": {
+              "default": false,
+              "description": "The guest bound this share to their HerdrUp account, so each of their\ndevices may use it (\"on all my devices\").",
+              "type": "boolean"
+            },
             "created_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -15129,6 +15224,14 @@
             },
             "device": {
               "type": "string"
+            },
+            "devices": {
+              "default": [],
+              "description": "Devices the person added to an account-bound share after the one\nthat accepted (`fingerprint`, `device`), including removed ones.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/GuestDeviceInfo"
+              },
+              "type": "array"
             },
             "fingerprint": {
               "description": "`SHA256:` plus the first 8 bytes of SHA-256(device key), for example\n`SHA256:9f3a·e71c·04bd·c21e`.",
@@ -15149,6 +15252,11 @@
               ]
             },
             "name": {
+              "type": "string"
+            },
+            "person": {
+              "default": "",
+              "description": "Who the share belongs to, for grouping and `guest.revoke {person}`:\nthe account's id on this host when account-bound, else `fingerprint`.",
               "type": "string"
             },
             "revoked": {
@@ -18750,6 +18858,12 @@
                     "null"
                   ]
                 },
+                "person": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "guest_revoked",
                   "type": "string"
@@ -18775,6 +18889,30 @@
               "required": [
                 "type",
                 "guest"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The share after `guest.remove_device`.",
+              "properties": {
+                "closed_streams": {
+                  "description": "Live guest streams of that device closed by the removal.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "guest": {
+                  "$ref": "#/schemas/success_response/$defs/GuestInfo"
+                },
+                "type": {
+                  "const": "guest_device_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "guest",
+                "closed_streams"
               ],
               "type": "object"
             },

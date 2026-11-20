@@ -70,6 +70,7 @@ pub(crate) enum Body {
     Read(usize),
 }
 
+#[derive(Debug)]
 pub(crate) struct Response {
     pub(crate) status: u16,
     /// Empty for [`Body::Ignore`].
