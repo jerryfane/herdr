@@ -143,10 +143,8 @@ impl GuestPrincipal {
     /// Registers this connection as live, so revoking the guest (or removing
     /// this device) closes it.
     pub(crate) fn register_live(&self) -> LiveSession {
-        register_live_keys(&[
-            &self.guest_id,
-            &device_live_key(&self.guest_id, &self.fingerprint),
-        ])
+        let device = device_live_key(&self.guest_id, &self.fingerprint);
+        register_live_keys(&[self.guest_id.as_str(), device.as_str()])
     }
 
     /// Whether the guest shares the agent's Gram now. Read from the store on
