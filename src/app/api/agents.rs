@@ -6309,6 +6309,120 @@ mod tests {
         }
     }
 
+    /// #480: t1 ("ordinals", filed and starred) exits; t2 takes "ordinals"
+    /// and clears it again; t1 resumes its session and takes the name back.
+    /// Renaming t2 later must leave "ordinals"'s folder and star with t1.
+    #[tokio::test]
+    async fn agent_groups_stay_with_an_agent_that_took_its_name_back_on_resume() {
+        use crate::events::AppEvent;
+        let mut app = app_with_agent();
+        app.state.workspaces.push(Workspace::test_new("second"));
+        app.state.ensure_test_terminals();
+        let t1_root = app.state.workspaces[0].tabs[0].root_pane;
+        let t1_terminal = app.state.workspaces[0].tabs[0].panes[&t1_root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _t1_input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(t1_root, runtime);
+        let session = crate::agent_resume::AgentSessionRef::path(
+            std::env::current_dir()
+                .unwrap()
+                .join("ordinals-groups-omp.jsonl")
+                .display()
+                .to_string(),
+        )
+        .unwrap();
+        let detection = |app: &mut App, agent: Option<Agent>, process_exited: bool| {
+            app.handle_internal_event(AppEvent::StateChanged {
+                pane_id: t1_root,
+                runtime_epoch: None,
+                agent,
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+        let omp_starts = |app: &mut App, pid: u32, seq: u64| {
+            app.handle_internal_event(AppEvent::AgentSessionReported {
+                pane_id: t1_root,
+                source: "herdr:omp".into(),
+                agent_label: "omp".into(),
+                seq: Some(seq),
+                session_ref: Some(session.clone()),
+                session_path: None,
+                session_cursor: None,
+                process_pid: Some(pid),
+                session_start_source: Some("startup".into()),
+            });
+            app.handle_internal_event(AppEvent::HookStateReported {
+                pane_id: t1_root,
+                source: "herdr:omp".into(),
+                agent_label: "omp".into(),
+                state: AgentState::Idle,
+                message: None,
+                seq: Some(seq + 1),
+                session_ref: Some(session.clone()),
+                session_cursor: None,
+                process_pid: Some(pid),
+            });
+        };
+        let rename = |app: &mut App, target: &str, name: Option<&str>| -> serde_json::Value {
+            serde_json::from_str(&app.handle_agent_rename(
+                "req".into(),
+                AgentRenameParams {
+                    target: target.into(),
+                    name: name.map(str::to_string),
+                    expected_name: None,
+                    expect_inactive: None,
+                },
+            ))
+            .unwrap()
+        };
+
+        detection(&mut app, Some(Agent::Omp), false);
+        omp_starts(&mut app, 1001, 100);
+        let t1_pane = app.pane_info(0, t1_root).unwrap().pane_id;
+        let named = rename(&mut app, &t1_pane, Some("ordinals"));
+        assert_eq!(named["result"]["agent"]["name"], "ordinals", "{named}");
+        groups_set(
+            &mut app,
+            0,
+            serde_json::json!([{"id": "f1", "name": "Pilot", "order": 0, "members": ["ordinals"]}]),
+            serde_json::json!(["ordinals"]),
+        );
+        detection(&mut app, Some(Agent::Omp), true);
+        detection(&mut app, None, false);
+        assert_eq!(app.state.terminals[&t1_terminal].agent_name, None);
+
+        arm_resumable_claude_in(&mut app, 1, "x");
+        let t2_pane = app
+            .pane_info(1, app.state.workspaces[1].tabs[0].root_pane)
+            .unwrap()
+            .pane_id;
+        let took = rename(&mut app, "x", Some("ordinals"));
+        assert_eq!(took["result"]["agent"]["name"], "ordinals", "{took}");
+        let cleared = rename(&mut app, &t2_pane, None);
+        assert_eq!(cleared["result"]["type"], "agent_info", "{cleared}");
+
+        detection(&mut app, Some(Agent::Omp), false);
+        omp_starts(&mut app, 2002, 200);
+        assert_eq!(
+            app.state.terminals[&t1_terminal].agent_name.as_deref(),
+            Some("ordinals")
+        );
+
+        let renamed = rename(&mut app, &t2_pane, Some("other"));
+        assert_eq!(renamed["result"]["agent"]["name"], "other", "{renamed}");
+        let groups = groups_get(&mut app);
+        assert_eq!(
+            groups["folders"][0]["members"],
+            serde_json::json!(["ordinals"])
+        );
+        assert_eq!(groups["stars"], serde_json::json!(["ordinals"]));
+    }
+
     /// The fence follows the name an agent was STARTED as. A fenced agent may rename
     /// itself (own-pane right), so a rename must not move it to another
     /// `[fence.agents]` entry at its next respawn or after a save and restore.
