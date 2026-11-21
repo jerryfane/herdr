@@ -351,13 +351,23 @@ fn omp_restarted_in_its_pane(next_session: &AgentSessionRef) -> (AppState, Termi
     name_agent(&mut app, &terminal_id, "ordinals");
     assert_eq!(session_value(&app, &terminal_id), Some(session.value));
 
-    real_exit(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(1));
+    real_exit(
+        &mut app,
+        pane_id,
+        Agent::Omp,
+        start + Duration::from_secs(1),
+    );
     assert_eq!(
         app.terminals[&terminal_id].agent_name, None,
         "the exited agent's name is free while the pane is a shell"
     );
 
-    detect(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(2));
+    detect(
+        &mut app,
+        pane_id,
+        Agent::Omp,
+        start + Duration::from_secs(2),
+    );
     omp_starts_on(&mut app, pane_id, next_session, 2002, 200);
     assert_eq!(
         session_value(&app, &terminal_id),
@@ -394,7 +404,12 @@ fn a_name_taken_while_the_agent_was_gone_is_not_restored_twice() {
     detect(&mut app, pane_id, Agent::Omp, start);
     omp_starts_on(&mut app, pane_id, &session, 1001, 100);
     name_agent(&mut app, &terminal_id, "ordinals");
-    real_exit(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(1));
+    real_exit(
+        &mut app,
+        pane_id,
+        Agent::Omp,
+        start + Duration::from_secs(1),
+    );
 
     let other_terminal = app
         .terminals
@@ -404,7 +419,12 @@ fn a_name_taken_while_the_agent_was_gone_is_not_restored_twice() {
         .expect("a second terminal");
     name_agent(&mut app, &other_terminal, "ordinals");
 
-    detect(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(2));
+    detect(
+        &mut app,
+        pane_id,
+        Agent::Omp,
+        start + Duration::from_secs(2),
+    );
     omp_starts_on(&mut app, pane_id, &session, 2002, 200);
 
     assert_eq!(app.terminals[&terminal_id].agent_name, None);
