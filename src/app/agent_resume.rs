@@ -12,6 +12,20 @@ struct PendingAgentResumeCandidate {
     plan: crate::agent_resume::AgentResumePlan,
     rows: u16,
     cols: u16,
+    /// Set while the pane waits for its missing saved directory: not before this.
+    retry_at: Option<Instant>,
+}
+
+/// When every pending candidate is waiting for its saved directory, the earliest
+/// re-check; `None` when any candidate can start now (or there are none).
+fn dir_wait_deadline(candidates: &[PendingAgentResumeCandidate]) -> Option<Instant> {
+    candidates
+        .iter()
+        .try_fold(None, |earliest: Option<Instant>, candidate| {
+            let at = candidate.retry_at?;
+            Some(Some(earliest.map_or(at, |earliest| earliest.min(at))))
+        })
+        .flatten()
 }
 
 /// What environment a resumed agent should launch with — or that it must NOT launch.
@@ -50,15 +64,21 @@ impl App {
             self.next_agent_resume_at = None;
             return;
         }
-        if self.pending_agent_resume_candidates().is_empty() {
+        let candidates = self.pending_agent_resume_candidates();
+        if candidates.is_empty() {
             self.pending_agent_resume_deadline = None;
             return;
         }
-        if let Some(next) = self.next_agent_resume_at {
-            self.pending_agent_resume_deadline = Some(next);
-        } else {
-            self.pending_agent_resume_deadline
-                .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
+        // Panes waiting for their directory must not make every tick due (#477).
+        match (self.next_agent_resume_at, dir_wait_deadline(&candidates)) {
+            (Some(next), Some(wait)) => self.pending_agent_resume_deadline = Some(next.max(wait)),
+            (Some(next), None) | (None, Some(next)) => {
+                self.pending_agent_resume_deadline = Some(next);
+            }
+            (None, None) => {
+                self.pending_agent_resume_deadline
+                    .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
+            }
         }
     }
 
@@ -85,9 +105,15 @@ impl App {
             plan,
             rows,
             cols,
+            retry_at,
         } in pending
         {
             if self.terminal_runtimes.get(&terminal_id).is_some() {
+                continue;
+            }
+            // Still backing off on a missing saved directory: skipped without
+            // consuming the spacing, so it never delays the panes behind it.
+            if retry_at.is_some_and(|at| now < at) {
                 continue;
             }
             changed |= self.start_pending_agent_resume(
@@ -98,6 +124,7 @@ impl App {
                 rows,
                 cols,
                 allow_empty_theme,
+                now,
             );
             if changed && !self.startup_per_agent_delay.is_zero() {
                 self.next_agent_resume_at = Some(now + self.startup_per_agent_delay);
@@ -109,8 +136,14 @@ impl App {
         if changed {
             self.schedule_session_save();
         }
-        if !self.has_pending_agent_resumes() || self.pending_agent_resume_candidates().is_empty() {
+        let remaining = self.pending_agent_resume_candidates();
+        if !self.has_pending_agent_resumes() || remaining.is_empty() {
             self.pending_agent_resume_deadline = None;
+        } else if let Some(wait) = dir_wait_deadline(&remaining) {
+            self.pending_agent_resume_deadline = Some(
+                self.next_agent_resume_at
+                    .map_or(wait, |next| next.max(wait)),
+            );
         }
         if !self.has_pending_agent_resumes() {
             self.next_agent_resume_at = None;
@@ -159,6 +192,7 @@ impl App {
                         plan,
                         rows: info.inner_rect.height,
                         cols: info.inner_rect.width,
+                        retry_at: terminal.restore_dir_wait.and_then(|wait| wait.retry_at()),
                     });
                 }
             }
@@ -240,6 +274,7 @@ impl App {
             rows,
             cols,
             allow_empty_theme,
+            Instant::now(),
         );
         if changed {
             self.schedule_session_save();
@@ -305,6 +340,7 @@ impl App {
         rows: u16,
         cols: u16,
         allow_empty_theme: bool,
+        now: Instant,
     ) -> bool {
         let host_terminal_theme = self.state.host_terminal_theme;
         if host_terminal_theme.is_empty() && !allow_empty_theme {
@@ -413,6 +449,29 @@ impl App {
         };
 
         if !cwd.is_dir() {
+            // A pane restored while its directory was missing keeps waiting for it,
+            // whoever asks to start it, until its window runs out (#477).
+            let retry = self.restore_dir_retry;
+            let retry_at = self
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .and_then(|terminal| terminal.restore_dir_wait.as_mut())
+                .and_then(|wait| wait.missed(now, retry));
+            if let Some(retry_at) = retry_at {
+                tracing::info!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    cwd = %cwd.display(),
+                    retry_in_ms = retry_at.saturating_duration_since(now).as_millis() as u64,
+                    "saved directory is missing; waiting for it before resuming the agent"
+                );
+                return false;
+            }
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.restore_dir_wait = None;
+            }
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -429,6 +488,9 @@ impl App {
             return true;
         }
 
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.restore_dir_wait = None;
+        }
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -869,6 +931,7 @@ mod tests {
             24,
             80,
             true,
+            Instant::now(),
         );
         assert!(!started, "an unresolvable account must not launch an agent");
 
@@ -1007,6 +1070,148 @@ mod tests {
             assert!(!app.has_pending_agent_resumes());
             assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
         }
+    }
+
+    /// A restored agent pane whose saved directory is missing (issue #477), plus a
+    /// healthy agent pane in a second workspace. Returns both terminal ids.
+    #[cfg(unix)]
+    fn app_with_missing_dir_restore(
+        missing: &std::path::Path,
+    ) -> (
+        App,
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalId,
+    ) {
+        let mut app = test_app();
+        app.startup_per_agent_delay = std::time::Duration::ZERO;
+        app.restore_dir_retry =
+            crate::terminal::RestoreDirRetry::with_window(std::time::Duration::from_secs(60));
+        let waiting = crate::workspace::Workspace::test_new("waiting");
+        let healthy = crate::workspace::Workspace::test_new("healthy");
+        let waiting_id = waiting
+            .terminal_id(waiting.tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        let healthy_id = healthy
+            .terminal_id(healthy.tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.state.view.pane_infos = waiting.tabs[0].layout.panes(area);
+        app.state.workspaces = vec![waiting, healthy];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = area;
+        for (terminal_id, key) in [(&waiting_id, "waiting"), (&healthy_id, "healthy")] {
+            let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: key.into(),
+            });
+        }
+        let terminal = app.state.terminals.get_mut(&waiting_id).unwrap();
+        terminal.cwd = missing.to_path_buf();
+        terminal.restore_dir_wait = Some(crate::terminal::RestoreDirWait::default());
+        (app, waiting_id, healthy_id)
+    }
+
+    #[cfg(unix)]
+    fn missing_restore_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-restore-dir-wait-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Issue #477: the mount holding a pane's directory comes up after the server. The
+    /// agent must start once the directory appears inside the window, and waiting for it
+    /// must not hold up the other restored panes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_resume_starts_once_a_missing_directory_appears_within_the_window() {
+        let dir = missing_restore_dir("appears");
+        let (mut app, waiting, healthy) = app_with_missing_dir_restore(&dir);
+        let start = Instant::now();
+
+        assert!(app.start_pending_agent_resumes(start, true));
+        assert!(
+            app.terminal_runtimes.get(&healthy).is_some(),
+            "a pane waiting for its directory must not delay the others"
+        );
+        assert!(app.terminal_runtimes.get(&waiting).is_none());
+        let terminal = &app.state.terminals[&waiting];
+        assert!(
+            terminal.restore_error.is_none(),
+            "failed before the window ran out"
+        );
+        assert!(terminal.pending_agent_resume_plan.is_some());
+
+        // Backing off: the next tick does not re-check yet, and the wake-up is the retry.
+        app.sync_pending_agent_resume_deadline(start);
+        let retry_at = app
+            .pending_agent_resume_deadline
+            .expect("a retry is scheduled");
+        assert!(retry_at > start);
+        assert!(retry_at <= start + std::time::Duration::from_secs(60));
+
+        std::fs::create_dir_all(&dir).unwrap();
+        let later = start + std::time::Duration::from_secs(45);
+        assert!(app.start_pending_agent_resumes(later, true));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            app.terminal_runtimes.get(&waiting).is_some(),
+            "the agent must restart once its directory appears"
+        );
+        let terminal = &app.state.terminals[&waiting];
+        assert!(terminal.restore_error.is_none());
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.restore_dir_wait.is_none());
+    }
+
+    /// Issue #477: a directory that never appears fails the pane with today's message,
+    /// but only after the whole window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_resume_fails_with_the_existing_message_when_the_directory_never_appears() {
+        let dir = missing_restore_dir("never");
+        let (mut app, waiting, _healthy) = app_with_missing_dir_restore(&dir);
+        let start = Instant::now();
+        app.start_pending_agent_resumes(start, true);
+
+        let mut now = start;
+        let mut checks = 1;
+        while let Some(retry_at) = app.state.terminals[&waiting]
+            .restore_dir_wait
+            .and_then(|wait| wait.retry_at())
+        {
+            assert!(
+                app.state.terminals[&waiting].restore_error.is_none(),
+                "failed {:?} into a 60 s window",
+                now - start
+            );
+            assert!(retry_at > now, "backoff must move forward");
+            now = retry_at;
+            app.start_pending_agent_resumes(now, true);
+            checks += 1;
+            assert!(checks < 100, "the wait must be bounded");
+        }
+
+        assert!(now >= start + std::time::Duration::from_secs(60));
+        assert!(
+            checks < 20,
+            "backoff must space the checks out, got {checks} in 60 s"
+        );
+        let terminal = &app.state.terminals[&waiting];
+        assert!(app.terminal_runtimes.get(&waiting).is_none());
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert_eq!(
+            terminal.restore_error.as_deref(),
+            Some("Saved directory is unavailable. Restore the directory and restart this session.")
+        );
+        assert!(!app.has_pending_agent_resumes());
     }
 
     #[cfg(unix)]

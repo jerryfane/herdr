@@ -411,6 +411,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+# Milliseconds a restored agent waits for a missing saved directory (for example
+# a mount that is not up yet) before failing; 0 fails at once.
+# restore_missing_dir_timeout_ms = 300000
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

@@ -34,6 +34,8 @@ Snapshot restore does not preserve running shells, servers, tests, or arbitrary 
 
 If a saved directory is unavailable or the shell cannot start, the pane stays in the layout with an error instead of disappearing or moving to your home directory. Its saved directory and agent session reference remain intact. Fix the directory or shell configuration and restart the server to retry, or explicitly close the pane to remove it.
 
+An agent pane whose saved directory is missing, such as a network mount that is not up yet after a reboot, waits for the directory instead of failing at once. Herdr re-checks it with backoff (1 second, doubling up to 30 seconds) for up to 5 minutes and starts the agent as soon as the directory appears; the other panes restore without waiting for it. If the directory never appears, the pane fails with the same error. Set `[session] restore_missing_dir_timeout_ms` to change the wait (`0` fails at once).
+
 When saving, Herdr prefers the live shell's directory where the operating system exposes it, and retains the last confirmed directory after the shell exits. Shell-reported directories remain the fallback on other platforms.
 
 If `session.json` cannot be read or parsed, or requires a newer Herdr version, Herdr logs why loading failed. Before saving or clearing the replacement session, it preserves the original bytes in `session-backups/` beside `session.json` and logs the recovery path as `persist.backup`. A file missing at startup is checked again before the first save or clear. These failed-load recovery copies are separate from normal snapshot history.
