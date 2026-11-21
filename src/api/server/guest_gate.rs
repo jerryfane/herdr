@@ -1,7 +1,8 @@
 //! Guest principal gate: an explicit allowlist bound to one agent grant.
 //! Everything else answers `guest_forbidden`. Prompts are labeled, and a guest
 //! answers the agent's questions as the owner can: `agent.answer` for an ask,
-//! `agent.answer_form` for an omp form ask, and menu keys (arrows, Enter, Tab,
+//! `agent.answer_form` for an omp form ask, `agent.dismiss_ask` to cancel
+//! either, and menu keys (arrows, Enter, Tab,
 //! Escape, Space, 1-9, y, n) through `pane.send_keys` only while the agent
 //! awaits menu input; a choosing key ends its batch, and no more keys are
 //! taken until a new menu is seen. The terminal
@@ -21,10 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    answer_agent, answer_agent_form, dispatch_to_app_with_timeout, error_response_json,
-    finish_wait_response, handle_request, pane_output_stream, parse_request_line, prompt_agent,
-    read_initial_request_line, write_json_line_allow_disconnect, write_text_line_allow_disconnect,
-    ApiRequestSender, ConnectionPrincipal, EventHub,
+    answer_agent, answer_agent_form, dismiss_agent_ask, dispatch_to_app_with_timeout,
+    error_response_json, finish_wait_response, handle_request, pane_output_stream,
+    parse_request_line, prompt_agent, read_initial_request_line, write_json_line_allow_disconnect,
+    write_text_line_allow_disconnect, ApiRequestSender, ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
     AgentInfo, AgentTranscriptParams, ErrorResponse, GramGetFileChunkParams, GramGetFileParams,
@@ -434,12 +435,13 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         return None;
     };
     // Only what this gate itself serves; the owner's capability set stays
-    // private. `ask_form`: a guest answers form asks with `agent.answer_form`.
+    // private. `ask_form`: a guest answers form asks with `agent.answer_form`;
+    // `ask_dismiss`: it cancels a pending ask with `agent.dismiss_ask`.
     Some(serde_json::json!({
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true, "agent_transcript_topic": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true},
     }))
 }
 
@@ -511,6 +513,13 @@ fn project_answer_form(result: ResponseResult) -> Option<serde_json::Value> {
         "status": serde_json::to_value(status).ok()?,
         "answers": serde_json::to_value(answers).ok()?,
     }))
+}
+
+fn project_dismissed(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::AskDismissed { dismissed } = result else {
+        return None;
+    };
+    Some(serde_json::json!({"type": "ask_dismissed", "dismissed": dismissed}))
 }
 
 /// A key a guest may send to a menu, in the form the app parses; `None` for
@@ -634,8 +643,10 @@ fn project_history(result: ResponseResult) -> Option<serde_json::Value> {
 
 /// The granted agent's conversation without the owner's private parts: no
 /// notes (the owner's fleet traffic), no step details (commands and paths) and
-/// no subagent assignments. A pending ask keeps its `answerable`: the guest
-/// answers it as the owner would.
+/// no subagent assignments. A pending ask keeps its `answerable` and
+/// `dismissable`: the guest answers or dismisses it as the owner would (the
+/// gate serves only the granted agent's transcript, the one agent where it
+/// may call `agent.answer*` and `agent.dismiss_ask`).
 fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
     let ResponseResult::AgentTranscript {
         agent,
@@ -1269,6 +1280,26 @@ fn serve_request(
             params.target = agent.pane_id;
             let response = answer_agent_form(id.clone(), params, api_tx);
             let reply = guest_reply(&id, &response, project_answer_form);
+            finish_wait_response(stream, Some(reply), &id, method, false)
+        }
+        // A guest may dismiss exactly where it may answer: the granted agent.
+        Method::AgentDismissAsk(mut params) => {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.target, guest, state.pane_id()) {
+                return forbidden(stream);
+            }
+            let GrantState::Live(agent) = state else {
+                return paused(stream);
+            };
+            guest.audit(
+                GuestAuditEvent::Prompt,
+                Some(method),
+                Some(format!("dismiss {}", params.ask_id)),
+                None,
+            );
+            params.target = agent.pane_id;
+            let response = dismiss_agent_ask(id.clone(), params, api_tx);
+            let reply = guest_reply(&id, &response, project_dismissed);
             finish_wait_response(stream, Some(reply), &id, method, false)
         }
         Method::PaneSendKeys(params) => {
@@ -3035,6 +3066,41 @@ mod tests {
         assert!(harness.pty_text(1, Duration::from_millis(50)).is_empty());
     }
 
+    /// `agent.dismiss_ask` passes the gate under `agent.answer_form`'s rules:
+    /// only the granted agent, audited; past it, no pending ask means no Esc.
+    #[test]
+    fn a_guest_dismisses_only_the_granted_agents_ask() {
+        let harness = start("dismiss");
+        let _sessions = omp_sessions(&harness);
+        let guest = harness.admit();
+        let dismiss = |target: &str| json!({"id": "d", "method": "agent.dismiss_ask", "params": {"target": target, "ask_id": "ask-1"}});
+        for target in [
+            harness.pane_ids[1].as_str(),
+            "other-agent",
+            "studio/llm-opt",
+        ] {
+            let lines = harness.call(&guest, dismiss(target));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+            // Nor does it see an ask it could dismiss there: no transcript,
+            // so no `pending_ask.dismissable`.
+            let lines = harness.call(
+                &guest,
+                json!({"id": "t", "method": "agent.transcript", "params": {"target": target}}),
+            );
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        let lines = harness.call(&guest, dismiss("llm-opt"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], "d");
+        assert!(
+            matches!(code(&lines), "ask_unsupported" | "ask_not_pending"),
+            "{lines:?}"
+        );
+        let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 10).unwrap();
+        assert_eq!(audit[0].method.as_deref(), Some("agent.dismiss_ask"));
+        assert!(harness.pty_text(1, Duration::from_millis(50)).is_empty());
+    }
+
     /// The shape of the form guest nike was asked on 16 Nov (herdr#455):
     /// three single-select fieldsets, each with omp's Other row.
     const THREE_FIELD_FORM: &str = r#"<form><fieldset><legend>Automatic no</legend>
@@ -4103,6 +4169,10 @@ mod tests {
                 result["pending_ask"]["answerable"], true,
                 "the guest answers it too"
             );
+            assert_eq!(
+                result["pending_ask"]["dismissable"], true,
+                "the guest may dismiss where it may answer"
+            );
             assert!(result.get("resent").is_none(), "newest pages omit it");
             // The cursor works for the guest's next poll.
             let after = result["after"].as_str().unwrap();
@@ -4738,7 +4808,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "agent_topics": true, "agent_transcript_topic": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true}),
             "only what the gate serves"
         );
 

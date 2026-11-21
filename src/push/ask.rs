@@ -330,6 +330,7 @@ mod tests {
                 answerable: false,
                 form: Some(wire),
                 form_answerable: parsed.drivable(),
+                dismissable: true,
             }
         };
         let defaults = pending(

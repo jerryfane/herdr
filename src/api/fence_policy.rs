@@ -133,6 +133,7 @@ const TALK: &[&str] = &[
     "agent.prompt",
     "agent.answer",
     "agent.answer_form",
+    "agent.dismiss_ask",
     "agent.topics.new",
     "agent.topics.send",
 ];

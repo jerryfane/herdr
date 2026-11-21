@@ -126,6 +126,8 @@ struct PeerRouteState {
     rename_preconditions: AtomicBool,
     /// The peer's latest poll advertised `ask_form`.
     ask_form: AtomicBool,
+    /// The peer's latest poll advertised `ask_dismiss`.
+    ask_dismiss: AtomicBool,
     /// The peer's latest poll advertised `agent_topics`.
     agent_topics: AtomicBool,
     /// The peer's latest poll advertised `agent_transcript_topic`.
@@ -150,6 +152,7 @@ impl PeerRoute {
                 identity_validation_required: requires_identity_validation,
                 rename_preconditions: AtomicBool::new(false),
                 ask_form: AtomicBool::new(false),
+                ask_dismiss: AtomicBool::new(false),
                 agent_topics: AtomicBool::new(false),
                 agent_transcript_topic: AtomicBool::new(false),
             }),
@@ -195,6 +198,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.ask_form),
             Ordering::Release,
         );
+        self.state.ask_dismiss.store(
+            capabilities.is_some_and(|capabilities| capabilities.ask_dismiss),
+            Ordering::Release,
+        );
         self.state.agent_topics.store(
             capabilities.is_some_and(|capabilities| capabilities.agent_topics),
             Ordering::Release,
@@ -233,6 +240,11 @@ impl PeerRoute {
     /// peer, or one whose boot changed since its last poll, is not.
     pub(crate) fn ask_form(&self) -> bool {
         self.state.ask_form.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to serve `agent.dismiss_ask`.
+    pub(crate) fn ask_dismiss(&self) -> bool {
+        self.state.ask_dismiss.load(Ordering::Acquire)
     }
 
     /// The peer's current presentation, or the bare alias as its label when the
@@ -341,6 +353,7 @@ impl PeerRoute {
                     .rename_preconditions
                     .store(false, Ordering::Release);
                 self.state.ask_form.store(false, Ordering::Release);
+                self.state.ask_dismiss.store(false, Ordering::Release);
                 self.state.agent_topics.store(false, Ordering::Release);
                 self.state
                     .agent_transcript_topic

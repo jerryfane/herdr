@@ -285,6 +285,11 @@ pub struct PendingAsk {
     /// herdr can drive this form through `agent.answer_form` for this caller.
     #[serde(default)]
     pub form_answerable: bool,
+    /// This caller may close the ask as cancelled with `agent.dismiss_ask`
+    /// (omp cancels a plain ask and an HTML form alike on Esc). Clients
+    /// gate their Dismiss button on it.
+    #[serde(default)]
+    pub dismissable: bool,
 }
 
 /// The tool step the agent is running now.
@@ -357,6 +362,7 @@ pub enum TranscriptEntry {
     /// An `ask` tool call; `id` is the tool call id, `answer` the selection once made.
     /// For an HTML form ask, `form` holds the form, `questions`/`answer` stay as a
     /// compatibility view and `form_answer`/`form_status` arrive with the result.
+    /// A plain ask that ended without a selection has `form_status: cancelled`.
     Ask {
         id: String,
         ts_ms: u64,

@@ -205,6 +205,7 @@ mod tests {
             "agent.send_keys",
             "agent.answer",
             "agent.answer_form",
+            "agent.dismiss_ask",
             "pane.split",
             "pane.swap",
             "pane.move",

@@ -157,6 +157,7 @@ operations::define_operations! {
     AgentWait(AgentWaitParams) => "agent.wait", false, false;
     AgentAnswer(AgentAnswerParams) => "agent.answer", true, false;
     AgentAnswerForm(AgentAnswerFormParams) => "agent.answer_form", true, false;
+    AgentDismissAsk(AgentDismissAskParams) => "agent.dismiss_ask", true, false;
     AgentRestart(AgentRestartParams) => "agent.restart", false, false;
     AgentTransferSession(AgentTransferSessionParams) => "agent.transfer_session", false, false;
     AccountsList(EmptyParams) => "accounts.list", false, false;

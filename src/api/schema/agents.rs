@@ -533,6 +533,17 @@ pub struct AgentAnswerFormParams {
     pub values: std::collections::BTreeMap<String, AskFormValue>,
 }
 
+/// `agent.dismiss_ask` — close an omp agent's pending `ask` (plain or HTML
+/// form) as cancelled, as Esc in the terminal does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentDismissAskParams {
+    /// Agent name or pane id, resolved like `agent.read`.
+    pub target: String,
+    /// The pending ask's tool call id, from `agent.transcript`'s `pending_ask`.
+    /// Refused unless it is still the agent's current pending ask.
+    pub ask_id: String,
+}
+
 /// One field's answer in `agent.answer_form`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskFormValue {
