@@ -649,6 +649,7 @@ impl App {
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        self.record_retaken_agent_names();
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }

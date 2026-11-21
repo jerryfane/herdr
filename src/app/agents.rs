@@ -342,6 +342,14 @@ impl App {
         }
     }
 
+    /// Record the names agents took back when they resumed their session in
+    /// their terminal (#480), as `agent start` and unarchive record theirs.
+    pub(super) fn record_retaken_agent_names(&mut self) {
+        for (terminal_id, name) in std::mem::take(&mut self.state.retaken_agent_names) {
+            self.agent_groups_name_taken(terminal_id.as_str(), &name);
+        }
+    }
+
     /// The terminal id an `agent.avatar.*` target names: a live agent (as for
     /// `agent.rename`), an archived agent's name or terminal id, or the id of
     /// any terminal this server holds. The last keeps a paused guest grant,

@@ -649,6 +649,7 @@ impl App {
             // come back follow them on the first scheduled pass.
             agents_changed: true,
             terminal_runtime_shutdowns: Vec::new(),
+            retaken_agent_names: Vec::new(),
             archived_agents: restored_archived_agents,
         };
 
