@@ -261,6 +261,69 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// How long, and how often, a restored agent pane re-checks a saved directory that was
+/// missing at restore before it fails the pane (issue #477).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreDirRetry {
+    /// Total wait, from the first check that found the directory missing.
+    pub window: Duration,
+    /// Delay before the second check; it doubles per miss up to `max_backoff`.
+    pub first_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl RestoreDirRetry {
+    pub const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
+
+    pub fn with_window(window: Duration) -> Self {
+        Self {
+            window,
+            first_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl Default for RestoreDirRetry {
+    fn default() -> Self {
+        Self::with_window(Self::DEFAULT_WINDOW)
+    }
+}
+
+/// Progress of one pane's wait for its missing saved directory. The clock is supplied
+/// by the caller, so the window and backoff are testable without sleeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RestoreDirWait {
+    started: Option<Instant>,
+    next_check: Option<Instant>,
+    misses: u32,
+}
+
+impl RestoreDirWait {
+    /// When the directory is due to be checked again; `None` before the first check.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.next_check
+    }
+
+    /// Record that the directory was still missing at `now`. Returns when to check again,
+    /// or `None` once the window has run out and the pane should fail.
+    pub fn missed(&mut self, now: Instant, retry: RestoreDirRetry) -> Option<Instant> {
+        let started = *self.started.get_or_insert(now);
+        let end = started.checked_add(retry.window)?;
+        if now >= end {
+            return None;
+        }
+        let backoff = retry
+            .first_backoff
+            .saturating_mul(1u32 << self.misses.min(16))
+            .min(retry.max_backoff);
+        self.misses = self.misses.saturating_add(1);
+        let at = now.checked_add(backoff).map_or(end, |at| at.min(end));
+        self.next_check = Some(at);
+        Some(at)
+    }
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -376,6 +439,11 @@ pub struct TerminalState {
     /// Not persisted: re-derived on the next restore attempt, and cleared when the
     /// accounts registry reloads so a re-added account is picked straight up.
     pub account_resume_blocked: Option<String>,
+    /// Set on a restored agent pane whose saved directory was missing at restore (issue
+    /// #477): the deferred resume re-checks the directory with backoff for a bounded
+    /// window — a mount often comes up just after the server — before failing the pane.
+    /// Not persisted; every restore starts a fresh window.
+    pub restore_dir_wait: Option<RestoreDirWait>,
     /// Server-owned Claude Code <-> Codex session-transfer transaction. Kept
     /// separate from presentation state; the API projects it into `AgentInfo`.
     pub(crate) session_transfer: Option<crate::session_transfer::RuntimeSessionTransfer>,
@@ -439,6 +507,7 @@ impl TerminalState {
             restart_in_flight: false,
             pending_launch_env: Vec::new(),
             account_resume_blocked: None,
+            restore_dir_wait: None,
             agent_account: None,
             fence_identity: crate::fence::FenceIdentity::Anonymous,
             session_transfer: None,
