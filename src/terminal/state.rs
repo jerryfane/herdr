@@ -264,6 +264,17 @@ struct ReleasedAgentName {
     session_ref: crate::agent_resume::AgentSessionRef,
 }
 
+/// See [`TerminalState::released_agent_name_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedAgentNameDisposition<'a> {
+    /// Nothing remembered, or nothing yet decides it.
+    Wait,
+    /// Another agent, session or name took the pane.
+    Forget,
+    /// The session that held the name runs here again.
+    Restore(&'a str),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
@@ -2953,6 +2964,7 @@ impl TerminalState {
     /// The agent that held this pane's name left the pane. The name is free
     /// again, but the pane remembers the session the agent ran: that session
     /// resumed here takes the name back (#480), whatever binary resumes it.
+    /// An exit with no name to record keeps the name remembered already.
     fn release_agent_name_on_exit(&mut self) {
         let released = self.agent_name.clone().and_then(|name| {
             let owner = self.agent_name_owner.as_ref()?;
@@ -2966,8 +2978,9 @@ impl TerminalState {
                 session_ref,
             })
         });
+        let remembered = released.or_else(|| self.released_agent_name.take());
         self.clear_agent_name();
-        self.released_agent_name = released;
+        self.released_agent_name = remembered;
     }
 
     fn agent_session_ref_of(
@@ -2986,44 +2999,55 @@ impl TerminalState {
             })
     }
 
-    /// The name an exited agent left behind, once its session runs in this
-    /// pane again. Another agent or another session here forgets that name
-    /// for good; a shell between the two keeps it.
-    pub fn resumed_agent_name(&mut self) -> Option<&str> {
-        let released = self.released_agent_name.as_ref()?;
-        let resumed = match self.effective_agent_label() {
-            None => return None,
-            Some(agent_label) if agent_label != released.agent_label => false,
-            Some(agent_label) => match self.agent_session_ref_of(agent_label) {
-                None => return None,
-                Some(session_ref) => session_ref == released.session_ref,
-            },
+    /// What becomes of the name an exited agent left behind (see
+    /// [`Self::settle_released_agent_name`]). Reads only.
+    pub fn released_agent_name_disposition(&self) -> ReleasedAgentNameDisposition<'_> {
+        let Some(released) = self.released_agent_name.as_ref() else {
+            return ReleasedAgentNameDisposition::Wait;
         };
-        if !resumed || self.agent_name.is_some() {
-            self.released_agent_name = None;
-            return None;
+        if self.agent_name.is_some() {
+            return ReleasedAgentNameDisposition::Forget;
         }
-        self.released_agent_name
-            .as_ref()
-            .map(|released| released.name.as_str())
+        if self.recent_agent_process_exit.is_some() {
+            return ReleasedAgentNameDisposition::Wait;
+        }
+        let Some(agent_label) = self.effective_agent_label() else {
+            return ReleasedAgentNameDisposition::Wait;
+        };
+        if agent_label != released.agent_label {
+            return ReleasedAgentNameDisposition::Forget;
+        }
+        match self.agent_session_ref_of(agent_label) {
+            None => ReleasedAgentNameDisposition::Wait,
+            Some(session_ref) if session_ref == released.session_ref => {
+                ReleasedAgentNameDisposition::Restore(&released.name)
+            }
+            Some(_) => ReleasedAgentNameDisposition::Forget,
+        }
     }
 
-    /// Give the resumed session back the name it held here (see
-    /// [`Self::resumed_agent_name`]).
-    pub fn restore_resumed_agent_name(&mut self) {
-        let Some(released) = self.released_agent_name.take() else {
-            return;
-        };
-        self.agent_name = Some(released.name);
+    /// Apply [`Self::released_agent_name_disposition`]: while the pane is a
+    /// shell or its agent has not reported a session yet, keep the name
+    /// remembered; another agent, another session or another name here
+    /// forgets it for good; the same session resumed takes it back, unless
+    /// `name_held_elsewhere` (another agent took it meanwhile, which keeps
+    /// it). Returns the name restored.
+    pub fn settle_released_agent_name(&mut self, name_held_elsewhere: bool) -> Option<String> {
+        match self.released_agent_name_disposition() {
+            ReleasedAgentNameDisposition::Wait => return None,
+            ReleasedAgentNameDisposition::Restore(_) if !name_held_elsewhere => {}
+            ReleasedAgentNameDisposition::Restore(_) | ReleasedAgentNameDisposition::Forget => {
+                self.released_agent_name = None;
+                return None;
+            }
+        }
+        let released = self.released_agent_name.take()?;
+        self.agent_name = Some(released.name.clone());
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: released.agent_label,
             session_ref: Some(released.session_ref),
         });
-    }
-
-    /// Another terminal took the released name meanwhile: it stays there.
-    pub fn forget_released_agent_name(&mut self) {
-        self.released_agent_name = None;
+        Some(released.name)
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -3134,6 +3158,13 @@ impl TerminalState {
         if self.managed_agent.is_some_and(|managed| {
             crate::detect::parse_agent_label(agent_label) == Some(managed.kind)
         }) {
+            // A managed seat keeps its name through its own session changes,
+            // and the name follows its current session, so an exit remembers
+            // the session a hand restart resumes (#480).
+            if let (Some(owner), Some(session_ref)) = (self.agent_name_owner.as_mut(), session_ref)
+            {
+                owner.session_ref = Some(session_ref.clone());
+            }
             return;
         }
         match self.agent_name_owner.as_mut() {
