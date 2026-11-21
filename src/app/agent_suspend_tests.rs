@@ -293,3 +293,123 @@ fn same_kind_replacement_drops_the_previous_pi_session_and_authority() {
     assert_eq!(session_value(&app, &terminal_id), None);
     app.assert_invariants_for_test();
 }
+
+fn omp_session(file: &str) -> AgentSessionRef {
+    AgentSessionRef::path(
+        std::env::current_dir()
+            .expect("cwd")
+            .join(file)
+            .display()
+            .to_string(),
+    )
+    .expect("omp session path")
+}
+
+/// What omp's integration sends when a process comes up on `session`: its
+/// session report (`session_start` reports "startup", also for `--resume`)
+/// and then its state, both from that process's pid.
+fn omp_starts_on(
+    app: &mut AppState,
+    pane_id: PaneId,
+    session: &AgentSessionRef,
+    process_pid: u32,
+    seq: u64,
+) {
+    app.handle_app_event(AppEvent::AgentSessionReported {
+        pane_id,
+        source: "herdr:omp".into(),
+        agent_label: "omp".into(),
+        seq: Some(seq),
+        session_ref: Some(session.clone()),
+        session_path: None,
+        session_cursor: None,
+        process_pid: Some(process_pid),
+        session_start_source: Some("startup".into()),
+    });
+    app.handle_app_event(AppEvent::HookStateReported {
+        pane_id,
+        source: "herdr:omp".into(),
+        agent_label: "omp".into(),
+        state: AgentState::Idle,
+        message: None,
+        seq: Some(seq + 1),
+        session_ref: Some(session.clone()),
+        session_cursor: None,
+        process_pid: Some(process_pid),
+    });
+}
+
+/// #480: the agent `ordinals` runs omp in its pane, is exited (`/exit`), and
+/// another omp process (from a different binary, so a new pid) starts in the
+/// same pane resuming the same session.
+fn omp_restarted_in_its_pane(next_session: &AgentSessionRef) -> (AppState, TerminalId) {
+    let start = Instant::now();
+    let (mut app, pane_id, terminal_id) = adversarial_pane();
+    let session = omp_session("ordinals-omp.jsonl");
+    detect(&mut app, pane_id, Agent::Omp, start);
+    omp_starts_on(&mut app, pane_id, &session, 1001, 100);
+    name_agent(&mut app, &terminal_id, "ordinals");
+    assert_eq!(session_value(&app, &terminal_id), Some(session.value));
+
+    real_exit(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(1));
+    assert_eq!(
+        app.terminals[&terminal_id].agent_name, None,
+        "the exited agent's name is free while the pane is a shell"
+    );
+
+    detect(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(2));
+    omp_starts_on(&mut app, pane_id, next_session, 2002, 200);
+    assert_eq!(
+        session_value(&app, &terminal_id),
+        Some(next_session.value.clone())
+    );
+    (app, terminal_id)
+}
+
+#[test]
+fn an_agent_restarted_in_its_pane_on_the_same_session_keeps_its_name() {
+    let (app, terminal_id) = omp_restarted_in_its_pane(&omp_session("ordinals-omp.jsonl"));
+
+    let terminal = &app.terminals[&terminal_id];
+    assert_eq!(terminal.agent_name.as_deref(), Some("ordinals"));
+    assert_eq!(terminal.effective_agent_label(), Some("omp"));
+    app.assert_invariants_for_test();
+}
+
+#[test]
+fn a_different_session_in_the_pane_does_not_inherit_the_name() {
+    let (app, terminal_id) = omp_restarted_in_its_pane(&omp_session("someone-else-omp.jsonl"));
+
+    let terminal = &app.terminals[&terminal_id];
+    assert_eq!(terminal.agent_name, None);
+    assert_eq!(terminal.effective_agent_label(), Some("omp"));
+    app.assert_invariants_for_test();
+}
+
+#[test]
+fn a_name_taken_while_the_agent_was_gone_is_not_restored_twice() {
+    let start = Instant::now();
+    let (mut app, pane_id, terminal_id) = adversarial_pane();
+    let session = omp_session("ordinals-omp.jsonl");
+    detect(&mut app, pane_id, Agent::Omp, start);
+    omp_starts_on(&mut app, pane_id, &session, 1001, 100);
+    name_agent(&mut app, &terminal_id, "ordinals");
+    real_exit(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(1));
+
+    let other_terminal = app
+        .terminals
+        .keys()
+        .find(|id| **id != terminal_id)
+        .cloned()
+        .expect("a second terminal");
+    name_agent(&mut app, &other_terminal, "ordinals");
+
+    detect(&mut app, pane_id, Agent::Omp, start + Duration::from_secs(2));
+    omp_starts_on(&mut app, pane_id, &session, 2002, 200);
+
+    assert_eq!(app.terminals[&terminal_id].agent_name, None);
+    assert_eq!(
+        app.terminals[&other_terminal].agent_name.as_deref(),
+        Some("ordinals")
+    );
+}
