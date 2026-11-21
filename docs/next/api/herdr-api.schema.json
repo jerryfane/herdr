@@ -1942,6 +1942,24 @@
           "description": "The secret an agent's control socket asks for. It acts for the agent, so\n`Debug` never prints it; it serializes as a plain string only for the wire.",
           "type": "string"
         },
+        "AgentDismissAskParams": {
+          "description": "`agent.dismiss_ask` — close an omp agent's pending `ask` (plain or HTML\nform) as cancelled, as Esc in the terminal does.",
+          "properties": {
+            "ask_id": {
+              "description": "The pending ask's tool call id, from `agent.transcript`'s `pending_ask`.\nRefused unless it is still the agent's current pending ask.",
+              "type": "string"
+            },
+            "target": {
+              "description": "Agent name or pane id, resolved like `agent.read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "ask_id"
+          ],
+          "type": "object"
+        },
         "AgentForgetParams": {
           "description": "`agent.forget` — permanently drop an archived agent's record (issue #291).\nOnly herdr's resume pointer is removed; the harness transcript and session\nfiles on disk are left untouched. Live agents are refused.",
           "properties": {
@@ -8204,6 +8222,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentAnswerFormParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.dismiss_ask",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDismissAskParams"
             }
           },
           "required": [
@@ -16697,6 +16731,11 @@
               "description": "One single-select question with at least one option, and a caller that\nmay answer it. Always false for an HTML form ask.",
               "type": "boolean"
             },
+            "dismissable": {
+              "default": false,
+              "description": "This caller may close the ask as cancelled with `agent.dismiss_ask`\n(omp cancels a plain ask and an HTML form alike on Esc). Clients\ngate their Dismiss button on it.",
+              "type": "boolean"
+            },
             "form": {
               "anyOf": [
                 {
@@ -17717,6 +17756,23 @@
                 "type",
                 "status",
                 "answers"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.dismiss_ask`: the ask's tool result reads cancelled.",
+              "properties": {
+                "dismissed": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "ask_dismissed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "dismissed"
               ],
               "type": "object"
             },
@@ -19857,6 +19913,11 @@
               "description": "`herdr api-bridge --multi` forwards newline-delimited requests over one\nlong-lived bridge process instead of one process per request.",
               "type": "boolean"
             },
+            "ask_dismiss": {
+              "default": false,
+              "description": "Serves `agent.dismiss_ask`: closes a pending omp ask (plain or form)\nas cancelled.",
+              "type": "boolean"
+            },
             "ask_form": {
               "default": false,
               "description": "Parses omp HTML form asks (`form` on transcript asks and `pending_ask`)\nand serves `agent.answer_form`.",
@@ -20363,7 +20424,7 @@
               "type": "object"
             },
             {
-              "description": "An `ask` tool call; `id` is the tool call id, `answer` the selection once made.\nFor an HTML form ask, `form` holds the form, `questions`/`answer` stay as a\ncompatibility view and `form_answer`/`form_status` arrive with the result.",
+              "description": "An `ask` tool call; `id` is the tool call id, `answer` the selection once made.\nFor an HTML form ask, `form` holds the form, `questions`/`answer` stay as a\ncompatibility view and `form_answer`/`form_status` arrive with the result.\nA plain ask that ended without a selection has `form_status: cancelled`.",
               "properties": {
                 "answer": {
                   "items": {

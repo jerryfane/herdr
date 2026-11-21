@@ -69,6 +69,28 @@ impl FakeOmp {
                     .unwrap();
                 writeln!(file, "{line}").unwrap();
             }
+            // omp's Esc: the ask throws, recorded as an error result.
+            "escape" if self.records_answer => {
+                let line = json!({
+                    "type": "message",
+                    "id": "e_result",
+                    "parentId": "e_ask",
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": self.ask_id,
+                        "toolName": "ask",
+                        "isError": true,
+                        "content": [{"type": "text", "text": "Ask tool was cancelled by the user"}],
+                        "details": {},
+                    },
+                });
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.session)
+                    .unwrap();
+                writeln!(file, "{line}").unwrap();
+            }
             _ => {}
         }
     }
@@ -227,6 +249,18 @@ impl Harness {
     /// Run `agent.answer` against an app that serves `agent.get` with this
     /// harness's agent and pane reads/keys from the fake omp.
     fn answer(&self, params: &AgentAnswerParams) -> Value {
+        self.run(|api_tx| answer_response("req".into(), params, api_tx, FAST))
+    }
+
+    fn dismiss(&self, ask_id: &str) -> Value {
+        let params = AgentDismissAskParams {
+            target: self.pane_id.clone(),
+            ask_id: ask_id.into(),
+        };
+        self.run(|api_tx| dismiss_response("req".into(), &params, api_tx, FAST))
+    }
+
+    fn run(&self, call: impl FnOnce(&ApiRequestSender) -> String) -> Value {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
         let omp = Arc::clone(&self.omp);
         let agent = self.agent.clone();
@@ -257,11 +291,61 @@ impl Harness {
                     .send(json!({"id": id, "result": result}).to_string());
             }
         });
-        let response = answer_response("req".into(), params, &api_tx, FAST);
+        let response = call(&api_tx);
         drop(api_tx);
         app.join().unwrap();
         serde_json::from_str(&response).unwrap()
     }
+}
+
+#[test]
+fn dismiss_refuses_another_ask_id_and_sends_nothing() {
+    let harness = harness(deploy_question());
+    let response = harness.dismiss("call_stale");
+    assert_eq!(error_code(&response), "ask_mismatch");
+    assert!(harness.keys().is_empty());
+}
+
+#[test]
+fn dismiss_refuses_when_no_ask_is_pending() {
+    let harness = harness(deploy_question());
+    let ask_id = harness.ask_id();
+    assert_eq!(
+        harness.answer(&harness.params("Ship it now"))["result"]["status"],
+        "answered"
+    );
+    let keys = harness.keys();
+    let response = harness.dismiss(&ask_id);
+    assert_eq!(error_code(&response), "ask_not_pending");
+    assert_eq!(harness.keys(), keys, "no key after the ask ended");
+}
+
+#[test]
+fn dismiss_sends_esc_once_and_confirms_cancelled() {
+    let harness = harness(deploy_question());
+    let ask_id = harness.ask_id();
+    let response = harness.dismiss(&ask_id);
+    assert_eq!(
+        response["result"],
+        json!({"type": "ask_dismissed", "dismissed": true})
+    );
+    assert_eq!(harness.keys(), ["escape"]);
+    assert_eq!(
+        crate::agent_transcript::ask_cancelled(&harness.session, &ask_id).unwrap(),
+        Some(true)
+    );
+    // A repeat tap is refused without a second Esc.
+    assert_eq!(error_code(&harness.dismiss(&ask_id)), "ask_not_pending");
+    assert_eq!(harness.keys(), ["escape"]);
+}
+
+#[test]
+fn dismiss_without_a_cancelled_result_times_out() {
+    let harness = harness(deploy_question());
+    harness.omp.lock().unwrap().records_answer = false;
+    let response = harness.dismiss(&harness.ask_id());
+    assert_eq!(error_code(&response), "timeout");
+    assert_eq!(harness.keys(), ["escape"]);
 }
 
 fn error_code(response: &Value) -> &str {

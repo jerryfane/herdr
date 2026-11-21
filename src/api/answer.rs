@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::agent_resume::AgentSessionRefKind;
 use crate::api::schema::{
-    AgentAnswerFormParams, AgentAnswerParams, AgentAnswerStatus, AgentInfo, AskFormAnswer,
-    AskQuestion, ErrorBody, ErrorResponse, Method, PaneReadParams, PaneReadResult,
+    AgentAnswerFormParams, AgentAnswerParams, AgentAnswerStatus, AgentDismissAskParams, AgentInfo,
+    AskFormAnswer, AskQuestion, ErrorBody, ErrorResponse, Method, PaneReadParams, PaneReadResult,
     PaneSendInputParams, PaneSendKeysParams, PendingAsk, ReadFormat, ReadIntent, ReadSource,
     Request, ResponseResult, SuccessResponse,
 };
@@ -60,6 +60,105 @@ pub(super) fn answer_agent_form(
     api_tx: &ApiRequestSender,
 ) -> String {
     answer_form_response(request_id, &params, api_tx, LIVE)
+}
+
+pub(super) fn dismiss_agent_ask(
+    request_id: String,
+    params: AgentDismissAskParams,
+    api_tx: &ApiRequestSender,
+) -> String {
+    dismiss_response(request_id, &params, api_tx, LIVE)
+}
+
+fn dismiss_response(
+    request_id: String,
+    params: &AgentDismissAskParams,
+    api_tx: &ApiRequestSender,
+    timing: Timing,
+) -> String {
+    match dismiss(&request_id, params, api_tx, timing) {
+        Ok(()) => serde_json::to_string(&SuccessResponse {
+            id: request_id,
+            result: ResponseResult::AskDismissed { dismissed: true },
+        }),
+        Err(error) => serde_json::to_string(&ErrorResponse {
+            id: request_id,
+            error,
+        }),
+    }
+    .expect("agent.dismiss_ask response serializes")
+}
+
+/// Close the agent's pending ask with Esc, as the owner does in the
+/// terminal: omp cancels both the plain selector and the HTML form on Esc
+/// and records an error tool result. Esc goes out only while `ask_id` is the
+/// agent's current pending ask, so a stale request never reaches a later
+/// ask, the composer or a running turn.
+fn dismiss(
+    request_id: &str,
+    params: &AgentDismissAskParams,
+    api_tx: &ApiRequestSender,
+    timing: Timing,
+) -> Result<(), ErrorBody> {
+    let agent = crate::api::wait::agent_get(request_id, &params.target, api_tx)
+        .map_err(|response| response.error)?;
+    let session_path = omp_session_path(&agent).ok_or_else(|| {
+        error(
+            "ask_unsupported",
+            "agent.dismiss_ask needs an omp agent with a session file",
+        )
+    })?;
+    // Shared with the answer methods: an ask being answered is not
+    // dismissed under it, and an ask already dismissed gets no second Esc.
+    let mut claim = Claim::take(&agent.pane_id, &params.ask_id).ok_or_else(|| {
+        error(
+            "ask_not_pending",
+            "this ask is already being answered or dismissed",
+        )
+    })?;
+    let pending = crate::agent_transcript::pending_ask(&session_path)
+        .map_err(|err| {
+            error(
+                "ask_not_pending",
+                format!("the agent's session file cannot be read: {err}"),
+            )
+        })?
+        .ok_or_else(|| error("ask_not_pending", "the agent is not waiting on any ask"))?;
+    if pending.id != params.ask_id {
+        return Err(error(
+            "ask_mismatch",
+            "the agent's pending ask is a different one; reload the transcript",
+        ));
+    }
+    let mut pane = AppPane {
+        request_id,
+        pane_id: &agent.pane_id,
+        api_tx,
+        pause: timing.selector_pause,
+    };
+    selector::SelectorPane::send_keys(&mut pane, &["escape"])?;
+    // Esc is out: a retry must not press it again into whatever comes next.
+    claim.keep();
+    let deadline = Instant::now() + timing.confirm_timeout;
+    loop {
+        match crate::agent_transcript::ask_cancelled(&session_path, &params.ask_id) {
+            Ok(Some(true)) => return Ok(()),
+            Ok(Some(false)) => {
+                return Err(error(
+                    "not_cancelled",
+                    "the ask was answered before Esc took effect",
+                ))
+            }
+            Ok(None) | Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(error(
+                "timeout",
+                "Esc was sent but no cancelled result reached the session file in time",
+            ));
+        }
+        std::thread::sleep(timing.confirm_poll);
+    }
 }
 
 fn answer_form_response(

@@ -120,6 +120,10 @@ pub struct ServerCapabilities {
     /// and serves `agent.answer_form`.
     #[serde(default)]
     pub ask_form: bool,
+    /// Serves `agent.dismiss_ask`: closes a pending omp ask (plain or form)
+    /// as cancelled.
+    #[serde(default)]
+    pub ask_dismiss: bool,
     /// Serves `agent.topics.*`, the `agent.topics.changed` event and
     /// `topic_sessions` on `agent.list`/`agent.get`.
     #[serde(default)]

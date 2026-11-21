@@ -767,6 +767,7 @@ fn an_ask_is_pending_until_its_result_records_the_answer() {
         answerable: true,
         form: None,
         form_answerable: false,
+        dismissable: true,
     };
     let page = session.newest();
     assert_eq!(page.pending_ask, Some(pending.clone()));
@@ -2845,9 +2846,39 @@ fn a_cancelled_questions_ask_has_no_answer() {
     let page = session.newest();
     // Before ask forms, empty details became `answer: Some([])`, which apps
     // drew as an empty "You chose".
-    let answer = page.entries.iter().find_map(|entry| match entry {
-        TranscriptEntry::Ask { answer, .. } => Some(answer.clone()),
+    let (answer, status) = page
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptEntry::Ask {
+                answer,
+                form_status,
+                ..
+            } => Some((answer.clone(), *form_status)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(answer, None, "{:?}", page.entries);
+    // omp's Esc (or `agent.dismiss_ask`) reads cancelled, as for a form.
+    assert_eq!(status, Some(AskFormStatus::Cancelled));
+}
+
+#[test]
+fn an_answered_questions_ask_has_no_form_status() {
+    let mut session = Fixture::new("questions-answered");
+    session.user("q");
+    session.assistant(
+        vec![ask_call(
+            "a",
+            json!([{"question": "Pick", "options": ["A"]}]),
+        )],
+        "toolUse",
+    );
+    session.result("a", "ask", false, json!({"selectedOptions": ["A"]}));
+    let page = session.newest();
+    let status = page.entries.iter().find_map(|entry| match entry {
+        TranscriptEntry::Ask { form_status, .. } => Some(*form_status),
         _ => None,
     });
-    assert_eq!(answer, Some(None), "{:?}", page.entries);
+    assert_eq!(status, Some(None), "{:?}", page.entries);
 }

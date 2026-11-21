@@ -125,6 +125,10 @@ pub enum ResponseResult {
         status: AgentAnswerStatus,
         answers: Vec<AskFormAnswer>,
     },
+    /// `agent.dismiss_ask`: the ask's tool result reads cancelled.
+    AskDismissed {
+        dismissed: bool,
+    },
     /// `agent.avatar.set`: the agent's picture now, `null` once cleared.
     AgentAvatarSet {
         avatar: Option<super::agents::AgentAvatar>,

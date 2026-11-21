@@ -399,6 +399,30 @@ pub(crate) fn ask_result(
     }
 }
 
+/// Whether the `ask` call `ask_id` (plain or form) ended cancelled, once its
+/// result is written; `None` while it is unanswered. omp records a user's
+/// Esc as an error result; a result without any selection or form answer
+/// counts as cancelled too, as the apps show it.
+pub(crate) fn ask_cancelled(session_path: &Path, ask_id: &str) -> std::io::Result<Option<bool>> {
+    let read = with_index(session_path, |view| {
+        let Some(result) = view.index.result_for(ask_id) else {
+            return Ok(None);
+        };
+        let failed = view.index.record(result).failed;
+        let line: ResultLine = view.parse(result)?.ok_or(TranscriptError::CursorExpired)?;
+        let details = line.message.details.as_ref();
+        let (form_answers, _) = normalize::form_result(details, failed);
+        Ok(Some(
+            failed || (normalize::ask_answer(details).is_empty() && form_answers.is_empty()),
+        ))
+    });
+    match read {
+        Ok(cancelled) => Ok(cancelled),
+        Err(TranscriptError::Unavailable(error)) => Err(error),
+        Err(other) => Err(std::io::Error::other(other.message())),
+    }
+}
+
 /// Opaque cursors. `before` names the first record of a page. `after` holds
 /// the number of records seen and the newest active-branch record among them
 /// (`tip`), which must still be on the active branch: after a rewind the
@@ -1337,9 +1361,13 @@ impl View<'_> {
                                 )
                             }
                             None => {
-                                // An ask with no selection (cancelled, failed) has no answer.
+                                // An ask with no selection (cancelled, failed) has no
+                                // answer; its `form_status` reads `cancelled` (omp's
+                                // Esc, or `agent.dismiss_ask`) as a form's does.
                                 let answer = normalize::ask_answer(details);
-                                ((!answer.is_empty()).then_some(answer), None, None)
+                                let status = (failed || answer.is_empty())
+                                    .then_some(crate::api::schema::AskFormStatus::Cancelled);
+                                ((!answer.is_empty()).then_some(answer), None, status)
                             }
                         }
                     }
@@ -1486,6 +1514,7 @@ impl View<'_> {
                             answerable: false,
                             form: Some(wire),
                             form_answerable: parsed.drivable(),
+                            dismissable: true,
                         }
                     }
                     None => {
@@ -1497,6 +1526,7 @@ impl View<'_> {
                             answerable,
                             form: None,
                             form_answerable: false,
+                            dismissable: true,
                         }
                     }
                 });

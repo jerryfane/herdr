@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
-use crate::api::answer::{answer_agent, answer_agent_form};
+use crate::api::answer::{answer_agent, answer_agent_form, dismiss_agent_ask};
 use crate::api::client::{
     parse_response_value, ApiClient, ApiClientError, ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
@@ -219,6 +219,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         turn_origin: true,
         rename_preconditions: true,
         ask_form: true,
+        ask_dismiss: true,
         // The control socket client is Unix-only.
         agent_topics: cfg!(unix),
         // Topic pages are read from the session files on disk, on every platform.
@@ -1928,6 +1929,10 @@ fn handle_principal_connection(
             let response = answer_agent_form(request_id.clone(), params, api_tx);
             finish_wait_response(&mut stream, Some(response), &request_id, method, changes_ui)
         }
+        Method::AgentDismissAsk(params) => {
+            let response = dismiss_agent_ask(request_id.clone(), params, api_tx);
+            finish_wait_response(&mut stream, Some(response), &request_id, method, changes_ui)
+        }
         Method::PaneWaitForOutput(params) => {
             let response =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
@@ -2037,6 +2042,7 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // the one that can read the agent's session file.
         Method::AgentAnswer(params) => Some(&mut params.target),
         Method::AgentAnswerForm(params) => Some(&mut params.target),
+        Method::AgentDismissAsk(params) => Some(&mut params.target),
         // Admin methods that name a pane/agent. `federation.rs` classifies all of these
         // as AllowedAt(Admin) - remote admin is INTENDED - but without an arm here they
         // fall through to `_ => None`, dispatch locally, and fail to resolve an
@@ -2269,6 +2275,29 @@ fn maybe_route_to_peer(
                 code: "ask_unsupported".into(),
                 message: format!(
                     "machine {alias} has not advertised ask_form, so it cannot answer HTML form asks; update Herdr there"
+                ),
+            },
+        };
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "ask_unsupported",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
+    // Likewise a peer without `ask_dismiss` has no `agent.dismiss_ask`.
+    if matches!(&request.method, Method::AgentDismissAsk(_)) && !peer_target.ask_dismiss() {
+        let response = ErrorResponse {
+            id: request_id.to_owned(),
+            error: ErrorBody {
+                code: "ask_unsupported".into(),
+                message: format!(
+                    "machine {alias} has not advertised ask_dismiss, so it cannot dismiss asks; update Herdr there"
                 ),
             },
         };
@@ -3892,6 +3921,7 @@ mod tests {
                 turn_origin: false,
                 rename_preconditions: false,
                 ask_form: false,
+                ask_dismiss: false,
                 agent_topics: false,
                 agent_transcript_topic: false,
                 gram_reachable: false,
@@ -5394,6 +5424,7 @@ mod federation_tests {
             ("agent.wait", AllowedAt(Observe)),
             ("agent.answer", AllowedAt(Admin)),
             ("agent.answer_form", AllowedAt(Admin)),
+            ("agent.dismiss_ask", AllowedAt(Admin)),
             ("pane.copy_motion", Denied),
             ("pane.copy_search", Denied),
             ("pane.edit_scrollback", Denied),
@@ -7375,6 +7406,10 @@ mod federation_tests {
             (
                 "agent.answer_form",
                 serde_json::json!({ "target": "remote/w1:p1", "ask_id": "call_1", "values": {} }),
+            ),
+            (
+                "agent.dismiss_ask",
+                serde_json::json!({ "target": "remote/w1:p1", "ask_id": "call_1" }),
             ),
             (
                 "pane.send_text",
