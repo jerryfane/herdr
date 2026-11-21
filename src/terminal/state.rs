@@ -255,6 +255,15 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// The name an agent held when it left this pane, and the session it ran.
+/// The name is free; only that session resuming in this pane takes it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleasedAgentName {
+    name: String,
+    agent_label: String,
+    session_ref: crate::agent_resume::AgentSessionRef,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
@@ -285,6 +294,7 @@ pub struct TerminalState {
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
+    released_agent_name: Option<ReleasedAgentName>,
     managed_agent: Option<ManagedAgent>,
     codex_prompt_ready: bool,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
@@ -403,6 +413,7 @@ impl TerminalState {
             manual_label: None,
             agent_name: None,
             agent_name_owner: None,
+            released_agent_name: None,
             managed_agent: None,
             codex_prompt_ready: false,
             managed_agent_launch_session: None,
@@ -1088,12 +1099,13 @@ impl TerminalState {
         // A process-exit notification is not enough to release a name: the
         // agent may still occupy the pane. Once a later observation confirms
         // absence, preserve deliberate restart/transfer identity while
-        // releasing its old session anchor; all other exits free the name.
+        // releasing its old session anchor; all other exits free the name,
+        // which only the same session resumed in this pane takes back.
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
             if self.deliberate_relaunch_keeps_name() {
                 self.release_agent_name_session_anchor();
             } else {
-                self.clear_agent_name();
+                self.release_agent_name_on_exit();
             }
         }
         let effective_state_change = self.recompute_effective_state(
@@ -2403,7 +2415,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         if !process_owns_agent {
             self.detected_agent = None;
-            self.clear_agent_name();
+            self.release_agent_name_on_exit();
         }
         self.hook_authority = None;
         self.composer_write = None;
@@ -2454,7 +2466,7 @@ impl TerminalState {
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
-        self.clear_agent_name();
+        self.release_agent_name_on_exit();
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -2670,6 +2682,7 @@ impl TerminalState {
     }
 
     pub fn set_agent_name(&mut self, name: String) {
+        self.released_agent_name = None;
         self.agent_name = (!name.is_empty()).then_some(name);
         self.agent_name_owner = self.agent_name.as_ref().and_then(|_| {
             self.hook_authority
@@ -2784,7 +2797,7 @@ impl TerminalState {
                     && observed_expected
                     && known_agent.is_none());
         if clear {
-            self.clear_agent_name();
+            self.release_agent_name_on_exit();
             return true;
         }
         if managed.phase == ManagedAgentPhase::Blocked {
@@ -2933,7 +2946,84 @@ impl TerminalState {
         }
         self.agent_name = None;
         self.agent_name_owner = None;
+        self.released_agent_name = None;
         self.managed_agent = None;
+    }
+
+    /// The agent that held this pane's name left the pane. The name is free
+    /// again, but the pane remembers the session the agent ran: that session
+    /// resumed here takes the name back (#480), whatever binary resumes it.
+    fn release_agent_name_on_exit(&mut self) {
+        let released = self.agent_name.clone().and_then(|name| {
+            let owner = self.agent_name_owner.as_ref()?;
+            let session_ref = owner
+                .session_ref
+                .clone()
+                .or_else(|| self.agent_session_ref_of(&owner.agent_label))?;
+            Some(ReleasedAgentName {
+                name,
+                agent_label: owner.agent_label.clone(),
+                session_ref,
+            })
+        });
+        self.clear_agent_name();
+        self.released_agent_name = released;
+    }
+
+    fn agent_session_ref_of(
+        &self,
+        agent_label: &str,
+    ) -> Option<crate::agent_resume::AgentSessionRef> {
+        self.hook_authority
+            .as_ref()
+            .filter(|authority| authority.agent_label == agent_label)
+            .and_then(|authority| authority.session_ref.clone())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .filter(|session| session.agent == agent_label)
+                    .map(|session| session.session_ref.clone())
+            })
+    }
+
+    /// The name an exited agent left behind, once its session runs in this
+    /// pane again. Another agent or another session here forgets that name
+    /// for good; a shell between the two keeps it.
+    pub fn resumed_agent_name(&mut self) -> Option<&str> {
+        let released = self.released_agent_name.as_ref()?;
+        let resumed = match self.effective_agent_label() {
+            None => return None,
+            Some(agent_label) if agent_label != released.agent_label => false,
+            Some(agent_label) => match self.agent_session_ref_of(agent_label) {
+                None => return None,
+                Some(session_ref) => session_ref == released.session_ref,
+            },
+        };
+        if !resumed || self.agent_name.is_some() {
+            self.released_agent_name = None;
+            return None;
+        }
+        self.released_agent_name
+            .as_ref()
+            .map(|released| released.name.as_str())
+    }
+
+    /// Give the resumed session back the name it held here (see
+    /// [`Self::resumed_agent_name`]).
+    pub fn restore_resumed_agent_name(&mut self) {
+        let Some(released) = self.released_agent_name.take() else {
+            return;
+        };
+        self.agent_name = Some(released.name);
+        self.agent_name_owner = Some(AgentNameOwner {
+            agent_label: released.agent_label,
+            session_ref: Some(released.session_ref),
+        });
+    }
+
+    /// Another terminal took the released name meanwhile: it stays there.
+    pub fn forget_released_agent_name(&mut self) {
+        self.released_agent_name = None;
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {

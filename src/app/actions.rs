@@ -1825,6 +1825,20 @@ impl AppState {
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
+            // An agent that exited from this pane and came back on the same
+            // session takes its name back, unless another terminal took it.
+            if let Some(name) = terminal.resumed_agent_name().map(str::to_string) {
+                let taken = self.terminals.iter().any(|(id, other)| {
+                    id != &terminal_id && other.agent_name.as_deref() == Some(name.as_str())
+                });
+                let terminal = self.terminals.get_mut(&terminal_id)?;
+                if taken {
+                    terminal.forget_released_agent_name();
+                } else {
+                    terminal.restore_resumed_agent_name();
+                }
+            }
+            let terminal = self.terminals.get_mut(&terminal_id)?;
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
