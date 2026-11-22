@@ -428,9 +428,20 @@ fn without_deleted_suffix(exe: PathBuf) -> PathBuf {
     }
 }
 
+/// Whether `exe` lies under `dirs.root()`. The OS reports a process's own
+/// executable with directory symlinks resolved (`/proc/self/exe` on Linux),
+/// so a config dir reached through a symlink only matches canonicalized.
+fn runs_from_updates(exe: &Path, dirs: &UpdateDirs) -> bool {
+    exe.starts_with(dirs.root())
+        || dirs
+            .root()
+            .canonicalize()
+            .is_ok_and(|root| exe.starts_with(root))
+}
+
 fn install_path_for(exe: PathBuf, dirs: &UpdateDirs) -> io::Result<PathBuf> {
     let exe = without_deleted_suffix(exe);
-    if !exe.starts_with(dirs.root()) {
+    if !runs_from_updates(&exe, dirs) {
         return Ok(exe);
     }
     dirs.load()
@@ -456,7 +467,7 @@ pub(crate) fn exe_for_children(exe: PathBuf) -> PathBuf {
 }
 
 fn exe_for_children_in(exe: PathBuf, dirs: &UpdateDirs) -> PathBuf {
-    if !exe.starts_with(dirs.root()) {
+    if !runs_from_updates(&exe, dirs) {
         return exe;
     }
     match install_path_for(exe.clone(), dirs) {
@@ -888,5 +899,47 @@ mod tests {
             "the rollback copy is replaced by every update too"
         );
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    /// The server's own path comes back with directory symlinks resolved, so
+    /// a config dir reached through a symlink must still count as `updates/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_dir_still_maps_to_the_install_path() {
+        let real = temp_dirs("symlink-real");
+        let real_config = real.root().parent().unwrap().to_path_buf();
+        let link_config = std::env::temp_dir().join(format!(
+            "herdr-update-state-symlink-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&link_config);
+        std::fs::create_dir_all(real.root()).unwrap();
+        std::os::unix::fs::symlink(&real_config, &link_config).unwrap();
+        let dirs = UpdateDirs::at(link_config.join(UPDATES_DIR));
+
+        let install = real_config.join("bin").join(BINARY_NAME);
+        std::fs::create_dir_all(install.parent().unwrap()).unwrap();
+        std::fs::write(&install, b"herdr").unwrap();
+        let mut attempt = record(Some(UpdateOutcome::Updated));
+        attempt.install_path = install.clone();
+        dirs.store(&UpdateState {
+            attempt: Some(attempt),
+            rolled_back: Vec::new(),
+        })
+        .unwrap();
+
+        // What `current_exe()` reports: the build dir, symlinks resolved.
+        let running = real
+            .root()
+            .canonicalize()
+            .unwrap()
+            .join("2026-10-28-0123456789ab")
+            .join(BINARY_NAME);
+        assert!(!running.starts_with(dirs.root()));
+        assert_eq!(install_path_for(running.clone(), &dirs).unwrap(), install);
+        assert_eq!(exe_for_children_in(running, &dirs), install);
+
+        let _ = std::fs::remove_file(&link_config);
+        let _ = std::fs::remove_dir_all(&real_config);
     }
 }
