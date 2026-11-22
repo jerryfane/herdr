@@ -3642,7 +3642,7 @@ mod tests {
     #[test]
     fn a_guest_acts_on_the_granted_agents_topic_suggestions_under_their_name() {
         use crate::agent_topics::control::tests::FakeControl;
-        let fake = FakeControl::start("guest-suggestions", |frame| {
+        let fake = FakeControl::start("g-suggest", |frame| {
             match frame["type"].as_str().unwrap_or_default() {
                 "topics_accept_suggestion" => {
                     json!({"success": true, "data": {"topicId": "T1", "alreadyAccepted": false}})

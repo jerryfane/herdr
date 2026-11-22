@@ -602,7 +602,7 @@ fn next_topics_change(app: &mut App) -> crate::events::AppEvent {
 
 #[test]
 fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
-    let fake = FakeControl::start("suggest-owner", |frame| {
+    let fake = FakeControl::start("sg-owner", |frame| {
         let again = frame["suggestionId"] == "sg_again";
         match frame["type"].as_str().unwrap_or_default() {
             "topics_accept_suggestion" => {
@@ -615,7 +615,7 @@ fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
             _ => json!({"success": true, "data": {"topics": []}}),
         }
     });
-    let (_session, mut app, pane) = offered("suggest-owner", &fake);
+    let (_session, mut app, pane) = offered("sg-owner", &fake);
     // The first topics request also subscribes to the agent's changes; wait
     // for it before the commands, whose frames `received` skips past.
     topics(&app, list(&pane));
@@ -736,14 +736,14 @@ fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
 
 #[test]
 fn a_suggestion_refusal_keeps_the_agents_code() {
-    let fake = FakeControl::start("suggest-codes", |frame| {
+    let fake = FakeControl::start("sg-codes", |frame| {
         let code = match frame["type"].as_str().unwrap_or_default() {
             "topics_organise" => "organise_running",
             _ => frame["suggestionId"].as_str().unwrap_or("topic_rejected"),
         };
         json!({"success": false, "error": format!("refused: {code}"), "code": code})
     });
-    let (_session, app, pane) = offered("suggest-codes", &fake);
+    let (_session, app, pane) = offered("sg-codes", &fake);
     for code in [
         "suggestion_not_found",
         "invalid_message_ids",
@@ -773,7 +773,7 @@ fn a_suggestion_refusal_keeps_the_agents_code() {
 
 #[test]
 fn topics_list_passes_only_open_suggestions_through() {
-    let fake = FakeControl::start("suggest-list", |_| {
+    let fake = FakeControl::start("sg-list", |_| {
         json!({"success": true, "data": {"topics": [], "suggestions": [
             {"id": "sg_open", "title": "Release notes", "reason": "a separate subject",
                 "messageIds": ["m1", "m2"], "createdMs": 5_000},
@@ -781,7 +781,7 @@ fn topics_list_passes_only_open_suggestions_through() {
                 "state": "dismissed"},
         ]}})
     });
-    let (_session, app, pane) = offered("suggest-list", &fake);
+    let (_session, app, pane) = offered("sg-list", &fake);
     let response = topics(&app, list(&pane));
     assert_eq!(
         response["result"]["suggestions"],
@@ -792,8 +792,8 @@ fn topics_list_passes_only_open_suggestions_through() {
     );
 
     // An omp without suggestions lists none rather than an empty list.
-    let older = FakeControl::start("suggest-list-old", empty_topics);
-    let (_session, app, pane) = offered("suggest-list-old", &older);
+    let older = FakeControl::start("sg-list-0", empty_topics);
+    let (_session, app, pane) = offered("sg-list-0", &older);
     let response = topics(&app, list(&pane));
     assert_eq!(response["result"]["topics"], json!([]), "{response}");
     assert!(
@@ -804,14 +804,14 @@ fn topics_list_passes_only_open_suggestions_through() {
 
 #[test]
 fn an_omp_without_suggestions_answers_topics_unsupported() {
-    let fake = FakeControl::start("suggest-old", |frame| {
+    let fake = FakeControl::start("sg-old", |frame| {
         if frame["type"] == "topics_list" {
             empty_topics(frame)
         } else {
             json!({"success": false, "error": "Unknown command."})
         }
     });
-    let (_session, app, pane) = offered("suggest-old", &fake);
+    let (_session, app, pane) = offered("sg-old", &fake);
     let response = topics(
         &app,
         wire(

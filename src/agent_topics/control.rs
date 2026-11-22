@@ -666,27 +666,44 @@ pub(crate) mod tests {
 
     impl Drop for FakeControl {
         fn drop(&mut self) {
+            // Exactly this fake's own directory, nothing above it.
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
+    /// Longest socket path the fake binds: under macOS's 104-byte `SUN_LEN`
+    /// (Linux allows 108).
+    const MAX_SOCKET_PATH_BYTES: usize = 100;
+
+    /// A fresh directory for one fake's socket, under a short fixed root:
+    /// `std::env::temp_dir()` is long on macOS (`/var/folders/…/T/`), so a
+    /// socket there can outgrow `SUN_LEN` whatever the test names it.
+    fn socket_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PathBuf::from(format!("/tmp/htc-{}-{n}", std::process::id()))
+    }
+
     impl FakeControl {
+        /// `tag` names the fake in failure messages only; the socket path
+        /// does not depend on it.
         pub(crate) fn start(
             tag: &str,
             reply: impl Fn(&Value) -> Value + Send + Sync + 'static,
         ) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-topics-{tag}-{}-{:x}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_nanos())
-                    .unwrap_or_default()
-            ));
+            let dir = socket_dir();
+            // Left by an earlier process that had this pid.
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("c.sock");
-            let listener = UnixListener::bind(&path).unwrap();
+            assert!(
+                path.as_os_str().len() < MAX_SOCKET_PATH_BYTES,
+                "fake control {tag}: socket path {} is too long for SUN_LEN",
+                path.display()
+            );
+            let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+                panic!("fake control {tag}: bind {}: {error}", path.display())
+            });
             let (frames_tx, frames) = mpsc::channel();
             let (updates, updates_rx) = mpsc::channel::<Value>();
             let subscribers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<UnixStream>::new()));
@@ -820,6 +837,20 @@ pub(crate) mod tests {
             .frames
             .recv_timeout(Duration::from_millis(200))
             .is_err());
+    }
+
+    #[test]
+    fn a_fake_socket_path_fits_sun_len_whatever_the_tag() {
+        let fake = FakeControl::start(&"a-very-long-tag-".repeat(10), list_reply);
+        assert!(
+            fake.path.as_os_str().len() < MAX_SOCKET_PATH_BYTES,
+            "{}",
+            fake.path.display()
+        );
+        let dir = fake.dir.clone();
+        assert!(dir.is_dir());
+        drop(fake);
+        assert!(!dir.exists(), "the fake removes its own directory");
     }
 
     #[test]
