@@ -276,8 +276,16 @@ pub(crate) fn classify_child_exit(_status: &portable_pty::ExitStatus) -> ChildEx
     ChildExitReason::Exited
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The herdr executable to hand to children that can outlive this server
+/// (`HERDR_BIN_PATH` for panes, plugins and custom commands). A server that a
+/// live update started runs from `updates/<build_id>/herdr`, which the next
+/// update removes, so children get the installed binary instead.
 pub(crate) fn launch_executable() -> std::io::Result<std::path::PathBuf> {
+    running_executable().map(crate::update::state::exe_for_children)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_executable() -> std::io::Result<std::path::PathBuf> {
     std::env::current_exe()
 }
 
