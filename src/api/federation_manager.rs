@@ -134,6 +134,8 @@ struct PeerRouteState {
     agent_transcript_topic: AtomicBool,
     /// The peer's latest poll advertised `agent_topics_switch`.
     agent_topics_switch: AtomicBool,
+    /// The peer's latest poll advertised `agent_topic_suggestions`.
+    agent_topic_suggestions: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -158,6 +160,7 @@ impl PeerRoute {
                 agent_topics: AtomicBool::new(false),
                 agent_transcript_topic: AtomicBool::new(false),
                 agent_topics_switch: AtomicBool::new(false),
+                agent_topic_suggestions: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -217,6 +220,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.agent_topics_switch),
             Ordering::Release,
         );
+        self.state.agent_topic_suggestions.store(
+            capabilities.is_some_and(|capabilities| capabilities.agent_topic_suggestions),
+            Ordering::Release,
+        );
     }
 
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
@@ -246,6 +253,11 @@ impl PeerRoute {
     /// Whether the peer is known to honour `topic` on `agent.transcript`.
     pub(crate) fn agent_transcript_topic(&self) -> bool {
         self.state.agent_transcript_topic.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to serve the topic suggestion methods.
+    pub(crate) fn agent_topic_suggestions(&self) -> bool {
+        self.state.agent_topic_suggestions.load(Ordering::Acquire)
     }
 
     /// Whether the peer is known to serve `agent.answer_form`. An unpolled
@@ -372,6 +384,9 @@ impl PeerRoute {
                     .store(false, Ordering::Release);
                 self.state
                     .agent_topics_switch
+                    .store(false, Ordering::Release);
+                self.state
+                    .agent_topic_suggestions
                     .store(false, Ordering::Release);
             }
             *current = Some(remote_boot_id.to_owned());

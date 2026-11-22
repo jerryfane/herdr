@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 use super::{ControlEndpoint, CONTROL_PROTOCOL};
 use crate::api::schema::{
     AgentTopicChangeReason, AgentTopicInfo, AgentTopicSendMode, AgentTopicState,
+    AgentTopicSuggestionInfo,
 };
 
 /// Longest frame read from the agent.
@@ -43,9 +44,26 @@ pub(crate) enum ControlError {
     Protocol(String),
     /// The agent did not answer in time.
     TimedOut,
-    /// The agent refused the command.
-    Rejected(String),
+    /// The agent refused the command, naming why in `code` when it is one
+    /// herdr passes through (see [`REFUSAL_CODES`]).
+    Rejected {
+        message: String,
+        code: Option<&'static str>,
+    },
+    /// The agent's omp does not know the command (a build without topic
+    /// suggestions).
+    Unsupported(String),
 }
+
+/// The refusal codes omp's topics answer with that herdr passes through as
+/// its own error code; any other refusal is `topic_rejected`.
+const REFUSAL_CODES: &[&str] = &[
+    "suggestion_not_found",
+    "already_accepted",
+    "invalid_message_ids",
+    "organise_running",
+    "topics_disabled",
+];
 
 impl ControlError {
     pub(crate) fn code(&self) -> &'static str {
@@ -55,7 +73,8 @@ impl ControlError {
             | Self::Unauthorized
             | Self::Protocol(_) => "topics_unreachable",
             Self::TimedOut => "topics_timeout",
-            Self::Rejected(_) => "topic_rejected",
+            Self::Rejected { code, .. } => code.unwrap_or("topic_rejected"),
+            Self::Unsupported(_) => "topics_unsupported",
         }
     }
 
@@ -69,7 +88,10 @@ impl ControlError {
             Self::Unauthorized => "the agent refused Herdr's control token".into(),
             Self::Protocol(why) => format!("the agent's control socket answered unexpectedly: {why}"),
             Self::TimedOut => "the agent did not answer in time".into(),
-            Self::Rejected(why) => why.clone(),
+            Self::Rejected { message, .. } => message.clone(),
+            Self::Unsupported(command) => format!(
+                "the agent's omp does not serve {command}; it needs an omp build with topic suggestions"
+            ),
         }
     }
 }
@@ -199,13 +221,19 @@ impl ControlConnection {
             if reply.get("success").and_then(Value::as_bool) == Some(true) {
                 return Ok(reply.get_mut("data").map(Value::take));
             }
-            return Err(ControlError::Rejected(
-                reply
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the agent refused the command")
-                    .to_owned(),
-            ));
+            let message = reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the agent refused the command");
+            let code = reply.get("code").and_then(Value::as_str);
+            if code.is_none() && message.starts_with("Unknown command") {
+                return Err(ControlError::Unsupported(kind.to_owned()));
+            }
+            return Err(ControlError::Rejected {
+                message: message.to_owned(),
+                code: code
+                    .and_then(|code| REFUSAL_CODES.iter().copied().find(|&known| known == code)),
+            });
         }
     }
 
@@ -221,9 +249,22 @@ impl ControlConnection {
             TopicCommand::List => {
                 let data = self.request("topics_list", Map::new(), COMMAND_TIMEOUT)?;
                 let list: TopicsListData = parse_data(data)?;
-                Ok(TopicReply::List(
-                    list.topics.into_iter().map(AgentTopicInfo::from).collect(),
-                ))
+                Ok(TopicReply::List {
+                    topics: list.topics.into_iter().map(AgentTopicInfo::from).collect(),
+                    // Open ones only, whatever an omp lists.
+                    suggestions: list.suggestions.map(|suggestions| {
+                        suggestions
+                            .into_iter()
+                            .filter(|suggestion| {
+                                suggestion
+                                    .state
+                                    .as_deref()
+                                    .is_none_or(|state| state == "open")
+                            })
+                            .map(AgentTopicSuggestionInfo::from)
+                            .collect()
+                    }),
+                })
             }
             TopicCommand::New { title, message } => {
                 let data = self.request(
@@ -275,6 +316,49 @@ impl ControlConnection {
                 )?;
                 Ok(TopicReply::Done { topic_id })
             }
+            TopicCommand::AcceptSuggestion { suggestion_id, by } => {
+                // The topic starts with the messages the agent picked.
+                let data = self.request(
+                    "topics_accept_suggestion",
+                    fields(&[
+                        ("suggestionId", suggestion_id.as_str()),
+                        ("by", by.as_str()),
+                    ]),
+                    DELIVERY_TIMEOUT,
+                )?;
+                let accepted: SuggestionAcceptedData = parse_data(data)?;
+                Ok(TopicReply::SuggestionAccepted {
+                    suggestion_id,
+                    topic_id: accepted.topic_id,
+                    already_accepted: accepted.already_accepted,
+                })
+            }
+            TopicCommand::DismissSuggestion { suggestion_id, by } => {
+                let data = self.request(
+                    "topics_dismiss_suggestion",
+                    fields(&[
+                        ("suggestionId", suggestion_id.as_str()),
+                        ("by", by.as_str()),
+                    ]),
+                    COMMAND_TIMEOUT,
+                )?;
+                let dismissed: SuggestionDismissedData = parse_data(data)?;
+                Ok(TopicReply::SuggestionDismissed {
+                    suggestion_id,
+                    already_dismissed: dismissed.already_dismissed,
+                })
+            }
+            TopicCommand::Organise { by } => {
+                let data = self.request(
+                    "topics_organise",
+                    fields(&[("by", by.as_str())]),
+                    COMMAND_TIMEOUT,
+                )?;
+                let organising: OrganiseData = parse_data(data)?;
+                Ok(TopicReply::Organising {
+                    queued: organising.queued,
+                })
+            }
         }
     }
 
@@ -295,17 +379,47 @@ impl ControlConnection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TopicCommand {
     List,
-    New { title: String, message: String },
-    Send { topic_id: String, message: String },
-    Close { topic_id: String },
-    Reopen { topic_id: String },
-    Rename { topic_id: String, title: String },
+    New {
+        title: String,
+        message: String,
+    },
+    Send {
+        topic_id: String,
+        message: String,
+    },
+    Close {
+        topic_id: String,
+    },
+    Reopen {
+        topic_id: String,
+    },
+    Rename {
+        topic_id: String,
+        title: String,
+    },
+    /// `by` names who acts, as herdr names them (`owner` or a guest's name);
+    /// omp records it and never treats it as authority.
+    AcceptSuggestion {
+        suggestion_id: String,
+        by: String,
+    },
+    DismissSuggestion {
+        suggestion_id: String,
+        by: String,
+    },
+    Organise {
+        by: String,
+    },
 }
 
 /// What a `topics_*` command answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TopicReply {
-    List(Vec<AgentTopicInfo>),
+    List {
+        topics: Vec<AgentTopicInfo>,
+        /// `None` from an omp without topic suggestions.
+        suggestions: Option<Vec<AgentTopicSuggestionInfo>>,
+    },
     Created {
         topic_id: String,
     },
@@ -316,6 +430,18 @@ pub(crate) enum TopicReply {
     Done {
         topic_id: String,
     },
+    SuggestionAccepted {
+        suggestion_id: String,
+        topic_id: String,
+        already_accepted: bool,
+    },
+    SuggestionDismissed {
+        suggestion_id: String,
+        already_dismissed: bool,
+    },
+    Organising {
+        queued: bool,
+    },
 }
 
 /// One topic change from the agent.
@@ -323,6 +449,8 @@ pub(crate) enum TopicReply {
 pub(crate) struct TopicChange {
     pub(crate) topic_id: String,
     pub(crate) reason: AgentTopicChangeReason,
+    /// The suggestion whose state changed.
+    pub(crate) suggestion_id: Option<String>,
 }
 
 /// The agent's stream of topic changes (`subscribe`).
@@ -352,6 +480,7 @@ impl TopicUpdates {
             return Some(TopicChange {
                 topic_id: change.id,
                 reason: change_reason(&change.reason),
+                suggestion_id: None,
             });
         }
     }
@@ -378,6 +507,40 @@ fn parse_data<T: serde::de::DeserializeOwned>(data: Option<Value>) -> Result<T, 
 #[derive(Deserialize)]
 struct TopicsListData {
     topics: Vec<AgentTopicSummary>,
+    /// Absent from an omp without topic suggestions.
+    #[serde(default)]
+    suggestions: Option<Vec<SuggestionSummary>>,
+}
+
+/// An open suggestion as omp's `topics_list` describes it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuggestionSummary {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    message_ids: Vec<String>,
+    #[serde(default)]
+    created_ms: f64,
+    /// omp lists open suggestions only and leaves this out; any other state
+    /// is dropped.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+impl From<SuggestionSummary> for AgentTopicSuggestionInfo {
+    fn from(suggestion: SuggestionSummary) -> Self {
+        Self {
+            suggestion_id: suggestion.id,
+            title: suggestion.title,
+            reason: suggestion.reason,
+            message_ids: suggestion.message_ids,
+            created_unix_ms: unix_ms(suggestion.created_ms),
+        }
+    }
 }
 
 /// A topic as omp's `topics_list` describes it.
@@ -434,6 +597,27 @@ struct TopicCreatedData {
 struct TopicSentData {
     topic_id: String,
     mode: AgentTopicSendMode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuggestionAcceptedData {
+    topic_id: String,
+    #[serde(default)]
+    already_accepted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuggestionDismissedData {
+    #[serde(default)]
+    already_dismissed: bool,
+}
+
+#[derive(Deserialize)]
+struct OrganiseData {
+    #[serde(default)]
+    queued: bool,
 }
 
 #[cfg(test)]
@@ -576,9 +760,15 @@ pub(crate) mod tests {
         let fake = FakeControl::start("list", list_reply);
         let mut connection = ControlConnection::open(&fake.endpoint(std::process::id())).unwrap();
         let reply = connection.run(TopicCommand::List).unwrap();
-        let TopicReply::List(topics) = reply else {
+        let TopicReply::List {
+            topics,
+            suggestions,
+        } = reply
+        else {
             panic!("{reply:?}");
         };
+        // An omp without topic suggestions lists none, not an empty list.
+        assert_eq!(suggestions, None);
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].topic_id, "Plan");
         assert_eq!(topics[0].state, AgentTopicState::Idle);
@@ -645,6 +835,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_refusal_passes_the_agents_code_through_and_an_unknown_command_is_unsupported() {
+        let fake = FakeControl::start("codes", |frame| match frame["suggestionId"].as_str() {
+            Some("old-omp") => json!({"success": false, "error": "Unknown command."}),
+            Some(code) => {
+                json!({"success": false, "error": format!("refused: {code}"), "code": code})
+            }
+            None => {
+                json!({"success": false, "error": "Topics are disabled.", "code": "topics_disabled"})
+            }
+        });
+        let mut connection = ControlConnection::open(&fake.endpoint(std::process::id())).unwrap();
+        for code in REFUSAL_CODES {
+            let error = connection
+                .run(TopicCommand::DismissSuggestion {
+                    suggestion_id: (*code).into(),
+                    by: "owner".into(),
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), *code);
+            assert_eq!(error.message(), format!("refused: {code}"));
+        }
+        // A code herdr does not know stays a plain refusal.
+        let error = connection
+            .run(TopicCommand::DismissSuggestion {
+                suggestion_id: "not_a_herdr_code".into(),
+                by: "owner".into(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "topic_rejected");
+        let error = connection
+            .run(TopicCommand::Organise { by: "owner".into() })
+            .unwrap_err();
+        assert_eq!(error.code(), "topics_disabled");
+        let error = connection
+            .run(TopicCommand::DismissSuggestion {
+                suggestion_id: "old-omp".into(),
+                by: "owner".into(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "topics_unsupported");
+        assert!(
+            error.message().contains("topics_dismiss_suggestion"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
     fn a_subscription_reads_topic_changes() {
         let fake = FakeControl::start("subscribe", list_reply);
         let connection = ControlConnection::open(&fake.endpoint(std::process::id())).unwrap();
@@ -657,6 +895,7 @@ pub(crate) mod tests {
             Some(TopicChange {
                 topic_id: "Plan".into(),
                 reason: AgentTopicChangeReason::TurnSettled,
+                suggestion_id: None,
             })
         );
     }

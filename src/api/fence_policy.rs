@@ -136,6 +136,9 @@ const TALK: &[&str] = &[
     "agent.dismiss_ask",
     "agent.topics.new",
     "agent.topics.send",
+    "agent.topics.accept_suggestion",
+    "agent.topics.dismiss_suggestion",
+    "agent.topics.organise",
 ];
 
 const CREATE: &[&str] = &["pane.split", "tab.create", "workspace.create"];
@@ -268,6 +271,9 @@ mod topic_tests {
         for (method, extra) in [
             ("agent.topics.new", r#","title":"t","message":"m""#),
             ("agent.topics.send", r#","topic_id":"T","message":"m""#),
+            ("agent.topics.accept_suggestion", r#","suggestion_id":"S""#),
+            ("agent.topics.dismiss_suggestion", r#","suggestion_id":"S""#),
+            ("agent.topics.organise", ""),
         ] {
             assert_eq!(
                 access(&format!(

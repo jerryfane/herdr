@@ -699,7 +699,8 @@ pub enum EventData {
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
     },
-    /// One of an omp agent's topics changed (`agent.topics.changed`).
+    /// One of an omp agent's topics changed (`agent.topics.changed`), or one
+    /// of its topic suggestions was accepted or dismissed (`suggestion_id`).
     AgentTopicsChanged {
         pane_id: String,
         workspace_id: String,
@@ -707,5 +708,9 @@ pub enum EventData {
         agent: Option<String>,
         topic_id: String,
         reason: super::topics::AgentTopicChangeReason,
+        /// The suggestion whose state changed (`suggestion_accepted`,
+        /// `suggestion_dismissed`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggestion_id: Option<String>,
     },
 }

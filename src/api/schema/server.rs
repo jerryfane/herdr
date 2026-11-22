@@ -137,6 +137,14 @@ pub struct ServerCapabilities {
     /// conversation, so clients must not send `topic` to it.
     #[serde(default)]
     pub agent_transcript_topic: bool,
+    /// Serves `agent.topics.accept_suggestion`, `agent.topics.dismiss_suggestion`
+    /// and `agent.topics.organise`, `suggestions` on `agent.topics.list` and
+    /// `topic_suggestion` entries on `agent.transcript`. Whether one agent's
+    /// omp has suggestions shows per agent: its `agent.topics.list` carries
+    /// `suggestions` only then, and an omp without them answers these
+    /// methods `topics_unsupported`.
+    #[serde(default)]
+    pub agent_topic_suggestions: bool,
     /// `agent.list` marks each remote agent with `gram_reachable`, whether
     /// `gram.post` may name it. Without this, a client cannot tell and should
     /// keep offering every live agent.

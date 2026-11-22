@@ -245,6 +245,7 @@ fn kinds(entries: &[TranscriptEntry]) -> Vec<&'static str> {
             TranscriptEntry::Ask { .. } => "ask",
             TranscriptEntry::TurnEnd { .. } => "turn_end",
             TranscriptEntry::Summary { .. } => "summary",
+            TranscriptEntry::TopicSuggestion { .. } => "topic_suggestion",
         })
         .collect()
 }
@@ -2881,4 +2882,149 @@ fn an_answered_questions_ask_has_no_form_status() {
         _ => None,
     });
     assert_eq!(status, Some(None), "{:?}", page.entries);
+}
+
+fn suggest(session: &mut Fixture, id: &str, message_ids: &[&str]) -> String {
+    session.note(
+        "topic-suggestion",
+        "Suggested topic: Release notes",
+        true,
+        json!({"id": id, "title": "Release notes", "reason": "a separate subject",
+            "messageIds": message_ids, "createdMs": T0_MS + 42}),
+    )
+}
+
+fn suggestion_state(session: &mut Fixture, data: Value) -> String {
+    session.push(json!({"type": "custom", "customType": "topic-suggestion-state", "data": data}))
+}
+
+fn the_suggestion(entries: &[TranscriptEntry], id: &str) -> Option<TranscriptEntry> {
+    entries
+        .iter()
+        .find(|entry| matches!(entry, TranscriptEntry::TopicSuggestion { id: found, .. } if found == id))
+        .cloned()
+}
+
+#[test]
+fn a_topic_suggestion_shows_its_newest_state_and_is_resent_when_it_changes() {
+    let mut session = Fixture::new("suggestion");
+    let asked = session.user("draft the release notes");
+    let answered = session.assistant(vec![text("drafting")], "stop");
+    let note = suggest(&mut session, "sg_1", &[&asked, &answered]);
+
+    let open = session.newest();
+    assert_eq!(
+        kinds(&open.entries),
+        ["user", "reply", "turn_end", "topic_suggestion"]
+    );
+    assert!(
+        !ids(&open.entries).contains(&note),
+        "keyed by suggestion id"
+    );
+    assert_eq!(
+        the_suggestion(&open.entries, "sg_1"),
+        Some(TranscriptEntry::TopicSuggestion {
+            id: "sg_1".into(),
+            ts_ms: T0_MS + 42,
+            title: "Release notes".into(),
+            reason: "a separate subject".into(),
+            message_ids: vec![asked.clone(), answered.clone()],
+            message_count: 2,
+            state: TopicSuggestionState::Open,
+            topic_id: None,
+            by: None,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(the_suggestion(&open.entries, "sg_1").unwrap()).unwrap(),
+        json!({"kind": "topic_suggestion", "id": "sg_1", "ts_ms": T0_MS + 42,
+            "title": "Release notes", "reason": "a separate subject",
+            "message_ids": [asked, answered], "message_count": 2, "state": "open"})
+    );
+
+    // Dismissed by a guest: hidden itself, it re-sends the suggestion.
+    suggestion_state(
+        &mut session,
+        json!({"id": "sg_1", "state": "dismissed", "by": "Ana (via HerdrUp)", "atMs": 1}),
+    );
+    // Another suggestion's state changes nothing here.
+    suggestion_state(
+        &mut session,
+        json!({"id": "sg_other", "state": "accepted", "topicId": "X", "by": "owner"}),
+    );
+    let dismissed = session.page(None, Some(&open.after), None);
+    assert_eq!(dismissed.resent, Some(vec!["sg_1".to_owned()]));
+    assert_eq!(kinds(&dismissed.entries), ["topic_suggestion"]);
+    let Some(TranscriptEntry::TopicSuggestion {
+        state,
+        topic_id,
+        by,
+        ..
+    }) = the_suggestion(&dismissed.entries, "sg_1")
+    else {
+        panic!("{:?}", dismissed.entries);
+    };
+    assert_eq!(state, TopicSuggestionState::Dismissed);
+    assert_eq!(topic_id, None);
+    assert_eq!(by.as_deref(), Some("Ana (via HerdrUp)"));
+    assert_eq!(
+        the_suggestion(&session.newest().entries, "sg_1"),
+        the_suggestion(&dismissed.entries, "sg_1"),
+        "a newest page shows the same state"
+    );
+
+    // The owner changed their mind: the newest state wins.
+    suggestion_state(
+        &mut session,
+        json!({"id": "sg_1", "state": "accepted", "topicId": "T1", "by": "owner", "atMs": 2}),
+    );
+    let later = session.user("thanks");
+    let accepted = session.page(None, Some(&dismissed.after), None);
+    assert_eq!(accepted.resent, Some(vec!["sg_1".to_owned()]));
+    assert_eq!(ids(&accepted.entries), ["sg_1".to_owned(), later]);
+    let Some(TranscriptEntry::TopicSuggestion {
+        state,
+        topic_id,
+        by,
+        ..
+    }) = the_suggestion(&accepted.entries, "sg_1")
+    else {
+        panic!("{:?}", accepted.entries);
+    };
+    assert_eq!(state, TopicSuggestionState::Accepted);
+    assert_eq!(topic_id.as_deref(), Some("T1"));
+    assert_eq!(by.as_deref(), Some("owner"));
+
+    // Nothing changed since: nothing is re-sent.
+    let quiet = session.page(None, Some(&accepted.after), None);
+    assert_eq!(quiet.resent, Some(Vec::new()));
+    assert!(quiet.entries.is_empty(), "{:?}", quiet.entries);
+}
+
+#[test]
+fn a_suggestion_before_the_clients_window_is_not_resent() {
+    let mut session = Fixture::new("suggestion-floor");
+    suggest(&mut session, "sg_old", &[]);
+    session.user("one");
+    session.assistant(vec![text("a")], "stop");
+    session.user("two");
+    session.assistant(vec![text("b")], "stop");
+    // The client holds only the newest turn.
+    let held = session.page(None, None, Some(1));
+    assert!(the_suggestion(&held.entries, "sg_old").is_none());
+    suggestion_state(
+        &mut session,
+        json!({"id": "sg_old", "state": "dismissed", "by": "owner"}),
+    );
+    let next = session.page(None, Some(&held.after), None);
+    assert_eq!(next.resent, Some(Vec::new()));
+    assert!(next.entries.is_empty(), "{:?}", next.entries);
+    // The older page brings it in its newest state.
+    let older = session.page(held.before.as_deref(), None, None);
+    let Some(TranscriptEntry::TopicSuggestion { state, .. }) =
+        the_suggestion(&older.entries, "sg_old")
+    else {
+        panic!("{:?}", older.entries);
+    };
+    assert_eq!(state, TopicSuggestionState::Dismissed);
 }

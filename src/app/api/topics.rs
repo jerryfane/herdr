@@ -58,8 +58,8 @@ mod control {
     };
     use crate::agent_topics::{ControlEndpoint, ControlHandle, CONTROL_PROTOCOL};
     use crate::api::schema::{
-        ErrorBody, EventData, EventEnvelope, EventKind, Method, PaneReportAgentControlParams,
-        Request, ResponseResult,
+        AgentTopicChangeReason, ErrorBody, EventData, EventEnvelope, EventKind, Method,
+        PaneReportAgentControlParams, Request, ResponseResult,
     };
     use crate::app::App;
     use crate::events::AppEvent;
@@ -291,6 +291,26 @@ mod control {
                         title: params.title,
                     },
                 ),
+                Method::AgentTopicsAcceptSuggestion(params) => (
+                    params.target,
+                    TopicCommand::AcceptSuggestion {
+                        suggestion_id: params.suggestion_id,
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
+                Method::AgentTopicsDismissSuggestion(params) => (
+                    params.target,
+                    TopicCommand::DismissSuggestion {
+                        suggestion_id: params.suggestion_id,
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
+                Method::AgentTopicsOrganise(params) => (
+                    params.target,
+                    TopicCommand::Organise {
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
                 _ => {
                     let _ = respond_to.send(encode_error(
                         id,
@@ -310,8 +330,19 @@ mod control {
             self.follow_topic_changes(&target);
             let reply = respond_to.clone();
             let reply_id = id.clone();
+            let event_tx = self.event_tx.clone();
             let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics", move || {
-                let _ = reply.send(topics_response(reply_id, &target, command));
+                let (response, change) = topics_response(reply_id, &target, command);
+                let _ = reply.send(response);
+                // A suggestion's new state, from whoever made it, is an
+                // `agent.topics.changed` like the agent's own changes.
+                if let Some(change) = change {
+                    let _ = event_tx.blocking_send(AppEvent::AgentTopicsChanged {
+                        terminal_id: target.terminal_id.clone(),
+                        generation: target.control.generation,
+                        change,
+                    });
+                }
             });
             if let Err(err) = spawned {
                 tracing::warn!(err = %err, "failed to spawn agent topics request");
@@ -373,6 +404,7 @@ mod control {
                     agent,
                     topic_id: change.topic_id,
                     reason: change.reason,
+                    suggestion_id: change.suggestion_id,
                 },
             });
         }
@@ -426,18 +458,36 @@ mod control {
         }
     }
 
-    fn topics_response(id: String, target: &TopicsTarget, command: TopicCommand) -> String {
+    /// Who acts on a suggestion, as omp's `by` records it: the guest's name
+    /// as their share shows it (`<name> (via HerdrUp)`, the sender of their
+    /// Gram posts), else `owner` (the owner, their scripts and agents, and
+    /// federated peers acting for them).
+    fn acting_by(acting_guest: Option<String>) -> String {
+        acting_guest.unwrap_or_else(|| "owner".into())
+    }
+
+    /// The reply to one topics command and, when it changed a suggestion's
+    /// state, the change to announce.
+    fn topics_response(
+        id: String,
+        target: &TopicsTarget,
+        command: TopicCommand,
+    ) -> (String, Option<TopicChange>) {
         let reply = ControlConnection::open(&target.control.endpoint)
             .and_then(|mut connection| connection.run(command));
         let agent = target.agent.clone();
         let pane_id = target.pane_id.clone();
-        match reply {
-            Ok(TopicReply::List(topics)) => encode_success(
+        let response = match reply {
+            Ok(TopicReply::List {
+                topics,
+                suggestions,
+            }) => encode_success(
                 id,
                 ResponseResult::AgentTopics {
                     agent,
                     pane_id,
                     topics,
+                    suggestions,
                 },
             ),
             Ok(TopicReply::Created { topic_id }) => encode_success(
@@ -465,11 +515,62 @@ mod control {
                     topic_id,
                 },
             ),
+            Ok(TopicReply::SuggestionAccepted {
+                suggestion_id,
+                topic_id,
+                already_accepted,
+            }) => {
+                let change = (!already_accepted).then(|| TopicChange {
+                    topic_id: topic_id.clone(),
+                    reason: AgentTopicChangeReason::SuggestionAccepted,
+                    suggestion_id: Some(suggestion_id.clone()),
+                });
+                let response = encode_success(
+                    id,
+                    ResponseResult::AgentTopicSuggestionAccepted {
+                        agent,
+                        pane_id,
+                        suggestion_id,
+                        topic_id,
+                        already_accepted,
+                    },
+                );
+                return (response, change);
+            }
+            Ok(TopicReply::SuggestionDismissed {
+                suggestion_id,
+                already_dismissed,
+            }) => {
+                let change = (!already_dismissed).then(|| TopicChange {
+                    topic_id: String::new(),
+                    reason: AgentTopicChangeReason::SuggestionDismissed,
+                    suggestion_id: Some(suggestion_id.clone()),
+                });
+                let response = encode_success(
+                    id,
+                    ResponseResult::AgentTopicSuggestionDismissed {
+                        agent,
+                        pane_id,
+                        suggestion_id,
+                        already_dismissed,
+                    },
+                );
+                return (response, change);
+            }
+            Ok(TopicReply::Organising { queued }) => encode_success(
+                id,
+                ResponseResult::AgentTopicsOrganiseStarted {
+                    agent,
+                    pane_id,
+                    queued,
+                },
+            ),
             Err(error) => {
                 log_control_error("topics request", &error);
                 encode_error(id, error.code(), error.message())
             }
-        }
+        };
+        (response, None)
     }
 }
 
