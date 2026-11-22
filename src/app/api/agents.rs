@@ -4815,15 +4815,19 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
-    /// A fake topics build: an executable file and a config path.
+    /// A fake topics build: an executable file and a config path. On Windows any
+    /// regular file counts as executable, so only Unix needs the mode bits.
     fn topics_build(name: &str) -> (crate::config::TopicsConfig, String, String) {
-        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("herdr-topics-build-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("omp");
         std::fs::write(&binary, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let config = dir.join("topics.yml");
         let topics = crate::config::TopicsConfig {
             omp_binary: Some(binary.clone()),
