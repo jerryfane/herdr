@@ -261,37 +261,8 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
-/// How long, and how often, a restored agent pane re-checks a saved directory that was
-/// missing at restore before it fails the pane (issue #477).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RestoreDirRetry {
-    /// Total wait, from the first check that found the directory missing.
-    pub window: Duration,
-    /// Delay before the second check; it doubles per miss up to `max_backoff`.
-    pub first_backoff: Duration,
-    pub max_backoff: Duration,
-}
-
-impl RestoreDirRetry {
-    pub const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
-
-    pub fn with_window(window: Duration) -> Self {
-        Self {
-            window,
-            first_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(30),
-        }
-    }
-}
-
-impl Default for RestoreDirRetry {
-    fn default() -> Self {
-        Self::with_window(Self::DEFAULT_WINDOW)
-    }
-}
-
-/// Progress of one pane's wait for its missing saved directory. The clock is supplied
-/// by the caller, so the window and backoff are testable without sleeping.
+/// Progress of one pane's wait for its missing saved directory (issue #477). The clock
+/// and window are supplied by the caller, so the wait is testable without sleeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RestoreDirWait {
     started: Option<Instant>,
@@ -306,17 +277,19 @@ impl RestoreDirWait {
     }
 
     /// Record that the directory was still missing at `now`. Returns when to check again,
-    /// or `None` once the window has run out and the pane should fail.
-    pub fn missed(&mut self, now: Instant, retry: RestoreDirRetry) -> Option<Instant> {
+    /// or `None` once `window` (counted from the first miss) has run out and the pane
+    /// should fail. Checks back off from 1 s, doubling per miss, up to 30 s.
+    pub fn missed(&mut self, now: Instant, window: Duration) -> Option<Instant> {
+        const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
         let started = *self.started.get_or_insert(now);
-        let end = started.checked_add(retry.window)?;
+        let end = started.checked_add(window)?;
         if now >= end {
             return None;
         }
-        let backoff = retry
-            .first_backoff
+        let backoff = FIRST_BACKOFF
             .saturating_mul(1u32 << self.misses.min(16))
-            .min(retry.max_backoff);
+            .min(MAX_BACKOFF);
         self.misses = self.misses.saturating_add(1);
         let at = now.checked_add(backoff).map_or(end, |at| at.min(end));
         self.next_check = Some(at);
@@ -439,10 +412,12 @@ pub struct TerminalState {
     /// Not persisted: re-derived on the next restore attempt, and cleared when the
     /// accounts registry reloads so a re-added account is picked straight up.
     pub account_resume_blocked: Option<String>,
-    /// Set on a restored agent pane whose saved directory was missing at restore (issue
-    /// #477): the deferred resume re-checks the directory with backoff for a bounded
-    /// window — a mount often comes up just after the server — before failing the pane.
-    /// Not persisted; every restore starts a fresh window.
+    /// Set on an agent pane whose resume may wait for a missing saved directory (issue
+    /// #477): a restore whose directory was missing, an `agent.restart` and an unarchive.
+    /// The resume re-checks the directory with backoff for a bounded window — a mount
+    /// often comes up just after the server — before failing the pane. The window starts
+    /// at the first miss, so arming it costs nothing when the directory exists; it is
+    /// cleared when the resume starts or fails. Not persisted.
     pub restore_dir_wait: Option<RestoreDirWait>,
     /// Server-owned Claude Code <-> Codex session-transfer transaction. Kept
     /// separate from presentation state; the API projects it into `AgentInfo`.
@@ -2968,6 +2943,8 @@ impl TerminalState {
     /// its deadline must not expire the name while the resumed agent loads.
     pub(crate) fn arm_restart(&mut self, plan: crate::agent_resume::AgentResumePlan) {
         self.pending_agent_resume_plan = Some(plan);
+        // A restart waits for a missing directory like a restore does (#477).
+        self.restore_dir_wait = Some(RestoreDirWait::default());
         self.restart_in_flight = true;
         self.release_agent_name_session_anchor();
         if let Some(managed) = self.managed_agent.as_mut() {

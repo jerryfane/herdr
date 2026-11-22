@@ -28,6 +28,29 @@ fn dir_wait_deadline(candidates: &[PendingAgentResumeCandidate]) -> Option<Insta
         .flatten()
 }
 
+/// Outcome of trying to start a pane's pending agent resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum AgentResumeStart {
+    /// The agent's shell is running and the resume command was sent.
+    Started,
+    /// The resume failed for good; the pane now carries a `restore_error`.
+    Failed,
+    /// Waiting for a saved directory that was missing at restore (#477): the scheduler
+    /// retries it, so callers must not fall back to a plain shell.
+    Deferred,
+    /// Nothing was started and nothing is scheduled: no plan, no geometry, or a
+    /// refusal that leaves the plan in place. Callers may fall back to a plain shell.
+    Declined,
+}
+
+impl AgentResumeStart {
+    /// Pane state changed in a way worth saving.
+    pub(crate) fn changed(self) -> bool {
+        matches!(self, Self::Started | Self::Failed)
+    }
+}
+
 /// What environment a resumed agent should launch with — or that it must NOT launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeLaunchEnv {
@@ -116,16 +139,18 @@ impl App {
             if retry_at.is_some_and(|at| now < at) {
                 continue;
             }
-            changed |= self.start_pending_agent_resume(
-                pane_id,
-                terminal_id,
-                cwd,
-                plan,
-                rows,
-                cols,
-                allow_empty_theme,
-                now,
-            );
+            changed |= self
+                .start_pending_agent_resume(
+                    pane_id,
+                    terminal_id,
+                    cwd,
+                    plan,
+                    rows,
+                    cols,
+                    allow_empty_theme,
+                    now,
+                )
+                .changed();
             if changed && !self.startup_per_agent_delay.is_zero() {
                 self.next_agent_resume_at = Some(now + self.startup_per_agent_delay);
                 self.pending_agent_resume_deadline = self.next_agent_resume_at;
@@ -243,9 +268,9 @@ impl App {
         rows: u16,
         cols: u16,
         allow_empty_theme: bool,
-    ) -> bool {
+    ) -> AgentResumeStart {
         if self.terminal_runtimes.get(terminal_id).is_some() {
-            return false;
+            return AgentResumeStart::Declined;
         }
         let Some((pane_id, cwd, plan)) = self.state.workspaces.iter().find_map(|ws| {
             ws.tabs.iter().find_map(|tab| {
@@ -263,10 +288,10 @@ impl App {
                 })
             })
         }) else {
-            return false;
+            return AgentResumeStart::Declined;
         };
 
-        let changed = self.start_pending_agent_resume(
+        let started = self.start_pending_agent_resume(
             pane_id,
             terminal_id.clone(),
             cwd,
@@ -276,13 +301,13 @@ impl App {
             allow_empty_theme,
             Instant::now(),
         );
-        if changed {
+        if started.changed() {
             self.schedule_session_save();
         }
         if !self.has_pending_agent_resumes() {
             self.pending_agent_resume_deadline = None;
         }
-        changed
+        started
     }
 
     /// The child environment a resumed agent must launch with: the env armed by
@@ -341,10 +366,10 @@ impl App {
         cols: u16,
         allow_empty_theme: bool,
         now: Instant,
-    ) -> bool {
+    ) -> AgentResumeStart {
         let host_terminal_theme = self.state.host_terminal_theme;
         if host_terminal_theme.is_empty() && !allow_empty_theme {
-            return false;
+            return AgentResumeStart::Declined;
         }
 
         let transfer_resume = transfer_resume_replaces_shell(
@@ -381,9 +406,9 @@ impl App {
                     "could not encode the source harness resume command for shell {shell_name:?}"
                 ),
             ) {
-                return false;
+                return AgentResumeStart::Declined;
             }
-            return false;
+            return AgentResumeStart::Declined;
         };
         // Carry the account config-home env armed by `agent.restart`, and REBUILD it from
         // the account registry when it is absent.
@@ -423,7 +448,7 @@ impl App {
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.account_resume_blocked = Some(account_id);
                 }
-                return false;
+                return AgentResumeStart::Declined;
             }
         };
         // Capture what we are about to apply, for the per-pane routing report below.
@@ -445,19 +470,20 @@ impl App {
             .find_pane(pane_id)
             .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, extra_env))
         else {
-            return false;
+            return AgentResumeStart::Declined;
         };
 
         if !cwd.is_dir() {
-            // A pane restored while its directory was missing keeps waiting for it,
-            // whoever asks to start it, until its window runs out (#477).
-            let retry = self.restore_dir_retry;
+            // Restore, `agent.restart` and unarchive arm a wait for a missing directory
+            // (#477): keep waiting, whoever asks to start the pane, until the window
+            // runs out. Without an armed wait the pane fails at once.
+            let window = self.missing_dir_wait_window;
             let retry_at = self
                 .state
                 .terminals
                 .get_mut(&terminal_id)
                 .and_then(|terminal| terminal.restore_dir_wait.as_mut())
-                .and_then(|wait| wait.missed(now, retry));
+                .and_then(|wait| wait.missed(now, window));
             if let Some(retry_at) = retry_at {
                 tracing::info!(
                     pane = pane_id.raw(),
@@ -467,7 +493,7 @@ impl App {
                     retry_in_ms = retry_at.saturating_duration_since(now).as_millis() as u64,
                     "saved directory is missing; waiting for it before resuming the agent"
                 );
-                return false;
+                return AgentResumeStart::Deferred;
             }
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.restore_dir_wait = None;
@@ -485,7 +511,7 @@ impl App {
                 "Saved directory is unavailable. Restore the directory and restart this session."
                     .into(),
             );
-            return true;
+            return AgentResumeStart::Failed;
         }
 
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
@@ -524,14 +550,14 @@ impl App {
                     &terminal_id,
                     format!("could not launch the source harness shell: {err}"),
                 ) {
-                    return false;
+                    return AgentResumeStart::Declined;
                 }
                 self.fail_pending_agent_resume(
                     pane_id,
                     &terminal_id,
                     format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."),
                 );
-                return true;
+                return AgentResumeStart::Failed;
             }
         };
 
@@ -556,9 +582,9 @@ impl App {
                 &terminal_id,
                 format!("could not submit the source harness resume command: {err}"),
             ) {
-                return false;
+                return AgentResumeStart::Declined;
             }
-            return false;
+            return AgentResumeStart::Declined;
         }
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
@@ -585,7 +611,7 @@ impl App {
             routed_config_dir.as_deref(),
             cleared_conflicting_auth,
         );
-        true
+        AgentResumeStart::Started
     }
 
     /// Give up on a deferred resume that cannot start: drop the plan, record why on the
@@ -933,7 +959,11 @@ mod tests {
             true,
             Instant::now(),
         );
-        assert!(!started, "an unresolvable account must not launch an agent");
+        assert_eq!(
+            started,
+            AgentResumeStart::Declined,
+            "an unresolvable account must not launch an agent"
+        );
 
         let terminal = app.state.terminals.get(&terminal_id).expect("terminal");
         assert_eq!(
@@ -1061,15 +1091,75 @@ mod tests {
                 argv: long_running_test_argv(),
                 dedupe_key: "resume-test".into(),
             });
-            app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+            // No wait armed: a missing directory fails at once.
+            assert_eq!(
+                app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true),
+                AgentResumeStart::Failed
+            );
             assert!(app.terminal_runtimes.get(&terminal_id).is_none());
             let terminal = &app.state.terminals[&terminal_id];
             assert!(terminal.pending_agent_resume_plan.is_none());
             assert_eq!(terminal.persisted_agent_session.as_ref(), Some(&session));
             assert!(terminal.restore_error.is_some());
             assert!(!app.has_pending_agent_resumes());
-            assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+            assert_eq!(
+                app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true),
+                AgentResumeStart::Declined
+            );
         }
+    }
+
+    /// An explicit start of a pane still waiting for its saved directory (#477) reports
+    /// `Deferred`, not `Declined`: callers such as unarchive and the pane-exit handler
+    /// fall back to a plain shell only on `Declined`, and a shell here would replace the
+    /// agent the scheduler is about to resume.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_start_of_a_waiting_pane_is_deferred_not_declined() {
+        let dir = missing_restore_dir("explicit");
+        let (mut app, waiting, _healthy) = app_with_missing_dir_restore(&dir);
+
+        assert_eq!(
+            app.start_pending_agent_resume_for_terminal(&waiting, 24, 80, true),
+            AgentResumeStart::Deferred
+        );
+        assert!(app.terminal_runtimes.get(&waiting).is_none());
+        let terminal = &app.state.terminals[&waiting];
+        assert!(terminal.restore_error.is_none());
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal
+            .restore_dir_wait
+            .and_then(|wait| wait.retry_at())
+            .is_some());
+    }
+
+    /// Issue #477: `agent.restart` arms the same wait. When the restarted pane's
+    /// directory is missing, the pane-exit relaunch reports `Deferred` (so no plain
+    /// shell replaces the agent), and the agent starts once the directory appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_waits_for_a_missing_directory() {
+        let dir = missing_restore_dir("restart");
+        let (mut app, waiting, _healthy) = app_with_missing_dir_restore(&dir);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.terminals.get_mut(&waiting).unwrap();
+        terminal.restore_dir_wait = None;
+        let plan = terminal.pending_agent_resume_plan.take().unwrap();
+        terminal.arm_restart(plan);
+
+        assert_eq!(
+            app.resume_pending_agent_for_pane(pane_id),
+            AgentResumeStart::Deferred
+        );
+        assert!(app.terminal_runtimes.get(&waiting).is_none());
+        assert!(app.state.terminals[&waiting].restore_error.is_none());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = app.resume_pending_agent_for_pane(pane_id);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(started, AgentResumeStart::Started);
+        assert!(app.terminal_runtimes.get(&waiting).is_some());
+        assert!(app.state.terminals[&waiting].restore_dir_wait.is_none());
     }
 
     /// A restored agent pane whose saved directory is missing (issue #477), plus a
@@ -1084,8 +1174,7 @@ mod tests {
     ) {
         let mut app = test_app();
         app.startup_per_agent_delay = std::time::Duration::ZERO;
-        app.restore_dir_retry =
-            crate::terminal::RestoreDirRetry::with_window(std::time::Duration::from_secs(60));
+        app.missing_dir_wait_window = std::time::Duration::from_secs(60);
         let waiting = crate::workspace::Workspace::test_new("waiting");
         let healthy = crate::workspace::Workspace::test_new("healthy");
         let waiting_id = waiting

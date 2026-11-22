@@ -277,8 +277,9 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
-    /// Milliseconds a restored agent pane keeps re-checking a saved directory that is
-    /// missing at restore (a mount not up yet) before failing. Zero fails at once.
+    /// Milliseconds an agent resume (restore, `agent.restart`, unarchive) keeps
+    /// re-checking a missing saved directory (a mount not up yet) before failing. Zero
+    /// fails at once.
     pub restore_missing_dir_timeout_ms: u32,
 }
 

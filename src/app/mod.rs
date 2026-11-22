@@ -5,6 +5,7 @@
 
 pub(crate) mod actions;
 mod agent_resume;
+pub(crate) use agent_resume::AgentResumeStart;
 #[cfg(test)]
 mod agent_suspend_tests;
 pub(crate) mod agent_view;
@@ -199,9 +200,9 @@ pub struct App {
     pane_host_appearance: Option<crate::terminal_theme::HostAppearance>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
-    /// Wait for a saved directory missing at restore (issue #477). A field, not a
-    /// constant, so tests can shorten it.
-    pub(crate) restore_dir_retry: crate::terminal::RestoreDirRetry,
+    /// How long an agent resume waits for a missing saved directory (issue #477). A
+    /// field, not a constant, so tests can shorten it.
+    pub(crate) missing_dir_wait_window: Duration,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -748,8 +749,8 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
-            restore_dir_retry: crate::terminal::RestoreDirRetry::with_window(
-                Duration::from_millis(config.session.restore_missing_dir_timeout_ms.into()),
+            missing_dir_wait_window: Duration::from_millis(
+                config.session.restore_missing_dir_timeout_ms.into(),
             ),
             session_save_deadline: None,
             session_save_thread: None,
@@ -1116,9 +1117,8 @@ impl App {
         }
 
         if !invalid_section("session") {
-            self.restore_dir_retry = crate::terminal::RestoreDirRetry::with_window(
-                Duration::from_millis(config.session.restore_missing_dir_timeout_ms.into()),
-            );
+            self.missing_dir_wait_window =
+                Duration::from_millis(config.session.restore_missing_dir_timeout_ms.into());
         }
         if !invalid_section("session")
             && Duration::from_millis(config.session.startup_per_agent_delay_ms.into())

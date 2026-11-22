@@ -518,6 +518,26 @@ impl App {
             );
         };
 
+        // FAIL LOUD before tearing anything down (#477): the agent resumes in its
+        // directory, so a missing one (a mount that dropped) would turn a live agent into
+        // a pane waiting on a directory. Refuse and leave the agent running instead.
+        if let Some(cwd) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.cwd.clone())
+            .filter(|cwd| !cwd.is_dir())
+        {
+            return encode_error(
+                id,
+                "agent_directory_unavailable",
+                format!(
+                    "the agent's directory {} is missing; the agent was left running — restart it once the directory is back",
+                    cwd.display()
+                ),
+            );
+        }
+
         // Resolve which account to resume under: an explicit `account` param is a
         // swap; absent, default to the account this agent already runs under so a
         // plain restart stays on the same subscription.
@@ -5148,6 +5168,156 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
+    /// Issue #477: unarchiving an agent whose directory is missing for now (a mount not
+    /// up yet) waits for it like a restore does — no restore error, and no plain shell
+    /// standing in for the agent — and the agent starts once the directory appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_unarchive_waits_for_a_missing_directory_instead_of_a_plain_shell() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        let missing =
+            std::env::temp_dir().join(format!("herdr-unarchive-dir-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(app.state.archived_agents.len(), 1);
+        app.state.archived_agents[0].cwd = missing.clone();
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id);
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+        let err: crate::api::schema::ErrorResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("a pending wait must not read as success: {response}"));
+        assert_eq!(err.error.code, "agent_waiting_for_directory");
+        assert!(
+            err.error.message.contains(&missing.display().to_string()),
+            "{response}"
+        );
+
+        assert!(
+            app.terminal_runtimes.get(&tid).is_none(),
+            "a plain shell replaced the agent that is waiting for its directory"
+        );
+        let terminal = &app.state.terminals[&tid];
+        assert!(terminal.restore_error.is_none(), "unarchive failed at once");
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal
+            .restore_dir_wait
+            .and_then(|wait| wait.retry_at())
+            .is_some());
+
+        std::fs::create_dir_all(&missing).unwrap();
+        let started = app.start_pending_agent_resume_for_terminal(&tid, 24, 80, true);
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert_eq!(started, crate::app::AgentResumeStart::Started);
+        assert!(app.terminal_runtimes.get(&tid).is_some());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    /// Issue #477: when the wait for an unarchived agent's directory runs out (here at
+    /// once), the call fails loudly with the pane's reason, and the failure stays visible
+    /// on the pane and in `agent.list`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_unarchive_into_a_missing_directory_fails_loudly_when_the_wait_runs_out() {
+        let mut app = app_with_agent();
+        app.missing_dir_wait_window = std::time::Duration::ZERO;
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        app.handle_agent_archive(
+            "req".into(),
+            AgentArchiveParams {
+                target: "reviewer".into(),
+                reason: None,
+                by: Some("tester".into()),
+                parked_work: Vec::new(),
+                force: false,
+            },
+        );
+        let missing =
+            std::env::temp_dir().join(format!("herdr-unarchive-dir-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        app.state.archived_agents[0].cwd = missing;
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id);
+
+        let response = app.handle_agent_unarchive(
+            "req".into(),
+            AgentUnarchiveParams {
+                target: "reviewer".into(),
+                fresh: false,
+            },
+        );
+
+        let reason =
+            "Saved directory is unavailable. Restore the directory and restart this session.";
+        let err: crate::api::schema::ErrorResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("a failed resume must not read as success: {response}"));
+        assert_eq!(err.error.code, "agent_resume_failed");
+        assert!(err.error.message.ends_with(reason), "{response}");
+        assert!(
+            app.terminal_runtimes.get(&tid).is_none(),
+            "a plain shell hid the failed resume"
+        );
+        assert_eq!(
+            app.state.terminals[&tid].restore_error.as_deref(),
+            Some(reason)
+        );
+        let agent = app
+            .agent_info_for_target("reviewer")
+            .unwrap_or_else(|_| panic!("the failed agent must stay listed"));
+        assert_eq!(agent.restore_error.as_deref(), Some(reason));
+    }
+
+    /// Issue #477: restarting an agent whose directory is gone must refuse BEFORE
+    /// killing it — a restart there could only end in a pane waiting on, or failed for,
+    /// that directory — and say why.
+    #[tokio::test]
+    async fn restart_refuses_a_missing_directory_and_leaves_the_agent_running() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_resumable_claude(&mut app, "reviewer", AgentState::Idle);
+        let tid = crate::terminal::TerminalId::from_persisted(terminal_id);
+        let missing =
+            std::env::temp_dir().join(format!("herdr-restart-dir-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        app.state.terminals.get_mut(&tid).unwrap().cwd = missing.clone();
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            crate::api::schema::AgentRestartParams {
+                target: "reviewer".into(),
+                account: None,
+            },
+        );
+
+        let err: crate::api::schema::ErrorResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("a restart into a missing directory must fail: {response}"));
+        assert_eq!(err.error.code, "agent_directory_unavailable");
+        assert!(
+            err.error.message.contains(&missing.display().to_string()),
+            "{response}"
+        );
+        // Nothing armed and nothing marked for respawn: the restart arms before it
+        // kills, so the agent was never torn down.
+        let terminal = &app.state.terminals[&tid];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(!terminal.respawn_shell_on_exit);
+        assert!(terminal.restore_dir_wait.is_none());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
     /// The `--fresh` escape hatch arms no resume plan, so the resume launcher declines —
     /// and the pane must still get a shell. A pane you cannot open is not an escape
     /// hatch. Kept separate because `fresh` takes the other branch entirely, and a test
@@ -5830,7 +6000,8 @@ mod tests {
             "claude",
             crate::agent_resume::AgentSessionRefKind::Id,
             path_shaped_id,
-            "/tmp/claude",
+            // An existing directory: a missing one would make the resume wait (#477).
+            "/tmp",
         );
 
         let response = app.handle_agent_unarchive(
