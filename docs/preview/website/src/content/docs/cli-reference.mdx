@@ -187,6 +187,22 @@ With `[guest] accounts` on (the default), an invite also offers "Add to my accou
 
 A guest's app can keep one encrypted session for its calls instead of reconnecting for each one, so polling and file transfers stay under the relay's limit on new connections. Each request on it is checked on its own; the session ends when the guest is revoked or the agent stops running, and after 60 seconds without a request.
 
+## Pairing
+
+```bash
+herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+```
+
+`herdr pair` shows a QR for the HerdrUp app to scan. It carries a single-use token (valid for `--ttl`, 300 seconds by default) and public facts about this machine, never a key: the app makes its own keypair and sends only the public half, which `herdr pair` adds to `~/.ssh/authorized_keys`.
+
+Under the QR it prints an app link for pairing HerdrUp desktop on this same computer, which can't scan its own screen:
+
+```text
+  Or open   herdrup://pair#eyJ2IjoxLCJob3N0Ijoi…   (this computer)
+```
+
+The part after `#` is the exact JSON the QR encodes, base64url without padding, so the link carries the same single-use token and nothing more. On a terminal the link is an OSC 8 hyperlink, so one click opens it; the full URL is always printed as plain text too, for copying when the terminal doesn't support OSC 8 or the output isn't a terminal.
+
 ## Sessions
 
 ```bash
