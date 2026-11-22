@@ -151,6 +151,11 @@ pub struct PaneSnapshot {
     /// restore resumes it there. Additive: an old snapshot restores on stock omp.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_topics_enabled: bool,
+    /// A `when_idle` Topics switch still waiting for the agent's next idle
+    /// transition: the choice it relaunches on then. Kept through a live update
+    /// or a restart; absent when none is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics_switch_pending: Option<bool>,
     /// Who this pane's processes are fenced as (`[fence.agents]`). Kept apart from
     /// `agent_name` so a renamed agent restores under the fence it started with.
     /// Additive: an old snapshot falls back to `agent_name`.
@@ -245,6 +250,10 @@ pub struct ArchivedAgentSnapshot {
     /// unarchive resumes it there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub topics_enabled: bool,
+    /// A `when_idle` Topics switch still pending when the agent was archived: the
+    /// unarchive's launch resolves it. Absent when none was pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics_switch_pending: Option<bool>,
 }
 
 impl ArchivedAgentSnapshot {
@@ -569,6 +578,7 @@ fn capture_tab(
                 agent_account,
                 agent_topics_enabled: terminal
                     .is_some_and(|terminal| terminal.agent_topics_enabled),
+                topics_switch_pending: terminal.and_then(|terminal| terminal.topics_switch_pending),
                 fence: terminal.map(|terminal| terminal.fence_identity.clone()),
                 other_prompts: terminal
                     .map(|terminal| terminal.other_prompts.delivered())
@@ -983,6 +993,31 @@ mod tests {
         assert!(back.workspaces[0].tabs[0].panes[&pane_id.raw()].agent_topics_enabled);
     }
 
+    /// A `when_idle` Topics switch still waiting for the agent to go idle survives
+    /// the wire, so a live update or a restart keeps it pending.
+    #[test]
+    fn a_pending_topics_switch_is_captured_and_round_trips() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("agent")];
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .topics_switch_pending = Some(true);
+
+        let json = serde_json::to_string(&capture_from_state(&state)).expect("serialize");
+        let back: SessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        let pane = &back.workspaces[0].tabs[0].panes[&pane_id.raw()];
+        assert_eq!(pane.topics_switch_pending, Some(true));
+        // Requested, not applied: the saved choice is still the running build.
+        assert!(!pane.agent_topics_enabled);
+    }
+
     /// A pane written before routing was persisted must still load, with no account — which
     /// restores to the default, i.e. exactly the old behaviour.
     #[test]
@@ -1032,6 +1067,7 @@ mod tests {
                 pane_label: Some("reviewer".into()),
                 fence: None,
                 topics_enabled: false,
+                topics_switch_pending: None,
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -1108,6 +1144,7 @@ mod tests {
                 occupant_generation: 0,
                 agent_account: None,
                 agent_topics_enabled: false,
+                topics_switch_pending: None,
                 fence: None,
             },
         );
@@ -1126,6 +1163,7 @@ mod tests {
                 occupant_generation: 0,
                 agent_account: None,
                 agent_topics_enabled: false,
+                topics_switch_pending: None,
                 fence: None,
             },
         );
@@ -2091,6 +2129,7 @@ mod tests {
                 occupant_generation: 0,
                 agent_account: None,
                 agent_topics_enabled: false,
+                topics_switch_pending: None,
                 fence: None,
             },
         );
@@ -2111,6 +2150,7 @@ mod tests {
                 occupant_generation: 0,
                 agent_account: None,
                 agent_topics_enabled: false,
+                topics_switch_pending: None,
                 fence: None,
             },
         );

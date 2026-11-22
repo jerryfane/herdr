@@ -21,6 +21,12 @@ impl TerminalRuntime {
         self.0.epoch()
     }
 
+    /// Where this runtime's user input stands: `(epoch, user input writes)`. Equal
+    /// marks mean no user or API write reached the PTY in between, by any path.
+    pub(crate) fn user_input_mark(&self) -> (u64, u64) {
+        (self.0.epoch(), self.0.user_input_seq())
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

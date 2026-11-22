@@ -1125,6 +1125,7 @@ mod tests {
             avatar: None,
             topic_sessions: None,
             topics_enabled: None,
+            topics_switch_pending: false,
         }
     }
 

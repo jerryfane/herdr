@@ -715,6 +715,10 @@ pub struct AgentInfo {
     /// now. Absent for other agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics_enabled: Option<bool>,
+    /// A `when_idle` Topics switch waits for this busy omp agent's next idle
+    /// transition (`agent.topics.set_enabled`). Absent when none is pending.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub topics_switch_pending: bool,
 }
 
 fn lenient_avatar<'de, D>(deserializer: D) -> Result<Option<AgentAvatar>, D::Error>

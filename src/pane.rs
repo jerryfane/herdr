@@ -1670,6 +1670,12 @@ pub struct PaneRuntime {
     /// a reconnecting client can tell whether the runtime it last saw is still
     /// the same one (a changed epoch forces a resync).
     epoch: u64,
+    /// Bumped by every user or API write to the PTY (`try_send_bytes`, which keys,
+    /// text, pastes, mouse reports and focus events all go through, and a queued
+    /// prompt submission). Terminal query responses and resizes take other paths
+    /// and do not count. Lets a caller tell whether anything reached the agent
+    /// since a point in time without knowing which path wrote it.
+    user_input_seq: AtomicU64,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -2899,6 +2905,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             compression,
             epoch,
+            user_input_seq: AtomicU64::new(0),
             detect_handle: Some(detect_handle),
         })
     }
@@ -3581,6 +3588,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             compression,
             epoch,
+            user_input_seq: AtomicU64::new(0),
             detect_handle,
         })
     }
@@ -4018,7 +4026,13 @@ impl PaneRuntime {
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.user_input_seq.fetch_add(1, Ordering::AcqRel);
         self.io.try_send_bytes(bytes)
+    }
+
+    /// How many user or API writes reached this runtime's PTY input so far.
+    pub(crate) fn user_input_seq(&self) -> u64 {
+        self.user_input_seq.load(Ordering::Acquire)
     }
 
     /// Preflight a complete API command without changing input queue semantics.
@@ -4044,6 +4058,7 @@ impl PaneRuntime {
         deadline: Option<std::time::Instant>,
         guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.user_input_seq.fetch_add(1, Ordering::AcqRel);
         self.io
             .queue_user_input_submission_guarded(text, enter, delay, deadline, guard)
     }
@@ -4435,6 +4450,7 @@ impl PaneRuntime {
                 preserve_processes_on_drop: true,
                 compression,
                 epoch: next_pane_epoch(),
+                user_input_seq: AtomicU64::new(0),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -5950,6 +5966,7 @@ mod tests {
             preserve_processes_on_drop: true,
             compression,
             epoch: next_pane_epoch(),
+            user_input_seq: AtomicU64::new(0),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -5991,6 +6008,7 @@ mod tests {
             preserve_processes_on_drop: true,
             compression,
             epoch: next_pane_epoch(),
+            user_input_seq: AtomicU64::new(0),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

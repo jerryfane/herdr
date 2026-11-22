@@ -555,6 +555,14 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
+            // After the API, client-input and server-event drains: input already
+            // queued this tick reaches the PTY (and moves its input mark) before an
+            // armed `when_idle` Topics switch decides it saw none.
+            if self.app.apply_due_topics_switches(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+            }
+
             if latest_shell_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
                 needs_render = true;
                 needs_full_render = true;

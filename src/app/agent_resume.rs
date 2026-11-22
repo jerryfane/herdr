@@ -395,15 +395,12 @@ impl App {
                 .and_then(|terminal| terminal.session_transfer.as_ref())
                 .map(|transfer| transfer.phase),
         );
+        // Restore, unarchive and a plain restart keep the build the Topics switch chose;
+        // a `when_idle` switch still pending applies here, since this launch cuts no turn.
+        let topics_enabled = self.resolve_launch_topics(&terminal_id, None);
         let shell_config =
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
         let shell_name = crate::pane::resolved_pane_shell(shell_config);
-        // Restore, unarchive and a plain restart keep the build the Topics switch chose.
-        let topics_enabled = self
-            .state
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|terminal| terminal.agent_topics_enabled);
         let plan = self.topics_build_plan(plan, topics_enabled);
         let Some(resume_command) =
             crate::platform::managed_resume_shell_command(&plan.argv, &shell_name, transfer_resume)

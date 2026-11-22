@@ -2690,10 +2690,18 @@ mod tests {
         let guest = harness.admit();
         for target in [guest.grant.terminal_id.clone(), harness.pane_ids[0].clone()] {
             for enabled in [true, false] {
-                let request = json!({"id": "x", "method": "agent.topics.set_enabled",
-                    "params": {"target": target, "enabled": enabled}});
-                let lines = harness.call(&guest, request.clone());
-                assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+                // A `when_idle` switch schedules a restart: as owner-only as an immediate one.
+                for when_idle in [false, true] {
+                    let params = crate::api::schema::AgentTopicsSetEnabledParams {
+                        target: target.clone(),
+                        enabled,
+                        when_idle,
+                    };
+                    let request = json!({"id": "x", "method": "agent.topics.set_enabled",
+                        "params": params});
+                    let lines = harness.call(&guest, request.clone());
+                    assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+                }
             }
         }
     }

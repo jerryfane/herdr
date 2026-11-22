@@ -297,14 +297,24 @@ mod topic_tests {
             );
         }
         // The Topics switch restarts the agent: owner only, even on a fenced
-        // caller's own agent.
+        // caller's own agent, and a `when_idle` switch as much as an immediate one.
         for enabled in [true, false] {
-            assert_eq!(
-                access(&format!(
-                    r#"{{"id":"1","method":"agent.topics.set_enabled","params":{{"target":"builder","enabled":{enabled}}}}}"#
-                )),
-                FencedAccess::Denied
-            );
+            for when_idle in [false, true] {
+                let request = serde_json::json!({
+                    "id": "1",
+                    "method": "agent.topics.set_enabled",
+                    "params": crate::api::schema::AgentTopicsSetEnabledParams {
+                        target: "builder".into(),
+                        enabled,
+                        when_idle,
+                    },
+                });
+                assert_eq!(
+                    access(&request.to_string()),
+                    FencedAccess::Denied,
+                    "{request}"
+                );
+            }
         }
     }
 }

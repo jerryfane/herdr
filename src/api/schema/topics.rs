@@ -41,6 +41,13 @@ pub struct AgentTopicsRenameParams {
 pub struct AgentTopicsSetEnabledParams {
     pub target: String,
     pub enabled: bool,
+    /// Never cut a running turn: on an agent that is working or blocked, keep
+    /// the requested choice pending and relaunch at its next idle transition
+    /// (`scheduled: true`). On an idle agent the switch happens now. A later
+    /// call replaces a pending switch; asking for the state the agent runs now
+    /// cancels it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub when_idle: bool,
 }
 
 /// One suggestion of one agent (`agent.topics.accept_suggestion`, which

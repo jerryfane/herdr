@@ -134,6 +134,8 @@ struct PeerRouteState {
     agent_transcript_topic: AtomicBool,
     /// The peer's latest poll advertised `agent_topics_switch`.
     agent_topics_switch: AtomicBool,
+    /// The peer's latest poll advertised `agent_topics_switch_when_idle`.
+    agent_topics_switch_when_idle: AtomicBool,
     /// The peer's latest poll advertised `agent_topic_suggestions`.
     agent_topic_suggestions: AtomicBool,
 }
@@ -160,6 +162,7 @@ impl PeerRoute {
                 agent_topics: AtomicBool::new(false),
                 agent_transcript_topic: AtomicBool::new(false),
                 agent_topics_switch: AtomicBool::new(false),
+                agent_topics_switch_when_idle: AtomicBool::new(false),
                 agent_topic_suggestions: AtomicBool::new(false),
             }),
             presentation: None,
@@ -220,6 +223,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.agent_topics_switch),
             Ordering::Release,
         );
+        self.state.agent_topics_switch_when_idle.store(
+            capabilities.is_some_and(|capabilities| capabilities.agent_topics_switch_when_idle),
+            Ordering::Release,
+        );
         self.state.agent_topic_suggestions.store(
             capabilities.is_some_and(|capabilities| capabilities.agent_topic_suggestions),
             Ordering::Release,
@@ -248,6 +255,13 @@ impl PeerRoute {
     /// Whether the peer is known to serve `agent.topics.set_enabled`.
     pub(crate) fn agent_topics_switch(&self) -> bool {
         self.state.agent_topics_switch.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to honour `when_idle` on `agent.topics.set_enabled`.
+    pub(crate) fn agent_topics_switch_when_idle(&self) -> bool {
+        self.state
+            .agent_topics_switch_when_idle
+            .load(Ordering::Acquire)
     }
 
     /// Whether the peer is known to honour `topic` on `agent.transcript`.
@@ -384,6 +398,9 @@ impl PeerRoute {
                     .store(false, Ordering::Release);
                 self.state
                     .agent_topics_switch
+                    .store(false, Ordering::Release);
+                self.state
+                    .agent_topics_switch_when_idle
                     .store(false, Ordering::Release);
                 self.state
                     .agent_topic_suggestions

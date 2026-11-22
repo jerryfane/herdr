@@ -422,6 +422,11 @@ pub struct TerminalState {
     /// (`agent.topics.set_enabled`). Persisted, so every later relaunch — a plain
     /// `agent.restart`, a restore, an unarchive — resumes it on the same binary.
     pub agent_topics_enabled: bool,
+    /// A `when_idle` Topics switch (`agent.topics.set_enabled`) requested while the
+    /// agent was busy: the choice the agent relaunches on at its next idle
+    /// transition, or at any earlier relaunch. Persisted, so it survives a live
+    /// update or a restart.
+    pub topics_switch_pending: Option<bool>,
     /// Who this terminal's processes are fenced as. Set by `agent.start`, restore and
     /// unarchive; a rename leaves it alone. Every respawn of the pane reuses it.
     pub fence_identity: crate::fence::FenceIdentity,
@@ -511,6 +516,7 @@ impl TerminalState {
             restore_dir_wait: None,
             agent_account: None,
             agent_topics_enabled: false,
+            topics_switch_pending: None,
             fence_identity: crate::fence::FenceIdentity::Anonymous,
             session_transfer: None,
             restore_error: None,
@@ -3180,6 +3186,23 @@ impl TerminalState {
         self.reported_agent_session_runtime = None;
         self.agent_account = None;
         self.agent_topics_enabled = false;
+        self.topics_switch_pending = None;
+    }
+
+    /// The one launch-time resolver for the Topics choice: every launch (a restart,
+    /// a restore, an unarchive, a `when_idle` switch applied at idle) runs on what
+    /// this returns. `requested` is an immediate switch and replaces a pending one;
+    /// otherwise a pending `when_idle` switch becomes the saved choice, since a
+    /// launch cuts no turn. Returns the choice and whether a pending switch applied.
+    pub fn resolve_launch_topics(&mut self, requested: Option<bool>) -> (bool, bool) {
+        let pending = self.topics_switch_pending.take();
+        if let Some(enabled) = requested.or(pending) {
+            self.agent_topics_enabled = enabled;
+        }
+        (
+            self.agent_topics_enabled,
+            requested.is_none() && pending.is_some(),
+        )
     }
 
     fn reconcile_agent_name_owner(
