@@ -80,7 +80,7 @@ fn topics(app: &App, method: Method) -> Value {
         },
         respond_to,
     );
-    serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap()
+    serde_json::from_str(&response.recv_timeout(WAIT).expect("no topics reply")).unwrap()
 }
 
 fn list(target: &str) -> Method {
@@ -320,27 +320,11 @@ fn a_topic_change_from_the_agent_becomes_an_agent_topics_changed_event() {
     );
     // The first topics request also subscribes to the agent's changes.
     topics(&app, list(&pane));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let frame = fake.frames.recv_timeout(Duration::from_secs(10)).unwrap();
-        if frame["type"] == "subscribe" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no subscription");
-    }
+    received(&fake, "subscribe");
     fake.updates
         .send(json!({"id": "Plan", "ownerId": "o", "parentSessionId": "p", "reason": "spawned"}))
         .unwrap();
-    let event = loop {
-        match app.event_rx.try_recv() {
-            Ok(event @ crate::events::AppEvent::AgentTopicsChanged { .. }) => break event,
-            Ok(_) => {}
-            Err(_) => {
-                assert!(Instant::now() < deadline, "no topic change");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
+    let event = next_topics_change(&mut app);
     app.handle_internal_event_with_render_impact(event);
     let emitted: Vec<_> = app
         .event_hub
@@ -580,15 +564,38 @@ fn offered(tag: &str, fake: &FakeControl) -> (Fixture, App, String) {
     (session, app, pane)
 }
 
-/// The next `kind` command the agent received.
+/// How long a test waits for one thing the agent or the app's worker
+/// threads do: generous for a loaded CI runner, still red when it never
+/// happens.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// The next `kind` frame the agent read, skipping any others.
 fn received(fake: &FakeControl, kind: &str) -> Value {
+    let deadline = Instant::now() + WAIT;
     loop {
+        let left = deadline.saturating_duration_since(Instant::now());
         let frame = fake
             .frames
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the agent got the command");
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("the agent never got {kind}"));
         if frame["type"] == kind {
             return frame;
+        }
+    }
+}
+
+/// The next topic change the app's reader thread queued, skipping other
+/// app events; each call gets its own deadline.
+fn next_topics_change(app: &mut App) -> crate::events::AppEvent {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match app.event_rx.try_recv() {
+            Ok(event @ crate::events::AppEvent::AgentTopicsChanged { .. }) => return event,
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline, "no agent.topics.changed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }
@@ -609,6 +616,10 @@ fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
         }
     });
     let (_session, mut app, pane) = offered("suggest-owner", &fake);
+    // The first topics request also subscribes to the agent's changes; wait
+    // for it before the commands, whose frames `received` skips past.
+    topics(&app, list(&pane));
+    received(&fake, "subscribe");
 
     let accepted = topics(
         &app,
@@ -685,26 +696,20 @@ fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
         "Ana (via HerdrUp)"
     );
 
-    // Each state change, and only a change, is an `agent.topics.changed`.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut changes = Vec::new();
-    while changes.len() < 2 {
-        match app.event_rx.try_recv() {
-            Ok(event @ crate::events::AppEvent::AgentTopicsChanged { .. }) => changes.push(event),
-            Ok(_) => {}
-            Err(_) => {
-                assert!(Instant::now() < deadline, "no suggestion change");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+    // The agent announces each suggestion change on its `topic_update`
+    // stream (which the requests above subscribed to), naming the
+    // suggestion: each one is an `agent.topics.changed` with
+    // `suggestion_id`, not a topic id.
+    for (id, reason) in [
+        ("sg_3", "suggested"),
+        ("sg_1", "suggestion-accepted"),
+        ("sg_2", "suggestion-dismissed"),
+    ] {
+        fake.updates
+            .send(json!({"id": id, "ownerId": "o", "parentSessionId": "p", "reason": reason}))
+            .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(200));
-    while let Ok(event) = app.event_rx.try_recv() {
-        assert!(
-            !matches!(event, crate::events::AppEvent::AgentTopicsChanged { .. }),
-            "a repeat changed nothing"
-        );
-    }
+    let changes: Vec<_> = (0..3).map(|_| next_topics_change(&mut app)).collect();
     for change in changes {
         app.handle_internal_event_with_render_impact(change);
     }
@@ -715,12 +720,15 @@ fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
         .map(|(_, event)| serde_json::to_value(event).unwrap()["data"].clone())
         .filter(|data| data["type"] == "agent_topics_changed")
         .collect();
+    let workspace = emitted[0]["workspace_id"].clone();
     assert_eq!(
         emitted,
         [
-            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": emitted[0]["workspace_id"],
-                "agent": "omp", "topic_id": "T1", "reason": "suggestion_accepted", "suggestion_id": "sg_1"}),
-            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": emitted[0]["workspace_id"],
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+                "agent": "omp", "topic_id": "", "reason": "suggested", "suggestion_id": "sg_3"}),
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+                "agent": "omp", "topic_id": "", "reason": "suggestion_accepted", "suggestion_id": "sg_1"}),
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
                 "agent": "omp", "topic_id": "", "reason": "suggestion_dismissed", "suggestion_id": "sg_2"}),
         ]
     );

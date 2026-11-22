@@ -477,10 +477,26 @@ impl TopicUpdates {
             else {
                 continue;
             };
-            return Some(TopicChange {
-                topic_id: change.id,
-                reason: change_reason(&change.reason),
-                suggestion_id: None,
+            let reason = change_reason(&change.reason);
+            // For a suggestion's change, omp's `id` is the suggestion's.
+            let suggestion = matches!(
+                reason,
+                AgentTopicChangeReason::Suggested
+                    | AgentTopicChangeReason::SuggestionAccepted
+                    | AgentTopicChangeReason::SuggestionDismissed
+            );
+            return Some(if suggestion {
+                TopicChange {
+                    topic_id: String::new(),
+                    reason,
+                    suggestion_id: Some(change.id),
+                }
+            } else {
+                TopicChange {
+                    topic_id: change.id,
+                    reason,
+                    suggestion_id: None,
+                }
             });
         }
     }
@@ -495,6 +511,9 @@ fn change_reason(reason: &str) -> AgentTopicChangeReason {
         "reopened" => AgentTopicChangeReason::Reopened,
         "retitled" => AgentTopicChangeReason::Retitled,
         "restored" => AgentTopicChangeReason::Restored,
+        "suggested" => AgentTopicChangeReason::Suggested,
+        "suggestion-accepted" => AgentTopicChangeReason::SuggestionAccepted,
+        "suggestion-dismissed" => AgentTopicChangeReason::SuggestionDismissed,
         _ => AgentTopicChangeReason::Unknown,
     }
 }
@@ -720,10 +739,15 @@ pub(crate) mod tests {
                                 answer["command"] = frame["type"].clone();
                                 answer
                             };
-                            // Recorded once handled: a test that sees `subscribe`
-                            // knows its stream already gets every update.
+                            // Recorded once answered, as omp answers `subscribe`
+                            // before it pushes any change: a test that sees
+                            // `subscribe` knows its stream gets every later
+                            // update, after the reply the client waits for (an
+                            // update written first would be skipped as it
+                            // waits, and lost).
+                            let written = writeln!(writer, "{answer}").is_ok();
                             let _ = frames_tx.send(frame);
-                            if writeln!(writer, "{answer}").is_err() {
+                            if !written {
                                 return;
                             }
                         }

@@ -150,8 +150,12 @@ pub enum AgentTopicChangeReason {
     Retitled,
     /// The agent restored the topic with its session (startup, session switch).
     Restored,
-    /// Suggestion `suggestion_id` was accepted; `topic_id` is the topic
-    /// started from it.
+    /// The agent suggested a topic: `suggestion_id` names it and `topic_id`
+    /// is empty. The suggestion is in `agent.topics.list` at once; its
+    /// `agent.transcript` entry appears once the agent's current turn ends.
+    Suggested,
+    /// Suggestion `suggestion_id` was accepted; `topic_id` is empty (the
+    /// topic's id is in the accept reply and the transcript entry).
     SuggestionAccepted,
     /// Suggestion `suggestion_id` was dismissed; `topic_id` is empty.
     SuggestionDismissed,

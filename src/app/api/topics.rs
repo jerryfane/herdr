@@ -58,8 +58,8 @@ mod control {
     };
     use crate::agent_topics::{ControlEndpoint, ControlHandle, CONTROL_PROTOCOL};
     use crate::api::schema::{
-        AgentTopicChangeReason, ErrorBody, EventData, EventEnvelope, EventKind, Method,
-        PaneReportAgentControlParams, Request, ResponseResult,
+        ErrorBody, EventData, EventEnvelope, EventKind, Method, PaneReportAgentControlParams,
+        Request, ResponseResult,
     };
     use crate::app::App;
     use crate::events::AppEvent;
@@ -328,21 +328,12 @@ mod control {
                 }
             };
             self.follow_topic_changes(&target);
+            // Suggestion state changes reach `agent.topics.changed` through
+            // the agent's own `topic_update` stream this request follows.
             let reply = respond_to.clone();
             let reply_id = id.clone();
-            let event_tx = self.event_tx.clone();
             let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics", move || {
-                let (response, change) = topics_response(reply_id, &target, command);
-                let _ = reply.send(response);
-                // A suggestion's new state, from whoever made it, is an
-                // `agent.topics.changed` like the agent's own changes.
-                if let Some(change) = change {
-                    let _ = event_tx.blocking_send(AppEvent::AgentTopicsChanged {
-                        terminal_id: target.terminal_id.clone(),
-                        generation: target.control.generation,
-                        change,
-                    });
-                }
+                let _ = reply.send(topics_response(reply_id, &target, command));
             });
             if let Err(err) = spawned {
                 tracing::warn!(err = %err, "failed to spawn agent topics request");
@@ -466,18 +457,12 @@ mod control {
         acting_guest.unwrap_or_else(|| "owner".into())
     }
 
-    /// The reply to one topics command and, when it changed a suggestion's
-    /// state, the change to announce.
-    fn topics_response(
-        id: String,
-        target: &TopicsTarget,
-        command: TopicCommand,
-    ) -> (String, Option<TopicChange>) {
+    fn topics_response(id: String, target: &TopicsTarget, command: TopicCommand) -> String {
         let reply = ControlConnection::open(&target.control.endpoint)
             .and_then(|mut connection| connection.run(command));
         let agent = target.agent.clone();
         let pane_id = target.pane_id.clone();
-        let response = match reply {
+        match reply {
             Ok(TopicReply::List {
                 topics,
                 suggestions,
@@ -519,44 +504,28 @@ mod control {
                 suggestion_id,
                 topic_id,
                 already_accepted,
-            }) => {
-                let change = (!already_accepted).then(|| TopicChange {
-                    topic_id: topic_id.clone(),
-                    reason: AgentTopicChangeReason::SuggestionAccepted,
-                    suggestion_id: Some(suggestion_id.clone()),
-                });
-                let response = encode_success(
-                    id,
-                    ResponseResult::AgentTopicSuggestionAccepted {
-                        agent,
-                        pane_id,
-                        suggestion_id,
-                        topic_id,
-                        already_accepted,
-                    },
-                );
-                return (response, change);
-            }
+            }) => encode_success(
+                id,
+                ResponseResult::AgentTopicSuggestionAccepted {
+                    agent,
+                    pane_id,
+                    suggestion_id,
+                    topic_id,
+                    already_accepted,
+                },
+            ),
             Ok(TopicReply::SuggestionDismissed {
                 suggestion_id,
                 already_dismissed,
-            }) => {
-                let change = (!already_dismissed).then(|| TopicChange {
-                    topic_id: String::new(),
-                    reason: AgentTopicChangeReason::SuggestionDismissed,
-                    suggestion_id: Some(suggestion_id.clone()),
-                });
-                let response = encode_success(
-                    id,
-                    ResponseResult::AgentTopicSuggestionDismissed {
-                        agent,
-                        pane_id,
-                        suggestion_id,
-                        already_dismissed,
-                    },
-                );
-                return (response, change);
-            }
+            }) => encode_success(
+                id,
+                ResponseResult::AgentTopicSuggestionDismissed {
+                    agent,
+                    pane_id,
+                    suggestion_id,
+                    already_dismissed,
+                },
+            ),
             Ok(TopicReply::Organising { queued }) => encode_success(
                 id,
                 ResponseResult::AgentTopicsOrganiseStarted {
@@ -569,8 +538,7 @@ mod control {
                 log_control_error("topics request", &error);
                 encode_error(id, error.code(), error.message())
             }
-        };
-        (response, None)
+        }
     }
 }
 
