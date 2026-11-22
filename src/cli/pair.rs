@@ -9,7 +9,7 @@
 //! `~/.ssh/authorized_keys`. The QR carries a single-use token plus public facts, so a
 //! photograph of it is worthless once redeemed.
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -207,6 +207,12 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     writeln!(out)?;
     writeln!(out, "{qr}")?;
     writeln!(out, "  Scan this in herdrup to connect this machine.")?;
+    let app_link = payload.app_link();
+    writeln!(
+        out,
+        "{}",
+        app_link_line(&app_link, std::io::stdout().is_terminal())
+    )?;
     writeln!(out)?;
     writeln!(out, "  address    {}:{}", bind_ip, local.port())?;
     writeln!(out, "  user       {user}")?;
@@ -322,6 +328,17 @@ fn ssh_readiness_with(
     fingerprint().map_err(|failure| SshReadinessError::MissingHostKey { address, failure })
 }
 
+/// The "open on this computer" line under the QR. On a terminal the URL is wrapped in an
+/// OSC 8 hyperlink so one click opens it; the URL itself is always the visible text, so it
+/// can still be copied where OSC 8 is unsupported or stdout is not a terminal.
+fn app_link_line(link: &str, tty: bool) -> String {
+    if tty {
+        format!("  Or open   \x1b]8;;{link}\x1b\\{link}\x1b]8;;\x1b\\   (this computer)")
+    } else {
+        format!("  Or open   {link}   (this computer)")
+    }
+}
+
 /// Render the SAME help clap builds for `herdr pair --help`, taken from `spec.rs`.
 ///
 /// `--help` never reaches this function: because `pair` IS registered in the spec,
@@ -344,6 +361,20 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_link_line_wraps_osc8_only_on_a_tty() {
+        let link = "herdrup://pair#eyJ2IjoxfQ";
+        let plain = app_link_line(link, false);
+        assert_eq!(plain, format!("  Or open   {link}   (this computer)"));
+        assert!(!plain.contains('\x1b'));
+
+        let tty = app_link_line(link, true);
+        assert_eq!(
+            tty,
+            format!("  Or open   \x1b]8;;{link}\x1b\\{link}\x1b]8;;\x1b\\   (this computer)")
+        );
+    }
 
     #[test]
     fn ssh_must_listen_before_the_fingerprint_is_read() {
