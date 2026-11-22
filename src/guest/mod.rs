@@ -16,6 +16,9 @@ pub(crate) mod audit;
 pub(crate) mod gram;
 pub(crate) mod link;
 pub(crate) mod mirror;
+pub(crate) mod owner;
+#[cfg(test)]
+mod owner_tests;
 pub(crate) mod push;
 pub(crate) mod store;
 
@@ -55,8 +58,9 @@ pub(crate) fn host_info() -> std::io::Result<GuestHostInfo> {
     })
 }
 
-/// At least one non-revoked guest or one unexpired, unused invite. Invite
-/// expiry does not fire [`subscribe_changes`]; poll this on a timer too.
+/// At least one non-revoked guest, one unexpired, unused invite, or one live
+/// owner grant (see [`store::link_wanted_in`]). Expiry does not fire
+/// [`subscribe_changes`]; poll this on a timer too.
 pub(crate) fn link_wanted() -> bool {
     store::link_wanted_in(&store::guest_dir(), store::now_ms())
 }
@@ -698,7 +702,8 @@ fn link_info() -> GuestLinkInfo {
 
 static SUBSCRIBERS: Mutex<Vec<mpsc::Sender<()>>> = Mutex::new(Vec::new());
 
-/// Fires when guests or invites change (created, accepted, revoked).
+/// Fires when guests, invites or owner grants change (created, accepted,
+/// renewed, revoked).
 pub(crate) fn subscribe_changes() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
     SUBSCRIBERS

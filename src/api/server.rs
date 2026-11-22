@@ -51,6 +51,7 @@ mod gram_upload_stream;
 #[cfg(unix)]
 mod guest_gate;
 mod guest_owner;
+mod owner_access;
 #[cfg(unix)]
 pub(crate) use guest_gate::serve_guest_stream;
 mod pane_input_stream;
@@ -1762,6 +1763,12 @@ fn handle_principal_connection(
         running,
         changes_ui,
     ) {
+        return result;
+    }
+
+    // Owner-only `owner_access.*`, local to this machine. Federation peers and
+    // fenced callers were refused above, and guests never get here.
+    if let Some(result) = owner_access::maybe_handle(&mut stream, &request, changes_ui) {
         return result;
     }
 
@@ -5406,6 +5413,11 @@ mod federation_tests {
             ("guest.remove_device", Denied),
             ("guest.audit", Denied),
             ("guest.agent_probe", Denied),
+            ("owner_access.info", Denied),
+            ("owner_access.list", Denied),
+            ("owner_access.add", Denied),
+            ("owner_access.renew", Denied),
+            ("owner_access.remove", Denied),
             ("fence.scoped", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
@@ -5788,6 +5800,47 @@ mod federation_tests {
         assert!(
             fed.api_rx.try_recv().is_err(),
             "no guest RPC reached the app"
+        );
+    }
+
+    #[test]
+    fn admin_federation_peers_are_forbidden_every_owner_access_method() {
+        use crate::api::schema::{
+            OwnerAccessAddParams, OwnerAccessInfoParams, OwnerAccessListParams,
+            OwnerAccessRemoveParams, OwnerAccessRenewParams, OwnerScope,
+        };
+        let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
+        for method in [
+            Method::OwnerAccessInfo(OwnerAccessInfoParams {}),
+            Method::OwnerAccessList(OwnerAccessListParams {}),
+            Method::OwnerAccessAdd(OwnerAccessAddParams {
+                device_pub: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+                device_name: "Chrome on macOS".into(),
+                scope: OwnerScope::Terminal,
+                ttl_secs: 3600,
+                account_statement: "a.b.c".into(),
+                approved_by: "Mac".into(),
+            }),
+            Method::OwnerAccessRenew(OwnerAccessRenewParams {
+                grant_id: "g".into(),
+                ttl_secs: 3600,
+                scope: None,
+            }),
+            Method::OwnerAccessRemove(OwnerAccessRemoveParams {
+                grant_id: Some("g".into()),
+                ..Default::default()
+            }),
+        ] {
+            let mut stream = raw_hello(fed.addr, "adm");
+            send_request(&mut stream, "owner", method);
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["error"]["code"], "forbidden", "{line}");
+        }
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "no owner_access RPC reached the app"
         );
     }
 
@@ -7562,6 +7615,11 @@ mod federation_tests {
             r#"{"id":"1","method":"server.reload_config","params":{}}"#,
             r#"{"id":"1","method":"server.stop","params":{}}"#,
             r#"{"id":"1","method":"plugin.link","params":{"path":"/tmp"}}"#,
+            r#"{"id":"1","method":"owner_access.info","params":{}}"#,
+            r#"{"id":"1","method":"owner_access.list","params":{}}"#,
+            r#"{"id":"1","method":"owner_access.add","params":{"device_pub":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI","device_name":"Chrome","ttl_secs":3600,"account_statement":"a.b.c","approved_by":"Mac"}}"#,
+            r#"{"id":"1","method":"owner_access.renew","params":{"grant_id":"g","ttl_secs":3600}}"#,
+            r#"{"id":"1","method":"owner_access.remove","params":{"grant_id":"g"}}"#,
         ] {
             let mut request = fence_request(json);
             match fence_gate(&mut request, fenced, &peers) {
@@ -8022,6 +8080,28 @@ mod federation_tests {
             .read_line(&mut response)
             .expect("read home response");
         response.trim().to_string()
+    }
+
+    /// The owner's own connection reaches `owner_access.*` without the app:
+    /// these checks answer before the guest store is touched.
+    #[cfg(unix)]
+    #[test]
+    fn owner_connections_reach_owner_access_without_the_app() {
+        let mut conn = drive_home(HashMap::new());
+        let renew = home_roundtrip(
+            &mut conn,
+            serde_json::json!({"id": "r", "method": "owner_access.renew", "params": {"grant_id": "g", "ttl_secs": 3599}}),
+        );
+        let renew: serde_json::Value = serde_json::from_str(&renew).unwrap();
+        assert_eq!(renew["error"]["code"], "owner_ttl_invalid", "{renew}");
+        let mut conn = drive_home(HashMap::new());
+        let remove = home_roundtrip(
+            &mut conn,
+            serde_json::json!({"id": "x", "method": "owner_access.remove", "params": {"grant_id": "g", "fingerprint": "f"}}),
+        );
+        let remove: serde_json::Value = serde_json::from_str(&remove).unwrap();
+        assert_eq!(remove["error"]["code"], "invalid_params", "{remove}");
+        assert!(conn.api_rx.try_recv().is_err(), "nothing reached the app");
     }
 
     #[test]

@@ -377,6 +377,11 @@ pub(crate) struct GuestStore {
     pub guests: Vec<GuestRecord>,
     #[serde(default)]
     pub invites: Vec<InviteRecord>,
+    /// The owner's browsers allowed on this machine (`owner_access.*`).
+    /// Left out while empty, so a store without owner grants reads and
+    /// writes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<super::owner::OwnerGrant>,
 }
 
 impl GuestRecord {
@@ -485,6 +490,7 @@ pub(crate) fn update_store<T>(
                         .saturating_add(EXPIRED_INVITE_RETENTION_MS)
                         > now
             });
+            super::owner::prune(&mut store.owners, now);
             write_private(
                 &dir.join("guests.json"),
                 &serde_json::to_vec_pretty(&store)?,
@@ -494,8 +500,9 @@ pub(crate) fn update_store<T>(
     })
 }
 
-/// At least one non-revoked guest, one unexpired unused invite, or a revoke
-/// within [`REVOKED_LINK_GRACE_MS`].
+/// At least one non-revoked guest, one unexpired unused invite, one live
+/// owner grant, or a revoke (or an owner grant's expiry) within
+/// [`REVOKED_LINK_GRACE_MS`].
 pub(crate) fn link_wanted_in(dir: &Path, now: u64) -> bool {
     load_store(dir).is_ok_and(|store| {
         store.guests.iter().any(|guest| {
@@ -504,6 +511,7 @@ pub(crate) fn link_wanted_in(dir: &Path, now: u64) -> bool {
                     .revoked_ms
                     .is_some_and(|at| now < at.saturating_add(REVOKED_LINK_GRACE_MS))
         }) || store.invites.iter().any(|invite| invite.pending(now))
+            || store.owners.iter().any(|grant| grant.wants_link(now))
     })
 }
 
