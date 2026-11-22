@@ -1124,6 +1124,7 @@ mod tests {
             session_transfer: None,
             avatar: None,
             topic_sessions: None,
+            topics_enabled: None,
         }
     }
 

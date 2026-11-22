@@ -544,6 +544,7 @@ fn restore_tab(
         // rebuilt from the account registry when the agent is next spawned, so nothing
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
+        let saved_agent_topics_enabled = saved_pane.is_some_and(|p| p.agent_topics_enabled);
         let saved_fence = saved_pane
             .map(super::snapshot::PaneSnapshot::fence_identity)
             .unwrap_or_default();
@@ -638,6 +639,7 @@ fn restore_tab(
             // Restore account routing. Without this the pane comes back on the harness
             // default and writes to the WRONG account's transcript, which reads as lost work.
             terminal.agent_account = saved_agent_account.clone();
+            terminal.agent_topics_enabled = saved_agent_topics_enabled;
             terminal.fence_identity = saved_fence.clone();
             terminal.other_prompts = saved_other_prompts.clone();
             if let Some(session) = restored_agent_session {
@@ -754,6 +756,7 @@ fn restore_tab(
                     terminal.set_manual_label(label);
                 }
                 terminal.agent_account = saved_agent_account.clone();
+                terminal.agent_topics_enabled = saved_agent_topics_enabled;
                 terminal.fence_identity = saved_fence.clone();
                 terminal.other_prompts = saved_other_prompts.clone();
                 if let Some(session) = restored_agent_session {
@@ -1129,6 +1132,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            agent_topics_enabled: false,
                             fence: None,
                         },
                     )]),
@@ -1423,6 +1427,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: Some("claudecrazy".into()),
+                            agent_topics_enabled: true,
                             fence: None,
                         },
                     )]),
@@ -1470,6 +1475,8 @@ mod tests {
         // The receipt also requires names and labels to survive, by assertion rather than
         // by the eventual re-registration that happened to rescue us during the incident.
         assert_eq!(terminal.manual_label.as_deref(), Some("herdr-app"));
+        // The Topics switch comes back too, so the resume runs on the same omp build.
+        assert!(terminal.agent_topics_enabled);
     }
 
     #[test]
@@ -1879,6 +1886,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            agent_topics_enabled: false,
                             fence: None,
                         },
                     )]),
@@ -1961,6 +1969,7 @@ mod tests {
                             terminal_id: Some("term_persisted_boot1".into()),
                             occupant_generation: 7,
                             agent_account: None,
+                            agent_topics_enabled: false,
                             fence: None,
                         },
                     )]),
@@ -2051,6 +2060,7 @@ mod tests {
                                 terminal_id: None,
                                 occupant_generation: 0,
                                 agent_account: None,
+                                agent_topics_enabled: false,
                                 fence: None,
                             },
                         ),
@@ -2068,6 +2078,7 @@ mod tests {
                                 terminal_id: None,
                                 occupant_generation: 0,
                                 agent_account: None,
+                                agent_topics_enabled: false,
                                 fence: None,
                             },
                         ),
@@ -2128,6 +2139,7 @@ mod tests {
                     terminal_id: None,
                     occupant_generation: 0,
                     agent_account: None,
+                    agent_topics_enabled: false,
                     fence: None,
                 },
             )
@@ -2149,6 +2161,7 @@ mod tests {
             terminal_id: None,
             occupant_generation: 0,
             agent_account: None,
+            agent_topics_enabled: false,
             fence: None,
         };
         let snapshot = SessionSnapshot {
@@ -2315,6 +2328,7 @@ mod tests {
                             terminal_id: None,
                             occupant_generation: 0,
                             agent_account: None,
+                            agent_topics_enabled: false,
                             fence: None,
                         },
                     )]),
@@ -2628,6 +2642,7 @@ mod tests {
                 terminal_id: None,
                 occupant_generation: 0,
                 agent_account: None,
+                agent_topics_enabled: false,
                 fence: None,
             },
         );

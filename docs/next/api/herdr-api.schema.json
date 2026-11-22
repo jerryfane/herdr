@@ -2353,6 +2353,22 @@
           ],
           "type": "object"
         },
+        "AgentTopicsSetEnabledParams": {
+          "description": "`agent.topics.set_enabled`: switch one omp agent onto the topics build or\nback onto the stock omp (servers advertising `agent_topics_switch`).",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "enabled"
+          ],
+          "type": "object"
+        },
         "AgentTranscriptParams": {
           "properties": {
             "after": {
@@ -9399,6 +9415,23 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "description": "Restart an omp agent on the topics build or the stock omp, resuming the\nsame session (`capabilities.agent_topics_switch`). Owner only.",
+          "properties": {
+            "method": {
+              "const": "agent.topics.set_enabled",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicsSetEnabledParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -12727,6 +12760,13 @@
               },
               "type": [
                 "array",
+                "null"
+              ]
+            },
+            "topics_enabled": {
+              "description": "An omp agent runs with topics: the owner switched it onto the topics\nbuild (`agent.topics.set_enabled`), or it offers a topics control right\nnow. Absent for other agents.",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -18538,6 +18578,31 @@
               "type": "object"
             },
             {
+              "description": "`agent.topics.set_enabled`: the agent's state after the switch.\n`changed` is false when the agent was already in the requested state,\nand then nothing was restarted.",
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "changed": {
+                  "type": "boolean"
+                },
+                "topics_enabled": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "agent_topics_switched",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "changed",
+                "topics_enabled"
+              ],
+              "type": "object"
+            },
+            {
               "description": "`agent.topics.close`, `agent.topics.reopen`, `agent.topics.rename`.",
               "properties": {
                 "agent": {
@@ -19891,6 +19956,11 @@
             "agent_topics": {
               "default": false,
               "description": "Serves `agent.topics.*`, the `agent.topics.changed` event and\n`topic_sessions` on `agent.list`/`agent.get`.",
+              "type": "boolean"
+            },
+            "agent_topics_switch": {
+              "default": false,
+              "description": "Serves `agent.topics.set_enabled` and reports `topics_enabled` on\n`agent.list`/`agent.get`: `[topics] omp_binary` is configured.",
               "type": "boolean"
             },
             "agent_transcript": {

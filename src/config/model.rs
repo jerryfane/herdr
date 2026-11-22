@@ -341,6 +341,70 @@ pub struct Config {
     pub guest: GuestConfig,
     pub accounts: Vec<AccountConfig>,
     pub fence: FenceConfig,
+    pub topics: TopicsConfig,
+}
+
+/// `[topics]`: the topics-enabled omp build behind the per-agent Topics switch
+/// (`agent.topics.set_enabled`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct TopicsConfig {
+    /// Path to the topics-enabled omp binary. The per-agent Topics switch is
+    /// offered only while this is set and executable; switching an agent on
+    /// restarts it on this binary, resuming the same session.
+    pub omp_binary: Option<std::path::PathBuf>,
+    /// Config file passed to the topics build as `--config <path>`. Optional.
+    pub omp_config: Option<std::path::PathBuf>,
+}
+
+impl TopicsConfig {
+    /// The topics build, when it is configured and executable.
+    pub fn usable_omp_binary(&self) -> Option<&std::path::Path> {
+        let binary = self.omp_binary.as_deref()?;
+        is_executable_file(binary).then_some(binary)
+    }
+
+    /// An omp resume argv relaunched on the build the agent's Topics switch
+    /// selects: the topics build (plus `--config`) when `enabled` and the build
+    /// is usable, else the stock `omp`. Idempotent; any program and leading
+    /// `--config <path>` already in `argv` are replaced.
+    pub fn omp_launch_argv(&self, argv: &[String], enabled: bool) -> Vec<String> {
+        let mut args = argv.get(1..).unwrap_or_default();
+        if args.first().map(String::as_str) == Some("--config") {
+            args = args.get(2..).unwrap_or_default();
+        }
+        let mut launch = Vec::with_capacity(args.len() + 3);
+        match self.usable_omp_binary().filter(|_| enabled) {
+            Some(binary) => {
+                launch.push(binary.to_string_lossy().into_owned());
+                if let Some(config) = self.omp_config.as_deref() {
+                    launch.push("--config".into());
+                    launch.push(config.to_string_lossy().into_owned());
+                }
+            }
+            None => launch.push("omp".into()),
+        }
+        launch.extend(args.iter().cloned());
+        launch
+    }
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// A per-harness credential/config-home account.

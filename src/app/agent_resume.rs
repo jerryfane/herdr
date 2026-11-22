@@ -356,6 +356,31 @@ impl App {
         }
     }
 
+    /// `plan` relaunched on the omp build the agent's Topics switch selects
+    /// (`agent.topics.set_enabled`). Other agents, and an omp agent never switched
+    /// on, keep their plan as it is.
+    pub(crate) fn topics_build_plan(
+        &self,
+        mut plan: crate::agent_resume::AgentResumePlan,
+        topics_enabled: bool,
+    ) -> crate::agent_resume::AgentResumePlan {
+        if plan.agent != "omp" {
+            return plan;
+        }
+        let on_topics_build = self
+            .topics_config
+            .omp_binary
+            .as_deref()
+            .zip(plan.argv.first())
+            .is_some_and(|(binary, program)| binary.as_os_str() == program.as_str());
+        if topics_enabled || on_topics_build {
+            plan.argv = self
+                .topics_config
+                .omp_launch_argv(&plan.argv, topics_enabled);
+        }
+        plan
+    }
+
     fn start_pending_agent_resume(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -382,6 +407,13 @@ impl App {
         let shell_config =
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
         let shell_name = crate::pane::resolved_pane_shell(shell_config);
+        // Restore, unarchive and a plain restart keep the build the Topics switch chose.
+        let topics_enabled = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| terminal.agent_topics_enabled);
+        let plan = self.topics_build_plan(plan, topics_enabled);
         let Some(resume_command) =
             crate::platform::managed_resume_shell_command(&plan.argv, &shell_name, transfer_resume)
         else {

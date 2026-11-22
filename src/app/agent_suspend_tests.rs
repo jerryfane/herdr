@@ -500,6 +500,7 @@ fn a_name_an_archived_agent_holds_is_not_restored() {
             origin_tab_id: None,
             pane_label: None,
             fence: None,
+            topics_enabled: false,
         });
 
     let session = omp_session("ordinals-omp.jsonl");

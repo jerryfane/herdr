@@ -180,6 +180,7 @@ mod tests {
             "worktree.remove",
             "agent.start",
             "agent.restart",
+            "agent.topics.set_enabled",
             "agent.transfer_session",
             "accounts.create",
             "integration.install",
@@ -287,6 +288,16 @@ mod topic_tests {
                 )),
                 FencedAccess::Own(OwnTarget::Agent("builder".into())),
                 "{method}"
+            );
+        }
+        // The Topics switch restarts the agent: owner only, even on a fenced
+        // caller's own agent.
+        for enabled in [true, false] {
+            assert_eq!(
+                access(&format!(
+                    r#"{{"id":"1","method":"agent.topics.set_enabled","params":{{"target":"builder","enabled":{enabled}}}}}"#
+                )),
+                FencedAccess::Denied
             );
         }
     }

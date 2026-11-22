@@ -5,7 +5,7 @@ use bytes::Bytes;
 use crate::api::schema::{
     AgentArchiveParams, AgentForgetParams, AgentListParams, AgentPromptDelivery, AgentPromptParams,
     AgentRenameParams, AgentRestartParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    AgentUnarchiveParams, PaneReadResult, ResponseResult,
+    AgentTopicsSetEnabledParams, AgentUnarchiveParams, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -484,9 +484,25 @@ impl App {
         id: String,
         params: AgentRestartParams,
     ) -> String {
+        match self.restart_agent(id.clone(), params, None) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+            Err(response) => response,
+        }
+    }
+
+    /// `agent.restart`, and the relaunch behind `agent.topics.set_enabled`:
+    /// `topics` is the Topics switch to apply (persisted on the terminal before
+    /// the relaunch); `None` keeps the agent's current choice. Returns the agent
+    /// as it was before the kill, or the encoded error response.
+    fn restart_agent(
+        &mut self,
+        id: String,
+        params: AgentRestartParams,
+        topics: Option<bool>,
+    ) -> Result<crate::api::schema::AgentInfo, String> {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
         let Some(terminal_id) = self
             .state
@@ -495,7 +511,7 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
             .cloned()
         else {
-            return agent_not_found(id, &params.target);
+            return Err(agent_not_found(id, &params.target));
         };
 
         let Some((source, agent, session_ref)) = self
@@ -504,18 +520,18 @@ impl App {
             .get(&terminal_id)
             .and_then(Self::terminal_resume_source)
         else {
-            return encode_error(
+            return Err(encode_error(
                 id,
                 "no_resumable_session",
                 "agent has no resumable session — not a herdr-launched agent, or no session was reported",
-            );
+            ));
         };
         let Some(plan) = crate::agent_resume::plan(&source, &agent, &session_ref) else {
-            return encode_error(
+            return Err(encode_error(
                 id,
                 "no_resumable_session",
                 "agent has no resumable session for its harness",
-            );
+            ));
         };
 
         // FAIL LOUD before tearing anything down (#477): the agent resumes in its
@@ -528,14 +544,14 @@ impl App {
             .map(|terminal| terminal.cwd.clone())
             .filter(|cwd| !cwd.is_dir())
         {
-            return encode_error(
+            return Err(encode_error(
                 id,
                 "agent_directory_unavailable",
                 format!(
                     "the agent's directory {} is missing; the agent was left running — restart it once the directory is back",
                     cwd.display()
                 ),
-            );
+            ));
         }
 
         // Resolve which account to resume under: an explicit `account` param is a
@@ -550,7 +566,7 @@ impl App {
         let account_env = match selected_account.as_deref() {
             Some(account_id) => match self.resolve_account_launch_env(account_id, &agent) {
                 Ok(env) => Some((account_id.to_string(), env)),
-                Err(err) => return encode_error_body(id, err.into_error_body()),
+                Err(err) => return Err(encode_error_body(id, err.into_error_body())),
             },
             None => None,
         };
@@ -579,7 +595,11 @@ impl App {
                         if let Some(blocker) =
                             claude_account_launch_blocker(&account.config_dir, cwd.as_deref())
                         {
-                            return encode_error(id, blocker.code(), blocker.message(account_id));
+                            return Err(encode_error(
+                                id,
+                                blocker.code(),
+                                blocker.message(account_id),
+                            ));
                         }
                     }
                 }
@@ -599,20 +619,20 @@ impl App {
                 remembered_account.as_deref(),
                 selected_account.as_deref(),
             ) {
-                return encode_error(
+                return Err(encode_error(
                     id,
                     "session_migrate_failed",
                     format!(
                         "couldn't move this agent's session to the new account: {reason}; the agent was left on its current account"
                     ),
-                );
+                ));
             }
         }
 
         // Snapshot the agent info to return before the process is killed.
         let agent_info = match self.agent_info_for_target(&params.target) {
             Ok(agent) => agent,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
 
         // Arm the resume plan and guarantee the imminent PaneDied respawns the
@@ -620,8 +640,17 @@ impl App {
         // PaneDied drives one resume relaunch via the resume-aware respawn path.
         // The account env (if any) rides on `pending_launch_env`, read at that
         // relaunch's fresh-shell spawn; `agent_account` remembers the choice so a
-        // later plain restart keeps it.
+        // later plain restart keeps it. The Topics switch is recorded the same way, and
+        // picks the omp build this relaunch and every later one runs on.
+        let topics_enabled = topics.unwrap_or_else(|| {
+            self.state
+                .terminals
+                .get(&terminal_id)
+                .is_some_and(|terminal| terminal.agent_topics_enabled)
+        });
+        let plan = self.topics_build_plan(plan, topics_enabled);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.agent_topics_enabled = topics_enabled;
             terminal.arm_restart(plan);
             terminal.respawn_shell_on_exit = true;
             match account_env {
@@ -636,7 +665,74 @@ impl App {
             }
         }
         self.shutdown_terminal_runtime(terminal_id);
-        encode_success(id, ResponseResult::AgentInfo { agent: agent_info })
+        Ok(agent_info)
+    }
+
+    /// `agent.topics.set_enabled`: relaunch one omp agent on the topics build
+    /// (`[topics] omp_binary`, plus `--config <omp_config>`) or back on the stock
+    /// omp, resuming the same session through `agent.restart`. The choice is
+    /// recorded on the terminal and persisted, so every later relaunch keeps it.
+    pub(super) fn handle_agent_topics_set_enabled(
+        &mut self,
+        id: String,
+        params: AgentTopicsSetEnabledParams,
+    ) -> String {
+        if params.enabled && self.topics_config.usable_omp_binary().is_none() {
+            let detail = match self.topics_config.omp_binary.as_deref() {
+                Some(binary) => format!("the topics build {} is not executable", binary.display()),
+                None => "no topics build is configured ([topics] omp_binary)".to_string(),
+            };
+            return encode_error(id, "topics_build_missing", detail);
+        }
+        let resolved = match self.resolve_agent_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+        else {
+            return agent_not_found(id, &params.target);
+        };
+        let Some(current) = self.agent_topics_enabled(terminal) else {
+            return encode_error(id, "not_omp", "only omp agents have a Topics switch");
+        };
+        if current == params.enabled {
+            let agent = match self.agent_info_for_target(&params.target) {
+                Ok(agent) => agent,
+                Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            };
+            return encode_success(
+                id,
+                ResponseResult::AgentTopicsSwitched {
+                    agent,
+                    changed: false,
+                    topics_enabled: current,
+                },
+            );
+        }
+        let restart = AgentRestartParams {
+            target: params.target,
+            account: None,
+        };
+        match self.restart_agent(id.clone(), restart, Some(params.enabled)) {
+            Ok(mut agent) => {
+                agent.topics_enabled = Some(params.enabled);
+                self.schedule_session_save();
+                encode_success(
+                    id,
+                    ResponseResult::AgentTopicsSwitched {
+                        agent,
+                        changed: true,
+                        topics_enabled: params.enabled,
+                    },
+                )
+            }
+            Err(response) => response,
+        }
     }
 
     /// The `(source, agent, session_ref)` needed to resume a terminal's agent,
@@ -4719,6 +4815,312 @@ mod tests {
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
+    /// A fake topics build: an executable file and a config path.
+    fn topics_build(name: &str) -> (crate::config::TopicsConfig, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("herdr-topics-build-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("omp");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dir.join("topics.yml");
+        let topics = crate::config::TopicsConfig {
+            omp_binary: Some(binary.clone()),
+            omp_config: Some(config.clone()),
+        };
+        (
+            topics,
+            binary.display().to_string(),
+            config.display().to_string(),
+        )
+    }
+
+    fn arm_omp_agent(app: &mut App, name: &str) -> crate::terminal::TerminalId {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(absolute_session_path(
+                    "omp-topics-sess.jsonl",
+                ))
+                .unwrap(),
+            });
+        }
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        terminal_id
+    }
+
+    fn set_topics(app: &mut App, target: &str, enabled: bool) -> String {
+        app.handle_agent_topics_set_enabled(
+            "req".into(),
+            AgentTopicsSetEnabledParams {
+                target: target.into(),
+                enabled,
+            },
+        )
+    }
+
+    fn switched(response: &str) -> (bool, bool, crate::api::schema::AgentInfo) {
+        let success: SuccessResponse = serde_json::from_str(response).expect(response);
+        let ResponseResult::AgentTopicsSwitched {
+            agent,
+            changed,
+            topics_enabled,
+        } = success.result
+        else {
+            panic!("{response}");
+        };
+        (changed, topics_enabled, agent)
+    }
+
+    fn error_code(response: &str) -> String {
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(response).expect(response);
+        error.error.code
+    }
+
+    fn armed_argv(app: &App, terminal_id: &crate::terminal::TerminalId) -> Vec<String> {
+        app.state.terminals[terminal_id]
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("the switch arms a resume plan")
+            .argv
+            .clone()
+    }
+
+    fn omp_resume_arg() -> String {
+        format!(
+            "--resume={}",
+            absolute_session_path("omp-topics-sess.jsonl")
+        )
+    }
+
+    #[tokio::test]
+    async fn topics_enable_relaunches_on_the_topics_build_resuming_the_same_session() {
+        let mut app = app_with_agent();
+        let (topics, binary, config) = topics_build("enable");
+        app.topics_config = topics;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+
+        let (changed, enabled, _) = switched(&set_topics(&mut app, "ordinals", true));
+
+        assert!(changed && enabled);
+        assert_eq!(
+            armed_argv(&app, &terminal_id),
+            vec![binary, "--config".into(), config, omp_resume_arg()]
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.agent_topics_enabled);
+        // The same seat comes back: the name is kept and the restart is in flight,
+        // so the relaunch on the same session reclaims it (#485).
+        assert_eq!(terminal.agent_name.as_deref(), Some("ordinals"));
+        assert!(terminal.restart_in_flight_for_test());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn topics_disable_relaunches_on_the_stock_omp() {
+        let mut app = app_with_agent();
+        app.topics_config = topics_build("disable").0;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_topics_enabled = true;
+
+        let (changed, enabled, agent) = switched(&set_topics(&mut app, "ordinals", false));
+
+        assert!(changed && !enabled);
+        assert_eq!(agent.topics_enabled, Some(false));
+        assert_eq!(
+            armed_argv(&app, &terminal_id),
+            vec!["omp".to_string(), omp_resume_arg()]
+        );
+        assert!(!app.state.terminals[&terminal_id].agent_topics_enabled);
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_name.as_deref(),
+            Some("ordinals")
+        );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_plain_restart_keeps_the_topics_build_the_switch_chose() {
+        let mut app = app_with_agent();
+        let (topics, binary, config) = topics_build("restart");
+        app.topics_config = topics;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_topics_enabled = true;
+
+        let response = app.handle_agent_restart(
+            "req".into(),
+            AgentRestartParams {
+                target: "ordinals".into(),
+                account: None,
+            },
+        );
+
+        assert!(response.contains("\"agent_info\""), "{response}");
+        assert_eq!(
+            armed_argv(&app, &terminal_id),
+            vec![binary, "--config".into(), config, omp_resume_arg()]
+        );
+        assert!(app.state.terminals[&terminal_id].agent_topics_enabled);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_resume_after_restore_runs_on_the_build_the_terminal_records() {
+        let mut app = app_with_agent();
+        let (topics, binary, config) = topics_build("restore");
+        app.topics_config = topics;
+        let plan = crate::agent_resume::plan(
+            "herdr:omp",
+            "omp",
+            &crate::agent_resume::AgentSessionRef::path(absolute_session_path(
+                "omp-topics-sess.jsonl",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            app.topics_build_plan(plan.clone(), true).argv,
+            vec![binary.clone(), "--config".into(), config, omp_resume_arg()]
+        );
+        // Switched off again: a plan that a topics-build agent reported comes back on stock omp.
+        let on_build = app.topics_build_plan(plan.clone(), true);
+        assert_eq!(
+            app.topics_build_plan(on_build, false).argv,
+            vec!["omp".to_string(), omp_resume_arg()]
+        );
+        assert_eq!(app.topics_build_plan(plan.clone(), false), plan);
+    }
+
+    #[tokio::test]
+    async fn switching_to_the_state_the_agent_is_in_restarts_nothing() {
+        let mut app = app_with_agent();
+        app.topics_config = topics_build("noop").0;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+
+        let (changed, enabled, agent) = switched(&set_topics(&mut app, "ordinals", false));
+        assert!(!changed && !enabled);
+        assert_eq!(agent.topics_enabled, Some(false));
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_topics_enabled = true;
+        let (changed, enabled, _) = switched(&set_topics(&mut app, "ordinals", true));
+        assert!(!changed && enabled);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn only_omp_agents_have_a_topics_switch() {
+        let mut app = app_with_agent();
+        app.topics_config = topics_build("not-omp").0;
+        let terminal_id = arm_codex_agent(&mut app, "builder");
+
+        for enabled in [true, false] {
+            assert_eq!(
+                error_code(&set_topics(&mut app, "builder", enabled)),
+                "not_omp"
+            );
+        }
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert_eq!(
+            app.agent_info_for_target("builder").unwrap().topics_enabled,
+            None
+        );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn enabling_topics_without_a_usable_topics_build_is_refused() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+
+        assert_eq!(
+            error_code(&set_topics(&mut app, "ordinals", true)),
+            "topics_build_missing"
+        );
+        // Configured, but not executable.
+        let (mut topics, _, config) = topics_build("not-executable");
+        topics.omp_binary = Some(config.into());
+        app.topics_config = topics;
+        assert_eq!(
+            error_code(&set_topics(&mut app, "ordinals", true)),
+            "topics_build_missing"
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn the_topics_switch_refuses_a_missing_directory_like_restart() {
+        let mut app = app_with_agent();
+        app.topics_config = topics_build("missing-dir").0;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd =
+            std::env::temp_dir().join("herdr-topics-switch-gone");
+
+        assert_eq!(
+            error_code(&set_topics(&mut app, "ordinals", true)),
+            "agent_directory_unavailable"
+        );
+        assert!(!app.state.terminals[&terminal_id].agent_topics_enabled);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn omp_agents_report_whether_topics_are_enabled() {
+        let mut app = app_with_agent();
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+        assert_eq!(
+            app.agent_info_for_target("ordinals")
+                .unwrap()
+                .topics_enabled,
+            Some(false)
+        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_topics_enabled = true;
+        let agent = app.agent_info_for_target("ordinals").unwrap();
+        assert_eq!(agent.topics_enabled, Some(true));
+        assert_eq!(
+            serde_json::to_value(&agent).unwrap()["topics_enabled"],
+            serde_json::json!(true)
+        );
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
     #[tokio::test]
     async fn agent_restart_errors_without_resumable_session() {
         let mut app = app_with_agent();
@@ -5682,6 +6084,7 @@ mod tests {
                 origin_tab_id: None,
                 pane_label: None,
                 fence: None,
+                topics_enabled: false,
             });
     }
 
@@ -6078,6 +6481,7 @@ mod tests {
                 origin_tab_id: None,
                 pane_label: None,
                 fence: None,
+                topics_enabled: false,
             });
 
         let agents = app.collect_agent_infos();

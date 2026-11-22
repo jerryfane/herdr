@@ -1201,6 +1201,7 @@ fn success_response_round_trips() {
                 ask_dismiss: false,
                 agent_topics: false,
                 agent_transcript_topic: false,
+                agent_topics_switch: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,

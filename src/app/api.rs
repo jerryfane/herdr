@@ -1775,6 +1775,9 @@ impl App {
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
+            Method::AgentTopicsSetEnabled(params) => {
+                return self.handle_agent_topics_set_enabled(request.id, params);
+            }
             Method::AgentTransferSession(params) => {
                 return self.handle_agent_transfer_session(request.id, params)
             }

@@ -194,6 +194,8 @@ pub struct App {
     /// Configured credential/config-home accounts, refreshed on config reload.
     /// Holds only directory paths and labels — never a credential value.
     pub(crate) loaded_accounts: Vec<crate::config::AccountConfig>,
+    /// `[topics]`: the topics-enabled omp build behind `agent.topics.set_enabled`.
+    pub(crate) topics_config: crate::config::TopicsConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) pending_host_appearance_deadline: Option<Instant>,
@@ -458,6 +460,7 @@ impl App {
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         // Before session restore below spawns any pane.
         crate::fence::set_startup_config(&config.fence);
+        crate::api::set_topics_switch_configured(config.topics.usable_omp_binary().is_some());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -742,6 +745,7 @@ impl App {
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
             loaded_accounts: config.accounts.clone(),
+            topics_config: config.topics.clone(),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             pending_host_appearance_deadline: None,
@@ -1147,6 +1151,12 @@ impl App {
         // Applies to panes started from now on; running panes keep their fence.
         if !invalid_section("fence") {
             crate::fence::set_config(&config.fence);
+        }
+        if !invalid_section("topics") {
+            self.topics_config = config.topics.clone();
+            crate::api::set_topics_switch_configured(
+                self.topics_config.usable_omp_binary().is_some(),
+            );
         }
 
         if !invalid_section("experimental") {

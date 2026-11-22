@@ -444,6 +444,7 @@ impl App {
         // silently unhooks a restored agent from the channel that addresses it.
         let pane_label = terminal.manual_label.clone();
         let fence = terminal.fence_identity.clone();
+        let topics_enabled = terminal.agent_topics_enabled;
         let cwd = terminal.cwd.clone();
         let occupant_generation = terminal.occupant_generation;
         let kind = terminal
@@ -474,6 +475,7 @@ impl App {
                 origin_tab_id: Some(info.tab_id.clone()),
                 pane_label,
                 fence: Some(fence),
+                topics_enabled,
             });
 
         // Release the pane's process, then remove the now-empty pane. The session
@@ -613,6 +615,7 @@ impl App {
             crate::terminal::TerminalState::new(terminal_id.clone(), record.cwd.clone())
                 .with_occupant_generation(record.occupant_generation);
         terminal.fence_identity = record.fence_identity();
+        terminal.agent_topics_enabled = record.topics_enabled;
         if let Some((persisted, plan)) = resume {
             terminal = terminal.with_pending_agent_resume_plan(plan);
             // An unarchive waits for a missing directory like a restore does (#477).
@@ -1440,6 +1443,7 @@ impl App {
         let account_unresolved = account.is_some() && resolved_account.is_none();
         let account_config_dir = resolved_account.map(|entry| entry.config_dir.clone());
         let avatar = self.agent_avatars.get(&pane.terminal_id).cloned();
+        let topics_enabled = self.agent_topics_enabled(terminal);
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -1497,7 +1501,37 @@ impl App {
             // Filled from disk by `agent.list` and `agent.get` only, so the
             // other readers of agent info never touch the session file.
             topic_sessions: None,
+            topics_enabled,
         })
+    }
+
+    /// Whether this terminal's agent is an omp agent (by its live or saved identity).
+    pub(crate) fn terminal_runs_omp(terminal: &crate::terminal::TerminalState) -> bool {
+        terminal
+            .effective_agent_label()
+            .or_else(|| {
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.agent.as_str())
+            })
+            .is_some_and(|agent| agent == "omp")
+    }
+
+    /// `topics_enabled` for an omp agent: switched onto the topics build, or
+    /// offering a topics control right now. `None` for any other agent.
+    pub(crate) fn agent_topics_enabled(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> Option<bool> {
+        if !Self::terminal_runs_omp(terminal) {
+            return None;
+        }
+        #[cfg(unix)]
+        let offers_control = self.agent_controls.handle(terminal.id.as_str()).is_some();
+        #[cfg(not(unix))]
+        let offers_control = false;
+        Some(terminal.agent_topics_enabled || offers_control)
     }
 
     fn agent_name_conflicts(
@@ -1806,6 +1840,7 @@ fn archived_agent_info(
         session_transfer: None,
         avatar: avatars.get(&record.terminal_id).cloned(),
         topic_sessions: None,
+        topics_enabled: (record.kind == "omp").then_some(record.topics_enabled),
     }
 }
 
