@@ -53,13 +53,13 @@ pub(super) fn run_guest_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// Positional arguments plus `--flag value` options and value-less [`FLAGS`].
-struct Parsed {
-    positional: Vec<String>,
+pub(super) struct Parsed {
+    pub(super) positional: Vec<String>,
     options: Vec<(String, String)>,
 }
 
 impl Parsed {
-    fn option(&self, name: &str) -> Option<String> {
+    pub(super) fn option(&self, name: &str) -> Option<String> {
         self.options
             .iter()
             .rev()
@@ -72,7 +72,7 @@ impl Parsed {
     }
 }
 
-fn parse(args: &[String], known: &[&str]) -> Result<Parsed, String> {
+pub(super) fn parse(args: &[String], known: &[&str]) -> Result<Parsed, String> {
     let mut parsed = Parsed {
         positional: Vec::new(),
         options: Vec::new(),
@@ -98,7 +98,7 @@ fn parse(args: &[String], known: &[&str]) -> Result<Parsed, String> {
     Ok(parsed)
 }
 
-fn send(id: &str, method: Method) -> std::io::Result<i32> {
+pub(super) fn send(id: &str, method: Method) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: id.into(),
         method,

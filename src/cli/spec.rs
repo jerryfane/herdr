@@ -43,6 +43,7 @@ pub(super) fn command() -> Command {
         .subcommand(notification_command())
         .subcommand(gram_command())
         .subcommand(guest_command())
+        .subcommand(owner_access_command())
         .subcommand(agent_command())
         .subcommand(super::fence::command())
         .subcommand(pane_command())
@@ -352,6 +353,48 @@ fn guest_command() -> Command {
                 .arg(Arg::new("guest-id").value_name("GUEST-ID"))
                 .arg(option("limit", "N"))
                 .arg(machine()),
+        )
+}
+
+fn owner_access_command() -> Command {
+    let scope = || {
+        option("scope", "SCOPE")
+            .value_parser(["chat", "terminal"])
+            .help("chat: agents only; terminal: agents and their terminals (a shell)")
+    };
+    let ttl = || option("ttl", "SECS").help("Grant lifetime, 3600 to 2592000 (1 hour to 30 days)");
+    Command::new("owner-access")
+        .about("Allow your own browsers on this machine through HerdrUp")
+        .subcommand(
+            Command::new("info").about("Show this machine's relay id, public key and relay link"),
+        )
+        .subcommand(Command::new("list").about("List the browsers allowed on this machine"))
+        .subcommand(
+            Command::new("add")
+                .about("Allow one browser key, bound to the approving device's account")
+                .arg(option("device-pub", "KEY").help("The browser's key (unpadded base64url)"))
+                .arg(option("device-name", "NAME"))
+                .arg(scope())
+                .arg(ttl())
+                .arg(
+                    option("statement", "JWS")
+                        .help("The approving device's account statement for this machine"),
+                )
+                .arg(option("approved-by", "NAME").help("The approving device's name")),
+        )
+        .subcommand(
+            Command::new("renew")
+                .about("Set a grant to expire SECS from now; revives an expired grant")
+                .arg(required("grant-id", "GRANT-ID"))
+                .arg(ttl())
+                .arg(scope()),
+        )
+        .subcommand(
+            Command::new("remove")
+                .about("Remove a browser's grants; unknown ones are not an error")
+                .arg(Arg::new("grant-id").value_name("GRANT-ID"))
+                .arg(option("device-pub", "KEY"))
+                .arg(option("fingerprint", "FINGERPRINT")),
         )
 }
 

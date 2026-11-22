@@ -431,6 +431,37 @@ pub enum ResponseResult {
     GuestAudit {
         entries: Vec<super::guest::GuestAuditEntry>,
     },
+    /// This machine's relay identity for owner access. Never includes
+    /// secrets.
+    OwnerAccessInfo {
+        /// Owner access protocol version.
+        protocol: u32,
+        /// The relay's id for this machine, unpadded base64url of 16 bytes.
+        host_id: String,
+        /// This machine's X25519 Noise key, unpadded base64url of 32 bytes.
+        node_pub: String,
+        relay_url: String,
+        link: super::guest::GuestLinkInfo,
+        /// The longest grant `owner_access.add` and `owner_access.renew` accept.
+        max_ttl_secs: u64,
+        scopes: Vec<super::owner_access::OwnerScope>,
+        version: String,
+    },
+    OwnerAccessList {
+        grants: Vec<super::owner_access::OwnerGrantInfo>,
+    },
+    OwnerAccessAdded {
+        grant: super::owner_access::OwnerGrantInfo,
+        /// Grants for the same key that this one replaced (now revoked).
+        replaced: Vec<String>,
+    },
+    OwnerAccessRenewed {
+        grant: super::owner_access::OwnerGrantInfo,
+    },
+    OwnerAccessRemoved {
+        /// Grants this call revoked; `[]` when none matched.
+        removed: Vec<String>,
+    },
     /// Internal: the guest gate's agent lookup plus its live-agent check.
     #[cfg(unix)]
     #[schemars(skip)]

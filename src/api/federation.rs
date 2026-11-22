@@ -280,6 +280,30 @@ mod tests {
     }
 
     #[test]
+    fn owner_access_methods_are_denied_to_every_peer() {
+        let names: Vec<&str> = crate::api::schema::Method::OPERATIONS
+            .iter()
+            .map(|operation| operation.name)
+            .filter(|name| name.starts_with("owner_access."))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "owner_access.info",
+                "owner_access.list",
+                "owner_access.add",
+                "owner_access.renew",
+                "owner_access.remove",
+            ]
+        );
+        for method in names {
+            let policy = federation_method_policy(method);
+            assert_eq!(policy.access, FederationAccess::Denied, "{method}");
+            assert!(!policy.outbound_routable, "{method}");
+        }
+    }
+
+    #[test]
     fn hello_round_trips_to_the_exact_wire_shape() {
         let line = FederationHello::new("s3cret").to_line().unwrap();
         assert_eq!(
