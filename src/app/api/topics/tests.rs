@@ -523,6 +523,7 @@ fn switching_on_an_omp_that_already_offers_topics_records_the_choice() {
         Method::AgentTopicsSetEnabled(crate::api::schema::AgentTopicsSetEnabledParams {
             target: pane.clone(),
             enabled: true,
+            when_idle: false,
         }),
     );
 
@@ -540,6 +541,7 @@ fn switching_on_an_omp_that_already_offers_topics_records_the_choice() {
         Method::AgentTopicsSetEnabled(crate::api::schema::AgentTopicsSetEnabledParams {
             target: pane,
             enabled: true,
+            when_idle: false,
         }),
     );
     assert_eq!(response["result"]["changed"], false, "{response}");

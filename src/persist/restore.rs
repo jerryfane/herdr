@@ -545,6 +545,7 @@ fn restore_tab(
         // credential-shaped is carried through the snapshot.
         let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
         let saved_agent_topics_enabled = saved_pane.is_some_and(|p| p.agent_topics_enabled);
+        let saved_topics_switch_pending = saved_pane.and_then(|p| p.topics_switch_pending);
         let saved_fence = saved_pane
             .map(super::snapshot::PaneSnapshot::fence_identity)
             .unwrap_or_default();
@@ -640,6 +641,7 @@ fn restore_tab(
             // default and writes to the WRONG account's transcript, which reads as lost work.
             terminal.agent_account = saved_agent_account.clone();
             terminal.agent_topics_enabled = saved_agent_topics_enabled;
+            terminal.topics_switch_pending = saved_topics_switch_pending;
             terminal.fence_identity = saved_fence.clone();
             terminal.other_prompts = saved_other_prompts.clone();
             if let Some(session) = restored_agent_session {
@@ -757,6 +759,7 @@ fn restore_tab(
                 }
                 terminal.agent_account = saved_agent_account.clone();
                 terminal.agent_topics_enabled = saved_agent_topics_enabled;
+                terminal.topics_switch_pending = saved_topics_switch_pending;
                 terminal.fence_identity = saved_fence.clone();
                 terminal.other_prompts = saved_other_prompts.clone();
                 if let Some(session) = restored_agent_session {
@@ -1133,6 +1136,7 @@ mod tests {
                             occupant_generation: 0,
                             agent_account: None,
                             agent_topics_enabled: false,
+                            topics_switch_pending: None,
                             fence: None,
                         },
                     )]),
@@ -1428,6 +1432,7 @@ mod tests {
                             occupant_generation: 0,
                             agent_account: Some("claudecrazy".into()),
                             agent_topics_enabled: true,
+                            topics_switch_pending: Some(false),
                             fence: None,
                         },
                     )]),
@@ -1477,6 +1482,8 @@ mod tests {
         assert_eq!(terminal.manual_label.as_deref(), Some("herdr-app"));
         // The Topics switch comes back too, so the resume runs on the same omp build.
         assert!(terminal.agent_topics_enabled);
+        // A `when_idle` switch still waiting for the agent to go idle stays pending.
+        assert_eq!(terminal.topics_switch_pending, Some(false));
     }
 
     #[test]
@@ -1887,6 +1894,7 @@ mod tests {
                             occupant_generation: 0,
                             agent_account: None,
                             agent_topics_enabled: false,
+                            topics_switch_pending: None,
                             fence: None,
                         },
                     )]),
@@ -1970,6 +1978,7 @@ mod tests {
                             occupant_generation: 7,
                             agent_account: None,
                             agent_topics_enabled: false,
+                            topics_switch_pending: None,
                             fence: None,
                         },
                     )]),
@@ -2061,6 +2070,7 @@ mod tests {
                                 occupant_generation: 0,
                                 agent_account: None,
                                 agent_topics_enabled: false,
+                                topics_switch_pending: None,
                                 fence: None,
                             },
                         ),
@@ -2079,6 +2089,7 @@ mod tests {
                                 occupant_generation: 0,
                                 agent_account: None,
                                 agent_topics_enabled: false,
+                                topics_switch_pending: None,
                                 fence: None,
                             },
                         ),
@@ -2140,6 +2151,7 @@ mod tests {
                     occupant_generation: 0,
                     agent_account: None,
                     agent_topics_enabled: false,
+                    topics_switch_pending: None,
                     fence: None,
                 },
             )
@@ -2162,6 +2174,7 @@ mod tests {
             occupant_generation: 0,
             agent_account: None,
             agent_topics_enabled: false,
+            topics_switch_pending: None,
             fence: None,
         };
         let snapshot = SessionSnapshot {
@@ -2329,6 +2342,7 @@ mod tests {
                             occupant_generation: 0,
                             agent_account: None,
                             agent_topics_enabled: false,
+                            topics_switch_pending: None,
                             fence: None,
                         },
                     )]),
@@ -2643,6 +2657,7 @@ mod tests {
                 occupant_generation: 0,
                 agent_account: None,
                 agent_topics_enabled: false,
+                topics_switch_pending: None,
                 fence: None,
             },
         );

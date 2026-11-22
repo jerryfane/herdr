@@ -299,11 +299,15 @@ pub enum ResponseResult {
     },
     /// `agent.topics.set_enabled`: the agent's state after the switch.
     /// `changed` is false when the agent was already in the requested state,
-    /// and then nothing was restarted.
+    /// and then nothing was restarted. `scheduled` is true when a `when_idle`
+    /// switch waits for the busy agent's next idle transition; `topics_enabled`
+    /// is then still the build the agent runs now.
     AgentTopicsSwitched {
         agent: AgentInfo,
         changed: bool,
         topics_enabled: bool,
+        #[serde(default)]
+        scheduled: bool,
     },
     /// `agent.topics.close`, `agent.topics.reopen`, `agent.topics.rename`.
     AgentTopicUpdated {

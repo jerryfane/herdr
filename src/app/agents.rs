@@ -444,7 +444,10 @@ impl App {
         // silently unhooks a restored agent from the channel that addresses it.
         let pane_label = terminal.manual_label.clone();
         let fence = terminal.fence_identity.clone();
-        let topics_enabled = terminal.agent_topics_enabled;
+        // An unarchive is a relaunch, so a pending `when_idle` switch applies there.
+        let topics_enabled = terminal
+            .topics_switch_pending
+            .unwrap_or(terminal.agent_topics_enabled);
         let cwd = terminal.cwd.clone();
         let occupant_generation = terminal.occupant_generation;
         let kind = terminal
@@ -1502,6 +1505,7 @@ impl App {
             // other readers of agent info never touch the session file.
             topic_sessions: None,
             topics_enabled,
+            topics_switch_pending: terminal.topics_switch_pending.is_some(),
         })
     }
 
@@ -1841,6 +1845,7 @@ fn archived_agent_info(
         avatar: avatars.get(&record.terminal_id).cloned(),
         topic_sessions: None,
         topics_enabled: (record.kind == "omp").then_some(record.topics_enabled),
+        topics_switch_pending: false,
     }
 }
 

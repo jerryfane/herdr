@@ -212,6 +212,7 @@ pub(crate) fn advertise_topics_switch(
 ) -> Option<ServerCapabilities> {
     capabilities.map(|mut capabilities| {
         capabilities.agent_topics_switch = configured;
+        capabilities.agent_topics_switch_when_idle = configured;
         capabilities
     })
 }
@@ -251,6 +252,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_transcript_topic: true,
         // Follows `[topics] omp_binary`; ping fills it in from the live config.
         agent_topics_switch: false,
+        agent_topics_switch_when_idle: false,
         // Suggestions go through the same Unix-only control socket.
         agent_topic_suggestions: cfg!(unix),
         gram_reachable: true,
@@ -2276,6 +2278,11 @@ fn maybe_route_to_peer(
         && !peer_target.agent_topics_switch()
     {
         Some("agent_topics_switch")
+    } else if matches!(&request.method, Method::AgentTopicsSetEnabled(params) if params.when_idle)
+        && !peer_target.agent_topics_switch_when_idle()
+    {
+        // An older peer ignores `when_idle` and would cut the running turn.
+        Some("agent_topics_switch_when_idle")
     } else if request.method.is_agent_topic_suggestions() && !peer_target.agent_topic_suggestions()
     {
         Some("agent_topic_suggestions")
@@ -3968,6 +3975,7 @@ mod tests {
                 agent_topics: false,
                 agent_transcript_topic: false,
                 agent_topics_switch: false,
+                agent_topics_switch_when_idle: false,
                 agent_topic_suggestions: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
@@ -8260,6 +8268,48 @@ mod federation_tests {
             "{response}"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    /// A `when_idle` switch reaches only a peer that honours it: an older peer
+    /// would ignore the field and cut the running turn with an immediate restart.
+    #[test]
+    fn proxy_forwards_a_when_idle_topics_switch_only_to_a_peer_honouring_it() {
+        let switched = serde_json::json!({"id": "s1", "result": {"type": "ok"}}).to_string();
+        let request = serde_json::json!({
+            "id": "s1",
+            "method": "agent.topics.set_enabled",
+            "params": {"target": "remote/ordinals", "enabled": true, "when_idle": true},
+        });
+
+        let old_peer = ServerCapabilities {
+            agent_topics_switch: true,
+            agent_topics_switch_when_idle: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(old_peer, switched.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        let response: serde_json::Value =
+            serde_json::from_str(&home_roundtrip(&mut home, request.clone())).unwrap();
+        assert_eq!(
+            response["error"]["code"], "topics_unsupported",
+            "{response}"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+
+        let new_peer = ServerCapabilities {
+            agent_topics_switch: true,
+            agent_topics_switch_when_idle: true,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(new_peer, switched.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        assert_eq!(home_roundtrip(&mut home, request), switched);
+        let seen = peer.seen.lock().expect("seen lock");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "ordinals", "enabled": true, "when_idle": true})
+        );
     }
 
     #[test]

@@ -2411,6 +2411,10 @@
             },
             "target": {
               "type": "string"
+            },
+            "when_idle": {
+              "description": "Never cut a running turn: on an agent that is working or blocked, keep\nthe requested choice pending and relaunch at its next idle transition\n(`scheduled: true`). On an idle agent the switch happens now. A later\ncall replaces a pending switch; asking for the state the agent runs now\ncancels it.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -12892,6 +12896,10 @@
                 "null"
               ]
             },
+            "topics_switch_pending": {
+              "description": "A `when_idle` Topics switch waits for this busy omp agent's next idle\ntransition (`agent.topics.set_enabled`). Absent when none is pending.",
+              "type": "boolean"
+            },
             "turn": {
               "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
               "format": "uint64",
@@ -18767,12 +18775,16 @@
               "type": "object"
             },
             {
-              "description": "`agent.topics.set_enabled`: the agent's state after the switch.\n`changed` is false when the agent was already in the requested state,\nand then nothing was restarted.",
+              "description": "`agent.topics.set_enabled`: the agent's state after the switch.\n`changed` is false when the agent was already in the requested state,\nand then nothing was restarted. `scheduled` is true when a `when_idle`\nswitch waits for the busy agent's next idle transition; `topics_enabled`\nis then still the build the agent runs now.",
               "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
                 "changed": {
+                  "type": "boolean"
+                },
+                "scheduled": {
+                  "default": false,
                   "type": "boolean"
                 },
                 "topics_enabled": {
@@ -20242,6 +20254,11 @@
             "agent_topics_switch": {
               "default": false,
               "description": "Serves `agent.topics.set_enabled` and reports `topics_enabled` on\n`agent.list`/`agent.get`: `[topics] omp_binary` is configured.",
+              "type": "boolean"
+            },
+            "agent_topics_switch_when_idle": {
+              "default": false,
+              "description": "`agent.topics.set_enabled` honours `when_idle` (a busy agent switches at\nits next idle transition) and `agent.list`/`agent.get` report\n`topics_switch_pending`. A server without it ignores `when_idle` and\nrestarts the agent at once, so clients must not send it there.",
               "type": "boolean"
             },
             "agent_transcript": {

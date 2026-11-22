@@ -132,6 +132,12 @@ pub struct ServerCapabilities {
     /// `agent.list`/`agent.get`: `[topics] omp_binary` is configured.
     #[serde(default)]
     pub agent_topics_switch: bool,
+    /// `agent.topics.set_enabled` honours `when_idle` (a busy agent switches at
+    /// its next idle transition) and `agent.list`/`agent.get` report
+    /// `topics_switch_pending`. A server without it ignores `when_idle` and
+    /// restarts the agent at once, so clients must not send it there.
+    #[serde(default)]
+    pub agent_topics_switch_when_idle: bool,
     /// `agent.transcript` honours `topic` (pages a topic's own conversation).
     /// A server without it ignores the field and pages the agent's main
     /// conversation, so clients must not send `topic` to it.
