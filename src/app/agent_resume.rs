@@ -364,16 +364,7 @@ impl App {
         mut plan: crate::agent_resume::AgentResumePlan,
         topics_enabled: bool,
     ) -> crate::agent_resume::AgentResumePlan {
-        if plan.agent != "omp" {
-            return plan;
-        }
-        let on_topics_build = self
-            .topics_config
-            .omp_binary
-            .as_deref()
-            .zip(plan.argv.first())
-            .is_some_and(|(binary, program)| binary.as_os_str() == program.as_str());
-        if topics_enabled || on_topics_build {
+        if plan.agent == "omp" {
             plan.argv = self
                 .topics_config
                 .omp_launch_argv(&plan.argv, topics_enabled);

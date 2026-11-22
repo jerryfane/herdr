@@ -75,7 +75,10 @@ impl App {
                 origin_boot_id: Some(crate::api::server_boot_id().to_owned()),
                 origin_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 origin_protocol: Some(crate::protocol::PROTOCOL_VERSION),
-                origin_capabilities: crate::api::default_capabilities(),
+                origin_capabilities: crate::api::advertise_topics_switch(
+                    crate::api::default_capabilities(),
+                    self.topics_config.usable_omp_binary().is_some(),
+                ),
             },
         )
     }
@@ -697,22 +700,24 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let Some(current) = self.agent_topics_enabled(terminal) else {
+        // `running` is what the agent runs now: switched on, or offering a topics
+        // control. The saved choice is what every later relaunch follows.
+        let Some(running) = self.agent_topics_enabled(terminal) else {
             return encode_error(id, "not_omp", "only omp agents have a Topics switch");
         };
-        if current == params.enabled {
-            let agent = match self.agent_info_for_target(&params.target) {
-                Ok(agent) => agent,
-                Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
-            };
-            return encode_success(
-                id,
-                ResponseResult::AgentTopicsSwitched {
-                    agent,
-                    changed: false,
-                    topics_enabled: current,
-                },
-            );
+        let saved = terminal.agent_topics_enabled;
+        let terminal_id = terminal.id.clone();
+        if params.enabled == saved && params.enabled == running {
+            return self.topics_switched(id, &params.target, false, running);
+        }
+        if params.enabled && running {
+            // Already on a topics build, never switched on: record the choice so a
+            // later restart, restore or unarchive stays there. No relaunch needed.
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.agent_topics_enabled = true;
+            }
+            self.schedule_session_save();
+            return self.topics_switched(id, &params.target, true, true);
         }
         let restart = AgentRestartParams {
             target: params.target,
@@ -732,6 +737,26 @@ impl App {
                 )
             }
             Err(response) => response,
+        }
+    }
+
+    fn topics_switched(
+        &self,
+        id: String,
+        target: &str,
+        changed: bool,
+        topics_enabled: bool,
+    ) -> String {
+        match self.agent_info_for_target(target) {
+            Ok(agent) => encode_success(
+                id,
+                ResponseResult::AgentTopicsSwitched {
+                    agent,
+                    changed,
+                    topics_enabled,
+                },
+            ),
+            Err(err) => encode_error_body(id, self.agent_target_error_body(err)),
         }
     }
 
@@ -5012,6 +5037,55 @@ mod tests {
             vec!["omp".to_string(), omp_resume_arg()]
         );
         assert_eq!(app.topics_build_plan(plan.clone(), false), plan);
+    }
+
+    #[tokio::test]
+    async fn agent_list_advertises_the_topics_switch_from_the_live_config() {
+        let mut app = app_with_agent();
+        let advertised = |app: &mut App| {
+            let list: serde_json::Value = serde_json::from_str(
+                &app.handle_agent_list("list".into(), AgentListParams { local_only: true }),
+            )
+            .unwrap();
+            list["result"]["origin_capabilities"]["agent_topics_switch"].clone()
+        };
+        assert_eq!(advertised(&mut app), serde_json::json!(false));
+        // Federation polls agent.list, not ping: a peer with the build configured
+        // must say so here, or every forwarded switch is refused at home.
+        app.topics_config = topics_build("advertise").0;
+        assert_eq!(advertised(&mut app), serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn switching_off_drops_the_topics_config_from_a_bare_name_reported_argv() {
+        let mut app = app_with_agent();
+        let (topics, _, config) = topics_build("bare-name");
+        app.topics_config = topics;
+        let reported = crate::agent_resume::AgentResumePlan {
+            agent: "omp".into(),
+            argv: vec![
+                "omp".into(),
+                "--config".into(),
+                config.clone(),
+                omp_resume_arg(),
+            ],
+            dedupe_key: "omp-bare".into(),
+        };
+        assert_eq!(
+            app.topics_build_plan(reported.clone(), false).argv,
+            vec!["omp".to_string(), omp_resume_arg()]
+        );
+        // A config of the user's own is not the topics one, and stays.
+        let own = crate::agent_resume::AgentResumePlan {
+            argv: vec![
+                "omp".into(),
+                "--config".into(),
+                "/etc/omp/mine.yml".into(),
+                omp_resume_arg(),
+            ],
+            ..reported
+        };
+        assert_eq!(app.topics_build_plan(own.clone(), false), own);
     }
 
     #[tokio::test]

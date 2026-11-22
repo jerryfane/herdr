@@ -1528,7 +1528,7 @@ impl App {
             return None;
         }
         #[cfg(unix)]
-        let offers_control = self.agent_controls.handle(terminal.id.as_str()).is_some();
+        let offers_control = self.agent_controls.contains(terminal.id.as_str());
         #[cfg(not(unix))]
         let offers_control = false;
         Some(terminal.agent_topics_enabled || offers_control)

@@ -204,6 +204,18 @@ fn topics_switch_configured() -> bool {
     TOPICS_SWITCH_CONFIGURED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// `capabilities` as advertised with the live Topics switch. Ping and
+/// `agent.list` (what federation polls) both answer through this.
+pub(crate) fn advertise_topics_switch(
+    capabilities: Option<ServerCapabilities>,
+    configured: bool,
+) -> Option<ServerCapabilities> {
+    capabilities.map(|mut capabilities| {
+        capabilities.agent_topics_switch = configured;
+        capabilities
+    })
+}
+
 pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
@@ -2724,10 +2736,7 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
-        let capabilities = capabilities.map(|mut capabilities| {
-            capabilities.agent_topics_switch = topics_switch_configured();
-            capabilities
-        });
+        let capabilities = advertise_topics_switch(capabilities, topics_switch_configured());
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
@@ -8153,6 +8162,49 @@ mod federation_tests {
             serde_json::json!({"target": "customer"})
         );
         assert!(home.api_rx.try_recv().is_err());
+    }
+
+    /// `agent.topics.set_enabled` reaches a peer that advertises the switch in the
+    /// `agent.list` it is polled with, and is refused at home for one that does not.
+    #[test]
+    fn proxy_forwards_the_topics_switch_only_to_a_peer_advertising_it() {
+        let switched = serde_json::json!({"id": "s1", "result": {"type": "ok"}}).to_string();
+        let request = serde_json::json!({
+            "id": "s1",
+            "method": "agent.topics.set_enabled",
+            "params": {"target": "remote/ordinals", "enabled": true},
+        });
+
+        let with_switch = ServerCapabilities {
+            agent_topics_switch: true,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(with_switch, switched.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        assert_eq!(home_roundtrip(&mut home, request.clone()), switched);
+        let seen = peer.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(forwarded["method"], "agent.topics.set_enabled");
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "ordinals", "enabled": true})
+        );
+        drop(seen);
+
+        let without_switch = ServerCapabilities {
+            agent_topics_switch: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(without_switch, switched);
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        let response: serde_json::Value =
+            serde_json::from_str(&home_roundtrip(&mut home, request)).unwrap();
+        assert_eq!(
+            response["error"]["code"], "topics_unsupported",
+            "{response}"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
 
     #[test]

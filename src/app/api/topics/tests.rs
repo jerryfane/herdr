@@ -497,3 +497,65 @@ fn a_session_report_naming_another_process_is_accepted_and_moves_no_control() {
     let listed = topics(&app, list(&pane));
     assert_eq!(listed["result"]["topics"], json!([]), "{listed}");
 }
+
+/// A fake topics build the switch accepts: an executable file.
+fn usable_topics_build(name: &str) -> crate::config::TopicsConfig {
+    let dir = std::env::temp_dir().join(format!(
+        "herdr-topics-control-build-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("omp");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::config::TopicsConfig {
+        omp_binary: Some(binary),
+        omp_config: None,
+    }
+}
+
+/// An omp already on a topics build (it offers a control) but never switched on:
+/// switching it on records the choice, so a later restart, restore or unarchive
+/// stays on the topics build, and it is not relaunched for nothing.
+#[test]
+fn switching_on_an_omp_that_already_offers_topics_records_the_choice() {
+    let session = Fixture::new("topics-switch-control");
+    let omp = std::process::id();
+    let (mut app, pane, terminal) = omp_app(&session.path, omp);
+    app.topics_config = usable_topics_build("record");
+    let fake = FakeControl::start("switch-record", empty_topics);
+    let response = send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+    assert!(response.get("result").is_some(), "{response}");
+    let terminal_id = crate::terminal::TerminalId::from_persisted(terminal.clone());
+    assert!(!app.state.terminals[&terminal_id].agent_topics_enabled);
+
+    let response = send(
+        &mut app,
+        Method::AgentTopicsSetEnabled(crate::api::schema::AgentTopicsSetEnabledParams {
+            target: pane.clone(),
+            enabled: true,
+        }),
+    );
+
+    assert_eq!(response["result"]["topics_enabled"], true, "{response}");
+    assert_eq!(response["result"]["changed"], true, "{response}");
+    let state = &app.state.terminals[&terminal_id];
+    assert!(state.agent_topics_enabled, "the choice was not recorded");
+    assert!(
+        state.pending_agent_resume_plan.is_none(),
+        "an omp already on the topics build was relaunched"
+    );
+    // Asked again, nothing changes.
+    let response = send(
+        &mut app,
+        Method::AgentTopicsSetEnabled(crate::api::schema::AgentTopicsSetEnabledParams {
+            target: pane,
+            enabled: true,
+        }),
+    );
+    assert_eq!(response["result"]["changed"], false, "{response}");
+}

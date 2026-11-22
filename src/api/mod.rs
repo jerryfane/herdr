@@ -16,7 +16,9 @@ pub(crate) mod reverse;
 pub(crate) mod reverse_agents;
 pub mod schema;
 mod server;
-pub(crate) use server::{default_capabilities, set_topics_switch_configured, UploadClaim};
+pub(crate) use server::{
+    advertise_topics_switch, default_capabilities, set_topics_switch_configured, UploadClaim,
+};
 mod status;
 mod subscriptions;
 mod transport;

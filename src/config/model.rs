@@ -365,26 +365,49 @@ impl TopicsConfig {
     }
 
     /// An omp resume argv relaunched on the build the agent's Topics switch
-    /// selects: the topics build (plus `--config`) when `enabled` and the build
-    /// is usable, else the stock `omp`. Idempotent; any program and leading
-    /// `--config <path>` already in `argv` are replaced.
+    /// selects: the topics build (plus `--config <omp_config>`) when `enabled` and
+    /// the build is usable, else the stock `omp`. Idempotent. Any `--config
+    /// <omp_config>` already in `argv` is dropped whatever form its program takes
+    /// (a reported resume names a bare `omp`); any other `--config` is the user's
+    /// own and stays.
     pub fn omp_launch_argv(&self, argv: &[String], enabled: bool) -> Vec<String> {
-        let mut args = argv.get(1..).unwrap_or_default();
-        if args.first().map(String::as_str) == Some("--config") {
-            args = args.get(2..).unwrap_or_default();
+        let topics_config = self
+            .omp_config
+            .as_deref()
+            .map(|config| config.to_string_lossy());
+        let mut args = Vec::with_capacity(argv.len() + 2);
+        let mut rest = argv.iter().skip(1);
+        while let Some(arg) = rest.next() {
+            if arg == "--config" {
+                if let Some(value) = rest.next() {
+                    if topics_config.as_deref() != Some(value.as_str()) {
+                        args.push(arg.clone());
+                        args.push(value.clone());
+                    }
+                    continue;
+                }
+            }
+            args.push(arg.clone());
         }
         let mut launch = Vec::with_capacity(args.len() + 3);
         match self.usable_omp_binary().filter(|_| enabled) {
             Some(binary) => {
                 launch.push(binary.to_string_lossy().into_owned());
-                if let Some(config) = self.omp_config.as_deref() {
+                if let Some(config) = topics_config {
                     launch.push("--config".into());
-                    launch.push(config.to_string_lossy().into_owned());
+                    launch.push(config.into_owned());
                 }
             }
-            None => launch.push("omp".into()),
+            None => {
+                let program = argv.first().map(String::as_str).unwrap_or("omp");
+                let on_topics_build = self
+                    .omp_binary
+                    .as_deref()
+                    .is_some_and(|binary| binary.as_os_str() == program);
+                launch.push(if on_topics_build { "omp" } else { program }.to_string());
+            }
         }
-        launch.extend(args.iter().cloned());
+        launch.extend(args);
         launch
     }
 }
