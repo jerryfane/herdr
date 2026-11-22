@@ -31,7 +31,7 @@ pub use self::{
         GramRelayConfig, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig, PushConfig,
         PushMode, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
         TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
-        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        ToastHerdrPosition, TopicsConfig, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,

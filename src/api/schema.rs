@@ -264,6 +264,9 @@ operations::define_operations! {
     AgentTopicsClose(AgentTopicTarget) => "agent.topics.close", false, false;
     AgentTopicsReopen(AgentTopicTarget) => "agent.topics.reopen", false, false;
     AgentTopicsRename(AgentTopicsRenameParams) => "agent.topics.rename", false, false;
+    /// Restart an omp agent on the topics build or the stock omp, resuming the
+    /// same session (`capabilities.agent_topics_switch`). Owner only.
+    AgentTopicsSetEnabled(AgentTopicsSetEnabledParams) => "agent.topics.set_enabled", false, false;
 }
 
 impl Method {

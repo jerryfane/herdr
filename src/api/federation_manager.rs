@@ -132,6 +132,8 @@ struct PeerRouteState {
     agent_topics: AtomicBool,
     /// The peer's latest poll advertised `agent_transcript_topic`.
     agent_transcript_topic: AtomicBool,
+    /// The peer's latest poll advertised `agent_topics_switch`.
+    agent_topics_switch: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -155,6 +157,7 @@ impl PeerRoute {
                 ask_dismiss: AtomicBool::new(false),
                 agent_topics: AtomicBool::new(false),
                 agent_transcript_topic: AtomicBool::new(false),
+                agent_topics_switch: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -210,6 +213,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.agent_transcript_topic),
             Ordering::Release,
         );
+        self.state.agent_topics_switch.store(
+            capabilities.is_some_and(|capabilities| capabilities.agent_topics_switch),
+            Ordering::Release,
+        );
     }
 
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
@@ -229,6 +236,11 @@ impl PeerRoute {
     /// or one whose boot changed since its last poll, is not.
     pub(crate) fn agent_topics(&self) -> bool {
         self.state.agent_topics.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to serve `agent.topics.set_enabled`.
+    pub(crate) fn agent_topics_switch(&self) -> bool {
+        self.state.agent_topics_switch.load(Ordering::Acquire)
     }
 
     /// Whether the peer is known to honour `topic` on `agent.transcript`.
@@ -357,6 +369,9 @@ impl PeerRoute {
                 self.state.agent_topics.store(false, Ordering::Release);
                 self.state
                     .agent_transcript_topic
+                    .store(false, Ordering::Release);
+                self.state
+                    .agent_topics_switch
                     .store(false, Ordering::Release);
             }
             *current = Some(remote_boot_id.to_owned());

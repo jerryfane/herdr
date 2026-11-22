@@ -2660,6 +2660,20 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_cannot_switch_topics_on_or_off_even_on_its_granted_agent() {
+        let harness = start("topics-switch");
+        let guest = harness.admit();
+        for target in [guest.grant.terminal_id.clone(), harness.pane_ids[0].clone()] {
+            for enabled in [true, false] {
+                let request = json!({"id": "x", "method": "agent.topics.set_enabled",
+                    "params": {"target": target, "enabled": enabled}});
+                let lines = harness.call(&guest, request.clone());
+                assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+            }
+        }
+    }
+
+    #[test]
     fn forged_and_alias_qualified_targets_never_reach_another_pane() {
         let harness = start("forged");
         let guest = harness.admit();

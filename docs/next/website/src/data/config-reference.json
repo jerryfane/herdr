@@ -1737,6 +1737,24 @@
           "description": "Per-agent entries, `[fence.agents.<name>]`, keyed by the name an agent was started with (`herdr agent start <NAME>`). Each entry needs a non-empty `reason` and may set `profile` to `\"default\"` (the `[fence]` settings) or `\"unfenced\"`. The entry follows the agent through `agent restart`, `agent archive`/`unarchive` and session restore; renaming the agent does not change it. `agent start` restarts the pane's shell first when the shell is not under the agent's fence."
         }
       ]
+    },
+    {
+      "id": "topics",
+      "title": "Topics",
+      "keys": [
+        {
+          "key": "topics.omp_binary",
+          "type": "path",
+          "default": "unset",
+          "description": "Absolute path to a topics-enabled omp build. While it is set and executable, the server advertises `agent_topics_switch` and the owner can turn topics on or off per omp agent with `agent.topics.set_enabled`: the agent restarts on this binary (or back on the stock `omp`), resuming the same session and keeping its name. The choice is saved with the agent, so later restarts, restores and unarchives keep it. Reloads apply to the next switch or relaunch."
+        },
+        {
+          "key": "topics.omp_config",
+          "type": "path",
+          "default": "unset",
+          "description": "Optional absolute path to a config file passed to the topics build as `--config <path>` whenever an agent is launched on it."
+        }
+      ]
     }
   ]
 }

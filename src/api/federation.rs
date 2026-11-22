@@ -176,6 +176,7 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "agent.topics.close"
         | "agent.topics.reopen"
         | "agent.topics.rename"
+        | "agent.topics.set_enabled"
         | "agent.answer_form"
         | "agent.dismiss_ask"
         | "pane.send_input"

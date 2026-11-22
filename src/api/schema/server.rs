@@ -128,6 +128,10 @@ pub struct ServerCapabilities {
     /// `topic_sessions` on `agent.list`/`agent.get`.
     #[serde(default)]
     pub agent_topics: bool,
+    /// Serves `agent.topics.set_enabled` and reports `topics_enabled` on
+    /// `agent.list`/`agent.get`: `[topics] omp_binary` is configured.
+    #[serde(default)]
+    pub agent_topics_switch: bool,
     /// `agent.transcript` honours `topic` (pages a topic's own conversation).
     /// A server without it ignores the field and pages the agent's main
     /// conversation, so clients must not send `topic` to it.

@@ -292,6 +292,14 @@ pub enum ResponseResult {
         topic_id: String,
         mode: AgentTopicSendMode,
     },
+    /// `agent.topics.set_enabled`: the agent's state after the switch.
+    /// `changed` is false when the agent was already in the requested state,
+    /// and then nothing was restarted.
+    AgentTopicsSwitched {
+        agent: AgentInfo,
+        changed: bool,
+        topics_enabled: bool,
+    },
     /// `agent.topics.close`, `agent.topics.reopen`, `agent.topics.rename`.
     AgentTopicUpdated {
         agent: String,

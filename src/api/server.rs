@@ -191,6 +191,31 @@ pub(crate) fn start_server_with_stop_control(
     )
 }
 
+/// Whether `[topics] omp_binary` is configured, so ping can advertise
+/// `agent_topics_switch`. Follows config reloads.
+static TOPICS_SWITCH_CONFIGURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_topics_switch_configured(configured: bool) {
+    TOPICS_SWITCH_CONFIGURED.store(configured, std::sync::atomic::Ordering::Release);
+}
+
+fn topics_switch_configured() -> bool {
+    TOPICS_SWITCH_CONFIGURED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `capabilities` as advertised with the live Topics switch. Ping and
+/// `agent.list` (what federation polls) both answer through this.
+pub(crate) fn advertise_topics_switch(
+    capabilities: Option<ServerCapabilities>,
+    configured: bool,
+) -> Option<ServerCapabilities> {
+    capabilities.map(|mut capabilities| {
+        capabilities.agent_topics_switch = configured;
+        capabilities
+    })
+}
+
 pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
@@ -224,6 +249,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_topics: cfg!(unix),
         // Topic pages are read from the session files on disk, on every platform.
         agent_transcript_topic: true,
+        // Follows `[topics] omp_binary`; ping fills it in from the live config.
+        agent_topics_switch: false,
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -2034,6 +2061,8 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
             Some(&mut params.target)
         }
         Method::AgentTopicsRename(params) => Some(&mut params.target),
+        // The restart runs where the agent's process is.
+        Method::AgentTopicsSetEnabled(params) => Some(&mut params.target),
         Method::AgentExplain(params) => Some(&mut params.target),
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
@@ -2237,6 +2266,10 @@ fn maybe_route_to_peer(
     // conversation instead, as a success.
     let unsupported = if request.method.is_agent_topics() && !peer_target.agent_topics() {
         Some("agent_topics")
+    } else if matches!(&request.method, Method::AgentTopicsSetEnabled(_))
+        && !peer_target.agent_topics_switch()
+    {
+        Some("agent_topics_switch")
     } else if matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some())
         && !peer_target.agent_transcript_topic()
     {
@@ -2703,6 +2736,7 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
+        let capabilities = advertise_topics_switch(capabilities, topics_switch_configured());
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
@@ -3924,6 +3958,7 @@ mod tests {
                 ask_dismiss: false,
                 agent_topics: false,
                 agent_transcript_topic: false,
+                agent_topics_switch: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
@@ -5397,6 +5432,7 @@ mod federation_tests {
             ("agent.topics.close", AllowedAt(Admin)),
             ("agent.topics.reopen", AllowedAt(Admin)),
             ("agent.topics.rename", AllowedAt(Admin)),
+            ("agent.topics.set_enabled", AllowedAt(Admin)),
             ("agent.explain", AllowedAt(Observe)),
             ("fence.explain", Denied),
             ("agent.send_keys", AllowedAt(Interact)),
@@ -8126,6 +8162,49 @@ mod federation_tests {
             serde_json::json!({"target": "customer"})
         );
         assert!(home.api_rx.try_recv().is_err());
+    }
+
+    /// `agent.topics.set_enabled` reaches a peer that advertises the switch in the
+    /// `agent.list` it is polled with, and is refused at home for one that does not.
+    #[test]
+    fn proxy_forwards_the_topics_switch_only_to_a_peer_advertising_it() {
+        let switched = serde_json::json!({"id": "s1", "result": {"type": "ok"}}).to_string();
+        let request = serde_json::json!({
+            "id": "s1",
+            "method": "agent.topics.set_enabled",
+            "params": {"target": "remote/ordinals", "enabled": true},
+        });
+
+        let with_switch = ServerCapabilities {
+            agent_topics_switch: true,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(with_switch, switched.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        assert_eq!(home_roundtrip(&mut home, request.clone()), switched);
+        let seen = peer.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(forwarded["method"], "agent.topics.set_enabled");
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "ordinals", "enabled": true})
+        );
+        drop(seen);
+
+        let without_switch = ServerCapabilities {
+            agent_topics_switch: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(without_switch, switched);
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        let response: serde_json::Value =
+            serde_json::from_str(&home_roundtrip(&mut home, request)).unwrap();
+        assert_eq!(
+            response["error"]["code"], "topics_unsupported",
+            "{response}"
+        );
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
 
     #[test]

@@ -418,6 +418,10 @@ pub struct TerminalState {
     /// keeps the same account; an explicit swap overrides it. Independent of the
     /// session-ref churn from hook reports.
     pub agent_account: Option<String>,
+    /// The owner switched this omp agent onto the topics build
+    /// (`agent.topics.set_enabled`). Persisted, so every later relaunch — a plain
+    /// `agent.restart`, a restore, an unarchive — resumes it on the same binary.
+    pub agent_topics_enabled: bool,
     /// Who this terminal's processes are fenced as. Set by `agent.start`, restore and
     /// unarchive; a rename leaves it alone. Every respawn of the pane reuses it.
     pub fence_identity: crate::fence::FenceIdentity,
@@ -506,6 +510,7 @@ impl TerminalState {
             account_resume_blocked: None,
             restore_dir_wait: None,
             agent_account: None,
+            agent_topics_enabled: false,
             fence_identity: crate::fence::FenceIdentity::Anonymous,
             session_transfer: None,
             restore_error: None,
@@ -2979,6 +2984,11 @@ impl TerminalState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn restart_in_flight_for_test(&self) -> bool {
+        self.restart_in_flight
+    }
+
     /// Herdr is relaunching this pane's agent on purpose, as an `agent.restart`
     /// or a session transfer: its exit, a sign-off from the old session and the
     /// shell in between leave the seat's name in place.
@@ -3169,6 +3179,7 @@ impl TerminalState {
         self.reported_agent_session_path = None;
         self.reported_agent_session_runtime = None;
         self.agent_account = None;
+        self.agent_topics_enabled = false;
     }
 
     fn reconcile_agent_name_owner(

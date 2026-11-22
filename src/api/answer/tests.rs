@@ -220,6 +220,7 @@ fn harness(questions: Value) -> Harness {
         session_transfer: None,
         avatar: None,
         topic_sessions: None,
+        topics_enabled: None,
     };
     Harness {
         omp: Arc::new(Mutex::new(omp)),

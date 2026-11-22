@@ -90,6 +90,11 @@ impl AgentControls {
         self.entries.remove(terminal_id).is_some()
     }
 
+    /// Whether the terminal's agent offers a control right now.
+    pub(crate) fn contains(&self, terminal_id: &str) -> bool {
+        self.entries.contains_key(terminal_id)
+    }
+
     pub(crate) fn handle(&self, terminal_id: &str) -> Option<ControlHandle> {
         self.entries
             .get(terminal_id)

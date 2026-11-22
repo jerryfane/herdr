@@ -35,6 +35,14 @@ pub struct AgentTopicsRenameParams {
     pub title: String,
 }
 
+/// `agent.topics.set_enabled`: switch one omp agent onto the topics build or
+/// back onto the stock omp (servers advertising `agent_topics_switch`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTopicsSetEnabledParams {
+    pub target: String,
+    pub enabled: bool,
+}
+
 /// Where a topic's worker is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]

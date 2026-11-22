@@ -710,6 +710,11 @@ pub struct AgentInfo {
     /// (`agent.list`, `agent.get` on servers advertising `agent_topics`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_sessions: Option<Vec<super::topics::AgentTopicSession>>,
+    /// An omp agent runs with topics: the owner switched it onto the topics
+    /// build (`agent.topics.set_enabled`), or it offers a topics control right
+    /// now. Absent for other agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics_enabled: Option<bool>,
 }
 
 fn lenient_avatar<'de, D>(deserializer: D) -> Result<Option<AgentAvatar>, D::Error>
