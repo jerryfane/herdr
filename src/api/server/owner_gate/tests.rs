@@ -680,3 +680,41 @@ fn an_idle_input_stream_closes_soon_after_removal() {
     assert_eq!(code(&ended), "owner_not_granted", "{ended}");
     handle.join().unwrap();
 }
+
+/// A frame read right after the grant was removed (by another process: no
+/// live flag, only the store) is never typed, however recently the grant
+/// was last checked.
+#[test]
+fn a_frame_arriving_right_after_removal_is_never_dispatched() {
+    let harness = start("owner-frame-after-removal");
+    let principal = owner(&harness, OwnerScope::Terminal);
+    let grant_id = principal.grant_id.clone();
+    let (mut reader, handle) = open(
+        &harness,
+        principal,
+        json!({"id": "i", "method": "pane.input.stream", "params": {"pane_id": harness.pane_ids[1]}}),
+    );
+    assert_eq!(code(&read_reply(&mut reader).unwrap()), "<success>");
+    // The grant is checked for this frame, so the next check may be within
+    // the watch interval.
+    let acked = ask(&mut reader, json!({"seq": 1, "text": "ok", "ack": true}));
+    assert_eq!(acked["ok"], true, "{acked}");
+    crate::guest::store::update_store(&harness.dir.0, |store| {
+        for grant in &mut store.owners {
+            if grant.grant_id == grant_id {
+                grant.revoked = true;
+            }
+        }
+        ((), true)
+    })
+    .unwrap();
+    let refused = ask(
+        &mut reader,
+        json!({"seq": 2, "text": "after-removal", "ack": true}),
+    );
+    assert_eq!(code(&refused), "owner_not_granted", "{refused}");
+    assert!(!harness
+        .pty_text(1, Duration::from_millis(500))
+        .contains("after-removal"));
+    handle.join().unwrap();
+}
