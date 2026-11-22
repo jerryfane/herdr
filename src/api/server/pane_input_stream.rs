@@ -97,10 +97,19 @@ pub(super) fn serve(
     )
 }
 
+/// The owner gate's check on a live input stream: the line that ends it, or
+/// `None` while it may go on. Asked from the frame loop and from a watcher
+/// thread, so it must be `Sync`.
+pub(super) type StreamGuard<'a> = &'a (dyn Fn() -> Option<String> + Sync);
+
+/// How often an idle guarded stream asks its guard.
+const GUARD_POLL: Duration = Duration::from_millis(250);
+
 /// [`serve`] for the owner gate: `guard` is asked before every frame is
-/// written; when it returns a line, that line is sent and the stream ends,
-/// so a removed or expired grant cannot type another key. Unix only, like
-/// the owner gate.
+/// written and every [`GUARD_POLL`] while the stream is idle; when it
+/// returns a line, that line is sent and the stream ends, so a removed,
+/// expired or narrowed grant cannot type another key. Unix only, like the
+/// owner gate.
 #[cfg(unix)]
 pub(super) fn serve_guarded(
     stream: &mut ApiStream,
@@ -108,7 +117,7 @@ pub(super) fn serve_guarded(
     params: PaneInputStreamParams,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
-    guard: &mut dyn FnMut() -> Option<String>,
+    guard: StreamGuard<'_>,
 ) -> std::io::Result<()> {
     serve_with_open_timeout(
         stream,
@@ -142,7 +151,7 @@ fn serve_with_open_timeout(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     open_timeout: Duration,
-    guard: Option<&mut dyn FnMut() -> Option<String>>,
+    guard: Option<StreamGuard<'_>>,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
     let input_source = params.input_source;
@@ -179,19 +188,60 @@ fn serve_with_open_timeout(
         return Err(err);
     }
 
-    let result = serve_frames(
-        stream,
-        &request_id,
-        &pane_id,
-        input_source,
-        fenced,
-        api_tx,
-        running,
-        &stream_active,
-        guard,
-    );
-    stream_active.store(false, Ordering::Release);
-    result
+    let Some(guard) = guard else {
+        let result = serve_frames(
+            stream,
+            &request_id,
+            &pane_id,
+            input_source,
+            fenced,
+            api_tx,
+            running,
+            &stream_active,
+            None,
+        );
+        stream_active.store(false, Ordering::Release);
+        return result;
+    };
+    // Whoever first sees the guard end the stream (the frame loop or the idle
+    // watcher) claims it by stopping `stream_active`, so its line is written
+    // once.
+    let claim = |line: String| stream_active.swap(false, Ordering::AcqRel).then_some(line);
+    let ended: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while stream_is_running(running, &stream_active) {
+                std::thread::sleep(GUARD_POLL);
+                if let Some(line) = guard().and_then(claim) {
+                    *ended
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(line);
+                }
+            }
+        });
+        // An empty line: the watcher claimed the end and writes its line.
+        let frame_guard = || guard().map(|line| claim(line).unwrap_or_default());
+        let result = serve_frames(
+            stream,
+            &request_id,
+            &pane_id,
+            input_source,
+            fenced,
+            api_tx,
+            running,
+            &stream_active,
+            Some(&frame_guard),
+        );
+        stream_active.store(false, Ordering::Release);
+        result
+    });
+    let ended = ended
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match (result, ended) {
+        (Ok(()), Some(line)) => write_text_line_allow_disconnect(stream, &line),
+        (result, _) => result,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,7 +254,7 @@ fn serve_frames(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
-    mut guard: Option<&mut dyn FnMut() -> Option<String>>,
+    guard: Option<StreamGuard<'_>>,
 ) -> std::io::Result<()> {
     let mut last_seq: Option<u64> = None;
     while stream_is_running(running, stream_active) {
@@ -281,7 +331,10 @@ fn serve_frames(
                 input_source,
             })
         };
-        if let Some(line) = guard.as_mut().and_then(|guard| guard()) {
+        if let Some(line) = guard.and_then(|guard| guard()) {
+            if line.is_empty() {
+                return Ok(());
+            }
             return write_text_line_allow_disconnect(stream, &line);
         }
         let response = dispatch_to_app_with_timeout(

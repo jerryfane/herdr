@@ -6,8 +6,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::api::server::guest_gate::tests::{ask, hang_up_after_reply, read_reply, start, Harness};
-use crate::guest::owner::{remove_in, test_principal, RemoveTarget};
+use crate::api::server::remote_gate::test_app::{
+    ask, hang_up_after_reply, read_reply, start, Harness,
+};
+use crate::guest::owner::{remove_in, renew_in, test_principal, RemoveTarget};
 
 const BROWSER: [u8; 32] = [0x42; 32];
 
@@ -521,4 +523,160 @@ fn chat_scope_sends_menu_keys_only_while_an_agent_waits_on_a_menu() {
         "{typed:?}"
     );
     assert!(typed.contains('\r'), "{typed:?}");
+}
+
+/// The first error line the server sends, skipping stream frames.
+fn ending_error(reader: &mut BufReader<UnixStream>) -> Value {
+    reader
+        .by_ref()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+        .find(|line| line.get("error").is_some())
+        .expect("the stream ends with an error line")
+}
+
+/// P2: after a committing menu key the agent's menu may be gone, so chat
+/// refuses further keys until detection sees the agent's state change;
+/// otherwise a second `y` or Enter lands in the pane's shell.
+#[test]
+fn chat_menu_keys_stop_after_a_commit_until_the_agent_changes_state() {
+    let harness = start("owner-menu-commit");
+    harness.with_granted_terminal(|terminal| {
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Blocked,
+        );
+    });
+    let pane = harness.pane_ids[0].clone();
+    let keys = |keys: Value| json!({"id": "k", "method": "pane.send_keys", "params": {"pane_id": pane, "keys": keys}});
+    let first = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            keys(json!(["enter"])),
+            keys(json!(["y"])),
+            keys(json!(["enter"])),
+        ],
+    );
+    assert_eq!(
+        first,
+        ["<success>", "owner_forbidden", "owner_forbidden"],
+        "{first:?}"
+    );
+    let typed = harness.pty_text(0, Duration::from_millis(500));
+    assert_eq!(typed.matches('\r').count(), 1, "{typed:?}");
+    assert!(!typed.contains('y'), "{typed:?}");
+    // A new menu (detection saw the agent change state) takes keys again.
+    harness.with_granted_terminal(|terminal| {
+        let next = terminal.last_agent_state_change_seq.unwrap_or(0) + 1;
+        terminal.last_agent_state_change_seq = Some(next);
+    });
+    let again = codes(&harness, OwnerScope::Chat, &[keys(json!(["enter"]))]);
+    assert_eq!(again, ["<success>"], "{again:?}");
+}
+
+/// P2: renewing a grant with a narrower scope ends the streams it opened
+/// under the wider one: a terminal input stream must not keep typing, and a
+/// subscription must not keep every event kind.
+#[test]
+fn a_scope_change_ends_open_input_streams_and_subscriptions() {
+    let harness = start("owner-scope-change");
+    let principal = owner(&harness, OwnerScope::Terminal);
+    let grant_id = principal.grant_id.clone();
+    let (mut input, input_handle) = open(
+        &harness,
+        principal,
+        json!({"id": "i", "method": "pane.input.stream", "params": {"pane_id": harness.pane_ids[1]}}),
+    );
+    let opened = read_reply(&mut input).unwrap();
+    assert_eq!(code(&opened), "<success>", "{opened}");
+    let (mut events, events_handle) = open(
+        &harness,
+        owner(&harness, OwnerScope::Terminal),
+        json!({"id": "e", "method": "events.subscribe", "params": {"subscriptions": [{"type": "pane.created"}]}}),
+    );
+    assert_eq!(
+        read_reply(&mut events).unwrap()["result"]["type"],
+        "subscription_started"
+    );
+    let events_grant = crate::guest::store::load_store(&harness.dir.0)
+        .unwrap()
+        .owners
+        .iter()
+        .map(|grant| grant.grant_id.clone())
+        .find(|id| *id != grant_id)
+        .unwrap();
+    for grant in [&grant_id, &events_grant] {
+        renew_in(
+            &harness.dir.0,
+            grant,
+            3600,
+            Some(OwnerScope::Chat),
+            now_ms(),
+        )
+        .unwrap();
+    }
+    let ended = ending_error(&mut input);
+    assert_eq!(code(&ended), "owner_scope_changed", "{ended}");
+    // Nothing typed after the change reaches the shell.
+    let _ = writeln!(input.get_mut(), r#"{{"seq":1,"text":"rm -rf ~"}}"#);
+    assert!(!harness
+        .pty_text(1, Duration::from_millis(500))
+        .contains("rm -rf"));
+    input_handle.join().unwrap();
+    let ended = ending_error(&mut events);
+    assert_eq!(code(&ended), "owner_scope_changed", "{ended}");
+    events_handle.join().unwrap();
+}
+
+/// P2: a chat stream watches an agent; when the agent leaves the pane (on
+/// unix the pane is then its shell), the stream ends.
+#[test]
+fn a_chat_stream_ends_when_the_pane_stops_being_an_agent() {
+    let harness = start("owner-agent-gone");
+    let (mut reader, handle) = open(
+        &harness,
+        owner(&harness, OwnerScope::Chat),
+        json!({"id": "s", "method": "pane.stream", "params": {"pane_id": harness.pane_ids[0]}}),
+    );
+    let started = read_reply(&mut reader).unwrap();
+    assert_eq!(code(&started), "<success>", "{started}");
+    harness.with_granted_terminal(|terminal| {
+        terminal.set_detected_state(None, crate::detect::AgentState::Idle);
+    });
+    let ended = ending_error(&mut reader);
+    assert_eq!(code(&ended), "owner_paused", "{ended}");
+    handle.join().unwrap();
+}
+
+/// An idle input stream closes within the watch interval of a removal, not
+/// at its next frame.
+#[test]
+fn an_idle_input_stream_closes_soon_after_removal() {
+    let harness = start("owner-idle-input");
+    let principal = owner(&harness, OwnerScope::Terminal);
+    let grant_id = principal.grant_id.clone();
+    let (mut reader, handle) = open(
+        &harness,
+        principal,
+        json!({"id": "i", "method": "pane.input.stream", "params": {"pane_id": harness.pane_ids[1]}}),
+    );
+    assert_eq!(code(&read_reply(&mut reader).unwrap()), "<success>");
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // Written by another process: no live flag, only the store.
+    crate::guest::store::update_store(&harness.dir.0, |store| {
+        for grant in &mut store.owners {
+            if grant.grant_id == grant_id {
+                grant.revoked = true;
+            }
+        }
+        ((), true)
+    })
+    .unwrap();
+    let ended = read_reply(&mut reader).expect("closed within 2 s of the removal");
+    assert_eq!(code(&ended), "owner_not_granted", "{ended}");
+    handle.join().unwrap();
 }

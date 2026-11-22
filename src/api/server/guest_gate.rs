@@ -17,72 +17,39 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
     answer_agent, answer_agent_form, dismiss_agent_ask, dispatch_to_app_with_timeout,
-    error_response_json, finish_wait_response, handle_request, pane_output_stream,
-    parse_request_line, prompt_agent, read_initial_request_line, write_json_line_allow_disconnect,
+    error_response_json, finish_wait_response, handle_request, pane_output_stream, prompt_agent,
     write_text_line_allow_disconnect, ApiRequestSender, ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
     AgentInfo, AgentTranscriptParams, ErrorResponse, GramGetFileChunkParams, GramGetFileParams,
     GramPostParams, GramRelayCall, GramRelayParams, GramRelayPostParams, GramUploadChunkParams,
-    GramUploadDiscardParams, GuestAgentProbeParams, GuestAuditEvent, GuestAuditFile,
-    GuestGrantInfo, Method, PaneHistoryParams, PanePtyLeaseReleaseParams, PaneReadParams,
-    PaneSendKeysParams, PaneSetPtySizeParams, ReadIntent, ReadSource, Request, ResponseResult,
-    SuccessResponse, TranscriptEntry,
+    GramUploadDiscardParams, GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method,
+    PaneHistoryParams, PanePtyLeaseReleaseParams, PaneReadParams, PaneSetPtySizeParams, ReadIntent,
+    ReadSource, Request, ResponseResult, SuccessResponse, TranscriptEntry,
 };
-use crate::api::transport::{ApiStream, ApiStreamRead};
+use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
 use crate::persist::gram::GramItem;
 
+use super::remote_gate::{
+    audit_due, clamp_resize, menu_batch, next_request, probe_target, send_menu_keys, Probe,
+    PROBE_TIMEOUT, WATCH_INTERVAL,
+};
+
 /// Prompt text cap, before the label is prefixed.
 const PROMPT_MAX_BYTES: usize = 32 * 1024;
-/// Most keys one guest `pane.send_keys` carries: enough to walk a long menu.
-const SEND_KEYS_MAX: usize = 32;
-/// How often a guest stream re-checks revocation and the live-agent check.
-pub(super) const WATCH_INTERVAL: Duration = Duration::from_millis(250);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a guest connection waits for its next request after answering
 /// one. The relay caps a guest's connects per minute, so the app keeps one
 /// connection for its polling and calls instead of reconnecting per request.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most scrollback lines one guest `agent.read` returns.
 const READ_MAX_LINES: u32 = 1000;
-/// A guest's reads and resizes are audited at most once per interval: the app
-/// reads the scrollback again on every stream reseed and reconnect, and
-/// resizes on every rotation or layout change.
-const AUDIT_INTERVAL: Duration = Duration::from_secs(60);
-/// Bounds of a guest's terminal size and width-lease TTL. The TTL is the
-/// backstop when the guest vanishes without closing its stream.
-const RESIZE_COLS: std::ops::RangeInclusive<u16> = 20..=500;
-const RESIZE_ROWS: std::ops::RangeInclusive<u16> = 5..=300;
-const RESIZE_TTL_MS: std::ops::RangeInclusive<u64> = 1_000..=60_000;
-const RESIZE_DEFAULT_TTL_MS: u64 = 30_000;
-
-/// When each throttled event was last audited, per key (a guest id, or a
-/// guest id and Gram id for file opens).
-static AUDITED: Mutex<Vec<(GuestAuditEvent, String, Instant)>> = Mutex::new(Vec::new());
-
-/// Whether `event` for `key` should be audited now; records it if so.
-pub(super) fn audit_due(event: GuestAuditEvent, key: &str) -> bool {
-    let now = Instant::now();
-    let mut audited = AUDITED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    audited.retain(|(_, _, at)| now.duration_since(*at) < AUDIT_INTERVAL);
-    if audited
-        .iter()
-        .any(|(seen, seen_key, _)| *seen == event && seen_key == key)
-    {
-        return false;
-    }
-    audited.push((event, key.to_string(), now));
-    true
-}
 
 /// The viewer a guest's width lease and stream are tied to, whatever viewer
 /// id the guest sent, so its stream closing drops its lease.
@@ -105,71 +72,16 @@ fn release_lease(api_tx: &ApiRequestSender, guest_id: &str) {
     );
 }
 
-#[derive(Clone)]
-struct GuestContext {
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    running: Arc<AtomicBool>,
-}
-
-static CONTEXT: Mutex<Option<GuestContext>> = Mutex::new(None);
-
-/// The API server's channels, once it is up (see [`install_context`]).
-pub(super) fn context() -> Option<(ApiRequestSender, EventHub, Arc<AtomicBool>)> {
-    CONTEXT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-        .map(|context| (context.api_tx, context.event_hub, context.running))
-}
-
-/// A remote viewer's `pane.set_pty_size` within the bounds guests and owner
-/// browsers get: `(cols, rows, ttl_ms)`.
-pub(super) fn clamp_resize(cols: u16, rows: u16, ttl_ms: Option<u64>) -> (u16, u16, u64) {
-    (
-        cols.clamp(*RESIZE_COLS.start(), *RESIZE_COLS.end()),
-        rows.clamp(*RESIZE_ROWS.start(), *RESIZE_ROWS.end()),
-        ttl_ms
-            .unwrap_or(RESIZE_DEFAULT_TTL_MS)
-            .clamp(*RESIZE_TTL_MS.start(), *RESIZE_TTL_MS.end()),
-    )
-}
-
-/// Called once the API server is up, so `serve` can run guest connections.
-pub(super) fn install_context(
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    running: Arc<AtomicBool>,
-) {
-    *CONTEXT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(GuestContext {
-        api_tx,
-        event_hub,
-        running,
-    });
-}
-
 /// Run one guest API connection. The stream closes when this returns.
 pub(crate) fn serve_guest_stream(
     principal: GuestPrincipal,
     stream: std::os::unix::net::UnixStream,
 ) {
-    let context = CONTEXT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let Some(context) = context else {
+    let Some((api_tx, event_hub, running)) = super::remote_gate::context() else {
         tracing::warn!("guest connection before the API server started; closing");
         return;
     };
-    if let Err(err) = serve_guest_with(
-        &context.api_tx,
-        &context.event_hub,
-        &context.running,
-        principal,
-        stream,
-    ) {
+    if let Err(err) = serve_guest_with(&api_tx, &event_hub, &running, principal, stream) {
         tracing::debug!(err = %err, "guest connection ended with an error");
     }
 }
@@ -197,54 +109,6 @@ fn serve_guest_with(
         // Guests cannot register SSH agents for the server.
         None,
     )
-}
-
-/// What the app reports for one pane: its public id, the agent in it (if
-/// any), and the `agent.prompt` live-agent check.
-pub(super) struct Probe {
-    pub pane_id: String,
-    pub agent: Option<AgentInfo>,
-    pub running: bool,
-    /// The terminal's picture, agent or not.
-    pub avatar: Option<crate::api::schema::AgentAvatar>,
-}
-
-/// Probe by terminal id (any pane) or by agent target (agent panes only).
-/// Errors return the app's error line.
-pub(super) fn probe_target(
-    api_tx: &ApiRequestSender,
-    terminal_id: Option<&str>,
-    target: Option<&str>,
-) -> Result<Probe, String> {
-    let response = dispatch_to_app_with_timeout(
-        Request {
-            id: "guest:probe".into(),
-            method: Method::GuestAgentProbe(GuestAgentProbeParams {
-                terminal_id: terminal_id.map(str::to_string),
-                target: target.map(str::to_string),
-            }),
-        },
-        api_tx,
-        Some(PROBE_TIMEOUT),
-    );
-    match serde_json::from_str::<SuccessResponse>(&response) {
-        Ok(SuccessResponse {
-            result:
-                ResponseResult::GuestAgentProbed {
-                    pane_id,
-                    agent,
-                    running,
-                    avatar,
-                },
-            ..
-        }) => Ok(Probe {
-            pane_id,
-            agent,
-            running,
-            avatar,
-        }),
-        _ => Err(response),
-    }
 }
 
 /// The grant is the agent with this name and kind in this terminal, local,
@@ -559,86 +423,6 @@ fn project_dismissed(result: ResponseResult) -> Option<serde_json::Value> {
     Some(serde_json::json!({"type": "ask_dismissed", "dismissed": dismissed}))
 }
 
-/// A key a guest may send to a menu, in the form the app parses; `None` for
-/// anything else. Named keys match any case; characters match exactly, so
-/// `Y` (shift) and every modifier combination are refused.
-fn guest_menu_key(key: &str) -> Option<&'static str> {
-    const NAMED: [&str; 8] = [
-        "up", "down", "left", "right", "enter", "tab", "escape", "space",
-    ];
-    const CHARS: [&str; 11] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "y", "n"];
-    NAMED
-        .into_iter()
-        .find(|name| name.eq_ignore_ascii_case(key))
-        .or_else(|| CHARS.into_iter().find(|ch| *ch == key))
-}
-
-/// A key that acts on the menu (chooses, confirms or dismisses it), after
-/// which the menu may be gone; the others only move within it.
-fn commits_menu(key: &str) -> bool {
-    !matches!(key, "up" | "down" | "left" | "right" | "tab" | "space")
-}
-
-/// A guest `pane.send_keys` batch in the form the app parses: 1 to
-/// [`SEND_KEYS_MAX`] menu keys, at most one of them committing, and that one
-/// last, so no key can land after the menu closes. `None` refuses the batch.
-pub(super) fn guest_menu_batch(keys: &[String]) -> Option<Vec<&'static str>> {
-    if !(1..=SEND_KEYS_MAX).contains(&keys.len()) {
-        return None;
-    }
-    let keys = keys
-        .iter()
-        .map(|key| guest_menu_key(key))
-        .collect::<Option<Vec<_>>>()?;
-    let (_, before_last) = keys.split_last()?;
-    if before_last.iter().any(|key| commits_menu(key)) {
-        return None;
-    }
-    Some(keys)
-}
-
-/// The granted agent is waiting on a menu: an ask, a plan approval or a
-/// permission prompt. A free-text prompt is no menu.
-pub(super) fn awaits_menu_input(agent: &AgentInfo) -> bool {
-    use crate::detect::InputPromptKind;
-    match agent.input_prompt_kind {
-        Some(InputPromptKind::Confirm | InputPromptKind::Select) => true,
-        Some(InputPromptKind::FreeText) => false,
-        Some(InputPromptKind::Unknown) | None => {
-            agent.agent_status == crate::api::schema::AgentStatus::Blocked
-        }
-    }
-}
-
-/// Per guest store and granted terminal, the agent's `state_change_seq` when
-/// a guest batch last committed a menu choice. Until detection has seen the
-/// agent change state since, the menu on record may already be gone, so no
-/// guest keys are accepted.
-///
-/// Each terminal has its own lock, held by a batch from its check through
-/// its write, so a concurrent batch for that terminal sees this one's commit.
-/// The map's own lock is only held to find that entry: a slow write to one
-/// terminal never holds up guest keys to another.
-static MENU_COMMITS: Mutex<Option<HashMap<MenuMarker, MenuCommit>>> = Mutex::new(None);
-
-type MenuMarker = (std::path::PathBuf, String);
-
-/// One terminal's last committed `state_change_seq`, if any.
-type MenuCommit = Arc<Mutex<Option<u64>>>;
-
-/// The commit record for `marker`, created on first use.
-fn menu_commit(marker: MenuMarker) -> MenuCommit {
-    let mut commits = MENU_COMMITS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(
-        commits
-            .get_or_insert_with(HashMap::new)
-            .entry(marker)
-            .or_default(),
-    )
-}
-
 /// The rendered scrollback and the fields the app decodes; the workspace,
 /// tab and revision stay with the owner.
 fn project_read(result: ResponseResult) -> Option<serde_json::Value> {
@@ -879,76 +663,6 @@ pub(super) fn serve_session(
             return Ok(());
         };
         request = next;
-    }
-}
-
-/// The guest's next request, or `None` when the session ends first. An
-/// unparseable line is answered with `invalid_request` and ends it.
-pub(super) fn next_request(
-    stream: &mut ApiStream,
-    live: &crate::guest::LiveSession,
-    running: &AtomicBool,
-    idle: Duration,
-) -> std::io::Result<Option<Request>> {
-    if !await_request(stream, live, running, idle)? {
-        return Ok(None);
-    }
-    let Some(line) = read_initial_request_line(stream)? else {
-        return Ok(None);
-    };
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    match parse_request_line(line) {
-        Ok(request) => Ok(Some(request)),
-        Err(response) => {
-            write_json_line_allow_disconnect(stream, &response)?;
-            Ok(None)
-        }
-    }
-}
-
-/// Waits until request bytes arrive (true), or the guest closes, is revoked,
-/// the server stops, or `idle` passes (false). Nothing is consumed.
-fn await_request(
-    stream: &mut ApiStream,
-    live: &crate::guest::LiveSession,
-    running: &AtomicBool,
-    idle: Duration,
-) -> std::io::Result<bool> {
-    stream.set_polling(true)?;
-    let result = poll_for_request(stream, live, running, idle);
-    stream.set_polling(false)?;
-    result
-}
-
-fn poll_for_request(
-    stream: &mut ApiStream,
-    live: &crate::guest::LiveSession,
-    running: &AtomicBool,
-    idle: Duration,
-) -> std::io::Result<bool> {
-    let deadline = Instant::now() + idle;
-    let mut probe = [0u8; 1];
-    loop {
-        match stream.poll_peek(&mut probe)? {
-            // No peek on this transport: let the line reader find out.
-            Some(ApiStreamRead::Data(_)) | None => return Ok(true),
-            Some(ApiStreamRead::Closed) => return Ok(false),
-            Some(ApiStreamRead::Pending) => {}
-        }
-        if live.revoked() || !running.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(false);
-        }
-        let wait = (deadline - now).min(WATCH_INTERVAL);
-        if !stream.wait_readable(wait)? {
-            std::thread::sleep(wait);
-        }
     }
 }
 
@@ -1347,7 +1061,7 @@ fn serve_request(
         Method::PaneSendKeys(params) => {
             // Menu keys only, and only while the agent awaits a menu: a guest
             // must never be able to type into a shell.
-            let Some(keys) = guest_menu_batch(&params.keys) else {
+            let Some(keys) = menu_batch(&params.keys) else {
                 return forbidden(stream);
             };
             let state = grant_state(guest, api_tx);
@@ -1357,36 +1071,17 @@ fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(stream);
             };
-            let commit = menu_commit((guest.dir.clone(), guest.grant.terminal_id.clone()));
-            // Held through the write, so a concurrent guest batch for this
-            // terminal sees this one's commit.
-            let mut committed_at = commit
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let stale = committed_at.is_some_and(|seq| agent.state_change_seq <= seq);
-            if stale || !awaits_menu_input(&agent) {
+            let sent = send_menu_keys(api_tx, &guest.dir, &agent, keys, &id, |keys| {
+                guest.audit(
+                    GuestAuditEvent::Prompt,
+                    Some(method),
+                    Some(keys.join(" ")),
+                    None,
+                );
+            });
+            let Some(response) = sent else {
                 return forbidden(stream);
-            }
-            *committed_at = None;
-            guest.audit(
-                GuestAuditEvent::Prompt,
-                Some(method),
-                Some(keys.join(" ")),
-                None,
-            );
-            let commits_choice = keys.last().is_some_and(|key| commits_menu(key));
-            let request = Request {
-                id: id.clone(),
-                method: Method::PaneSendKeys(PaneSendKeysParams {
-                    pane_id: agent.pane_id,
-                    keys: keys.into_iter().map(str::to_owned).collect(),
-                    input_source: None,
-                }),
             };
-            let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            if commits_choice {
-                *committed_at = Some(agent.state_change_seq);
-            }
             write_text_line_allow_disconnect(stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramUploadChunk(params) => {
@@ -1615,7 +1310,7 @@ fn serve_request(
 
 /// Message `message_id` when it is in the guest's shared Gram. The first
 /// fetch of its file, at whatever offset, is audited as the guest opening it;
-/// further fetches of the same file within [`AUDIT_INTERVAL`] are not.
+/// further fetches of the same file within a minute are not.
 fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> Option<GramItem> {
     let item = crate::guest::gram::items(guest)
         .into_iter()
@@ -2229,7 +1924,7 @@ fn audit_post(guest: &GuestPrincipal, method: &str, text: String, response: &str
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use super::*;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixStream;
@@ -2248,161 +1943,9 @@ pub(super) mod tests {
     use crate::guest::store::{now_ms, RevokeTarget};
     use crate::guest::{admit_in, Admission};
 
-    type Control = Box<dyn FnOnce(&mut App) + Send>;
-    type PtyHook = Box<dyn FnMut(&mut App, usize, &[u8]) + Send>;
-    type PtyView = ((u16, u16), Vec<(String, u16, u16, Duration)>);
-
-    /// A real `App` on its own thread with two named agents: the granted
-    /// `llm-opt` and `other-agent` on another pane.
-    pub(in crate::api::server) struct Harness {
-        pub(in crate::api::server) api_tx: ApiRequestSender,
-        pub(in crate::api::server) event_hub: EventHub,
-        pub(in crate::api::server) running: Arc<AtomicBool>,
-        control: std_mpsc::Sender<Control>,
-        pty: std_mpsc::Receiver<(usize, bytes::Bytes)>,
-        pub(in crate::api::server) pane_ids: Vec<String>,
-        pub(in crate::api::server) dir: TempDir,
-        /// Runs once on the app thread just before it applies the next
-        /// `pane.set_pty_size`.
-        before_resize: Arc<Mutex<Option<Control>>>,
-        /// Sees every write to an agent's terminal on the app thread, before
-        /// `pty` does: a fake program answering its keys.
-        pty_hook: Arc<Mutex<Option<PtyHook>>>,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl Drop for Harness {
-        fn drop(&mut self) {
-            self.running.store(false, Ordering::Release);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
-    }
-
-    pub(in crate::api::server) fn start(tag: &str) -> Harness {
-        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (control_tx, control_rx) = std_mpsc::channel::<Control>();
-        let (pty_tx, pty_rx) = std_mpsc::channel();
-        let (ids_tx, ids_rx) = std_mpsc::channel();
-        let running = Arc::new(AtomicBool::new(true));
-        let app_running = Arc::clone(&running);
-        let before_resize: Arc<Mutex<Option<Control>>> = Arc::default();
-        let app_before_resize = Arc::clone(&before_resize);
-        let pty_hook: Arc<Mutex<Option<PtyHook>>> = Arc::default();
-        let app_pty_hook = Arc::clone(&pty_hook);
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .unwrap();
-            let _guard = runtime.enter();
-            let (_unused, app_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(
-                &crate::config::Config::default(),
-                crate::app::AppPolicy::TEST,
-                None,
-                app_rx,
-                EventHub::default(),
-            );
-            app.state.workspaces = vec![
-                crate::workspace::Workspace::test_new("agent"),
-                crate::workspace::Workspace::test_new("other"),
-            ];
-            app.state.ensure_test_terminals();
-            app.state.active = Some(0);
-            let mut ptys = Vec::new();
-            let mut ids = Vec::new();
-            for (ws_idx, name) in [(0, "llm-opt"), (1, "other-agent")] {
-                let pane = app.state.workspaces[ws_idx].tabs[0].root_pane;
-                let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane]
-                    .attached_terminal_id
-                    .clone();
-                let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-                terminal.set_agent_name(name.into());
-                terminal.set_detected_state(
-                    Some(crate::detect::Agent::Pi),
-                    crate::detect::AgentState::Idle,
-                );
-                terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-                    source: "herdr".into(),
-                    agent: "pi".into(),
-                    session_ref: crate::agent_resume::AgentSessionRef::id(format!(
-                        "session-{ws_idx}"
-                    ))
-                    .unwrap(),
-                });
-                let (runtime, rx) =
-                    crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                        80,
-                        24,
-                        1024 * 1024,
-                        &[],
-                        4,
-                    );
-                app.state.insert_test_runtime(pane, runtime);
-                ptys.push(rx);
-                ids.push(app.public_pane_id(ws_idx, pane).unwrap());
-            }
-            ids_tx.send(ids).unwrap();
-            while app_running.load(Ordering::Acquire) {
-                while let Ok(control) = control_rx.try_recv() {
-                    control(&mut app);
-                }
-                for (index, rx) in ptys.iter_mut().enumerate() {
-                    while let Ok(bytes) = rx.try_recv() {
-                        if let Some(hook) = app_pty_hook
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .as_mut()
-                        {
-                            hook(&mut app, index, &bytes);
-                        }
-                        let _ = pty_tx.send((index, bytes));
-                    }
-                }
-                match api_rx.try_recv() {
-                    Ok(message) if matches!(message.request.method, Method::AgentPrompt(_)) => {
-                        app.handle_deferred_agent_api_request(message.request, message.respond_to);
-                    }
-                    Ok(message) if matches!(message.request.method, Method::AgentTranscript(_)) => {
-                        app.handle_deferred_transcript_request(message.request, message.respond_to);
-                    }
-                    Ok(message) if message.request.method.is_agent_topics() => {
-                        app.handle_deferred_topics_request(message.request, message.respond_to);
-                    }
-                    Ok(message) => {
-                        if matches!(message.request.method, Method::PaneSetPtySize(_)) {
-                            let hook = app_before_resize
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .take();
-                            if let Some(hook) = hook {
-                                hook(&mut app);
-                            }
-                        }
-                        let response = app.handle_api_request(message.request);
-                        let _ = message.respond_to.send(response);
-                    }
-                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
-                }
-            }
-        });
-        let pane_ids = ids_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        Harness {
-            api_tx,
-            event_hub: EventHub::default(),
-            running,
-            control: control_tx,
-            pty: pty_rx,
-            pane_ids,
-            dir: TempDir::new(tag),
-            before_resize,
-            pty_hook,
-            thread: Some(thread),
-        }
-    }
+    use super::super::remote_gate::test_app::{
+        ask, hang_up_after_reply, read_reply, start, Harness, PtyView,
+    };
 
     impl Harness {
         /// An invite to agent `index`, created through the store.
@@ -2503,39 +2046,6 @@ pub(super) mod tests {
             handle.join().unwrap();
             lines
         }
-
-        pub(in crate::api::server) fn pty_text(&self, index: usize, wait: Duration) -> String {
-            let deadline = Instant::now() + wait;
-            let mut text = Vec::new();
-            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                match self.pty.recv_timeout(left) {
-                    Ok((pane, bytes)) if pane == index => text.extend_from_slice(&bytes),
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            String::from_utf8_lossy(&text).into_owned()
-        }
-
-        /// Change the granted terminal's agent on the app thread.
-        pub(in crate::api::server) fn with_granted_terminal(
-            &self,
-            change: impl FnOnce(&mut crate::terminal::TerminalState) + Send + 'static,
-        ) {
-            let (done_tx, done_rx) = std_mpsc::channel();
-            self.control
-                .send(Box::new(move |app: &mut App| {
-                    let pane = app.state.workspaces[0].tabs[0].root_pane;
-                    let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
-                        .attached_terminal_id
-                        .clone();
-                    change(app.state.terminals.get_mut(&terminal_id).unwrap());
-                    let _ = done_tx.send(());
-                }))
-                .unwrap();
-            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-
         /// The agent comes back in the same terminal under a new session.
         fn agent_restarts(&self, kind: crate::detect::Agent, name: &str, session: &str) {
             let (name, session) = (name.to_string(), session.to_string());
@@ -2564,22 +2074,6 @@ pub(super) mod tests {
                 }))
                 .unwrap();
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-
-        fn agent_exits(&self) {
-            self.control
-                .send(Box::new(|app: &mut App| {
-                    let pane = app.state.workspaces[0].tabs[0].root_pane;
-                    let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
-                        .attached_terminal_id
-                        .clone();
-                    app.state
-                        .terminals
-                        .get_mut(&terminal_id)
-                        .unwrap()
-                        .set_detected_state(None, crate::detect::AgentState::Idle);
-                }))
-                .unwrap();
         }
 
         /// Agent `index`'s PTY size as (cols, rows) and the width leases on
@@ -2641,30 +2135,6 @@ pub(super) mod tests {
         "agent_status",
         "guest_running",
     ];
-
-    /// Closes the client's write side after a reply. The server may already
-    /// have ended the connection (a refusal, a stream, a one-shot reply); macOS
-    /// then answers `shutdown` with ENOTCONN, which means the same thing here.
-    pub(in crate::api::server) fn hang_up_after_reply(client: &UnixStream) {
-        match client.shutdown(std::net::Shutdown::Write) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotConnected => {
-                panic!("shutdown: {err}")
-            }
-            _ => {}
-        }
-    }
-
-    /// The next reply line, or `None` once the server closed.
-    pub(in crate::api::server) fn read_reply(reader: &mut BufReader<UnixStream>) -> Option<Value> {
-        let mut line = String::new();
-        (reader.read_line(&mut line).unwrap() > 0).then(|| serde_json::from_str(&line).unwrap())
-    }
-
-    /// Sends one more request on an open guest connection and reads its reply.
-    pub(in crate::api::server) fn ask(reader: &mut BufReader<UnixStream>, request: Value) -> Value {
-        writeln!(reader.get_mut(), "{request}").unwrap();
-        read_reply(reader).unwrap_or_else(|| panic!("closed before answering {request}"))
-    }
 
     /// The server closes the connection: no further reply line.
     fn assert_closed(reader: &mut BufReader<UnixStream>) {
@@ -3029,7 +2499,7 @@ pub(super) mod tests {
             json!(["backspace"]),
             json!(["Space+y"]),
             json!([]),
-            json!(vec!["Down"; SEND_KEYS_MAX + 1]),
+            json!(vec!["Down"; 33]),
         ] {
             let lines = harness.call(&guest, send_keys(&pane, keys.clone()));
             assert_eq!(code(&lines), "guest_forbidden", "{keys} -> {lines:?}");
@@ -3063,13 +2533,17 @@ pub(super) mod tests {
             ("y", "y"),
             ("n", "n"),
         ] {
-            assert_eq!(guest_menu_key(key), Some(canonical), "{key}");
+            assert_eq!(
+                super::super::remote_gate::menu_key(key),
+                Some(canonical),
+                "{key}"
+            );
         }
         for key in [
             "", " ", "0", "Y", "N", "a", "esc", "return", "ctrl+c", "C-c", "enter ", "shift+up",
             "backtab", "f1", "\r", "\u{1b}", "10",
         ] {
-            assert_eq!(guest_menu_key(key), None, "{key:?}");
+            assert_eq!(super::super::remote_gate::menu_key(key), None, "{key:?}");
         }
     }
 

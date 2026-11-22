@@ -101,13 +101,13 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
     let id = request.id.clone();
     let result = match &request.method {
         Method::GuestInviteCreate(params) => {
-            match super::guest_gate::probe_target(api_tx, None, Some(&params.target)) {
+            match super::remote_gate::probe_target(api_tx, None, Some(&params.target)) {
                 Err(response) => return response,
-                Ok(super::guest_gate::Probe { agent: None, .. }) => Err((
+                Ok(super::remote_gate::Probe { agent: None, .. }) => Err((
                     "agent_not_found",
                     format!("{} is not an agent pane", params.target),
                 )),
-                Ok(super::guest_gate::Probe {
+                Ok(super::remote_gate::Probe {
                     agent: Some(agent),
                     running,
                     ..

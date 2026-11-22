@@ -14,10 +14,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::guest_gate::{self, probe_target, Probe, WATCH_INTERVAL};
+use super::remote_gate::{
+    self, audit_due, clamp_resize, menu_batch, probe_target, send_menu_keys, Probe, WATCH_INTERVAL,
+};
 use super::{
     answer_agent, answer_agent_form, dismiss_agent_ask, error_response_json, finish_wait_response,
     handle_request, pane_input_stream, pane_output_stream, prompt_agent,
@@ -121,7 +123,7 @@ pub(crate) fn serve_owner_stream(
     principal: OwnerPrincipal,
     stream: std::os::unix::net::UnixStream,
 ) {
-    let Some((api_tx, event_hub, running)) = guest_gate::context() else {
+    let Some((api_tx, event_hub, running)) = remote_gate::context() else {
         tracing::warn!("owner browser connection before the API server started; closing");
         return;
     };
@@ -172,7 +174,7 @@ pub(super) fn serve_session(
             return Ok(());
         }
         let Some(next) =
-            guest_gate::next_request(&mut stream, owner.live(), running, SESSION_IDLE_TIMEOUT)?
+            remote_gate::next_request(&mut stream, owner.live(), running, SESSION_IDLE_TIMEOUT)?
         else {
             return Ok(());
         };
@@ -184,6 +186,8 @@ fn owner_error(id: &str, code: &str) -> String {
     let message = match code {
         "owner_not_granted" => "this browser's access to this machine was removed",
         "owner_expired" => "this browser's access to this machine expired",
+        "owner_scope_changed" => "this browser's access changed; open the stream again",
+        "owner_paused" => "the agent this stream watches is no longer running",
         _ => "owner browsers may not call this method",
     };
     error_response_json(id.to_string(), code, message.to_string())
@@ -274,7 +278,7 @@ fn serve_request(
     request.method.clear_input_source();
     let forbidden = |stream: &mut ApiStream| -> std::io::Result<bool> {
         let key = format!("{}\n{method}", owner.grant_id);
-        if guest_gate::audit_due(GuestAuditEvent::OwnerDenied, &key) {
+        if audit_due(GuestAuditEvent::OwnerDenied, &key) {
             owner.audit(GuestAuditEvent::OwnerDenied, Some(method), None);
         }
         write_text_line_allow_disconnect(stream, &owner_error(&id, "owner_forbidden"))?;
@@ -287,26 +291,19 @@ fn serve_request(
         (OwnerScope::Terminal, _) | (OwnerScope::Chat, Ok(None)) => None,
         (OwnerScope::Chat, Err(())) => return forbidden(stream),
         (OwnerScope::Chat, Ok(Some(target))) => match chat_agent(api_tx, target) {
-            Some(probe) => Some(probe),
-            None => return forbidden(stream),
+            // Pane methods touch the terminal itself: once the agent's
+            // process is gone the pane is a shell, so it must be running.
+            Some(probe) if probe.running || !method.starts_with("pane.") => Some(probe),
+            _ => return forbidden(stream),
         },
     };
-    // Reads the grant again while a stream runs: at most every
-    // `WATCH_INTERVAL`, and at once after a removal (the live flag).
-    let mut last_check = Instant::now();
-    let watch_id = id.clone();
-    let mut watch = move || -> Option<String> {
-        if owner.live().revoked() {
-            return Some(owner_error(&watch_id, "owner_not_granted"));
-        }
-        if last_check.elapsed() < WATCH_INTERVAL {
-            return None;
-        }
-        last_check = Instant::now();
-        owner
-            .current(now_ms())
-            .err()
-            .map(|code| owner_error(&watch_id, code))
+    let guard = StreamGuard {
+        owner,
+        api_tx,
+        id: id.clone(),
+        scope,
+        agent_terminal: None,
+        last_check: Mutex::new(Instant::now()),
     };
     match request.method {
         Method::Ping(params) => {
@@ -370,25 +367,29 @@ fn serve_request(
             finish_wait_response(stream, Some(response), &id, method, false)?;
             Ok(false)
         }
-        Method::PaneSendKeys(mut params) if scope == OwnerScope::Chat => {
+        Method::PaneSendKeys(params) => match scope {
             // Chat never types into a terminal: menu keys only, while the
-            // agent waits on a menu.
-            let Some(keys) = guest_gate::guest_menu_batch(&params.keys) else {
-                return forbidden(stream);
-            };
-            let Some(agent) = chat_probe.and_then(|probe| probe.agent) else {
-                return forbidden(stream);
-            };
-            if !guest_gate::awaits_menu_input(&agent) {
-                return forbidden(stream);
+            // agent waits on a menu, and none after a committing key until
+            // the agent's state changes (the menu may already be gone and
+            // the keys would reach the pane's shell).
+            OwnerScope::Chat => {
+                let Some(keys) = menu_batch(&params.keys) else {
+                    return forbidden(stream);
+                };
+                let Some(agent) = chat_probe.and_then(|probe| probe.agent) else {
+                    return forbidden(stream);
+                };
+                let Some(response) = send_menu_keys(api_tx, &owner.dir, &agent, keys, &id, |_| {})
+                else {
+                    return forbidden(stream);
+                };
+                write_text_line_allow_disconnect(stream, &response)?;
+                Ok(false)
             }
-            params.pane_id = agent.pane_id;
-            params.keys = keys.into_iter().map(str::to_owned).collect();
-            pass(stream, id, Method::PaneSendKeys(params), api_tx)
-        }
+            OwnerScope::Terminal => pass(stream, id, Method::PaneSendKeys(params), api_tx),
+        },
         Method::PaneSetPtySize(mut params) => {
-            let (cols, rows, ttl) =
-                guest_gate::clamp_resize(params.cols, params.rows, params.ttl_ms);
+            let (cols, rows, ttl) = clamp_resize(params.cols, params.rows, params.ttl_ms);
             params.cols = cols;
             params.rows = rows;
             params.ttl_ms = Some(ttl);
@@ -400,7 +401,15 @@ fn serve_request(
         }
         Method::PaneStream(mut params) => {
             params.viewer_id = Some(owner.viewer_id());
-            let mut stream_watch = |_closed: bool| watch();
+            // A chat stream watches an agent: it ends when the terminal no
+            // longer hosts one (on unix the pane is then the agent's shell).
+            let guard = StreamGuard {
+                agent_terminal: chat_probe
+                    .and_then(|probe| probe.agent)
+                    .map(|agent| agent.terminal_id),
+                ..guard
+            };
+            let mut stream_watch = |closed: bool| guard.check(closed);
             pane_output_stream::serve_watched(
                 stream,
                 id,
@@ -432,20 +441,28 @@ fn serve_request(
                 event_hub,
                 running,
                 super::SUBSCRIPTION_HEARTBEAT_INTERVAL,
-                Some(&mut watch),
+                Some(&mut || guard.check(false)),
             )?;
             Ok(true)
         }
         Method::PaneInputStream(params) => {
-            pane_input_stream::serve_guarded(stream, id, params, api_tx, running, &mut watch)?;
+            pane_input_stream::serve_guarded(stream, id, params, api_tx, running, &|| {
+                guard.check(false)
+            })?;
             Ok(true)
         }
-        method_body => {
-            // Remote Gram goes to the coordinator's restricted reverse socket,
-            // as for the owner's own clients; it carries Gram only.
+        // The owner's Gram. Remote Gram goes to the coordinator's restricted
+        // reverse socket, as for the owner's own clients.
+        method @ (Method::GramList(_)
+        | Method::GramMarkRead(_)
+        | Method::GramGetFile(_)
+        | Method::GramGetFileChunk(_)
+        | Method::GramPost(_)
+        | Method::GramUploadChunk(_)
+        | Method::GramUploadDiscard(_)) => {
             let request = Request {
                 id: id.clone(),
-                method: method_body,
+                method,
             };
             if let Some(response) = crate::api::reverse::forward_local(&request) {
                 write_text_line_allow_disconnect(stream, &response)?;
@@ -453,6 +470,56 @@ fn serve_request(
             }
             pass(stream, id, request.method, api_tx)
         }
+        method => pass(stream, id, method, api_tx),
+    }
+}
+
+/// Ends a stream an owner browser opened when its grant no longer allows it:
+/// at once after a removal or replacement (the live flag), and within
+/// [`WATCH_INTERVAL`] after the store changes (removed, expired, or renewed
+/// with another scope), or, for a chat stream watching an agent, when the
+/// terminal no longer hosts a local agent. Safe to ask from another thread
+/// (the input stream's idle watcher).
+struct StreamGuard<'a> {
+    owner: &'a OwnerPrincipal,
+    api_tx: &'a ApiRequestSender,
+    id: String,
+    /// The scope the stream was opened under.
+    scope: OwnerScope,
+    /// A chat `pane.stream`'s agent terminal.
+    agent_terminal: Option<String>,
+    last_check: Mutex<Instant>,
+}
+
+impl StreamGuard<'_> {
+    /// The line that ends the stream, or `None` while it may go on. `closed`:
+    /// the watched runtime ended, so check now.
+    fn check(&self, closed: bool) -> Option<String> {
+        if self.owner.live().revoked() {
+            return Some(owner_error(&self.id, "owner_not_granted"));
+        }
+        {
+            let mut last_check = self
+                .last_check
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !closed && last_check.elapsed() < WATCH_INTERVAL {
+                return None;
+            }
+            *last_check = Instant::now();
+        }
+        match self.owner.current(now_ms()) {
+            Err(code) => return Some(owner_error(&self.id, code)),
+            Ok(scope) if scope != self.scope => {
+                return Some(owner_error(&self.id, "owner_scope_changed"));
+            }
+            Ok(_) => {}
+        }
+        let terminal = self.agent_terminal.as_deref()?;
+        let agent_running = probe_target(self.api_tx, Some(terminal), None).is_ok_and(|probe| {
+            probe.running && probe.agent.is_some_and(|agent| agent.machine_id.is_none())
+        });
+        (!agent_running).then(|| owner_error(&self.id, "owner_paused"))
     }
 }
 

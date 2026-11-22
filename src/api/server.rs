@@ -55,6 +55,8 @@ mod owner_access;
 #[cfg(unix)]
 mod owner_gate;
 #[cfg(unix)]
+mod remote_gate;
+#[cfg(unix)]
 pub(crate) use guest_gate::serve_guest_stream;
 #[cfg(unix)]
 pub(crate) use owner_gate::serve_owner_stream;
@@ -332,7 +334,7 @@ fn start_server_inner(
     let session = crate::session::active_name();
     federation_manager.reconcile_config_for_session(federation, session.as_deref());
     #[cfg(unix)]
-    guest_gate::install_context(api_tx.clone(), event_hub.clone(), Arc::clone(&running));
+    remote_gate::install_context(api_tx.clone(), event_hub.clone(), Arc::clone(&running));
 
     let listener_running = Arc::clone(&running);
     let listener_api_tx = api_tx.clone();
