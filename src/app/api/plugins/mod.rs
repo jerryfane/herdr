@@ -1916,6 +1916,167 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
         );
     }
 
+    /// After a live update the server runs from `updates/<build_id>/herdr`,
+    /// which the next update removes. Panes, plugins and custom commands
+    /// outlive that, so they must be handed the installed binary instead.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn herdr_bin_path_names_the_install_after_a_live_update() {
+        const CHILD_INSTALL: &str = "HERDR_TEST_LIVE_UPDATE_INSTALL";
+        if let Some(install) = std::env::var_os(CHILD_INSTALL) {
+            let install = std::path::PathBuf::from(install);
+            let plugin_root = install.parent().unwrap().parent().unwrap().join("plugin");
+
+            let mut pane = portable_pty::CommandBuilder::new("sh");
+            crate::integration::apply_pane_base_env(&mut pane);
+            let pane_env = pane.get_env("HERDR_BIN_PATH").map(std::path::PathBuf::from);
+
+            let mut app = test_app();
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("live-update")];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            app.state.mode = crate::app::Mode::Terminal;
+            let custom_command_env = app
+                .custom_command_env()
+                .0
+                .into_iter()
+                .find(|(key, _)| key == "HERDR_BIN_PATH")
+                .map(|(_, value)| std::path::PathBuf::from(value));
+            write_manifest_content(
+                &plugin_root,
+                r#"
+id = "example.live-update"
+name = "Live Update Probe"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux"]
+
+[[actions]]
+id = "probe"
+title = "Probe executable"
+command = ["sh", "-c", 'printf "%s\n" "$HERDR_BIN_PATH" > action-bin']
+
+[[panes]]
+id = "probe"
+title = "Probe executable"
+command = ["sh", "-c", 'printf "%s\n" "$HERDR_BIN_PATH" > pane-bin']
+"#,
+            );
+            link_manifest(&mut app, &plugin_root);
+            app.invoke_plugin_action_from_keybind("example.live-update.probe".into(), None)
+                .unwrap();
+            let action_bin = read_capture_when_ready(&plugin_root.join("action-bin"), || {
+                app.drain_all_internal_events();
+            });
+            let open = app.handle_api_request(Request {
+                id: "live-update-pane".into(),
+                method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                    plugin_id: "example.live-update".into(),
+                    entrypoint: "probe".into(),
+                    placement: Some(PluginPanePlacement::Overlay),
+                    width: None,
+                    height: None,
+                    workspace_id: None,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd: None,
+                    focus: true,
+                    env: std::collections::HashMap::new(),
+                }),
+            });
+            assert!(matches!(
+                response_result(&open),
+                ResponseResult::PluginPaneOpened { .. }
+            ));
+            let pane_bin = read_capture_when_ready(&plugin_root.join("pane-bin"), || {});
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            assert_eq!(pane_env.as_ref(), Some(&install), "pane HERDR_BIN_PATH");
+            assert_eq!(
+                custom_command_env.as_ref(),
+                Some(&install),
+                "custom command HERDR_BIN_PATH"
+            );
+            assert_eq!(
+                std::path::Path::new(action_bin.trim()),
+                install,
+                "plugin action HERDR_BIN_PATH"
+            );
+            assert_eq!(
+                std::path::Path::new(pane_bin.trim()),
+                install,
+                "plugin pane HERDR_BIN_PATH"
+            );
+            return;
+        }
+
+        let root = std::path::PathBuf::from("/var/tmp").join(format!(
+            "herdr-live-update-bin-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_home = root.join("config");
+        let dirs = crate::update::state::UpdateDirs::at(
+            config_home
+                .join(crate::config::app_dir_name())
+                .join(crate::update::state::UPDATES_DIR),
+        );
+        let build_id = "2026-11-22-0123456789ab";
+        let running = dirs
+            .build_dir(build_id)
+            .join(crate::update::state::BINARY_NAME);
+        let install = root.join("bin").join(crate::update::state::BINARY_NAME);
+        for path in [&running, &install] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(std::env::current_exe().unwrap(), path).unwrap();
+        }
+        dirs.store(&crate::update::state::UpdateState {
+            attempt: Some(crate::update::state::AttemptRecord {
+                public: crate::api::schema::UpdateAttempt {
+                    attempt_id: "upd-1".into(),
+                    build_id: build_id.into(),
+                    from: "0.9.5".into(),
+                    to: format!("0.9.6-preview.{build_id}"),
+                    phase: crate::api::schema::UpdatePhase::Confirming,
+                    bytes_done: 1,
+                    bytes_total: 1,
+                    restart_later: false,
+                    panes: Some(1),
+                    outcome: Some(crate::api::schema::UpdateOutcome::Updated),
+                    message: None,
+                },
+                socket: root.join("herdr.sock"),
+                install_path: install.clone(),
+                running_exe: install.clone(),
+                previous_sha256: "a".repeat(64),
+            }),
+            rolled_back: Vec::new(),
+        })
+        .unwrap();
+        let result = std::process::Command::new(&running)
+            .args([
+                "--exact",
+                "app::api::plugins::tests::herdr_bin_path_names_the_install_after_a_live_update",
+                "--nocapture",
+            ])
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env(CHILD_INSTALL, &install)
+            .output();
+        std::fs::remove_dir_all(&root).unwrap();
+        let output = result.unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn plugin_pane_open_uses_plugin_root_title_env_and_target_context() {

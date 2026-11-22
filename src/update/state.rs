@@ -447,6 +447,24 @@ fn install_path_for(exe: PathBuf, dirs: &UpdateDirs) -> io::Result<PathBuf> {
         })
 }
 
+/// The executable to hand to children that can outlive this server. A
+/// server that a live switch started runs from `updates/<build_id>/herdr`,
+/// which a later update removes; the install path outlives every update, so
+/// children get it whenever it exists. Any other path is returned unchanged.
+pub(crate) fn exe_for_children(exe: PathBuf) -> PathBuf {
+    exe_for_children_in(exe, &UpdateDirs::current())
+}
+
+fn exe_for_children_in(exe: PathBuf, dirs: &UpdateDirs) -> PathBuf {
+    if !exe.starts_with(dirs.root()) {
+        return exe;
+    }
+    match install_path_for(exe.clone(), dirs) {
+        Ok(install) if install.is_file() => install,
+        _ => exe,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +853,40 @@ mod tests {
         })
         .unwrap();
         assert_eq!(install_path_for(running, &dirs).unwrap(), installed);
+        let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
+    }
+
+    #[test]
+    fn children_get_the_install_path_while_it_exists() {
+        let dirs = temp_dirs("children");
+        let install = dirs.root().parent().unwrap().join("bin").join(BINARY_NAME);
+        let running = dirs.build_dir("2026-10-28-0123456789ab").join(BINARY_NAME);
+        let deleted = PathBuf::from(format!("{} (deleted)", running.display()));
+        let elsewhere = PathBuf::from("/opt/herdr/bin/herdr (deleted)");
+        // Outside `updates/` the path is untouched, as before.
+        assert_eq!(exe_for_children_in(elsewhere.clone(), &dirs), elsewhere);
+        // Without a recorded install the running path is all there is.
+        assert_eq!(exe_for_children_in(running.clone(), &dirs), running);
+
+        let mut attempt = record(Some(UpdateOutcome::Updated));
+        attempt.install_path = install.clone();
+        dirs.store(&UpdateState {
+            attempt: Some(attempt),
+            rolled_back: Vec::new(),
+        })
+        .unwrap();
+        // A recorded install that is gone is no better than the build dir.
+        assert_eq!(exe_for_children_in(running.clone(), &dirs), running);
+
+        std::fs::create_dir_all(install.parent().unwrap()).unwrap();
+        std::fs::write(&install, b"herdr").unwrap();
+        assert_eq!(exe_for_children_in(running, &dirs), install);
+        assert_eq!(exe_for_children_in(deleted, &dirs), install);
+        assert_eq!(
+            exe_for_children_in(dirs.previous_exe(), &dirs),
+            install,
+            "the rollback copy is replaced by every update too"
+        );
         let _ = std::fs::remove_dir_all(dirs.root().parent().unwrap());
     }
 }
