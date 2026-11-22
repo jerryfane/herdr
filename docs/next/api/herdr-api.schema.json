@@ -114,6 +114,11 @@
               "type": "string"
             },
             {
+              "const": "start_failed",
+              "description": "Topic `topic_id` ended before its first turn, so it never started:\n`code` says why (`seed_too_large`: the messages copied from the\nsuggestion did not fit its model). For a topic accepted from a\nsuggestion, `suggestion_id` names it: it stays open, and the agent's\nInbox note about it is in `agent.transcript`.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -998,6 +1003,13 @@
                     "null"
                   ]
                 },
+                "code": {
+                  "description": "Why the topic failed to start (`start_failed`), e.g.\n`seed_too_large`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -1005,7 +1017,7 @@
                   "$ref": "#/schemas/event/$defs/AgentTopicChangeReason"
                 },
                 "suggestion_id": {
-                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`), or that `topic_id` was accepted from\n(`start_failed`).",
                   "type": [
                     "string",
                     "null"
@@ -10607,6 +10619,11 @@
               "type": "string"
             },
             {
+              "const": "start_failed",
+              "description": "Topic `topic_id` ended before its first turn, so it never started:\n`code` says why (`seed_too_large`: the messages copied from the\nsuggestion did not fit its model). For a topic accepted from a\nsuggestion, `suggestion_id` names it: it stays open, and the agent's\nInbox note about it is in `agent.transcript`.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -11491,6 +11508,13 @@
                     "null"
                   ]
                 },
+                "code": {
+                  "description": "Why the topic failed to start (`start_failed`), e.g.\n`seed_too_large`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -11498,7 +11522,7 @@
                   "$ref": "#/schemas/subscription_stream_event/$defs/AgentTopicChangeReason"
                 },
                 "suggestion_id": {
-                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`), or that `topic_id` was accepted from\n(`start_failed`).",
                   "type": [
                     "string",
                     "null"
@@ -13433,6 +13457,11 @@
               "type": "string"
             },
             {
+              "const": "start_failed",
+              "description": "Topic `topic_id` ended before its first turn, so it never started:\n`code` says why (`seed_too_large`: the messages copied from the\nsuggestion did not fit its model). For a topic accepted from a\nsuggestion, `suggestion_id` names it: it stays open, and the agent's\nInbox note about it is in `agent.transcript`.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -14916,6 +14945,13 @@
                     "null"
                   ]
                 },
+                "code": {
+                  "description": "Why the topic failed to start (`start_failed`), e.g.\n`seed_too_large`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -14923,7 +14959,7 @@
                   "$ref": "#/schemas/success_response/$defs/AgentTopicChangeReason"
                 },
                 "suggestion_id": {
-                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`), or that `topic_id` was accepted from\n(`start_failed`).",
                   "type": [
                     "string",
                     "null"
@@ -19129,7 +19165,7 @@
               "type": "object"
             },
             {
-              "description": "`agent.topics.accept_suggestion`: the topic started from the\nsuggestion. A suggestion accepted before answers the same `topic_id`\nwith `already_accepted: true`.",
+              "description": "`agent.topics.accept_suggestion`: the topic started from the\nsuggestion. A suggestion accepted before answers the same `topic_id`\nwith `already_accepted: true`. Refused with `seed_too_large` when the\nmessages the agent picked cannot fit the topic's model even trimmed:\nno topic started and the suggestion stays open, so it can be accepted\nagain.",
               "properties": {
                 "agent": {
                   "type": "string"

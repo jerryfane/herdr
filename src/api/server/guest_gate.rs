@@ -3657,6 +3657,10 @@ mod tests {
         use crate::agent_topics::control::tests::FakeControl;
         let fake = FakeControl::start("g-suggest", |frame| {
             match frame["type"].as_str().unwrap_or_default() {
+                "topics_accept_suggestion" if frame["suggestionId"] == "sg_big" => json!({
+                    "success": false,
+                    "error": "The picked messages do not fit the topic's model.",
+                    "code": "seed_too_large"}),
                 "topics_accept_suggestion" => {
                     json!({"success": true, "data": {"topicId": "T1", "alreadyAccepted": false}})
                 }
@@ -3732,6 +3736,19 @@ mod tests {
             "the agent picks the messages"
         );
         assert_eq!(frame["by"], by);
+
+        // The agent's refusal reaches the guest with its own code.
+        let lines = harness.call(
+            &guest,
+            json!({"id": "s", "method": "agent.topics.accept_suggestion", "params": {
+                "target": pane, "suggestion_id": "sg_big"}}),
+        );
+        assert_eq!(code(&lines), "seed_too_large", "{lines:?}");
+        assert_eq!(
+            lines[0]["error"]["message"], "The picked messages do not fit the topic's model.",
+            "{lines:?}"
+        );
+        assert_eq!(sent("topics_accept_suggestion")["by"], by);
 
         let lines = harness.call(
             &guest,

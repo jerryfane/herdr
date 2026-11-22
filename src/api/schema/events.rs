@@ -709,8 +709,13 @@ pub enum EventData {
         topic_id: String,
         reason: super::topics::AgentTopicChangeReason,
         /// The suggestion whose state changed (`suggestion_accepted`,
-        /// `suggestion_dismissed`).
+        /// `suggestion_dismissed`), or that `topic_id` was accepted from
+        /// (`start_failed`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggestion_id: Option<String>,
+        /// Why the topic failed to start (`start_failed`), e.g.
+        /// `seed_too_large`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
 }
