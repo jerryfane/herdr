@@ -128,15 +128,26 @@ pub(crate) struct Claims {
     pub exp: u64,
 }
 
-/// What a statement must say to be accepted here.
+/// What a statement must say to be accepted here (the golden-vector tests
+/// check [`verify`] with it; production goes through [`check`]).
+#[cfg(test)]
 pub(crate) struct Expected<'a> {
     pub issuer: &'a str,
     /// This host's id (the invite's `host_id`).
     pub host_id: &'a str,
-    /// b64url of the device key the Noise handshake proved. `None` skips the
-    /// `dev` check: an owner grant's approving device presents its own
-    /// statement for a browser key it is not.
-    pub device: Option<&'a str>,
+    /// b64url of the device key the Noise handshake proved.
+    pub device: &'a str,
+}
+
+/// Whether a statement's `dev` must name one device key.
+#[derive(Debug, Clone, Copy)]
+enum DeviceBinding<'a> {
+    /// `dev` must equal this b64url key: the key the Noise handshake proved.
+    Bound(&'a str),
+    /// `dev` is not compared. Only [`check_unbound`] asks for this: an owner
+    /// grant's approving device presents its own statement to vouch for
+    /// another key (a browser's).
+    Unbound,
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(part: &str) -> Result<T, Failure> {
@@ -172,11 +183,30 @@ fn valid_sub(sub: &str) -> bool {
 }
 
 /// Verifies `jws` with `keys` at `now_secs`: the signature first, then the
-/// claims. Never fetches.
+/// claims, `dev` included. Never fetches.
+#[cfg(test)]
 pub(crate) fn verify(
     jws: &str,
     keys: &KeyCache,
     expected: &Expected<'_>,
+    now_secs: u64,
+) -> Result<Claims, Failure> {
+    verify_with(
+        jws,
+        keys,
+        expected.issuer,
+        expected.host_id,
+        DeviceBinding::Bound(expected.device),
+        now_secs,
+    )
+}
+
+fn verify_with(
+    jws: &str,
+    keys: &KeyCache,
+    issuer: &str,
+    host_id: &str,
+    device: DeviceBinding<'_>,
     now_secs: u64,
 ) -> Result<Claims, Failure> {
     let [header_part, payload_part, signature_part] = segments(jws)?;
@@ -205,14 +235,16 @@ pub(crate) fn verify(
     {
         return Err(Failure::Malformed);
     }
-    if claims.iss != expected.issuer {
+    if claims.iss != issuer {
         return Err(Failure::WrongIssuer);
     }
-    if claims.aud != expected.host_id {
+    if claims.aud != host_id {
         return Err(Failure::WrongAudience);
     }
-    if expected.device.is_some_and(|device| claims.dev != device) {
-        return Err(Failure::WrongDevice);
+    if let DeviceBinding::Bound(device) = device {
+        if claims.dev != device {
+            return Err(Failure::WrongDevice);
+        }
     }
     if now_secs < claims.iat.saturating_sub(SKEW_SECS) {
         return Err(Failure::NotYetValid);
@@ -420,27 +452,65 @@ pub(crate) struct Verified {
 }
 
 /// Checks `jws` for `device_pub` at this host, fetching the issuer's keys
-/// when the cache is stale or lacks the statement's `kid`. With no
-/// `device_pub` the statement's `dev` is not compared. Errors are the
+/// when the cache is stale or lacks the statement's `kid`. Errors are the
 /// refusal codes in [`codes`].
 pub(crate) fn check(
     dir: &Path,
     settings: &Settings,
     fetch: &(dyn Fn(&str) -> Result<Vec<u8>, String> + Sync),
     host_id: &str,
-    device_pub: Option<&[u8; 32]>,
+    device_pub: &[u8; 32],
+    jws: &str,
+    now_ms: u64,
+) -> Result<Verified, &'static str> {
+    let device = b64url(device_pub);
+    check_with(
+        dir,
+        settings,
+        fetch,
+        host_id,
+        DeviceBinding::Bound(&device),
+        jws,
+        now_ms,
+    )
+}
+
+/// Like [`check`], but the statement's `dev` is deliberately not compared:
+/// for `owner_access.add`, where the approving device presents its own
+/// statement to bind a grant for another key (a browser's) to its account.
+/// Never use it for a statement that should prove the caller's own key.
+pub(crate) fn check_unbound(
+    dir: &Path,
+    settings: &Settings,
+    fetch: &(dyn Fn(&str) -> Result<Vec<u8>, String> + Sync),
+    host_id: &str,
+    jws: &str,
+    now_ms: u64,
+) -> Result<Verified, &'static str> {
+    check_with(
+        dir,
+        settings,
+        fetch,
+        host_id,
+        DeviceBinding::Unbound,
+        jws,
+        now_ms,
+    )
+}
+
+fn check_with(
+    dir: &Path,
+    settings: &Settings,
+    fetch: &(dyn Fn(&str) -> Result<Vec<u8>, String> + Sync),
+    host_id: &str,
+    device: DeviceBinding<'_>,
     jws: &str,
     now_ms: u64,
 ) -> Result<Verified, &'static str> {
     let kid = statement_kid(jws).map_err(Failure::code)?;
     let keys = current_keys(dir, settings, fetch, &kid, now_ms)?;
-    let device = device_pub.map(|device| b64url(device.as_slice()));
-    let expected = Expected {
-        issuer: &settings.issuer,
-        host_id,
-        device: device.as_deref(),
-    };
-    let claims = match verify(jws, &keys, &expected, now_ms / 1000) {
+    let verified = verify_with(jws, &keys, &settings.issuer, host_id, device, now_ms / 1000);
+    let claims = match verified {
         Ok(claims) => claims,
         // The service may have rotated while it could not be reached.
         Err(Failure::UnknownKid) if keys.last_attempt_failed() && !keys.revoked(&kid) => {
@@ -566,7 +636,7 @@ pub(crate) mod tests {
             let expected = Expected {
                 issuer,
                 host_id: case["host_id"].as_str().unwrap(),
-                device: Some(case["noise_device_pub"].as_str().unwrap()),
+                device: case["noise_device_pub"].as_str().unwrap(),
             };
             let outcome = verify(
                 case["jws"].as_str().unwrap(),
@@ -594,7 +664,7 @@ pub(crate) mod tests {
             &Expected {
                 issuer,
                 host_id: issued["host_id"].as_str().unwrap(),
-                device: Some(issued["dev"].as_str().unwrap()),
+                device: issued["dev"].as_str().unwrap(),
             },
             issued["iat"].as_u64().unwrap(),
         )
@@ -609,7 +679,7 @@ pub(crate) mod tests {
         let expected = Expected {
             issuer: "https://accounts.example",
             host_id: issued["host_id"].as_str().unwrap(),
-            device: Some(issued["dev"].as_str().unwrap()),
+            device: issued["dev"].as_str().unwrap(),
         };
         let jws = issued["jws"].as_str().unwrap();
         let now = issued["iat"].as_u64().unwrap();
@@ -646,7 +716,7 @@ pub(crate) mod tests {
         let expected = Expected {
             issuer: ISSUER,
             host_id: "HostIdExample-01234567",
-            device: Some(&device),
+            device: &device,
         };
         let claims = issuer.claims(
             "HostIdExample-01234567",
@@ -787,7 +857,7 @@ pub(crate) mod tests {
             &settings(),
             &|issuer: &str| server.fetch(issuer),
             HOST,
-            Some(device),
+            device,
             jws,
             now_ms,
         )
@@ -795,6 +865,43 @@ pub(crate) mod tests {
 
     fn statement_at(issuer: &Issuer, device: &[u8; 32], now_ms: u64) -> String {
         issuer.sign(&issuer.claims(HOST, device, SUB, now_ms / 1000))
+    }
+
+    /// `check` always binds the statement to the device key it is given;
+    /// only `check_unbound` (owner grants) skips `dev`, and nothing else.
+    #[test]
+    fn check_binds_the_device_and_only_check_unbound_skips_dev() {
+        let dir = TempDir::new("acct-unbound");
+        let issuer = Issuer::new("k1");
+        let server = KeyServer::serving(issuer.jwks());
+        let t0 = 1_800_000_000_000;
+        let approver = statement_at(&issuer, &[7; 32], t0);
+        assert_eq!(
+            check_at(&dir.0, &server, &approver, &[8; 32], t0),
+            Err(codes::INVALID),
+            "another device's statement never passes the bound check"
+        );
+        let unbound = |jws: &str, host: &str, now: u64| {
+            check_unbound(
+                &dir.0,
+                &settings(),
+                &|issuer: &str| server.fetch(issuer),
+                host,
+                jws,
+                now,
+            )
+        };
+        assert_eq!(unbound(&approver, HOST, t0).unwrap().sub, SUB);
+        assert_eq!(
+            unbound(&approver, "AnotherHost-0123456789", t0),
+            Err(codes::INVALID)
+        );
+        assert_eq!(
+            unbound(&approver, HOST, t0 + 60 * MINUTE),
+            Err(codes::EXPIRED)
+        );
+        let forged = Issuer::new("k1").sign(&issuer.claims(HOST, &[7; 32], SUB, t0 / 1000));
+        assert_eq!(unbound(&forged, HOST, t0), Err(codes::INVALID));
     }
 
     #[test]

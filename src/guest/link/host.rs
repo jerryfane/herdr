@@ -63,7 +63,9 @@ pub(crate) trait GuestHost: Send + Sync + 'static {
     /// Relay credentials and node key, created on first use.
     fn host_info(&self) -> io::Result<HostInfo>;
 
-    /// True while at least one active guest or unexpired, unused invite exists.
+    /// True while at least one active guest, unexpired unused invite, or live
+    /// owner grant exists, or while a revoked guest or an ended owner grant is
+    /// within its 24 h grace (`store::link_wanted_in`).
     fn link_wanted(&self) -> bool;
 
     /// Decides a guest's admission from its static key and message-1 payload.

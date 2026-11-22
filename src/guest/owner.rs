@@ -28,6 +28,10 @@ pub(crate) const MAX_LIVE_GRANTS: usize = 10;
 /// Revoked and expired grants are deleted this long after they ended. Until
 /// then an expired one can be renewed.
 pub(crate) const ENDED_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Grants kept in the store, live and ended together. Past it the grants
+/// that ended first are deleted early, so repeated adds and removals cannot
+/// grow `guests.json` without limit.
+pub(crate) const MAX_STORED_GRANTS: usize = 50;
 const MAX_LABEL_CHARS: usize = 64;
 
 /// One browser allowed on this machine.
@@ -119,12 +123,40 @@ impl OwnerGrant {
     }
 }
 
-/// Drop grants that ended more than [`ENDED_RETENTION_MS`] ago. Returns
-/// whether any was dropped.
+/// Drop grants that ended more than [`ENDED_RETENTION_MS`] ago, then the
+/// grants that ended first while more than [`MAX_STORED_GRANTS`] remain.
+/// Live grants are never dropped. Returns whether any was dropped.
 pub(crate) fn prune(owners: &mut Vec<OwnerGrant>, now: u64) -> bool {
     let before = owners.len();
     owners.retain(|grant| grant.retained(now));
+    let excess = owners.len().saturating_sub(MAX_STORED_GRANTS);
+    if excess > 0 {
+        let mut ended: Vec<(u64, usize)> = owners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, grant)| grant.ended_ms(now).map(|at| (at, index)))
+            .collect();
+        ended.sort_unstable();
+        let dropped: std::collections::HashSet<usize> = ended
+            .into_iter()
+            .take(excess)
+            .map(|(_, index)| index)
+            .collect();
+        let mut index = 0;
+        owners.retain(|_| {
+            let keep = !dropped.contains(&index);
+            index += 1;
+            keep
+        });
+    }
     owners.len() != before
+}
+
+fn limit_error() -> OwnerError {
+    (
+        "owner_grant_limit",
+        format!("this machine already allows {MAX_LIVE_GRANTS} browsers; remove one first"),
+    )
 }
 
 /// `ttl_secs` within 1 hour to 30 days; anything else is refused, never
@@ -209,12 +241,11 @@ pub(crate) fn add_in(
     check_label("device_name", &params.device_name)?;
     check_label("approved_by", &params.approved_by)?;
     let (host, _) = store::load_host(dir).map_err(io_error)?;
-    let verified = account::check(
+    let verified = account::check_unbound(
         dir,
         &(env.settings)(),
         env.fetch_keys,
         &host.host_id,
-        None,
         &params.account_statement,
         now,
     )
@@ -261,12 +292,7 @@ pub(crate) fn add_in(
         (Some(replaced), true)
     })
     .map_err(io_error)?
-    .ok_or_else(|| {
-        (
-            "owner_grant_limit",
-            format!("this machine already allows {MAX_LIVE_GRANTS} browsers; remove one first"),
-        )
-    })?;
+    .ok_or_else(limit_error)?;
     notify_changes();
     for old in &replaced {
         old.audit(
@@ -301,10 +327,10 @@ pub(crate) fn renew_in(
     let ttl_ms = ttl_ms(ttl_secs)?;
     let renewed = store::update_store(dir, |store| {
         let pruned = prune(&mut store.owners, now);
-        let Some(grant) = store
+        let Some(index) = store
             .owners
-            .iter_mut()
-            .find(|grant| grant.grant_id == grant_id)
+            .iter()
+            .position(|grant| grant.grant_id == grant_id)
         else {
             return (
                 Err((
@@ -314,7 +340,7 @@ pub(crate) fn renew_in(
                 pruned,
             );
         };
-        if grant.revoked {
+        if store.owners[index].revoked {
             return (
                 Err((
                     "owner_grant_revoked",
@@ -323,6 +349,14 @@ pub(crate) fn renew_in(
                 pruned,
             );
         }
+        // Reviving an expired grant makes one more live grant.
+        if !store.owners[index].live(now) {
+            let live_others = store.owners.iter().filter(|other| other.live(now)).count();
+            if live_others >= MAX_LIVE_GRANTS {
+                return (Err(limit_error()), pruned);
+            }
+        }
+        let grant = &mut store.owners[index];
         grant.expires_ms = now.saturating_add(ttl_ms);
         grant.renewed_ms = Some(now);
         if let Some(scope) = scope {

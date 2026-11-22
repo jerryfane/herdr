@@ -479,7 +479,7 @@ fn account_hello(
         &settings,
         env.fetch_keys,
         &host.host_id,
-        Some(device_pub),
+        device_pub,
         jws,
         now,
     ) {

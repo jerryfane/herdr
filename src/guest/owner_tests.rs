@@ -284,6 +284,105 @@ fn the_eleventh_live_grant_is_refused() {
     host.add_with(&late, past_expiry).unwrap();
 }
 
+/// The approving device's statement issued at `now_ms`, for adds at a
+/// later test clock.
+fn add_at(
+    host: &Host,
+    device: &[u8; 32],
+    ttl_secs: u64,
+    now_ms: u64,
+) -> Result<crate::api::schema::OwnerGrantInfo, super::OwnerError> {
+    let mut params = host.params(device, ttl_secs);
+    params.account_statement = host.issuer.sign(&host.issuer.claims(
+        &host.host_id,
+        &PHONE,
+        SUB,
+        now_ms / 1000,
+    ));
+    host.add_with(&params, now_ms).map(|(grant, _)| grant)
+}
+
+#[test]
+fn renew_cannot_revive_an_expired_grant_past_the_live_limit() {
+    let host = Host::new("owner-revive-limit");
+    let now = store::now_ms();
+    let short = host.add(&[0x50; 32], 3600);
+    let long: Vec<_> = (1..owner::MAX_LIVE_GRANTS as u8)
+        .map(|index| host.add(&[0x50 + index; 32], 2 * 24 * 3600))
+        .collect();
+    let later = now + 2 * HOUR_MS;
+    // `short` expired, so a new key fits under the cap again.
+    add_at(&host, &[0x60; 32], 3600, later).unwrap();
+    assert_eq!(
+        code(owner::renew_in(
+            &host.dir.0,
+            &short.grant_id,
+            3600,
+            None,
+            later
+        )),
+        "owner_grant_limit",
+        "reviving it would make 11 live grants"
+    );
+    assert!(
+        !host.grants()[0].live(later),
+        "the refused grant stays expired"
+    );
+    // Renewing a grant that is still live adds none, so it works at the cap.
+    owner::renew_in(&host.dir.0, &long[0].grant_id, 3600, None, later).unwrap();
+    // With one removed, the expired grant may come back.
+    owner::remove_in(&host.dir.0, RemoveTarget::Grant(&long[1].grant_id), later).unwrap();
+    owner::renew_in(&host.dir.0, &short.grant_id, 3600, None, later).unwrap();
+    let live = host
+        .grants()
+        .iter()
+        .filter(|grant| grant.live(later))
+        .count();
+    assert_eq!(live, owner::MAX_LIVE_GRANTS);
+}
+
+#[test]
+fn stored_grants_are_capped_dropping_the_ones_that_ended_first() {
+    let host = Host::new("owner-stored-cap");
+    let now = store::now_ms();
+    let total = owner::MAX_STORED_GRANTS + 10;
+    // Every add for the same key revokes the one before it.
+    let ids: Vec<String> = (0..total as u64)
+        .map(|step| add_at(&host, &BROWSER, 3600, now + step).unwrap().grant_id)
+        .collect();
+    let stored: Vec<String> = host
+        .grants()
+        .into_iter()
+        .map(|grant| grant.grant_id)
+        .collect();
+    assert_eq!(stored.len(), owner::MAX_STORED_GRANTS);
+    assert_eq!(
+        stored,
+        ids[total - owner::MAX_STORED_GRANTS..],
+        "oldest dropped first"
+    );
+    let last = host.grants().pop().unwrap();
+    assert!(last.live(now + total as u64), "the live grant is kept");
+
+    // Removals leave ended grants too; the cap still holds and live grants
+    // are never dropped for it.
+    let mut live = Vec::new();
+    // Nine live in all with the BROWSER grant, so each add below fits.
+    for index in 0..owner::MAX_LIVE_GRANTS as u8 - 2 {
+        live.push(host.add(&[0x70 + index; 32], 3600).grant_id);
+    }
+    for index in 0..20u8 {
+        let key = [0x90 + index; 32];
+        host.add(&key, 3600);
+        owner::remove_in(&host.dir.0, RemoveTarget::Device(&store::b64url(&key)), now).unwrap();
+    }
+    let grants = host.grants();
+    assert!(grants.len() <= owner::MAX_STORED_GRANTS, "{}", grants.len());
+    for id in live.iter().chain([&last.grant_id]) {
+        assert!(grants.iter().any(|grant| &grant.grant_id == id), "{id}");
+    }
+}
+
 #[test]
 fn renew_revives_an_expired_grant_within_its_retention_only() {
     let host = Host::new("owner-revive");
