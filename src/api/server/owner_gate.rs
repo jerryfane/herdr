@@ -446,8 +446,10 @@ fn serve_request(
             Ok(true)
         }
         Method::PaneInputStream(params) => {
-            pane_input_stream::serve_guarded(stream, id, params, api_tx, running, &|| {
-                guard.check(false)
+            // Checked in full before each frame is typed, and throttled on
+            // the read's idle wakes.
+            pane_input_stream::serve_guarded(stream, id, params, api_tx, running, &mut |now| {
+                guard.check(now)
             })?;
             Ok(true)
         }
@@ -478,8 +480,7 @@ fn serve_request(
 /// at once after a removal or replacement (the live flag), and within
 /// [`WATCH_INTERVAL`] after the store changes (removed, expired, or renewed
 /// with another scope), or, for a chat stream watching an agent, when the
-/// terminal no longer hosts a local agent. Safe to ask from another thread
-/// (the input stream's idle watcher).
+/// terminal no longer hosts a local agent.
 struct StreamGuard<'a> {
     owner: &'a OwnerPrincipal,
     api_tx: &'a ApiRequestSender,
@@ -492,9 +493,10 @@ struct StreamGuard<'a> {
 }
 
 impl StreamGuard<'_> {
-    /// The line that ends the stream, or `None` while it may go on. `closed`:
-    /// the watched runtime ended, so check now.
-    fn check(&self, closed: bool) -> Option<String> {
+    /// The line that ends the stream, or `None` while it may go on. `now`:
+    /// check everything at once (before a frame is typed, or the watched
+    /// runtime ended) instead of at most every [`WATCH_INTERVAL`].
+    fn check(&self, now: bool) -> Option<String> {
         if self.owner.live().revoked() {
             return Some(owner_error(&self.id, "owner_not_granted"));
         }
@@ -503,7 +505,7 @@ impl StreamGuard<'_> {
                 .last_check
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !closed && last_check.elapsed() < WATCH_INTERVAL {
+            if !now && last_check.elapsed() < WATCH_INTERVAL {
                 return None;
             }
             *last_check = Instant::now();

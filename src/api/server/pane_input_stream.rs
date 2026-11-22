@@ -98,18 +98,15 @@ pub(super) fn serve(
 }
 
 /// The owner gate's check on a live input stream: the line that ends it, or
-/// `None` while it may go on. Asked from the frame loop and from a watcher
-/// thread, so it must be `Sync`.
-pub(super) type StreamGuard<'a> = &'a (dyn Fn() -> Option<String> + Sync);
+/// `None` while it may go on. With `true` it checks everything now; with
+/// `false` (the read loop's idle wakes) it may throttle its slower checks.
+pub(super) type StreamGuard<'a> = &'a mut dyn FnMut(bool) -> Option<String>;
 
-/// How often an idle guarded stream asks its guard.
-const GUARD_POLL: Duration = Duration::from_millis(250);
-
-/// [`serve`] for the owner gate: `guard` is asked before every frame is
-/// written and every [`GUARD_POLL`] while the stream is idle; when it
-/// returns a line, that line is sent and the stream ends, so a removed,
-/// expired or narrowed grant cannot type another key. Unix only, like the
-/// owner gate.
+/// [`serve`] for the owner gate: `guard` is asked, on the thread that reads
+/// the stream, on every wake of the frame read (about every 100 ms while
+/// idle) and in full before every frame is written. When it returns a line,
+/// that line is sent and the stream ends, so a removed, expired or narrowed
+/// grant cannot type another key. Unix only, like the owner gate.
 #[cfg(unix)]
 pub(super) fn serve_guarded(
     stream: &mut ApiStream,
@@ -188,60 +185,19 @@ fn serve_with_open_timeout(
         return Err(err);
     }
 
-    let Some(guard) = guard else {
-        let result = serve_frames(
-            stream,
-            &request_id,
-            &pane_id,
-            input_source,
-            fenced,
-            api_tx,
-            running,
-            &stream_active,
-            None,
-        );
-        stream_active.store(false, Ordering::Release);
-        return result;
-    };
-    // Whoever first sees the guard end the stream (the frame loop or the idle
-    // watcher) claims it by stopping `stream_active`, so its line is written
-    // once.
-    let claim = |line: String| stream_active.swap(false, Ordering::AcqRel).then_some(line);
-    let ended: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while stream_is_running(running, &stream_active) {
-                std::thread::sleep(GUARD_POLL);
-                if let Some(line) = guard().and_then(claim) {
-                    *ended
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(line);
-                }
-            }
-        });
-        // An empty line: the watcher claimed the end and writes its line.
-        let frame_guard = || guard().map(|line| claim(line).unwrap_or_default());
-        let result = serve_frames(
-            stream,
-            &request_id,
-            &pane_id,
-            input_source,
-            fenced,
-            api_tx,
-            running,
-            &stream_active,
-            Some(&frame_guard),
-        );
-        stream_active.store(false, Ordering::Release);
-        result
-    });
-    let ended = ended
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match (result, ended) {
-        (Ok(()), Some(line)) => write_text_line_allow_disconnect(stream, &line),
-        (result, _) => result,
-    }
+    let result = serve_frames(
+        stream,
+        &request_id,
+        &pane_id,
+        input_source,
+        fenced,
+        api_tx,
+        running,
+        &stream_active,
+        guard,
+    );
+    stream_active.store(false, Ordering::Release);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -254,11 +210,12 @@ fn serve_frames(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
-    guard: Option<StreamGuard<'_>>,
+    mut guard: Option<StreamGuard<'_>>,
 ) -> std::io::Result<()> {
     let mut last_seq: Option<u64> = None;
     while stream_is_running(running, stream_active) {
-        let Some(line) = read_line(
+        let mut ended = None;
+        let read = read_line(
             stream,
             running,
             stream_active,
@@ -266,8 +223,15 @@ fn serve_frames(
             INPUT_FRAME_IDLE_TIMEOUT,
             INPUT_FRAME_TOTAL_TIMEOUT,
             "input frame",
-        )?
-        else {
+            &mut || {
+                ended = guard.as_mut().and_then(|guard| guard(false));
+                ended.is_none()
+            },
+        )?;
+        if let Some(line) = ended {
+            return write_text_line_allow_disconnect(stream, &line);
+        }
+        let Some(line) = read else {
             return Ok(());
         };
         let line = line.trim();
@@ -331,10 +295,9 @@ fn serve_frames(
                 input_source,
             })
         };
-        if let Some(line) = guard.and_then(|guard| guard()) {
-            if line.is_empty() {
-                return Ok(());
-            }
+        // In full, on this thread, after the frame was read: a grant removed
+        // a moment ago never gets this frame through.
+        if let Some(line) = guard.as_mut().and_then(|guard| guard(true)) {
             return write_text_line_allow_disconnect(stream, &line);
         }
         let response = dispatch_to_app_with_timeout(

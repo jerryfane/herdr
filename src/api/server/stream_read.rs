@@ -49,6 +49,11 @@ pub(super) fn stream_is_running(running: &AtomicBool, stream_active: &AtomicBool
 /// whose frames are all text should use [`LineReader`] instead — one syscall per
 /// byte costs ~1 MB/s, which is fine for keystrokes and ruinous for a 700 KB
 /// upload frame.
+///
+/// `keep_reading` is asked on every wake of the loop (each byte, and each
+/// read timeout while idle); returning false stops the read with `None`, as a
+/// stopped channel does.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn read_line(
     stream: &mut ApiStream,
     running: &Arc<AtomicBool>,
@@ -57,6 +62,7 @@ pub(super) fn read_line(
     idle_timeout: Duration,
     total_timeout: Duration,
     label: &str,
+    keep_reading: &mut dyn FnMut() -> bool,
 ) -> std::io::Result<Option<String>> {
     // Built ONCE: this loop reads a single byte per iteration, so formatting inside
     // it would cost a heap allocation per byte on the keystroke path.
@@ -71,6 +77,7 @@ pub(super) fn read_line(
             idle_timeout,
             total_timeout,
             &timeout_message,
+            keep_reading,
         )
     })
 }
@@ -89,6 +96,7 @@ fn read_line_polling(
     idle_timeout: Duration,
     total_timeout: Duration,
     timeout_message: &str,
+    keep_reading: &mut dyn FnMut() -> bool,
 ) -> std::io::Result<Option<String>> {
     {
         let mut bytes = Vec::new();
@@ -97,7 +105,7 @@ fn read_line_polling(
         let mut idle_deadline = None;
 
         loop {
-            if !stream_is_running(running, stream_active) {
+            if !stream_is_running(running, stream_active) || !keep_reading() {
                 return Ok(None);
             }
             ensure_before_deadlines(idle_deadline, total_deadline, timeout_message)?;
@@ -503,6 +511,7 @@ mod zero_read_tests {
             Duration::from_millis(40),
             Duration::from_millis(200),
             "test frame",
+            &mut || true,
         );
         (result, started.elapsed())
     }
