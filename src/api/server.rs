@@ -8342,6 +8342,39 @@ mod federation_tests {
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
 
+    /// A peer's `seed_too_large` refusal of `agent.topics.accept_suggestion`
+    /// reaches the client unchanged.
+    #[test]
+    fn proxy_forwards_a_peers_seed_too_large_refusal_unchanged() {
+        let refusal = serde_json::json!({"id": "a1", "error": {
+            "code": "seed_too_large",
+            "message": "The picked messages do not fit the topic's model.",
+        }})
+        .to_string();
+        let with_suggestions = ServerCapabilities {
+            agent_topic_suggestions: true,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(with_suggestions, refusal.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "a1",
+                "method": "agent.topics.accept_suggestion",
+                "params": {"target": "remote/ordinals", "suggestion_id": "sg_big"},
+            }),
+        );
+        assert_eq!(response, refusal);
+        let seen = peer.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"target": "ordinals", "suggestion_id": "sg_big"})
+        );
+    }
+
     #[test]
     fn proxy_rejects_an_identity_pinned_route_before_validation() {
         let registry = HashMap::from([(

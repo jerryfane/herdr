@@ -57,12 +57,16 @@ pub(crate) enum ControlError {
 
 /// The refusal codes omp's topics answer with that herdr passes through as
 /// its own error code; any other refusal is `topic_rejected`.
+/// `seed_too_large`: the messages an accepted suggestion (or a seeded
+/// `topics_new`) copies into the topic cannot fit its model even trimmed; no
+/// topic started and the suggestion stays open.
 const REFUSAL_CODES: &[&str] = &[
     "suggestion_not_found",
     "already_accepted",
     "invalid_message_ids",
     "organise_running",
     "topics_disabled",
+    "seed_too_large",
 ];
 
 impl ControlError {
@@ -449,8 +453,11 @@ pub(crate) enum TopicReply {
 pub(crate) struct TopicChange {
     pub(crate) topic_id: String,
     pub(crate) reason: AgentTopicChangeReason,
-    /// The suggestion whose state changed.
+    /// The suggestion whose state changed, or whose accepted topic failed to
+    /// start.
     pub(crate) suggestion_id: Option<String>,
+    /// Why a topic failed to start (`start_failed`), e.g. `seed_too_large`.
+    pub(crate) code: Option<String>,
 }
 
 /// The agent's stream of topic changes (`subscribe`).
@@ -462,9 +469,14 @@ impl TopicUpdates {
     /// The next topic change; `None` once the stream ended.
     pub(crate) fn next_change(&mut self) -> Option<TopicChange> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Change {
             id: String,
             reason: String,
+            #[serde(default)]
+            suggestion_id: Option<String>,
+            #[serde(default)]
+            code: Option<String>,
         }
         loop {
             let frame = self.connection.read_frame().ok()?;
@@ -478,25 +490,30 @@ impl TopicUpdates {
                 continue;
             };
             let reason = change_reason(&change.reason);
-            // For a suggestion's change, omp's `id` is the suggestion's.
-            let suggestion = matches!(
-                reason,
+            return Some(match reason {
+                // For a suggestion's change, omp's `id` is the suggestion's.
                 AgentTopicChangeReason::Suggested
-                    | AgentTopicChangeReason::SuggestionAccepted
-                    | AgentTopicChangeReason::SuggestionDismissed
-            );
-            return Some(if suggestion {
-                TopicChange {
+                | AgentTopicChangeReason::SuggestionAccepted
+                | AgentTopicChangeReason::SuggestionDismissed => TopicChange {
                     topic_id: String::new(),
                     reason,
                     suggestion_id: Some(change.id),
-                }
-            } else {
-                TopicChange {
+                    code: None,
+                },
+                // A topic that ended before its first turn: `id` is the
+                // topic's, `suggestionId` the suggestion it was accepted from.
+                AgentTopicChangeReason::StartFailed => TopicChange {
+                    topic_id: change.id,
+                    reason,
+                    suggestion_id: change.suggestion_id,
+                    code: change.code,
+                },
+                _ => TopicChange {
                     topic_id: change.id,
                     reason,
                     suggestion_id: None,
-                }
+                    code: None,
+                },
             });
         }
     }
@@ -514,6 +531,7 @@ fn change_reason(reason: &str) -> AgentTopicChangeReason {
         "suggested" => AgentTopicChangeReason::Suggested,
         "suggestion-accepted" => AgentTopicChangeReason::SuggestionAccepted,
         "suggestion-dismissed" => AgentTopicChangeReason::SuggestionDismissed,
+        "start-failed" => AgentTopicChangeReason::StartFailed,
         _ => AgentTopicChangeReason::Unknown,
     }
 }
@@ -951,6 +969,28 @@ pub(crate) mod tests {
                 topic_id: "Plan".into(),
                 reason: AgentTopicChangeReason::TurnSettled,
                 suggestion_id: None,
+                code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_topic_that_failed_to_start_names_its_suggestion_and_why() {
+        let fake = FakeControl::start("start-failed", list_reply);
+        let connection = ControlConnection::open(&fake.endpoint(std::process::id())).unwrap();
+        let mut updates = connection.subscribe().unwrap();
+        fake.updates
+            .send(json!({"id": "T1", "ownerId": "o", "parentSessionId": "p",
+                "reason": "start-failed", "suggestionId": "sg_1", "code": "seed_too_large",
+                "tokens": 210_000, "limit": 128_000}))
+            .unwrap();
+        assert_eq!(
+            updates.next_change(),
+            Some(TopicChange {
+                topic_id: "T1".into(),
+                reason: AgentTopicChangeReason::StartFailed,
+                suggestion_id: Some("sg_1".into()),
+                code: Some("seed_too_large".into()),
             })
         );
     }

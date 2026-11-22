@@ -396,6 +396,7 @@ mod control {
                     topic_id: change.topic_id,
                     reason: change.reason,
                     suggestion_id: change.suggestion_id,
+                    code: change.code,
                 },
             });
         }
