@@ -282,7 +282,22 @@ impl PairingPayload {
         // programming error, not a runtime condition, so it is not surfaced as an error.
         serde_json::to_string(self).unwrap_or_default()
     }
+
+    /// The same-computer pairing link: `herdrup://pair#` followed by the exact JSON the QR
+    /// encodes, base64url without padding. The QR cannot be scanned by the computer that
+    /// shows it, so the desktop app opens this link instead. It carries the same
+    /// single-use token as the QR and nothing more.
+    pub fn app_link(&self) -> String {
+        use base64::Engine as _;
+        format!(
+            "{PAIRING_APP_LINK_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.to_json())
+        )
+    }
 }
+
+/// Prefix of [`PairingPayload::app_link`]; herdrup-desktop matches it as `AppLinkPrefix`.
+pub const PAIRING_APP_LINK_PREFIX: &str = "herdrup://pair#";
 
 /// Render a QR to a terminal using half-block characters, two module rows per text line.
 ///
@@ -1228,6 +1243,22 @@ mod tests {
             token: "tok".into(),
             fp: "SHA256:vL7GMFHkifrUqP8D1g/8YJGKWxWjkvRaHfKjeLXytuc".into(),
         }
+    }
+
+    #[test]
+    fn the_app_link_carries_the_exact_qr_json_unpadded() {
+        use base64::Engine as _;
+        let p = sample_payload();
+        let link = p.app_link();
+        let encoded = link
+            .strip_prefix("herdrup://pair#")
+            .expect("app link prefix");
+        assert!(!encoded.contains('='), "no padding: {link}");
+        assert!(!encoded.contains(['+', '/']), "base64url alphabet: {link}");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("base64url");
+        assert_eq!(String::from_utf8(decoded).expect("utf-8"), p.to_json());
     }
 
     #[test]

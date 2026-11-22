@@ -177,6 +177,22 @@ herdr guest log [<guest-id>] [--limit N]          # 活动记录,最新在前
 
 只要存在至少一位访客或一个未过期的邀请,服务器就会保持一条到中继的出站 TLS WebSocket 连接,断开后以 2 到 60 秒的退避重连;没有访客和邀请时即关闭该连接。这是 Herdr 唯一在进程内建立的 TLS 连接;更新检查和推送投递则改为运行 `curl`。`herdr guest list` 会显示其状态(`off`、`connecting`、`up` 或 `retrying`)及最近一次错误。
 
+## 配对
+
+```bash
+herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+```
+
+`herdr pair` 会显示一个供 HerdrUp 应用扫描的二维码。二维码只包含一次性令牌(有效期为 `--ttl`,默认 300 秒)和本机的公开信息,绝不包含密钥:应用自行生成密钥对,只发送公钥,`herdr pair` 将其追加到 `~/.ssh/authorized_keys`。
+
+二维码下方还会打印一个应用链接,用于在同一台电脑上配对 HerdrUp 桌面版(这台电脑无法扫描自己屏幕上的二维码):
+
+```text
+  Or open   herdrup://pair#eyJ2IjoxLCJob3N0Ijoi…   (this computer)
+```
+
+`#` 之后是二维码所编码的同一份 JSON,经无填充的 base64url 编码,因此只携带同一个一次性令牌。在终端中该链接以 OSC 8 超链接输出,点击一次即可打开;完整 URL 也始终以纯文本显示,便于在不支持 OSC 8 的终端或非终端输出中复制。
+
 ## 会话
 
 ```bash

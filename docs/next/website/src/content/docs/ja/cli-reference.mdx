@@ -177,6 +177,22 @@ herdr guest log [<guest-id>] [--limit N]          # アクティビティ(新し
 
 ゲストまたは有効期限内の招待が 1 つ以上ある間、サーバーはリレーへの送信方向の TLS WebSocket 接続を 1 本維持し、切断時は 2〜60 秒のバックオフで再接続します。ゲストも招待もなくなると接続を閉じます。これは Herdr がプロセス内で開く唯一の TLS 接続で、アップデート確認やプッシュ配信は代わりに `curl` を実行します。`herdr guest list` で接続状態(`off`・`connecting`・`up`・`retrying`)と直近のエラーを確認できます。
 
+## ペアリング
+
+```bash
+herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+```
+
+`herdr pair` は HerdrUp アプリで読み取る QR を表示します。QR には 1 回限りのトークン(有効期間は `--ttl`、既定 300 秒)とこのマシンの公開情報だけが入り、鍵は含まれません。アプリは自分で鍵ペアを作り、公開鍵だけを送ります。`herdr pair` はそれを `~/.ssh/authorized_keys` に追加します。
+
+QR の下には、画面の QR を自分では読み取れない同じコンピューター上の HerdrUp デスクトップ用のアプリリンクも表示します:
+
+```text
+  Or open   herdrup://pair#eyJ2IjoxLCJob3N0Ijoi…   (this computer)
+```
+
+`#` 以降は QR と同じ JSON をパディングなしの base64url にしたもので、同じ 1 回限りのトークン以外は含みません。端末ではリンクを OSC 8 ハイパーリンクとして出力するのでクリック 1 回で開けます。OSC 8 非対応の端末や端末以外への出力でもコピーできるよう、URL 全体は常にプレーンテキストでも表示します。
+
 ## セッション
 
 ```bash
