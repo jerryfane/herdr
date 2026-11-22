@@ -313,7 +313,10 @@ pub enum ResponseResult {
     },
     /// `agent.topics.accept_suggestion`: the topic started from the
     /// suggestion. A suggestion accepted before answers the same `topic_id`
-    /// with `already_accepted: true`.
+    /// with `already_accepted: true`. Refused with `seed_too_large` when the
+    /// messages the agent picked cannot fit the topic's model even trimmed:
+    /// no topic started and the suggestion stays open, so it can be accepted
+    /// again.
     AgentTopicSuggestionAccepted {
         agent: String,
         pane_id: String,

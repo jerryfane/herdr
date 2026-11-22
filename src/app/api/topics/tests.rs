@@ -771,6 +771,99 @@ fn a_suggestion_refusal_keeps_the_agents_code() {
     assert_eq!(response["error"]["code"], "organise_running", "{response}");
 }
 
+/// The agent's copy of the suggestion's messages cannot fit the topic's model
+/// even trimmed: the accept is refused with the agent's `seed_too_large`, no
+/// topic starts, and the suggestion is still listed open, so it can be
+/// accepted again.
+#[test]
+fn an_oversized_seed_refuses_the_accept_and_the_suggestion_stays_open() {
+    let open = json!({"id": "sg_big", "title": "Release notes", "reason": "a separate subject",
+        "messageIds": ["m1"], "createdMs": 5_000});
+    let fake = FakeControl::start("sg-seed", move |frame| {
+        match frame["type"].as_str().unwrap_or_default() {
+            "topics_accept_suggestion" => json!({"success": false,
+                "error": "The picked messages do not fit the topic's model.",
+                "code": "seed_too_large"}),
+            _ => json!({"success": true, "data": {"topics": [], "suggestions": [open.clone()]}}),
+        }
+    });
+    let (_session, mut app, pane) = offered("sg-seed", &fake);
+    topics(&app, list(&pane));
+    received(&fake, "subscribe");
+
+    let response = topics(
+        &app,
+        wire(
+            "agent.topics.accept_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_big"}),
+        ),
+    );
+    assert_eq!(response["error"]["code"], "seed_too_large", "{response}");
+    assert_eq!(
+        response["error"]["message"],
+        "The picked messages do not fit the topic's model."
+    );
+    assert_eq!(
+        received(&fake, "topics_accept_suggestion")["suggestionId"],
+        "sg_big"
+    );
+
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["result"]["suggestions"][0]["suggestion_id"], "sg_big",
+        "{response}"
+    );
+    while let Ok(event) = app.event_rx.try_recv() {
+        app.handle_internal_event_with_render_impact(event);
+    }
+    assert!(
+        app.event_hub
+            .events_after(0)
+            .into_iter()
+            .all(
+                |(_, event)| serde_json::to_value(event).unwrap()["data"]["type"]
+                    != "agent_topics_changed"
+            ),
+        "a refused accept changed nothing"
+    );
+}
+
+/// The late case: the accept succeeded, but the topic ended before its first
+/// turn. The agent says so on its `topic_update` stream once, naming the
+/// topic, the suggestion (still open) and why; herdr passes it on as an
+/// `agent.topics.changed` the apps refresh on.
+#[test]
+fn a_topic_that_never_started_is_an_agent_topics_change_naming_the_suggestion() {
+    let fake = FakeControl::start("sg-late", empty_topics);
+    let (_session, mut app, pane) = offered("sg-late", &fake);
+    topics(&app, list(&pane));
+    received(&fake, "subscribe");
+
+    fake.updates
+        .send(json!({"id": "T2", "ownerId": "o", "parentSessionId": "p",
+            "reason": "start-failed", "suggestionId": "sg_big", "code": "seed_too_large",
+            "tokens": 210_000, "limit": 128_000}))
+        .unwrap();
+    let change = next_topics_change(&mut app);
+    app.handle_internal_event_with_render_impact(change);
+    let emitted: Vec<_> = app
+        .event_hub
+        .events_after(0)
+        .into_iter()
+        .map(|(_, event)| serde_json::to_value(event).unwrap()["data"].clone())
+        .filter(|data| data["type"] == "agent_topics_changed")
+        .collect();
+    let workspace = emitted[0]["workspace_id"].clone();
+    assert_eq!(
+        emitted,
+        [
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+            "agent": "omp", "topic_id": "T2", "reason": "start_failed",
+            "suggestion_id": "sg_big", "code": "seed_too_large"})
+        ]
+    );
+}
+
 #[test]
 fn topics_list_passes_only_open_suggestions_through() {
     let fake = FakeControl::start("sg-list", |_| {

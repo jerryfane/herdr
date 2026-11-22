@@ -159,6 +159,12 @@ pub enum AgentTopicChangeReason {
     SuggestionAccepted,
     /// Suggestion `suggestion_id` was dismissed; `topic_id` is empty.
     SuggestionDismissed,
+    /// Topic `topic_id` ended before its first turn, so it never started:
+    /// `code` says why (`seed_too_large`: the messages copied from the
+    /// suggestion did not fit its model). For a topic accepted from a
+    /// suggestion, `suggestion_id` names it: it stays open, and the agent's
+    /// Inbox note about it is in `agent.transcript`.
+    StartFailed,
     /// A reason this server does not know yet.
     #[serde(other)]
     Unknown,
