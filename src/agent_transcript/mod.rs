@@ -25,11 +25,14 @@ use base64::Engine as _;
 
 use crate::api::schema::{AskFormAnswer, PendingAsk};
 use crate::api::schema::{
-    TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap, TranscriptStepStatus,
-    TranscriptSubagent, TranscriptTurnStatus, TranscriptWorking,
+    TopicSuggestionState, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
+    TranscriptStepStatus, TranscriptSubagent, TranscriptTurnStatus, TranscriptWorking,
 };
 use index::{read_line, Kind, SessionIndex};
-use normalize::{AssistantLine, NoteLine, ResultLine, StampLine, UserLine, SUMMARY_TEXT};
+use normalize::{
+    AssistantLine, NoteLine, ResultLine, StampLine, SuggestionLine, SuggestionStateLine, UserLine,
+    SUMMARY_TEXT,
+};
 #[cfg(test)]
 pub(crate) use origin::PENDING_PROMPT_LIMIT;
 pub(crate) use origin::{OtherPrompt, OtherPromptLog, PromptOutcome, TooManyPendingPrompts};
@@ -711,7 +714,7 @@ impl View<'_> {
             others = Some(matched);
         }
         if let Some(seen) = changed_since {
-            self.resend_changed(seen, start, &mut entries)?;
+            self.resend_changed(seen, floor_at(served_floor), start, end, &mut entries)?;
         }
         // Everything rendered so far precedes the new range: it is re-sent.
         let resent = changed_since.map(|_| {
@@ -1246,6 +1249,7 @@ impl View<'_> {
                         text: SUMMARY_TEXT.to_owned(),
                     });
                 }
+                Kind::Suggestion => entries.extend(self.suggestion_entry(record)?),
                 Kind::ToolResult
                 | Kind::TaskResult
                 | Kind::ResetBoundary
@@ -1253,7 +1257,8 @@ impl View<'_> {
                 | Kind::Hidden
                 | Kind::ModelChange
                 | Kind::ThinkingLevelChange
-                | Kind::Recap => {}
+                | Kind::Recap
+                | Kind::SuggestionState => {}
             }
         }
         Ok(())
@@ -1445,12 +1450,16 @@ impl View<'_> {
 
     /// Entries emitted before the client's `after` cursor whose state moved
     /// since: the steps and asks of the newest earlier model message (its
-    /// results land after it). A changed plan needs nothing here: its new todo
-    /// result is in the range and re-renders the plan under the turn's id.
+    /// results land after it), and the topic suggestions from `floor` on
+    /// whose state the new range (`start..end`) changes. A changed plan needs
+    /// nothing here: its new todo result is in the range and re-renders the
+    /// plan under the turn's id.
     fn resend_changed(
         &self,
         seen: u32,
+        floor: usize,
         start: usize,
+        end: usize,
         entries: &mut Vec<TranscriptEntry>,
     ) -> Result<(), TranscriptError> {
         if let Some(position) = (0..start)
@@ -1459,7 +1468,72 @@ impl View<'_> {
         {
             self.render_assistant(position, Some(seen), entries)?;
         }
+        let mut resent = HashSet::new();
+        for position in start..end {
+            if self.kind(position) != Kind::SuggestionState {
+                continue;
+            }
+            let Some(line) = self.parse::<SuggestionStateLine>(self.branch[position])? else {
+                continue;
+            };
+            // A suggestion in the new range renders there with its newest
+            // state; one before the client's floor comes with an older page.
+            let Some(suggestion) = self.index.suggestion(&line.data.id).filter(|&record| {
+                self.position_of(record)
+                    .is_some_and(|at| (floor..start).contains(&at))
+            }) else {
+                continue;
+            };
+            if resent.insert(suggestion) {
+                entries.extend(self.suggestion_entry(suggestion)?);
+            }
+        }
         Ok(())
+    }
+
+    /// The `topic-suggestion` record `record` as its entry, in the newest
+    /// state the visible branch records for it.
+    fn suggestion_entry(&self, record: u32) -> Result<Option<TranscriptEntry>, TranscriptError> {
+        let Some(line) = self.parse::<SuggestionLine>(record)? else {
+            return Ok(None);
+        };
+        let details = line.details;
+        let mut state = TopicSuggestionState::Open;
+        let mut topic_id = None;
+        let mut by = None;
+        for &change in self.index.suggestion_states(&details.id).iter().rev() {
+            if self.position_of(change).is_none() {
+                continue;
+            }
+            let Some(change) = self.parse::<SuggestionStateLine>(change)? else {
+                continue;
+            };
+            let Some(newest) = normalize::suggestion_state(&change.data.state) else {
+                continue;
+            };
+            state = newest;
+            topic_id = change
+                .data
+                .topic_id
+                .filter(|id| state == TopicSuggestionState::Accepted && !id.is_empty());
+            by = change.data.by.filter(|by| !by.is_empty());
+            break;
+        }
+        let created_ms = details
+            .created_ms
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map(|ms| ms as u64);
+        Ok(Some(TranscriptEntry::TopicSuggestion {
+            id: details.id,
+            ts_ms: normalize::ts_ms(created_ms, line.timestamp.as_deref()),
+            title: details.title,
+            reason: details.reason,
+            message_count: details.message_ids.len() as u64,
+            message_ids: details.message_ids,
+            state,
+            topic_id,
+            by,
+        }))
     }
 
     /// The ask waiting for an answer and the step running now, both from the

@@ -12,6 +12,12 @@ use serde::Deserialize;
 
 pub(super) const NO_PARENT: u32 = u32::MAX;
 
+/// omp's `custom_message` for a topic the agent suggests (`topic_suggest`).
+const SUGGESTION_TYPE: &str = "topic-suggestion";
+/// omp's hidden `custom` entry recording a suggestion's new state; the
+/// newest one per suggestion wins.
+const SUGGESTION_STATE_TYPE: &str = "topic-suggestion-state";
+
 /// Reminders and mode context omp injects for the model, not for the user.
 const HIDDEN_NOTE_TYPES: &[&str] = &[
     "mid-run-todo-nudge",
@@ -41,6 +47,11 @@ pub(super) enum Kind {
     /// An `async-result` note: shown like any note, and it settles the
     /// background job (a subagent among them) it reports.
     AsyncResult,
+    /// A `topic-suggestion` message: a topic the agent suggests.
+    Suggestion,
+    /// A `topic-suggestion-state` entry: a suggestion was accepted or
+    /// dismissed. Renders nothing itself; its suggestion shows the newest one.
+    SuggestionState,
     ModelChange,
     /// omp's effort (`/thinking`) selection.
     ThinkingLevelChange,
@@ -67,6 +78,7 @@ impl Kind {
                 | Kind::ModelChange
                 | Kind::ThinkingLevelChange
                 | Kind::Recap
+                | Kind::SuggestionState
         )
     }
 }
@@ -121,6 +133,10 @@ pub(super) struct SessionIndex {
     by_id: HashMap<Box<str>, u32>,
     /// `toolCallId` → its tool result record.
     results: HashMap<Box<str>, u32>,
+    /// Suggestion id → its `topic-suggestion` record.
+    suggestions: HashMap<Box<str>, u32>,
+    /// Suggestion id → its `topic-suggestion-state` records, in file order.
+    suggestion_states: HashMap<Box<str>, Vec<u32>>,
     /// Lines that were not valid JSON entries; skipped.
     pub(super) malformed: u64,
     /// Record indices of the active branch (root first), all of it.
@@ -159,6 +175,28 @@ struct MessageHead<'a> {
     is_error: Option<bool>,
 }
 
+/// The suggestion id of a `topic-suggestion` (`details.id`) or
+/// `topic-suggestion-state` (`data.id`) entry.
+#[derive(Deserialize)]
+struct SuggestionHead<'a> {
+    #[serde(borrow, default)]
+    details: Option<IdHead<'a>>,
+    #[serde(borrow, default)]
+    data: Option<IdHead<'a>>,
+}
+
+#[derive(Deserialize)]
+struct IdHead<'a> {
+    #[serde(borrow, default)]
+    id: Option<Cow<'a, str>>,
+}
+
+fn suggestion_id(body: &[u8]) -> Option<Box<str>> {
+    let head = serde_json::from_slice::<SuggestionHead>(body).ok()?;
+    let id = head.details.or(head.data)?.id?;
+    (!id.is_empty()).then(|| id.as_ref().into())
+}
+
 impl SessionIndex {
     pub(super) fn new(path: &Path) -> Self {
         Self {
@@ -169,6 +207,8 @@ impl SessionIndex {
             records: Vec::new(),
             by_id: HashMap::new(),
             results: HashMap::new(),
+            suggestions: HashMap::new(),
+            suggestion_states: HashMap::new(),
             malformed: 0,
             branch: Vec::new(),
             branch_start: 0,
@@ -209,6 +249,16 @@ impl SessionIndex {
 
     pub(super) fn result_for(&self, tool_call_id: &str) -> Option<u32> {
         self.results.get(tool_call_id).copied()
+    }
+
+    /// The `topic-suggestion` record of suggestion `id`.
+    pub(super) fn suggestion(&self, id: &str) -> Option<u32> {
+        self.suggestions.get(id).copied()
+    }
+
+    /// The `topic-suggestion-state` records of suggestion `id`, oldest first.
+    pub(super) fn suggestion_states(&self, id: &str) -> &[u32] {
+        self.suggestion_states.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Catch up with the file: tail what was appended, or rebuild from scratch
@@ -328,6 +378,14 @@ impl SessionIndex {
                     Kind::Hidden
                 } else if custom == "async-result" {
                     Kind::AsyncResult
+                } else if custom == SUGGESTION_TYPE {
+                    match suggestion_id(body) {
+                        Some(suggestion) => {
+                            self.suggestions.insert(suggestion, index);
+                            Kind::Suggestion
+                        }
+                        None => Kind::Note,
+                    }
                 } else {
                     Kind::Note
                 }
@@ -340,6 +398,18 @@ impl SessionIndex {
             "thinking_level_change" => Kind::ThinkingLevelChange,
             "custom" if head.custom_type.as_deref() == Some("session_exit") => Kind::SessionExit,
             "custom" if head.custom_type.as_deref() == Some("completion-recap") => Kind::Recap,
+            "custom" if head.custom_type.as_deref() == Some(SUGGESTION_STATE_TYPE) => {
+                match suggestion_id(body) {
+                    Some(suggestion) => {
+                        self.suggestion_states
+                            .entry(suggestion)
+                            .or_default()
+                            .push(index);
+                        Kind::SuggestionState
+                    }
+                    None => Kind::Hidden,
+                }
+            }
             _ => Kind::Hidden,
         };
         let failed = matches!(kind, Kind::ToolResult | Kind::TaskResult)

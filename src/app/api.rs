@@ -1939,7 +1939,10 @@ impl App {
             | Method::AgentTopicsSend(_)
             | Method::AgentTopicsClose(_)
             | Method::AgentTopicsReopen(_)
-            | Method::AgentTopicsRename(_) => {
+            | Method::AgentTopicsRename(_)
+            | Method::AgentTopicsAcceptSuggestion(_)
+            | Method::AgentTopicsDismissSuggestion(_)
+            | Method::AgentTopicsOrganise(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",

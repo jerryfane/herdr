@@ -19,7 +19,7 @@ use super::plugins::{
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
-use super::topics::{AgentTopicInfo, AgentTopicSendMode};
+use super::topics::{AgentTopicInfo, AgentTopicSendMode, AgentTopicSuggestionInfo};
 use super::transcript::{
     AskFormAnswer, PendingAsk, TranscriptEntry, TranscriptModel, TranscriptPlanItem,
     TranscriptRecap, TranscriptSubagent, TranscriptWorking,
@@ -278,6 +278,11 @@ pub enum ResponseResult {
         agent: String,
         pane_id: String,
         topics: Vec<AgentTopicInfo>,
+        /// The agent's open topic suggestions, oldest first. Present only when
+        /// the agent's omp serves suggestions
+        /// (`agent.topics.accept_suggestion`); absent for an omp without them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggestions: Option<Vec<AgentTopicSuggestionInfo>>,
     },
     /// `agent.topics.new`: the topic the agent started.
     AgentTopicCreated {
@@ -305,6 +310,32 @@ pub enum ResponseResult {
         agent: String,
         pane_id: String,
         topic_id: String,
+    },
+    /// `agent.topics.accept_suggestion`: the topic started from the
+    /// suggestion. A suggestion accepted before answers the same `topic_id`
+    /// with `already_accepted: true`.
+    AgentTopicSuggestionAccepted {
+        agent: String,
+        pane_id: String,
+        suggestion_id: String,
+        topic_id: String,
+        already_accepted: bool,
+    },
+    /// `agent.topics.dismiss_suggestion`; `already_dismissed` when it was
+    /// dismissed before.
+    AgentTopicSuggestionDismissed {
+        agent: String,
+        pane_id: String,
+        suggestion_id: String,
+        already_dismissed: bool,
+    },
+    /// `agent.topics.organise`: the review turn was started, or `queued`
+    /// behind the agent's running turn. Its suggestions arrive as
+    /// `topic_suggestion` entries of `agent.transcript`.
+    AgentTopicsOrganiseStarted {
+        agent: String,
+        pane_id: String,
+        queued: bool,
     },
     StreamStarted {
         pane_id: String,

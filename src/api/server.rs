@@ -251,6 +251,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_transcript_topic: true,
         // Follows `[topics] omp_binary`; ping fills it in from the live config.
         agent_topics_switch: false,
+        // Suggestions go through the same Unix-only control socket.
+        agent_topic_suggestions: cfg!(unix),
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -2063,6 +2065,9 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::AgentTopicsRename(params) => Some(&mut params.target),
         // The restart runs where the agent's process is.
         Method::AgentTopicsSetEnabled(params) => Some(&mut params.target),
+        Method::AgentTopicsAcceptSuggestion(params) => Some(&mut params.target),
+        Method::AgentTopicsDismissSuggestion(params) => Some(&mut params.target),
+        Method::AgentTopicsOrganise(params) => Some(&mut params.target),
         Method::AgentExplain(params) => Some(&mut params.target),
         // `agent.restart` routes to the owning peer so a federated `<alias>/pane`
         // agent can be restarted from home; the resume runs where the process is.
@@ -2261,15 +2266,19 @@ fn maybe_route_to_peer(
         }
         return Some(result);
     }
-    // A peer without topics would refuse `agent.topics.*`; one that does not
-    // honour `topic` on `agent.transcript` would page the agent's own
-    // conversation instead, as a success.
+    // A peer without topics would refuse `agent.topics.*`, and one without
+    // topic suggestions their methods; one that does not honour `topic` on
+    // `agent.transcript` would page the agent's own conversation instead, as
+    // a success.
     let unsupported = if request.method.is_agent_topics() && !peer_target.agent_topics() {
         Some("agent_topics")
     } else if matches!(&request.method, Method::AgentTopicsSetEnabled(_))
         && !peer_target.agent_topics_switch()
     {
         Some("agent_topics_switch")
+    } else if request.method.is_agent_topic_suggestions() && !peer_target.agent_topic_suggestions()
+    {
+        Some("agent_topic_suggestions")
     } else if matches!(&request.method, Method::AgentTranscript(params) if params.topic.is_some())
         && !peer_target.agent_transcript_topic()
     {
@@ -3959,6 +3968,7 @@ mod tests {
                 agent_topics: false,
                 agent_transcript_topic: false,
                 agent_topics_switch: false,
+                agent_topic_suggestions: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
@@ -5433,6 +5443,9 @@ mod federation_tests {
             ("agent.topics.reopen", AllowedAt(Admin)),
             ("agent.topics.rename", AllowedAt(Admin)),
             ("agent.topics.set_enabled", AllowedAt(Admin)),
+            ("agent.topics.accept_suggestion", AllowedAt(Interact)),
+            ("agent.topics.dismiss_suggestion", AllowedAt(Interact)),
+            ("agent.topics.organise", AllowedAt(Interact)),
             ("agent.explain", AllowedAt(Observe)),
             ("fence.explain", Denied),
             ("agent.send_keys", AllowedAt(Interact)),
@@ -7612,6 +7625,48 @@ mod federation_tests {
             fence_gate(&mut stream, fenced, &peers),
             FenceGate::Stream(4026532000)
         ));
+    }
+
+    #[test]
+    fn fence_gate_treats_topic_suggestions_like_agent_topics_new() {
+        let fenced = crate::platform::FencePeer::Fenced {
+            mount_namespace: 4026532000,
+        };
+        let mut peers = HashMap::new();
+        peers.insert("w1".to_string(), ());
+        for (method, extra) in [
+            ("agent.topics.new", r#","title":"t","message":"m""#),
+            (
+                "agent.topics.accept_suggestion",
+                r#","suggestion_id":"sg_1""#,
+            ),
+            (
+                "agent.topics.dismiss_suggestion",
+                r#","suggestion_id":"sg_1""#,
+            ),
+            ("agent.topics.organise", ""),
+        ] {
+            // A fenced pane may talk to a local agent, unchanged…
+            let mut local = fence_request(&format!(
+                r#"{{"id":"1","method":"{method}","params":{{"target":"builder"{extra}}}}}"#
+            ));
+            let before = local.clone();
+            assert!(
+                matches!(fence_gate(&mut local, fenced, &peers), FenceGate::Pass),
+                "{method}"
+            );
+            assert_eq!(local, before, "{method}");
+            // …but not to one on another machine.
+            let mut remote = fence_request(&format!(
+                r#"{{"id":"1","method":"{method}","params":{{"target":"w1/builder"{extra}}}}}"#
+            ));
+            match fence_gate(&mut remote, fenced, &peers) {
+                FenceGate::Refuse(message) => {
+                    assert!(message.contains(method), "{message}")
+                }
+                _ => panic!("{method} on another machine must be refused"),
+            }
+        }
     }
 
     #[test]

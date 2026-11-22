@@ -99,6 +99,21 @@
               "type": "string"
             },
             {
+              "const": "suggested",
+              "description": "The agent suggested a topic: `suggestion_id` names it and `topic_id`\nis empty. The suggestion is in `agent.topics.list` at once; its\n`agent.transcript` entry appears once the agent's current turn ends.",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_accepted",
+              "description": "Suggestion `suggestion_id` was accepted; `topic_id` is empty (the\ntopic's id is in the accept reply and the transcript entry).",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_dismissed",
+              "description": "Suggestion `suggestion_id` was dismissed; `topic_id` is empty.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -975,7 +990,7 @@
               "type": "object"
             },
             {
-              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`), or one\nof its topic suggestions was accepted or dismissed (`suggestion_id`).",
               "properties": {
                 "agent": {
                   "type": [
@@ -988,6 +1003,13 @@
                 },
                 "reason": {
                   "$ref": "#/schemas/event/$defs/AgentTopicChangeReason"
+                },
+                "suggestion_id": {
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "topic_id": {
                   "type": "string"
@@ -2278,6 +2300,22 @@
           ],
           "type": "object"
         },
+        "AgentTopicSuggestionTarget": {
+          "description": "One suggestion of one agent (`agent.topics.accept_suggestion`, which\nstarts the topic with the messages the agent picked, and\n`agent.topics.dismiss_suggestion`).",
+          "properties": {
+            "suggestion_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "suggestion_id"
+          ],
+          "type": "object"
+        },
         "AgentTopicTarget": {
           "description": "One topic of one agent (`agent.topics.close`, `agent.topics.reopen`).",
           "properties": {
@@ -2312,6 +2350,18 @@
             "target",
             "title",
             "message"
+          ],
+          "type": "object"
+        },
+        "AgentTopicsOrganiseParams": {
+          "description": "`agent.topics.organise`: one agent.",
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
           ],
           "type": "object"
         },
@@ -9432,6 +9482,56 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "description": "Start the topic an omp agent suggested (`capabilities.agent_topic_suggestions`).",
+          "properties": {
+            "method": {
+              "const": "agent.topics.accept_suggestion",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicSuggestionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.topics.dismiss_suggestion",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicSuggestionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ask an omp agent to review its main conversation and suggest topics.",
+          "properties": {
+            "method": {
+              "const": "agent.topics.organise",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTopicsOrganiseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -10282,6 +10382,21 @@
             {
               "const": "restored",
               "description": "The agent restored the topic with its session (startup, session switch).",
+              "type": "string"
+            },
+            {
+              "const": "suggested",
+              "description": "The agent suggested a topic: `suggestion_id` names it and `topic_id`\nis empty. The suggestion is in `agent.topics.list` at once; its\n`agent.transcript` entry appears once the agent's current turn ends.",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_accepted",
+              "description": "Suggestion `suggestion_id` was accepted; `topic_id` is empty (the\ntopic's id is in the accept reply and the transcript entry).",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_dismissed",
+              "description": "Suggestion `suggestion_id` was dismissed; `topic_id` is empty.",
               "type": "string"
             },
             {
@@ -11161,7 +11276,7 @@
               "type": "object"
             },
             {
-              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`), or one\nof its topic suggestions was accepted or dismissed (`suggestion_id`).",
               "properties": {
                 "agent": {
                   "type": [
@@ -11174,6 +11289,13 @@
                 },
                 "reason": {
                   "$ref": "#/schemas/subscription_stream_event/$defs/AgentTopicChangeReason"
+                },
+                "suggestion_id": {
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "topic_id": {
                   "type": "string"
@@ -13085,6 +13207,21 @@
               "type": "string"
             },
             {
+              "const": "suggested",
+              "description": "The agent suggested a topic: `suggestion_id` names it and `topic_id`\nis empty. The suggestion is in `agent.topics.list` at once; its\n`agent.transcript` entry appears once the agent's current turn ends.",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_accepted",
+              "description": "Suggestion `suggestion_id` was accepted; `topic_id` is empty (the\ntopic's id is in the accept reply and the transcript entry).",
+              "type": "string"
+            },
+            {
+              "const": "suggestion_dismissed",
+              "description": "Suggestion `suggestion_id` was dismissed; `topic_id` is empty.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -13220,6 +13357,41 @@
               "type": "string"
             }
           ]
+        },
+        "AgentTopicSuggestionInfo": {
+          "description": "One open topic suggestion, as `agent.topics.list` reports it: the agent\nproposes moving these messages of its main conversation into a new topic.",
+          "properties": {
+            "created_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message_ids": {
+              "description": "The main conversation's entries (`agent.transcript` ids) the topic\nwould start with.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reason": {
+              "description": "Why the agent suggests it, in its words.",
+              "type": "string"
+            },
+            "suggestion_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "suggestion_id",
+            "title",
+            "reason",
+            "message_ids",
+            "created_unix_ms"
+          ],
+          "type": "object"
         },
         "AskForm": {
           "description": "An omp (≥ 18.18.3) `ask` HTML form, reduced the way omp's terminal form\ndraws it (upstream `packages/tui/src/html-form/parse.ts`). Hidden inputs\nare left out: omp submits them itself.",
@@ -14525,7 +14697,7 @@
               "type": "object"
             },
             {
-              "description": "One of an omp agent's topics changed (`agent.topics.changed`).",
+              "description": "One of an omp agent's topics changed (`agent.topics.changed`), or one\nof its topic suggestions was accepted or dismissed (`suggestion_id`).",
               "properties": {
                 "agent": {
                   "type": [
@@ -14538,6 +14710,13 @@
                 },
                 "reason": {
                   "$ref": "#/schemas/success_response/$defs/AgentTopicChangeReason"
+                },
+                "suggestion_id": {
+                  "description": "The suggestion whose state changed (`suggestion_accepted`,\n`suggestion_dismissed`).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "topic_id": {
                   "type": "string"
@@ -18504,6 +18683,16 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "suggestions": {
+                  "description": "The agent's open topic suggestions, oldest first. Present only when\nthe agent's omp serves suggestions\n(`agent.topics.accept_suggestion`); absent for an omp without them.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentTopicSuggestionInfo"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
                 "topics": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentTopicInfo"
@@ -18624,6 +18813,93 @@
                 "agent",
                 "pane_id",
                 "topic_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.accept_suggestion`: the topic started from the\nsuggestion. A suggestion accepted before answers the same `topic_id`\nwith `already_accepted: true`.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "already_accepted": {
+                  "type": "boolean"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "suggestion_id": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topic_suggestion_accepted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "suggestion_id",
+                "topic_id",
+                "already_accepted"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.dismiss_suggestion`; `already_dismissed` when it was\ndismissed before.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "already_dismissed": {
+                  "type": "boolean"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "suggestion_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_topic_suggestion_dismissed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "suggestion_id",
+                "already_dismissed"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`agent.topics.organise`: the review turn was started, or `queued`\nbehind the agent's running turn. Its suggestions arrive as\n`topic_suggestion` entries of `agent.transcript`.",
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "queued": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "agent_topics_organise_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "pane_id",
+                "queued"
               ],
               "type": "object"
             },
@@ -19953,6 +20229,11 @@
               },
               "type": "array"
             },
+            "agent_topic_suggestions": {
+              "default": false,
+              "description": "Serves `agent.topics.accept_suggestion`, `agent.topics.dismiss_suggestion`\nand `agent.topics.organise`, `suggestions` on `agent.topics.list` and\n`topic_suggestion` entries on `agent.transcript`. Whether one agent's\nomp has suggestions shows per agent: its `agent.topics.list` carries\n`suggestions` only then, and an omp without them answers these\nmethods `topics_unsupported`.",
+              "type": "boolean"
+            },
             "agent_topics": {
               "default": false,
               "description": "Serves `agent.topics.*`, the `agent.topics.changed` event and\n`topic_sessions` on `agent.list`/`agent.get`.",
@@ -20265,6 +20546,23 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TopicSuggestionState": {
+          "description": "Where a topic suggestion stands (`agent.transcript` `topic_suggestion`).",
+          "oneOf": [
+            {
+              "enum": [
+                "open",
+                "dismissed"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "accepted",
+              "description": "A topic was started from it (`topic_id`).",
+              "type": "string"
+            }
+          ]
         },
         "TranscriptAuthor": {
           "description": "Who wrote a `user` entry: the owner at the terminal, or a guest whose prompt\narrived through HerdrUp with the `<name> (via HerdrUp): ` prefix.",
@@ -20617,6 +20915,69 @@
                 "id",
                 "ts_ms",
                 "text"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A topic the agent suggests starting from some of its messages (omp\nwith topics). `id` is the suggestion id `agent.topics.accept_suggestion`\nand `agent.topics.dismiss_suggestion` take. Its newest state wins: an\n`after` page re-sends the entry under the same id when it changes.",
+              "properties": {
+                "by": {
+                  "description": "Who accepted or dismissed it: `owner`, or the guest's name as\nthe owner's share names them.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "topic_suggestion",
+                  "type": "string"
+                },
+                "message_count": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message_ids": {
+                  "description": "The entries of this conversation the topic would start with.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/TopicSuggestionState"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "description": "The topic started from it, once `accepted`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "ts_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind",
+                "id",
+                "ts_ms",
+                "title",
+                "reason",
+                "message_ids",
+                "message_count",
+                "state"
               ],
               "type": "object"
             }

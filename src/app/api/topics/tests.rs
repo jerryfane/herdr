@@ -80,7 +80,7 @@ fn topics(app: &App, method: Method) -> Value {
         },
         respond_to,
     );
-    serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap()
+    serde_json::from_str(&response.recv_timeout(WAIT).expect("no topics reply")).unwrap()
 }
 
 fn list(target: &str) -> Method {
@@ -320,27 +320,11 @@ fn a_topic_change_from_the_agent_becomes_an_agent_topics_changed_event() {
     );
     // The first topics request also subscribes to the agent's changes.
     topics(&app, list(&pane));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let frame = fake.frames.recv_timeout(Duration::from_secs(10)).unwrap();
-        if frame["type"] == "subscribe" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no subscription");
-    }
+    received(&fake, "subscribe");
     fake.updates
         .send(json!({"id": "Plan", "ownerId": "o", "parentSessionId": "p", "reason": "spawned"}))
         .unwrap();
-    let event = loop {
-        match app.event_rx.try_recv() {
-            Ok(event @ crate::events::AppEvent::AgentTopicsChanged { .. }) => break event,
-            Ok(_) => {}
-            Err(_) => {
-                assert!(Instant::now() < deadline, "no topic change");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
+    let event = next_topics_change(&mut app);
     app.handle_internal_event_with_render_impact(event);
     let emitted: Vec<_> = app
         .event_hub
@@ -559,4 +543,284 @@ fn switching_on_an_omp_that_already_offers_topics_records_the_choice() {
         }),
     );
     assert_eq!(response["result"]["changed"], false, "{response}");
+}
+
+/// An `agent.topics.*` request as a client sends it.
+fn wire(method: &str, params: Value) -> Method {
+    serde_json::from_value::<Request>(json!({"id": "t", "method": method, "params": params}))
+        .unwrap()
+        .method
+}
+
+/// An app whose omp offered the control `fake` serves.
+fn offered(tag: &str, fake: &FakeControl) -> (Fixture, App, String) {
+    let session = Fixture::new(tag);
+    let omp = std::process::id();
+    let (mut app, pane, _) = omp_app(&session.path, omp);
+    send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+    (session, app, pane)
+}
+
+/// How long a test waits for one thing the agent or the app's worker
+/// threads do: generous for a loaded CI runner, still red when it never
+/// happens.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// The next `kind` frame the agent read, skipping any others.
+fn received(fake: &FakeControl, kind: &str) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let frame = fake
+            .frames
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("the agent never got {kind}"));
+        if frame["type"] == kind {
+            return frame;
+        }
+    }
+}
+
+/// The next topic change the app's reader thread queued, skipping other
+/// app events; each call gets its own deadline.
+fn next_topics_change(app: &mut App) -> crate::events::AppEvent {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match app.event_rx.try_recv() {
+            Ok(event @ crate::events::AppEvent::AgentTopicsChanged { .. }) => return event,
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline, "no agent.topics.changed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_owner_acts_on_suggestions_as_owner_and_a_repeat_is_a_success() {
+    let fake = FakeControl::start("sg-owner", |frame| {
+        let again = frame["suggestionId"] == "sg_again";
+        match frame["type"].as_str().unwrap_or_default() {
+            "topics_accept_suggestion" => {
+                json!({"success": true, "data": {"topicId": "T1", "alreadyAccepted": again}})
+            }
+            "topics_dismiss_suggestion" => {
+                json!({"success": true, "data": {"alreadyDismissed": again}})
+            }
+            "topics_organise" => json!({"success": true, "data": {"queued": false}}),
+            _ => json!({"success": true, "data": {"topics": []}}),
+        }
+    });
+    let (_session, mut app, pane) = offered("sg-owner", &fake);
+    // The first topics request also subscribes to the agent's changes; wait
+    // for it before the commands, whose frames `received` skips past.
+    topics(&app, list(&pane));
+    received(&fake, "subscribe");
+
+    let accepted = topics(
+        &app,
+        wire(
+            "agent.topics.accept_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_1"}),
+        ),
+    );
+    assert_eq!(
+        accepted["result"],
+        json!({"type": "agent_topic_suggestion_accepted", "agent": "omp", "pane_id": pane,
+            "suggestion_id": "sg_1", "topic_id": "T1", "already_accepted": false}),
+        "{accepted}"
+    );
+    let frame = received(&fake, "topics_accept_suggestion");
+    assert_eq!(frame["suggestionId"], "sg_1");
+    // The agent picked the messages: herdr forwards none.
+    assert!(frame.get("messageIds").is_none(), "{frame}");
+    assert_eq!(frame["by"], "owner");
+
+    // A repeat answers the same topic as a success.
+    let again = topics(
+        &app,
+        wire(
+            "agent.topics.accept_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_again"}),
+        ),
+    );
+    assert_eq!(again["result"]["already_accepted"], true, "{again}");
+    assert_eq!(again["result"]["topic_id"], "T1", "{again}");
+
+    let dismissed = topics(
+        &app,
+        wire(
+            "agent.topics.dismiss_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_2"}),
+        ),
+    );
+    assert_eq!(
+        dismissed["result"],
+        json!({"type": "agent_topic_suggestion_dismissed", "agent": "omp", "pane_id": pane,
+            "suggestion_id": "sg_2", "already_dismissed": false}),
+        "{dismissed}"
+    );
+    assert_eq!(received(&fake, "topics_dismiss_suggestion")["by"], "owner");
+    let again = topics(
+        &app,
+        wire(
+            "agent.topics.dismiss_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_again"}),
+        ),
+    );
+    assert_eq!(again["result"]["already_dismissed"], true, "{again}");
+
+    let organised = topics(&app, wire("agent.topics.organise", json!({"target": pane})));
+    assert_eq!(
+        organised["result"],
+        json!({"type": "agent_topics_organise_started", "agent": "omp", "pane_id": pane,
+            "queued": false}),
+        "{organised}"
+    );
+    assert_eq!(received(&fake, "topics_organise")["by"], "owner");
+
+    // The guest gate names a guest; herdr passes the name as `by`.
+    topics(
+        &app,
+        Method::AgentTopicsOrganise(crate::api::schema::AgentTopicsOrganiseParams {
+            target: pane.clone(),
+            acting_guest: Some("Ana (via HerdrUp)".into()),
+        }),
+    );
+    assert_eq!(
+        received(&fake, "topics_organise")["by"],
+        "Ana (via HerdrUp)"
+    );
+
+    // The agent announces each suggestion change on its `topic_update`
+    // stream (which the requests above subscribed to), naming the
+    // suggestion: each one is an `agent.topics.changed` with
+    // `suggestion_id`, not a topic id.
+    for (id, reason) in [
+        ("sg_3", "suggested"),
+        ("sg_1", "suggestion-accepted"),
+        ("sg_2", "suggestion-dismissed"),
+    ] {
+        fake.updates
+            .send(json!({"id": id, "ownerId": "o", "parentSessionId": "p", "reason": reason}))
+            .unwrap();
+    }
+    let changes: Vec<_> = (0..3).map(|_| next_topics_change(&mut app)).collect();
+    for change in changes {
+        app.handle_internal_event_with_render_impact(change);
+    }
+    let emitted: Vec<_> = app
+        .event_hub
+        .events_after(0)
+        .into_iter()
+        .map(|(_, event)| serde_json::to_value(event).unwrap()["data"].clone())
+        .filter(|data| data["type"] == "agent_topics_changed")
+        .collect();
+    let workspace = emitted[0]["workspace_id"].clone();
+    assert_eq!(
+        emitted,
+        [
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+                "agent": "omp", "topic_id": "", "reason": "suggested", "suggestion_id": "sg_3"}),
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+                "agent": "omp", "topic_id": "", "reason": "suggestion_accepted", "suggestion_id": "sg_1"}),
+            json!({"type": "agent_topics_changed", "pane_id": pane, "workspace_id": workspace,
+                "agent": "omp", "topic_id": "", "reason": "suggestion_dismissed", "suggestion_id": "sg_2"}),
+        ]
+    );
+}
+
+#[test]
+fn a_suggestion_refusal_keeps_the_agents_code() {
+    let fake = FakeControl::start("sg-codes", |frame| {
+        let code = match frame["type"].as_str().unwrap_or_default() {
+            "topics_organise" => "organise_running",
+            _ => frame["suggestionId"].as_str().unwrap_or("topic_rejected"),
+        };
+        json!({"success": false, "error": format!("refused: {code}"), "code": code})
+    });
+    let (_session, app, pane) = offered("sg-codes", &fake);
+    for code in [
+        "suggestion_not_found",
+        "invalid_message_ids",
+        "topics_disabled",
+    ] {
+        let response = topics(
+            &app,
+            wire(
+                "agent.topics.accept_suggestion",
+                json!({"target": pane, "suggestion_id": code}),
+            ),
+        );
+        assert_eq!(response["error"]["code"], code, "{response}");
+        assert_eq!(response["error"]["message"], format!("refused: {code}"));
+    }
+    let response = topics(
+        &app,
+        wire(
+            "agent.topics.dismiss_suggestion",
+            json!({"target": pane, "suggestion_id": "already_accepted"}),
+        ),
+    );
+    assert_eq!(response["error"]["code"], "already_accepted", "{response}");
+    let response = topics(&app, wire("agent.topics.organise", json!({"target": pane})));
+    assert_eq!(response["error"]["code"], "organise_running", "{response}");
+}
+
+#[test]
+fn topics_list_passes_only_open_suggestions_through() {
+    let fake = FakeControl::start("sg-list", |_| {
+        json!({"success": true, "data": {"topics": [], "suggestions": [
+            {"id": "sg_open", "title": "Release notes", "reason": "a separate subject",
+                "messageIds": ["m1", "m2"], "createdMs": 5_000},
+            {"id": "sg_gone", "title": "Old", "reason": "r", "messageIds": [], "createdMs": 1,
+                "state": "dismissed"},
+        ]}})
+    });
+    let (_session, app, pane) = offered("sg-list", &fake);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["result"]["suggestions"],
+        json!([{"suggestion_id": "sg_open", "title": "Release notes",
+            "reason": "a separate subject", "message_ids": ["m1", "m2"],
+            "created_unix_ms": 5_000}]),
+        "{response}"
+    );
+
+    // An omp without suggestions lists none rather than an empty list.
+    let older = FakeControl::start("sg-list-0", empty_topics);
+    let (_session, app, pane) = offered("sg-list-0", &older);
+    let response = topics(&app, list(&pane));
+    assert_eq!(response["result"]["topics"], json!([]), "{response}");
+    assert!(
+        response["result"].get("suggestions").is_none(),
+        "{response}"
+    );
+}
+
+#[test]
+fn an_omp_without_suggestions_answers_topics_unsupported() {
+    let fake = FakeControl::start("sg-old", |frame| {
+        if frame["type"] == "topics_list" {
+            empty_topics(frame)
+        } else {
+            json!({"success": false, "error": "Unknown command."})
+        }
+    });
+    let (_session, app, pane) = offered("sg-old", &fake);
+    let response = topics(
+        &app,
+        wire(
+            "agent.topics.dismiss_suggestion",
+            json!({"target": pane, "suggestion_id": "sg_1"}),
+        ),
+    );
+    assert_eq!(
+        response["error"]["code"], "topics_unsupported",
+        "{response}"
+    );
 }

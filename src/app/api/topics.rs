@@ -291,6 +291,26 @@ mod control {
                         title: params.title,
                     },
                 ),
+                Method::AgentTopicsAcceptSuggestion(params) => (
+                    params.target,
+                    TopicCommand::AcceptSuggestion {
+                        suggestion_id: params.suggestion_id,
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
+                Method::AgentTopicsDismissSuggestion(params) => (
+                    params.target,
+                    TopicCommand::DismissSuggestion {
+                        suggestion_id: params.suggestion_id,
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
+                Method::AgentTopicsOrganise(params) => (
+                    params.target,
+                    TopicCommand::Organise {
+                        by: acting_by(params.acting_guest),
+                    },
+                ),
                 _ => {
                     let _ = respond_to.send(encode_error(
                         id,
@@ -308,6 +328,8 @@ mod control {
                 }
             };
             self.follow_topic_changes(&target);
+            // Suggestion state changes reach `agent.topics.changed` through
+            // the agent's own `topic_update` stream this request follows.
             let reply = respond_to.clone();
             let reply_id = id.clone();
             let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics", move || {
@@ -373,6 +395,7 @@ mod control {
                     agent,
                     topic_id: change.topic_id,
                     reason: change.reason,
+                    suggestion_id: change.suggestion_id,
                 },
             });
         }
@@ -426,18 +449,30 @@ mod control {
         }
     }
 
+    /// Who acts on a suggestion, as omp's `by` records it: the guest's name
+    /// as their share shows it (`<name> (via HerdrUp)`, the sender of their
+    /// Gram posts), else `owner` (the owner, their scripts and agents, and
+    /// federated peers acting for them).
+    fn acting_by(acting_guest: Option<String>) -> String {
+        acting_guest.unwrap_or_else(|| "owner".into())
+    }
+
     fn topics_response(id: String, target: &TopicsTarget, command: TopicCommand) -> String {
         let reply = ControlConnection::open(&target.control.endpoint)
             .and_then(|mut connection| connection.run(command));
         let agent = target.agent.clone();
         let pane_id = target.pane_id.clone();
         match reply {
-            Ok(TopicReply::List(topics)) => encode_success(
+            Ok(TopicReply::List {
+                topics,
+                suggestions,
+            }) => encode_success(
                 id,
                 ResponseResult::AgentTopics {
                     agent,
                     pane_id,
                     topics,
+                    suggestions,
                 },
             ),
             Ok(TopicReply::Created { topic_id }) => encode_success(
@@ -463,6 +498,40 @@ mod control {
                     agent,
                     pane_id,
                     topic_id,
+                },
+            ),
+            Ok(TopicReply::SuggestionAccepted {
+                suggestion_id,
+                topic_id,
+                already_accepted,
+            }) => encode_success(
+                id,
+                ResponseResult::AgentTopicSuggestionAccepted {
+                    agent,
+                    pane_id,
+                    suggestion_id,
+                    topic_id,
+                    already_accepted,
+                },
+            ),
+            Ok(TopicReply::SuggestionDismissed {
+                suggestion_id,
+                already_dismissed,
+            }) => encode_success(
+                id,
+                ResponseResult::AgentTopicSuggestionDismissed {
+                    agent,
+                    pane_id,
+                    suggestion_id,
+                    already_dismissed,
+                },
+            ),
+            Ok(TopicReply::Organising { queued }) => encode_success(
+                id,
+                ResponseResult::AgentTopicsOrganiseStarted {
+                    agent,
+                    pane_id,
+                    queued,
                 },
             ),
             Err(error) => {

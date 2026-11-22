@@ -165,8 +165,15 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "worktree.list"
         | "layout.export" => (AllowedAt(Observe), false),
         // Interact methods with an explicit remote-owned target.
-        "agent.prompt" | "agent.send_keys" | "agent.topics.new" | "agent.topics.send"
-        | "pane.send_text" | "pane.send_keys" => (AllowedAt(Interact), true),
+        "agent.prompt"
+        | "agent.send_keys"
+        | "agent.topics.new"
+        | "agent.topics.send"
+        | "agent.topics.accept_suggestion"
+        | "agent.topics.dismiss_suggestion"
+        | "agent.topics.organise"
+        | "pane.send_text"
+        | "pane.send_keys" => (AllowedAt(Interact), true),
         // Admin methods with an explicit remote-owned target.
         "agent.focus"
         | "agent.rename"

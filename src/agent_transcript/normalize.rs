@@ -5,8 +5,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::schema::{
-    AskForm, AskFormAnswer, AskFormStatus, AskQuestion, TranscriptAuthor, TranscriptNoteSource,
-    TranscriptPlanItem, TranscriptSubagentStatus, TranscriptTaskStatus, TranscriptTurnStatus,
+    AskForm, AskFormAnswer, AskFormStatus, AskQuestion, TopicSuggestionState, TranscriptAuthor,
+    TranscriptNoteSource, TranscriptPlanItem, TranscriptSubagentStatus, TranscriptTaskStatus,
+    TranscriptTurnStatus,
 };
 
 pub(super) const DETAIL_MAX_CHARS: usize = 300;
@@ -22,6 +23,56 @@ const GUEST_PROMPT_MARKER: &str = " (via HerdrUp): ";
 const DETAIL_KEYS: &[&str] = &[
     "command", "path", "file", "pattern", "url", "query", "target", "task",
 ];
+
+/// A `topic-suggestion` message: `details` is the suggestion.
+#[derive(Deserialize)]
+pub(super) struct SuggestionLine {
+    #[serde(default)]
+    pub(super) timestamp: Option<String>,
+    pub(super) details: SuggestionDetails,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SuggestionDetails {
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) title: String,
+    #[serde(default)]
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) message_ids: Vec<String>,
+    #[serde(default)]
+    pub(super) created_ms: Option<f64>,
+}
+
+/// A `topic-suggestion-state` entry: `data` is the suggestion's new state.
+#[derive(Deserialize)]
+pub(super) struct SuggestionStateLine {
+    pub(super) data: SuggestionStateData,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SuggestionStateData {
+    pub(super) id: String,
+    pub(super) state: String,
+    #[serde(default)]
+    pub(super) topic_id: Option<String>,
+    #[serde(default)]
+    pub(super) by: Option<String>,
+}
+
+/// A state omp records for a suggestion; `None` for one this build does not
+/// know, which leaves the previous state standing.
+pub(super) fn suggestion_state(state: &str) -> Option<TopicSuggestionState> {
+    match state {
+        "open" => Some(TopicSuggestionState::Open),
+        "accepted" => Some(TopicSuggestionState::Accepted),
+        "dismissed" => Some(TopicSuggestionState::Dismissed),
+        _ => None,
+    }
+}
 
 #[derive(Deserialize)]
 pub(super) struct UserLine {

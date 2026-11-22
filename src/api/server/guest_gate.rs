@@ -441,7 +441,7 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true},
     }))
 }
 
@@ -452,7 +452,10 @@ fn project_topics(result: ResponseResult) -> Option<serde_json::Value> {
         ResponseResult::AgentTopics { .. }
         | ResponseResult::AgentTopicCreated { .. }
         | ResponseResult::AgentTopicSent { .. }
-        | ResponseResult::AgentTopicUpdated { .. } => serde_json::to_value(result).ok(),
+        | ResponseResult::AgentTopicUpdated { .. }
+        | ResponseResult::AgentTopicSuggestionAccepted { .. }
+        | ResponseResult::AgentTopicSuggestionDismissed { .. }
+        | ResponseResult::AgentTopicsOrganiseStarted { .. } => serde_json::to_value(result).ok(),
         _ => None,
     }
 }
@@ -468,6 +471,19 @@ fn topics_fields(method: &mut Method) -> Option<(&mut String, Option<&mut String
             Some((&mut params.target, None))
         }
         Method::AgentTopicsRename(params) => Some((&mut params.target, None)),
+        Method::AgentTopicsAcceptSuggestion(params) => Some((&mut params.target, None)),
+        Method::AgentTopicsDismissSuggestion(params) => Some((&mut params.target, None)),
+        Method::AgentTopicsOrganise(params) => Some((&mut params.target, None)),
+        _ => None,
+    }
+}
+
+/// Where a guest's suggestion request names who acts (`by` on omp's side).
+fn topics_actor(method: &mut Method) -> Option<&mut Option<String>> {
+    match method {
+        Method::AgentTopicsAcceptSuggestion(params) => Some(&mut params.acting_guest),
+        Method::AgentTopicsDismissSuggestion(params) => Some(&mut params.acting_guest),
+        Method::AgentTopicsOrganise(params) => Some(&mut params.acting_guest),
         _ => None,
     }
 }
@@ -1057,12 +1073,18 @@ fn serve_request(
         // `agent.topics.changed`.
         // Owner decision (2026-11-19, #474): a guest gets the same topic
         // access as the owner, close/reopen/rename included, not read-only.
+        // Owner decision (2026-11-22): a guest who may send to the agent may
+        // also accept and dismiss its topic suggestions and run Organise;
+        // omp records them as `by` the guest's name (`post_from`).
         mut topics @ (Method::AgentTopicsList(_)
         | Method::AgentTopicsNew(_)
         | Method::AgentTopicsSend(_)
         | Method::AgentTopicsClose(_)
         | Method::AgentTopicsReopen(_)
-        | Method::AgentTopicsRename(_)) => {
+        | Method::AgentTopicsRename(_)
+        | Method::AgentTopicsAcceptSuggestion(_)
+        | Method::AgentTopicsDismissSuggestion(_)
+        | Method::AgentTopicsOrganise(_)) => {
             let Some((target, message)) = topics_fields(&mut topics) else {
                 return forbidden(stream);
             };
@@ -1096,6 +1118,9 @@ fn serve_request(
                 *message = format!("{}{}", guest.label(), message);
             }
             *target = agent.pane_id;
+            if let Some(actor) = topics_actor(&mut topics) {
+                *actor = Some(guest.post_from());
+            }
             let request = Request {
                 id: id.clone(),
                 method: topics,
@@ -3614,6 +3639,151 @@ mod tests {
         assert_eq!(code(&lines), "guest_forbidden");
     }
 
+    #[test]
+    fn a_guest_acts_on_the_granted_agents_topic_suggestions_under_their_name() {
+        use crate::agent_topics::control::tests::FakeControl;
+        let fake = FakeControl::start("g-suggest", |frame| {
+            match frame["type"].as_str().unwrap_or_default() {
+                "topics_accept_suggestion" => {
+                    json!({"success": true, "data": {"topicId": "T1", "alreadyAccepted": false}})
+                }
+                "topics_dismiss_suggestion" => {
+                    json!({"success": true, "data": {"alreadyDismissed": true}})
+                }
+                "topics_organise" => json!({"success": true, "data": {"queued": true}}),
+                _ => json!({"success": false, "error": "Unknown command."}),
+            }
+        });
+        let harness = start("topic-suggestions");
+        // The granted agent is an omp that offered its topics, before the
+        // invite records its kind.
+        let endpoint = fake.endpoint(std::process::id());
+        let (ready_tx, ready) = std_mpsc::channel();
+        harness
+            .control
+            .send(Box::new(move |app: &mut App| {
+                let pane = app.state.workspaces[0].tabs[0].root_pane;
+                let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+                terminal.set_detected_state(
+                    Some(crate::detect::Agent::Omp),
+                    crate::detect::AgentState::Idle,
+                );
+                terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    session_ref: crate::agent_resume::AgentSessionRef::id("session-omp").unwrap(),
+                });
+                terminal.set_agent_name("llm-opt".into());
+                app.agent_controls.inspected_pid_for_test = Some(Some(std::process::id()));
+                app.agent_controls.register(terminal_id, endpoint);
+                let _ = ready_tx.send(());
+            }))
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let guest = harness.admit();
+        let by = format!("{} (via HerdrUp)", guest.name);
+        let sent = |kind: &str| loop {
+            let frame = fake
+                .frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the agent got the command");
+            if frame["type"] == kind {
+                return frame;
+            }
+        };
+
+        // The wire cannot name who acts: the gate does.
+        let pane = harness.pane_ids[0].clone();
+        let lines = harness.call(
+            &guest,
+            json!({"id": "a", "method": "agent.topics.accept_suggestion", "params": {
+                "target": pane, "suggestion_id": "sg_1",
+                "acting_guest": "owner", "by": "owner"}}),
+        );
+        let result = &lines[0]["result"];
+        assert_eq!(
+            result["type"], "agent_topic_suggestion_accepted",
+            "{lines:?}"
+        );
+        assert_eq!(result["pane_id"], pane.as_str(), "{lines:?}");
+        assert_eq!(result["suggestion_id"], "sg_1", "{lines:?}");
+        assert_eq!(result["topic_id"], "T1", "{lines:?}");
+        assert_eq!(result["already_accepted"], false, "{lines:?}");
+        let frame = sent("topics_accept_suggestion");
+        assert_eq!(frame["suggestionId"], "sg_1");
+        assert!(
+            frame.get("messageIds").is_none(),
+            "the agent picks the messages"
+        );
+        assert_eq!(frame["by"], by);
+
+        let lines = harness.call(
+            &guest,
+            json!({"id": "d", "method": "agent.topics.dismiss_suggestion", "params": {
+                "target": pane, "suggestion_id": "sg_2"}}),
+        );
+        assert_eq!(lines[0]["result"]["already_dismissed"], true, "{lines:?}");
+        assert_eq!(sent("topics_dismiss_suggestion")["by"], by);
+
+        let lines = harness.call(
+            &guest,
+            json!({"id": "o", "method": "agent.topics.organise", "params": {"target": pane}}),
+        );
+        assert_eq!(
+            lines[0]["result"]["type"], "agent_topics_organise_started",
+            "{lines:?}"
+        );
+        assert_eq!(lines[0]["result"]["queued"], true, "{lines:?}");
+        assert_eq!(sent("topics_organise")["by"], by);
+
+        // Any other agent's suggestions stay closed.
+        for request in [
+            json!({"id": "x", "method": "agent.topics.accept_suggestion", "params": {"target": "other-agent", "suggestion_id": "sg_1"}}),
+            json!({"id": "x", "method": "agent.topics.dismiss_suggestion", "params": {"target": "other-agent", "suggestion_id": "sg_1"}}),
+            json!({"id": "x", "method": "agent.topics.organise", "params": {"target": "other-agent"}}),
+        ] {
+            let lines = harness.call(&guest, request);
+            assert_eq!(code(&lines), "guest_forbidden", "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_guest_sees_topic_suggestions_in_the_transcript() {
+        use crate::api::schema::TopicSuggestionState;
+        let suggestion = TranscriptEntry::TopicSuggestion {
+            id: "sg_1".into(),
+            ts_ms: 1,
+            title: "Release notes".into(),
+            reason: "a separate subject".into(),
+            message_ids: vec!["m1".into()],
+            message_count: 1,
+            state: TopicSuggestionState::Dismissed,
+            topic_id: None,
+            by: Some("Ana (via HerdrUp)".into()),
+        };
+        let projected = project_transcript(ResponseResult::AgentTranscript {
+            agent: "a".into(),
+            pane_id: "p".into(),
+            session_id: "s".into(),
+            entries: vec![suggestion.clone()],
+            before: None,
+            after: "cursor".into(),
+            pending_ask: None,
+            working: None,
+            model: None,
+            plan: None,
+            recap: None,
+            subagents: None,
+            resent: Some(vec!["sg_1".into()]),
+        })
+        .unwrap();
+        assert_eq!(projected["entries"], json!([suggestion]));
+        assert_eq!(projected["resent"], json!(["sg_1"]));
+    }
+
     /// Open the granted stream and read up to its `stream_started` ack.
     fn open_stream(
         harness: &Harness,
@@ -4822,7 +4992,7 @@ mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true}),
             "only what the gate serves"
         );
 

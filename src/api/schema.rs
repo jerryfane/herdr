@@ -267,6 +267,11 @@ operations::define_operations! {
     /// Restart an omp agent on the topics build or the stock omp, resuming the
     /// same session (`capabilities.agent_topics_switch`). Owner only.
     AgentTopicsSetEnabled(AgentTopicsSetEnabledParams) => "agent.topics.set_enabled", false, false;
+    /// Start the topic an omp agent suggested (`capabilities.agent_topic_suggestions`).
+    AgentTopicsAcceptSuggestion(AgentTopicSuggestionTarget) => "agent.topics.accept_suggestion", false, false;
+    AgentTopicsDismissSuggestion(AgentTopicSuggestionTarget) => "agent.topics.dismiss_suggestion", false, false;
+    /// Ask an omp agent to review its main conversation and suggest topics.
+    AgentTopicsOrganise(AgentTopicsOrganiseParams) => "agent.topics.organise", false, false;
 }
 
 impl Method {
@@ -280,6 +285,17 @@ impl Method {
                 | Self::AgentTopicsClose(_)
                 | Self::AgentTopicsReopen(_)
                 | Self::AgentTopicsRename(_)
+        ) || self.is_agent_topic_suggestions()
+    }
+
+    /// One of the `agent.topics.*` methods on suggestions
+    /// (`capabilities.agent_topic_suggestions`).
+    pub(crate) fn is_agent_topic_suggestions(&self) -> bool {
+        matches!(
+            self,
+            Self::AgentTopicsAcceptSuggestion(_)
+                | Self::AgentTopicsDismissSuggestion(_)
+                | Self::AgentTopicsOrganise(_)
         )
     }
 

@@ -43,6 +43,55 @@ pub struct AgentTopicsSetEnabledParams {
     pub enabled: bool,
 }
 
+/// One suggestion of one agent (`agent.topics.accept_suggestion`, which
+/// starts the topic with the messages the agent picked, and
+/// `agent.topics.dismiss_suggestion`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTopicSuggestionTarget {
+    pub target: String,
+    pub suggestion_id: String,
+    /// Internal only: the guest gate's name for the guest who acts. Never
+    /// read from the wire; `None` is the owner.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub acting_guest: Option<String>,
+}
+
+/// `agent.topics.organise`: one agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTopicsOrganiseParams {
+    pub target: String,
+    /// Internal only: the guest gate's name for the guest who acts. Never
+    /// read from the wire; `None` is the owner.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub acting_guest: Option<String>,
+}
+
+/// One open topic suggestion, as `agent.topics.list` reports it: the agent
+/// proposes moving these messages of its main conversation into a new topic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTopicSuggestionInfo {
+    pub suggestion_id: String,
+    pub title: String,
+    /// Why the agent suggests it, in its words.
+    pub reason: String,
+    /// The main conversation's entries (`agent.transcript` ids) the topic
+    /// would start with.
+    pub message_ids: Vec<String>,
+    pub created_unix_ms: u64,
+}
+
+/// Where a topic suggestion stands (`agent.transcript` `topic_suggestion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicSuggestionState {
+    Open,
+    /// A topic was started from it (`topic_id`).
+    Accepted,
+    Dismissed,
+}
+
 /// Where a topic's worker is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +150,15 @@ pub enum AgentTopicChangeReason {
     Retitled,
     /// The agent restored the topic with its session (startup, session switch).
     Restored,
+    /// The agent suggested a topic: `suggestion_id` names it and `topic_id`
+    /// is empty. The suggestion is in `agent.topics.list` at once; its
+    /// `agent.transcript` entry appears once the agent's current turn ends.
+    Suggested,
+    /// Suggestion `suggestion_id` was accepted; `topic_id` is empty (the
+    /// topic's id is in the accept reply and the transcript entry).
+    SuggestionAccepted,
+    /// Suggestion `suggestion_id` was dismissed; `topic_id` is empty.
+    SuggestionDismissed,
     /// A reason this server does not know yet.
     #[serde(other)]
     Unknown,

@@ -389,6 +389,27 @@ pub enum TranscriptEntry {
         ts_ms: u64,
         text: String,
     },
+    /// A topic the agent suggests starting from some of its messages (omp
+    /// with topics). `id` is the suggestion id `agent.topics.accept_suggestion`
+    /// and `agent.topics.dismiss_suggestion` take. Its newest state wins: an
+    /// `after` page re-sends the entry under the same id when it changes.
+    TopicSuggestion {
+        id: String,
+        ts_ms: u64,
+        title: String,
+        reason: String,
+        /// The entries of this conversation the topic would start with.
+        message_ids: Vec<String>,
+        message_count: u64,
+        state: super::topics::TopicSuggestionState,
+        /// The topic started from it, once `accepted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic_id: Option<String>,
+        /// Who accepted or dismissed it: `owner`, or the guest's name as
+        /// the owner's share names them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
 }
 
 impl TranscriptEntry {
@@ -402,7 +423,8 @@ impl TranscriptEntry {
             | Self::Plan { id, .. }
             | Self::Ask { id, .. }
             | Self::TurnEnd { id, .. }
-            | Self::Summary { id, .. } => id,
+            | Self::Summary { id, .. }
+            | Self::TopicSuggestion { id, .. } => id,
         }
     }
 }
