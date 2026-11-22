@@ -591,7 +591,8 @@ crate::cli::projection::cli_params! {
 pub struct AgentControlToken(String);
 
 impl AgentControlToken {
-    #[cfg(test)]
+    // Its callers (agent_topics and the topics API tests) are unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn new(token: impl Into<String>) -> Self {
         Self(token.into())
     }

@@ -99,7 +99,9 @@ pub(super) fn serve(
 
 /// [`serve`] for the owner gate: `guard` is asked before every frame is
 /// written; when it returns a line, that line is sent and the stream ends,
-/// so a removed or expired grant cannot type another key.
+/// so a removed or expired grant cannot type another key. Unix only, like
+/// the owner gate.
+#[cfg(unix)]
 pub(super) fn serve_guarded(
     stream: &mut ApiStream,
     request_id: String,
