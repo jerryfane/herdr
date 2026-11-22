@@ -187,6 +187,18 @@ With `[guest] accounts` on (the default), an invite also offers "Add to my accou
 
 A guest's app can keep one encrypted session for its calls instead of reconnecting for each one, so polling and file transfers stay under the relay's limit on new connections. Each request on it is checked on its own; the session ends when the guest is revoked or the agent stops running, and after 60 seconds without a request.
 
+Your own browsers can be allowed on this machine through the same relay with owner grants. HerdrUp runs these for you when you approve a browser from a trusted device, one SSH call per machine:
+
+```bash
+herdr owner-access info                           # this machine's relay id (host_id), public key (node_pub), relay and link state
+herdr owner-access list                           # the browsers allowed here, removed and expired ones too until they are deleted
+herdr owner-access add --device-pub KEY --device-name NAME --scope chat|terminal --ttl SECS --statement JWS --approved-by NAME
+herdr owner-access renew <grant-id> --ttl SECS [--scope chat|terminal]
+herdr owner-access remove <grant-id> | --device-pub KEY | --fingerprint FINGERPRINT
+```
+
+A grant names one browser key (unpadded base64url; padding is refused) and lasts 1 hour to 30 days: any other `--ttl` is refused, never shortened. `--statement` is the approving device's own HerdrUp account statement for this machine (its `aud` is `host_id` from `info`); the server checks its signature, issuer, machine and time, then binds the grant to that account, also with `[guest] accounts` off. `terminal` access is a shell on this machine; `chat` reaches agents only. Adding a key that already has a grant replaces it. At most 10 grants may be live at once. `renew` sets the expiry to `--ttl` from now and also revives an expired grant that was not removed. `remove` of an unknown grant succeeds with nothing removed, so it is safe to repeat. Removed and expired grants are deleted 30 days later. While a grant is live the relay link stays up, as for a guest, and it goes down 24 hours after the last grant expires or is removed. `herdr guest log` records each add, renew and remove. These commands work only on this machine (no `--machine`); browsers cannot connect with a grant yet.
+
 ## Pairing
 
 ```bash
