@@ -507,10 +507,6 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
-            if self.app.apply_due_topics_switches(Instant::now()) {
-                needs_render = true;
-                needs_full_render = true;
-            }
             if self.app.expire_pty_leases_and_apply_shrinks(Instant::now()) {
                 needs_render = true;
                 needs_full_render = true;
@@ -557,6 +553,14 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
                 needs_graphics_render = false;
+            }
+
+            // After the API, client-input and server-event drains: input already
+            // queued this tick reaches the PTY (and moves its input mark) before an
+            // armed `when_idle` Topics switch decides it saw none.
+            if self.app.apply_due_topics_switches(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
             }
 
             if latest_shell_client(&self.clients).is_some() && self.app.ensure_default_workspace() {

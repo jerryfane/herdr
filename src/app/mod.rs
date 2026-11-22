@@ -196,9 +196,15 @@ pub struct App {
     pub(crate) loaded_accounts: Vec<crate::config::AccountConfig>,
     /// `[topics]`: the topics-enabled omp build behind `agent.topics.set_enabled`.
     pub(crate) topics_config: crate::config::TopicsConfig,
-    /// `when_idle` Topics switches armed at their agent's idle transition, by when
-    /// they were armed. Applied after `TOPICS_SWITCH_QUIET` without input.
-    pub(crate) topics_switch_armed: std::collections::HashMap<crate::terminal::TerminalId, Instant>,
+    /// `when_idle` Topics switches armed at their agent's idle transition: when,
+    /// and the pane's user input mark then. Applied after `TOPICS_SWITCH_QUIET`
+    /// only if that mark has not moved.
+    pub(crate) topics_switch_armed:
+        std::collections::HashMap<crate::terminal::TerminalId, (Instant, (u64, u64))>,
+    /// Each agent's user input mark when it was last reported working or blocked:
+    /// input past it was typed after its turn began and may sit unsent.
+    pub(crate) topics_busy_input_mark:
+        std::collections::HashMap<crate::terminal::TerminalId, (u64, u64)>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) pending_host_appearance_deadline: Option<Instant>,
@@ -750,6 +756,7 @@ impl App {
             loaded_accounts: config.accounts.clone(),
             topics_config: config.topics.clone(),
             topics_switch_armed: std::collections::HashMap::new(),
+            topics_busy_input_mark: std::collections::HashMap::new(),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             pending_host_appearance_deadline: None,

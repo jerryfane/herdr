@@ -211,8 +211,6 @@ impl App {
         else {
             return;
         };
-        // A prompt on its way in: an armed `when_idle` Topics switch waits again.
-        self.disarm_topics_switch(&terminal_id);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             // A second prompt inside the delay window would otherwise orphan the
             // first watch, and any abandonment it later raises becomes
@@ -247,8 +245,6 @@ impl App {
         create_if_absent: bool,
         force_new_attempt: bool,
     ) -> Option<String> {
-        // Input reached the agent: an armed `when_idle` Topics switch waits again.
-        self.disarm_topics_switch(terminal_id);
         let terminal = self.state.terminals.get_mut(terminal_id)?;
         if terminal.composer_write.is_none() && !create_if_absent {
             return None;

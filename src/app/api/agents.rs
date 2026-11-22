@@ -12,10 +12,10 @@ use crate::app::App;
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
-/// How long an armed `when_idle` Topics switch waits for quiet after the agent's
-/// idle transition: well past [`AGENT_PROMPT_SUBMIT_DELAY`], so a prompt accepted
-/// just before a stale idle report has its Enter written (and the agent reports
-/// working, which disarms the switch) before any relaunch.
+/// How long an armed `when_idle` Topics switch waits after the agent's idle
+/// transition before it may relaunch: well past [`AGENT_PROMPT_SUBMIT_DELAY`], so
+/// input arriving around a stale idle report moves the pane's input mark (or the
+/// agent reports working) first, and the relaunch is called off.
 const TOPICS_SWITCH_QUIET: Duration = Duration::from_millis(1500);
 fn input_kind_suffix(kind: Option<crate::detect::InputPromptKind>) -> &'static str {
     match kind {
@@ -718,7 +718,7 @@ impl App {
         let saved = terminal.agent_topics_enabled;
         let pending = terminal.topics_switch_pending;
         // Mid-turn by the busy/idle signal agent status reports (working or blocked),
-        // or a prompt whose submission is still in flight.
+        // a prompt still being submitted, or input typed since its turn began.
         let busy = !self.topics_switch_quiet(terminal);
         let terminal_id = terminal.id.clone();
         if params.enabled == saved && params.enabled == running {
@@ -764,8 +764,8 @@ impl App {
     }
 
     /// Record (or clear) a `when_idle` Topics switch, save it, and announce the
-    /// agent's new `topics_switch_pending` with `pane.updated`. A switch recorded on
-    /// an agent that is already idle is armed at once; any other change disarms it.
+    /// agent's new `topics_switch_pending` with `pane.updated`. Any change disarms
+    /// it: a switch is armed only at the agent's next idle transition.
     fn set_topics_switch_pending(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
@@ -777,18 +777,6 @@ impl App {
         let changed = terminal.topics_switch_pending != pending;
         terminal.topics_switch_pending = pending;
         self.topics_switch_armed.remove(terminal_id);
-        if pending.is_some()
-            && self
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| {
-                    self.reported_agent_state(terminal) == crate::detect::AgentState::Idle
-                })
-        {
-            self.topics_switch_armed
-                .insert(terminal_id.clone(), std::time::Instant::now());
-        }
         self.schedule_session_save();
         if changed {
             if let Some(target) = self.terminal_target_for_terminal_id(terminal_id.as_str()) {
@@ -799,23 +787,23 @@ impl App {
 
     /// The launch-time resolver behind every agent launch (`agent.restart`, a
     /// `when_idle` switch, a restore, an unarchive): `requested` is an immediate
-    /// switch, otherwise a pending `when_idle` switch applies. When it applies, the
-    /// change is saved and announced with `pane.updated`. Returns the build to run.
+    /// switch, otherwise a pending `when_idle` switch applies. Either way a pending
+    /// switch is gone afterwards, so its end is saved and announced with
+    /// `pane.updated`. Returns the build to run.
     pub(in crate::app) fn resolve_launch_topics(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
         requested: Option<bool>,
     ) -> bool {
         self.topics_switch_armed.remove(terminal_id);
+        self.topics_busy_input_mark.remove(terminal_id);
         let Some(terminal) = self.state.terminals.get_mut(terminal_id) else {
             return requested.unwrap_or(false);
         };
         let had_pending = terminal.topics_switch_pending.is_some();
-        let (topics_enabled, applied_pending) = terminal.resolve_launch_topics(requested);
+        let (topics_enabled, _) = terminal.resolve_launch_topics(requested);
         if had_pending {
             self.state.mark_session_dirty();
-        }
-        if applied_pending {
             if let Some(target) = self.terminal_target_for_terminal_id(terminal_id.as_str()) {
                 self.emit_pane_updated(target.ws_idx, target.pane_id);
             }
@@ -823,9 +811,23 @@ impl App {
         topics_enabled
     }
 
-    /// Whether a Topics relaunch would cut nothing now: the agent reports idle,
-    /// no `agent.prompt` submission is still in flight (its delayed Enter), and no
-    /// brokered prompt is unresolved.
+    /// The agent's pane input mark now (see [`TerminalRuntime::user_input_mark`]):
+    /// every user or API write to its PTY moves it, whichever path wrote it.
+    ///
+    /// [`TerminalRuntime::user_input_mark`]: crate::terminal::TerminalRuntime::user_input_mark
+    fn topics_input_mark(&self, terminal_id: &crate::terminal::TerminalId) -> Option<(u64, u64)> {
+        let target = self.terminal_target_for_terminal_id(terminal_id.as_str())?;
+        self.state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, target.ws_idx, target.pane_id)
+            .map(crate::terminal::TerminalRuntime::user_input_mark)
+    }
+
+    /// Whether a Topics relaunch would cut nothing now: the agent reports idle, no
+    /// prompt submission is unresolved (an `agent.prompt` whose delayed Enter is
+    /// pending, or a brokered prompt), and nothing was written to its pane since it
+    /// was last reported working or blocked. Such input may be a prompt the agent
+    /// has not picked up yet, or text sitting unsent in its composer; either way
+    /// the switch waits for the turn after it.
     pub(in crate::app) fn topics_switch_quiet(
         &self,
         terminal: &crate::terminal::TerminalState,
@@ -837,17 +839,26 @@ impl App {
                 !watch.abandoned.load(std::sync::atomic::Ordering::SeqCst)
                     && !watch.submitted.load(std::sync::atomic::Ordering::SeqCst)
             });
+        let input_mark = self.topics_input_mark(&terminal.id);
+        // Never reported busy on this runtime: quiet only if nothing was ever written.
+        let busy_mark = self
+            .topics_busy_input_mark
+            .get(&terminal.id)
+            .copied()
+            .or(input_mark.map(|(epoch, _)| (epoch, 0)));
         self.reported_agent_state(terminal) == crate::detect::AgentState::Idle
             && !submit_in_flight
             && !terminal.other_prompts.has_pending()
+            && input_mark == busy_mark
     }
 
-    /// Arm the `when_idle` Topics switch of every agent in `updates` that just
-    /// went from working or blocked to idle; disarm any agent reported working or
-    /// blocked again. An armed switch applies only after [`TOPICS_SWITCH_QUIET`]
-    /// without input ([`Self::apply_due_topics_switches`]), never in the handler
-    /// of the transition itself: a prompt accepted before a stale idle report must
-    /// still be submitted.
+    /// Track the agents in `updates`: one reported working or blocked records its
+    /// pane input mark and loses any armed Topics switch; one that just went from
+    /// working or blocked to idle with a `when_idle` switch waiting arms it, with
+    /// the input mark of that moment, if [`Self::topics_switch_quiet`]. A prompt
+    /// accepted before a stale idle report was processed moved the mark, so it
+    /// arms nothing. An armed switch applies only after [`TOPICS_SWITCH_QUIET`]
+    /// ([`Self::apply_due_topics_switches`]), never in this handler.
     pub(in crate::app) fn arm_idle_topics_switches(
         &mut self,
         updates: &[crate::app::actions::PaneStateUpdate],
@@ -869,51 +880,58 @@ impl App {
                     crate::detect::AgentState::Working | crate::detect::AgentState::Blocked
                 )
             };
+            if busy(update.state) {
+                self.topics_switch_armed.remove(&terminal_id);
+                if let Some(mark) = self.topics_input_mark(&terminal_id) {
+                    self.topics_busy_input_mark.insert(terminal_id, mark);
+                }
+                continue;
+            }
             if update.state != crate::detect::AgentState::Idle {
                 self.topics_switch_armed.remove(&terminal_id);
                 continue;
             }
-            let pending = self
-                .state
-                .terminals
-                .get(&terminal_id)
-                .is_some_and(|terminal| terminal.topics_switch_pending.is_some());
-            if busy(update.previous_state) && pending {
-                self.topics_switch_armed.insert(terminal_id, now);
+            if !busy(update.previous_state) {
+                continue;
+            }
+            let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+                continue;
+            };
+            if terminal.topics_switch_pending.is_none() || !self.topics_switch_quiet(terminal) {
+                continue;
+            }
+            if let Some(mark) = self.topics_input_mark(&terminal_id) {
+                self.topics_switch_armed.insert(terminal_id, (now, mark));
             }
         }
-    }
-
-    /// Any input to the agent (an `agent.prompt`, pane text, keys, an attached
-    /// client's keystrokes) restarts the wait: the switch re-arms at the next idle.
-    pub(in crate::app) fn disarm_topics_switch(
-        &mut self,
-        terminal_id: &crate::terminal::TerminalId,
-    ) {
-        self.topics_switch_armed.remove(terminal_id);
     }
 
     /// When the next armed Topics switch is due.
     pub(crate) fn next_topics_switch_deadline(&self) -> Option<std::time::Instant> {
         self.topics_switch_armed
             .values()
+            .map(|(armed, _)| *armed)
             .min()
-            .map(|armed| *armed + TOPICS_SWITCH_QUIET)
+            .map(|armed| armed + TOPICS_SWITCH_QUIET)
     }
 
     /// Relaunch every agent whose armed `when_idle` Topics switch has been quiet
-    /// for [`TOPICS_SWITCH_QUIET`], after checking again that nothing would be cut.
-    /// One that is not quiet stays pending and re-arms at its next idle transition;
-    /// a relaunch that fails leaves it pending too. Returns whether any relaunched.
+    /// for [`TOPICS_SWITCH_QUIET`]. Just before, it checks again that nothing would
+    /// be cut: the agent still reports idle, no prompt submission is unresolved,
+    /// and its pane input mark has not moved since the arm. Any of that failing
+    /// drops the arm; the switch stays pending until the next transition from
+    /// working or blocked to idle (never re-armed on a timer, so text left unsent
+    /// in the composer is never lost). A relaunch that fails leaves it pending too.
+    /// Returns whether any relaunched.
     pub(crate) fn apply_due_topics_switches(&mut self, now: std::time::Instant) -> bool {
         let due: Vec<_> = self
             .topics_switch_armed
             .iter()
-            .filter(|(_, armed)| now >= **armed + TOPICS_SWITCH_QUIET)
-            .map(|(terminal_id, _)| terminal_id.clone())
+            .filter(|(_, (armed, _))| now >= *armed + TOPICS_SWITCH_QUIET)
+            .map(|(terminal_id, (_, mark))| (terminal_id.clone(), *mark))
             .collect();
         let mut relaunched = false;
-        for terminal_id in due {
+        for (terminal_id, armed_mark) in due {
             self.topics_switch_armed.remove(&terminal_id);
             let Some(terminal) = self.state.terminals.get(&terminal_id) else {
                 continue;
@@ -921,7 +939,9 @@ impl App {
             let Some(enabled) = terminal.topics_switch_pending else {
                 continue;
             };
-            if !self.topics_switch_quiet(terminal) {
+            if self.topics_input_mark(&terminal_id) != Some(armed_mark)
+                || !self.topics_switch_quiet(terminal)
+            {
                 continue;
             }
             if enabled && self.topics_config.usable_omp_binary().is_none() {
@@ -5591,6 +5611,125 @@ mod tests {
         assert!(response.contains("\"result\""), "{response}");
         assert_eq!(written(&mut rx), b"and then the docs");
         assert_switch_waits_for_the_next_idle(&mut app, &terminal_id);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    /// Deliver `events` the way `ClientShellPaneInput` does for an attached
+    /// client: straight to the pane runtime, with no API handler in between.
+    fn client_shell_pane_input(app: &App, events: &[crate::protocol::ClientPaneInputEvent]) {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("agent runtime");
+        crate::server::pane_input::test_apply_client_pane_input_events(runtime, events)
+            .expect("client input applies");
+    }
+
+    #[tokio::test]
+    async fn client_keystrokes_after_the_idle_report_defer_the_switch() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = busy_agent_with_pending_switch(&mut app, "when-idle-keys");
+
+        report_omp_state(&mut app, AgentState::Idle);
+        client_shell_pane_input(
+            &app,
+            &[
+                crate::protocol::ClientPaneInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('y'),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    shifted_codepoint: None,
+                    generated_text: Some("y".into()),
+                    tracks_release: false,
+                    physical_key_id: None,
+                    windows_record: None,
+                },
+                crate::protocol::ClientPaneInputEvent::TextCommit("es, ship it".into()),
+            ],
+        );
+
+        assert_eq!(written(&mut rx), b"yes, ship it");
+        assert_switch_waits_for_the_next_idle(&mut app, &terminal_id);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_client_paste_after_the_idle_report_defers_the_switch() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = busy_agent_with_pending_switch(&mut app, "when-idle-paste");
+
+        report_omp_state(&mut app, AgentState::Idle);
+        client_shell_pane_input(
+            &app,
+            &[crate::protocol::ClientPaneInputEvent::Paste(
+                "the release notes".into(),
+            )],
+        );
+
+        let written = written(&mut rx);
+        assert!(
+            String::from_utf8_lossy(&written).contains("the release notes"),
+            "the paste reaches the agent: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+        assert_switch_waits_for_the_next_idle(&mut app, &terminal_id);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_accepted_before_a_queued_idle_report_arms_nothing() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = busy_agent_with_pending_switch(&mut app, "when-idle-stale");
+        report_omp_state(&mut app, AgentState::Working);
+
+        // The prompt is accepted and fully written (Enter included) while the
+        // agent's idle report from the end of the last turn still waits in the
+        // queue; the agent has not reported the new turn yet.
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "prompt",
+            AgentPromptParams {
+                target: "ordinals".into(),
+                text: "now the changelog".into(),
+                wait: None,
+                input_source: None,
+            },
+        );
+        assert!(response.contains("\"result\""), "{response}");
+        assert!(written(&mut rx).ends_with(b"\r"));
+        report_omp_state(&mut app, AgentState::Idle);
+
+        assert!(!app.topics_switch_armed.contains_key(&terminal_id));
+        assert_switch_waits_for_the_next_idle(&mut app, &terminal_id);
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn an_immediate_switch_over_a_pending_one_announces_it() {
+        let mut app = app_with_agent();
+        app.topics_config = topics_build("when-idle-takeover").0;
+        let terminal_id = arm_omp_agent(&mut app, "ordinals");
+        scheduled_switch(&set_topics_when_idle(&mut app, "ordinals", true));
+        let baseline = app
+            .event_hub
+            .events_after(0)
+            .last()
+            .map_or(0, |(sequence, _)| *sequence);
+
+        let (changed, enabled, agent) = switched(&set_topics(&mut app, "ordinals", true));
+
+        assert!(changed && enabled && !agent.topics_switch_pending);
+        assert_eq!(
+            app.state.terminals[&terminal_id].topics_switch_pending,
+            None
+        );
+        assert!(app
+            .event_hub
+            .events_after(baseline)
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::PaneUpdated));
         super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 

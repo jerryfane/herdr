@@ -684,8 +684,8 @@ impl App {
         }
         self.emit_apns_agent_notifications(&pane_updates, false);
         self.emit_live_activity_updates();
-        // A `when_idle` Topics switch waiting on an agent that just went idle is
-        // armed here, and applied only after a quiet window (never in this handler).
+        // Record each agent's input mark as it turns busy, and arm a `when_idle`
+        // Topics switch on one that just went idle (applied only after a quiet window).
         self.arm_idle_topics_switches(&pane_updates);
         self.sync_agent_metadata_deadline();
         if let Some((
