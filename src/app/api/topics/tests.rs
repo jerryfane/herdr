@@ -524,7 +524,8 @@ fn switching_on_an_omp_that_already_offers_topics_records_the_choice() {
     let omp = std::process::id();
     let (mut app, pane, terminal) = omp_app(&session.path, omp);
     app.topics_config = usable_topics_build("record");
-    let fake = FakeControl::start("switch-record", empty_topics);
+    // Short tag: the socket path must fit macOS's 104-byte SUN_LEN.
+    let fake = FakeControl::start("switch", empty_topics);
     let response = send(
         &mut app,
         Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
