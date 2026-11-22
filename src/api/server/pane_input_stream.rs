@@ -78,7 +78,7 @@ struct InputFrameError {
 /// fence: the open and every frame then go through the own-pane check, so a
 /// stream cannot outlive the caller's ownership of the pane.
 pub(super) fn serve(
-    stream: ApiStream,
+    mut stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     fenced: Option<u64>,
@@ -86,13 +86,48 @@ pub(super) fn serve(
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     serve_with_open_timeout(
-        stream,
+        &mut stream,
         request_id,
         params,
         fenced,
         api_tx,
         running,
         APP_RESPONSE_TIMEOUT,
+        None,
+    )
+}
+
+/// The owner gate's check on a live input stream: the line that ends it, or
+/// `None` while it may go on. Asked from the frame loop and from a watcher
+/// thread, so it must be `Sync`.
+pub(super) type StreamGuard<'a> = &'a (dyn Fn() -> Option<String> + Sync);
+
+/// How often an idle guarded stream asks its guard.
+const GUARD_POLL: Duration = Duration::from_millis(250);
+
+/// [`serve`] for the owner gate: `guard` is asked before every frame is
+/// written and every [`GUARD_POLL`] while the stream is idle; when it
+/// returns a line, that line is sent and the stream ends, so a removed,
+/// expired or narrowed grant cannot type another key. Unix only, like the
+/// owner gate.
+#[cfg(unix)]
+pub(super) fn serve_guarded(
+    stream: &mut ApiStream,
+    request_id: String,
+    params: PaneInputStreamParams,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+    guard: StreamGuard<'_>,
+) -> std::io::Result<()> {
+    serve_with_open_timeout(
+        stream,
+        request_id,
+        params,
+        None,
+        api_tx,
+        running,
+        APP_RESPONSE_TIMEOUT,
+        Some(guard),
     )
 }
 
@@ -107,14 +142,16 @@ fn scoped(method: Method, fenced: Option<u64>) -> Method {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_with_open_timeout(
-    mut stream: ApiStream,
+    stream: &mut ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     fenced: Option<u64>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     open_timeout: Duration,
+    guard: Option<StreamGuard<'_>>,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
     let input_source = params.input_source;
@@ -134,11 +171,11 @@ fn serve_with_open_timeout(
     );
     if api_response_outcome(&open_response) != "ok" {
         stream_active.store(false, Ordering::Release);
-        return write_text_line_allow_disconnect(&mut stream, &open_response);
+        return write_text_line_allow_disconnect(stream, &open_response);
     }
 
     if let Err(err) = write_json_line(
-        &mut stream,
+        stream,
         &SuccessResponse {
             id: request_id.clone(),
             result: ResponseResult::Ok {},
@@ -151,20 +188,63 @@ fn serve_with_open_timeout(
         return Err(err);
     }
 
-    let result = serve_frames(
-        &mut stream,
-        &request_id,
-        &pane_id,
-        input_source,
-        fenced,
-        api_tx,
-        running,
-        &stream_active,
-    );
-    stream_active.store(false, Ordering::Release);
-    result
+    let Some(guard) = guard else {
+        let result = serve_frames(
+            stream,
+            &request_id,
+            &pane_id,
+            input_source,
+            fenced,
+            api_tx,
+            running,
+            &stream_active,
+            None,
+        );
+        stream_active.store(false, Ordering::Release);
+        return result;
+    };
+    // Whoever first sees the guard end the stream (the frame loop or the idle
+    // watcher) claims it by stopping `stream_active`, so its line is written
+    // once.
+    let claim = |line: String| stream_active.swap(false, Ordering::AcqRel).then_some(line);
+    let ended: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while stream_is_running(running, &stream_active) {
+                std::thread::sleep(GUARD_POLL);
+                if let Some(line) = guard().and_then(claim) {
+                    *ended
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(line);
+                }
+            }
+        });
+        // An empty line: the watcher claimed the end and writes its line.
+        let frame_guard = || guard().map(|line| claim(line).unwrap_or_default());
+        let result = serve_frames(
+            stream,
+            &request_id,
+            &pane_id,
+            input_source,
+            fenced,
+            api_tx,
+            running,
+            &stream_active,
+            Some(&frame_guard),
+        );
+        stream_active.store(false, Ordering::Release);
+        result
+    });
+    let ended = ended
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match (result, ended) {
+        (Ok(()), Some(line)) => write_text_line_allow_disconnect(stream, &line),
+        (result, _) => result,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_frames(
     stream: &mut ApiStream,
     request_id: &str,
@@ -174,6 +254,7 @@ fn serve_frames(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
+    guard: Option<StreamGuard<'_>>,
 ) -> std::io::Result<()> {
     let mut last_seq: Option<u64> = None;
     while stream_is_running(running, stream_active) {
@@ -250,6 +331,12 @@ fn serve_frames(
                 input_source,
             })
         };
+        if let Some(line) = guard.and_then(|guard| guard()) {
+            if line.is_empty() {
+                return Ok(());
+            }
+            return write_text_line_allow_disconnect(stream, &line);
+        }
         let response = dispatch_to_app_with_timeout(
             Request {
                 id: format!("{request_id}:frame:{seq}"),

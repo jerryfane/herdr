@@ -4,9 +4,13 @@
 //! device's account statement), and lasts 1 hour to 30 days. Grants live in
 //! `guests.json` under `owners`, beside guests and invites.
 //!
-//! This module writes and lists grants; browsers cannot use them yet.
+//! A browser connects with an owner hello (`"mode": "owner"`): its Noise key
+//! must hold a live grant, and its own account statement must name the
+//! grant's account. Both must hold, so removing the browser from the
+//! account (its statements stop) ends its access too. The per-request gate
+//! is `crate::api::server::owner_gate`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +19,25 @@ use crate::api::schema::{
     OwnerScope,
 };
 
-use super::{account, audit, io_error, notify_changes, store, OwnerError};
+use super::account::{self, codes};
+use super::{audit, io_error, notify_changes, store, AccountHolder, AccountSession, OwnerError};
 
-/// `owner_access.info`'s `protocol`.
-pub(crate) const PROTOCOL: u32 = 1;
+/// `owner_access.info`'s `protocol`: 1 stores grants (`owner_access.*`);
+/// 2 also admits owner browsers (owner hello, owner gate).
+pub(crate) const PROTOCOL: u32 = 2;
+/// Live connections one grant may hold at once, so one browser cannot take
+/// every relay session of this machine and lock guests out.
+pub(crate) const SESSION_CAP: usize = 8;
+/// Refusal codes an owner browser acts on, besides the statement codes in
+/// [`codes`].
+pub(crate) mod refusals {
+    /// No grant for this key, or it was removed or replaced.
+    pub(crate) const NOT_GRANTED: &str = "owner_not_granted";
+    /// The grant expired; renewing it brings it back.
+    pub(crate) const EXPIRED: &str = "owner_expired";
+    /// The grant already holds [`super::SESSION_CAP`] live connections.
+    pub(crate) const BUSY: &str = "owner_busy";
+}
 /// The shortest grant: 1 hour.
 pub(crate) const MIN_TTL_SECS: u64 = 60 * 60;
 /// The longest grant: 30 days.
@@ -59,6 +78,10 @@ pub(crate) struct OwnerGrant {
     pub revoked: bool,
     #[serde(default)]
     pub revoked_ms: Option<u64>,
+    /// The latest admission that was audited as `owner_connected` (at most
+    /// one per [`store::CONNECTED_AUDIT_WINDOW_MS`]).
+    #[serde(default)]
+    pub last_connected_ms: Option<u64>,
 }
 
 impl OwnerGrant {
@@ -106,20 +129,41 @@ impl OwnerGrant {
     }
 
     fn audit(&self, dir: &Path, event: GuestAuditEvent, text: Option<String>, now: u64) {
-        let entry = GuestAuditEntry {
-            ts_ms: now,
-            guest_id: self.grant_id.clone(),
-            name: self.device.clone(),
-            fingerprint: self.fingerprint.clone(),
+        audit_grant(
+            dir,
+            [&self.grant_id, &self.device, &self.fingerprint],
             event,
-            pane: String::new(),
-            method: None,
+            None,
             text,
-            file: None,
-        };
-        if let Err(err) = audit::append(dir, &entry) {
-            tracing::warn!(err = %err, "owner access audit log write failed");
-        }
+            now,
+        );
+    }
+}
+
+/// One audit line for a grant (`[grant_id, device, fingerprint]`): the grant
+/// id in `guest_id`, the browser's name in `name`, and an empty `pane`.
+/// Audit failures are logged, never fatal.
+fn audit_grant(
+    dir: &Path,
+    [grant_id, device, fingerprint]: [&str; 3],
+    event: GuestAuditEvent,
+    method: Option<&str>,
+    text: Option<String>,
+    now: u64,
+) {
+    let entry = GuestAuditEntry {
+        ts_ms: now,
+        guest_id: grant_id.to_owned(),
+        name: device.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+        event,
+        pane: String::new(),
+        method: method.map(str::to_owned),
+        text,
+        file: None,
+    };
+    if let Err(err) = audit::append(dir, &entry) {
+        tracing::warn!(err = %err, "owner access audit log write failed");
     }
 }
 
@@ -269,6 +313,7 @@ pub(crate) fn add_in(
         last_seen_ms: None,
         revoked: false,
         revoked_ms: None,
+        last_connected_ms: None,
     };
     let stored = grant.clone();
     let replaced = store::update_store(dir, |store| {
@@ -295,6 +340,7 @@ pub(crate) fn add_in(
     .ok_or_else(limit_error)?;
     notify_changes();
     for old in &replaced {
+        super::revoke_live(&live_key(&old.grant_id));
         old.audit(
             dir,
             GuestAuditEvent::OwnerRemoved,
@@ -430,7 +476,279 @@ pub(crate) fn remove_in(
         notify_changes();
     }
     for grant in &removed {
+        // Its live connections close now, not at their next request.
+        super::revoke_live(&live_key(&grant.grant_id));
         grant.audit(dir, GuestAuditEvent::OwnerRemoved, None, now);
     }
     Ok(removed.into_iter().map(|grant| grant.grant_id).collect())
+}
+
+/// The live-registry key of a grant's connections.
+fn live_key(grant_id: &str) -> String {
+    format!("owner\n{grant_id}")
+}
+
+/// An admitted owner browser, for one relay connection. The grant is read
+/// again on every request ([`OwnerPrincipal::current`]): its scope may
+/// change with a renewal, and a removal or expiry ends the connection.
+pub struct OwnerPrincipal {
+    pub(crate) grant_id: String,
+    pub(crate) fingerprint: String,
+    pub(crate) device: String,
+    pub(crate) dir: PathBuf,
+    /// Registered at admission, so it counts against [`SESSION_CAP`] and a
+    /// removal closes the connection at once.
+    live: super::LiveSession,
+}
+
+impl OwnerPrincipal {
+    /// The grant's scope now, or the code that ends the connection: removed,
+    /// replaced or unknown (`owner_not_granted`) or expired
+    /// (`owner_expired`).
+    pub(crate) fn current(&self, now: u64) -> Result<OwnerScope, &'static str> {
+        if self.live.revoked() {
+            return Err(refusals::NOT_GRANTED);
+        }
+        let store = store::load_store(&self.dir).map_err(|_| refusals::NOT_GRANTED)?;
+        let grant = store
+            .owners
+            .iter()
+            .find(|grant| grant.grant_id == self.grant_id && !grant.revoked)
+            .ok_or(refusals::NOT_GRANTED)?;
+        if !grant.live(now) {
+            return Err(refusals::EXPIRED);
+        }
+        Ok(grant.scope)
+    }
+
+    /// This connection's entry in the live registry: set once a removal or
+    /// replacement closes it.
+    pub(crate) fn live(&self) -> &super::LiveSession {
+        &self.live
+    }
+
+    /// The viewer this browser's streams and width leases are tied to,
+    /// whatever viewer id it sent.
+    pub(crate) fn viewer_id(&self) -> String {
+        format!("owner-web:{}", self.grant_id)
+    }
+
+    /// Record one audit event for this grant.
+    pub(crate) fn audit(&self, event: GuestAuditEvent, method: Option<&str>, text: Option<String>) {
+        audit_grant(
+            &self.dir,
+            [&self.grant_id, &self.device, &self.fingerprint],
+            event,
+            method,
+            text,
+            store::now_ms(),
+        );
+    }
+}
+
+/// An admitted owner hello: the principal, the message-2 payload, and the
+/// statement-bound session (it ends at `account.deadline_ms` unless the
+/// browser sends a newer statement).
+pub(crate) struct OwnerAdmission {
+    pub principal: OwnerPrincipal,
+    pub reply: serde_json::Value,
+    pub account: AccountSession,
+}
+
+/// The live grant for `device_pub`, or why there is none.
+fn live_grant(
+    dir: &Path,
+    find: impl Fn(&OwnerGrant) -> bool,
+    now: u64,
+) -> Result<OwnerGrant, &'static str> {
+    let store = store::load_store(dir).map_err(|err| {
+        tracing::warn!(err = %err, "guest store unavailable; refusing owner browser");
+        refusals::NOT_GRANTED
+    })?;
+    let grant = store
+        .owners
+        .into_iter()
+        .find(|grant| !grant.revoked && find(grant))
+        .ok_or(refusals::NOT_GRANTED)?;
+    if !grant.live(now) {
+        return Err(refusals::EXPIRED);
+    }
+    Ok(grant)
+}
+
+/// Checks `jws` as `device_pub`'s own statement for this host (`dev` is the
+/// Noise-proved key) naming `grant`'s account. Statements are checked even
+/// with `[guest] accounts` off: that switch governs guest shares, and an
+/// owner grant always needs one. The deadline never passes the grant's
+/// expiry, so the connection ends when the grant does.
+fn check_statement(
+    dir: &Path,
+    env: &account::Env<'_>,
+    grant: &OwnerGrant,
+    device_pub: &[u8; 32],
+    jws: &str,
+    now: u64,
+) -> Result<u64, &'static str> {
+    let (host, _) = store::load_host(dir).map_err(|err| {
+        tracing::warn!(err = %err, "guest host identity unavailable; refusing statement");
+        codes::INVALID
+    })?;
+    let verified = account::check(
+        dir,
+        &(env.settings)(),
+        env.fetch_keys,
+        &host.host_id,
+        device_pub,
+        jws,
+        now,
+    )?;
+    if verified.sub != grant.account {
+        return Err(codes::MISMATCH);
+    }
+    Ok(verified.deadline_ms.min(grant.expires_ms))
+}
+
+/// Admits an owner hello (`{"v":1, "mode":"owner", "account":"<jws>",
+/// "device":"…"}`) from the Noise-proved `device_pub`. Refusals are
+/// `owner_not_granted`, `owner_expired`, `owner_busy` and the statement codes
+/// (`account_required`, `statement_invalid`, `statement_expired`,
+/// `account_keys_stale`, `account_mismatch`).
+pub(crate) fn admit_in(
+    dir: &Path,
+    env: &account::Env<'_>,
+    device_pub: [u8; 32],
+    hello: &serde_json::Value,
+    now: u64,
+) -> Result<OwnerAdmission, &'static str> {
+    let key = store::b64url(&device_pub);
+    let grant = live_grant(dir, |grant| grant.device_pub == key, now)?;
+    let jws = match hello.get("account") {
+        None | Some(serde_json::Value::Null) => return Err(codes::REQUIRED),
+        Some(serde_json::Value::String(jws)) => jws,
+        Some(_) => return Err(codes::INVALID),
+    };
+    let deadline_ms = check_statement(dir, env, &grant, &device_pub, jws, now)?;
+    let live = super::register_live_capped(&live_key(&grant.grant_id), SESSION_CAP)
+        .ok_or(refusals::BUSY)?;
+    let principal = OwnerPrincipal {
+        grant_id: grant.grant_id.clone(),
+        fingerprint: grant.fingerprint.clone(),
+        device: grant.device.clone(),
+        dir: dir.to_path_buf(),
+        live,
+    };
+    if note_connected(dir, &grant.grant_id, now) {
+        principal.audit(GuestAuditEvent::OwnerConnected, None, None);
+    }
+    let reply = serde_json::json!({
+        "ok": true,
+        "mode": "owner",
+        "grant_id": grant.grant_id,
+        "scope": grant.scope,
+        "expires_unix": grant.expires_ms / 1000,
+        "machine_label": crate::platform::hostname().unwrap_or_default(),
+        "account": {"deadline_unix": deadline_ms / 1000},
+        // `multi_request`: the connection serves further requests after a
+        // reply (see `serve_session` in the API's owner gate).
+        "features": {"owner": PROTOCOL, "multi_request": true},
+    });
+    Ok(OwnerAdmission {
+        principal,
+        reply,
+        account: AccountSession {
+            holder: AccountHolder::Owner(grant.grant_id),
+            device_pub,
+            deadline_ms,
+        },
+    })
+}
+
+/// Records an admission on the grant: `last_seen_ms` at most once per
+/// [`store::LAST_SEEN_RESOLUTION_MS`], and whether this one should be
+/// audited as `owner_connected` (at most once per
+/// [`store::CONNECTED_AUDIT_WINDOW_MS`]).
+fn note_connected(dir: &Path, grant_id: &str, now: u64) -> bool {
+    let noted = store::update_store(dir, |store| {
+        let Some(grant) = store
+            .owners
+            .iter_mut()
+            .find(|grant| grant.grant_id == grant_id && !grant.revoked)
+        else {
+            return (false, false);
+        };
+        let due = |at: Option<u64>, every: u64| at.is_none_or(|at| now.saturating_sub(at) >= every);
+        let seen = due(grant.last_seen_ms, store::LAST_SEEN_RESOLUTION_MS);
+        let connected = due(grant.last_connected_ms, store::CONNECTED_AUDIT_WINDOW_MS);
+        if seen {
+            grant.last_seen_ms = Some(now);
+        }
+        if connected {
+            grant.last_connected_ms = Some(now);
+        }
+        (connected, seen || connected)
+    });
+    noted.unwrap_or_else(|err| {
+        tracing::warn!(err = %err, "owner grant last seen not recorded");
+        false
+    })
+}
+
+/// `account.refresh` on a live owner connection: the new deadline when the
+/// statement is the browser's own, names the grant's account, and the grant
+/// is still live; else the code that ends the connection.
+pub(crate) fn refresh_in(
+    dir: &Path,
+    env: &account::Env<'_>,
+    grant_id: &str,
+    device_pub: &[u8; 32],
+    jws: &str,
+    now: u64,
+) -> Result<u64, &'static str> {
+    let key = store::b64url(device_pub);
+    let grant = live_grant(
+        dir,
+        |grant| grant.grant_id == grant_id && grant.device_pub == key,
+        now,
+    )?;
+    check_statement(dir, env, &grant, device_pub, jws, now)
+}
+
+/// A grant written straight into the store and an admitted principal for
+/// it, for the API gate's tests (no statement, no relay).
+#[cfg(test)]
+pub(crate) fn test_principal(
+    dir: &Path,
+    device_pub: [u8; 32],
+    scope: OwnerScope,
+) -> OwnerPrincipal {
+    let now = store::now_ms();
+    let grant = OwnerGrant {
+        grant_id: store::b64url(&store::random_bytes::<16>().unwrap()),
+        device_pub: store::b64url(&device_pub),
+        fingerprint: store::fingerprint(&device_pub),
+        device: "Chrome on macOS".into(),
+        account: "sub-Example-012345678".into(),
+        scope,
+        approved_by: "Jerry's iPhone".into(),
+        created_ms: now,
+        expires_ms: now + 60 * 60 * 1000,
+        renewed_ms: None,
+        last_seen_ms: None,
+        revoked: false,
+        revoked_ms: None,
+        last_connected_ms: None,
+    };
+    let stored = grant.clone();
+    store::update_store(dir, |store| {
+        store.owners.push(stored);
+        ((), true)
+    })
+    .unwrap();
+    OwnerPrincipal {
+        live: super::register_live_capped(&live_key(&grant.grant_id), SESSION_CAP).unwrap(),
+        grant_id: grant.grant_id,
+        fingerprint: grant.fingerprint,
+        device: grant.device,
+        dir: dir.to_path_buf(),
+    }
 }

@@ -29,6 +29,8 @@ pub use event_hub::EventHub;
 pub(crate) use server::prefix_remote_agent;
 #[cfg(unix)]
 pub(crate) use server::serve_guest_stream;
+#[cfg(unix)]
+pub(crate) use server::serve_owner_stream;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};

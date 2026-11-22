@@ -3,7 +3,8 @@
 //! audit log and the live-session registry. The relay client lives in `link`;
 //! the per-request gate lives in `crate::api::server::guest_gate`. A guest may
 //! bind a share to their HerdrUp account to use it from each of their devices
-//! ([`account`]).
+//! ([`account`]). The owner's own browsers use the same relay with owner
+//! grants ([`owner`]); their gate is `crate::api::server::owner_gate`.
 //!
 //! The interface functions below are the contract with `link`, which is the
 //! only production caller of `host_info`, `link_wanted`, `admit`, `serve`,
@@ -423,13 +424,22 @@ pub enum Admission {
     Refused(&'static str),
 }
 
+/// Who an account-bound session belongs to: a guest share or an owner
+/// grant. Its statement is refreshed against that record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountHolder {
+    Guest(String),
+    Owner(String),
+}
+
 /// An admitted account-bound session: it ends at `deadline_ms` unless the
-/// guest sends a newer statement in-band ([`refresh_account`]).
+/// device sends a newer statement in-band ([`refresh_account`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSession {
-    pub(crate) guest_id: String,
+    pub(crate) holder: AccountHolder,
     pub(crate) device_pub: [u8; 32],
-    /// Unix ms: the statement's `exp` plus the allowed skew.
+    /// Unix ms: the statement's `exp` plus the allowed skew (for an owner
+    /// grant, never past the grant's expiry).
     pub(crate) deadline_ms: u64,
 }
 
@@ -440,11 +450,63 @@ impl AccountSession {
     }
 }
 
-/// Message-1 payload in, message-2 payload out.
-pub(crate) fn admit(device_pub: [u8; 32], hello: &serde_json::Value) -> Admission {
-    admit_in(store::guest_dir(), device_pub, hello)
+/// Who a relay connection serves: a guest on its share, or the owner's
+/// browser on an owner grant.
+// One per connection and moved, not stored.
+#[allow(clippy::large_enum_variant)]
+pub enum Principal {
+    Guest(GuestPrincipal),
+    Owner(owner::OwnerPrincipal),
 }
 
+/// Message-1 payload in, message-2 payload out. A hello with
+/// `"mode": "owner"` is checked against owner grants only; any other hello
+/// against guest shares only, even when one key holds both.
+pub(crate) fn admit(
+    device_pub: [u8; 32],
+    hello: &serde_json::Value,
+) -> link::host::Admission<Principal> {
+    admit_principal_in(
+        store::guest_dir(),
+        &account::Env::PRODUCTION,
+        device_pub,
+        hello,
+    )
+}
+
+pub(crate) fn admit_principal_in(
+    dir: PathBuf,
+    env: &account::Env<'_>,
+    device_pub: [u8; 32],
+    hello: &serde_json::Value,
+) -> link::host::Admission<Principal> {
+    use link::host::Admission as Link;
+    if hello.get("mode").and_then(serde_json::Value::as_str) == Some("owner") {
+        return match owner::admit_in(&dir, env, device_pub, hello, store::now_ms()) {
+            Ok(admitted) => Link::Admitted {
+                principal: Principal::Owner(admitted.principal),
+                reply: admitted.reply,
+                account: Some(admitted.account),
+            },
+            Err(code) => Link::Refused(code),
+        };
+    }
+    match admit_with(dir, env, device_pub, hello) {
+        Admission::Admitted {
+            principal,
+            reply,
+            account,
+        } => Link::Admitted {
+            principal: Principal::Guest(principal),
+            reply,
+            account,
+        },
+        Admission::Refused(code) => Link::Refused(code),
+    }
+}
+
+/// A guest hello in `dir`, with the production account service.
+#[cfg(test)]
 pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::Value) -> Admission {
     admit_with(dir, &account::Env::PRODUCTION, device_pub, hello)
 }
@@ -548,7 +610,7 @@ pub(crate) fn admit_with(
     }
     let account = match (&record.account, &statement) {
         (Some(_), AccountHello::Verified(verified)) => Some(AccountSession {
-            guest_id: record.guest_id.clone(),
+            holder: AccountHolder::Guest(record.guest_id.clone()),
             device_pub,
             deadline_ms: verified.deadline_ms,
         }),
@@ -607,7 +669,8 @@ fn device_added_alert(
 
 /// `account.refresh` on a live account-bound session: the new deadline when
 /// the statement is valid for the session's account and device and the
-/// device is still on the share, else the code that ends the session.
+/// device is still on the share (or its owner grant is still live), else the
+/// code that ends the session.
 pub(crate) fn refresh_account(session: &AccountSession, jws: &str) -> Result<u64, &'static str> {
     refresh_account_in(&store::guest_dir(), &account::Env::PRODUCTION, session, jws)
 }
@@ -618,20 +681,36 @@ pub(crate) fn refresh_account_in(
     session: &AccountSession,
     jws: &str,
 ) -> Result<u64, &'static str> {
+    let guest_id = match &session.holder {
+        AccountHolder::Guest(guest_id) => guest_id,
+        AccountHolder::Owner(grant_id) => {
+            return owner::refresh_in(
+                dir,
+                env,
+                grant_id,
+                &session.device_pub,
+                jws,
+                store::now_ms(),
+            )
+        }
+    };
     let hello = serde_json::json!({ "account": jws });
     let verified = match account_hello(dir, env, &session.device_pub, &hello, store::now_ms()) {
         AccountHello::Verified(verified) => verified,
         AccountHello::Refused(code) => return Err(code),
         AccountHello::Absent => return Err(account::codes::REQUIRED),
     };
-    store::account_session_holds(dir, &session.guest_id, &session.device_pub, &verified)?;
+    store::account_session_holds(dir, guest_id, &session.device_pub, &verified)?;
     Ok(verified.deadline_ms)
 }
 
 /// Run one API connection as `principal`. Blocks until the connection's
 /// session ends (see `features.multi_request`), then closes the stream.
-pub(crate) fn serve(principal: GuestPrincipal, stream: std::os::unix::net::UnixStream) {
-    crate::api::serve_guest_stream(principal, stream);
+pub(crate) fn serve(principal: Principal, stream: std::os::unix::net::UnixStream) {
+    match principal {
+        Principal::Guest(guest) => crate::api::serve_guest_stream(guest, stream),
+        Principal::Owner(owner) => crate::api::serve_owner_stream(owner, stream),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -752,6 +831,24 @@ pub(crate) fn register_live(guest_id: &str) -> LiveSession {
 /// The live-registry key of one device of a guest.
 fn device_live_key(guest_id: &str, fingerprint: &str) -> String {
     format!("{guest_id}\n{fingerprint}")
+}
+
+/// One live connection under `key`, or `None` while `cap` connections are
+/// already live there. Counted and registered under one lock, so two
+/// connections at once cannot both take the last slot.
+fn register_live_capped(key: &str, cap: usize) -> Option<LiveSession> {
+    let revoked = Arc::new(AtomicBool::new(false));
+    let mut live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let sessions = live
+        .get_or_insert_with(HashMap::new)
+        .entry(key.to_string())
+        .or_default();
+    sessions.retain(|session| session.strong_count() > 0);
+    if sessions.len() >= cap {
+        return None;
+    }
+    sessions.push(Arc::downgrade(&revoked));
+    Some(LiveSession { revoked })
 }
 
 /// One live connection, closed by revoking any of `keys`.
@@ -1260,7 +1357,13 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&store::b64url_decode(&secret).unwrap()).unwrap();
         let hello = json!({"v": 1, "invite_id": invite.invite_id, "secret": payload["secret"], "device": "iPhone"});
-        assert!(matches!(admit([6; 32], &hello), Admission::Admitted { .. }));
+        assert!(matches!(
+            admit([6; 32], &hello),
+            link::host::Admission::Admitted {
+                principal: Principal::Guest(_),
+                ..
+            }
+        ));
         let pending = create_invite(
             &agent(),
             true,

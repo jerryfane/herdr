@@ -135,7 +135,7 @@ impl GuestHost for FakeHost {
             return Admission::Refused(code);
         }
         let account = hello.get("account").map(|_| AccountSession {
-            guest_id: "g".into(),
+            holder: crate::guest::AccountHolder::Guest("g".into()),
             device_pub,
             deadline_ms: deadline_after(self.statement_life),
         });

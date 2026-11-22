@@ -57,7 +57,8 @@ impl LinkState {
 }
 
 pub(crate) trait GuestHost: Send + Sync + 'static {
-    /// Authenticated guest identity handed from `admit` to `serve`.
+    /// Authenticated identity (a guest, or the owner's browser) handed from
+    /// `admit` to `serve`.
     type Principal: Send + 'static;
 
     /// Relay credentials and node key, created on first use.
@@ -86,28 +87,11 @@ pub(crate) trait GuestHost: Send + Sync + 'static {
     fn subscribe_changes(&self) -> Receiver<()>;
 }
 
-impl From<crate::guest::Admission> for Admission<crate::guest::GuestPrincipal> {
-    fn from(admission: crate::guest::Admission) -> Self {
-        match admission {
-            crate::guest::Admission::Admitted {
-                principal,
-                reply,
-                account,
-            } => Self::Admitted {
-                principal,
-                reply,
-                account,
-            },
-            crate::guest::Admission::Refused(code) => Self::Refused(code),
-        }
-    }
-}
-
 /// The daemon's guest store, config and API server.
 pub(crate) struct DaemonGuestHost;
 
 impl GuestHost for DaemonGuestHost {
-    type Principal = crate::guest::GuestPrincipal;
+    type Principal = crate::guest::Principal;
 
     fn host_info(&self) -> io::Result<HostInfo> {
         let info = crate::guest::host_info()?;
@@ -124,7 +108,7 @@ impl GuestHost for DaemonGuestHost {
     }
 
     fn admit(&self, device_pub: [u8; 32], hello: &serde_json::Value) -> Admission<Self::Principal> {
-        crate::guest::admit(device_pub, hello).into()
+        crate::guest::admit(device_pub, hello)
     }
 
     fn serve(&self, principal: Self::Principal, stream: UnixStream) {

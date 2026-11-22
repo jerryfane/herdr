@@ -664,3 +664,294 @@ fn info_reports_this_hosts_relay_identity() {
         created.host_id
     );
 }
+
+/// Owner hellos through admission, with this host's throwaway account
+/// service.
+mod admission {
+    use serde_json::Value;
+
+    use super::*;
+    use crate::guest::link::host::Admission as LinkAdmission;
+    use crate::guest::owner::{refusals, OwnerAdmission};
+    use crate::guest::Principal;
+
+    impl Host {
+        fn env_run<R>(&self, run: impl FnOnce(&Env<'_>) -> R) -> R {
+            let settings = || Settings {
+                enabled: self.accounts.load(std::sync::atomic::Ordering::Relaxed),
+                ..settings()
+            };
+            let fetch = |issuer: &str| self.keys.fetch(issuer);
+            let notify = |_: crate::push::PushNotification| {};
+            run(&Env {
+                settings: &settings,
+                fetch_keys: &fetch,
+                notify_owner: &notify,
+            })
+        }
+
+        /// The browser's own statement, issued at `now_ms`.
+        fn browser_statement(&self, device: &[u8; 32], sub: &str, now_ms: u64) -> String {
+            self.issuer.sign(
+                &self
+                    .issuer
+                    .claims(&self.host_id, device, sub, now_ms / 1000),
+            )
+        }
+
+        fn owner_hello(&self, statement: Option<String>) -> Value {
+            let mut hello = json!({"v": 1, "mode": "owner", "device": "Chrome on macOS"});
+            if let Some(statement) = statement {
+                hello["account"] = json!(statement);
+            }
+            hello
+        }
+
+        fn admit_at(
+            &self,
+            device: &[u8; 32],
+            hello: &Value,
+            now: u64,
+        ) -> Result<OwnerAdmission, &'static str> {
+            self.env_run(|env| owner::admit_in(&self.dir.0, env, *device, hello, now))
+        }
+
+        /// The browser's statement for `SUB`, now.
+        fn admit(&self, device: &[u8; 32]) -> Result<OwnerAdmission, &'static str> {
+            let now = store::now_ms();
+            let hello = self.owner_hello(Some(self.browser_statement(device, SUB, now)));
+            self.admit_at(device, &hello, now)
+        }
+
+        fn admit_any(&self, device: &[u8; 32], hello: &Value) -> LinkAdmission<Principal> {
+            self.env_run(|env| {
+                crate::guest::admit_principal_in(self.dir.0.clone(), env, *device, hello)
+            })
+        }
+    }
+
+    fn refused<T>(result: Result<T, &'static str>) -> &'static str {
+        match result {
+            Ok(_) => "<admitted>",
+            Err(code) => code,
+        }
+    }
+
+    #[test]
+    fn a_live_grant_and_the_browsers_own_statement_admit_it() {
+        let host = Host::new("owner-admit");
+        assert_eq!(refused(host.admit(&BROWSER)), refusals::NOT_GRANTED);
+        let grant = host.add(&BROWSER, 3600);
+        let now = store::now_ms();
+        let admitted = host.admit(&BROWSER).unwrap();
+        let reply = &admitted.reply;
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["mode"], "owner");
+        assert_eq!(reply["grant_id"], grant.grant_id);
+        assert_eq!(reply["scope"], "terminal");
+        assert_eq!(reply["expires_unix"], grant.expires_ms / 1000);
+        assert_eq!(reply["features"]["owner"], 2);
+        assert_eq!(reply["features"]["multi_request"], true);
+        // The statement's ten minutes plus the skew.
+        let deadline = reply["account"]["deadline_unix"].as_u64().unwrap();
+        assert!(
+            (now / 1000 + 600..=now / 1000 + 661).contains(&deadline),
+            "{reply}"
+        );
+        assert_eq!(admitted.account.deadline_ms / 1000, deadline);
+        assert_eq!(
+            admitted.account.holder,
+            crate::guest::AccountHolder::Owner(grant.grant_id.clone())
+        );
+        assert_eq!(admitted.principal.current(now), Ok(OwnerScope::Terminal));
+        let seen = host.grants()[0].clone();
+        assert!(seen.last_seen_ms.is_some() && seen.last_connected_ms.is_some());
+        let connected = |host: &Host| {
+            super::super::audit::read(&host.dir.0, Some(&grant.grant_id), None, 50)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.event == GuestAuditEvent::OwnerConnected)
+                .count()
+        };
+        drop(admitted);
+        host.admit(&BROWSER).unwrap();
+        assert_eq!(connected(&host), 1, "one entry per 10 minutes");
+
+        // `[guest] accounts` governs guest shares only.
+        host.accounts
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        host.admit(&BROWSER).unwrap();
+    }
+
+    #[test]
+    fn expired_removed_and_replaced_grants_are_refused() {
+        let host = Host::new("owner-admit-ended");
+        let grant = host.add(&BROWSER, 3600);
+        let later = grant.expires_ms + 1;
+        let hello = host.owner_hello(Some(host.browser_statement(&BROWSER, SUB, later)));
+        assert_eq!(
+            refused(host.admit_at(&BROWSER, &hello, later)),
+            refusals::EXPIRED
+        );
+        let (replacement, _) = host
+            .add_with(&host.params(&BROWSER, 3600), store::now_ms())
+            .unwrap();
+        host.admit(&BROWSER).unwrap();
+        owner::remove_in(
+            &host.dir.0,
+            RemoveTarget::Grant(&replacement.grant_id),
+            store::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(refused(host.admit(&BROWSER)), refusals::NOT_GRANTED);
+    }
+
+    #[test]
+    fn the_statement_must_be_the_browsers_own_and_name_the_grants_account() {
+        let host = Host::new("owner-admit-statement");
+        host.add(&BROWSER, 3600);
+        let now = store::now_ms();
+        let other_sub = "sub-Another-012345678";
+        for (statement, expected) in [
+            (None, codes::REQUIRED),
+            (
+                Some(host.browser_statement(&BROWSER, other_sub, now)),
+                codes::MISMATCH,
+            ),
+            // The approving phone's statement is not the browser's.
+            (
+                Some(host.browser_statement(&PHONE, SUB, now)),
+                codes::INVALID,
+            ),
+            (
+                Some(host.browser_statement(&BROWSER, SUB, now - 2 * HOUR_MS)),
+                codes::EXPIRED,
+            ),
+            (
+                Some(Issuer::new("k1").statement(&host.host_id, &BROWSER, SUB)),
+                codes::INVALID,
+            ),
+        ] {
+            let hello = host.owner_hello(statement.clone());
+            assert_eq!(
+                refused(host.admit_at(&BROWSER, &hello, now)),
+                expected,
+                "{statement:?}"
+            );
+        }
+        let mut hello = host.owner_hello(None);
+        hello["account"] = json!(7);
+        assert_eq!(
+            refused(host.admit_at(&BROWSER, &hello, now)),
+            codes::INVALID
+        );
+    }
+
+    #[test]
+    fn cached_keys_within_their_grace_still_admit_a_granted_browser() {
+        let host = Host::new("owner-admit-stale-keys");
+        let t0 = store::now_ms();
+        host.add(&BROWSER, 30 * 24 * 3600);
+        // The account service is unreachable from here on.
+        *host.keys.jwks.lock().unwrap() = None;
+        let later = t0 + 3 * DAY_MS;
+        let hello = host.owner_hello(Some(host.browser_statement(&BROWSER, SUB, later)));
+        host.admit_at(&BROWSER, &hello, later).unwrap();
+        let past_grace = t0 + 8 * DAY_MS;
+        let hello = host.owner_hello(Some(host.browser_statement(&BROWSER, SUB, past_grace)));
+        assert_eq!(
+            refused(host.admit_at(&BROWSER, &hello, past_grace)),
+            codes::KEYS_STALE
+        );
+    }
+
+    #[test]
+    fn a_refresh_extends_the_session_while_the_grant_and_account_hold() {
+        let host = Host::new("owner-refresh");
+        let grant = host.add(&BROWSER, 3600);
+        let admitted = host.admit(&BROWSER).unwrap();
+        let refresh = |jws: &str, now: u64| {
+            host.env_run(|env| {
+                owner::refresh_in(&host.dir.0, env, &grant.grant_id, &BROWSER, jws, now)
+            })
+        };
+        let later = store::now_ms() + 9 * 60 * 1000;
+        let extended = refresh(&host.browser_statement(&BROWSER, SUB, later), later).unwrap();
+        assert!(extended > admitted.account.deadline_ms);
+        // Never past the grant's expiry.
+        let near_end = grant.expires_ms - 60 * 1000;
+        let capped = refresh(&host.browser_statement(&BROWSER, SUB, near_end), near_end).unwrap();
+        assert_eq!(capped, grant.expires_ms);
+        assert_eq!(
+            refresh(
+                &host.browser_statement(&BROWSER, "sub-Another-012345678", later),
+                later
+            ),
+            Err(codes::MISMATCH)
+        );
+        owner::remove_in(&host.dir.0, RemoveTarget::Grant(&grant.grant_id), later).unwrap();
+        assert_eq!(
+            refresh(&host.browser_statement(&BROWSER, SUB, later), later),
+            Err(refusals::NOT_GRANTED)
+        );
+        assert!(admitted.principal.live().revoked(), "the removal closed it");
+    }
+
+    #[test]
+    fn the_ninth_live_connection_of_one_grant_is_busy() {
+        let host = Host::new("owner-busy");
+        host.add(&BROWSER, 3600);
+        let live: Vec<_> = (0..owner::SESSION_CAP)
+            .map(|_| host.admit(&BROWSER).unwrap())
+            .collect();
+        assert_eq!(refused(host.admit(&BROWSER)), refusals::BUSY);
+        drop(live);
+        host.admit(&BROWSER).unwrap();
+    }
+
+    #[test]
+    fn each_hello_mode_selects_only_its_own_kind_for_one_key() {
+        let host = Host::new("owner-mode");
+        let invite = store::create_invite(
+            &host.dir.0,
+            "alice",
+            store::tests::grant(),
+            "Jerry",
+            "Mac",
+            3600,
+            false,
+            store::now_ms(),
+        )
+        .unwrap();
+        let guest_hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "Chrome"});
+        let guest_id = match host.admit_any(&BROWSER, &guest_hello) {
+            LinkAdmission::Admitted {
+                principal: Principal::Guest(guest),
+                ..
+            } => guest.guest_id,
+            _ => panic!("a guest hello is a guest"),
+        };
+        // The key holds a guest share but no owner grant.
+        let now = store::now_ms();
+        let owner_hello = host.owner_hello(Some(host.browser_statement(&BROWSER, SUB, now)));
+        assert!(matches!(
+            host.admit_any(&BROWSER, &owner_hello),
+            LinkAdmission::Refused(refusals::NOT_GRANTED)
+        ));
+        host.add(&BROWSER, 3600);
+        assert!(matches!(
+            host.admit_any(&BROWSER, &owner_hello),
+            LinkAdmission::Admitted {
+                principal: Principal::Owner(_),
+                ..
+            }
+        ));
+        match host.admit_any(&BROWSER, &json!({"v": 1, "device": "Chrome"})) {
+            LinkAdmission::Admitted {
+                principal: Principal::Guest(guest),
+                ..
+            } => assert_eq!(guest.guest_id, guest_id),
+            _ => panic!("a returning guest hello still selects the share"),
+        }
+    }
+}
