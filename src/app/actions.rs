@@ -1825,6 +1825,8 @@ impl AppState {
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
+            self.settle_released_agent_name(&terminal_id);
+            let terminal = self.terminals.get_mut(&terminal_id)?;
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
@@ -1999,6 +2001,34 @@ impl AppState {
             .values()
             .filter_map(crate::terminal::TerminalState::next_managed_agent_deadline)
             .min()
+    }
+
+    /// An agent that exited from this terminal and came back on the same
+    /// session takes its name back (#480), unless another agent, live or
+    /// archived, holds the name now (the names `agent rename` and
+    /// `agent start` refuse). A restored name is queued in
+    /// `retaken_agent_names` for the app to record with agent groups.
+    fn settle_released_agent_name(&mut self, terminal_id: &crate::terminal::TerminalId) {
+        let Some(terminal) = self.terminals.get(terminal_id) else {
+            return;
+        };
+        let name_held_elsewhere = match terminal.released_agent_name_disposition() {
+            crate::terminal::state::ReleasedAgentNameDisposition::Restore(name) => {
+                self.terminals.iter().any(|(id, other)| {
+                    id != terminal_id && other.agent_name.as_deref() == Some(name)
+                }) || self.archived_agents.iter().any(|record| {
+                    record.name.as_deref() == Some(name)
+                        && record.terminal_id != terminal_id.as_str()
+                })
+            }
+            _ => false,
+        };
+        let Some(terminal) = self.terminals.get_mut(terminal_id) else {
+            return;
+        };
+        if let Some(name) = terminal.settle_released_agent_name(name_held_elsewhere) {
+            self.retaken_agent_names.push((terminal_id.clone(), name));
+        }
     }
 
     pub(crate) fn publish_pane_process_exit_if_agent(
