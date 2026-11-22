@@ -224,6 +224,12 @@ pub enum GuestAuditEvent {
     /// The owner removed a browser, or a newer grant for the same key
     /// replaced it (`text` is `replaced`).
     OwnerRemoved,
+    /// An owner browser connected (at most one entry per grant per 10
+    /// minutes).
+    OwnerConnected,
+    /// The owner gate refused a browser's request (`method`; at most one
+    /// entry per grant and method per minute).
+    OwnerDenied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -24,7 +24,7 @@ pub(crate) const MAX_INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const EXPIRED_INVITE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// `last_seen_ms` is rewritten at most this often, so each request does not
 /// rewrite the store.
-const LAST_SEEN_RESOLUTION_MS: u64 = 60 * 1000;
+pub(crate) const LAST_SEEN_RESOLUTION_MS: u64 = 60 * 1000;
 /// One `connected` audit entry per guest per this window: every guest request
 /// is its own Noise session.
 pub(crate) const CONNECTED_AUDIT_WINDOW_MS: u64 = 10 * 60 * 1000;

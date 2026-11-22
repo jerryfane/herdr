@@ -53,7 +53,11 @@ mod guest_gate;
 mod guest_owner;
 mod owner_access;
 #[cfg(unix)]
+mod owner_gate;
+#[cfg(unix)]
 pub(crate) use guest_gate::serve_guest_stream;
+#[cfg(unix)]
+pub(crate) use owner_gate::serve_owner_stream;
 mod pane_input_stream;
 mod pane_output_stream;
 #[cfg(all(test, unix))]
@@ -1521,6 +1525,10 @@ pub(crate) enum ConnectionPrincipal {
     /// A HerdrUp guest through the guest relay, gated to one agent.
     #[cfg(unix)]
     Guest(crate::guest::GuestPrincipal),
+    /// The owner's browser on an owner grant, through the guest relay, gated
+    /// to its grant's scope.
+    #[cfg(unix)]
+    OwnerBrowser(crate::guest::owner::OwnerPrincipal),
 }
 
 /// Stamp `pane.report_agent_control` with the connection's peer pid, the
@@ -1641,6 +1649,12 @@ fn handle_principal_connection(
     #[cfg(unix)]
     if let ConnectionPrincipal::Guest(guest) = &principal {
         return guest_gate::serve_session(stream, request, guest, api_tx, event_hub, running);
+    }
+    // Nor does the owner's browser: its gate is an explicit allowlist per
+    // grant scope, and it never routes to federation peers.
+    #[cfg(unix)]
+    if let ConnectionPrincipal::OwnerBrowser(owner) = &principal {
+        return owner_gate::serve_session(stream, request, owner, api_tx, event_hub, running);
     }
     let federation = match &principal {
         ConnectionPrincipal::Federation(peer) => Some(peer),
@@ -3140,6 +3154,32 @@ fn stream_subscriptions_with_heartbeat(
     running: &Arc<AtomicBool>,
     heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
+    stream_subscriptions_watched(
+        &mut stream,
+        request_id,
+        params,
+        api_tx,
+        event_hub,
+        running,
+        heartbeat_interval,
+        None,
+    )
+}
+
+/// The subscription stream with an optional watch, asked on every poll:
+/// when it returns a line, that line is written and the stream ends (the
+/// owner gate's removal and expiry check).
+#[allow(clippy::too_many_arguments)]
+fn stream_subscriptions_watched(
+    stream: &mut ApiStream,
+    request_id: String,
+    params: crate::api::schema::EventsSubscribeParams,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    heartbeat_interval: Duration,
+    mut watch: Option<&mut dyn FnMut() -> Option<String>>,
+) -> std::io::Result<()> {
     let events_v2 = params.events_v2;
     let local_only = params.local_only;
     let event_start_sequence = event_hub.current_sequence();
@@ -3165,13 +3205,13 @@ fn stream_subscriptions_with_heartbeat(
             }
             Err(mut response) => {
                 response.id = request_id;
-                return write_json_line_allow_disconnect(&mut stream, &response);
+                return write_json_line_allow_disconnect(stream, &response);
             }
         }
     }
 
     if !write_subscription_line(
-        &mut stream,
+        stream,
         &SuccessResponse {
             id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted { rejected },
@@ -3184,15 +3224,18 @@ fn stream_subscriptions_with_heartbeat(
     let mut last_write = Instant::now();
     let mut lines = Vec::new();
     loop {
-        if should_stop_connection(&mut stream, running)? {
+        if should_stop_connection(stream, running)? {
             return Ok(());
+        }
+        if let Some(line) = watch.as_mut().and_then(|watch| watch()) {
+            return write_text_line_allow_disconnect(stream, &line);
         }
 
         let batch = match event_hub.read_checked(cursor, !local_only) {
             Ok(batch) => batch,
             Err(error) => {
                 return write_json_line_allow_disconnect(
-                    &mut stream,
+                    stream,
                     &ErrorResponse {
                         id: request_id,
                         error: history_error(error),
@@ -3205,7 +3248,7 @@ fn stream_subscriptions_with_heartbeat(
         // reader gets a `lagged` line below and continues.
         if batch.missed.is_some() && !events_v2 {
             return write_json_line_allow_disconnect(
-                &mut stream,
+                stream,
                 &ErrorResponse {
                     id: request_id,
                     error: history_error(EventHistoryError::Lost),
@@ -3232,7 +3275,7 @@ fn stream_subscriptions_with_heartbeat(
                 first_missed_seq: missed.first,
                 last_missed_seq: missed.last,
             };
-            if !write_subscription_line(&mut stream, &lagged)? {
+            if !write_subscription_line(stream, &lagged)? {
                 return Ok(());
             }
             wrote = true;
@@ -3242,7 +3285,7 @@ fn stream_subscriptions_with_heartbeat(
                 seq: line.seq,
                 payload: line.payload,
             };
-            if !write_subscription_line(&mut stream, &event)? {
+            if !write_subscription_line(stream, &event)? {
                 return Ok(());
             }
             wrote = true;
@@ -3251,7 +3294,7 @@ fn stream_subscriptions_with_heartbeat(
             last_write = Instant::now();
         } else if events_v2 && last_write.elapsed() >= heartbeat_interval {
             let heartbeat = crate::api::schema::SubscriptionControlLine::Heartbeat { seq: cursor };
-            if !write_subscription_line(&mut stream, &heartbeat)? {
+            if !write_subscription_line(stream, &heartbeat)? {
                 return Ok(());
             }
             last_write = Instant::now();

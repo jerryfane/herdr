@@ -15637,6 +15637,16 @@
               "const": "owner_removed",
               "description": "The owner removed a browser, or a newer grant for the same key\nreplaced it (`text` is `replaced`).",
               "type": "string"
+            },
+            {
+              "const": "owner_connected",
+              "description": "An owner browser connected (at most one entry per grant per 10\nminutes).",
+              "type": "string"
+            },
+            {
+              "const": "owner_denied",
+              "description": "The owner gate refused a browser's request (`method`; at most one\nentry per grant and method per minute).",
+              "type": "string"
             }
           ]
         },
@@ -19701,7 +19711,7 @@
                   "type": "string"
                 },
                 "protocol": {
-                  "description": "Owner access protocol version.",
+                  "description": "Owner access protocol: 1 stores grants (`owner_access.*`); 2 also\nadmits owner browsers (owner hello and gate). Approve a browser\nonly on machines reporting 2 or more.",
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"

@@ -437,7 +437,9 @@ pub enum ResponseResult {
     /// This machine's relay identity for owner access. Never includes
     /// secrets.
     OwnerAccessInfo {
-        /// Owner access protocol version.
+        /// Owner access protocol: 1 stores grants (`owner_access.*`); 2 also
+        /// admits owner browsers (owner hello and gate). Approve a browser
+        /// only on machines reporting 2 or more.
         protocol: u32,
         /// The relay's id for this machine, unpadded base64url of 16 bytes.
         host_id: String,

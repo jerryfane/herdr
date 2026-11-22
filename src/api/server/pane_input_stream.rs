@@ -78,7 +78,7 @@ struct InputFrameError {
 /// fence: the open and every frame then go through the own-pane check, so a
 /// stream cannot outlive the caller's ownership of the pane.
 pub(super) fn serve(
-    stream: ApiStream,
+    mut stream: ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     fenced: Option<u64>,
@@ -86,13 +86,37 @@ pub(super) fn serve(
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     serve_with_open_timeout(
-        stream,
+        &mut stream,
         request_id,
         params,
         fenced,
         api_tx,
         running,
         APP_RESPONSE_TIMEOUT,
+        None,
+    )
+}
+
+/// [`serve`] for the owner gate: `guard` is asked before every frame is
+/// written; when it returns a line, that line is sent and the stream ends,
+/// so a removed or expired grant cannot type another key.
+pub(super) fn serve_guarded(
+    stream: &mut ApiStream,
+    request_id: String,
+    params: PaneInputStreamParams,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+    guard: &mut dyn FnMut() -> Option<String>,
+) -> std::io::Result<()> {
+    serve_with_open_timeout(
+        stream,
+        request_id,
+        params,
+        None,
+        api_tx,
+        running,
+        APP_RESPONSE_TIMEOUT,
+        Some(guard),
     )
 }
 
@@ -107,14 +131,16 @@ fn scoped(method: Method, fenced: Option<u64>) -> Method {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_with_open_timeout(
-    mut stream: ApiStream,
+    stream: &mut ApiStream,
     request_id: String,
     params: PaneInputStreamParams,
     fenced: Option<u64>,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     open_timeout: Duration,
+    guard: Option<&mut dyn FnMut() -> Option<String>>,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
     let input_source = params.input_source;
@@ -134,11 +160,11 @@ fn serve_with_open_timeout(
     );
     if api_response_outcome(&open_response) != "ok" {
         stream_active.store(false, Ordering::Release);
-        return write_text_line_allow_disconnect(&mut stream, &open_response);
+        return write_text_line_allow_disconnect(stream, &open_response);
     }
 
     if let Err(err) = write_json_line(
-        &mut stream,
+        stream,
         &SuccessResponse {
             id: request_id.clone(),
             result: ResponseResult::Ok {},
@@ -152,7 +178,7 @@ fn serve_with_open_timeout(
     }
 
     let result = serve_frames(
-        &mut stream,
+        stream,
         &request_id,
         &pane_id,
         input_source,
@@ -160,11 +186,13 @@ fn serve_with_open_timeout(
         api_tx,
         running,
         &stream_active,
+        guard,
     );
     stream_active.store(false, Ordering::Release);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_frames(
     stream: &mut ApiStream,
     request_id: &str,
@@ -174,6 +202,7 @@ fn serve_frames(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     stream_active: &Arc<AtomicBool>,
+    mut guard: Option<&mut dyn FnMut() -> Option<String>>,
 ) -> std::io::Result<()> {
     let mut last_seq: Option<u64> = None;
     while stream_is_running(running, stream_active) {
@@ -250,6 +279,9 @@ fn serve_frames(
                 input_source,
             })
         };
+        if let Some(line) = guard.as_mut().and_then(|guard| guard()) {
+            return write_text_line_allow_disconnect(stream, &line);
+        }
         let response = dispatch_to_app_with_timeout(
             Request {
                 id: format!("{request_id}:frame:{seq}"),

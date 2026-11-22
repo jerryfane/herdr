@@ -68,7 +68,7 @@ const RESIZE_DEFAULT_TTL_MS: u64 = 30_000;
 static AUDITED: Mutex<Vec<(GuestAuditEvent, String, Instant)>> = Mutex::new(Vec::new());
 
 /// Whether `event` for `key` should be audited now; records it if so.
-fn audit_due(event: GuestAuditEvent, key: &str) -> bool {
+pub(super) fn audit_due(event: GuestAuditEvent, key: &str) -> bool {
     let now = Instant::now();
     let mut audited = AUDITED
         .lock()
@@ -113,6 +113,27 @@ struct GuestContext {
 }
 
 static CONTEXT: Mutex<Option<GuestContext>> = Mutex::new(None);
+
+/// The API server's channels, once it is up (see [`install_context`]).
+pub(super) fn context() -> Option<(ApiRequestSender, EventHub, Arc<AtomicBool>)> {
+    CONTEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .map(|context| (context.api_tx, context.event_hub, context.running))
+}
+
+/// A remote viewer's `pane.set_pty_size` within the bounds guests and owner
+/// browsers get: `(cols, rows, ttl_ms)`.
+pub(super) fn clamp_resize(cols: u16, rows: u16, ttl_ms: Option<u64>) -> (u16, u16, u64) {
+    (
+        cols.clamp(*RESIZE_COLS.start(), *RESIZE_COLS.end()),
+        rows.clamp(*RESIZE_ROWS.start(), *RESIZE_ROWS.end()),
+        ttl_ms
+            .unwrap_or(RESIZE_DEFAULT_TTL_MS)
+            .clamp(*RESIZE_TTL_MS.start(), *RESIZE_TTL_MS.end()),
+    )
+}
 
 /// Called once the API server is up, so `serve` can run guest connections.
 pub(super) fn install_context(
@@ -561,7 +582,7 @@ fn commits_menu(key: &str) -> bool {
 /// A guest `pane.send_keys` batch in the form the app parses: 1 to
 /// [`SEND_KEYS_MAX`] menu keys, at most one of them committing, and that one
 /// last, so no key can land after the menu closes. `None` refuses the batch.
-fn guest_menu_batch(keys: &[String]) -> Option<Vec<&'static str>> {
+pub(super) fn guest_menu_batch(keys: &[String]) -> Option<Vec<&'static str>> {
     if !(1..=SEND_KEYS_MAX).contains(&keys.len()) {
         return None;
     }
@@ -578,7 +599,7 @@ fn guest_menu_batch(keys: &[String]) -> Option<Vec<&'static str>> {
 
 /// The granted agent is waiting on a menu: an ask, a plan approval or a
 /// permission prompt. A free-text prompt is no menu.
-fn awaits_menu_input(agent: &AgentInfo) -> bool {
+pub(super) fn awaits_menu_input(agent: &AgentInfo) -> bool {
     use crate::detect::InputPromptKind;
     match agent.input_prompt_kind {
         Some(InputPromptKind::Confirm | InputPromptKind::Select) => true,
@@ -863,7 +884,7 @@ pub(super) fn serve_session(
 
 /// The guest's next request, or `None` when the session ends first. An
 /// unparseable line is answered with `invalid_request` and ends it.
-fn next_request(
+pub(super) fn next_request(
     stream: &mut ApiStream,
     live: &crate::guest::LiveSession,
     running: &AtomicBool,
@@ -1165,19 +1186,15 @@ fn serve_request(
             };
             // Only while one of the guest's streams watches the grant: the lease
             // then ends with the guest's last stream, and a revoke closes those.
+            let (cols, rows, ttl_ms) = clamp_resize(params.cols, params.rows, params.ttl_ms);
             let request = Request {
                 id: id.clone(),
                 method: Method::PaneSetPtySize(PaneSetPtySizeParams {
                     pane_id: Some(agent.pane_id),
-                    cols: params.cols.clamp(*RESIZE_COLS.start(), *RESIZE_COLS.end()),
-                    rows: params.rows.clamp(*RESIZE_ROWS.start(), *RESIZE_ROWS.end()),
+                    cols,
+                    rows,
                     viewer_id: Some(guest_viewer_id(&guest.guest_id)),
-                    ttl_ms: Some(
-                        params
-                            .ttl_ms
-                            .unwrap_or(RESIZE_DEFAULT_TTL_MS)
-                            .clamp(*RESIZE_TTL_MS.start(), *RESIZE_TTL_MS.end()),
-                    ),
+                    ttl_ms: Some(ttl_ms),
                     require_stream: true,
                     ..params
                 }),
@@ -2212,7 +2229,7 @@ fn audit_post(guest: &GuestPrincipal, method: &str, text: String, response: &str
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixStream;
@@ -2237,14 +2254,14 @@ mod tests {
 
     /// A real `App` on its own thread with two named agents: the granted
     /// `llm-opt` and `other-agent` on another pane.
-    struct Harness {
-        api_tx: ApiRequestSender,
-        event_hub: EventHub,
-        running: Arc<AtomicBool>,
+    pub(in crate::api::server) struct Harness {
+        pub(in crate::api::server) api_tx: ApiRequestSender,
+        pub(in crate::api::server) event_hub: EventHub,
+        pub(in crate::api::server) running: Arc<AtomicBool>,
         control: std_mpsc::Sender<Control>,
         pty: std_mpsc::Receiver<(usize, bytes::Bytes)>,
-        pane_ids: Vec<String>,
-        dir: TempDir,
+        pub(in crate::api::server) pane_ids: Vec<String>,
+        pub(in crate::api::server) dir: TempDir,
         /// Runs once on the app thread just before it applies the next
         /// `pane.set_pty_size`.
         before_resize: Arc<Mutex<Option<Control>>>,
@@ -2263,7 +2280,7 @@ mod tests {
         }
     }
 
-    fn start(tag: &str) -> Harness {
+    pub(in crate::api::server) fn start(tag: &str) -> Harness {
         let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
         let (control_tx, control_rx) = std_mpsc::channel::<Control>();
         let (pty_tx, pty_rx) = std_mpsc::channel();
@@ -2487,7 +2504,7 @@ mod tests {
             lines
         }
 
-        fn pty_text(&self, index: usize, wait: Duration) -> String {
+        pub(in crate::api::server) fn pty_text(&self, index: usize, wait: Duration) -> String {
             let deadline = Instant::now() + wait;
             let mut text = Vec::new();
             while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -2501,7 +2518,7 @@ mod tests {
         }
 
         /// Change the granted terminal's agent on the app thread.
-        fn with_granted_terminal(
+        pub(in crate::api::server) fn with_granted_terminal(
             &self,
             change: impl FnOnce(&mut crate::terminal::TerminalState) + Send + 'static,
         ) {
@@ -2628,7 +2645,7 @@ mod tests {
     /// Closes the client's write side after a reply. The server may already
     /// have ended the connection (a refusal, a stream, a one-shot reply); macOS
     /// then answers `shutdown` with ENOTCONN, which means the same thing here.
-    fn hang_up_after_reply(client: &UnixStream) {
+    pub(in crate::api::server) fn hang_up_after_reply(client: &UnixStream) {
         match client.shutdown(std::net::Shutdown::Write) {
             Err(err) if err.kind() != std::io::ErrorKind::NotConnected => {
                 panic!("shutdown: {err}")
@@ -2638,13 +2655,13 @@ mod tests {
     }
 
     /// The next reply line, or `None` once the server closed.
-    fn read_reply(reader: &mut BufReader<UnixStream>) -> Option<Value> {
+    pub(in crate::api::server) fn read_reply(reader: &mut BufReader<UnixStream>) -> Option<Value> {
         let mut line = String::new();
         (reader.read_line(&mut line).unwrap() > 0).then(|| serde_json::from_str(&line).unwrap())
     }
 
     /// Sends one more request on an open guest connection and reads its reply.
-    fn ask(reader: &mut BufReader<UnixStream>, request: Value) -> Value {
+    pub(in crate::api::server) fn ask(reader: &mut BufReader<UnixStream>, request: Value) -> Value {
         writeln!(reader.get_mut(), "{request}").unwrap();
         read_reply(reader).unwrap_or_else(|| panic!("closed before answering {request}"))
     }
@@ -5247,7 +5264,18 @@ mod tests {
         }
 
         fn admit(&self, device_pub: [u8; 32], hello: &Value) -> LinkAdmission<GuestPrincipal> {
-            admit_in(self.dir.clone(), device_pub, hello).into()
+            match admit_in(self.dir.clone(), device_pub, hello) {
+                Admission::Admitted {
+                    principal,
+                    reply,
+                    account,
+                } => LinkAdmission::Admitted {
+                    principal,
+                    reply,
+                    account,
+                },
+                Admission::Refused(code) => LinkAdmission::Refused(code),
+            }
         }
 
         fn serve(&self, principal: GuestPrincipal, stream: UnixStream) {
