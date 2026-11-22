@@ -684,9 +684,9 @@ impl App {
         }
         self.emit_apns_agent_notifications(&pane_updates, false);
         self.emit_live_activity_updates();
-        // After the idle transition is announced: a `when_idle` Topics switch
-        // waiting on this agent relaunches it now that its turn is over.
-        self.apply_idle_topics_switches(&pane_updates);
+        // A `when_idle` Topics switch waiting on an agent that just went idle is
+        // armed here, and applied only after a quiet window (never in this handler).
+        self.arm_idle_topics_switches(&pane_updates);
         self.sync_agent_metadata_deadline();
         if let Some((
             overlay,

@@ -3189,13 +3189,20 @@ impl TerminalState {
         self.topics_switch_pending = None;
     }
 
-    /// The Topics choice the agent's next launch runs on: a pending `when_idle`
-    /// switch becomes the saved choice here, since a relaunch cuts no turn.
-    pub fn settle_topics_switch(&mut self) -> bool {
-        if let Some(enabled) = self.topics_switch_pending.take() {
+    /// The one launch-time resolver for the Topics choice: every launch (a restart,
+    /// a restore, an unarchive, a `when_idle` switch applied at idle) runs on what
+    /// this returns. `requested` is an immediate switch and replaces a pending one;
+    /// otherwise a pending `when_idle` switch becomes the saved choice, since a
+    /// launch cuts no turn. Returns the choice and whether a pending switch applied.
+    pub fn resolve_launch_topics(&mut self, requested: Option<bool>) -> (bool, bool) {
+        let pending = self.topics_switch_pending.take();
+        if let Some(enabled) = requested.or(pending) {
             self.agent_topics_enabled = enabled;
         }
-        self.agent_topics_enabled
+        (
+            self.agent_topics_enabled,
+            requested.is_none() && pending.is_some(),
+        )
     }
 
     fn reconcile_agent_name_owner(

@@ -507,6 +507,10 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
+            if self.app.apply_due_topics_switches(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+            }
             if self.app.expire_pty_leases_and_apply_shrinks(Instant::now()) {
                 needs_render = true;
                 needs_full_render = true;

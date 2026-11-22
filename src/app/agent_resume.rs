@@ -395,20 +395,9 @@ impl App {
                 .and_then(|terminal| terminal.session_transfer.as_ref())
                 .map(|transfer| transfer.phase),
         );
-        // Restore, unarchive and a plain restart keep the build the Topics switch chose.
-        // A `when_idle` switch still pending applies here: this launch cuts no turn.
-        let (topics_enabled, settled) = self
-            .state
-            .terminals
-            .get_mut(&terminal_id)
-            .map(|terminal| {
-                let settled = terminal.topics_switch_pending.is_some();
-                (terminal.settle_topics_switch(), settled)
-            })
-            .unwrap_or_default();
-        if settled {
-            self.state.mark_session_dirty();
-        }
+        // Restore, unarchive and a plain restart keep the build the Topics switch chose;
+        // a `when_idle` switch still pending applies here, since this launch cuts no turn.
+        let topics_enabled = self.resolve_launch_topics(&terminal_id, None);
         let shell_config =
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
         let shell_name = crate::pane::resolved_pane_shell(shell_config);

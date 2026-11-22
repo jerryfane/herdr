@@ -250,6 +250,10 @@ pub struct ArchivedAgentSnapshot {
     /// unarchive resumes it there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub topics_enabled: bool,
+    /// A `when_idle` Topics switch still pending when the agent was archived: the
+    /// unarchive's launch resolves it. Absent when none was pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics_switch_pending: Option<bool>,
 }
 
 impl ArchivedAgentSnapshot {
@@ -1063,6 +1067,7 @@ mod tests {
                 pane_label: Some("reviewer".into()),
                 fence: None,
                 topics_enabled: false,
+                topics_switch_pending: None,
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();

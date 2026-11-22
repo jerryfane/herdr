@@ -196,6 +196,9 @@ pub struct App {
     pub(crate) loaded_accounts: Vec<crate::config::AccountConfig>,
     /// `[topics]`: the topics-enabled omp build behind `agent.topics.set_enabled`.
     pub(crate) topics_config: crate::config::TopicsConfig,
+    /// `when_idle` Topics switches armed at their agent's idle transition, by when
+    /// they were armed. Applied after `TOPICS_SWITCH_QUIET` without input.
+    pub(crate) topics_switch_armed: std::collections::HashMap<crate::terminal::TerminalId, Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) pending_host_appearance_deadline: Option<Instant>,
@@ -746,6 +749,7 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             loaded_accounts: config.accounts.clone(),
             topics_config: config.topics.clone(),
+            topics_switch_armed: std::collections::HashMap::new(),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             pending_host_appearance_deadline: None,

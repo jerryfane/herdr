@@ -444,10 +444,9 @@ impl App {
         // silently unhooks a restored agent from the channel that addresses it.
         let pane_label = terminal.manual_label.clone();
         let fence = terminal.fence_identity.clone();
-        // An unarchive is a relaunch, so a pending `when_idle` switch applies there.
-        let topics_enabled = terminal
-            .topics_switch_pending
-            .unwrap_or(terminal.agent_topics_enabled);
+        let topics_enabled = terminal.agent_topics_enabled;
+        // Kept pending: the unarchive's launch resolves it like any other launch.
+        let topics_switch_pending = terminal.topics_switch_pending;
         let cwd = terminal.cwd.clone();
         let occupant_generation = terminal.occupant_generation;
         let kind = terminal
@@ -479,6 +478,7 @@ impl App {
                 pane_label,
                 fence: Some(fence),
                 topics_enabled,
+                topics_switch_pending,
             });
 
         // Release the pane's process, then remove the now-empty pane. The session
@@ -619,6 +619,7 @@ impl App {
                 .with_occupant_generation(record.occupant_generation);
         terminal.fence_identity = record.fence_identity();
         terminal.agent_topics_enabled = record.topics_enabled;
+        terminal.topics_switch_pending = record.topics_switch_pending;
         if let Some((persisted, plan)) = resume {
             terminal = terminal.with_pending_agent_resume_plan(plan);
             // An unarchive waits for a missing directory like a restore does (#477).
@@ -1845,7 +1846,7 @@ fn archived_agent_info(
         avatar: avatars.get(&record.terminal_id).cloned(),
         topic_sessions: None,
         topics_enabled: (record.kind == "omp").then_some(record.topics_enabled),
-        topics_switch_pending: false,
+        topics_switch_pending: record.topics_switch_pending.is_some(),
     }
 }
 

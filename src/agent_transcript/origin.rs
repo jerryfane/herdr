@@ -166,6 +166,13 @@ impl OtherPromptLog {
         changed
     }
 
+    /// A brokered prompt was admitted and its submission has not resolved yet.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.outcome.get().is_none())
+    }
+
     /// The delivered prompts, oldest first, at most [`OTHER_PROMPT_LIMIT`]:
     /// one pass, each record read once.
     pub(crate) fn delivered(&self) -> Vec<OtherPrompt> {
