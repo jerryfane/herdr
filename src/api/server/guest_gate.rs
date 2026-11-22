@@ -2817,6 +2817,11 @@ mod tests {
             json!({"id": "d", "method": "guest.invite.create", "params": {"target": terminal, "name": "friend", "owner_name": "Jerry", "machine_label": "Mac"}}),
             json!({"id": "d", "method": "guest.revoke", "params": {"guest_id": guest.guest_id}}),
             json!({"id": "d", "method": "guest.audit", "params": {}}),
+            json!({"id": "d", "method": "owner_access.info", "params": {}}),
+            json!({"id": "d", "method": "owner_access.list", "params": {}}),
+            json!({"id": "d", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "Chrome", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "Mac"}}),
+            json!({"id": "d", "method": "owner_access.renew", "params": {"grant_id": "g", "ttl_secs": 3600}}),
+            json!({"id": "d", "method": "owner_access.remove", "params": {"grant_id": "g"}}),
             json!({"id": "d", "method": "server.stop", "params": {}}),
         ] {
             let lines = harness.call(&guest, request.clone());

@@ -4357,6 +4357,128 @@
             }
           ]
         },
+        "OwnerAccessAddParams": {
+          "additionalProperties": false,
+          "description": "`owner_access.add`: allow one browser key on this machine, bound to the\naccount of the device approving it. A live grant for the same key is\nreplaced.",
+          "properties": {
+            "account_statement": {
+              "description": "The approving device's own account statement for this machine\n(`aud` = `host_id` from `owner_access.info`). Its `sub` becomes the\ngrant's account.",
+              "type": "string"
+            },
+            "approved_by": {
+              "description": "The approving device's name, for display: 1 to 64 printable\ncharacters.",
+              "type": "string"
+            },
+            "device_name": {
+              "description": "For example `Chrome on macOS`: 1 to 64 printable characters.",
+              "type": "string"
+            },
+            "device_pub": {
+              "description": "The browser's X25519 key (its Noise key), unpadded base64url of 32\nbytes.",
+              "type": "string"
+            },
+            "scope": {
+              "$ref": "#/schemas/request/$defs/OwnerScope",
+              "default": "terminal",
+              "description": "Default: `terminal`."
+            },
+            "ttl_secs": {
+              "description": "Grant lifetime in seconds, 3600 to 2592000 (1 hour to 30 days).\nAnything else is refused with `owner_ttl_invalid`, never clamped.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "device_pub",
+            "device_name",
+            "ttl_secs",
+            "account_statement",
+            "approved_by"
+          ],
+          "type": "object"
+        },
+        "OwnerAccessInfoParams": {
+          "additionalProperties": false,
+          "description": "`owner_access.info`: this machine's relay identity, created on first use.",
+          "type": "object"
+        },
+        "OwnerAccessListParams": {
+          "additionalProperties": false,
+          "description": "`owner_access.list`: every owner grant kept, revoked and expired ones\nincluded until they are deleted 30 days after they ended.",
+          "type": "object"
+        },
+        "OwnerAccessRemoveParams": {
+          "additionalProperties": false,
+          "description": "`owner_access.remove`: exactly one of `grant_id`, `device_pub` or\n`fingerprint`. Unknown or already removed grants answer `removed: []`.",
+          "properties": {
+            "device_pub": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fingerprint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "grant_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "OwnerAccessRenewParams": {
+          "additionalProperties": false,
+          "description": "`owner_access.renew`: `expires = now + ttl_secs` (not added to the time\nleft). Revives an expired grant that was not removed, within 30 days of\nits expiry.",
+          "properties": {
+            "grant_id": {
+              "type": "string"
+            },
+            "scope": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OwnerScope"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Change the scope; unchanged when absent."
+            },
+            "ttl_secs": {
+              "description": "3600 to 2592000, as for `owner_access.add`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "grant_id",
+            "ttl_secs"
+          ],
+          "type": "object"
+        },
+        "OwnerScope": {
+          "description": "What a granted browser may do on this machine.",
+          "oneOf": [
+            {
+              "const": "chat",
+              "description": "Agents only: read and talk to local agents.",
+              "type": "string"
+            },
+            {
+              "const": "terminal",
+              "description": "Agents and their terminals. A terminal is a shell on this machine.",
+              "type": "string"
+            }
+          ]
+        },
         "PaneAgentState": {
           "enum": [
             "idle",
@@ -7535,6 +7657,87 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GuestAuditParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Owner only: the owner's browsers allowed on this machine (owner\ngrants). Never reachable by guests, federation peers or fenced callers.",
+          "properties": {
+            "method": {
+              "const": "owner_access.info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/OwnerAccessInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "owner_access.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/OwnerAccessListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "owner_access.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/OwnerAccessAddParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "owner_access.renew",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/OwnerAccessRenewParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "owner_access.remove",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/OwnerAccessRemoveParams"
             }
           },
           "required": [
@@ -15375,6 +15578,21 @@
               "const": "device_removed",
               "description": "The owner removed a device from an account-bound share.",
               "type": "string"
+            },
+            {
+              "const": "owner_added",
+              "description": "The owner allowed a browser (`owner_access.add`). Owner events carry\nthe grant id in `guest_id`, the browser's name in `name`, its\nfingerprint, and an empty `pane`; `text` is the approving device.",
+              "type": "string"
+            },
+            {
+              "const": "owner_renewed",
+              "description": "The owner renewed a browser's grant (`text` is its scope).",
+              "type": "string"
+            },
+            {
+              "const": "owner_removed",
+              "description": "The owner removed a browser, or a newer grant for the same key\nreplaced it (`text` is `replaced`).",
+              "type": "string"
             }
           ]
         },
@@ -15988,6 +16206,88 @@
             {
               "const": "unconfigured",
               "description": "Direct mode without a complete APNs key config, or relay/auto mode with no\ncapability-bearing device registered yet.",
+              "type": "string"
+            }
+          ]
+        },
+        "OwnerGrantInfo": {
+          "description": "One owner grant. The account it is bound to is never shown.",
+          "properties": {
+            "approved_by": {
+              "type": "string"
+            },
+            "created_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "device": {
+              "type": "string"
+            },
+            "device_pub": {
+              "description": "The browser's key, unpadded base64url.",
+              "type": "string"
+            },
+            "expires_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "fingerprint": {
+              "description": "`SHA256:` plus the first 8 bytes of SHA-256(device key), as for guests.",
+              "type": "string"
+            },
+            "grant_id": {
+              "type": "string"
+            },
+            "last_seen_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "renewed_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "revoked": {
+              "description": "Removed (`owner_access.remove`) or replaced by a newer grant for the\nsame key. A revoked grant is never renewed.",
+              "type": "boolean"
+            },
+            "scope": {
+              "$ref": "#/schemas/success_response/$defs/OwnerScope"
+            }
+          },
+          "required": [
+            "grant_id",
+            "device_pub",
+            "fingerprint",
+            "device",
+            "scope",
+            "approved_by",
+            "created_ms",
+            "expires_ms",
+            "revoked"
+          ],
+          "type": "object"
+        },
+        "OwnerScope": {
+          "description": "What a granted browser may do on this machine.",
+          "oneOf": [
+            {
+              "const": "chat",
+              "description": "Agents only: read and talk to local agents.",
+              "type": "string"
+            },
+            {
+              "const": "terminal",
+              "description": "Agents and their terminals. A terminal is a shell on this machine.",
               "type": "string"
             }
           ]
@@ -19329,6 +19629,141 @@
               "required": [
                 "type",
                 "entries"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "This machine's relay identity for owner access. Never includes\nsecrets.",
+              "properties": {
+                "host_id": {
+                  "description": "The relay's id for this machine, unpadded base64url of 16 bytes.",
+                  "type": "string"
+                },
+                "link": {
+                  "$ref": "#/schemas/success_response/$defs/GuestLinkInfo"
+                },
+                "max_ttl_secs": {
+                  "description": "The longest grant `owner_access.add` and `owner_access.renew` accept.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "node_pub": {
+                  "description": "This machine's X25519 Noise key, unpadded base64url of 32 bytes.",
+                  "type": "string"
+                },
+                "protocol": {
+                  "description": "Owner access protocol version.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relay_url": {
+                  "type": "string"
+                },
+                "scopes": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/OwnerScope"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "owner_access_info",
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "protocol",
+                "host_id",
+                "node_pub",
+                "relay_url",
+                "link",
+                "max_ttl_secs",
+                "scopes",
+                "version"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "grants": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/OwnerGrantInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "owner_access_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "grants"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "grant": {
+                  "$ref": "#/schemas/success_response/$defs/OwnerGrantInfo"
+                },
+                "replaced": {
+                  "description": "Grants for the same key that this one replaced (now revoked).",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "owner_access_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "grant",
+                "replaced"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "grant": {
+                  "$ref": "#/schemas/success_response/$defs/OwnerGrantInfo"
+                },
+                "type": {
+                  "const": "owner_access_renewed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "grant"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "removed": {
+                  "description": "Grants this call revoked; `[]` when none matched.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "owner_access_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "removed"
               ],
               "type": "object"
             },

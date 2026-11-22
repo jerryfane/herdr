@@ -215,6 +215,15 @@ pub enum GuestAuditEvent {
     DeviceAdded,
     /// The owner removed a device from an account-bound share.
     DeviceRemoved,
+    /// The owner allowed a browser (`owner_access.add`). Owner events carry
+    /// the grant id in `guest_id`, the browser's name in `name`, its
+    /// fingerprint, and an empty `pane`; `text` is the approving device.
+    OwnerAdded,
+    /// The owner renewed a browser's grant (`text` is its scope).
+    OwnerRenewed,
+    /// The owner removed a browser, or a newer grant for the same key
+    /// replaced it (`text` is `replaced`).
+    OwnerRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

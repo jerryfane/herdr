@@ -79,7 +79,8 @@ pub(crate) trait GuestHost: Send + Sync + 'static {
 
     fn set_link_status(&self, state: LinkState, last_error: Option<String>);
 
-    /// Fires whenever guests or invites change, which may flip `link_wanted`.
+    /// Fires whenever guests, invites or owner grants change, which may flip
+    /// `link_wanted`.
     fn subscribe_changes(&self) -> Receiver<()>;
 }
 

@@ -534,6 +534,105 @@ fn missing_required_params_are_rejected() {
 }
 
 #[test]
+fn owner_access_requests_parse_with_terminal_scope_by_default_and_refuse_machine() {
+    let add = serde_json::from_str::<Request>(
+        r#"{"id":"1","method":"owner_access.add","params":{"device_pub":"K","device_name":"Chrome on macOS","ttl_secs":3600,"account_statement":"a.b.c","approved_by":"iPhone"}}"#,
+    )
+    .unwrap();
+    match add.method {
+        Method::OwnerAccessAdd(params) => assert_eq!(params.scope, OwnerScope::Terminal),
+        other => panic!("{other:?}"),
+    }
+    let renew = serde_json::from_str::<Request>(
+        r#"{"id":"1","method":"owner_access.renew","params":{"grant_id":"g","ttl_secs":3600,"scope":"chat"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        renew.method,
+        Method::OwnerAccessRenew(OwnerAccessRenewParams {
+            grant_id: "g".into(),
+            ttl_secs: 3600,
+            scope: Some(OwnerScope::Chat),
+        })
+    );
+    // No federation routing: `machine` (or any unknown field) is refused, not
+    // ignored, so a call meant for another machine never runs here.
+    for json in [
+        r#"{"id":"1","method":"owner_access.info","params":{"machine":"studio"}}"#,
+        r#"{"id":"1","method":"owner_access.list","params":{"machine":"studio"}}"#,
+        r#"{"id":"1","method":"owner_access.add","params":{"device_pub":"K","device_name":"C","ttl_secs":3600,"account_statement":"a.b.c","approved_by":"i","machine":"studio"}}"#,
+        r#"{"id":"1","method":"owner_access.renew","params":{"grant_id":"g","ttl_secs":3600,"machine":"studio"}}"#,
+        r#"{"id":"1","method":"owner_access.remove","params":{"grant_id":"g","machine":"studio"}}"#,
+        r#"{"id":"1","method":"owner_access.add","params":{"device_pub":"K","device_name":"C","scope":"admin","ttl_secs":3600,"account_statement":"a.b.c","approved_by":"i"}}"#,
+    ] {
+        assert!(serde_json::from_str::<Request>(json).is_err(), "{json}");
+    }
+}
+
+#[test]
+fn owner_access_results_keep_their_wire_shape() {
+    let grant = OwnerGrantInfo {
+        grant_id: "g".into(),
+        device_pub: "K".into(),
+        fingerprint: "SHA256:0000·0000·0000·0000".into(),
+        device: "Chrome on macOS".into(),
+        scope: OwnerScope::Terminal,
+        approved_by: "iPhone".into(),
+        created_ms: 1,
+        expires_ms: 2,
+        renewed_ms: None,
+        last_seen_ms: None,
+        revoked: false,
+    };
+    let added = serde_json::to_value(ResponseResult::OwnerAccessAdded {
+        grant,
+        replaced: vec!["old".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        added,
+        serde_json::json!({
+            "type": "owner_access_added",
+            "grant": {
+                "grant_id": "g", "device_pub": "K", "fingerprint": "SHA256:0000·0000·0000·0000",
+                "device": "Chrome on macOS", "scope": "terminal", "approved_by": "iPhone",
+                "created_ms": 1, "expires_ms": 2, "renewed_ms": null, "last_seen_ms": null,
+                "revoked": false
+            },
+            "replaced": ["old"]
+        })
+    );
+    let removed =
+        serde_json::to_value(ResponseResult::OwnerAccessRemoved { removed: vec![] }).unwrap();
+    assert_eq!(
+        removed,
+        serde_json::json!({"type": "owner_access_removed", "removed": []})
+    );
+    let info = serde_json::to_value(ResponseResult::OwnerAccessInfo {
+        protocol: 1,
+        host_id: "h".into(),
+        node_pub: "n".into(),
+        relay_url: "https://guest.herdrup.app".into(),
+        link: GuestLinkInfo {
+            state: GuestLinkState::Off,
+            last_error: None,
+        },
+        max_ttl_secs: 2_592_000,
+        scopes: vec![OwnerScope::Chat, OwnerScope::Terminal],
+        version: "0.0.0".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        info,
+        serde_json::json!({
+            "type": "owner_access_info", "protocol": 1, "host_id": "h", "node_pub": "n",
+            "relay_url": "https://guest.herdrup.app", "link": {"state": "off", "last_error": null},
+            "max_ttl_secs": 2_592_000, "scopes": ["chat", "terminal"], "version": "0.0.0"
+        })
+    );
+}
+
+#[test]
 fn pane_send_input_defaults_to_empty_text_and_keys() {
     let json = r#"
     {

@@ -177,6 +177,18 @@ herdr guest log [<guest-id>] [--limit N]          # アクティビティ(新し
 
 ゲストまたは有効期限内の招待が 1 つ以上ある間、サーバーはリレーへの送信方向の TLS WebSocket 接続を 1 本維持し、切断時は 2〜60 秒のバックオフで再接続します。ゲストも招待もなくなると接続を閉じます。これは Herdr がプロセス内で開く唯一の TLS 接続で、アップデート確認やプッシュ配信は代わりに `curl` を実行します。`herdr guest list` で接続状態(`off`・`connecting`・`up`・`retrying`)と直近のエラーを確認できます。
 
+オーナーグラントを使うと、自分のブラウザーを同じリレー経由でこのマシンに許可できます。信頼済みデバイスでブラウザーを承認すると、HerdrUp がマシンごとに SSH で次のコマンドを実行します。
+
+```bash
+herdr owner-access info                           # このマシンのリレー ID(host_id)、公開鍵(node_pub)、リレーと接続状態
+herdr owner-access list                           # 許可済みのブラウザー(削除済み・期限切れのものも、消去されるまで表示)
+herdr owner-access add --device-pub KEY --device-name NAME --scope chat|terminal --ttl SECS --statement JWS --approved-by NAME
+herdr owner-access renew <grant-id> --ttl SECS [--scope chat|terminal]
+herdr owner-access remove <grant-id> | --device-pub KEY | --fingerprint FINGERPRINT
+```
+
+グラントは 1 つのブラウザー鍵(パディングなしの base64url。パディング付きは拒否)を指定し、有効期間は 1 時間〜30 日です。範囲外の `--ttl` は短縮されず拒否されます。`--statement` は承認するデバイス自身の、このマシン向け HerdrUp アカウントステートメント(`aud` は `info` の `host_id`)です。サーバーは署名・発行者・マシン・有効時間を確認し、グラントをそのアカウントに結び付けます。`[guest] accounts` がオフでも同じです。`terminal` アクセスはこのマシンのシェルと同等で、`chat` はエージェントのみです。同じ鍵を再度追加すると以前のグラントを置き換えます。同時に有効なグラントは最大 10 個です。`renew` は有効期限を現在から `--ttl` 後に設定し、削除されていない期限切れのグラントも復活させます。存在しないグラントの `remove` は何も削除せずに成功するため、繰り返し実行できます。削除済み・期限切れのグラントは 30 日後に消去されます。有効なグラントがある間はゲストと同様にリレー接続を維持し、最後のグラントが期限切れまたは削除されてから 24 時間後に閉じます。追加・更新・削除は `herdr guest log` に記録されます。これらのコマンドはこのマシンでのみ動作します(`--machine` なし)。ブラウザーはまだグラントで接続できません。
+
 ## ペアリング
 
 ```bash

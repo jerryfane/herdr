@@ -133,8 +133,10 @@ pub(crate) struct Expected<'a> {
     pub issuer: &'a str,
     /// This host's id (the invite's `host_id`).
     pub host_id: &'a str,
-    /// b64url of the device key the Noise handshake proved.
-    pub device: &'a str,
+    /// b64url of the device key the Noise handshake proved. `None` skips the
+    /// `dev` check: an owner grant's approving device presents its own
+    /// statement for a browser key it is not.
+    pub device: Option<&'a str>,
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(part: &str) -> Result<T, Failure> {
@@ -209,7 +211,7 @@ pub(crate) fn verify(
     if claims.aud != expected.host_id {
         return Err(Failure::WrongAudience);
     }
-    if claims.dev != expected.device {
+    if expected.device.is_some_and(|device| claims.dev != device) {
         return Err(Failure::WrongDevice);
     }
     if now_secs < claims.iat.saturating_sub(SKEW_SECS) {
@@ -418,24 +420,25 @@ pub(crate) struct Verified {
 }
 
 /// Checks `jws` for `device_pub` at this host, fetching the issuer's keys
-/// when the cache is stale or lacks the statement's `kid`. Errors are the
+/// when the cache is stale or lacks the statement's `kid`. With no
+/// `device_pub` the statement's `dev` is not compared. Errors are the
 /// refusal codes in [`codes`].
 pub(crate) fn check(
     dir: &Path,
     settings: &Settings,
     fetch: &(dyn Fn(&str) -> Result<Vec<u8>, String> + Sync),
     host_id: &str,
-    device_pub: &[u8; 32],
+    device_pub: Option<&[u8; 32]>,
     jws: &str,
     now_ms: u64,
 ) -> Result<Verified, &'static str> {
     let kid = statement_kid(jws).map_err(Failure::code)?;
     let keys = current_keys(dir, settings, fetch, &kid, now_ms)?;
-    let device = b64url(device_pub);
+    let device = device_pub.map(|device| b64url(device.as_slice()));
     let expected = Expected {
         issuer: &settings.issuer,
         host_id,
-        device: &device,
+        device: device.as_deref(),
     };
     let claims = match verify(jws, &keys, &expected, now_ms / 1000) {
         Ok(claims) => claims,
@@ -563,7 +566,7 @@ pub(crate) mod tests {
             let expected = Expected {
                 issuer,
                 host_id: case["host_id"].as_str().unwrap(),
-                device: case["noise_device_pub"].as_str().unwrap(),
+                device: Some(case["noise_device_pub"].as_str().unwrap()),
             };
             let outcome = verify(
                 case["jws"].as_str().unwrap(),
@@ -591,7 +594,7 @@ pub(crate) mod tests {
             &Expected {
                 issuer,
                 host_id: issued["host_id"].as_str().unwrap(),
-                device: issued["dev"].as_str().unwrap(),
+                device: Some(issued["dev"].as_str().unwrap()),
             },
             issued["iat"].as_u64().unwrap(),
         )
@@ -606,7 +609,7 @@ pub(crate) mod tests {
         let expected = Expected {
             issuer: "https://accounts.example",
             host_id: issued["host_id"].as_str().unwrap(),
-            device: issued["dev"].as_str().unwrap(),
+            device: Some(issued["dev"].as_str().unwrap()),
         };
         let jws = issued["jws"].as_str().unwrap();
         let now = issued["iat"].as_u64().unwrap();
@@ -643,7 +646,7 @@ pub(crate) mod tests {
         let expected = Expected {
             issuer: ISSUER,
             host_id: "HostIdExample-01234567",
-            device: &device,
+            device: Some(&device),
         };
         let claims = issuer.claims(
             "HostIdExample-01234567",
@@ -784,7 +787,7 @@ pub(crate) mod tests {
             &settings(),
             &|issuer: &str| server.fetch(issuer),
             HOST,
-            device,
+            Some(device),
             jws,
             now_ms,
         )

@@ -12,6 +12,7 @@ pub mod guest;
 pub mod integrations;
 pub mod machines;
 pub(crate) mod operations;
+pub mod owner_access;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -35,6 +36,7 @@ pub use gram::*;
 pub use guest::*;
 pub use integrations::*;
 pub use machines::*;
+pub use owner_access::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -105,6 +107,13 @@ operations::define_operations! {
     GuestUpdate(GuestUpdateParams) => "guest.update", false, false;
     GuestRemoveDevice(GuestRemoveDeviceParams) => "guest.remove_device", false, false;
     GuestAudit(GuestAuditParams) => "guest.audit", false, false;
+    /// Owner only: the owner's browsers allowed on this machine (owner
+    /// grants). Never reachable by guests, federation peers or fenced callers.
+    OwnerAccessInfo(OwnerAccessInfoParams) => "owner_access.info", false, false;
+    OwnerAccessList(OwnerAccessListParams) => "owner_access.list", false, false;
+    OwnerAccessAdd(OwnerAccessAddParams) => "owner_access.add", false, false;
+    OwnerAccessRenew(OwnerAccessRenewParams) => "owner_access.renew", false, false;
+    OwnerAccessRemove(OwnerAccessRemoveParams) => "owner_access.remove", false, false;
     /// Internal only: resolve an agent and its live-agent check for the guest gate.
     #[serde(skip)]
     #[schemars(skip)]
