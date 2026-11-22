@@ -532,17 +532,7 @@ fn restore_tab(
 
         let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
-        if !has_import && !cwd.is_dir() {
-            let terminal = unavailable_restored_terminal(
-                saved_pane,
-                cwd,
-                "Saved directory is unavailable. Restore the directory and restart this session."
-                    .into(),
-            );
-            panes.insert(*id, PaneState::new(terminal.id.clone()));
-            terminals.push(terminal);
-            continue;
-        }
+        let cwd_missing = !has_import && !cwd.is_dir();
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
@@ -579,6 +569,20 @@ fn restore_tab(
                 &mut agent_restore,
             )
         };
+        // A missing directory fails a plain pane at once. An agent pane is deferred like
+        // any resume and waits for the directory (issue #477): mounts often come up just
+        // after the server, and the wait must not hold up the panes restored after it.
+        if cwd_missing && startup.restore_plan.is_none() {
+            let terminal = unavailable_restored_terminal(
+                saved_pane,
+                cwd,
+                "Saved directory is unavailable. Restore the directory and restart this session."
+                    .into(),
+            );
+            panes.insert(*id, PaneState::new(terminal.id.clone()));
+            terminals.push(terminal);
+            continue;
+        }
         let restored_agent_resume = saved_agent_resume
             .filter(|_| !startup.duplicate_agent_session)
             .map(reported_resume_from_snapshot);
@@ -625,6 +629,9 @@ fn restore_tab(
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan)
                 .with_occupant_generation(saved_pane.map(|p| p.occupant_generation).unwrap_or(0));
+            if cwd_missing {
+                terminal.restore_dir_wait = Some(crate::terminal::RestoreDirWait::default());
+            }
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }

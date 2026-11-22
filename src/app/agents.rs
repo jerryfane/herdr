@@ -607,6 +607,8 @@ impl App {
         terminal.fence_identity = record.fence_identity();
         if let Some((persisted, plan)) = resume {
             terminal = terminal.with_pending_agent_resume_plan(plan);
+            // An unarchive waits for a missing directory like a restore does (#477).
+            terminal.restore_dir_wait = Some(crate::terminal::RestoreDirWait::default());
             terminal.set_persisted_agent_session(persisted);
         }
         match (
@@ -679,7 +681,8 @@ impl App {
                 ws_idx,
                 pane: pane_id,
             });
-        if !self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true) {
+        let started = self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true);
+        if started == super::AgentResumeStart::Declined {
             // No plan to resume (`fresh`), or the resume launcher declined. The pane
             // still has to be usable, so give it a plain shell in the archived cwd
             // rather than leave the dead pane this whole block exists to prevent.
@@ -688,6 +691,39 @@ impl App {
 
         self.state.mark_session_dirty();
         self.schedule_session_save();
+
+        // FAIL LOUD (#477): the pane is back either way, but a caller must learn when
+        // its agent did not come back with it, rather than read a plain shell, a failed
+        // pane or a pending wait as success.
+        match started {
+            super::AgentResumeStart::Started => {}
+            super::AgentResumeStart::Declined if fresh => {}
+            super::AgentResumeStart::Declined => return Err(AgentUnarchiveError::ResumeDeclined),
+            super::AgentResumeStart::Failed => {
+                let reason = self
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.restore_error.clone())
+                    .unwrap_or_default();
+                return Err(AgentUnarchiveError::ResumeFailed { reason });
+            }
+            // The archived directory is missing for now: the resume scheduler starts the
+            // agent once it appears, or fails the pane with a restore error (visible on
+            // the pane, in `agent.list` and as a status event) when the wait runs out.
+            super::AgentResumeStart::Deferred => {
+                let dir = self
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.cwd.display().to_string())
+                    .unwrap_or_default();
+                return Err(AgentUnarchiveError::WaitingForDirectory {
+                    dir,
+                    window: self.missing_dir_wait_window,
+                });
+            }
+        }
 
         self.agent_info(ws_idx, pane_id)
             .ok_or(AgentUnarchiveError::NoResumablePlan)
@@ -998,6 +1034,23 @@ impl App {
                 message: format!(
                     "pane {pane} is already running this session; retire it first, or retry with --fresh to start a clean agent"
                 ),
+            },
+            AgentUnarchiveError::WaitingForDirectory { dir, window } => {
+                crate::api::schema::ErrorBody {
+                    code: "agent_waiting_for_directory".into(),
+                    message: format!(
+                        "the pane is back, but its directory {dir} is missing; waiting up to {} s for it — the agent starts when it appears, otherwise the pane shows why it could not",
+                        window.as_secs()
+                    ),
+                }
+            }
+            AgentUnarchiveError::ResumeFailed { reason } => crate::api::schema::ErrorBody {
+                code: "agent_resume_failed".into(),
+                message: format!("the pane is back, but its agent could not be resumed: {reason}"),
+            },
+            AgentUnarchiveError::ResumeDeclined => crate::api::schema::ErrorBody {
+                code: "agent_resume_failed".into(),
+                message: "the pane is back with a plain shell, but its agent could not be resumed; see the server log".into(),
             },
         }
     }
@@ -1652,6 +1705,19 @@ pub(super) enum AgentUnarchiveError {
     SessionInUse {
         pane: String,
     },
+    /// The pane was restored but its directory is missing for now; the resume waits
+    /// for it (#477).
+    WaitingForDirectory {
+        dir: String,
+        window: std::time::Duration,
+    },
+    /// The pane was restored but its agent failed to resume; `reason` is the pane's
+    /// restore error.
+    ResumeFailed {
+        reason: String,
+    },
+    /// The pane was restored with a plain shell because the resume launcher declined.
+    ResumeDeclined,
 }
 
 pub(super) enum AgentForgetError {

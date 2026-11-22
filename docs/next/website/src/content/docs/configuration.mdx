@@ -728,9 +728,12 @@ Herdr resumes supported Agent conversations after a server restart by default:
 [session]
 resume_agents_on_restore = true
 startup_per_agent_delay_ms = 100
+restore_missing_dir_timeout_ms = 300000
 ```
 
 Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
+
+An agent whose saved directory is missing at restore keeps re-checking it, with backoff, for `restore_missing_dir_timeout_ms` (5 minutes by default) and starts once it appears, so a mount that comes up after the server does not strand its agents. Unarchive waits the same way. Set it to `0` to fail at once.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 

@@ -1441,6 +1441,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.restore_missing_dir_timeout_ms",
+          "type": "integer",
+          "default": "300000",
+          "description": "Milliseconds a restored agent keeps re-checking a saved directory that is missing at restore, such as a mount that is not up yet, before failing the pane. Checks back off from 1 second to 30 seconds; the agent starts as soon as the directory appears, and other panes restore without waiting. Unarchive waits the same way. 0 fails at once."
         }
       ]
     },

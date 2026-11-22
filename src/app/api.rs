@@ -540,8 +540,14 @@ impl App {
                 self.session_transfer_process_exited(*pane_id);
                 if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell {
                     let relaunched = if self.pane_has_pending_agent_resume(*pane_id) {
-                        self.resume_pending_agent_for_pane(*pane_id)
-                            || self.respawn_shell_for_launch_pane(*pane_id, true)
+                        // Only a declined resume falls back to a shell: a deferred one
+                        // is waiting for its saved directory and the scheduler retries it.
+                        match self.resume_pending_agent_for_pane(*pane_id) {
+                            crate::app::agent_resume::AgentResumeStart::Declined => {
+                                self.respawn_shell_for_launch_pane(*pane_id, true)
+                            }
+                            _ => true,
+                        }
                     } else {
                         self.respawn_shell_for_launch_pane(*pane_id, true)
                     };
@@ -1020,9 +1026,12 @@ impl App {
     /// started. The old runtime was already removed by `agent.restart`'s
     /// `shutdown_terminal_runtime`, so the launcher (which requires no live
     /// runtime) proceeds.
-    pub(super) fn resume_pending_agent_for_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+    pub(super) fn resume_pending_agent_for_pane(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+    ) -> crate::app::agent_resume::AgentResumeStart {
         let Some((ws_idx, pane)) = self.find_pane(pane_id) else {
-            return false;
+            return crate::app::agent_resume::AgentResumeStart::Declined;
         };
         let terminal_id = pane.attached_terminal_id.clone();
         let (rows, cols) = self

@@ -231,6 +231,8 @@ fn start_agent_restore_server(
     name: &str,
     snapshot: impl FnOnce(&Path, &Path) -> serde_json::Value,
     default_shell: &str,
+    // Extra lines for the `[session]` config section.
+    session_config: &str,
 ) -> (RestoredServer, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -268,7 +270,9 @@ fn start_agent_restore_server(
     .unwrap();
     fs::write(
         data_dir.join("config.toml"),
-        format!("onboarding = false\n[terminal]\ndefault_shell = {default_shell:?}\n"),
+        format!(
+            "onboarding = false\n[terminal]\ndefault_shell = {default_shell:?}\n[session]\n{session_config}\n"
+        ),
     )
     .unwrap();
     support::register_runtime_dir(&runtime_dir);
@@ -356,6 +360,7 @@ fn deferred_agent_resume_starts_in_a_zero_width_pane() {
             })
         },
         "/bin/sh",
+        "",
     );
 
     let pane_id = restored_agent(&socket_path, "deep")["pane_id"].clone();
@@ -400,6 +405,7 @@ fn failed_deferred_agent_resume_reports_the_agent_as_unavailable() {
             })
         },
         "/nonexistent/herdr-test-shell",
+        "",
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -469,9 +475,22 @@ fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason()
             })
         },
         "/bin/sh",
+        // Fail on the first resume attempt instead of waiting for the directory.
+        "restore_missing_dir_timeout_ms = 0",
     );
 
-    let agent = restored_agent(&socket_path, "gone");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let agent = loop {
+        let agent = restored_agent(&socket_path, "gone");
+        if agent.get("restore_error").is_some() {
+            break agent;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a zero wait never failed the missing directory: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(agent["agent_status"], "unknown", "{agent}");
     let reason = agent["restore_error"].as_str().unwrap();
     assert!(
@@ -493,6 +512,66 @@ fn prompting_an_agent_whose_saved_directory_is_gone_reports_the_restore_reason()
             .ends_with(reason),
         "{prompt}"
     );
+}
+
+/// Issue #477: after a reboot the mount holding an agent's directory came up seconds
+/// after the server, and every agent on it stayed failed until a manual restart. The
+/// restore must keep waiting for the directory and start the agent once it appears.
+#[test]
+fn deferred_agent_resume_waits_for_a_saved_directory_that_appears_later() {
+    let (_herdr, socket_path) = start_agent_restore_server(
+        "resume-late",
+        |project, session| {
+            let late = project.join("late-mount");
+            serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [{"id": "w1", "custom_name": "late", "identity_cwd": project,
+                    "tabs": [{"layout": {"Pane": 1},
+                              "panes": {"1": omp_agent_pane(&late, session, "late")},
+                              "zoomed": false, "focused": 1, "root_pane": 1}]}]
+            })
+        },
+        "/bin/sh",
+        "restore_missing_dir_timeout_ms = 60000",
+    );
+    let late = socket_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("project")
+        .join("late-mount");
+
+    // Well past the first attempts: still waiting, not failed.
+    std::thread::sleep(Duration::from_secs(3));
+    let agent = restored_agent(&socket_path, "late");
+    assert!(
+        agent.get("restore_error").is_none(),
+        "the restore gave up on a directory that may still appear: {agent}"
+    );
+
+    fs::create_dir_all(&late).unwrap();
+    let pane_id = agent["pane_id"].clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let info = restore_request_with_params(
+            &socket_path,
+            "pane.process_info",
+            serde_json::json!({"pane_id": pane_id}),
+        );
+        if info.get("error").is_none() {
+            break;
+        }
+        let agent = restored_agent(&socket_path, "late");
+        assert!(
+            agent.get("restore_error").is_none(),
+            "the restore failed after the directory appeared: {agent}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent never started once its directory appeared: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Whenever a pane reports `agent_status: unknown` for a failed restore, every pane view
