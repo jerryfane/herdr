@@ -24,9 +24,9 @@ const TABLE: &[(&str, &str)] = &[
     ("machine.status", "-"),
     ("server.staged_update", "-"),
     ("server.apply_staged_update", "-"),
-    ("server.update_check", "-"),
-    ("server.update_apply", "-"),
-    ("server.update_status", "-"),
+    ("server.update_check", "terminal"),
+    ("server.update_apply", "terminal"),
+    ("server.update_status", "terminal"),
     ("server.ssh_agent.register", "-"),
     ("server.agent_manifests", "-"),
     ("server.reload_agent_manifests", "-"),
@@ -51,12 +51,12 @@ const TABLE: &[(&str, &str)] = &[
     ("gram.get_file_chunk", "chat"),
     ("gram.relay", "-"),
     ("gram.relay_status", "-"),
-    ("guest.invite.create", "-"),
-    ("guest.list", "-"),
-    ("guest.revoke", "-"),
-    ("guest.update", "-"),
-    ("guest.remove_device", "-"),
-    ("guest.audit", "-"),
+    ("guest.invite.create", "terminal"),
+    ("guest.list", "terminal"),
+    ("guest.revoke", "terminal"),
+    ("guest.update", "terminal"),
+    ("guest.remove_device", "terminal"),
+    ("guest.audit", "terminal"),
     ("owner_access.info", "-"),
     ("owner_access.list", "-"),
     ("owner_access.add", "-"),
@@ -94,31 +94,31 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.explain", "-"),
     ("fence.explain", "-"),
     ("agent.send_keys", "terminal"),
-    ("agent.rename", "-"),
-    ("agent.avatar.set", "-"),
+    ("agent.rename", "terminal"),
+    ("agent.avatar.set", "terminal"),
     ("agent.avatar.get", "chat"),
     ("agent.groups.get", "chat"),
-    ("agent.groups.set", "-"),
-    ("agent.archive", "-"),
+    ("agent.groups.set", "terminal"),
+    ("agent.archive", "terminal"),
     ("agent.unarchive", "-"),
     ("agent.forget", "-"),
     ("agent.view.set", "-"),
     ("agent.view.clear", "-"),
     ("agent.focus", "-"),
-    ("agent.start", "-"),
+    ("agent.start", "terminal"),
     ("agent.prompt", "chat"),
     ("agent.wait", "-"),
     ("agent.answer", "chat"),
     ("agent.answer_form", "chat"),
     ("agent.dismiss_ask", "chat"),
-    ("agent.restart", "-"),
+    ("agent.restart", "terminal"),
     ("agent.transfer_session", "-"),
-    ("accounts.list", "-"),
-    ("accounts.create", "-"),
-    ("accounts.remove", "-"),
-    ("agent.kinds", "-"),
-    ("fs.list_dir", "-"),
-    ("pane.split", "-"),
+    ("accounts.list", "terminal"),
+    ("accounts.create", "terminal"),
+    ("accounts.remove", "terminal"),
+    ("agent.kinds", "terminal"),
+    ("fs.list_dir", "terminal"),
+    ("pane.split", "terminal"),
     ("pane.swap", "-"),
     ("pane.move", "-"),
     ("pane.zoom", "-"),
@@ -146,7 +146,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pane.input.set", "-"),
     ("pane.link.activate", "-"),
     ("pane.link.resolve", "-"),
-    ("pane.rename", "-"),
+    ("pane.rename", "terminal"),
     ("pane.send_text", "terminal"),
     ("pane.send_keys", "chat"),
     ("pane.send_input", "terminal"),
@@ -166,7 +166,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pane.report_metadata", "-"),
     ("pane.clear_agent_authority", "-"),
     ("pane.release_agent", "-"),
-    ("pane.close", "-"),
+    ("pane.close", "terminal"),
     ("popup.close", "-"),
     ("events.subscribe", "chat"),
     ("events.wait", "-"),
@@ -352,7 +352,7 @@ fn both_scopes_refuse_peers_grants_server_and_forged_gram_and_stay_open() {
         let requests = [
             json!({"id": "1", "method": "agent.get", "params": {"target": "studio/builder"}}),
             json!({"id": "2", "method": "pane.stream", "params": {"pane_id": "studio/w1:p1"}}),
-            json!({"id": "3", "method": "guest.list", "params": {}}),
+            json!({"id": "3", "method": "guest.list", "params": {"machine": "studio"}}),
             json!({"id": "4", "method": "owner_access.list", "params": {}}),
             json!({"id": "5", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "x", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "x"}}),
             json!({"id": "6", "method": "gram.send", "params": {"text": "x", "from": "llm-opt"}}),
@@ -389,7 +389,11 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
         assert_eq!(capabilities["owner"], 2, "{pong}");
         assert_eq!(capabilities["owner_scope"], json!(scope), "{pong}");
         assert_eq!(capabilities["agent_transcript"], true, "{pong}");
-        assert!(capabilities.get("server_update").is_none(), "{pong}");
+        assert_eq!(
+            capabilities.get("server_update").is_some(),
+            input_stream,
+            "{pong}"
+        );
         assert!(
             capabilities.get("ssh_agent_registration").is_none(),
             "{pong}"
@@ -717,4 +721,79 @@ fn a_frame_arriving_right_after_removal_is_never_dispatched() {
         .pty_text(1, Duration::from_millis(500))
         .contains("after-removal"));
     handle.join().unwrap();
+}
+
+/// Terminal scope administers and creates agents and terminals, manages
+/// guests and Claude accounts and updates herdr, as the desktop does: a
+/// terminal is already a shell on this machine. Chat scope reaches none of
+/// it, and neither scope reaches `owner_access.*`, so no browser can mint,
+/// renew or widen its own grant. Calls are still local: a `guest.*` naming
+/// a saved machine and a split of another machine's pane are refused.
+#[test]
+fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
+    let harness = start("owner-shell");
+    // Arguments that fail in the app (no such agent, pane, kind or account),
+    // so nothing here changes this machine or reaches the network.
+    let terminal_ok = [
+        json!({"id": "1", "method": "agent.groups.set", "params": {"revision": 999_999, "folders": [], "stars": []}}),
+        json!({"id": "2", "method": "agent.rename", "params": {"target": "nobody", "name": "x"}}),
+        json!({"id": "3", "method": "agent.avatar.set", "params": {"target": "nobody"}}),
+        json!({"id": "4", "method": "agent.archive", "params": {"target": "nobody"}}),
+        json!({"id": "5", "method": "agent.restart", "params": {"target": "nobody"}}),
+        json!({"id": "6", "method": "agent.kinds", "params": {}}),
+        json!({"id": "7", "method": "agent.start", "params": {"name": "x", "kind": "nope", "pane_id": "w9:p9"}}),
+        json!({"id": "8", "method": "fs.list_dir", "params": {"path": "/nonexistent-herdr-owner-test"}}),
+        json!({"id": "9", "method": "pane.split", "params": {"target_pane_id": "w9:p9", "direction": "right"}}),
+        json!({"id": "10", "method": "pane.rename", "params": {"pane_id": "w9:p9", "label": "x"}}),
+        json!({"id": "11", "method": "pane.close", "params": {"pane_id": "w9:p9"}}),
+        json!({"id": "12", "method": "accounts.list", "params": {}}),
+        json!({"id": "13", "method": "accounts.create", "params": {"kind": "nope", "label": "x"}}),
+        json!({"id": "14", "method": "accounts.remove", "params": {"id": "nope"}}),
+        json!({"id": "15", "method": "guest.revoke", "params": {}}),
+        json!({"id": "16", "method": "server.update_status", "params": {}}),
+    ];
+    let replies = codes(&harness, OwnerScope::Terminal, &terminal_ok);
+    for (request, code) in terminal_ok.iter().zip(&replies) {
+        assert_ne!(code, "owner_forbidden", "terminal: {request}");
+    }
+    assert_eq!(replies[5], "<success>", "agent.kinds: {replies:?}");
+    assert_eq!(replies[11], "<success>", "accounts.list: {replies:?}");
+    // It reached the guest RPCs, which want exactly one id.
+    assert_eq!(replies[14], "invalid_params", "guest.revoke: {replies:?}");
+
+    let terminal_refused = [
+        json!({"id": "20", "method": "guest.list", "params": {"machine": "studio"}}),
+        json!({"id": "21", "method": "guest.revoke", "params": {"guest_id": "g", "machine": "studio"}}),
+        json!({"id": "22", "method": "pane.split", "params": {"target_pane_id": "studio/w1:p1", "direction": "right"}}),
+        json!({"id": "23", "method": "agent.restart", "params": {"target": "studio/builder"}}),
+    ];
+    let replies = codes(&harness, OwnerScope::Terminal, &terminal_refused);
+    assert_eq!(replies, ["owner_forbidden"; 4], "{replies:?}");
+
+    let mut chat_refused: Vec<Value> = terminal_ok.to_vec();
+    chat_refused.extend([
+        json!({"id": "30", "method": "guest.invite.create", "params": {"target": "llm-opt", "name": "friend", "owner_name": "Jerry", "machine_label": "Mac"}}),
+        json!({"id": "31", "method": "guest.list", "params": {}}),
+        json!({"id": "32", "method": "guest.update", "params": {"guest_id": "g", "share_gram": true}}),
+        json!({"id": "33", "method": "guest.remove_device", "params": {"guest_id": "g", "fingerprint": "f"}}),
+        json!({"id": "34", "method": "guest.audit", "params": {}}),
+        json!({"id": "35", "method": "server.update_check", "params": {}}),
+        json!({"id": "36", "method": "server.update_apply", "params": {"build_id": "2026-11-23-0123456789ab"}}),
+    ]);
+    let replies = codes(&harness, OwnerScope::Chat, &chat_refused);
+    for (request, code) in chat_refused.iter().zip(&replies) {
+        assert_eq!(code, "owner_forbidden", "chat: {request}");
+    }
+
+    let owner_access = [
+        json!({"id": "40", "method": "owner_access.info", "params": {}}),
+        json!({"id": "41", "method": "owner_access.list", "params": {}}),
+        json!({"id": "42", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "x", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "x"}}),
+        json!({"id": "43", "method": "owner_access.renew", "params": {"grant_id": "g", "ttl_secs": 2_592_000}}),
+        json!({"id": "44", "method": "owner_access.remove", "params": {"grant_id": "g"}}),
+    ];
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let replies = codes(&harness, scope, &owner_access);
+        assert_eq!(replies, ["owner_forbidden"; 5], "{scope:?}: {replies:?}");
+    }
 }
