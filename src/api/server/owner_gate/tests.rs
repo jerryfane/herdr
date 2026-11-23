@@ -881,3 +881,66 @@ fn both_scopes_delete_the_owners_gram() {
         assert_ne!(replies[0], "owner_forbidden", "{scope:?}: {replies:?}");
     }
 }
+
+/// An owner browser's pong carries the flags the desktop and web gate their
+/// menus on, with the host's own value, in the scopes that allow the method:
+/// the Topics switch in both (`agent.topics.set_enabled`), session transfer
+/// in terminal only (`agent.transfer_session`).
+#[test]
+fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
+    let harness = start("owner-ping-menu-flags");
+    let pong = |scope: OwnerScope| {
+        let (mut reader, handle) = open(
+            &harness,
+            owner(&harness, scope),
+            json!({"id": "1", "method": "ping", "params": {}}),
+        );
+        let pong = read_reply(&mut reader).unwrap();
+        hang_up_after_reply(reader.get_ref());
+        handle.join().unwrap();
+        pong["result"]["capabilities"].clone()
+    };
+
+    // A host without `[topics] omp_binary` has no switch to offer.
+    crate::api::set_topics_switch_configured(false);
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let capabilities = pong(scope);
+        assert_ne!(
+            capabilities["agent_topics_switch"], true,
+            "{scope:?}: {capabilities}"
+        );
+        assert_ne!(
+            capabilities["agent_topics_switch_when_idle"], true,
+            "{scope:?}: {capabilities}"
+        );
+    }
+
+    crate::api::set_topics_switch_configured(true);
+    let chat = pong(OwnerScope::Chat);
+    assert_eq!(chat["agent_topics_switch"], true, "{chat}");
+    assert_eq!(chat["agent_topics_switch_when_idle"], true, "{chat}");
+    assert!(chat.get("agent_session_transfer").is_none(), "{chat}");
+    assert!(
+        chat.get("agent_session_transfer_harnesses").is_none(),
+        "{chat}"
+    );
+
+    let terminal = pong(OwnerScope::Terminal);
+    assert_eq!(terminal["agent_topics_switch"], true, "{terminal}");
+    assert_eq!(
+        terminal["agent_topics_switch_when_idle"], true,
+        "{terminal}"
+    );
+    let host = crate::api::default_capabilities().unwrap();
+    assert_eq!(
+        terminal["agent_session_transfer"], host.agent_session_transfer,
+        "{terminal}"
+    );
+    assert_eq!(terminal["agent_session_transfer"], true, "{terminal}");
+    assert_eq!(
+        terminal["agent_session_transfer_harnesses"],
+        serde_json::to_value(&host.agent_session_transfer_harnesses).unwrap(),
+        "{terminal}"
+    );
+    crate::api::set_topics_switch_configured(false);
+}

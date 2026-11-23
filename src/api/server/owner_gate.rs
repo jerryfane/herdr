@@ -135,7 +135,9 @@ const CHAT_EVENTS: &[&str] = &[
 ];
 
 /// Capabilities an owner browser's `ping` reports: only what this gate
-/// serves. The terminal ones are reported for the terminal scope only.
+/// serves, each with the host's own value, so a flag is true only when this
+/// herdr has the feature and the scope allows its methods. The terminal ones
+/// are reported for the terminal scope only.
 const CHAT_CAPABILITIES: &[&str] = &[
     "events_v2",
     "agent_avatar",
@@ -148,12 +150,19 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "agent_topics",
     "agent_transcript_topic",
     "agent_topic_suggestions",
+    "agent_topics_switch",
+    "agent_topics_switch_when_idle",
     "transcript_max_bytes",
     "pane_stream_resync",
     "gram_thumbnails",
 ];
-const TERMINAL_CAPABILITIES: &[&str] =
-    &["pane_input_stream", "rename_preconditions", "server_update"];
+const TERMINAL_CAPABILITIES: &[&str] = &[
+    "pane_input_stream",
+    "rename_preconditions",
+    "server_update",
+    "agent_session_transfer",
+    "agent_session_transfer_harnesses",
+];
 
 /// Whether `scope` may call the method named `name`.
 pub(super) fn allowed(name: &str, scope: OwnerScope) -> bool {
