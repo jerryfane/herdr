@@ -282,7 +282,12 @@ fn agent_list_keeps_the_session_file_shape_workspace_janitor_relies_on() {
     std::fs::write(&child, "{\"type\":\"session\"}\n").unwrap();
     let (mut app, _pane, _) = omp_app(&session.path, std::process::id());
 
-    let listed = send(&mut app, Method::AgentList(Default::default()));
+    // Janitor reads the raw text: parsing would hide a duplicated key.
+    let raw = app.handle_api_request(Request {
+        id: "r".into(),
+        method: Method::AgentList(Default::default()),
+    });
+    let listed: Value = serde_json::from_str(&raw).unwrap();
     let agent = &listed["result"]["agents"][0];
 
     let agent_session = &agent["agent_session"];
@@ -311,6 +316,19 @@ fn agent_list_keeps_the_session_file_shape_workspace_janitor_relies_on() {
     let path = topic["path"].as_str().expect("path is a string");
     assert_eq!(path, child.display().to_string());
     assert!(std::path::Path::new(path).is_absolute(), "{path}");
+    // Janitor fails closed on NUL, and on a path that names no file (a lossy
+    // conversion of a non-UTF-8 name would).
+    assert!(!path.contains('\0'), "{path:?}");
+    assert!(std::path::Path::new(path).is_file(), "{path}");
+    let start = raw
+        .find("\"topic_sessions\":[")
+        .expect("raw topic_sessions");
+    let end = start + raw[start..].find(']').expect("end of topic_sessions");
+    assert_eq!(
+        raw[start..end].matches("\"path\":").count(),
+        1,
+        "one `path` key per topic: {raw}"
+    );
     assert_eq!(topic["topic_id"], "Plan");
 }
 
