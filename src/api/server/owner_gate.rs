@@ -639,6 +639,12 @@ fn project_pong(id: &str, response: &str, scope: OwnerScope) -> String {
         serde_json::json!(crate::guest::owner::PROTOCOL),
     );
     served.insert("owner_scope".into(), serde_json::json!(scope));
+    // Served by this gate, not a server-wide capability: an owner browser's
+    // `agent.read` takes `source: "recent_unwrapped"` (older hosts refuse it).
+    served.insert(
+        "agent_read_recent_unwrapped".into(),
+        serde_json::json!(true),
+    );
     serde_json::json!({
         "id": id,
         "result": {
