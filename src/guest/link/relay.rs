@@ -1,7 +1,7 @@
 //! The host socket: dialling the relay and multiplexing guest sessions over it.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
@@ -221,20 +221,53 @@ fn connect(host: &str, port: u16, dial: &Dial) -> Result<TcpStream, Ended> {
 
 /// Tries each resolved address within what is left of `deadline`.
 pub(super) fn connect_blocking(host: &str, port: u16, deadline: Instant) -> io::Result<TcpStream> {
+    connect_any((host, port).to_socket_addrs()?.collect(), deadline)
+}
+
+/// Least time an attempt gets while other addresses wait: a TCP handshake
+/// with a distant live host, and RFC 8305's recommended attempt delay.
+const MIN_ATTEMPT: Duration = Duration::from_millis(250);
+
+/// Tries `addresses` one at a time, alternating families. Each attempt gets
+/// an even share of what is left of `deadline` (at least [`MIN_ATTEMPT`]),
+/// so an address that never answers cannot use up the deadline, and one that
+/// fails fast hands its unused share on. The last address gets all that is left.
+fn connect_any(addresses: Vec<SocketAddr>, deadline: Instant) -> io::Result<TcpStream> {
+    let addresses = interleave_families(addresses);
     let mut last = io::Error::new(io::ErrorKind::NotFound, "relay host has no address");
-    for address in (host, port).to_socket_addrs()? {
+    for (tried, address) in addresses.iter().enumerate() {
         let Some(left) = deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
         else {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
         };
-        match TcpStream::connect_timeout(&address, left) {
+        let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
+        let attempt = (left / untried).max(MIN_ATTEMPT).min(left);
+        match TcpStream::connect_timeout(address, attempt) {
             Ok(stream) => return Ok(stream),
             Err(error) => last = error,
         }
     }
     Err(last)
+}
+
+/// Alternates address families, starting with the family resolved first
+/// (RFC 8305 §4), so a family whose route blackholes costs every other
+/// attempt instead of all the attempts before the other family's.
+fn interleave_families(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_is_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let total = addresses.len();
+    let (first, other): (Vec<_>, Vec<_>) = addresses
+        .into_iter()
+        .partition(|address| address.is_ipv6() == first_is_v6);
+    let (mut first, mut other) = (first.into_iter(), other.into_iter());
+    let mut ordered = Vec::with_capacity(total);
+    while ordered.len() < total {
+        ordered.extend(first.next());
+        ordered.extend(other.next());
+    }
+    ordered
 }
 
 type Socket = WebSocket<MaybeTlsStream<RelayStream>>;
@@ -510,5 +543,77 @@ fn would_block(result: tungstenite::Result<()>) -> Result<bool, Ended> {
 impl Drop for Connection {
     fn drop(&mut self) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn blackholed_first_address_leaves_time_for_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // TEST-NET-1 (RFC 5737) is not routed on the internet, so a SYN to it
+        // goes unanswered, like an IPv6 route that blackholes.
+        let blackholed: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+
+        let stream = connect_any(vec![blackholed, listener.local_addr().unwrap()], deadline)
+            .expect("the listener after the blackholed address is reached");
+
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert!(Instant::now() <= deadline, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn every_address_blackholed_fails_by_the_deadline() {
+        let blackholed: Vec<SocketAddr> = vec![
+            "192.0.2.1:9".parse().unwrap(),
+            "192.0.2.2:9".parse().unwrap(),
+        ];
+        let deadline = Instant::now() + Duration::from_millis(600);
+
+        connect_any(blackholed, deadline).expect_err("nothing answers");
+
+        let late = Instant::now().saturating_duration_since(deadline);
+        assert!(late < Duration::from_millis(200), "late by {late:?}");
+    }
+
+    #[test]
+    fn families_alternate_starting_with_the_first_resolved() {
+        let addresses = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter()
+                .map(|address| address.parse().unwrap())
+                .collect()
+        };
+
+        assert_eq!(
+            interleave_families(addresses(&[
+                "[2001:db8::1]:443",
+                "[2001:db8::2]:443",
+                "192.0.2.1:443",
+                "192.0.2.2:443",
+                "192.0.2.3:443",
+            ])),
+            addresses(&[
+                "[2001:db8::1]:443",
+                "192.0.2.1:443",
+                "[2001:db8::2]:443",
+                "192.0.2.2:443",
+                "192.0.2.3:443",
+            ]),
+        );
+        assert_eq!(
+            interleave_families(addresses(&[
+                "192.0.2.1:443",
+                "[2001:db8::1]:443",
+                "192.0.2.2:443"
+            ])),
+            addresses(&["192.0.2.1:443", "[2001:db8::1]:443", "192.0.2.2:443"]),
+        );
+        assert!(interleave_families(Vec::new()).is_empty());
     }
 }
