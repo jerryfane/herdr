@@ -5605,6 +5605,7 @@ mod tests {
                 pane_id: public_pane_id,
                 text: "and then the docs".into(),
                 input_source: None,
+                bracketed: false,
             },
         );
 
@@ -8145,6 +8146,7 @@ mod tests {
                         pane_id: self.pane.clone(),
                         text: "also this".into(),
                         input_source,
+                        bracketed: false,
                     },
                 );
                 assert!(response.contains("\"result\""), "{response}");

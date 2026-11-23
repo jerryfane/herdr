@@ -183,4 +183,10 @@ pub struct ServerCapabilities {
     /// send the whole file.
     #[serde(default)]
     pub gram_thumbnails: bool,
+    /// `pane.send_text` honours `bracketed`: the text goes out as one bracketed
+    /// paste, or is refused with `bracketed_paste_unavailable` while the pane's
+    /// program has bracketed paste off. Older servers ignore the field and
+    /// write the text as it is, so a shell would run its lines.
+    #[serde(default)]
+    pub pane_send_text_bracketed: bool,
 }

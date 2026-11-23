@@ -286,6 +286,7 @@ fn serve_frames(
                 pane_id: pane_id.to_string(),
                 text: frame.text,
                 input_source,
+                bracketed: false,
             })
         } else {
             Method::PaneSendInput(PaneSendInputParams {

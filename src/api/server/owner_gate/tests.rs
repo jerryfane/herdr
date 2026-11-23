@@ -451,7 +451,7 @@ fn terminal_scope_sends_bracketed_text() {
     let pane = harness.pane_ids[0].clone();
     let send = json!({"id": "1", "method": "pane.send_text", "params": {"pane_id": pane, "text": "echo one\necho two\n", "bracketed": true}});
 
-    let replies = codes(&harness, OwnerScope::Terminal, &[send.clone()]);
+    let replies = codes(&harness, OwnerScope::Terminal, std::slice::from_ref(&send));
     assert_eq!(replies, ["bracketed_paste_unavailable"], "{replies:?}");
     assert_eq!(harness.pty_text(0, Duration::from_millis(200)), "");
 

@@ -2333,10 +2333,27 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if params.bracketed && !runtime.bracketed_paste_enabled() {
+            return encode_error(
+                id,
+                "bracketed_paste_unavailable",
+                format!(
+                    "the program in pane {} has not turned on bracketed paste; nothing was written",
+                    params.pane_id
+                ),
+            );
+        }
         let composer_baseline = runtime.detection_content_seq();
-        let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text);
+        // Control bytes inside a paste are pasted text, not keys.
+        let aborts_turn =
+            !params.bracketed && super::super::api_helpers::api_text_aborts_turn(&params.text);
         let wrote_input = !params.text.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        let bytes = if params.bracketed {
+            Bytes::from(super::super::api_helpers::bracketed_paste(&params.text))
+        } else {
+            Bytes::from(params.text)
+        };
+        if let Err(err) = runtime.try_send_bytes(bytes) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         self.record_pane_composer_write(

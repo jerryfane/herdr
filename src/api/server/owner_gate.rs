@@ -147,8 +147,12 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "pane_stream_resync",
     "gram_thumbnails",
 ];
-const TERMINAL_CAPABILITIES: &[&str] =
-    &["pane_input_stream", "rename_preconditions", "server_update"];
+const TERMINAL_CAPABILITIES: &[&str] = &[
+    "pane_input_stream",
+    "pane_send_text_bracketed",
+    "rename_preconditions",
+    "server_update",
+];
 
 /// Whether `scope` may call the method named `name`.
 pub(super) fn allowed(name: &str, scope: OwnerScope) -> bool {

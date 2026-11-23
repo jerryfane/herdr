@@ -49,6 +49,18 @@ pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: 
     }
 }
 
+/// `text` as one bracketed paste. Every paste end inside it is removed first,
+/// until none is left (removing one can join its neighbours into another), so
+/// the paste ends only where this says it does.
+pub(super) fn bracketed_paste(text: &str) -> Vec<u8> {
+    const END: &str = "\x1b[201~";
+    let mut text = std::borrow::Cow::Borrowed(text);
+    while text.contains(END) {
+        text = text.replace(END, "").into();
+    }
+    format!("\x1b[200~{text}{END}").into_bytes()
+}
+
 pub(super) fn encode_api_keys(
     runtime: &crate::terminal::TerminalRuntime,
     keys: &[String],

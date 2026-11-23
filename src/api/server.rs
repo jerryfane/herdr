@@ -269,6 +269,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_stream_resync: cfg!(unix),
         compressed_replies: true,
         gram_thumbnails: true,
+        pane_send_text_bracketed: true,
     })
 }
 
@@ -2291,6 +2292,34 @@ fn maybe_route_to_peer(
         }
         return Some(result);
     }
+    // A peer that does not advertise `pane_send_text_bracketed` ignores
+    // `bracketed` and writes the text as it is, so a shell would run its
+    // lines. Refuse with the code a caller already handles for a pane whose
+    // program has bracketed paste off.
+    if matches!(&request.method, Method::PaneSendText(params) if params.bracketed)
+        && !peer_target.pane_send_text_bracketed()
+    {
+        let response = ErrorResponse {
+            id: request_id.to_owned(),
+            error: ErrorBody {
+                code: "bracketed_paste_unavailable".into(),
+                message: format!(
+                    "machine {alias} has not advertised pane_send_text_bracketed, so it would write the text unbracketed; nothing was written; update Herdr there"
+                ),
+            },
+        };
+        let result = write_json_line_allow_disconnect(stream, &response);
+        match &result {
+            Ok(()) => crate::logging::api_request_completed(
+                request_id,
+                method,
+                "bracketed_paste_unavailable",
+                changes_ui,
+            ),
+            Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+        }
+        return Some(result);
+    }
     // A peer without topics would refuse `agent.topics.*`, and one without
     // topic suggestions their methods; one that does not honour `topic` on
     // `agent.transcript` would page the agent's own conversation instead, as
@@ -4035,6 +4064,7 @@ mod tests {
                 pane_stream_resync: false,
                 compressed_replies: false,
                 gram_thumbnails: false,
+                pane_send_text_bracketed: false,
             }),
             None,
             None,
@@ -8373,6 +8403,55 @@ mod federation_tests {
             serde_json::json!({"target": "customer"})
         );
         assert!(home.api_rx.try_recv().is_err());
+    }
+
+    /// A bracketed `pane.send_text` reaches a peer that advertises
+    /// `pane_send_text_bracketed`. An older peer would ignore `bracketed` and
+    /// write the text unwrapped, so there it is refused at home and never
+    /// forwarded; plain writes still are.
+    #[test]
+    fn proxy_sends_bracketed_text_only_to_a_peer_advertising_it() {
+        let sent = serde_json::json!({"id": "t1", "result": {"type": "ok"}}).to_string();
+        let bracketed = serde_json::json!({
+            "id": "t1",
+            "method": "pane.send_text",
+            "params": {"pane_id": "remote/w1:p1", "text": "a\nb\n", "bracketed": true},
+        });
+
+        let (peer, route) =
+            polled_rename_peer(default_capabilities().expect("capabilities"), sent.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        assert_eq!(home_roundtrip(&mut home, bracketed.clone()), sent);
+        let seen = peer.seen.lock().expect("seen lock");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"pane_id": "w1:p1", "text": "a\nb\n", "bracketed": true})
+        );
+
+        let old_peer = ServerCapabilities {
+            pane_send_text_bracketed: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(old_peer, sent.clone());
+        let home = || drive_home_routes(HashMap::from([("remote".to_string(), route.clone())]));
+        let mut refused = home();
+        let response: serde_json::Value =
+            serde_json::from_str(&home_roundtrip(&mut refused, bracketed)).unwrap();
+        assert_eq!(
+            response["error"]["code"], "bracketed_paste_unavailable",
+            "{response}"
+        );
+        assert!(refused.api_rx.try_recv().is_err());
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+
+        let mut plain = home();
+        let response = home_roundtrip(
+            &mut plain,
+            serde_json::json!({"id": "t1", "method": "pane.send_text", "params": {"pane_id": "remote/w1:p1", "text": "ls"}}),
+        );
+        assert_eq!(response, sent);
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 2);
     }
 
     /// `agent.topics.set_enabled` reaches a peer that advertises the switch in the
