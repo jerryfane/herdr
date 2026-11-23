@@ -100,7 +100,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.groups.get", "chat"),
     ("agent.groups.set", "terminal"),
     ("agent.archive", "terminal"),
-    ("agent.unarchive", "-"),
+    ("agent.unarchive", "terminal"),
     ("agent.forget", "-"),
     ("agent.view.set", "-"),
     ("agent.view.clear", "-"),
@@ -112,7 +112,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.answer_form", "chat"),
     ("agent.dismiss_ask", "chat"),
     ("agent.restart", "terminal"),
-    ("agent.transfer_session", "-"),
+    ("agent.transfer_session", "terminal"),
     ("accounts.list", "terminal"),
     ("accounts.create", "terminal"),
     ("accounts.remove", "terminal"),
@@ -192,7 +192,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.topics.close", "chat"),
     ("agent.topics.reopen", "chat"),
     ("agent.topics.rename", "chat"),
-    ("agent.topics.set_enabled", "-"),
+    ("agent.topics.set_enabled", "chat"),
     ("agent.topics.accept_suggestion", "chat"),
     ("agent.topics.dismiss_suggestion", "chat"),
     ("agent.topics.organise", "chat"),
@@ -357,7 +357,7 @@ fn both_scopes_refuse_peers_grants_server_and_forged_gram_and_stay_open() {
             json!({"id": "5", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "x", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "x"}}),
             json!({"id": "6", "method": "gram.send", "params": {"text": "x", "from": "llm-opt"}}),
             json!({"id": "7", "method": "server.stop", "params": {}}),
-            json!({"id": "8", "method": "agent.topics.set_enabled", "params": {"target": "llm-opt", "enabled": true}}),
+            json!({"id": "8", "method": "plugin.list", "params": {}}),
             json!({"id": "9", "method": "ping", "params": {}}),
         ];
         let codes = codes(&harness, scope, &requests);
@@ -783,6 +783,8 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "14", "method": "accounts.remove", "params": {"id": "nope"}}),
         json!({"id": "15", "method": "guest.revoke", "params": {}}),
         json!({"id": "16", "method": "server.update_status", "params": {}}),
+        json!({"id": "17", "method": "agent.unarchive", "params": {"target": "nobody"}}),
+        json!({"id": "18", "method": "agent.transfer_session", "params": {"target": "nobody", "to": "claude"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_ok);
     for (request, code) in terminal_ok.iter().zip(&replies) {
@@ -828,4 +830,34 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         let replies = codes(&harness, scope, &owner_access);
         assert_eq!(replies, ["owner_forbidden"; 5], "{scope:?}: {replies:?}");
     }
+}
+
+/// Topics on/off is part of chatting with an agent: both scopes may switch
+/// it, on a local agent pane only.
+#[test]
+fn both_scopes_switch_topics_on_a_local_agent_only() {
+    let harness = start("owner-topics-switch");
+    let target = harness.pane_ids[0].clone();
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let replies = codes(
+            &harness,
+            scope,
+            &[
+                // The test agent is not omp, so the app refuses the switch.
+                json!({"id": "1", "method": "agent.topics.set_enabled", "params": {"target": target, "enabled": true}}),
+                json!({"id": "2", "method": "agent.topics.set_enabled", "params": {"target": "studio/builder", "enabled": true}}),
+            ],
+        );
+        assert_ne!(replies[0], "owner_forbidden", "{scope:?}: {replies:?}");
+        assert_eq!(replies[1], "owner_forbidden", "{scope:?}: {replies:?}");
+    }
+    // Chat scope still names a local agent pane: not a missing one.
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            json!({"id": "3", "method": "agent.topics.set_enabled", "params": {"target": "nobody", "enabled": false}}),
+        ],
+    );
+    assert_eq!(replies, ["owner_forbidden"], "{replies:?}");
 }

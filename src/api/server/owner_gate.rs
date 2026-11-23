@@ -59,6 +59,7 @@ const CHAT: &[&str] = &[
     "agent.topics.accept_suggestion",
     "agent.topics.dismiss_suggestion",
     "agent.topics.organise",
+    "agent.topics.set_enabled",
     "pane.stream",
     "pane.history",
     "pane.set_pty_size",
@@ -95,6 +96,8 @@ const TERMINAL: &[&str] = &[
     "agent.avatar.set",
     "agent.archive",
     "agent.restart",
+    "agent.unarchive",
+    "agent.transfer_session",
     // Create and close agents and terminals.
     "agent.kinds",
     "agent.start",
@@ -274,6 +277,7 @@ fn chat_target(method: &Method) -> Result<Option<&str>, ()> {
         Method::AgentTopicsAcceptSuggestion(params)
         | Method::AgentTopicsDismissSuggestion(params) => &params.target,
         Method::AgentTopicsOrganise(params) => &params.target,
+        Method::AgentTopicsSetEnabled(params) => &params.target,
         Method::PaneStream(params) => &params.pane_id,
         Method::PaneHistory(params) => &params.pane_id,
         Method::PaneSendKeys(params) => &params.pane_id,
