@@ -71,6 +71,7 @@ const CHAT: &[&str] = &[
     "gram.post",
     "gram.upload_chunk",
     "gram.upload.discard",
+    "gram.delete",
     "events.subscribe",
 ];
 
@@ -508,7 +509,8 @@ fn serve_request(
         | Method::GramGetFileChunk(_)
         | Method::GramPost(_)
         | Method::GramUploadChunk(_)
-        | Method::GramUploadDiscard(_)) => {
+        | Method::GramUploadDiscard(_)
+        | Method::GramDelete(_)) => {
             let request = Request {
                 id: id.clone(),
                 method,

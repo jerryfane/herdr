@@ -44,7 +44,7 @@ const TABLE: &[(&str, &str)] = &[
     ("gram.list", "chat"),
     ("gram.grab", "-"),
     ("gram.mark_read", "chat"),
-    ("gram.delete", "-"),
+    ("gram.delete", "chat"),
     ("gram.upload_chunk", "chat"),
     ("gram.upload.discard", "chat"),
     ("gram.get_file", "chat"),
@@ -860,4 +860,22 @@ fn both_scopes_switch_topics_on_a_local_agent_only() {
         ],
     );
     assert_eq!(replies, ["owner_forbidden"], "{replies:?}");
+}
+
+/// Gram is the owner's own: both scopes may delete a Gram, as the desktop
+/// does, like they list, post and mark it read.
+#[test]
+fn both_scopes_delete_the_owners_gram() {
+    let harness = start("owner-gram-delete");
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        // An unknown caller pane fails in the app before the store is read.
+        let replies = codes(
+            &harness,
+            scope,
+            &[
+                json!({"id": "1", "method": "gram.delete", "params": {"id": "g1", "caller_pane_id": "w9:p9"}}),
+            ],
+        );
+        assert_ne!(replies[0], "owner_forbidden", "{scope:?}: {replies:?}");
+    }
 }

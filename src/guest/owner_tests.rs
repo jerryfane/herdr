@@ -752,6 +752,10 @@ mod admission {
         assert_eq!(reply["expires_unix"], grant.expires_ms / 1000);
         assert_eq!(reply["features"]["owner"], 2);
         assert_eq!(reply["features"]["multi_request"], true);
+        assert_eq!(
+            reply["features"]["gram"], true,
+            "the owner's own Gram is always there"
+        );
         // The statement's ten minutes plus the skew.
         let deadline = reply["account"]["deadline_unix"].as_u64().unwrap();
         assert!(

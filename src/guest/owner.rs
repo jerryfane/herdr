@@ -648,9 +648,10 @@ pub(crate) fn admit_in(
         "expires_unix": grant.expires_ms / 1000,
         "machine_label": crate::platform::hostname().unwrap_or_default(),
         "account": {"deadline_unix": deadline_ms / 1000},
-        // `multi_request`: the connection serves further requests after a
-        // reply (see `serve_session` in the API's owner gate).
-        "features": {"owner": PROTOCOL, "multi_request": true},
+        // `gram`: the owner's own Gram is always there. `multi_request`: the
+        // connection serves further requests after a reply (see
+        // `serve_session` in the API's owner gate).
+        "features": {"owner": PROTOCOL, "gram": true, "multi_request": true},
     });
     Ok(OwnerAdmission {
         principal,
