@@ -123,7 +123,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pane.move", "-"),
     ("pane.zoom", "-"),
     ("pane.layout", "-"),
-    ("pane.process_info", "-"),
+    ("pane.process_info", "terminal"),
     ("layout.export", "-"),
     ("layout.apply", "-"),
     ("layout.set_split_ratio", "-"),
@@ -785,6 +785,7 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "16", "method": "server.update_status", "params": {}}),
         json!({"id": "17", "method": "agent.unarchive", "params": {"target": "nobody"}}),
         json!({"id": "18", "method": "agent.transfer_session", "params": {"target": "nobody", "to": "claude"}}),
+        json!({"id": "19", "method": "pane.process_info", "params": {"pane_id": "w9:p9"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_ok);
     for (request, code) in terminal_ok.iter().zip(&replies) {
@@ -800,9 +801,10 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "21", "method": "guest.revoke", "params": {"guest_id": "g", "machine": "studio"}}),
         json!({"id": "22", "method": "pane.split", "params": {"target_pane_id": "studio/w1:p1", "direction": "right"}}),
         json!({"id": "23", "method": "agent.restart", "params": {"target": "studio/builder"}}),
+        json!({"id": "24", "method": "pane.process_info", "params": {"pane_id": "studio/w1:p1"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_refused);
-    assert_eq!(replies, ["owner_forbidden"; 4], "{replies:?}");
+    assert_eq!(replies, ["owner_forbidden"; 5], "{replies:?}");
 
     let mut chat_refused: Vec<Value> = terminal_ok.to_vec();
     chat_refused.extend([

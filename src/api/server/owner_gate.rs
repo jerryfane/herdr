@@ -106,6 +106,7 @@ const TERMINAL: &[&str] = &[
     "pane.split",
     "pane.rename",
     "pane.close",
+    "pane.process_info",
     // Claude accounts.
     "accounts.list",
     "accounts.create",
