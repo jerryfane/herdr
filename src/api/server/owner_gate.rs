@@ -164,9 +164,30 @@ const TERMINAL_CAPABILITIES: &[&str] = &[
     "agent_session_transfer_harnesses",
 ];
 
+/// The `agent.read` sources an owner browser may read: never the whole
+/// scrollback.
+const READ_SOURCES: &[ReadSource] = &[
+    ReadSource::Recent,
+    ReadSource::RecentUnwrapped,
+    ReadSource::Visible,
+];
+/// Capabilities this gate serves itself, so a pong reports them true in every
+/// scope whatever the host's own value: `agent_read_recent_unwrapped` because
+/// [`READ_SOURCES`] passes `recent_unwrapped` (older hosts refuse it). Change
+/// the two together.
+const GATE_CAPABILITIES: &[&str] = &["agent_read_recent_unwrapped"];
+
 /// Whether `scope` may call the method named `name`.
 pub(super) fn allowed(name: &str, scope: OwnerScope) -> bool {
     CHAT.contains(&name) || (scope == OwnerScope::Terminal && TERMINAL.contains(&name))
+}
+
+/// Whether `scope` serves the owner's Gram: what the owner hello's `gram`
+/// feature reports.
+pub(crate) fn serves_gram(scope: OwnerScope) -> bool {
+    ["gram.list", "gram.post", "gram.delete"]
+        .iter()
+        .all(|name| allowed(name, scope))
 }
 
 /// Run one owner browser connection. The stream closes when this returns.
@@ -309,6 +330,15 @@ fn chat_agent(api_tx: &ApiRequestSender, target: &str) -> Option<Probe> {
         })
 }
 
+/// Chat-scope methods that need the target agent's process running: the pane
+/// methods, which reach the terminal, and the Topics switch, which relaunches
+/// the agent in its pane. Without a running agent the pane is a shell, which
+/// chat scope never touches.
+fn needs_running_agent(method: &Method) -> bool {
+    matches!(method, Method::AgentTopicsSetEnabled(_))
+        || crate::api::api_method_name(method).starts_with("pane.")
+}
+
 /// Answers one request. `Ok(true)` when the session must not read another
 /// request after it: it took the connection over (a stream) or the grant
 /// ended.
@@ -346,9 +376,11 @@ fn serve_request(
         (OwnerScope::Terminal, _) | (OwnerScope::Chat, Ok(None)) => None,
         (OwnerScope::Chat, Err(())) => return forbidden(stream),
         (OwnerScope::Chat, Ok(Some(target))) => match chat_agent(api_tx, target) {
-            // Pane methods touch the terminal itself: once the agent's
-            // process is gone the pane is a shell, so it must be running.
-            Some(probe) if probe.running || !method.starts_with("pane.") => Some(probe),
+            // Pane methods touch the terminal itself, and switching Topics
+            // relaunches the agent in its pane (an `agent.restart`): once
+            // the agent's process is gone the pane is a shell, so it must be
+            // running.
+            Some(probe) if probe.running || !needs_running_agent(&request.method) => Some(probe),
             _ => return forbidden(stream),
         },
     };
@@ -385,10 +417,7 @@ fn serve_request(
             pass(stream, id, Method::WorkspaceList(params), api_tx)
         }
         Method::AgentRead(mut params) => {
-            if !matches!(
-                params.source,
-                ReadSource::Recent | ReadSource::RecentUnwrapped | ReadSource::Visible
-            ) {
+            if !READ_SOURCES.contains(&params.source) {
                 return forbidden(stream);
             }
             params.lines = Some(params.lines.unwrap_or(READ_MAX_LINES).min(READ_MAX_LINES));
@@ -512,7 +541,9 @@ fn serve_request(
             Ok(true)
         }
         // The owner's Gram. Remote Gram goes to the coordinator's restricted
-        // reverse socket, as for the owner's own clients.
+        // reverse socket through the same path as the owner's own clients,
+        // which keeps this machine's guest copies in step (a delete drops
+        // theirs too).
         method @ (Method::GramList(_)
         | Method::GramMarkRead(_)
         | Method::GramGetFile(_)
@@ -525,8 +556,8 @@ fn serve_request(
                 id: id.clone(),
                 method,
             };
-            if let Some(response) = crate::api::reverse::forward_local(&request) {
-                write_text_line_allow_disconnect(stream, &response)?;
+            if let Some(written) = super::guest_gate::relay_gram(stream, &request, api_tx) {
+                written?;
                 return Ok(false);
             }
             pass(stream, id, request.method, api_tx)
@@ -655,12 +686,9 @@ fn project_pong(id: &str, response: &str, scope: OwnerScope) -> String {
         serde_json::json!(crate::guest::owner::PROTOCOL),
     );
     served.insert("owner_scope".into(), serde_json::json!(scope));
-    // Served by this gate, not a server-wide capability: an owner browser's
-    // `agent.read` takes `source: "recent_unwrapped"` (older hosts refuse it).
-    served.insert(
-        "agent_read_recent_unwrapped".into(),
-        serde_json::json!(true),
-    );
+    for name in GATE_CAPABILITIES {
+        served.insert((*name).to_owned(), serde_json::json!(true));
+    }
     serde_json::json!({
         "id": id,
         "result": {

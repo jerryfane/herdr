@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::api::server::guest_gate::tests::{agent_sends, copy_ids, relay_remote, ConfigHome};
 use crate::api::server::remote_gate::test_app::{
     ask, hang_up_after_reply, read_reply, start, Harness,
 };
@@ -835,7 +836,9 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
 }
 
 /// Topics on/off is part of chatting with an agent: both scopes may switch
-/// it, on a local agent pane only.
+/// it, on a local agent pane only. Switching relaunches the agent in its
+/// pane, so chat scope also needs the agent running: once it exits the pane
+/// is a shell, and a switch there would be an `agent.restart`.
 #[test]
 fn both_scopes_switch_topics_on_a_local_agent_only() {
     let harness = start("owner-topics-switch");
@@ -862,24 +865,67 @@ fn both_scopes_switch_topics_on_a_local_agent_only() {
         ],
     );
     assert_eq!(replies, ["owner_forbidden"], "{replies:?}");
+
+    let set_enabled = json!({"id": "4", "method": "agent.topics.set_enabled", "params": {"target": target, "enabled": true}});
+    // The agent's process ended: its named pane is left with the shell.
+    harness.with_granted_terminal(|terminal| {
+        terminal.set_detected_state(None, crate::detect::AgentState::Idle);
+    });
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        std::slice::from_ref(&set_enabled),
+    );
+    assert_eq!(replies, ["owner_forbidden"], "exited agent: {replies:?}");
+    // A plain shell pane, with no agent claim left.
+    harness.with_granted_terminal(|terminal| {
+        terminal.clear_agent_name();
+        terminal.persisted_agent_session = None;
+    });
+    let replies = codes(&harness, OwnerScope::Chat, &[set_enabled]);
+    assert_eq!(replies, ["owner_forbidden"], "shell pane: {replies:?}");
 }
 
 /// Gram is the owner's own: both scopes may delete a Gram, as the desktop
-/// does, like they list, post and mark it read.
+/// does, like they list, post and mark it read: with the owner's authority,
+/// no caller pane.
 #[test]
 fn both_scopes_delete_the_owners_gram() {
+    let _config = ConfigHome::new("owner-gram-delete");
     let harness = start("owner-gram-delete");
     for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
-        // An unknown caller pane fails in the app before the store is read.
-        let replies = codes(
-            &harness,
-            scope,
-            &[
-                json!({"id": "1", "method": "gram.delete", "params": {"id": "g1", "caller_pane_id": "w9:p9"}}),
-            ],
+        let id = agent_sends(&harness, 0, "to delete");
+        let delete = json!({"id": "1", "method": "gram.delete", "params": {"id": id}});
+        // The second delete finds nothing: the first removed the stored Gram.
+        let replies = codes(&harness, scope, &[delete.clone(), delete]);
+        assert_eq!(
+            replies,
+            ["<success>", "not_found"],
+            "{scope:?}: {replies:?}"
         );
-        assert_ne!(replies[0], "owner_forbidden", "{scope:?}: {replies:?}");
     }
+}
+
+/// On a Gram-relay remote an owner browser's delete goes to the coordinator
+/// as the owner's own clients' does, and drops this machine's guest copy too.
+#[test]
+fn an_owner_browsers_relayed_delete_drops_the_guest_copy() {
+    let (_config, harness, _coordinator) = relay_remote("owner-relay-delete");
+    let guest = harness.admit_with(0, true);
+    let kept = agent_sends(&harness, 0, "kept");
+    let deleted = agent_sends(&harness, 0, "deleted");
+    assert_eq!(copy_ids(&guest), [kept.clone(), deleted.clone()]);
+
+    // The test coordinator deletes a Gram only for a pane involved in it.
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            json!({"id": "1", "method": "gram.delete", "params": {"id": deleted, "caller_pane_id": harness.pane_ids[0]}}),
+        ],
+    );
+    assert_eq!(replies, ["<success>"], "{replies:?}");
+    assert_eq!(copy_ids(&guest), [kept]);
 }
 
 /// An owner browser's pong carries the flags the desktop and web gate their

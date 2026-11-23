@@ -648,10 +648,17 @@ pub(crate) fn admit_in(
         "expires_unix": grant.expires_ms / 1000,
         "machine_label": crate::platform::hostname().unwrap_or_default(),
         "account": {"deadline_unix": deadline_ms / 1000},
-        // `gram`: the owner's own Gram is always there. `multi_request`: the
-        // connection serves further requests after a reply (see
-        // `serve_session` in the API's owner gate).
-        "features": {"owner": PROTOCOL, "gram": true, "multi_request": true},
+        // `gram`: the scope's gate serves the owner's Gram (`gram.list`,
+        // `gram.post`, `gram.delete`). Only the server daemon runs the link,
+        // and it always holds the Gram session; a Gram-relay remote whose
+        // coordinator is unreachable answers each call with that error.
+        // `multi_request`: the connection serves further requests after a
+        // reply (see `serve_session` in the API's owner gate).
+        "features": {
+            "owner": PROTOCOL,
+            "gram": crate::api::serves_gram(grant.scope),
+            "multi_request": true,
+        },
     });
     Ok(OwnerAdmission {
         principal,
