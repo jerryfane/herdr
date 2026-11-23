@@ -1,7 +1,7 @@
 //! The host socket: dialling the relay and multiplexing guest sessions over it.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
@@ -221,8 +221,12 @@ fn connect(host: &str, port: u16, dial: &Dial) -> Result<TcpStream, Ended> {
 
 /// Tries each resolved address within what is left of `deadline`.
 pub(super) fn connect_blocking(host: &str, port: u16, deadline: Instant) -> io::Result<TcpStream> {
+    connect_any((host, port).to_socket_addrs()?.collect(), deadline)
+}
+
+fn connect_any(addresses: Vec<SocketAddr>, deadline: Instant) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "relay host has no address");
-    for address in (host, port).to_socket_addrs()? {
+    for address in addresses {
         let Some(left) = deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
@@ -510,5 +514,28 @@ fn would_block(result: tungstenite::Result<()>) -> Result<bool, Ended> {
 impl Drop for Connection {
     fn drop(&mut self) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn blackholed_first_address_leaves_time_for_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // TEST-NET-1 (RFC 5737): never routed, so a SYN to it goes unanswered
+        // like an IPv6 route that blackholes.
+        let blackholed: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+
+        let stream = connect_any(vec![blackholed, listener.local_addr().unwrap()], deadline)
+            .expect("the listener after the blackholed address is reached");
+
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert!(Instant::now() <= deadline, "took {:?}", started.elapsed());
     }
 }
