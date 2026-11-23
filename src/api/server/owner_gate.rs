@@ -73,8 +73,12 @@ const CHAT: &[&str] = &[
     "events.subscribe",
 ];
 
-/// Methods only the terminal scope may call: a terminal is a shell on this
-/// machine.
+/// Methods only the terminal scope may call. A terminal is a shell on this
+/// machine, which can already do all of these; the methods only make them
+/// convenient for the web owner page (desktop parity): administer agents and
+/// terminals, start them, manage guests and Claude accounts, and update
+/// herdr. Never `owner_access.*`: a browser must not mint, renew or widen
+/// its own grant.
 const TERMINAL: &[&str] = &[
     "pane.list",
     "pane.get",
@@ -85,6 +89,34 @@ const TERMINAL: &[&str] = &[
     "pane.send_input",
     "pane.input.stream",
     "agent.send_keys",
+    // Administer agents.
+    "agent.groups.set",
+    "agent.rename",
+    "agent.avatar.set",
+    "agent.archive",
+    "agent.restart",
+    // Create and close agents and terminals.
+    "agent.kinds",
+    "agent.start",
+    "fs.list_dir",
+    "pane.split",
+    "pane.rename",
+    "pane.close",
+    // Claude accounts.
+    "accounts.list",
+    "accounts.create",
+    "accounts.remove",
+    // Guests, on this machine only.
+    "guest.invite.create",
+    "guest.list",
+    "guest.update",
+    "guest.revoke",
+    "guest.remove_device",
+    "guest.audit",
+    // herdr updates.
+    "server.update_check",
+    "server.update_apply",
+    "server.update_status",
 ];
 
 /// Event kinds a chat-scope `events.subscribe` may name.
@@ -115,7 +147,8 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "pane_stream_resync",
     "gram_thumbnails",
 ];
-const TERMINAL_CAPABILITIES: &[&str] = &["pane_input_stream"];
+const TERMINAL_CAPABILITIES: &[&str] =
+    &["pane_input_stream", "rename_preconditions", "server_update"];
 
 /// Whether `scope` may call the method named `name`.
 pub(super) fn allowed(name: &str, scope: OwnerScope) -> bool {
@@ -206,7 +239,7 @@ fn names_remote(method: &Method) -> bool {
             fields.iter().any(|(key, value)| {
                 matches!(
                     key.as_str(),
-                    "target" | "pane_id" | "workspace_id" | "tab_id" | "to"
+                    "target" | "pane_id" | "target_pane_id" | "workspace_id" | "tab_id" | "to"
                 ) && value.as_str().is_some_and(|text| text.contains('/'))
             })
         })
@@ -482,7 +515,35 @@ fn serve_request(
             }
             pass(stream, id, request.method, api_tx)
         }
+        // Guests of this machine. `machine` would route the call to a saved
+        // SSH machine; an owner browser never routes off this one.
+        method @ (Method::GuestInviteCreate(_)
+        | Method::GuestList(_)
+        | Method::GuestUpdate(_)
+        | Method::GuestRevoke(_)
+        | Method::GuestRemoveDevice(_)
+        | Method::GuestAudit(_)) => {
+            if routes_to_machine(&method) {
+                return forbidden(stream);
+            }
+            let response = super::guest_owner::handle_local(&Request { id, method }, api_tx);
+            write_text_line_allow_disconnect(stream, &response)?;
+            Ok(false)
+        }
         method => pass(stream, id, method, api_tx),
+    }
+}
+
+/// A `guest.*` call that names a saved SSH machine to run on.
+fn routes_to_machine(method: &Method) -> bool {
+    match method {
+        Method::GuestInviteCreate(params) => params.machine.is_some(),
+        Method::GuestList(params) => params.machine.is_some(),
+        Method::GuestUpdate(params) => params.machine.is_some(),
+        Method::GuestRevoke(params) => params.machine.is_some(),
+        Method::GuestRemoveDevice(params) => params.machine.is_some(),
+        Method::GuestAudit(params) => params.machine.is_some(),
+        _ => false,
     }
 }
 

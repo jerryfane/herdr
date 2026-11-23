@@ -94,8 +94,10 @@ fn handle_local(request: &Request, _api_tx: &ApiRequestSender) -> String {
     )
 }
 
+/// Runs one `guest.*` call on this machine. Also the owner gate's path for an
+/// owner browser with terminal access.
 #[cfg(unix)]
-fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
+pub(super) fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
     use crate::api::schema::{ResponseResult, SuccessResponse};
 
     let id = request.id.clone();
