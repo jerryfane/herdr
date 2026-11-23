@@ -4902,6 +4902,29 @@ mod tests {
         );
     }
 
+    /// Clients check this before sending `pane.send_text` with `bracketed`,
+    /// which older servers ignore (they write the text unwrapped).
+    #[test]
+    fn ping_advertises_pane_send_text_bracketed() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["capabilities"]["pane_send_text_bracketed"],
+            true
+        );
+    }
+
     #[test]
     fn ping_advertises_server_update_with_apply_and_status() {
         // The app offers its Update button for this flag, so it is true

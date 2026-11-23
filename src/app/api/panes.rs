@@ -4143,6 +4143,78 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A `pane.send_text` request as a client sends it.
+    fn send_text_request(
+        pane_id: &str,
+        text: &str,
+        bracketed: bool,
+    ) -> crate::api::schema::Request {
+        serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": text, "bracketed": bracketed},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_bracketed_wraps_when_the_program_enabled_bracketed_paste() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+
+        let response =
+            app.handle_api_request(send_text_request(&pane_id, "echo one\necho two\n", true));
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~echo one\necho two\n\x1b[201~")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_bracketed_is_refused_and_writes_nothing_without_bracketed_paste() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+
+        let response = app.handle_api_request(send_text_request(&pane_id, "rm -rf ~\n", true));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "bracketed_paste_unavailable");
+        assert!(rx.try_recv().is_err(), "nothing reaches the pane");
+
+        // Without `bracketed` the text is written as it is, as before.
+        let response = app.handle_api_request(send_text_request(&pane_id, "ls\n", false));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"ls\n"));
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_bracketed_neutralises_an_embedded_paste_end() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+        // Removing the inner end marker of the second one joins its halves
+        // into another end marker, which must go too.
+        let text = "a\x1b[201~b\x1b[20\x1b[201~1~c\n";
+
+        let response = app.handle_api_request(send_text_request(&pane_id, text, true));
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~abc\n\x1b[201~")
+        );
+    }
+
     #[tokio::test]
     async fn api_pane_send_input_keys_accept_key_combo_chords() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
