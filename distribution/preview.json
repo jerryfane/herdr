@@ -2,42 +2,79 @@
   "schema_version": 2,
   "channel": "preview",
   "base_version": "0.9.5",
-  "build_id": "2026-11-23-1802bbf92481",
-  "commit": "1802bbf924814708f2e06b564ff8715462af4bf3",
-  "commit_time": 1795389038,
-  "built_at": "2026-11-22T23:29:51Z",
+  "build_id": "2026-11-23-da878a2f1b49",
+  "commit": "da878a2f1b49ab42f269798259969ca912cc21be",
+  "commit_time": 1795418075,
+  "built_at": "2026-11-23T07:38:17Z",
   "protocol": 22,
   "endpoint_generation": 1,
-  "notes": "Herdr fork preview: owner gate input race fix, symlinked config dir\n\nSource: 1802bbf924814708f2e06b564ff8715462af4bf3 (PRs #503, #502).\n\nHERDR_BIN_PATH survives live updates also when the config dir is reached through a symlink, and an owner browser's typing stops the moment its grant is removed.\n\nHERDR_BIN_PATH and the recorded install path are now right when the config dir is a directory symlink (#503, fixes #500). An owner browser's input stream checks its grant on the thread that reads it, before every frame, so a frame that arrives right after the grant is removed is never typed (#502).\n\nIncludes the previous previews' changes: web owner access (owner browsers admitted by grant), HERDR_BIN_PATH that survives live updates, the Topics switch waits for the agent to go idle, seed_too_large and start_failed for topic suggestions, owner grants for browser keys, topic suggestions with accept, dismiss and Organise, a per-agent Topics switch, a same-computer app link from `herdr pair`, close an agent's question from the chat, account-bound guest shares, a retried short-invite upload, agents that wait for a late-mounted saved directory at restore, an agent restarted in its own pane keeps its name, topics for omp agents, api-bridge that follows a peer's live update, omp form tables and formatting in Herdrup, guests answer omp forms in the chat, transcript pages list re-sent entries, the update card clears itself after a restart on fork builds, `herdr fence explain`, live updates under systemd, image thumbnails in Gram, guest chat history that replays correctly when scrolling up, the pane fence and per-agent pane fence (off by default), shared chats no longer fill with old messages, faster and more reliable on slow connections, omp forms answerable from the phone, Gram knows which machines it can reach, chat with a brand-new omp agent, more reliable form answers, omp forms with a text box and other omp question forms answerable from Herdrup, a safer server stop, guest access that follows a recreated agent, agents in very small panes come back after a restart, safe agent renames, the latest upstream fixes, agent restart keeps the agent's name, turn origin and finish notifications for your own requests, renaming or clearing a name an agent left behind, Windows api-bridge and pairing fixes, HTML and SVG types in Gram, many guest requests on one encrypted connection, the herdrup.app relay addresses, short invite links, guest answers, faster file-transfer request handling, and named sessions no longer replace the default session's guest relay connection.\n\nUpdate through Herdrup's Update herdr card or `herdr update` on the preview channel. The release manifest is signed through the owner's keyring. All five assets are built from the pinned source commit.",
+  "notes": "Herdr fork preview: account keys and relay dial fall back to IPv4\n\nSource: da878a2f1b49ab42f269798259969ca912cc21be (PRs #507, #506).\n\nAccount keys and the guest relay connect over IPv4 when IPv6 blackholes, so owner-access approvals and guest links work on hosts with a broken IPv6 route (#507).\n\nWhen one address family hangs, herdr now falls back to the other instead of spending the whole deadline on the first address; this fixes account_keys_stale on hosts whose IPv6 route blackholes (#507). A contract test pins the agent session file shape that workspace-janitor relies on (#506).\n\nIncludes the previous previews' changes: an owner browser's typing stops the moment its grant is removed, HERDR_BIN_PATH through a symlinked config dir, web owner access (owner browsers admitted by grant), HERDR_BIN_PATH that survives live updates, the Topics switch waits for the agent to go idle, seed_too_large and start_failed for topic suggestions, owner grants for browser keys, topic suggestions with accept, dismiss and Organise, a per-agent Topics switch, a same-computer app link from `herdr pair`, close an agent's question from the chat, account-bound guest shares, a retried short-invite upload, agents that wait for a late-mounted saved directory at restore, an agent restarted in its own pane keeps its name, topics for omp agents, api-bridge that follows a peer's live update, omp form tables and formatting in Herdrup, guests answer omp forms in the chat, transcript pages list re-sent entries, the update card clears itself after a restart on fork builds, `herdr fence explain`, live updates under systemd, image thumbnails in Gram, guest chat history that replays correctly when scrolling up, the pane fence and per-agent pane fence (off by default), shared chats no longer fill with old messages, faster and more reliable on slow connections, omp forms answerable from the phone, Gram knows which machines it can reach, chat with a brand-new omp agent, more reliable form answers, omp forms with a text box and other omp question forms answerable from Herdrup, a safer server stop, guest access that follows a recreated agent, agents in very small panes come back after a restart, safe agent renames, the latest upstream fixes, agent restart keeps the agent's name, turn origin and finish notifications for your own requests, renaming or clearing a name an agent left behind, Windows api-bridge and pairing fixes, HTML and SVG types in Gram, many guest requests on one encrypted connection, the herdrup.app relay addresses, short invite links, guest answers, faster file-transfer request handling, and named sessions no longer replace the default session's guest relay connection.\n\nUpdate through Herdrup's Update herdr card or `herdr update` on the preview channel. The release manifest is signed through the owner's keyring. All five assets are built from the pinned source commit.",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-1802bbf92481/herdr-linux-x86_64",
-      "sha256": "b469a2b825ba553cf17a799a33a9d7344897d60238f2c1e46b110c865e5045df",
-      "size": 47973392
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-linux-x86_64",
+      "sha256": "40c3ff3f064c5c704a2e03a8d8d39d9619c5d81ed1d1df99b91111aa4c57c970",
+      "size": 48099112
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-1802bbf92481/herdr-linux-aarch64",
-      "sha256": "bf698413b2341a7eb6e7d485699e31264f8c3b2fb5401ba67b4e5b71c3b3a064",
-      "size": 44251144
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-linux-aarch64",
+      "sha256": "6c193ed3f28425ff1bc4811763d6755079bda34db461de33d846a7f15061a892",
+      "size": 44382200
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-1802bbf92481/herdr-macos-x86_64",
-      "sha256": "b901f29a3c03d7c23ce7ca4533d93d0a438632fa45313565b15fa6a342b46536",
-      "size": 40407288
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-macos-x86_64",
+      "sha256": "cadf0621d80e2f81169f93ef3d1c0dfeca45082a33f114eba3b45ab7dfde7afe",
+      "size": 40397136
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-1802bbf92481/herdr-macos-aarch64",
-      "sha256": "7b9486fc016a76908824b228ad6d8adb5e71305f352c31ab16f0b922dd612657",
-      "size": 37593488
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-macos-aarch64",
+      "sha256": "9487f85e580f66c79eacb5f6d9b1fd791a0906eb51eab74077c901676483c6be",
+      "size": 37533088
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-1802bbf92481/herdr-windows-x86_64.zip",
-      "sha256": "4b638f74d26b9ccfed62045ed4362e913b8286d007c0cf9423486809d710095c",
-      "size": 14483499,
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-windows-x86_64.zip",
+      "sha256": "aee716627e409394147613a4fa49d005583d396a997d3818f8f98f22eb006b41",
+      "size": 14483679,
       "format": "zip"
     }
   },
   "builds": {
+    "2026-11-23-da878a2f1b49": {
+      "base_version": "0.9.5",
+      "commit": "da878a2f1b49ab42f269798259969ca912cc21be",
+      "commit_time": 1795418075,
+      "built_at": "2026-11-23T07:38:17Z",
+      "protocol": 22,
+      "endpoint_generation": 1,
+      "tag": "preview-2026-11-23-da878a2f1b49",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-linux-x86_64",
+          "sha256": "40c3ff3f064c5c704a2e03a8d8d39d9619c5d81ed1d1df99b91111aa4c57c970",
+          "size": 48099112
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-linux-aarch64",
+          "sha256": "6c193ed3f28425ff1bc4811763d6755079bda34db461de33d846a7f15061a892",
+          "size": 44382200
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-macos-x86_64",
+          "sha256": "cadf0621d80e2f81169f93ef3d1c0dfeca45082a33f114eba3b45ab7dfde7afe",
+          "size": 40397136
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-macos-aarch64",
+          "sha256": "9487f85e580f66c79eacb5f6d9b1fd791a0906eb51eab74077c901676483c6be",
+          "size": 37533088
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-23-da878a2f1b49/herdr-windows-x86_64.zip",
+          "sha256": "aee716627e409394147613a4fa49d005583d396a997d3818f8f98f22eb006b41",
+          "size": 14483679,
+          "format": "zip"
+        }
+      }
+    },
     "2026-11-23-1802bbf92481": {
       "base_version": "0.9.5",
       "commit": "1802bbf924814708f2e06b564ff8715462af4bf3",
@@ -1107,37 +1144,6 @@
           "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-29-19296f26a3e2/herdr-windows-x86_64.zip",
           "sha256": "f4989ebe3fca4513b35effcc832d8c1d2244794891f4f404825927c0017e294c",
           "size": 13456080,
-          "format": "zip"
-        }
-      }
-    },
-    "2026-10-28-8a02b8342805": {
-      "base_version": "0.9.5",
-      "commit": "8a02b83428058fe60a61b00f61d007abadabfee1",
-      "built_at": "2026-10-28T13:52:30Z",
-      "protocol": 22,
-      "endpoint_generation": 1,
-      "tag": "preview-2026-10-28-8a02b8342805",
-      "assets": {
-        "linux-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-28-8a02b8342805/herdr-linux-x86_64",
-          "sha256": "21e2681535266110b943cc16789386c9f72961ba2c65778c25a241160105ab0c"
-        },
-        "linux-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-28-8a02b8342805/herdr-linux-aarch64",
-          "sha256": "1dc43a307c8583dde977dc068d7bf28c0908033c02a7cafa7318253a5a8d2b2c"
-        },
-        "macos-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-28-8a02b8342805/herdr-macos-x86_64",
-          "sha256": "ef64de11ca3b8cba05041bedf7be2a952bfce0944ce24ccd644f85e16a8747a7"
-        },
-        "macos-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-28-8a02b8342805/herdr-macos-aarch64",
-          "sha256": "5daeae59a19f5f93b74cf447eec7abd074108c755ca65b32e00168cf0f2f06da"
-        },
-        "windows-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-10-28-8a02b8342805/herdr-windows-x86_64.zip",
-          "sha256": "d5bef9c691d85a010e4c01f14b7751fa3a7ce854724fed9256c840e6531715c4",
           "format": "zip"
         }
       }
