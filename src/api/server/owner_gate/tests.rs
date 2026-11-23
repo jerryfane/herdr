@@ -193,9 +193,9 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.topics.reopen", "chat"),
     ("agent.topics.rename", "chat"),
     ("agent.topics.set_enabled", "-"),
-    ("agent.topics.accept_suggestion", "-"),
-    ("agent.topics.dismiss_suggestion", "-"),
-    ("agent.topics.organise", "-"),
+    ("agent.topics.accept_suggestion", "chat"),
+    ("agent.topics.dismiss_suggestion", "chat"),
+    ("agent.topics.organise", "chat"),
 ];
 
 #[test]
@@ -389,6 +389,7 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
         assert_eq!(capabilities["owner"], 2, "{pong}");
         assert_eq!(capabilities["owner_scope"], json!(scope), "{pong}");
         assert_eq!(capabilities["agent_transcript"], true, "{pong}");
+        assert_eq!(capabilities["agent_topic_suggestions"], true, "{pong}");
         assert_eq!(
             capabilities.get("server_update").is_some(),
             input_stream,
@@ -404,6 +405,36 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
             "{pong}"
         );
     }
+}
+
+/// The web owner page's "Copy recent" (`recent_unwrapped`) and its topic
+/// suggestion and Organise actions reach a local agent in chat scope; they
+/// may fail in the app (no topics control here), never at the gate.
+#[test]
+fn chat_scope_copies_recent_and_acts_on_topic_suggestions() {
+    let harness = start("owner-chat-web");
+    let target = harness.pane_ids[0].clone();
+    let requests = [
+        json!({"id": "1", "method": "agent.read", "params": {"target": target, "source": "recent_unwrapped"}}),
+        json!({"id": "2", "method": "agent.topics.accept_suggestion", "params": {"target": target, "suggestion_id": "s1"}}),
+        json!({"id": "3", "method": "agent.topics.dismiss_suggestion", "params": {"target": target, "suggestion_id": "s1"}}),
+        json!({"id": "4", "method": "agent.topics.organise", "params": {"target": target}}),
+    ];
+    let replies = codes(&harness, OwnerScope::Chat, &requests);
+    assert_eq!(replies[0], "<success>", "{replies:?}");
+    for (request, code) in requests.iter().zip(&replies) {
+        assert_ne!(code, "owner_forbidden", "{request}");
+    }
+    // Still local only, and reads are still capped rather than refused.
+    let more = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            json!({"id": "5", "method": "agent.topics.organise", "params": {"target": "studio/builder"}}),
+            json!({"id": "6", "method": "agent.read", "params": {"target": target, "source": "recent_unwrapped", "lines": 5000}}),
+        ],
+    );
+    assert_eq!(more, ["owner_forbidden", "<success>"], "{more:?}");
 }
 
 #[test]

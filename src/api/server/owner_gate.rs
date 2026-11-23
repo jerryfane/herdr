@@ -56,6 +56,9 @@ const CHAT: &[&str] = &[
     "agent.topics.close",
     "agent.topics.reopen",
     "agent.topics.rename",
+    "agent.topics.accept_suggestion",
+    "agent.topics.dismiss_suggestion",
+    "agent.topics.organise",
     "pane.stream",
     "pane.history",
     "pane.set_pty_size",
@@ -139,6 +142,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "ask_dismiss",
     "agent_topics",
     "agent_transcript_topic",
+    "agent_topic_suggestions",
     "transcript_max_bytes",
     "pane_stream_resync",
     "gram_thumbnails",
@@ -267,6 +271,9 @@ fn chat_target(method: &Method) -> Result<Option<&str>, ()> {
         Method::AgentTopicsSend(params) => &params.target,
         Method::AgentTopicsClose(params) | Method::AgentTopicsReopen(params) => &params.target,
         Method::AgentTopicsRename(params) => &params.target,
+        Method::AgentTopicsAcceptSuggestion(params)
+        | Method::AgentTopicsDismissSuggestion(params) => &params.target,
+        Method::AgentTopicsOrganise(params) => &params.target,
         Method::PaneStream(params) => &params.pane_id,
         Method::PaneHistory(params) => &params.pane_id,
         Method::PaneSendKeys(params) => &params.pane_id,
@@ -363,7 +370,10 @@ fn serve_request(
             pass(stream, id, Method::WorkspaceList(params), api_tx)
         }
         Method::AgentRead(mut params) => {
-            if !matches!(params.source, ReadSource::Recent | ReadSource::Visible) {
+            if !matches!(
+                params.source,
+                ReadSource::Recent | ReadSource::RecentUnwrapped | ReadSource::Visible
+            ) {
                 return forbidden(stream);
             }
             params.lines = Some(params.lines.unwrap_or(READ_MAX_LINES).min(READ_MAX_LINES));
