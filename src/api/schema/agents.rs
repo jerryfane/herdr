@@ -708,6 +708,8 @@ pub struct AgentInfo {
     /// An omp agent's topic transcripts in its current session, read from the
     /// session file on disk; listed whether or not the agent can be reached
     /// (`agent.list`, `agent.get` on servers advertising `agent_topics`).
+    /// External consumer: workspace-janitor protects every `path` here plus
+    /// `agent_session.value` from cleanup; tell it before changing either shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_sessions: Option<Vec<super::topics::AgentTopicSession>>,
     /// An omp agent runs with topics: the owner switched it onto the topics

@@ -13107,7 +13107,7 @@
               "type": "object"
             },
             "topic_sessions": {
-              "description": "An omp agent's topic transcripts in its current session, read from the\nsession file on disk; listed whether or not the agent can be reached\n(`agent.list`, `agent.get` on servers advertising `agent_topics`).",
+              "description": "An omp agent's topic transcripts in its current session, read from the\nsession file on disk; listed whether or not the agent can be reached\n(`agent.list`, `agent.get` on servers advertising `agent_topics`).\nExternal consumer: workspace-janitor protects every `path` here plus\n`agent_session.value` from cleanup; tell it before changing either shape.",
               "items": {
                 "$ref": "#/schemas/success_response/$defs/AgentTopicSession"
               },
@@ -13558,7 +13558,7 @@
               ]
             },
             "path": {
-              "description": "The topic's own session file.",
+              "description": "The topic's own session file: the agent's `agent_session` path without\n`.jsonl`, then `<topic_id>.jsonl`. External consumer: workspace-janitor\nprotects these files from cleanup; tell it before changing this shape.",
               "type": "string"
             },
             "title": {

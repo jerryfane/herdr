@@ -183,7 +183,9 @@ pub enum AgentTopicChangeReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentTopicSession {
     pub topic_id: String,
-    /// The topic's own session file.
+    /// The topic's own session file: the agent's `agent_session` path without
+    /// `.jsonl`, then `<topic_id>.jsonl`. External consumer: workspace-janitor
+    /// protects these files from cleanup; tell it before changing this shape.
     pub path: String,
     /// The newest owner-facing title the session file records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
