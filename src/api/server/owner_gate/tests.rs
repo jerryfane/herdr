@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::api::server::guest_gate::tests::{agent_sends, copy_ids, relay_remote, ConfigHome};
 use crate::api::server::remote_gate::test_app::{
     ask, hang_up_after_reply, read_reply, start, Harness,
 };
@@ -44,7 +45,7 @@ const TABLE: &[(&str, &str)] = &[
     ("gram.list", "chat"),
     ("gram.grab", "-"),
     ("gram.mark_read", "chat"),
-    ("gram.delete", "-"),
+    ("gram.delete", "chat"),
     ("gram.upload_chunk", "chat"),
     ("gram.upload.discard", "chat"),
     ("gram.get_file", "chat"),
@@ -100,7 +101,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.groups.get", "chat"),
     ("agent.groups.set", "terminal"),
     ("agent.archive", "terminal"),
-    ("agent.unarchive", "-"),
+    ("agent.unarchive", "terminal"),
     ("agent.forget", "-"),
     ("agent.view.set", "-"),
     ("agent.view.clear", "-"),
@@ -112,7 +113,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.answer_form", "chat"),
     ("agent.dismiss_ask", "chat"),
     ("agent.restart", "terminal"),
-    ("agent.transfer_session", "-"),
+    ("agent.transfer_session", "terminal"),
     ("accounts.list", "terminal"),
     ("accounts.create", "terminal"),
     ("accounts.remove", "terminal"),
@@ -123,7 +124,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pane.move", "-"),
     ("pane.zoom", "-"),
     ("pane.layout", "-"),
-    ("pane.process_info", "-"),
+    ("pane.process_info", "terminal"),
     ("layout.export", "-"),
     ("layout.apply", "-"),
     ("layout.set_split_ratio", "-"),
@@ -192,7 +193,7 @@ const TABLE: &[(&str, &str)] = &[
     ("agent.topics.close", "chat"),
     ("agent.topics.reopen", "chat"),
     ("agent.topics.rename", "chat"),
-    ("agent.topics.set_enabled", "-"),
+    ("agent.topics.set_enabled", "chat"),
     ("agent.topics.accept_suggestion", "chat"),
     ("agent.topics.dismiss_suggestion", "chat"),
     ("agent.topics.organise", "chat"),
@@ -357,7 +358,7 @@ fn both_scopes_refuse_peers_grants_server_and_forged_gram_and_stay_open() {
             json!({"id": "5", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "x", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "x"}}),
             json!({"id": "6", "method": "gram.send", "params": {"text": "x", "from": "llm-opt"}}),
             json!({"id": "7", "method": "server.stop", "params": {}}),
-            json!({"id": "8", "method": "agent.topics.set_enabled", "params": {"target": "llm-opt", "enabled": true}}),
+            json!({"id": "8", "method": "plugin.list", "params": {}}),
             json!({"id": "9", "method": "ping", "params": {}}),
         ];
         let codes = codes(&harness, scope, &requests);
@@ -390,6 +391,7 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
         assert_eq!(capabilities["owner_scope"], json!(scope), "{pong}");
         assert_eq!(capabilities["agent_transcript"], true, "{pong}");
         assert_eq!(capabilities["agent_topic_suggestions"], true, "{pong}");
+        assert_eq!(capabilities["agent_read_recent_unwrapped"], true, "{pong}");
         assert_eq!(
             capabilities.get("server_update").is_some(),
             input_stream,
@@ -819,6 +821,9 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "14", "method": "accounts.remove", "params": {"id": "nope"}}),
         json!({"id": "15", "method": "guest.revoke", "params": {}}),
         json!({"id": "16", "method": "server.update_status", "params": {}}),
+        json!({"id": "17", "method": "agent.unarchive", "params": {"target": "nobody"}}),
+        json!({"id": "18", "method": "agent.transfer_session", "params": {"target": "nobody", "to": "claude"}}),
+        json!({"id": "19", "method": "pane.process_info", "params": {"pane_id": "w9:p9"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_ok);
     for (request, code) in terminal_ok.iter().zip(&replies) {
@@ -834,9 +839,10 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "21", "method": "guest.revoke", "params": {"guest_id": "g", "machine": "studio"}}),
         json!({"id": "22", "method": "pane.split", "params": {"target_pane_id": "studio/w1:p1", "direction": "right"}}),
         json!({"id": "23", "method": "agent.restart", "params": {"target": "studio/builder"}}),
+        json!({"id": "24", "method": "pane.process_info", "params": {"pane_id": "studio/w1:p1"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_refused);
-    assert_eq!(replies, ["owner_forbidden"; 4], "{replies:?}");
+    assert_eq!(replies, ["owner_forbidden"; 5], "{replies:?}");
 
     let mut chat_refused: Vec<Value> = terminal_ok.to_vec();
     chat_refused.extend([
@@ -864,4 +870,160 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         let replies = codes(&harness, scope, &owner_access);
         assert_eq!(replies, ["owner_forbidden"; 5], "{scope:?}: {replies:?}");
     }
+}
+
+/// Topics on/off is part of chatting with an agent: both scopes may switch
+/// it, on a local agent pane only. Switching relaunches the agent in its
+/// pane, so chat scope also needs the agent running: once it exits the pane
+/// is a shell, and a switch there would be an `agent.restart`.
+#[test]
+fn both_scopes_switch_topics_on_a_local_agent_only() {
+    let harness = start("owner-topics-switch");
+    let target = harness.pane_ids[0].clone();
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let replies = codes(
+            &harness,
+            scope,
+            &[
+                // The test agent is not omp, so the app refuses the switch.
+                json!({"id": "1", "method": "agent.topics.set_enabled", "params": {"target": target, "enabled": true}}),
+                json!({"id": "2", "method": "agent.topics.set_enabled", "params": {"target": "studio/builder", "enabled": true}}),
+            ],
+        );
+        assert_ne!(replies[0], "owner_forbidden", "{scope:?}: {replies:?}");
+        assert_eq!(replies[1], "owner_forbidden", "{scope:?}: {replies:?}");
+    }
+    // Chat scope still names a local agent pane: not a missing one.
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            json!({"id": "3", "method": "agent.topics.set_enabled", "params": {"target": "nobody", "enabled": false}}),
+        ],
+    );
+    assert_eq!(replies, ["owner_forbidden"], "{replies:?}");
+
+    let set_enabled = json!({"id": "4", "method": "agent.topics.set_enabled", "params": {"target": target, "enabled": true}});
+    // The agent's process ended: its named pane is left with the shell.
+    harness.with_granted_terminal(|terminal| {
+        terminal.set_detected_state(None, crate::detect::AgentState::Idle);
+    });
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        std::slice::from_ref(&set_enabled),
+    );
+    assert_eq!(replies, ["owner_forbidden"], "exited agent: {replies:?}");
+    // A plain shell pane, with no agent claim left.
+    harness.with_granted_terminal(|terminal| {
+        terminal.clear_agent_name();
+        terminal.persisted_agent_session = None;
+    });
+    let replies = codes(&harness, OwnerScope::Chat, &[set_enabled]);
+    assert_eq!(replies, ["owner_forbidden"], "shell pane: {replies:?}");
+}
+
+/// Gram is the owner's own: both scopes may delete a Gram, as the desktop
+/// does, like they list, post and mark it read: with the owner's authority,
+/// no caller pane.
+#[test]
+fn both_scopes_delete_the_owners_gram() {
+    let _config = ConfigHome::new("owner-gram-delete");
+    let harness = start("owner-gram-delete");
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let id = agent_sends(&harness, 0, "to delete");
+        let delete = json!({"id": "1", "method": "gram.delete", "params": {"id": id}});
+        // The second delete finds nothing: the first removed the stored Gram.
+        let replies = codes(&harness, scope, &[delete.clone(), delete]);
+        assert_eq!(
+            replies,
+            ["<success>", "not_found"],
+            "{scope:?}: {replies:?}"
+        );
+    }
+}
+
+/// On a Gram-relay remote an owner browser's delete goes to the coordinator
+/// as the owner's own clients' does, and drops this machine's guest copy too.
+#[test]
+fn an_owner_browsers_relayed_delete_drops_the_guest_copy() {
+    let (_config, harness, _coordinator) = relay_remote("owner-relay-delete");
+    let guest = harness.admit_with(0, true);
+    let kept = agent_sends(&harness, 0, "kept");
+    let deleted = agent_sends(&harness, 0, "deleted");
+    assert_eq!(copy_ids(&guest), [kept.clone(), deleted.clone()]);
+
+    // The test coordinator deletes a Gram only for a pane involved in it.
+    let replies = codes(
+        &harness,
+        OwnerScope::Chat,
+        &[
+            json!({"id": "1", "method": "gram.delete", "params": {"id": deleted, "caller_pane_id": harness.pane_ids[0]}}),
+        ],
+    );
+    assert_eq!(replies, ["<success>"], "{replies:?}");
+    assert_eq!(copy_ids(&guest), [kept]);
+}
+
+/// An owner browser's pong carries the flags the desktop and web gate their
+/// menus on, with the host's own value, in the scopes that allow the method:
+/// the Topics switch in both (`agent.topics.set_enabled`), session transfer
+/// in terminal only (`agent.transfer_session`).
+#[test]
+fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
+    let harness = start("owner-ping-menu-flags");
+    let pong = |scope: OwnerScope| {
+        let (mut reader, handle) = open(
+            &harness,
+            owner(&harness, scope),
+            json!({"id": "1", "method": "ping", "params": {}}),
+        );
+        let pong = read_reply(&mut reader).unwrap();
+        hang_up_after_reply(reader.get_ref());
+        handle.join().unwrap();
+        pong["result"]["capabilities"].clone()
+    };
+
+    // A host without `[topics] omp_binary` has no switch to offer.
+    crate::api::set_topics_switch_configured(false);
+    for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
+        let capabilities = pong(scope);
+        assert_ne!(
+            capabilities["agent_topics_switch"], true,
+            "{scope:?}: {capabilities}"
+        );
+        assert_ne!(
+            capabilities["agent_topics_switch_when_idle"], true,
+            "{scope:?}: {capabilities}"
+        );
+    }
+
+    crate::api::set_topics_switch_configured(true);
+    let chat = pong(OwnerScope::Chat);
+    assert_eq!(chat["agent_topics_switch"], true, "{chat}");
+    assert_eq!(chat["agent_topics_switch_when_idle"], true, "{chat}");
+    assert!(chat.get("agent_session_transfer").is_none(), "{chat}");
+    assert!(
+        chat.get("agent_session_transfer_harnesses").is_none(),
+        "{chat}"
+    );
+
+    let terminal = pong(OwnerScope::Terminal);
+    assert_eq!(terminal["agent_topics_switch"], true, "{terminal}");
+    assert_eq!(
+        terminal["agent_topics_switch_when_idle"], true,
+        "{terminal}"
+    );
+    let host = crate::api::default_capabilities().unwrap();
+    assert_eq!(
+        terminal["agent_session_transfer"], host.agent_session_transfer,
+        "{terminal}"
+    );
+    assert_eq!(terminal["agent_session_transfer"], true, "{terminal}");
+    assert_eq!(
+        terminal["agent_session_transfer_harnesses"],
+        serde_json::to_value(&host.agent_session_transfer_harnesses).unwrap(),
+        "{terminal}"
+    );
+    crate::api::set_topics_switch_configured(false);
 }

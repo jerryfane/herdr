@@ -1423,13 +1423,32 @@ fn mirrored_thumbnail(
     }
 }
 
+/// On a Gram-relay remote, sends a Gram request to the coordinator, answers
+/// it on `stream` and keeps this machine's guest copies in step with it
+/// ([`before_relayed_gram`], [`after_relayed_gram`]). `None` when this daemon
+/// keeps its own Gram: the caller answers locally. The owner's own clients
+/// and owner browsers both relay through here, so the two cannot drift.
+pub(super) fn relay_gram(
+    stream: &mut ApiStream,
+    request: &Request,
+    api_tx: &ApiRequestSender,
+) -> Option<std::io::Result<()>> {
+    let sent_from = before_relayed_gram(request, api_tx);
+    let response = crate::api::reverse::forward_local(request)?;
+    let written = write_text_line_allow_disconnect(stream, &response);
+    // The coordinator keeps the Gram; the guests of the sending agent on this
+    // machine get their own copy.
+    after_relayed_gram(request, &response, api_tx, sent_from);
+    Some(written)
+}
+
 /// On a Gram-relay remote, after the coordinator accepted a local agent's
 /// `gram.send`, keep a guest copy of it when a sharing guest's grant names
 /// the sending pane's agent, and notify those guests. The owner's copy and
 /// the owner's notifications stay with the coordinator.
 ///
 /// A relayed `gram.delete` that the coordinator accepted drops the copy too.
-pub(super) fn after_relayed_gram(
+fn after_relayed_gram(
     request: &Request,
     response: &str,
     api_tx: &ApiRequestSender,
@@ -1509,10 +1528,7 @@ pub(super) struct RelaySender {
 /// Witness the sending pane's terminal and session before a `gram.send` is
 /// relayed to the coordinator, when guests are kept here; see
 /// [`after_relayed_gram`].
-pub(super) fn before_relayed_gram(
-    request: &Request,
-    api_tx: &ApiRequestSender,
-) -> Option<RelaySender> {
+fn before_relayed_gram(request: &Request, api_tx: &ApiRequestSender) -> Option<RelaySender> {
     let Method::GramSend(params) = &request.method else {
         return None;
     };
@@ -1924,7 +1940,7 @@ fn audit_post(guest: &GuestPrincipal, method: &str, text: String, response: &str
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixStream;
@@ -1997,7 +2013,11 @@ mod tests {
         }
 
         /// Accept a new invite for agent `index` with Gram sharing on or off.
-        fn admit_with(&self, index: usize, share_gram: bool) -> GuestPrincipal {
+        pub(in crate::api::server) fn admit_with(
+            &self,
+            index: usize,
+            share_gram: bool,
+        ) -> GuestPrincipal {
             let invite = self.invite_with(index, "plotarmordev", share_gram);
             let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
             match admit_in(self.dir.0.clone(), [4; 32], &hello) {
@@ -4460,14 +4480,14 @@ mod tests {
     }
 
     /// Points the Gram store at a scratch config dir for one test.
-    struct ConfigHome {
+    pub(in crate::api::server) struct ConfigHome {
         previous: Option<std::ffi::OsString>,
         dir: std::path::PathBuf,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ConfigHome {
-        fn new(tag: &str) -> Self {
+        pub(in crate::api::server) fn new(tag: &str) -> Self {
             let lock = crate::config::test_config_env_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6003,7 +6023,7 @@ mod tests {
     /// `other-agent` as a real coordinator does, qualified with the relay
     /// alias (`mac-studio/llm-opt`): the name its federation roster gives them
     /// and so the name its Gram stores. It serves files 3 bytes per chunk.
-    struct Coordinator {
+    pub(in crate::api::server) struct Coordinator {
         state: Arc<Mutex<CoordinatorState>>,
         /// The roster name of each remote pane.
         names: Arc<Mutex<HashMap<String, &'static str>>>,
@@ -6287,7 +6307,7 @@ mod tests {
     /// One request on this machine's own API, as a local client (`herdr` in
     /// an agent's pane) sends it. Runs on the calling thread, so a push
     /// capture installed there sees what it dispatches.
-    fn local_call(harness: &Harness, request: Value) -> Value {
+    pub(in crate::api::server) fn local_call(harness: &Harness, request: Value) -> Value {
         let (mut client, server) = UnixStream::pair().unwrap();
         writeln!(client, "{request}").unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
@@ -6312,7 +6332,7 @@ mod tests {
     }
 
     /// A harness whose guest store is this daemon's real one.
-    fn relay_remote(tag: &str) -> (ConfigHome, Harness, Coordinator) {
+    pub(in crate::api::server) fn relay_remote(tag: &str) -> (ConfigHome, Harness, Coordinator) {
         let config = ConfigHome::new(tag);
         let mut harness = start(tag);
         harness.dir = TempDir(crate::guest::store::guest_dir());
@@ -6488,7 +6508,7 @@ mod tests {
         assert!(coordinator.state.lock().unwrap().uploads.is_empty());
     }
 
-    fn copy_ids(guest: &GuestPrincipal) -> Vec<String> {
+    pub(in crate::api::server) fn copy_ids(guest: &GuestPrincipal) -> Vec<String> {
         crate::guest::mirror::load(&guest.dir)
             .unwrap()
             .into_iter()
@@ -6496,7 +6516,11 @@ mod tests {
             .collect()
     }
 
-    fn agent_sends(harness: &Harness, pane: usize, text: &str) -> String {
+    pub(in crate::api::server) fn agent_sends(
+        harness: &Harness,
+        pane: usize,
+        text: &str,
+    ) -> String {
         let sent = local_call(
             harness,
             json!({"id": "s", "method": "gram.send", "params": {"text": text, "caller_pane_id": harness.pane_ids[pane]}}),
