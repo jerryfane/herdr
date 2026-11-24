@@ -242,13 +242,30 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         let main_pid_recovery = crate::server::supervision::is_main_pid_successor()
             && std::env::var_os("HERDR_TEST_HANDOFF_NO_MAIN_PID_RECOVERY").is_none();
         crate::server::handoff::report_ready(&mut received.stream, main_pid_recovery)?;
-        // Test fault: drop a delivered commit unread, as import servers did when a
-        // signal cut this wait short.
         let committed =
             if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("commit_unread") {
-                crate::server::handoff::drop_commit_unread(&received.stream)
+                // Test fault: block until `committed` is queued, then give up without
+                // reading it, as import servers did when a signal cut this wait short.
+                use std::os::fd::AsRawFd as _;
+                let mut byte = 0u8;
+                // SAFETY: a valid socket fd and a one-byte buffer this frame owns;
+                // MSG_PEEK leaves the byte queued.
+                unsafe {
+                    libc::recv(
+                        received.stream.as_raw_fd(),
+                        (&raw mut byte).cast(),
+                        1,
+                        libc::MSG_PEEK,
+                    )
+                };
+                Err(io::Error::other(
+                    "test: the handoff commit was dropped unread",
+                ))
             } else {
-                crate::server::handoff::wait_committed(&mut received.stream)
+                crate::server::handoff::wait_committed(
+                    &mut received.stream,
+                    crate::server::handoff::COMMIT_TIMEOUT,
+                )
             };
         if let Err(err) = committed {
             warn!(err = %err, "the handoff did not commit; giving the panes up");

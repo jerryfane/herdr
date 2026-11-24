@@ -1265,9 +1265,9 @@ fn the_old_server_stays_main_when_the_new_server_never_takes_the_panes(fault: (&
 /// 2026-11-24, 130 panes: a signal reached the new server while it waited for the
 /// commit, and it took the interrupted read for a lost commit. It gave the panes up
 /// while the old server, its commit written, exited: the unit stopped and every pane
-/// died. The server ignores SIGHUP, so SIGHUP sent to the new server all the while it
-/// waits changes nothing: the switch completes in the same activation and the pane's
-/// process lives.
+/// died. The server catches SIGHUP and keeps running, so SIGHUP sent to the new server
+/// all the while it waits changes nothing: the switch completes in the same activation
+/// and the pane's process lives.
 #[test]
 fn update_apply_switches_live_inside_a_systemd_notify_unit_while_the_new_server_gets_sighup() {
     if !user_systemd_available() {
