@@ -20,8 +20,6 @@ use tracing::{info, warn};
 const HANDOFF_VERSION: u32 = 1;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(unix)]
-const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 // Descriptors are transferred in batches of this size. A single SCM_RIGHTS
 // control message caps out at 253 descriptors on Linux and 254 on macOS, so the
 // batch stays well below both limits and the number of panes stays unbounded.
@@ -245,28 +243,55 @@ pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<Ready> {
     parse_ready(&ready).ok_or_else(|| io::Error::other("handoff import did not report ready"))
 }
 
+/// The old server's commit point: once this write succeeds the importer has the
+/// commit, and it takes the panes whether or not its read of it fails later
+/// ([`wait_committed`]).
 #[cfg(unix)]
 pub(crate) fn report_committed(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(b"committed\n")?;
     stream.flush()
 }
 
+/// Run by the old server after the commit, while it still holds every pane: wait for
+/// the importer's `owned`.
+///
+/// `Err` only when the importer closed the handoff stream without saying `owned`: it
+/// found the commit lost and is giving the panes up, or it died. Then nobody else
+/// serves the panes, so the old server must keep them. Any other outcome (`owned`, a
+/// line it doesn't know, no answer by `timeout`) leaves an importer that still holds
+/// the stream and has the commit, and it owns the panes from here.
 #[cfg(unix)]
-pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
-    if let Err(err) = stream.set_read_timeout(Some(OWNED_ACK_TIMEOUT)) {
+pub(crate) fn wait_owned_ack(stream: &mut UnixStream, timeout: Duration) -> io::Result<()> {
+    if let Err(err) = stream.set_read_timeout(Some(timeout)) {
+        // The stream keeps the timeout of the earlier steps.
         warn!(err = %err, "failed to set handoff ownership ack timeout");
-        return;
     }
     match read_line_unbuffered(&mut *stream) {
-        Ok(owned) if owned.trim_end() == "owned" => {}
+        Ok(owned) if owned.trim_end() == "owned" => Ok(()),
         Ok(other) => {
             warn!(
                 response = %other.trim_end(),
                 "handoff import sent unexpected ownership ack after commit"
             );
+            Ok(())
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Err(io::Error::new(
+                err.kind(),
+                format!("the handoff import server let go of the panes after the commit: {err}"),
+            ))
         }
         Err(err) => {
-            warn!(err = %err, "handoff import ownership ack was not received after commit");
+            warn!(
+                err = %err,
+                "handoff import ownership ack was not received after commit; the import server holds the commit and owns the panes"
+            );
+            Ok(())
         }
     }
 }
@@ -334,14 +359,51 @@ pub(crate) fn report_ready(stream: &mut UnixStream, main_pid_recovery: bool) -> 
     stream.flush()
 }
 
+/// Run by the import server once it reported `ready`: wait for the old server's
+/// `committed`. `Ok` means this process owns the panes.
+///
+/// Its verdict must be the old server's, or both give the panes up. A signal never ends
+/// the wait ([`read_line_into`]). When it ends for any other reason (no `committed` by
+/// `timeout`, the stream ending), a `committed` already queued still counts
+/// ([`commit_already_queued`]). Otherwise this process gives the panes up and closes
+/// the stream, which the old server's ownership ack wait reads as the panes coming back
+/// ([`wait_owned_ack`]).
 #[cfg(unix)]
-pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let committed = read_line_unbuffered(&mut *stream)?;
-    if committed.trim_end() != "committed" {
+pub(crate) fn wait_committed(stream: &mut UnixStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    let mut line = Vec::new();
+    if let Err(err) = read_line_into(stream, &mut line) {
+        if !commit_already_queued(stream, &mut line) {
+            return Err(err);
+        }
+    }
+    if String::from_utf8_lossy(&line).trim_end() != "committed" {
         return Err(io::Error::other("handoff source did not commit"));
     }
     Ok(())
+}
+
+/// After the wait for `committed` failed: whether the rest of the line (`line` holds
+/// what was read) is queued all the same. Reads never block here.
+///
+/// The stream is closed for reading between two reads. On Linux that also makes a
+/// `committed` written afterwards fail, so even an old server without the ownership ack
+/// wait rolls back. macOS drops queued data on that close and keeps taking writes, so
+/// there the first read is what finds a queued commit, and an old server that wrote
+/// after it relies on the ack wait to take the panes back.
+#[cfg(unix)]
+fn commit_already_queued(stream: &mut UnixStream, line: &mut Vec<u8>) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let queued = read_line_into(stream, line).is_ok() || {
+        // Best effort: the reads decide, not whether this close worked.
+        let _ = stream.shutdown(std::net::Shutdown::Read);
+        read_line_into(stream, line).is_ok()
+    };
+    // `owned` still goes out on this stream.
+    let _ = stream.set_nonblocking(false);
+    queued
 }
 
 #[cfg(unix)]
@@ -406,9 +468,26 @@ fn accept_with_timeout(
 #[cfg(unix)]
 fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
     let mut bytes = Vec::new();
+    read_line_into(stream, &mut bytes)?;
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Reads up to and including `\n` into `bytes`, which keeps what was read when it fails.
+///
+/// A caught signal is no answer and is read past. Linux never restarts a socket read
+/// that has a timeout, `SA_RESTART` or not: it fails with `EINTR`, even with the line
+/// already queued. The server catches SIGHUP for its whole life, and on 2026-11-24 an
+/// import server took that `EINTR` on `committed` for a lost commit: it gave 130 panes
+/// up while the old server, its commit written, exited.
+#[cfg(unix)]
+fn read_line_into(stream: &mut UnixStream, bytes: &mut Vec<u8>) -> io::Result<()> {
     let mut byte = [0u8; 1];
     loop {
-        let read = stream.read(&mut byte)?;
+        let read = match stream.read(&mut byte) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -417,8 +496,7 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
         }
         bytes.push(byte[0]);
         if byte[0] == b'\n' {
-            return String::from_utf8(bytes)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+            return Ok(());
         }
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(io::Error::new(
@@ -714,5 +792,90 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    /// 2026-11-24: a signal ended the import server's wait while `committed` was
+    /// queued, so it gave 130 panes up while the old server, its commit written,
+    /// exited. The server catches SIGHUP, and Linux fails a socket read that has a
+    /// timeout with `EINTR` even under `SA_RESTART`, so a signal must not end the wait.
+    #[test]
+    fn a_signal_while_the_import_server_waits_does_not_lose_the_commit() {
+        use std::os::unix::thread::JoinHandleExt as _;
+
+        // Caught like the server's SIGHUP (`SA_RESTART`), without touching SIGHUP here.
+        unsafe { signal_hook::low_level::register(libc::SIGUSR1, || {}) }
+            .expect("SIGUSR1 handler should install");
+        let (mut old_server, mut import_server) = UnixStream::pair().unwrap();
+        let waiting =
+            std::thread::spawn(move || wait_committed(&mut import_server, COMMIT_TIMEOUT));
+        let thread = waiting.as_pthread_t();
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline && !waiting.is_finished() {
+            // SAFETY: the thread is not joined yet, so its id is still valid.
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = report_committed(&mut old_server);
+
+        let committed = waiting.join().unwrap();
+        assert!(committed.is_ok(), "{committed:?}");
+    }
+
+    /// When the wait for `committed` has failed, a `committed` that is queued anyway
+    /// still counts, including the rest of a line the failed read began.
+    #[test]
+    fn a_commit_queued_when_the_wait_failed_still_counts() {
+        let (mut old_server, mut import_server) = UnixStream::pair().unwrap();
+        old_server.write_all(b"mitted\n").unwrap();
+        let mut line = b"com".to_vec();
+
+        assert!(commit_already_queued(&mut import_server, &mut line));
+        assert_eq!(line, b"committed\n");
+    }
+
+    /// An import server that gave up the wait closes the handoff, and the old server
+    /// then keeps the panes on every platform: its write fails, or its ack wait sees
+    /// the stream end.
+    #[test]
+    fn the_old_server_keeps_the_panes_when_the_import_server_gave_up() {
+        let (mut old_server, mut import_server) = UnixStream::pair().unwrap();
+        assert!(wait_committed(&mut import_server, Duration::from_millis(50)).is_err());
+        drop(import_server);
+
+        let committed = report_committed(&mut old_server)
+            .and_then(|()| wait_owned_ack(&mut old_server, COMMIT_TIMEOUT));
+        assert!(committed.is_err());
+    }
+
+    /// Linux only: there the import server's close for reading makes a later
+    /// `committed` write fail at once, while it still holds the stream, so even an old
+    /// server without the ownership ack wait rolls back. macOS keeps accepting writes
+    /// after that close (and drops what it queued), so there only the test above holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_commit_written_after_the_import_server_gave_up_fails_at_once_on_linux() {
+        let (mut old_server, mut import_server) = UnixStream::pair().unwrap();
+        assert!(wait_committed(&mut import_server, Duration::from_millis(50)).is_err());
+
+        assert!(report_committed(&mut old_server).is_err());
+    }
+
+    /// After the commit the old server still holds every pane. It takes them back only
+    /// from an import server that closed the handoff without `owned` (the 2026-11-24
+    /// one closed it with `committed` unread); one that still holds it owns them.
+    #[test]
+    fn the_old_server_takes_the_panes_back_only_from_an_import_server_that_let_go() {
+        let (mut old_server, mut import_server) = UnixStream::pair().unwrap();
+        report_owned(&mut import_server).unwrap();
+        assert!(wait_owned_ack(&mut old_server, COMMIT_TIMEOUT).is_ok());
+
+        let (mut old_server, _silent_import_server) = UnixStream::pair().unwrap();
+        let silent = wait_owned_ack(&mut old_server, Duration::from_millis(50));
+        assert!(silent.is_ok(), "{silent:?}");
+
+        let (mut old_server, import_server) = UnixStream::pair().unwrap();
+        report_committed(&mut old_server).unwrap();
+        drop(import_server);
+        assert!(wait_owned_ack(&mut old_server, COMMIT_TIMEOUT).is_err());
     }
 }
