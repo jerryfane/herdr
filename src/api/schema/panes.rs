@@ -417,6 +417,12 @@ crate::cli::projection::cli_params! {
         pub text: String => Field::new(String::new()).input(binding::joined("text", "TEXT")),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input_source: Option<super::InputSource> => Field::new(None::<super::InputSource>),
+        /// Write the text as one bracketed paste (`ESC[200~` … `ESC[201~`),
+        /// so a shell runs none of its lines. Refused with
+        /// `bracketed_paste_unavailable`, writing nothing, while the pane's
+        /// program has not turned bracketed paste on (DECSET 2004).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub bracketed: bool => Field::new(false),
     }
 }
 

@@ -158,6 +158,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
 ];
 const TERMINAL_CAPABILITIES: &[&str] = &[
     "pane_input_stream",
+    "pane_send_text_bracketed",
     "rename_preconditions",
     "server_update",
     "agent_session_transfer",

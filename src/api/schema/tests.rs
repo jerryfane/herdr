@@ -1309,6 +1309,7 @@ fn success_response_round_trips() {
                 pane_stream_resync: false,
                 compressed_replies: false,
                 gram_thumbnails: false,
+                pane_send_text_bracketed: false,
             }),
         },
     };

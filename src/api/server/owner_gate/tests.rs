@@ -406,6 +406,11 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
             input_stream,
             "{pong}"
         );
+        assert_eq!(
+            capabilities.get("pane_send_text_bracketed").is_some(),
+            input_stream,
+            "{pong}"
+        );
     }
 }
 
@@ -437,6 +442,38 @@ fn chat_scope_copies_recent_and_acts_on_topic_suggestions() {
         ],
     );
     assert_eq!(more, ["owner_forbidden", "<success>"], "{more:?}");
+}
+
+/// Terminal scope may ask `pane.send_text` for a bracketed paste: the param
+/// reaches the app, which refuses and writes nothing while the program has
+/// bracketed paste off, and wraps the text once it turned it on.
+#[test]
+fn terminal_scope_sends_bracketed_text() {
+    let harness = start("owner-bracketed");
+    let pane = harness.pane_ids[0].clone();
+    let send = json!({"id": "1", "method": "pane.send_text", "params": {"pane_id": pane, "text": "echo one\necho two\n", "bracketed": true}});
+
+    let replies = codes(&harness, OwnerScope::Terminal, std::slice::from_ref(&send));
+    assert_eq!(replies, ["bracketed_paste_unavailable"], "{replies:?}");
+    assert_eq!(harness.pty_text(0, Duration::from_millis(200)), "");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut crate::app::App| {
+            let workspace = &app.state.workspaces[0];
+            workspace.test_runtimes[&workspace.tabs[0].root_pane]
+                .test_process_pty_bytes(b"\x1b[?2004h");
+            let _ = done_tx.send(());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let replies = codes(&harness, OwnerScope::Terminal, &[send]);
+    assert_eq!(replies, ["<success>"], "{replies:?}");
+    assert_eq!(
+        harness.pty_text(0, Duration::from_millis(500)),
+        "\x1b[200~echo one\necho two\n\x1b[201~"
+    );
 }
 
 #[test]
