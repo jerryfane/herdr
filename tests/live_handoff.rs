@@ -2118,3 +2118,11 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
 }
+
+/// The import server gives the panes up with `committed` already delivered, unread
+/// (a signal made one do that on 2026-11-24). The old server must keep its panes and
+/// serve on instead of exiting as if the import server owned them.
+#[test]
+fn live_handoff_commit_dropped_unread_rolls_back_old_server() {
+    live_handoff_import_failure_rolls_back_old_server_at("commit_unread");
+}

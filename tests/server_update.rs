@@ -1188,14 +1188,32 @@ fn update_apply_keeps_the_new_server_when_the_manager_stops_answering_with_notif
 /// and nothing is installed.
 #[test]
 fn update_apply_keeps_the_old_server_main_when_the_commit_is_lost_inside_a_systemd_notify_unit() {
+    the_old_server_stays_main_when_the_new_server_never_takes_the_panes((
+        "HERDR_TEST_HANDOFF_COMMIT_FAIL",
+        "1",
+    ));
+}
+
+/// 2026-11-24, 130 panes: the commit reached the new server, which gave the panes up
+/// without reading it (a signal had cut its wait short; here a test fault drops it),
+/// and the old server, its commit written, exited too. The unit stopped and every pane
+/// died. The old server must keep the panes until the new server says it owns them,
+/// so this ends like a commit write that failed.
+#[test]
+fn update_apply_keeps_the_old_server_main_when_the_new_server_drops_the_commit_inside_a_systemd_notify_unit(
+) {
+    the_old_server_stays_main_when_the_new_server_never_takes_the_panes((
+        "HERDR_TEST_HANDOFF_IMPORT_FAIL",
+        "commit_unread",
+    ));
+}
+
+fn the_old_server_stays_main_when_the_new_server_never_takes_the_panes(fault: (&str, &str)) {
     if !user_systemd_available() {
         return;
     }
     let mut fixture = Fixture::new();
-    fixture.start_server_in_unit(
-        &["Type=notify", "NotifyAccess=main"],
-        &[("HERDR_TEST_HANDOFF_COMMIT_FAIL", "1")],
-    );
+    fixture.start_server_in_unit(&["Type=notify", "NotifyAccess=main"], &[fault]);
     let (pane_id, shell_pid) = open_pane(&fixture);
     let build = fixture.publish_build(protocol(&fixture));
     let invocation = fixture.unit().show("InvocationID");
@@ -1242,6 +1260,109 @@ fn update_apply_keeps_the_old_server_main_when_the_commit_is_lost_inside_a_syste
     assert!(pane_ids(&fixture).contains(&pane_id));
     let after = install_identity(&fixture.install);
     assert_eq!((after.inode, after.sha256), (before.inode, before.sha256));
+}
+
+/// 2026-11-24, 130 panes: a signal reached the new server while it waited for the
+/// commit, and it took the interrupted read for a lost commit. It gave the panes up
+/// while the old server, its commit written, exited: the unit stopped and every pane
+/// died. The server ignores SIGHUP, so SIGHUP sent to the new server all the while it
+/// waits changes nothing: the switch completes in the same activation and the pane's
+/// process lives.
+#[test]
+fn update_apply_switches_live_inside_a_systemd_notify_unit_while_the_new_server_gets_sighup() {
+    if !user_systemd_available() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.start_server_in_unit(&["Type=notify", "NotifyAccess=main"], &[]);
+    let (pane_id, shell_pid) = open_pane(&fixture);
+    let build = fixture.publish_build(protocol(&fixture));
+    let invocation = fixture.unit().show("InvocationID");
+    let old_pid = serving_pid(&fixture.api_socket);
+
+    let hangups = thread::spawn(move || hang_up_the_import_server_of(old_pid));
+    let attempt_id = fixture.apply(serde_json::json!({"build_id": build.build_id}));
+    let attempt = fixture.wait_for_outcome(&attempt_id);
+    fixture.wait_for_guard_exit();
+    let hangups = hangups.join().unwrap();
+
+    assert!(hangups > 0, "no SIGHUP reached the new server");
+    assert_eq!(
+        attempt["outcome"],
+        "updated",
+        "{attempt}\n{}",
+        fixture.guard_log()
+    );
+    let unit = fixture.unit();
+    assert_eq!(unit.show("ActiveState"), "active", "the unit went down");
+    assert_eq!(unit.show("InvocationID"), invocation, "the unit restarted");
+    let new_pid = serving_pid(&fixture.api_socket);
+    assert_ne!(new_pid, old_pid, "the old server still serves");
+    assert_eq!(
+        unit.main_pid(),
+        new_pid,
+        "systemd does not follow the new server"
+    );
+    assert!(alive(shell_pid), "the pane's process did not survive");
+    assert!(pane_ids(&fixture).contains(&pane_id));
+}
+
+/// SIGHUP, every millisecond, to the import server `old_pid` spawns, from when it
+/// catches SIGHUP (before that SIGHUP kills it, a different failure) until one of the
+/// two is gone. Returns how many were sent.
+fn hang_up_the_import_server_of(old_pid: u32) -> usize {
+    let deadline = Instant::now() + ATTEMPT_TIMEOUT;
+    let mut import_pid = None;
+    let mut sent = 0;
+    while alive(old_pid) && Instant::now() < deadline {
+        let Some(pid) = import_pid.or_else(|| import_server_of(old_pid)) else {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        if !alive(pid) {
+            break;
+        }
+        import_pid = Some(pid);
+        if catches_sighup(pid) && unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) } == 0 {
+            sent += 1;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    sent
+}
+
+/// The `server --handoff-import` child of `parent`.
+fn import_server_of(parent: u32) -> Option<u32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|pid| {
+            let ppid = fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let (_, fields) = stat.rsplit_once(") ")?;
+                    fields.split_whitespace().nth(1)?.parse::<u32>().ok()
+                });
+            ppid == Some(parent)
+                && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                    cmdline
+                        .split(|byte| *byte == 0)
+                        .any(|arg| arg == b"--handoff-import")
+                })
+        })
+}
+
+fn catches_sighup(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigCgt:"))?;
+            u64::from_str_radix(mask.trim(), 16).ok()
+        })
+        .is_some_and(|mask| mask & (1 << (libc::SIGHUP - 1)) != 0)
 }
 
 /// The new build can't hand the unit's main pid back after a lost commit (a test

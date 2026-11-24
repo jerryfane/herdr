@@ -242,7 +242,16 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         let main_pid_recovery = crate::server::supervision::is_main_pid_successor()
             && std::env::var_os("HERDR_TEST_HANDOFF_NO_MAIN_PID_RECOVERY").is_none();
         crate::server::handoff::report_ready(&mut received.stream, main_pid_recovery)?;
-        if let Err(err) = crate::server::handoff::wait_committed(&mut received.stream) {
+        // Test fault: drop a delivered commit unread, as import servers did when a
+        // signal cut this wait short.
+        let committed =
+            if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("commit_unread") {
+                crate::server::handoff::drop_commit_unread(&received.stream)
+            } else {
+                crate::server::handoff::wait_committed(&mut received.stream)
+            };
+        if let Err(err) = committed {
+            warn!(err = %err, "the handoff did not commit; giving the panes up");
             commit_lost.set(true);
             return Err(err);
         }

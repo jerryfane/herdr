@@ -323,6 +323,15 @@ impl HeadlessServer {
         } else {
             crate::server::handoff::report_committed(&mut stream)
         };
+        // Every pane stays here until the replacement says it owns them. One that lets
+        // go of the handoff instead (it took the commit for lost, or died) serves
+        // nothing, so this process keeps the panes exactly as if the write had failed.
+        let committed = committed.and_then(|()| {
+            crate::server::handoff::wait_owned_ack(
+                &mut stream,
+                crate::server::handoff::COMMIT_TIMEOUT,
+            )
+        });
         if let Err(err) = committed {
             // End the stream so the replacement learns at once that no commit comes:
             // it then drops everything it imported, closes its sockets and, if the
@@ -377,7 +386,6 @@ impl HeadlessServer {
             debug!(terminal = %terminal_id, "preserving pane runtime for handoff");
             runtime.preserve_for_handoff();
         }
-        crate::server::handoff::wait_owned_ack(&mut stream);
         Ok(())
     }
 
