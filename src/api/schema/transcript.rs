@@ -37,6 +37,12 @@ cli_params! {
         /// Older servers ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub held_from: Option<String> => Field::new(None::<String>),
+        /// Show the messages omp hands between the agent's Inbox and its
+        /// topics as `relay` entries; without it they stay `user`/`note`
+        /// entries, as before. Honoured by servers that advertise
+        /// `capabilities.transcript_relay_entries`; older ones ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub relay_entries: bool => Field::new(false),
     }
 }
 

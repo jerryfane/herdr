@@ -203,4 +203,9 @@ pub struct ServerCapabilities {
     /// `guest_id` and `share_gram`.
     #[serde(default)]
     pub guest_relabel: bool,
+    /// `agent.transcript` honours `relay_entries`: with it, the messages omp
+    /// hands between an agent's Inbox and its topics are `relay` entries.
+    /// Older servers ignore the field and send them as `user`/`note`.
+    #[serde(default)]
+    pub transcript_relay_entries: bool,
 }

@@ -150,6 +150,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "ask_dismiss",
     "agent_topics",
     "agent_transcript_topic",
+    "transcript_relay_entries",
     "agent_topic_suggestions",
     "agent_topics_switch",
     "agent_topics_switch_when_idle",

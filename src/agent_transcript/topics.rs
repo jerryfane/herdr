@@ -361,11 +361,24 @@ mod page_tests {
         "<irc>\nReply from `Review`:\n\nThe numbers on slide 7 check out.\n</irc>";
     const HELPER_ASK: &str = "<irc>\nAsked by `helper`:\n\nWhich file?\n</irc>";
 
-    fn topic_page(session: &Fixture, topic: &str) -> serde_json::Value {
+    fn topic_page(session: &Fixture, topic: &str, relay_entries: bool) -> serde_json::Value {
         let page = read_page(
             &session.path,
             &PageRequest {
                 topic: Some(topic.into()),
+                relay_entries,
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        serde_json::to_value(&page.entries).unwrap()
+    }
+
+    fn inbox_page(session: &Fixture, relay_entries: bool) -> serde_json::Value {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                relay_entries,
                 ..PageRequest::default()
             },
         )
@@ -394,7 +407,7 @@ mod page_tests {
         deck.user("plain owner text");
         spawned(&mut session, "Deck", "Investor deck", &deck);
 
-        let entries = topic_page(&session, "Deck");
+        let entries = topic_page(&session, "Deck", true);
         assert_eq!(
             entries[0],
             serde_json::json!({"kind": "relay", "id": entries[0]["id"], "ts_ms": entries[0]["ts_ms"],
@@ -410,6 +423,13 @@ mod page_tests {
         assert_eq!(entries[2]["kind"], "user");
         assert_eq!(entries[2]["text"], HELPER_ASK);
         assert_eq!(entries[3]["kind"], "user");
+
+        // A client that did not ask for relays gets the user entries it always got.
+        let entries = topic_page(&session, "Deck", false);
+        for (entry, text) in [INBOX_ASK, TOPIC_REPLY, HELPER_ASK].into_iter().enumerate() {
+            assert_eq!(entries[entry]["kind"], "user", "{entries}");
+            assert_eq!(entries[entry]["text"], text);
+        }
     }
 
     #[test]
@@ -431,14 +451,21 @@ mod page_tests {
             true,
             serde_json::json!({"id": "15dc", "from": "GridReview", "message": "Cap verified."}),
         );
-        let page = read_page(&session.path, &PageRequest::default()).unwrap();
-        let entries = serde_json::to_value(&page.entries).unwrap();
+        let entries = inbox_page(&session, true);
         assert_eq!(entries[1]["kind"], "relay", "{entries}");
         assert_eq!(entries[1]["from"], "Investor deck");
         assert_eq!(entries[1]["topic_id"], "Deck");
         assert_eq!(entries[1]["direction"], "to_inbox");
         assert_eq!(entries[1]["text"], "Brief sent; waiting for the build.");
         assert_eq!(entries[2]["kind"], "note", "{entries}");
+
+        // A client that did not ask for relays gets the notes it always got.
+        let entries = inbox_page(&session, false);
+        assert_eq!(entries[1]["kind"], "note", "{entries}");
+        assert!(entries[1]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Brief sent; waiting for the build.")));
+        assert_eq!(entries[2]["kind"], "note");
     }
 }
 

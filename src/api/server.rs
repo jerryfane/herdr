@@ -273,6 +273,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_send_bracketed_text: true,
         // Guest RPCs are Unix-only.
         guest_relabel: cfg!(unix),
+        transcript_relay_entries: true,
     })
 }
 
@@ -4076,6 +4077,7 @@ mod tests {
                 pane_send_text_bracketed: false,
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
+                transcript_relay_entries: false,
             }),
             None,
             None,

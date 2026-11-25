@@ -122,6 +122,7 @@ fn transcript_response(
         held_from: params.held_from,
         subagent: params.subagent,
         topic: params.topic,
+        relay_entries: params.relay_entries,
     };
     match agent_transcript::read_page(&source.path, &request) {
         Ok(page) => encode_success(
@@ -163,6 +164,7 @@ mod tests {
             held_from: None,
             subagent: None,
             topic: None,
+            relay_entries: false,
         };
         serde_json::from_str(&transcript_response("t".into(), source, params)).unwrap()
     }

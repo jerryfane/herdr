@@ -207,6 +207,7 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         held_from: None,
         subagent: None,
         topic: None,
+        relay_entries: false,
     }
 }
 

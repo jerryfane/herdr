@@ -73,6 +73,9 @@ pub(crate) struct PageRequest {
     /// or `""` when it holds the session from its start. Origin marks that
     /// changed are re-sent from there instead of from the cursor's floor.
     pub(crate) held_from: Option<String>,
+    /// Show the handovers between the agent's Inbox and its topics as
+    /// `relay` entries; without it they stay `user`/`note` entries.
+    pub(crate) relay_entries: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,9 +248,10 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
             with_index(&child, |view| view.page(request, limit, &[]))
         }
         None => {
-            let relays = match request.topic {
-                Some(_) => Relays::IntoTopic(topic_titles(inbox)),
-                None => Relays::IntoInbox(topic_titles(inbox)),
+            let relays = match (request.relay_entries, &request.topic) {
+                (false, _) => Relays::None,
+                (true, Some(_)) => Relays::IntoTopic(topic_titles(inbox)),
+                (true, None) => Relays::IntoInbox(topic_titles(inbox)),
             };
             match with_index_relaying(path, relays, |view| {
                 view.page(request, limit, other_prompts)

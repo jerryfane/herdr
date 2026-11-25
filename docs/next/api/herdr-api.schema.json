@@ -2473,6 +2473,10 @@
                 "null"
               ]
             },
+            "relay_entries": {
+              "description": "Show the messages omp hands between the agent's Inbox and its\ntopics as `relay` entries; without it they stay `user`/`note`\nentries, as before. Honoured by servers that advertise\n`capabilities.transcript_relay_entries`; older ones ignore it.",
+              "type": "boolean"
+            },
             "subagent": {
               "type": [
                 "string",
@@ -20963,6 +20967,11 @@
             "transcript_max_bytes": {
               "default": false,
               "description": "`agent.transcript` honours `max_bytes`: a newest or `before` page keeps\nonly its newest entries whose JSON fits. Older servers ignore the param\nand page by turns alone.",
+              "type": "boolean"
+            },
+            "transcript_relay_entries": {
+              "default": false,
+              "description": "`agent.transcript` honours `relay_entries`: with it, the messages omp\nhands between an agent's Inbox and its topics are `relay` entries.\nOlder servers ignore the field and send them as `user`/`note`.",
               "type": "boolean"
             },
             "turn_origin": {
