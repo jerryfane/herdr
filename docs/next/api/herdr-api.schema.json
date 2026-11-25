@@ -19049,6 +19049,10 @@
                     }
                   ]
                 },
+                "relay_entries": {
+                  "description": "The page shows the handovers between the agent's Inbox and its\ntopics as `relay` entries: asked with `relay_entries`, and the\nsession's topics could be read. Absent when the page shows them\nas `user`/`note` entries (not asked, a subagent's page, an\nunreadable topic list, a server or peer without relays).",
+                  "type": "boolean"
+                },
                 "resent": {
                   "description": "On an `after` page: the ids of the entries re-sent from before the\ncursor (origin-mark replays and changed steps), in page order. Every\nother entry was appended since. Absent on newest and `before` pages.",
                   "items": {

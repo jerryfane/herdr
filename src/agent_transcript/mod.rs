@@ -260,10 +260,7 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         None => {
             // Without the session's topics no handover can be told apart:
             // the page says so by its `relay_entries` staying false.
-            let titles = request
-                .relay_entries
-                .then(|| topic_titles(inbox))
-                .flatten();
+            let titles = request.relay_entries.then(|| topic_titles(inbox)).flatten();
             let relays = match (titles, &request.topic) {
                 (None, _) => Relays::None,
                 (Some(titles), Some(_)) => Relays::IntoTopic(titles),
