@@ -119,6 +119,11 @@
               "type": "string"
             },
             {
+              "const": "listed",
+              "description": "Herdr's list of the agent's topics changed: a refresh behind an\n`agent.topics.list` answer, or after a change the agent streamed,\nfound it different. `topic_id` is empty; list again.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -10688,6 +10693,11 @@
               "type": "string"
             },
             {
+              "const": "listed",
+              "description": "Herdr's list of the agent's topics changed: a refresh behind an\n`agent.topics.list` answer, or after a change the agent streamed,\nfound it different. `topic_id` is empty; list again.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -13526,6 +13536,11 @@
               "type": "string"
             },
             {
+              "const": "listed",
+              "description": "Herdr's list of the agent's topics changed: a refresh behind an\n`agent.topics.list` answer, or after a change the agent streamed,\nfound it different. `topic_id` is empty; list again.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "A reason this server does not know yet.",
               "type": "string"
@@ -13533,7 +13548,7 @@
           ]
         },
         "AgentTopicInfo": {
-          "description": "One topic as `agent.topics.list` reports it, live from the agent.",
+          "description": "One topic as `agent.topics.list` reports it.",
           "properties": {
             "created_unix_ms": {
               "format": "uint64",
@@ -13657,7 +13672,7 @@
             },
             {
               "const": "unknown",
-              "description": "A state this server does not know yet.",
+              "description": "A state this server does not know yet, or a topic read from the\nsession file before the agent answered (`stale` lists).",
               "type": "string"
             }
           ]
@@ -19102,13 +19117,25 @@
               "type": "object"
             },
             {
-              "description": "`agent.topics.list`: the agent's topics, live from the agent; empty\nwhen it has none (an unreachable agent is an error instead).",
+              "description": "`agent.topics.list`: the agent's topics, as Herdr last heard them from\nthe agent (or, before the agent first answers, as the session file\nrecords them: `stale`, every `state` `unknown`). Herdr answers at once\nand asks the agent behind the answer; `agent.topics.changed` with\nreason `listed` follows when that changes the list. Empty when the\nagent has none; an agent that never answered is an error instead.",
               "properties": {
                 "agent": {
                   "type": "string"
                 },
+                "as_of_unix_ms": {
+                  "default": 0,
+                  "description": "When the agent gave this list (unix ms), or when it was read from\nthe session file.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "stale": {
+                  "default": false,
+                  "description": "Not the agent's own latest answer: read from the session file,\nchanged since (a refresh is under way), or the agent did not\nanswer the last refresh. Keep showing it.",
+                  "type": "boolean"
                 },
                 "suggestions": {
                   "description": "The agent's open topic suggestions, oldest first. Present only when\nthe agent's omp serves suggestions\n(`agent.topics.accept_suggestion`); absent for an omp without them.",

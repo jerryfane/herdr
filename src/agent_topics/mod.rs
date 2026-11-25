@@ -7,6 +7,10 @@
 //! per terminal, for as long as the agent process that offered it runs. It is
 //! never persisted, exported in a live handoff, logged, or returned by the
 //! API: anything that can reach the socket with the token controls the agent.
+//!
+//! Each endpoint also keeps the agent's last topic list ([`ListCache`]), so
+//! `agent.topics.list` answers at once while the agent is busy and refreshes
+//! it behind the answer.
 
 pub(crate) mod control;
 
@@ -14,7 +18,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::api::schema::AgentControlToken;
+use crate::api::schema::{
+    AgentControlToken, AgentTopicChangeReason, AgentTopicInfo, AgentTopicSession, AgentTopicState,
+    AgentTopicSuggestionInfo,
+};
 use crate::terminal::TerminalId;
 
 /// The only control protocol this build speaks.
@@ -38,6 +45,7 @@ pub(crate) struct ControlHandle {
     /// read from an older one are dropped.
     pub(crate) generation: u64,
     pub(crate) updates: Arc<UpdatesSlot>,
+    pub(crate) list: Arc<ListCache>,
 }
 
 /// The registered endpoints, by terminal.
@@ -55,11 +63,13 @@ struct Registered {
     endpoint: Arc<ControlEndpoint>,
     generation: u64,
     updates: Arc<UpdatesSlot>,
+    list: Arc<ListCache>,
 }
 
 impl Drop for Registered {
     fn drop(&mut self) {
         self.updates.cancel();
+        self.list.cancel();
     }
 }
 
@@ -81,6 +91,7 @@ impl AgentControls {
                 endpoint: Arc::new(endpoint),
                 generation: self.next_generation,
                 updates: Arc::default(),
+                list: Arc::default(),
             },
         );
     }
@@ -102,6 +113,7 @@ impl AgentControls {
                 endpoint: Arc::clone(&registered.endpoint),
                 generation: registered.generation,
                 updates: Arc::clone(&registered.updates),
+                list: Arc::clone(&registered.list),
             })
     }
 
@@ -181,6 +193,173 @@ impl UpdatesSlot {
     }
 }
 
+/// The agent's last topic list for one endpoint. `agent.topics.list` answers
+/// from it at once, then refreshes it from the agent behind the answer, one
+/// refresh at a time; the agent's `topic_update` stream keeps it current in
+/// between. Dropped with the endpoint.
+#[derive(Default)]
+pub(crate) struct ListCache {
+    state: Mutex<ListState>,
+}
+
+#[derive(Default)]
+struct ListState {
+    /// The endpoint was dropped: nothing is stored or refreshed any more.
+    cancelled: bool,
+    /// A refresh is asking the agent.
+    refreshing: bool,
+    /// Something changed while it asked: it asks once more.
+    again: bool,
+    list: Option<TopicList>,
+}
+
+/// A topic list as `agent.topics.list` answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopicList {
+    pub(crate) topics: Vec<AgentTopicInfo>,
+    pub(crate) suggestions: Option<Vec<AgentTopicSuggestionInfo>>,
+    /// When the agent answered it, or when it was read from disk.
+    pub(crate) as_of_unix_ms: u64,
+    /// Not the agent's own latest answer: read from disk, changed since, or
+    /// the last refresh failed.
+    pub(crate) stale: bool,
+}
+
+impl TopicList {
+    /// The topics the session file on disk records (`topic_sessions`): ids
+    /// and titles only, every state `unknown`, stale until the agent answers.
+    pub(crate) fn from_sessions(sessions: Vec<AgentTopicSession>, now_unix_ms: u64) -> Self {
+        let topics = sessions
+            .into_iter()
+            .map(|session| {
+                let created = session.created_unix_ms.unwrap_or(0);
+                AgentTopicInfo {
+                    title: session.title.unwrap_or_else(|| session.topic_id.clone()),
+                    topic_id: session.topic_id,
+                    state: AgentTopicState::Unknown,
+                    turns: 0,
+                    queued: 0,
+                    created_unix_ms: created,
+                    last_activity_unix_ms: created,
+                    last_activity: None,
+                }
+            })
+            .collect();
+        Self {
+            topics,
+            suggestions: None,
+            as_of_unix_ms: now_unix_ms,
+            stale: true,
+        }
+    }
+}
+
+impl ListCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ListState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn get(&self) -> Option<TopicList> {
+        self.lock().list.clone()
+    }
+
+    /// Fill an empty cache with `list`; what the cache holds afterwards.
+    pub(crate) fn seed(&self, list: TopicList) -> TopicList {
+        let mut state = self.lock();
+        if state.cancelled {
+            return list;
+        }
+        state.list.get_or_insert(list).clone()
+    }
+
+    /// Keep the agent's answer; whether its topics or suggestions differ
+    /// from what was kept.
+    pub(crate) fn store(&self, list: TopicList) -> bool {
+        let mut state = self.lock();
+        if state.cancelled {
+            return false;
+        }
+        let changed = state
+            .list
+            .as_ref()
+            .is_none_or(|kept| kept.topics != list.topics || kept.suggestions != list.suggestions);
+        state.list = Some(list);
+        changed
+    }
+
+    /// The agent did not answer a refresh: what is kept is stale.
+    pub(crate) fn refresh_failed(&self) {
+        if let Some(list) = self.lock().list.as_mut() {
+            list.stale = true;
+        }
+    }
+
+    /// Claim the one refresh; false while one runs (it then asks once more)
+    /// or once the endpoint is gone.
+    pub(crate) fn begin_refresh(&self) -> bool {
+        let mut state = self.lock();
+        if state.cancelled {
+            return false;
+        }
+        if state.refreshing {
+            state.again = true;
+            return false;
+        }
+        state.refreshing = true;
+        state.again = false;
+        true
+    }
+
+    /// The refresh asked; true when it must ask once more, else it ends.
+    pub(crate) fn end_refresh(&self) -> bool {
+        let mut state = self.lock();
+        if state.again && !state.cancelled {
+            state.again = false;
+            return true;
+        }
+        state.refreshing = false;
+        false
+    }
+
+    /// The claimed refresh never ran or stopped early.
+    pub(crate) fn abandon_refresh(&self) {
+        let mut state = self.lock();
+        state.refreshing = false;
+        state.again = false;
+    }
+
+    /// One change from the agent's `topic_update` stream: what it says for
+    /// sure is applied at once, and the list is stale until refreshed.
+    pub(crate) fn apply_change(&self, topic_id: &str, reason: AgentTopicChangeReason) {
+        let mut state = self.lock();
+        let Some(list) = state.list.as_mut() else {
+            return;
+        };
+        list.stale = true;
+        let state = match reason {
+            AgentTopicChangeReason::TurnStarted => AgentTopicState::Running,
+            AgentTopicChangeReason::TurnSettled => AgentTopicState::Idle,
+            AgentTopicChangeReason::Closed => AgentTopicState::Closed,
+            _ => return,
+        };
+        if let Some(topic) = list
+            .topics
+            .iter_mut()
+            .find(|topic| topic.topic_id == topic_id)
+        {
+            topic.state = state;
+        }
+    }
+
+    fn cancel(&self) {
+        let mut state = self.lock();
+        state.cancelled = true;
+        state.list = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +403,111 @@ mod tests {
         // The reader's end was shut down, so its peer reads end-of-stream.
         assert_eq!(std::io::Read::read(&mut &theirs, &mut byte).unwrap(), 0);
         assert!(!updates.claim(), "a dropped endpoint never streams again");
+    }
+
+    fn topic(id: &str, state: AgentTopicState) -> AgentTopicInfo {
+        AgentTopicInfo {
+            topic_id: id.into(),
+            title: id.into(),
+            state,
+            turns: 1,
+            queued: 0,
+            created_unix_ms: 1,
+            last_activity_unix_ms: 2,
+            last_activity: None,
+        }
+    }
+
+    fn answer(topics: Vec<AgentTopicInfo>, as_of_unix_ms: u64) -> TopicList {
+        TopicList {
+            topics,
+            suggestions: None,
+            as_of_unix_ms,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn one_refresh_runs_at_a_time_and_asks_once_more_for_what_came_meanwhile() {
+        let cache = ListCache::default();
+        assert!(cache.begin_refresh());
+        assert!(!cache.begin_refresh(), "one refresh at a time");
+        assert!(!cache.begin_refresh());
+        assert!(cache.end_refresh(), "requests meanwhile: one more round");
+        assert!(!cache.end_refresh(), "then it ends");
+        assert!(cache.begin_refresh(), "a later request starts a new one");
+        cache.abandon_refresh();
+        assert!(cache.begin_refresh());
+    }
+
+    #[test]
+    fn the_kept_list_tells_a_changed_answer_and_turns_stale_when_the_agent_fails() {
+        let cache = ListCache::default();
+        assert!(cache.store(answer(vec![topic("a", AgentTopicState::Idle)], 1)));
+        assert!(
+            !cache.store(answer(vec![topic("a", AgentTopicState::Idle)], 2)),
+            "the same topics are no change"
+        );
+        assert_eq!(cache.get().unwrap().as_of_unix_ms, 2);
+        cache.refresh_failed();
+        assert!(cache.get().unwrap().stale);
+        assert!(cache.store(answer(vec![topic("a", AgentTopicState::Running)], 3)));
+        assert!(!cache.get().unwrap().stale);
+    }
+
+    #[test]
+    fn a_seed_from_disk_fills_only_an_empty_cache() {
+        let cache = ListCache::default();
+        let seeded = cache.seed(TopicList::from_sessions(
+            vec![AgentTopicSession {
+                topic_id: "Plan".into(),
+                path: "/s/Plan.jsonl".into(),
+                title: None,
+                created_unix_ms: Some(5),
+            }],
+            9,
+        ));
+        assert!(seeded.stale);
+        assert_eq!(seeded.as_of_unix_ms, 9);
+        assert_eq!(seeded.topics[0].title, "Plan");
+        assert_eq!(seeded.topics[0].state, AgentTopicState::Unknown);
+        assert_eq!(seeded.topics[0].last_activity_unix_ms, 5);
+        cache.store(answer(vec![topic("a", AgentTopicState::Idle)], 10));
+        let kept = cache.seed(TopicList::from_sessions(Vec::new(), 11));
+        assert_eq!(kept.topics[0].topic_id, "a", "the agent's answer stays");
+    }
+
+    #[test]
+    fn a_streamed_change_marks_the_list_stale_and_applies_what_it_says_for_sure() {
+        let cache = ListCache::default();
+        cache.store(answer(vec![topic("a", AgentTopicState::Idle)], 1));
+        cache.apply_change("a", AgentTopicChangeReason::TurnStarted);
+        let kept = cache.get().unwrap();
+        assert!(kept.stale);
+        assert_eq!(kept.topics[0].state, AgentTopicState::Running);
+        cache.apply_change("a", AgentTopicChangeReason::Closed);
+        assert_eq!(
+            cache.get().unwrap().topics[0].state,
+            AgentTopicState::Closed
+        );
+    }
+
+    #[test]
+    fn dropping_an_endpoint_drops_its_kept_list() {
+        let mut controls = AgentControls::default();
+        controls.register(
+            TerminalId::from_persisted("term_1".into()),
+            endpoint("/tmp/a.sock", 7),
+        );
+        let list = controls.handle("term_1").unwrap().list;
+        list.store(answer(vec![topic("a", AgentTopicState::Idle)], 1));
+        controls.remove("term_1");
+        assert!(list.get().is_none());
+        assert!(
+            !list.store(answer(Vec::new(), 2)),
+            "nothing is kept any more"
+        );
+        assert!(list.get().is_none());
+        assert!(!list.begin_refresh(), "nor refreshed");
     }
 }

@@ -1,9 +1,11 @@
 //! Topics of omp agents (#474): `pane.report_agent_control` keeps the control
 //! socket an omp process offers its pane (memory only, see
-//! `crate::agent_topics`); `agent.topics.*` talk to it from worker threads;
-//! the first such request also follows the agent's topic changes and emits
-//! them as `agent.topics.changed`. `topic_sessions` is read from the session
-//! file on disk and never asks the agent.
+//! `crate::agent_topics`); `agent.topics.*` talk to it from worker threads,
+//! except `agent.topics.list`, which answers from the endpoint's kept list
+//! and refreshes it behind the answer; the first such request also follows
+//! the agent's topic changes and emits them as `agent.topics.changed`.
+//! `topic_sessions` is read from the session file on disk and never asks the
+//! agent.
 
 use std::path::PathBuf;
 
@@ -52,14 +54,15 @@ impl App {
 mod control {
     use std::path::PathBuf;
     use std::sync::mpsc::Sender;
+    use std::time::{Duration, Instant};
 
     use crate::agent_topics::control::{
         ControlConnection, ControlError, TopicChange, TopicCommand, TopicReply,
     };
-    use crate::agent_topics::{ControlEndpoint, ControlHandle, CONTROL_PROTOCOL};
+    use crate::agent_topics::{ControlEndpoint, ControlHandle, TopicList, CONTROL_PROTOCOL};
     use crate::api::schema::{
-        ErrorBody, EventData, EventEnvelope, EventKind, Method, PaneReportAgentControlParams,
-        Request, ResponseResult,
+        AgentTopicChangeReason, ErrorBody, EventData, EventEnvelope, EventKind, Method,
+        PaneReportAgentControlParams, Request, ResponseResult,
     };
     use crate::app::App;
     use crate::events::AppEvent;
@@ -222,12 +225,28 @@ mod control {
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
             };
-            let omp = self
-                .live_omp_pid(resolved.ws_idx, resolved.pane_id)
-                .ok_or_else(|| ErrorBody {
-                    code: "topics_unsupported".into(),
-                    message: "topics are served by live omp agents only".into(),
-                })?;
+            let Some(omp) = self.live_omp_pid(resolved.ws_idx, resolved.pane_id) else {
+                // herdr's probe can miss omp for a moment (a busy pane, a
+                // child process in front): an agent known to have topics is
+                // then unreachable, which clients retry, not unsupported.
+                let has_topics = self.agent_controls.contains(&resolved.terminal_id)
+                    || self
+                        .topic_sessions_for(&resolved.terminal_id)
+                        .is_some_and(|sessions| !sessions.is_empty());
+                return Err(if has_topics {
+                    ErrorBody {
+                        code: "topics_unreachable".into(),
+                        message:
+                            "herdr does not see the agent's omp in its pane right now; try again"
+                                .into(),
+                    }
+                } else {
+                    ErrorBody {
+                        code: "topics_unsupported".into(),
+                        message: "topics are served by live omp agents only".into(),
+                    }
+                });
+            };
             let control = self
                 .agent_controls
                 .handle(&resolved.terminal_id)
@@ -330,10 +349,21 @@ mod control {
             self.follow_topic_changes(&target);
             // Suggestion state changes reach `agent.topics.changed` through
             // the agent's own `topic_update` stream this request follows.
+            if matches!(command, TopicCommand::List) {
+                if let Some(list) = self.kept_topic_list(&target) {
+                    let _ = respond_to.send(encode_topic_list(id, &target, list));
+                    start_topic_list_refresh(&target.terminal_id, &target.control, &self.event_tx);
+                    return;
+                }
+            }
             let reply = respond_to.clone();
             let reply_id = id.clone();
             let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics", move || {
-                let _ = reply.send(topics_response(reply_id, &target, command));
+                let response = match command {
+                    TopicCommand::List => first_topic_list(reply_id, &target),
+                    command => topics_response(reply_id, &target, command),
+                };
+                let _ = reply.send(response);
             });
             if let Err(err) = spawned {
                 tracing::warn!(err = %err, "failed to spawn agent topics request");
@@ -362,6 +392,21 @@ mod control {
             if spawned.is_err() {
                 target.control.updates.release();
             }
+        }
+
+        /// The topic list kept for the agent's endpoint; before the agent
+        /// first answers, the topics its session file records (stale), when
+        /// it records any.
+        fn kept_topic_list(&self, target: &TopicsTarget) -> Option<TopicList> {
+            target.control.list.get().or_else(|| {
+                let sessions = self
+                    .topic_sessions_for(&target.terminal_id)
+                    .filter(|sessions| !sessions.is_empty())?;
+                Some(target.control.list.seed(TopicList::from_sessions(
+                    sessions,
+                    crate::app::actions::current_unix_ms(),
+                )))
+            })
         }
 
         /// One topic change read from the terminal's endpoint `generation`.
@@ -428,12 +473,142 @@ mod control {
             }
         };
         while let Some(change) = updates.next_change() {
+            // The kept list takes what the change says for sure at once and
+            // is refreshed from the agent behind it.
+            control.list.apply_change(&change.topic_id, change.reason);
+            start_topic_list_refresh(terminal_id, control, event_tx);
             let event = AppEvent::AgentTopicsChanged {
                 terminal_id: terminal_id.to_owned(),
                 generation: control.generation,
                 change,
             };
             if event_tx.blocking_send(event).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A topic list that took at least this long is logged at info, every
+    /// other one at debug.
+    const SLOW_TOPIC_LIST: Duration = Duration::from_secs(1);
+
+    /// Ask the agent for its topics, logging how long it took.
+    fn ask_topic_list(control: &ControlHandle) -> Result<TopicList, ControlError> {
+        let started = Instant::now();
+        let reply = ControlConnection::open(&control.endpoint)
+            .and_then(|mut connection| connection.run(TopicCommand::List))?;
+        let TopicReply::List {
+            topics,
+            suggestions,
+        } = reply
+        else {
+            return Err(ControlError::Protocol(
+                "topics_list answered something other than a topic list".into(),
+            ));
+        };
+        let elapsed = started.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        if elapsed >= SLOW_TOPIC_LIST {
+            tracing::info!(
+                elapsed_ms,
+                topics = topics.len(),
+                "agent topics listed (slow)"
+            );
+        } else {
+            tracing::debug!(elapsed_ms, topics = topics.len(), "agent topics listed");
+        }
+        Ok(TopicList {
+            topics,
+            suggestions,
+            as_of_unix_ms: crate::app::actions::current_unix_ms(),
+            stale: false,
+        })
+    }
+
+    fn encode_topic_list(id: String, target: &TopicsTarget, list: TopicList) -> String {
+        encode_success(
+            id,
+            ResponseResult::AgentTopics {
+                agent: target.agent.clone(),
+                pane_id: target.pane_id.clone(),
+                topics: list.topics,
+                suggestions: list.suggestions,
+                as_of_unix_ms: list.as_of_unix_ms,
+                stale: list.stale,
+            },
+        )
+    }
+
+    /// `agent.topics.list` with nothing kept yet: ask the agent and keep its
+    /// answer.
+    fn first_topic_list(id: String, target: &TopicsTarget) -> String {
+        match ask_topic_list(&target.control) {
+            Ok(list) => {
+                target.control.list.store(list.clone());
+                encode_topic_list(id, target, list)
+            }
+            Err(error) => {
+                log_control_error("topics list", &error);
+                encode_error(id, error.code(), error.message())
+            }
+        }
+    }
+
+    /// Refresh the kept topic list from the agent on a worker thread, unless
+    /// a refresh already runs (it then asks once more when done).
+    fn start_topic_list_refresh(
+        terminal_id: &str,
+        control: &ControlHandle,
+        event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    ) {
+        if !control.list.begin_refresh() {
+            return;
+        }
+        let terminal_id = terminal_id.to_owned();
+        let refreshing = control.clone();
+        let event_tx = event_tx.clone();
+        let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics-refresh", move || {
+            refresh_topic_list(&terminal_id, &refreshing, &event_tx);
+        });
+        if let Err(err) = spawned {
+            tracing::warn!(err = %err, "failed to spawn agent topics refresh");
+            control.list.abandon_refresh();
+        }
+    }
+
+    /// The claimed refresh: ask the agent, keep its answer and emit
+    /// `agent.topics.changed` (`listed`) when the list changed.
+    fn refresh_topic_list(
+        terminal_id: &str,
+        control: &ControlHandle,
+        event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    ) {
+        loop {
+            match ask_topic_list(control) {
+                Ok(list) => {
+                    if control.list.store(list) {
+                        let event = AppEvent::AgentTopicsChanged {
+                            terminal_id: terminal_id.to_owned(),
+                            generation: control.generation,
+                            change: TopicChange {
+                                topic_id: String::new(),
+                                reason: AgentTopicChangeReason::Listed,
+                                suggestion_id: None,
+                                code: None,
+                            },
+                        };
+                        if event_tx.blocking_send(event).is_err() {
+                            control.list.abandon_refresh();
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    log_control_error("topics refresh", &error);
+                    control.list.refresh_failed();
+                }
+            }
+            if !control.list.end_refresh() {
                 return;
             }
         }
@@ -464,18 +639,12 @@ mod control {
         let agent = target.agent.clone();
         let pane_id = target.pane_id.clone();
         match reply {
-            Ok(TopicReply::List {
-                topics,
-                suggestions,
-            }) => encode_success(
-                id,
-                ResponseResult::AgentTopics {
-                    agent,
-                    pane_id,
-                    topics,
-                    suggestions,
-                },
-            ),
+            // `agent.topics.list` is answered by `first_topic_list` or the
+            // kept list; no other command gets a list back.
+            Ok(TopicReply::List { .. }) => {
+                let error = ControlError::Protocol("the agent answered a topic list".into());
+                encode_error(id, error.code(), error.message())
+            }
             Ok(TopicReply::Created { topic_id }) => encode_success(
                 id,
                 ResponseResult::AgentTopicCreated {

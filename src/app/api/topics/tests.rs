@@ -221,13 +221,14 @@ fn topics_list_tells_an_unreachable_agent_from_one_without_topics() {
     assert_eq!(response["result"]["type"], "agent_topics", "{response}");
     assert_eq!(response["result"]["topics"], json!([]));
 
-    // The socket went away under a still-registered endpoint.
+    // The socket went away under a still-registered endpoint: the kept list
+    // still answers, and turns stale once the refresh behind it fails.
     drop(fake);
     let response = topics(&app, list(&pane));
-    assert_eq!(
-        response["error"]["code"], "topics_unreachable",
-        "{response}"
-    );
+    assert_eq!(response["result"]["topics"], json!([]), "{response}");
+    eventually("the kept list turns stale", || {
+        topics(&app, list(&pane))["result"]["stale"] == true
+    });
 }
 
 #[test]
@@ -981,6 +982,218 @@ fn an_omp_without_suggestions_answers_topics_unsupported() {
     );
     assert_eq!(
         response["error"]["code"], "topics_unsupported",
+        "{response}"
+    );
+}
+
+/// Poll `done` until it holds, failing after `WAIT`.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !done() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One topic as omp's `topics_list` reports it.
+fn omp_topic(id: &str, title: &str, state: &str) -> Value {
+    json!({"id": id, "title": title, "state": state, "turns": 1, "queued": 0,
+        "createdAt": 1_000, "lastActivityAt": 2_000, "sessionFile": format!("/tmp/s/{id}.jsonl")})
+}
+
+/// An agent whose `topics_list` answers `topics`, but only once it is no
+/// longer `busy` (as omp's event loop while it starts topics).
+#[derive(Clone)]
+struct BusyAgent {
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    topics: std::sync::Arc<std::sync::Mutex<Value>>,
+}
+
+impl BusyAgent {
+    fn start(tag: &str, topics: Value) -> (Self, FakeControl) {
+        let agent = Self {
+            busy: Default::default(),
+            topics: std::sync::Arc::new(std::sync::Mutex::new(topics)),
+        };
+        let serving = agent.clone();
+        let fake = FakeControl::start(tag, move |frame| {
+            if frame["type"] != "topics_list" {
+                return json!({"success": false, "error": "Unknown command."});
+            }
+            let deadline = Instant::now() + WAIT;
+            while serving.is_busy() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            json!({"success": true, "data": {"topics": serving.topics.lock().unwrap().clone()}})
+        });
+        (agent, fake)
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The `agent.topics.changed` events the app emitted so far.
+fn emitted_topic_changes(app: &App) -> Vec<Value> {
+    app.event_hub
+        .events_after(0)
+        .into_iter()
+        .map(|(_, event)| serde_json::to_value(event).unwrap())
+        .filter(|event| event["data"]["type"] == "agent_topics_changed")
+        .map(|event| event["data"].clone())
+        .collect()
+}
+
+/// Wait for the app's next queued topic change and handle it.
+fn handle_next_topics_change(app: &mut App) {
+    let event = next_topics_change(app);
+    app.handle_internal_event_with_render_impact(event);
+}
+
+#[test]
+fn a_busy_agent_is_answered_from_the_kept_list_and_a_refresh_follows() {
+    let (agent, fake) = BusyAgent::start("cache-busy", json!([omp_topic("Plan", "Plan", "idle")]));
+    let (_session, mut app, pane) = offered("cache-busy", &fake);
+    let first = topics(&app, list(&pane));
+    assert_eq!(first["result"]["topics"][0]["topic_id"], "Plan", "{first}");
+    assert_eq!(first["result"]["stale"], false, "{first}");
+    let as_of = first["result"]["as_of_unix_ms"].as_u64().unwrap();
+    assert!(as_of > 0, "{first}");
+
+    // The agent is busy and has a new topic: the list answers at once with
+    // what was kept, and asks the agent behind the answer.
+    agent.set_busy(true);
+    *agent.topics.lock().unwrap() = json!([
+        omp_topic("Plan", "Plan", "idle"),
+        omp_topic("Ship", "Ship it", "running"),
+    ]);
+    let asked = Instant::now();
+    let kept = topics(&app, list(&pane));
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "the kept list answers without waiting for the agent"
+    );
+    assert_eq!(
+        kept["result"]["topics"], first["result"]["topics"],
+        "{kept}"
+    );
+    assert_eq!(kept["result"]["as_of_unix_ms"], as_of, "{kept}");
+    assert!(emitted_topic_changes(&app).is_empty());
+
+    // Once the agent answers, the changed list is announced and listed.
+    agent.set_busy(false);
+    handle_next_topics_change(&mut app);
+    let changes = emitted_topic_changes(&app);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0]["reason"], "listed");
+    assert_eq!(changes[0]["topic_id"], "");
+    assert_eq!(changes[0]["pane_id"], pane);
+    let fresh = topics(&app, list(&pane));
+    assert_eq!(fresh["result"]["topics"][1]["topic_id"], "Ship", "{fresh}");
+    assert_eq!(fresh["result"]["stale"], false, "{fresh}");
+    assert!(fresh["result"]["as_of_unix_ms"].as_u64().unwrap() >= as_of);
+}
+
+#[test]
+fn before_the_agent_first_answers_the_list_comes_from_the_session_file() {
+    let mut session = Fixture::new("cache-disk");
+    session.push(spawn_entry("Plan"));
+    let child = session.path.with_extension("").join("Plan.jsonl");
+    std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+    std::fs::write(&child, "{\"type\":\"session\"}\n").unwrap();
+    let (agent, fake) = BusyAgent::start(
+        "cache-disk",
+        json!([omp_topic("Plan", "Plan the release", "idle")]),
+    );
+    agent.set_busy(true);
+    let omp = std::process::id();
+    let (mut app, pane, _) = omp_app(&session.path, omp);
+    send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+
+    let seeded = topics(&app, list(&pane));
+    assert_eq!(seeded["result"]["stale"], true, "{seeded}");
+    assert_eq!(
+        seeded["result"]["topics"],
+        json!([{"topic_id": "Plan", "title": "Plan", "state": "unknown", "turns": 0,
+            "queued": 0, "created_unix_ms": 1_000, "last_activity_unix_ms": 1_000}]),
+        "{seeded}"
+    );
+
+    agent.set_busy(false);
+    handle_next_topics_change(&mut app);
+    assert_eq!(emitted_topic_changes(&app)[0]["reason"], "listed");
+    let live = topics(&app, list(&pane));
+    assert_eq!(live["result"]["stale"], false, "{live}");
+    assert_eq!(live["result"]["topics"][0]["state"], "idle", "{live}");
+    assert_eq!(live["result"]["topics"][0]["title"], "Plan the release");
+}
+
+#[test]
+fn a_streamed_change_updates_the_kept_list_while_the_agent_is_busy() {
+    let (agent, fake) =
+        BusyAgent::start("cache-stream", json!([omp_topic("Plan", "Plan", "idle")]));
+    let (_session, mut app, pane) = offered("cache-stream", &fake);
+    topics(&app, list(&pane));
+    received(&fake, "subscribe");
+
+    agent.set_busy(true);
+    fake.updates
+        .send(
+            json!({"id": "Plan", "ownerId": "o", "parentSessionId": "p", "reason": "turn-started"}),
+        )
+        .unwrap();
+    handle_next_topics_change(&mut app);
+    let kept = topics(&app, list(&pane));
+    assert_eq!(kept["result"]["topics"][0]["state"], "running", "{kept}");
+    assert_eq!(kept["result"]["stale"], true, "{kept}");
+    agent.set_busy(false);
+}
+
+#[test]
+fn a_probe_miss_is_unreachable_for_an_agent_with_topics_and_unsupported_otherwise() {
+    let omp = std::process::id();
+    let session = Fixture::new("probe-none");
+    let (mut app, pane, _) = omp_app(&session.path, omp);
+    app.agent_controls.inspected_pid_for_test = Some(None);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["error"]["code"], "topics_unsupported",
+        "{response}"
+    );
+
+    // omp offered its topics, then the probe missed it for a moment.
+    app.agent_controls.inspected_pid_for_test = Some(Some(omp));
+    let fake = FakeControl::start("probe", empty_topics);
+    send(
+        &mut app,
+        Method::PaneReportAgentControl(report(&pane, Some(&fake.path), omp, Some(omp))),
+    );
+    app.agent_controls.inspected_pid_for_test = Some(None);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["error"]["code"], "topics_unreachable",
+        "{response}"
+    );
+
+    // No control (yet), but the session file records topics.
+    let mut session = Fixture::new("probe-disk");
+    session.push(spawn_entry("Plan"));
+    let child = session.path.with_extension("").join("Plan.jsonl");
+    std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+    std::fs::write(&child, "{\"type\":\"session\"}\n").unwrap();
+    let (mut app, pane, _) = omp_app(&session.path, omp);
+    app.agent_controls.inspected_pid_for_test = Some(None);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["error"]["code"], "topics_unreachable",
         "{response}"
     );
 }
