@@ -398,6 +398,7 @@ impl GuestRecord {
             share_gram: self.share_gram,
             account_bound: self.account.is_some(),
             person: self.person().to_owned(),
+            machine_label: self.machine_label.clone(),
             devices: self
                 .devices
                 .iter()
@@ -822,6 +823,46 @@ pub(crate) fn update_share_gram(
         let changed = guest.share_gram != share_gram;
         guest.share_gram = share_gram;
         (Some(guest.clone()), changed)
+    })
+}
+
+/// Set the machine label of the active guest `guest_id`, the pending invite
+/// `invite_id`, or, with neither, of every active guest and pending invite.
+/// Returns the matched records, already relabeled.
+pub(crate) fn relabel(
+    dir: &Path,
+    guest_id: Option<&str>,
+    invite_id: Option<&str>,
+    machine_label: &str,
+    now: u64,
+) -> io::Result<(Vec<GuestRecord>, Vec<InviteRecord>)> {
+    update_store(dir, |store| {
+        let mut changed = false;
+        let mut guests = Vec::new();
+        if invite_id.is_none() {
+            for guest in store
+                .guests
+                .iter_mut()
+                .filter(|guest| !guest.revoked && guest_id.is_none_or(|id| guest.guest_id == id))
+            {
+                changed |= guest.machine_label != machine_label;
+                guest.machine_label = machine_label.to_owned();
+                guests.push(guest.clone());
+            }
+        }
+        let mut invites = Vec::new();
+        if guest_id.is_none() {
+            for invite in store.invites.iter_mut().filter(|invite| {
+                invite.used_by.is_none()
+                    && invite.expires_ms > now
+                    && invite_id.is_none_or(|id| invite.invite_id == id)
+            }) {
+                changed |= invite.machine_label != machine_label;
+                invite.machine_label = machine_label.to_owned();
+                invites.push(invite.clone());
+            }
+        }
+        ((guests, invites), changed)
     })
 }
 

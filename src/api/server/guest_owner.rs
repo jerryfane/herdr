@@ -158,16 +158,7 @@ pub(super) fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> Stri
                 Err(err) => Err(err),
             }
         }
-        Method::GuestUpdate(params) => {
-            match crate::guest::update(&params.guest_id, params.share_gram) {
-                Ok(Some(guest)) => Ok(ResponseResult::GuestUpdated { guest }),
-                Ok(None) => Err((
-                    "guest_not_found",
-                    "no active guest with that id".to_string(),
-                )),
-                Err(err) => Err(err),
-            }
-        }
+        Method::GuestUpdate(params) => update_guest(params),
         Method::GuestRemoveDevice(params) => {
             match crate::guest::remove_device(&params.guest_id, &params.fingerprint) {
                 Ok(Some((guest, closed_streams))) => Ok(ResponseResult::GuestDeviceRemoved {
@@ -191,6 +182,52 @@ pub(super) fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> Stri
         Ok(result) => serde_json::to_string(&SuccessResponse { id, result }).unwrap_or_default(),
         Err((code, message)) => error_response_json(id, code, message),
     }
+}
+
+/// `guest.update`: relabel first (it validates the label), then Gram sharing.
+fn update_guest(
+    params: &crate::api::schema::GuestUpdateParams,
+) -> Result<crate::api::schema::ResponseResult, crate::guest::OwnerError> {
+    use crate::api::schema::ResponseResult;
+
+    let guest_id = params.guest_id.as_deref();
+    if params.share_gram.is_none() && params.machine_label.is_none() {
+        return Err((
+            "invalid_params",
+            "give share_gram or machine_label".to_string(),
+        ));
+    }
+    if params.share_gram.is_some() && (guest_id.is_none() || params.invite_id.is_some()) {
+        return Err((
+            "invalid_params",
+            "share_gram needs guest_id and no invite_id".to_string(),
+        ));
+    }
+    let mut relabeled = None;
+    if let Some(label) = &params.machine_label {
+        relabeled = Some(crate::guest::relabel(
+            guest_id,
+            params.invite_id.as_deref(),
+            label,
+        )?);
+    }
+    if let (Some(guest_id), Some(share_gram)) = (guest_id, params.share_gram) {
+        return match crate::guest::update(guest_id, share_gram)? {
+            Some(guest) => Ok(ResponseResult::GuestUpdated { guest }),
+            None => Err((
+                "guest_not_found",
+                "no active guest with that id".to_string(),
+            )),
+        };
+    }
+    let (mut guests, invites) = relabeled.unwrap_or_default();
+    if guest_id.is_some() {
+        // `relabel` refuses an unknown guest_id, so exactly one matched.
+        if let Some(guest) = guests.pop() {
+            return Ok(ResponseResult::GuestUpdated { guest });
+        }
+    }
+    Ok(ResponseResult::GuestRelabeled { guests, invites })
 }
 
 #[cfg(all(test, unix))]

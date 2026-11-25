@@ -930,15 +930,7 @@ pub(crate) fn create_invite(
         ));
     }
     for (field, value) in [("owner_name", owner_name), ("machine_label", machine_label)] {
-        if value.trim().is_empty()
-            || value.chars().count() > 64
-            || value.chars().any(char::is_control)
-        {
-            return Err((
-                "invalid_params",
-                format!("{field} must be 1 to 64 printable characters"),
-            ));
-        }
+        check_label(field, value)?;
     }
     let ttl_secs = ttl_secs.unwrap_or(store::DEFAULT_INVITE_TTL_SECS);
     if !(store::MIN_INVITE_TTL_SECS..=store::MAX_INVITE_TTL_SECS).contains(&ttl_secs) {
@@ -1249,6 +1241,66 @@ pub(crate) fn update_at(
     Ok(updated.as_ref().map(store::GuestRecord::info))
 }
 
+/// `owner_name` and `machine_label`: 1 to 64 printable characters.
+fn check_label(field: &str, value: &str) -> Result<(), OwnerError> {
+    if value.trim().is_empty() || value.chars().count() > 64 || value.chars().any(char::is_control)
+    {
+        return Err((
+            "invalid_params",
+            format!("{field} must be 1 to 64 printable characters"),
+        ));
+    }
+    Ok(())
+}
+
+/// `guest.update {machine_label}`: relabel this machine for the active guest
+/// `guest_id`, the pending invite `invite_id`, or, with neither, every active
+/// guest and pending invite. Guests see it in their next hello reply.
+pub(crate) fn relabel(
+    guest_id: Option<&str>,
+    invite_id: Option<&str>,
+    machine_label: &str,
+) -> Result<(Vec<GuestInfo>, Vec<GuestInviteInfo>), OwnerError> {
+    relabel_at(&store::guest_dir(), guest_id, invite_id, machine_label)
+}
+
+pub(crate) fn relabel_at(
+    dir: &std::path::Path,
+    guest_id: Option<&str>,
+    invite_id: Option<&str>,
+    machine_label: &str,
+) -> Result<(Vec<GuestInfo>, Vec<GuestInviteInfo>), OwnerError> {
+    check_label("machine_label", machine_label)?;
+    if guest_id.is_some() && invite_id.is_some() {
+        return Err((
+            "invalid_params",
+            "give at most one of guest_id or invite_id".into(),
+        ));
+    }
+    let (guests, invites) =
+        store::relabel(dir, guest_id, invite_id, machine_label, store::now_ms())
+            .map_err(io_error)?;
+    if guest_id.is_some() && guests.is_empty() {
+        return Err((
+            "guest_not_found",
+            "no active guest with that id".to_string(),
+        ));
+    }
+    if invite_id.is_some() && invites.is_empty() {
+        return Err((
+            "guest_not_found",
+            "no pending invite with that id".to_string(),
+        ));
+    }
+    if !guests.is_empty() || !invites.is_empty() {
+        notify_changes();
+    }
+    Ok((
+        guests.iter().map(store::GuestRecord::info).collect(),
+        invites.iter().map(store::InviteRecord::info).collect(),
+    ))
+}
+
 pub(crate) fn read_audit(
     guest_id: Option<&str>,
     before_ms: Option<u64>,
@@ -1503,6 +1555,83 @@ mod tests {
         revoke_at(dir.0.clone(), RevokeTarget::Guest(guest_id)).unwrap();
         assert!(update_at(&dir.0, guest_id, true).unwrap().is_none());
         assert!(update_at(&dir.0, "unknown", true).unwrap().is_none());
+    }
+
+    #[test]
+    fn relabel_validates_like_invites_and_reaches_the_next_hello() {
+        let dir = store::tests::TempDir::new("relabel");
+        for bad in ["", "   ", "a\nb", &"x".repeat(65)] {
+            let err = relabel_at(&dir.0, None, None, bad).unwrap_err();
+            assert_eq!(err.0, "invalid_params", "{bad:?}");
+        }
+        assert_eq!(
+            relabel_at(&dir.0, Some("g"), Some("i"), "Mac")
+                .unwrap_err()
+                .0,
+            "invalid_params"
+        );
+        assert_eq!(
+            relabel_at(&dir.0, Some("unknown"), None, "Mac")
+                .unwrap_err()
+                .0,
+            "guest_not_found"
+        );
+        assert_eq!(
+            relabel_at(&dir.0, None, Some("unknown"), "Mac")
+                .unwrap_err()
+                .0,
+            "guest_not_found"
+        );
+
+        let first = accept_in(&dir.0, &invite_in(&dir.0, false), 1);
+        let second = accept_in(&dir.0, &invite_in(&dir.0, false), 2);
+        assert_eq!(first["machine_label"], "Mac");
+        let first_id = first["guest_id"].as_str().unwrap();
+        let second_id = second["guest_id"].as_str().unwrap();
+        let pending = invite_in(&dir.0, false);
+        let other = invite_in(&dir.0, false);
+        let returning = |device: u8| match admit_in(dir.0.clone(), [device; 32], &json!({"v": 1})) {
+            Admission::Admitted { reply, .. } => reply["machine_label"].clone(),
+            Admission::Refused(error) => panic!("refused: {error}"),
+        };
+
+        // One guest.
+        let (guests, invites) = relabel_at(&dir.0, Some(first_id), None, "Studio").unwrap();
+        assert_eq!(guests.len(), 1);
+        assert_eq!(guests[0].machine_label, "Studio");
+        assert!(invites.is_empty());
+        assert_eq!(returning(1), "Studio");
+        assert_eq!(returning(2), "Mac");
+
+        // One pending invite: the guest who accepts it gets the new label.
+        let (guests, invites) =
+            relabel_at(&dir.0, None, Some(&pending.record.invite_id), "Laptop").unwrap();
+        assert!(guests.is_empty());
+        assert_eq!(invites.len(), 1);
+        assert_eq!(accept_in(&dir.0, &pending, 3)["machine_label"], "Laptop");
+        // A used invite is no longer pending.
+        assert_eq!(
+            relabel_at(&dir.0, None, Some(&pending.record.invite_id), "X")
+                .unwrap_err()
+                .0,
+            "guest_not_found"
+        );
+
+        // The whole host: every active guest and pending invite, not revoked ones.
+        revoke_at(dir.0.clone(), RevokeTarget::Guest(second_id)).unwrap();
+        let (guests, invites) = relabel_at(&dir.0, None, None, "Jerry's Mac").unwrap();
+        let mut ids: Vec<_> = guests.iter().map(|guest| guest.guest_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(!ids.contains(&second_id));
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].invite_id, other.record.invite_id);
+        assert!(guests
+            .iter()
+            .all(|guest| guest.machine_label == "Jerry's Mac"));
+        assert_eq!(returning(1), "Jerry's Mac");
+        assert_eq!(returning(3), "Jerry's Mac");
+        assert_eq!(accept_in(&dir.0, &other, 4)["machine_label"], "Jerry's Mac");
     }
 
     fn device(token: &str) -> crate::persist::devices::RegisteredDevice {

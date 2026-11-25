@@ -7,6 +7,7 @@ const HELP: &str = "Usage:
   herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram] [--machine ALIAS]
   herdr guest list [--machine ALIAS]
   herdr guest share-gram <guest-id> on|off [--machine ALIAS]
+  herdr guest relabel <label> [--guest ID | --invite ID] [--machine ALIAS]
   herdr guest revoke <guest-or-invite-id> [--machine ALIAS]
   herdr guest revoke --person <person> [--machine ALIAS]
   herdr guest remove-device <guest-id> <fingerprint> [--machine ALIAS]
@@ -20,7 +21,9 @@ agent sends from the moment the guest accepted, with its files. Invites work
 once and expire after 24 hours by default. A guest may bind the share to their
 HerdrUp account to use it from each of their devices ([guest] accounts):
 revoke --person (the person from guest list) revokes all of a person's shares
-at once, and remove-device drops one of their devices. --machine runs the
+at once, and remove-device drops one of their devices. relabel renames this
+machine for every existing guest and pending invite (or the one given); guests
+see the new label when they next connect. --machine runs the
 command on that saved SSH machine.";
 
 /// Options that take no value.
@@ -31,6 +34,7 @@ pub(super) fn run_guest_command(args: &[String]) -> std::io::Result<i32> {
         Some("invite") => invite(&args[1..]),
         Some("list") => list(&args[1..]),
         Some("share-gram") => share_gram(&args[1..]),
+        Some("relabel") => relabel(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
         Some("remove-device") => remove_device(&args[1..]),
         Some("log") => log(&args[1..]),
@@ -161,12 +165,41 @@ fn share_gram(args: &[String]) -> Result<i32, String> {
     send(
         "cli:guest:update",
         Method::GuestUpdate(GuestUpdateParams {
-            guest_id: guest_id.clone(),
-            share_gram,
+            guest_id: Some(guest_id.clone()),
+            share_gram: Some(share_gram),
             machine: parsed.option("machine"),
+            ..Default::default()
         }),
     )
     .map_err(|err| err.to_string())
+}
+
+/// Set the machine label existing guests and pending invites show.
+fn relabel(args: &[String]) -> Result<i32, String> {
+    send(
+        "cli:guest:relabel",
+        Method::GuestUpdate(relabel_params(args)?),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn relabel_params(args: &[String]) -> Result<GuestUpdateParams, String> {
+    let parsed = parse(args, &["guest", "invite", "machine"])?;
+    let [label] = parsed.positional.as_slice() else {
+        return Err("relabel takes exactly one label".into());
+    };
+    let guest_id = parsed.option("guest");
+    let invite_id = parsed.option("invite");
+    if guest_id.is_some() && invite_id.is_some() {
+        return Err("relabel takes --guest or --invite, not both".into());
+    }
+    Ok(GuestUpdateParams {
+        guest_id,
+        invite_id,
+        machine_label: Some(label.clone()),
+        machine: parsed.option("machine"),
+        ..Default::default()
+    })
 }
 
 fn list(args: &[String]) -> Result<i32, String> {
@@ -286,4 +319,32 @@ fn default_machine_label() -> String {
         }
     }
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Herdr".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn relabel_builds_a_scoped_or_host_wide_update() {
+        let all = relabel_params(&args(&["Jerry's Mac"])).unwrap();
+        assert_eq!(all.machine_label.as_deref(), Some("Jerry's Mac"));
+        assert_eq!(
+            (all.guest_id, all.invite_id, all.share_gram),
+            (None, None, None)
+        );
+        let one = relabel_params(&args(&["Mac", "--guest", "g1"])).unwrap();
+        assert_eq!(one.guest_id.as_deref(), Some("g1"));
+        let invite =
+            relabel_params(&args(&["Mac", "--invite", "i1", "--machine", "studio"])).unwrap();
+        assert_eq!(invite.invite_id.as_deref(), Some("i1"));
+        assert_eq!(invite.machine.as_deref(), Some("studio"));
+        assert!(relabel_params(&args(&["Mac", "--guest", "g", "--invite", "i"])).is_err());
+        assert!(relabel_params(&args(&[])).is_err());
+        assert!(relabel_params(&args(&["a", "b"])).is_err());
+    }
 }

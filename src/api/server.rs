@@ -5938,9 +5938,13 @@ mod federation_tests {
                 ..Default::default()
             }),
             Method::GuestUpdate(GuestUpdateParams {
-                guest_id: "g".into(),
-                share_gram: true,
-                machine: None,
+                guest_id: Some("g".into()),
+                share_gram: Some(true),
+                ..Default::default()
+            }),
+            Method::GuestUpdate(GuestUpdateParams {
+                machine_label: Some("Mac".into()),
+                ..Default::default()
             }),
             Method::GuestRemoveDevice(GuestRemoveDeviceParams {
                 guest_id: "g".into(),
