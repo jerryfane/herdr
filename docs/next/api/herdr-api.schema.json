@@ -5331,6 +5331,32 @@
           ],
           "type": "object"
         },
+        "PaneSendBracketedTextParams": {
+          "description": "`pane.send_bracketed_text`: `text` as one bracketed paste (`ESC[200~` …\n`ESC[201~`, every `ESC[201~` inside it removed), so a shell runs none of\nits lines. Refused with `bracketed_paste_unavailable`, writing nothing,\nwhile the pane's program has not turned bracketed paste on (DECSET 2004).\nA method of its own, not a `pane.send_text` field, so a server that\npredates it answers `unknown_method` instead of writing the text raw.",
+          "properties": {
+            "input_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text"
+          ],
+          "type": "object"
+        },
         "PaneSendInputParams": {
           "properties": {
             "input_source": {
@@ -5392,7 +5418,7 @@
         "PaneSendTextParams": {
           "properties": {
             "bracketed": {
-              "description": "Write the text as one bracketed paste (`ESC[200~` … `ESC[201~`),\nso a shell runs none of its lines. Refused with\n`bracketed_paste_unavailable`, writing nothing, while the pane's\nprogram has not turned bracketed paste on (DECSET 2004).",
+              "description": "Write the text as one bracketed paste (`ESC[200~` … `ESC[201~`),\nso a shell runs none of its lines. Refused with\n`bracketed_paste_unavailable`, writing nothing, while the pane's\nprogram has not turned bracketed paste on (DECSET 2004).\n\nDeprecated: use `pane.send_bracketed_text`, which a server that\npredates it refuses instead of writing the text raw.",
               "type": "boolean"
             },
             "input_source": {
@@ -9119,6 +9145,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendTextParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.send_bracketed_text",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendBracketedTextParams"
             }
           },
           "required": [
@@ -20832,9 +20874,14 @@
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
               "type": "boolean"
             },
+            "pane_send_bracketed_text": {
+              "default": false,
+              "description": "`pane.send_bracketed_text` is served: the text goes out as one\nbracketed paste, or is refused with `bracketed_paste_unavailable`,\nwriting nothing, while the pane's program has bracketed paste off.\nOlder servers answer the method with `unknown_method`, never writing.",
+              "type": "boolean"
+            },
             "pane_send_text_bracketed": {
               "default": false,
-              "description": "`pane.send_text` honours `bracketed`: the text goes out as one bracketed\npaste, or is refused with `bracketed_paste_unavailable` while the pane's\nprogram has bracketed paste off. Older servers ignore the field and\nwrite the text as it is, so a shell would run its lines.",
+              "description": "Deprecated: use `pane.send_bracketed_text` (`pane_send_bracketed_text`).\n`pane.send_text` honours `bracketed`: the text goes out as one bracketed\npaste, or is refused with `bracketed_paste_unavailable` while the pane's\nprogram has bracketed paste off. Older servers ignore the field and\nwrite the text as it is, so a shell would run its lines, and a client\nthat checked this flag can still reach an older server on its next\nconnection.",
               "type": "boolean"
             },
             "pane_stream_resync": {

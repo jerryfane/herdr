@@ -2321,6 +2321,7 @@ pub(super) mod tests {
             json!({"id": "d", "method": "agent.forget", "params": {"target": terminal}}),
             json!({"id": "d", "method": "agent.send_keys", "params": {"target": terminal, "keys": ["enter"]}}),
             json!({"id": "d", "method": "pane.send_text", "params": {"pane_id": pane, "text": "rm -rf /"}}),
+            json!({"id": "d", "method": "pane.send_bracketed_text", "params": {"pane_id": pane, "text": "rm -rf /"}}),
             // The agent is idle, not awaiting a menu.
             json!({"id": "d", "method": "pane.send_keys", "params": {"pane_id": pane, "keys": ["enter"]}}),
             json!({"id": "d", "method": "pane.send_input", "params": {"pane_id": pane, "text": "x"}}),
@@ -2528,6 +2529,7 @@ pub(super) mod tests {
             send_keys(&harness.pane_ids[1], json!(["Enter"])),
             send_keys("other-agent", json!(["Enter"])),
             json!({"id": "d", "method": "pane.send_text", "params": {"pane_id": pane, "text": "y"}}),
+            json!({"id": "d", "method": "pane.send_bracketed_text", "params": {"pane_id": pane, "text": "y"}}),
             json!({"id": "d", "method": "agent.send_keys", "params": {"target": pane, "keys": ["Enter"]}}),
         ] {
             let lines = harness.call(&guest, request.clone());

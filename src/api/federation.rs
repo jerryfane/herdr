@@ -173,6 +173,7 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "agent.topics.dismiss_suggestion"
         | "agent.topics.organise"
         | "pane.send_text"
+        | "pane.send_bracketed_text"
         | "pane.send_keys" => (AllowedAt(Interact), true),
         // Admin methods with an explicit remote-owned target.
         "agent.focus"

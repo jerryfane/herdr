@@ -183,10 +183,19 @@ pub struct ServerCapabilities {
     /// send the whole file.
     #[serde(default)]
     pub gram_thumbnails: bool,
+    /// Deprecated: use `pane.send_bracketed_text` (`pane_send_bracketed_text`).
     /// `pane.send_text` honours `bracketed`: the text goes out as one bracketed
     /// paste, or is refused with `bracketed_paste_unavailable` while the pane's
     /// program has bracketed paste off. Older servers ignore the field and
-    /// write the text as it is, so a shell would run its lines.
+    /// write the text as it is, so a shell would run its lines, and a client
+    /// that checked this flag can still reach an older server on its next
+    /// connection.
     #[serde(default)]
     pub pane_send_text_bracketed: bool,
+    /// `pane.send_bracketed_text` is served: the text goes out as one
+    /// bracketed paste, or is refused with `bracketed_paste_unavailable`,
+    /// writing nothing, while the pane's program has bracketed paste off.
+    /// Older servers answer the method with `unknown_method`, never writing.
+    #[serde(default)]
+    pub pane_send_bracketed_text: bool,
 }

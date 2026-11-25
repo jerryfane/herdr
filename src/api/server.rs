@@ -270,6 +270,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         compressed_replies: true,
         gram_thumbnails: true,
         pane_send_text_bracketed: true,
+        pane_send_bracketed_text: true,
     })
 }
 
@@ -2127,6 +2128,7 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         Method::PaneHistory(params) => Some(&mut params.pane_id),
         Method::PaneTurns(params) => Some(&mut params.pane_id),
         Method::PaneSendText(params) => Some(&mut params.pane_id),
+        Method::PaneSendBracketedText(params) => Some(&mut params.pane_id),
         Method::PaneSendInput(params) => Some(&mut params.pane_id),
         // `pane.set_pty_size` carries the target in `pane_id` too (an
         // `Option<String>`); a `None`/current-pane resize stays local, while a
@@ -2289,17 +2291,27 @@ fn maybe_route_to_peer(
     }
     // A peer that does not advertise `pane_send_text_bracketed` ignores
     // `bracketed` and writes the text as it is, so a shell would run its
-    // lines. Refuse with the code a caller already handles for a pane whose
-    // program has bracketed paste off.
-    if matches!(&request.method, Method::PaneSendText(params) if params.bracketed)
-        && !peer_target.pane_send_text_bracketed()
-    {
+    // lines; one that does not advertise `pane_send_bracketed_text` cannot
+    // serve that method. Refuse with the code a caller already handles for a
+    // pane whose program has bracketed paste off, never writing raw.
+    let missing_bracketed = match &request.method {
+        Method::PaneSendText(params)
+            if params.bracketed && !peer_target.pane_send_text_bracketed() =>
+        {
+            Some("pane_send_text_bracketed")
+        }
+        Method::PaneSendBracketedText(_) if !peer_target.pane_send_bracketed_text() => {
+            Some("pane_send_bracketed_text")
+        }
+        _ => None,
+    };
+    if let Some(capability) = missing_bracketed {
         let response = ErrorResponse {
             id: request_id.to_owned(),
             error: ErrorBody {
                 code: "bracketed_paste_unavailable".into(),
                 message: format!(
-                    "machine {alias} has not advertised pane_send_text_bracketed, so it would write the text unbracketed; nothing was written; update Herdr there"
+                    "machine {alias} has not advertised {capability}, so it would not write the text bracketed; nothing was written; update Herdr there"
                 ),
             },
         };
@@ -4060,6 +4072,7 @@ mod tests {
                 compressed_replies: false,
                 gram_thumbnails: false,
                 pane_send_text_bracketed: false,
+                pane_send_bracketed_text: false,
             }),
             None,
             None,
@@ -4948,6 +4961,50 @@ mod tests {
             value["result"]["capabilities"]["pane_send_text_bracketed"],
             true
         );
+        assert_eq!(
+            value["result"]["capabilities"]["pane_send_bracketed_text"],
+            true
+        );
+    }
+
+    /// A daemon refuses a method it does not list before anything reaches the
+    /// app, so `pane.send_bracketed_text` sent to a daemon that predates it
+    /// writes nothing (unlike `bracketed` on `pane.send_text`, which such a
+    /// daemon ignores). Shown with a method this build does not list either.
+    #[test]
+    fn an_unlisted_write_method_is_refused_before_the_app() {
+        let (mut client, server, _path) = local_stream_pair("unlisted-write");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        client
+            .write_all(
+                b"{\"id\":\"w\",\"method\":\"pane.send_bracketed_text_v2\",\"params\":{\"pane_id\":\"w1:p1\",\"text\":\"rm -rf ~\\n\"}}\n",
+            )
+            .unwrap();
+        client.flush().unwrap();
+
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "w");
+        assert!(response.get("result").is_none(), "{response}");
+        assert_eq!(response["error"]["code"], "invalid_request", "{response}");
+        assert!(api_rx.try_recv().is_err(), "the write reached the app");
+
+        // This build lists `pane.send_bracketed_text`.
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "w",
+            "method": "pane.send_bracketed_text",
+            "params": {"pane_id": "w1:p1", "text": "a\n"},
+        }))
+        .unwrap();
+        assert!(matches!(request.method, Method::PaneSendBracketedText(_)));
     }
 
     #[test]
@@ -5616,6 +5673,7 @@ mod federation_tests {
             ("pane.input.set", AllowedAt(Admin)),
             ("pane.rename", AllowedAt(Admin)),
             ("pane.send_text", AllowedAt(Interact)),
+            ("pane.send_bracketed_text", AllowedAt(Interact)),
             ("pane.send_keys", AllowedAt(Interact)),
             ("pane.send_input", AllowedAt(Admin)),
             ("pane.read", AllowedAt(Observe)),
@@ -8447,6 +8505,51 @@ mod federation_tests {
         );
         assert_eq!(response, sent);
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 2);
+    }
+
+    /// `pane.send_bracketed_text` reaches a peer that advertises
+    /// `pane_send_bracketed_text` and is refused at home, never forwarded and
+    /// never turned into a plain write, for one that does not (even one that
+    /// honours `bracketed` on `pane.send_text`).
+    #[test]
+    fn proxy_sends_bracketed_text_method_only_to_a_peer_advertising_it() {
+        let sent = serde_json::json!({"id": "t1", "result": {"type": "ok"}}).to_string();
+        let request = serde_json::json!({
+            "id": "t1",
+            "method": "pane.send_bracketed_text",
+            "params": {"pane_id": "remote/w1:p1", "text": "a\nb\n"},
+        });
+
+        let (peer, route) =
+            polled_rename_peer(default_capabilities().expect("capabilities"), sent.clone());
+        let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        assert_eq!(home_roundtrip(&mut home, request.clone()), sent);
+        let seen = peer.seen.lock().expect("seen lock");
+        let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert_eq!(forwarded["method"], "pane.send_bracketed_text");
+        assert_eq!(
+            forwarded["params"],
+            serde_json::json!({"pane_id": "w1:p1", "text": "a\nb\n"})
+        );
+        drop(seen);
+
+        let old_peer = ServerCapabilities {
+            pane_send_bracketed_text: false,
+            ..default_capabilities().expect("capabilities")
+        };
+        let (peer, route) = polled_rename_peer(old_peer, sent);
+        let mut refused = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+        let response: serde_json::Value =
+            serde_json::from_str(&home_roundtrip(&mut refused, request)).unwrap();
+        assert_eq!(
+            response["error"]["code"], "bracketed_paste_unavailable",
+            "{response}"
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("pane_send_bracketed_text")));
+        assert!(refused.api_rx.try_recv().is_err());
+        assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
     }
 
     /// `agent.topics.set_enabled` reaches a peer that advertises the switch in the
