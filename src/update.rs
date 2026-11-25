@@ -2686,6 +2686,7 @@ mod tests {
                 compressed_replies: false,
                 gram_thumbnails: false,
                 pane_send_text_bracketed: false,
+                pane_send_bracketed_text: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2790,6 +2791,7 @@ mod tests {
                     compressed_replies: false,
                     gram_thumbnails: false,
                     pane_send_text_bracketed: false,
+                    pane_send_bracketed_text: false,
                 }),
             },
         };
@@ -3081,6 +3083,7 @@ mod tests {
                     compressed_replies: false,
                     gram_thumbnails: false,
                     pane_send_text_bracketed: false,
+                    pane_send_bracketed_text: false,
                 }),
             },
         };

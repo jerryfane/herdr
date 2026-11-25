@@ -149,6 +149,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pane.link.resolve", "-"),
     ("pane.rename", "terminal"),
     ("pane.send_text", "terminal"),
+    ("pane.send_bracketed_text", "terminal"),
     ("pane.send_keys", "chat"),
     ("pane.send_input", "terminal"),
     ("pane.read", "terminal"),
@@ -305,12 +306,13 @@ fn chat_scope_never_types_into_a_terminal_and_reaches_agents_only() {
         json!({"id": "7", "method": "events.subscribe", "params": {"subscriptions": [{"type": "pane.created"}]}}),
         // A focused pane may be a shell.
         json!({"id": "8", "method": "pane.set_pty_size", "params": {"cols": 80, "rows": 24}}),
+        json!({"id": "8b", "method": "pane.send_bracketed_text", "params": {"pane_id": pane, "text": "rm -rf ~\n"}}),
         json!({"id": "9", "method": "agent.get", "params": {"target": "llm-opt"}}),
     ];
     let codes = codes(&harness, OwnerScope::Chat, &requests);
-    let refused = vec!["owner_forbidden".to_owned(); 8];
-    assert_eq!(codes[..8], refused[..], "{codes:?}");
-    assert_eq!(codes[8], "<success>", "a local agent is reachable");
+    let refused = vec!["owner_forbidden".to_owned(); 9];
+    assert_eq!(codes[..9], refused[..], "{codes:?}");
+    assert_eq!(codes[9], "<success>", "a local agent is reachable");
     assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
 
     // Prompts arrive as the owner's own, unlabeled.
@@ -411,6 +413,11 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
             input_stream,
             "{pong}"
         );
+        assert_eq!(
+            capabilities.get("pane_send_bracketed_text").is_some(),
+            input_stream,
+            "{pong}"
+        );
     }
 }
 
@@ -452,6 +459,38 @@ fn terminal_scope_sends_bracketed_text() {
     let harness = start("owner-bracketed");
     let pane = harness.pane_ids[0].clone();
     let send = json!({"id": "1", "method": "pane.send_text", "params": {"pane_id": pane, "text": "echo one\necho two\n", "bracketed": true}});
+
+    let replies = codes(&harness, OwnerScope::Terminal, std::slice::from_ref(&send));
+    assert_eq!(replies, ["bracketed_paste_unavailable"], "{replies:?}");
+    assert_eq!(harness.pty_text(0, Duration::from_millis(200)), "");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    harness
+        .control
+        .send(Box::new(move |app: &mut crate::app::App| {
+            let workspace = &app.state.workspaces[0];
+            workspace.test_runtimes[&workspace.tabs[0].root_pane]
+                .test_process_pty_bytes(b"\x1b[?2004h");
+            let _ = done_tx.send(());
+        }))
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let replies = codes(&harness, OwnerScope::Terminal, &[send]);
+    assert_eq!(replies, ["<success>"], "{replies:?}");
+    assert_eq!(
+        harness.pty_text(0, Duration::from_millis(500)),
+        "\x1b[200~echo one\necho two\n\x1b[201~"
+    );
+}
+
+/// Terminal scope may call `pane.send_bracketed_text`, exactly like a
+/// bracketed `pane.send_text`: refused, writing nothing, while the program
+/// has bracketed paste off, and wrapped once it turned it on.
+#[test]
+fn terminal_scope_sends_bracketed_text_method() {
+    let harness = start("owner-bracketed-method");
+    let pane = harness.pane_ids[0].clone();
+    let send = json!({"id": "1", "method": "pane.send_bracketed_text", "params": {"pane_id": pane, "text": "echo one\necho two\n"}});
 
     let replies = codes(&harness, OwnerScope::Terminal, std::slice::from_ref(&send));
     assert_eq!(replies, ["bracketed_paste_unavailable"], "{replies:?}");

@@ -42,6 +42,7 @@ pub(crate) fn fenced_access(method: &Method) -> FencedAccess {
     use OwnTarget::{Agent, Pane};
     match method {
         Method::PaneSendText(p) => Own(Pane(Some(p.pane_id.clone()))),
+        Method::PaneSendBracketedText(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneSendKeys(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneSendInput(p) => Own(Pane(Some(p.pane_id.clone()))),
         Method::PaneInputSet(p) => Own(Pane(Some(p.pane_id.clone()))),

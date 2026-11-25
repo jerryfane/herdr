@@ -204,6 +204,7 @@ operations::define_operations! {
     PaneLinkResolve(PaneLinkActivateParams) => "pane.link.resolve", false, true;
     PaneRename(PaneRenameParams) => "pane.rename", true, true;
     PaneSendText(PaneSendTextParams) => "pane.send_text", false, false;
+    PaneSendBracketedText(PaneSendBracketedTextParams) => "pane.send_bracketed_text", false, false;
     PaneSendKeys(PaneSendKeysParams) => "pane.send_keys", false, false;
     PaneSendInput(PaneSendInputParams) => "pane.send_input", false, false;
     PaneRead(PaneReadParams) => "pane.read", false, false;
@@ -316,6 +317,7 @@ impl Method {
             Self::AgentPrompt(params) => params.input_source = None,
             Self::AgentSendKeys(params) => params.input_source = None,
             Self::PaneSendText(params) => params.input_source = None,
+            Self::PaneSendBracketedText(params) => params.input_source = None,
             Self::PaneSendInput(params) => params.input_source = None,
             Self::PaneSendKeys(params) => params.input_source = None,
             Self::PaneInputStream(params) => params.input_source = None,

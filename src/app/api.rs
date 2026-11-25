@@ -1965,6 +1965,17 @@ impl App {
                 return self.handle_pane_release_agent(request.id, params);
             }
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
+            Method::PaneSendBracketedText(params) => {
+                return self.handle_pane_send_text(
+                    request.id,
+                    crate::api::schema::PaneSendTextParams {
+                        pane_id: params.pane_id,
+                        text: params.text,
+                        input_source: params.input_source,
+                        bracketed: true,
+                    },
+                );
+            }
             Method::PaneSendInput(params) => {
                 return self.handle_pane_send_input(request.id, params);
             }

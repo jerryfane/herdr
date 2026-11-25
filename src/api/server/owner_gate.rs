@@ -88,6 +88,7 @@ const TERMINAL: &[&str] = &[
     "tab.list",
     "pane.read",
     "pane.send_text",
+    "pane.send_bracketed_text",
     "pane.send_input",
     "pane.input.stream",
     "agent.send_keys",
@@ -159,6 +160,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
 const TERMINAL_CAPABILITIES: &[&str] = &[
     "pane_input_stream",
     "pane_send_text_bracketed",
+    "pane_send_bracketed_text",
     "rename_preconditions",
     "server_update",
     "agent_session_transfer",

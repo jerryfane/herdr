@@ -4232,6 +4232,49 @@ mod tests {
         );
     }
 
+    /// A `pane.send_bracketed_text` request as a client sends it.
+    fn send_bracketed_text_request(pane_id: &str, text: &str) -> crate::api::schema::Request {
+        serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_bracketed_text",
+            "params": {"pane_id": pane_id, "text": text},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_bracketed_text_wraps_when_the_program_enabled_bracketed_paste() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+
+        let response = app.handle_api_request(send_bracketed_text_request(
+            &pane_id,
+            "echo one\x1b[201~\necho two\n",
+        ));
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~echo one\necho two\n\x1b[201~")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_bracketed_text_is_refused_and_writes_nothing_without_bracketed_paste() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+
+        let response = app.handle_api_request(send_bracketed_text_request(&pane_id, "rm -rf ~\n"));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "bracketed_paste_unavailable");
+        assert!(rx.try_recv().is_err(), "nothing reaches the pane");
+    }
+
     #[tokio::test]
     async fn api_pane_send_input_keys_accept_key_combo_chords() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);

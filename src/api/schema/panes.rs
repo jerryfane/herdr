@@ -421,9 +421,26 @@ crate::cli::projection::cli_params! {
         /// so a shell runs none of its lines. Refused with
         /// `bracketed_paste_unavailable`, writing nothing, while the pane's
         /// program has not turned bracketed paste on (DECSET 2004).
+        ///
+        /// Deprecated: use `pane.send_bracketed_text`, which a server that
+        /// predates it refuses instead of writing the text raw.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub bracketed: bool => Field::new(false),
     }
+}
+
+/// `pane.send_bracketed_text`: `text` as one bracketed paste (`ESC[200~` …
+/// `ESC[201~`, every `ESC[201~` inside it removed), so a shell runs none of
+/// its lines. Refused with `bracketed_paste_unavailable`, writing nothing,
+/// while the pane's program has not turned bracketed paste on (DECSET 2004).
+/// A method of its own, not a `pane.send_text` field, so a server that
+/// predates it answers `unknown_method` instead of writing the text raw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendBracketedTextParams {
+    pub pane_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_source: Option<super::InputSource>,
 }
 
 crate::cli::projection::cli_params! {
