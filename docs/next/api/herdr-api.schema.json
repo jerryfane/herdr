@@ -21228,6 +21228,47 @@
               "type": "object"
             },
             {
+              "description": "A message omp handed between an agent's Inbox and one of its topics\n(or between two topics), not one the owner typed. `from` is `Inbox`\nor the sending topic's title, and `topic_id` the sending topic's id\n(absent when the Inbox sent it). `text` is the message alone, without\nomp's `<irc>` wrapper, its header line and its reply instructions.\nOlder servers send these as `user` entries (in a topic) or `note`\nentries (in the Inbox).",
+              "properties": {
+                "direction": {
+                  "$ref": "#/schemas/success_response/$defs/TranscriptRelayDirection"
+                },
+                "from": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "relay",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "topic_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "ts_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind",
+                "id",
+                "ts_ms",
+                "from",
+                "direction",
+                "text"
+              ],
+              "type": "object"
+            },
+            {
               "description": "Assistant text parts joined with a blank line; `final` marks an answer\nthat ended the model's turn (stop reason `stop`/`length`).",
               "properties": {
                 "final": {
@@ -21668,6 +21709,14 @@
             "text"
           ],
           "type": "object"
+        },
+        "TranscriptRelayDirection": {
+          "description": "Which way a `relay` entry went: into the topic whose page shows it, or\nfrom a topic into the Inbox.",
+          "enum": [
+            "to_topic",
+            "to_inbox"
+          ],
+          "type": "string"
         },
         "TranscriptStepStatus": {
           "enum": [

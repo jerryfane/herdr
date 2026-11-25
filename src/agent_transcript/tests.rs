@@ -237,6 +237,7 @@ fn kinds(entries: &[TranscriptEntry]) -> Vec<&'static str> {
         .iter()
         .map(|entry| match entry {
             TranscriptEntry::User { .. } => "user",
+            TranscriptEntry::Relay { .. } => "relay",
             TranscriptEntry::Reply { .. } => "reply",
             TranscriptEntry::Thinking { .. } => "thinking",
             TranscriptEntry::Step { .. } => "step",

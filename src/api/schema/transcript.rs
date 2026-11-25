@@ -40,6 +40,15 @@ cli_params! {
     }
 }
 
+/// Which way a `relay` entry went: into the topic whose page shows it, or
+/// from a topic into the Inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRelayDirection {
+    ToTopic,
+    ToInbox,
+}
+
 /// Who wrote a `user` entry: the owner at the terminal, or a guest whose prompt
 /// arrived through HerdrUp with the `<name> (via HerdrUp): ` prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -318,6 +327,22 @@ pub enum TranscriptEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<crate::terminal::TurnOrigin>,
     },
+    /// A message omp handed between an agent's Inbox and one of its topics
+    /// (or between two topics), not one the owner typed. `from` is `Inbox`
+    /// or the sending topic's title, and `topic_id` the sending topic's id
+    /// (absent when the Inbox sent it). `text` is the message alone, without
+    /// omp's `<irc>` wrapper, its header line and its reply instructions.
+    /// Older servers send these as `user` entries (in a topic) or `note`
+    /// entries (in the Inbox).
+    Relay {
+        id: String,
+        ts_ms: u64,
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic_id: Option<String>,
+        direction: TranscriptRelayDirection,
+        text: String,
+    },
     /// Assistant text parts joined with a blank line; `final` marks an answer
     /// that ended the model's turn (stop reason `stop`/`length`).
     Reply {
@@ -416,6 +441,7 @@ impl TranscriptEntry {
     pub fn id(&self) -> &str {
         match self {
             Self::User { id, .. }
+            | Self::Relay { id, .. }
             | Self::Reply { id, .. }
             | Self::Thinking { id, .. }
             | Self::Step { id, .. }

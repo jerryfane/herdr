@@ -351,6 +351,95 @@ mod page_tests {
         );
         assert!(matches!(unknown, Err(TranscriptError::TopicNotFound)));
     }
+
+    /// omp's wrappers as a real omp topics session file records them (enyo,
+    /// topic InvestordeckwithNicola, entry 16e61ea9, and the Inbox's
+    /// `irc:incoming` notes from that topic); the bodies are shortened and
+    /// neutral.
+    const INBOX_ASK: &str = "<irc>\nAsked by Inbox (`Main`):\n\nFrom enyo (Inbox): The comments on deck v33 arrived in the Inbox. Please take it from here.\n\nHis 2 comments:\n1. Slide 2: align the boxes.\n2. Two scores: Option D only.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Main?progress`.\n\nAnother agent started this turn, so in it you cannot ask other topics.\n</irc>";
+    const TOPIC_REPLY: &str =
+        "<irc>\nReply from `Review`:\n\nThe numbers on slide 7 check out.\n</irc>";
+    const HELPER_ASK: &str = "<irc>\nAsked by `helper`:\n\nWhich file?\n</irc>";
+
+    fn topic_page(session: &Fixture, topic: &str) -> serde_json::Value {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                topic: Some(topic.into()),
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        serde_json::to_value(&page.entries).unwrap()
+    }
+
+    fn spawned(session: &mut Fixture, id: &str, title: &str, child: &Fixture) {
+        let mut spawn = spawn_entry(id);
+        spawn["data"]["title"] = serde_json::json!(title);
+        session.push(spawn);
+        let path = super::super::subagents::child_path(&session.path, id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(&child.path, &path).unwrap();
+    }
+
+    #[test]
+    fn handovers_into_a_topic_are_relays_and_other_irc_stays_the_users() {
+        let mut session = Fixture::new("relay-main");
+        let review = Fixture::new("relay-review");
+        spawned(&mut session, "Review", "Review the numbers", &review);
+        let mut deck = Fixture::new("relay-deck");
+        deck.user(INBOX_ASK);
+        deck.user(TOPIC_REPLY);
+        deck.user(HELPER_ASK);
+        deck.user("plain owner text");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+
+        let entries = topic_page(&session, "Deck");
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"kind": "relay", "id": entries[0]["id"], "ts_ms": entries[0]["ts_ms"],
+                "from": "Inbox", "direction": "to_topic",
+                "text": "The comments on deck v33 arrived in the Inbox. Please take it from here.\n\nHis 2 comments:\n1. Slide 2: align the boxes.\n2. Two scores: Option D only."}),
+            "{entries}"
+        );
+        assert_eq!(entries[1]["kind"], "relay");
+        assert_eq!(entries[1]["from"], "Review the numbers");
+        assert_eq!(entries[1]["topic_id"], "Review");
+        assert_eq!(entries[1]["text"], "The numbers on slide 7 check out.");
+        // Not a topic of this session: as before.
+        assert_eq!(entries[2]["kind"], "user");
+        assert_eq!(entries[2]["text"], HELPER_ASK);
+        assert_eq!(entries[3]["kind"], "user");
+    }
+
+    #[test]
+    fn what_a_topic_sends_the_inbox_is_a_relay_and_other_agents_stay_notes() {
+        let mut session = Fixture::new("relay-inbox");
+        let deck = Fixture::new("relay-inbox-deck");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        session.user("start the deck");
+        session.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `Deck` (progress; its reply follows later):\n\nBrief sent; waiting for the build.\n</irc>",
+            true,
+            serde_json::json!({"id": "15dc457762d6e2ec", "from": "Deck",
+                "message": "Brief sent; waiting for the build.", "progress": true}),
+        );
+        session.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `GridReview`:\n\nCap verified.\n</irc>",
+            true,
+            serde_json::json!({"id": "15dc", "from": "GridReview", "message": "Cap verified."}),
+        );
+        let page = read_page(&session.path, &PageRequest::default()).unwrap();
+        let entries = serde_json::to_value(&page.entries).unwrap();
+        assert_eq!(entries[1]["kind"], "relay", "{entries}");
+        assert_eq!(entries[1]["from"], "Investor deck");
+        assert_eq!(entries[1]["topic_id"], "Deck");
+        assert_eq!(entries[1]["direction"], "to_inbox");
+        assert_eq!(entries[1]["text"], "Brief sent; waiting for the build.");
+        assert_eq!(entries[2]["kind"], "note", "{entries}");
+    }
 }
 
 #[cfg(test)]

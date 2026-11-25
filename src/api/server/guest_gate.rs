@@ -491,6 +491,11 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         .into_iter()
         .filter_map(|entry| match entry {
             TranscriptEntry::Note { .. } => None,
+            // What a topic sends the Inbox was a note, the owner's only.
+            TranscriptEntry::Relay {
+                direction: crate::api::schema::TranscriptRelayDirection::ToInbox,
+                ..
+            } => None,
             TranscriptEntry::Step {
                 id,
                 ts_ms,
