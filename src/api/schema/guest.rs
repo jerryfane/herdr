@@ -31,12 +31,14 @@ pub struct GuestInviteCreateParams {
     pub machine: Option<String>,
 }
 
-/// `guest.update`: change shares on this machine. `share_gram` needs
-/// `guest_id`. `machine_label` (1 to 64 printable characters, as for
+/// `guest.update`: change shares on this machine, either `share_gram` or
+/// `machine_label`, never both. `share_gram` needs `guest_id`.
+/// `machine_label` (1 to 64 printable characters, as for
 /// `guest.invite.create`) relabels the machine for the guest picked by
 /// `guest_id`, the pending invite picked by `invite_id`, or, with neither,
 /// every active guest and pending invite. Guests see the new label in their
-/// next hello reply.
+/// next hello reply; a pending invite's links keep showing the old label
+/// until it is accepted. Served where ping reports `guest_relabel`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

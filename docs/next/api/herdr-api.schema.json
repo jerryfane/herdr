@@ -3985,7 +3985,7 @@
           "type": "object"
         },
         "GuestUpdateParams": {
-          "description": "`guest.update`: change shares on this machine. `share_gram` needs\n`guest_id`. `machine_label` (1 to 64 printable characters, as for\n`guest.invite.create`) relabels the machine for the guest picked by\n`guest_id`, the pending invite picked by `invite_id`, or, with neither,\nevery active guest and pending invite. Guests see the new label in their\nnext hello reply.",
+          "description": "`guest.update`: change shares on this machine, either `share_gram` or\n`machine_label`, never both. `share_gram` needs `guest_id`.\n`machine_label` (1 to 64 printable characters, as for\n`guest.invite.create`) relabels the machine for the guest picked by\n`guest_id`, the pending invite picked by `invite_id`, or, with neither,\nevery active guest and pending invite. Guests see the new label in their\nnext hello reply; a pending invite's links keep showing the old label\nuntil it is accepted. Served where ping reports `guest_relabel`.",
           "properties": {
             "guest_id": {
               "type": [
@@ -20900,6 +20900,11 @@
             "gram_upload_stream": {
               "default": false,
               "description": "The daemon serves `gram.upload.stream`, uploading a whole file over one\nconnection instead of one connection per chunk. Clients feature-detect this\nand otherwise fall back to per-chunk `gram.upload_chunk`.",
+              "type": "boolean"
+            },
+            "guest_relabel": {
+              "default": false,
+              "description": "`guest.update` takes `machine_label` (scoped by `guest_id`,\n`invite_id` or neither). Older servers refuse a call without\n`guest_id` and `share_gram`.",
               "type": "boolean"
             },
             "health_check": {

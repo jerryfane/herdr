@@ -865,6 +865,8 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "19", "method": "pane.process_info", "params": {"pane_id": "w9:p9"}}),
         // An empty label is refused by the handler, so it reached guest.update.
         json!({"id": "1a", "method": "guest.update", "params": {"machine_label": ""}}),
+        // Relabel and share_gram in one call are refused: one write per call.
+        json!({"id": "1b", "method": "guest.update", "params": {"guest_id": "g", "share_gram": true, "machine_label": "Mac"}}),
     ];
     let replies = codes(&harness, OwnerScope::Terminal, &terminal_ok);
     for (request, code) in terminal_ok.iter().zip(&replies) {
@@ -875,6 +877,7 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
     // It reached the guest RPCs, which want exactly one id.
     assert_eq!(replies[14], "invalid_params", "guest.revoke: {replies:?}");
     assert_eq!(replies[19], "invalid_params", "guest.update: {replies:?}");
+    assert_eq!(replies[20], "invalid_params", "guest.update: {replies:?}");
 
     let terminal_refused = [
         json!({"id": "20", "method": "guest.list", "params": {"machine": "studio"}}),
@@ -1051,6 +1054,7 @@ fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
         chat.get("agent_session_transfer_harnesses").is_none(),
         "{chat}"
     );
+    assert!(chat.get("guest_relabel").is_none(), "{chat}");
 
     let terminal = pong(OwnerScope::Terminal);
     assert_eq!(terminal["agent_topics_switch"], true, "{terminal}");
@@ -1064,6 +1068,7 @@ fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
         "{terminal}"
     );
     assert_eq!(terminal["agent_session_transfer"], true, "{terminal}");
+    assert_eq!(terminal["guest_relabel"], true, "{terminal}");
     assert_eq!(
         terminal["agent_session_transfer_harnesses"],
         serde_json::to_value(&host.agent_session_transfer_harnesses).unwrap(),

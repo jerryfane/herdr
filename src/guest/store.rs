@@ -826,16 +826,30 @@ pub(crate) fn update_share_gram(
     })
 }
 
-/// Set the machine label of the active guest `guest_id`, the pending invite
-/// `invite_id`, or, with neither, of every active guest and pending invite.
-/// Returns the matched records, already relabeled.
+/// Which shares `guest.update {machine_label}` relabels.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RelabelScope<'a> {
+    /// One active guest.
+    Guest(&'a str),
+    /// One pending invite.
+    Invite(&'a str),
+    /// Every active guest and pending invite.
+    All,
+}
+
+/// Set the machine label of the shares in `scope`. Returns the matched
+/// records, already relabeled.
 pub(crate) fn relabel(
     dir: &Path,
-    guest_id: Option<&str>,
-    invite_id: Option<&str>,
+    scope: RelabelScope<'_>,
     machine_label: &str,
     now: u64,
 ) -> io::Result<(Vec<GuestRecord>, Vec<InviteRecord>)> {
+    let (guest_id, invite_id) = match scope {
+        RelabelScope::Guest(id) => (Some(id), None),
+        RelabelScope::Invite(id) => (None, Some(id)),
+        RelabelScope::All => (None, None),
+    };
     update_store(dir, |store| {
         let mut changed = false;
         let mut guests = Vec::new();
@@ -853,9 +867,7 @@ pub(crate) fn relabel(
         let mut invites = Vec::new();
         if guest_id.is_none() {
             for invite in store.invites.iter_mut().filter(|invite| {
-                invite.used_by.is_none()
-                    && invite.expires_ms > now
-                    && invite_id.is_none_or(|id| invite.invite_id == id)
+                invite.pending(now) && invite_id.is_none_or(|id| invite.invite_id == id)
             }) {
                 changed |= invite.machine_label != machine_label;
                 invite.machine_label = machine_label.to_owned();

@@ -35,7 +35,9 @@ use crate::api::schema::{
     AgentInfo, GuestAuditEntry, GuestAuditEvent, GuestAuditFile, GuestGrantInfo, GuestInfo,
     GuestInviteInfo, GuestLinkInfo, GuestLinkState,
 };
-use store::{AccountHello, AdmitOutcome, DeviceRemoval, RevokeTarget, Revoked, ShortInvite};
+use store::{
+    AccountHello, AdmitOutcome, DeviceRemoval, RelabelScope, RevokeTarget, Revoked, ShortInvite,
+};
 
 pub struct GuestHostInfo {
     pub host_id: String,
@@ -1253,52 +1255,60 @@ fn check_label(field: &str, value: &str) -> Result<(), OwnerError> {
     Ok(())
 }
 
-/// `guest.update {machine_label}`: relabel this machine for the active guest
-/// `guest_id`, the pending invite `invite_id`, or, with neither, every active
-/// guest and pending invite. Guests see it in their next hello reply.
+/// What `guest.update {machine_label}` relabeled.
+#[derive(Debug)]
+pub(crate) enum Relabeled {
+    /// The one guest of [`RelabelScope::Guest`].
+    Guest(Box<GuestInfo>),
+    /// The guests and pending invites of [`RelabelScope::Invite`] or
+    /// [`RelabelScope::All`].
+    Shares {
+        guests: Vec<GuestInfo>,
+        invites: Vec<GuestInviteInfo>,
+    },
+}
+
+/// `guest.update {machine_label}`: relabel this machine for the shares in
+/// `scope`. Guests see it in their next hello reply. A pending invite's links
+/// keep the old label; whoever accepts it gets the new one.
 pub(crate) fn relabel(
-    guest_id: Option<&str>,
-    invite_id: Option<&str>,
+    scope: RelabelScope<'_>,
     machine_label: &str,
-) -> Result<(Vec<GuestInfo>, Vec<GuestInviteInfo>), OwnerError> {
-    relabel_at(&store::guest_dir(), guest_id, invite_id, machine_label)
+) -> Result<Relabeled, OwnerError> {
+    relabel_at(&store::guest_dir(), scope, machine_label)
 }
 
 pub(crate) fn relabel_at(
     dir: &std::path::Path,
-    guest_id: Option<&str>,
-    invite_id: Option<&str>,
+    scope: RelabelScope<'_>,
     machine_label: &str,
-) -> Result<(Vec<GuestInfo>, Vec<GuestInviteInfo>), OwnerError> {
+) -> Result<Relabeled, OwnerError> {
     check_label("machine_label", machine_label)?;
-    if guest_id.is_some() && invite_id.is_some() {
-        return Err((
-            "invalid_params",
-            "give at most one of guest_id or invite_id".into(),
-        ));
-    }
     let (guests, invites) =
-        store::relabel(dir, guest_id, invite_id, machine_label, store::now_ms())
-            .map_err(io_error)?;
-    if guest_id.is_some() && guests.is_empty() {
-        return Err((
-            "guest_not_found",
-            "no active guest with that id".to_string(),
-        ));
-    }
-    if invite_id.is_some() && invites.is_empty() {
-        return Err((
-            "guest_not_found",
-            "no pending invite with that id".to_string(),
-        ));
-    }
+        store::relabel(dir, scope, machine_label, store::now_ms()).map_err(io_error)?;
+    let relabeled = match scope {
+        RelabelScope::Guest(_) => {
+            let guest = guests.first().ok_or((
+                "guest_not_found",
+                "no active guest with that id".to_string(),
+            ))?;
+            Relabeled::Guest(Box::new(guest.info()))
+        }
+        RelabelScope::Invite(_) if invites.is_empty() => {
+            return Err((
+                "guest_not_found",
+                "no pending invite with that id".to_string(),
+            ));
+        }
+        RelabelScope::Invite(_) | RelabelScope::All => Relabeled::Shares {
+            guests: guests.iter().map(store::GuestRecord::info).collect(),
+            invites: invites.iter().map(store::InviteRecord::info).collect(),
+        },
+    };
     if !guests.is_empty() || !invites.is_empty() {
         notify_changes();
     }
-    Ok((
-        guests.iter().map(store::GuestRecord::info).collect(),
-        invites.iter().map(store::InviteRecord::info).collect(),
-    ))
+    Ok(relabeled)
 }
 
 pub(crate) fn read_audit(
@@ -1561,27 +1571,12 @@ mod tests {
     fn relabel_validates_like_invites_and_reaches_the_next_hello() {
         let dir = store::tests::TempDir::new("relabel");
         for bad in ["", "   ", "a\nb", &"x".repeat(65)] {
-            let err = relabel_at(&dir.0, None, None, bad).unwrap_err();
+            let err = relabel_at(&dir.0, RelabelScope::All, bad).unwrap_err();
             assert_eq!(err.0, "invalid_params", "{bad:?}");
         }
-        assert_eq!(
-            relabel_at(&dir.0, Some("g"), Some("i"), "Mac")
-                .unwrap_err()
-                .0,
-            "invalid_params"
-        );
-        assert_eq!(
-            relabel_at(&dir.0, Some("unknown"), None, "Mac")
-                .unwrap_err()
-                .0,
-            "guest_not_found"
-        );
-        assert_eq!(
-            relabel_at(&dir.0, None, Some("unknown"), "Mac")
-                .unwrap_err()
-                .0,
-            "guest_not_found"
-        );
+        let refused = |scope| relabel_at(&dir.0, scope, "Mac").unwrap_err().0;
+        assert_eq!(refused(RelabelScope::Guest("unknown")), "guest_not_found");
+        assert_eq!(refused(RelabelScope::Invite("unknown")), "guest_not_found");
 
         let first = accept_in(&dir.0, &invite_in(&dir.0, false), 1);
         let second = accept_in(&dir.0, &invite_in(&dir.0, false), 2);
@@ -1594,34 +1589,37 @@ mod tests {
             Admission::Admitted { reply, .. } => reply["machine_label"].clone(),
             Admission::Refused(error) => panic!("refused: {error}"),
         };
+        let shares = |scope, label| match relabel_at(&dir.0, scope, label).unwrap() {
+            Relabeled::Shares { guests, invites } => (guests, invites),
+            Relabeled::Guest(guest) => panic!("one guest: {guest:?}"),
+        };
 
         // One guest.
-        let (guests, invites) = relabel_at(&dir.0, Some(first_id), None, "Studio").unwrap();
-        assert_eq!(guests.len(), 1);
-        assert_eq!(guests[0].machine_label, "Studio");
-        assert!(invites.is_empty());
+        let Relabeled::Guest(guest) =
+            relabel_at(&dir.0, RelabelScope::Guest(first_id), "Studio").unwrap()
+        else {
+            panic!("the guest");
+        };
+        assert_eq!(guest.guest_id, first_id);
+        assert_eq!(guest.machine_label, "Studio");
         assert_eq!(returning(1), "Studio");
         assert_eq!(returning(2), "Mac");
 
         // One pending invite: the guest who accepts it gets the new label.
-        let (guests, invites) =
-            relabel_at(&dir.0, None, Some(&pending.record.invite_id), "Laptop").unwrap();
+        let (guests, invites) = shares(RelabelScope::Invite(&pending.record.invite_id), "Laptop");
         assert!(guests.is_empty());
         assert_eq!(invites.len(), 1);
         assert_eq!(accept_in(&dir.0, &pending, 3)["machine_label"], "Laptop");
         // A used invite is no longer pending.
         assert_eq!(
-            relabel_at(&dir.0, None, Some(&pending.record.invite_id), "X")
-                .unwrap_err()
-                .0,
+            refused(RelabelScope::Invite(&pending.record.invite_id)),
             "guest_not_found"
         );
 
         // The whole host: every active guest and pending invite, not revoked ones.
         revoke_at(dir.0.clone(), RevokeTarget::Guest(second_id)).unwrap();
-        let (guests, invites) = relabel_at(&dir.0, None, None, "Jerry's Mac").unwrap();
-        let mut ids: Vec<_> = guests.iter().map(|guest| guest.guest_id.as_str()).collect();
-        ids.sort_unstable();
+        let (guests, invites) = shares(RelabelScope::All, "Jerry's Mac");
+        let ids: Vec<_> = guests.iter().map(|guest| guest.guest_id.as_str()).collect();
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(!ids.contains(&second_id));
         assert_eq!(invites.len(), 1);

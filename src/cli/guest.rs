@@ -23,7 +23,8 @@ HerdrUp account to use it from each of their devices ([guest] accounts):
 revoke --person (the person from guest list) revokes all of a person's shares
 at once, and remove-device drops one of their devices. relabel renames this
 machine for every existing guest and pending invite (or the one given); guests
-see the new label when they next connect. --machine runs the
+see the new label when they next connect, and a pending invite keeps showing
+the old name until it is accepted. --machine runs the
 command on that saved SSH machine.";
 
 /// Options that take no value.
