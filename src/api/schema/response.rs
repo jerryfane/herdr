@@ -425,6 +425,12 @@ pub enum ResponseResult {
     GuestUpdated {
         guest: super::guest::GuestInfo,
     },
+    /// `guest.update` with `machine_label` and no `guest_id`: the guests and
+    /// pending invites relabeled.
+    GuestRelabeled {
+        guests: Vec<super::guest::GuestInfo>,
+        invites: Vec<super::guest::GuestInviteInfo>,
+    },
     /// The share after `guest.remove_device`.
     GuestDeviceRemoved {
         guest: super::guest::GuestInfo,

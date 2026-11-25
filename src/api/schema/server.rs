@@ -198,4 +198,9 @@ pub struct ServerCapabilities {
     /// Older servers answer the method with `unknown_method`, never writing.
     #[serde(default)]
     pub pane_send_bracketed_text: bool,
+    /// `guest.update` takes `machine_label` (scoped by `guest_id`,
+    /// `invite_id` or neither). Older servers refuse a call without
+    /// `guest_id` and `share_gram`.
+    #[serde(default)]
+    pub guest_relabel: bool,
 }

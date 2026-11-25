@@ -457,6 +457,7 @@ mod tests {
                 gram_thumbnails: false,
                 pane_send_text_bracketed: false,
                 pane_send_bracketed_text: false,
+                guest_relabel: false,
             }),
         }
     }

@@ -31,12 +31,25 @@ pub struct GuestInviteCreateParams {
     pub machine: Option<String>,
 }
 
-/// `guest.update`: change an accepted guest's settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// `guest.update`: change shares on this machine, either `share_gram` or
+/// `machine_label`, never both. `share_gram` needs `guest_id`.
+/// `machine_label` (1 to 64 printable characters, as for
+/// `guest.invite.create`) relabels the machine for the guest picked by
+/// `guest_id`, the pending invite picked by `invite_id`, or, with neither,
+/// every active guest and pending invite. Guests see the new label in their
+/// next hello reply; a pending invite's links keep showing the old label
+/// until it is accepted. Served where ping reports `guest_relabel`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestUpdateParams {
-    pub guest_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_id: Option<String>,
     /// Share the agent's Gram with this guest (see `guest.invite.create`).
-    pub share_gram: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_gram: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }
@@ -168,6 +181,9 @@ pub struct GuestInfo {
     /// that accepted (`fingerprint`, `device`), including removed ones.
     #[serde(default)]
     pub devices: Vec<GuestDeviceInfo>,
+    /// This machine's name as the guest sees it (`guest.update`).
+    #[serde(default)]
+    pub machine_label: String,
 }
 
 /// One more device of an account-bound share.
