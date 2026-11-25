@@ -467,6 +467,52 @@ mod page_tests {
             .is_some_and(|body| body.contains("Brief sent; waiting for the build.")));
         assert_eq!(entries[2]["kind"], "note");
     }
+
+    #[test]
+    fn a_page_says_whether_it_shows_relays() {
+        let mut session = Fixture::new("relay-flag");
+        let deck = Fixture::new("relay-flag-deck");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        session.user("start the deck");
+        let shows_relays = |relay_entries, topic: Option<&str>| {
+            read_page(
+                &session.path,
+                &PageRequest {
+                    relay_entries,
+                    topic: topic.map(str::to_owned),
+                    ..PageRequest::default()
+                },
+            )
+            .unwrap()
+            .relay_entries
+        };
+        assert!(shows_relays(true, None));
+        assert!(shows_relays(true, Some("Deck")));
+        assert!(!shows_relays(false, None));
+        assert!(!shows_relays(false, Some("Deck")));
+        // A session whose topics cannot be read tells no handover apart.
+        assert!(super::super::topic_titles(session.path.parent().unwrap()).is_none());
+    }
+
+    #[test]
+    fn only_omps_exact_instruction_lines_are_dropped() {
+        let mut session = Fixture::new("relay-lookalike");
+        let mut deck = Fixture::new("relay-lookalike-deck");
+        deck.user("<irc>\nAsked by Inbox (`Main`):\n\nCheck slide 4.\nYour answer goes back to `Main` when this turn ends, so be brief.\n</irc>");
+        deck.user("<irc>\nAsked by Inbox (`Main`):\n\nCheck slide 5.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Other?progress`.\n</irc>");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        let entries = topic_page(&session, "Deck", true);
+        assert_eq!(
+            entries[0]["text"],
+            "Check slide 4.\nYour answer goes back to `Main` when this turn ends, so be brief.",
+            "{entries}"
+        );
+        assert_eq!(
+            entries[1]["text"],
+            "Check slide 5.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Other?progress`.",
+            "{entries}"
+        );
+    }
 }
 
 #[cfg(test)]

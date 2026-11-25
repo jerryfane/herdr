@@ -654,16 +654,31 @@ fn plain_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['`', '\n'])
 }
 
-/// `text` without its last line when that line is one of the instructions
-/// omp appends for the topic (where its answer goes; that it may not ask
-/// other topics).
+/// `text` without its last line when that line is exactly one of the
+/// instructions omp appends for the topic (where its answer goes; that it
+/// may not ask other topics).
 fn without_relay_instruction(text: &str) -> Option<&str> {
     let (rest, last) = text.rsplit_once('\n')?;
     let last = last.trim();
     let instruction = last
         == "Another agent started this turn, so in it you cannot ask other topics."
-        || (last.starts_with("Your answer goes back to `") && last.contains("when this turn ends"));
+        || is_answer_instruction(last);
     instruction.then_some(rest)
+}
+
+/// omp's ``Your answer goes back to `<from>` when this turn ends; for an
+/// interim note write `agent://<from>?progress`.``, both names the same.
+fn is_answer_instruction(line: &str) -> bool {
+    line.strip_prefix("Your answer goes back to `")
+        .and_then(|rest| {
+            rest.split_once("` when this turn ends; for an interim note write `agent://")
+        })
+        .is_some_and(|(from, rest)| {
+            plain_name(from)
+                && rest
+                    .strip_prefix(from)
+                    .is_some_and(|rest| rest == "?progress`.")
+        })
 }
 
 /// The Inbox signs what it hands a topic `From <agent> (Inbox): `; the relay

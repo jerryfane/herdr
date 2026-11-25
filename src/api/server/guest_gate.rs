@@ -483,6 +483,7 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         recap: _,
         subagents,
         resent,
+        relay_entries,
     } = result
     else {
         return None;
@@ -565,6 +566,9 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
     }
     if let Some(resent) = resent {
         projected["resent"] = serde_json::to_value(resent).ok()?;
+    }
+    if relay_entries {
+        projected["relay_entries"] = serde_json::Value::Bool(true);
     }
     Some(projected)
 }
@@ -3327,10 +3331,12 @@ pub(super) mod tests {
             recap: None,
             subagents: None,
             resent: Some(vec!["sg_1".into()]),
+            relay_entries: true,
         })
         .unwrap();
         assert_eq!(projected["entries"], json!([suggestion]));
         assert_eq!(projected["resent"], json!(["sg_1"]));
+        assert_eq!(projected["relay_entries"], true);
     }
 
     /// Open the granted stream and read up to its `stream_started` ack.
@@ -3952,6 +3958,7 @@ pub(super) mod tests {
             recap: None,
             subagents: None,
             resent,
+            relay_entries: false,
         };
         let projected = project_transcript(page(Some(vec!["old".into(), "note".into()]))).unwrap();
         assert_eq!(projected["resent"], json!(["old"]));

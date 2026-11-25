@@ -93,6 +93,8 @@ pub(crate) struct Page {
     /// On an `after` page, the ids of the entries re-sent from before the
     /// cursor, in page order; `None` on newest and `before` pages.
     pub(crate) resent: Option<Vec<String>>,
+    /// The page shows Inbox↔topic handovers as `relay` entries.
+    pub(crate) relay_entries: bool,
 }
 
 #[derive(Debug)]
@@ -211,16 +213,24 @@ enum Relays {
     IntoInbox(HashMap<String, String>),
 }
 
-/// The titles of the topics `session` records, by id (the id when untitled).
-fn topic_titles(session: &Path) -> HashMap<String, String> {
-    topics::topic_sessions(session)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|topic| {
-            let title = topic.title.unwrap_or_else(|| topic.topic_id.clone());
-            (topic.topic_id, title)
-        })
-        .collect()
+/// The titles of the topics `session` records, by id (the id when untitled);
+/// `None` when its topics cannot be read, so handovers cannot be told apart.
+fn topic_titles(session: &Path) -> Option<HashMap<String, String>> {
+    match topics::topic_sessions(session) {
+        Ok(sessions) => Some(
+            sessions
+                .into_iter()
+                .map(|topic| {
+                    let title = topic.title.unwrap_or_else(|| topic.topic_id.clone());
+                    (topic.topic_id, title)
+                })
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::debug!(error = %error, "agent transcript: topics unreadable, no relay entries");
+            None
+        }
+    }
 }
 
 /// One page of `path`'s conversation, as the owner sees it, or of its topic
@@ -248,10 +258,16 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
             with_index(&child, |view| view.page(request, limit, &[]))
         }
         None => {
-            let relays = match (request.relay_entries, &request.topic) {
-                (false, _) => Relays::None,
-                (true, Some(_)) => Relays::IntoTopic(topic_titles(inbox)),
-                (true, None) => Relays::IntoInbox(topic_titles(inbox)),
+            // Without the session's topics no handover can be told apart:
+            // the page says so by its `relay_entries` staying false.
+            let titles = request
+                .relay_entries
+                .then(|| topic_titles(inbox))
+                .flatten();
+            let relays = match (titles, &request.topic) {
+                (None, _) => Relays::None,
+                (Some(titles), Some(_)) => Relays::IntoTopic(titles),
+                (Some(titles), None) => Relays::IntoInbox(titles),
             };
             match with_index_relaying(path, relays, |view| {
                 view.page(request, limit, other_prompts)
@@ -342,6 +358,7 @@ fn unwritten_page(path: &Path, request: &PageRequest) -> Result<Page, Transcript
         recap: None,
         subagents: None,
         resent: request.after.as_ref().map(|_| Vec::new()),
+        relay_entries: false,
     })
 }
 
@@ -845,6 +862,7 @@ impl View<'_> {
             recap: self.current_recap()?,
             subagents: self.current_subagents()?,
             resent,
+            relay_entries: !matches!(self.relays, Relays::None),
         })
     }
 

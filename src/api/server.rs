@@ -2377,6 +2377,14 @@ fn maybe_route_to_peer(
         }
         return Some(result);
     }
+    // A peer that does not advertise `transcript_relay_entries` would ignore
+    // `relay_entries`; drop it so the page plainly comes without relays
+    // (its `relay_entries` is absent), as the peer serves it.
+    if let Method::AgentTranscript(params) = &mut request.method {
+        if params.relay_entries && !peer_target.transcript_relay_entries() {
+            params.relay_entries = false;
+        }
+    }
     // A peer that does not advertise `ask_form` has no `agent.answer_form`;
     // refuse here with the code an app already handles.
     if matches!(&request.method, Method::AgentAnswerForm(_)) && !peer_target.ask_form() {
@@ -8561,6 +8569,36 @@ mod federation_tests {
             .is_some_and(|message| message.contains("pane_send_bracketed_text")));
         assert!(refused.api_rx.try_recv().is_err());
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    /// `relay_entries` on `agent.transcript` reaches a peer that advertises
+    /// `transcript_relay_entries`; for one that does not it is dropped, so
+    /// the page plainly comes without relays rather than ignored unseen.
+    #[test]
+    fn proxy_asks_relay_entries_only_of_a_peer_advertising_them() {
+        let page = serde_json::json!({"id": "x1", "result": {"type": "ok"}}).to_string();
+        let request = serde_json::json!({
+            "id": "x1",
+            "method": "agent.transcript",
+            "params": {"target": "remote/ordinals", "relay_entries": true},
+        });
+        let forwarded_params = |capabilities: ServerCapabilities| {
+            let (peer, route) = polled_rename_peer(capabilities, page.clone());
+            let mut home = drive_home_routes(HashMap::from([("remote".to_string(), route)]));
+            assert_eq!(home_roundtrip(&mut home, request.clone()), page);
+            let seen = peer.seen.lock().expect("seen lock");
+            let forwarded: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+            assert_eq!(forwarded["method"], "agent.transcript");
+            forwarded["params"].clone()
+        };
+
+        let params = forwarded_params(default_capabilities().expect("capabilities"));
+        assert_eq!(params["relay_entries"], true, "{params}");
+        let params = forwarded_params(ServerCapabilities {
+            transcript_relay_entries: false,
+            ..default_capabilities().expect("capabilities")
+        });
+        assert!(params.get("relay_entries").is_none(), "{params}");
     }
 
     /// `agent.topics.set_enabled` reaches a peer that advertises the switch in the
