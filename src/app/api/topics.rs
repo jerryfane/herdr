@@ -59,7 +59,9 @@ mod control {
     use crate::agent_topics::control::{
         ControlConnection, ControlError, TopicChange, TopicCommand, TopicReply,
     };
-    use crate::agent_topics::{ControlEndpoint, ControlHandle, TopicList, CONTROL_PROTOCOL};
+    use crate::agent_topics::{
+        ControlEndpoint, ControlHandle, ListFailure, TopicList, CONTROL_PROTOCOL,
+    };
     use crate::api::schema::{
         AgentTopicChangeReason, ErrorBody, EventData, EventEnvelope, EventKind, Method,
         PaneReportAgentControlParams, Request, ResponseResult,
@@ -358,9 +360,10 @@ mod control {
             }
             let reply = respond_to.clone();
             let reply_id = id.clone();
+            let event_tx = self.event_tx.clone();
             let spawned = crate::thread_spawn::spawn_named("herdr-agent-topics", move || {
                 let response = match command {
-                    TopicCommand::List => first_topic_list(reply_id, &target),
+                    TopicCommand::List => first_topic_list(reply_id, &target, &event_tx),
                     command => topics_response(reply_id, &target, command),
                 };
                 let _ = reply.send(response);
@@ -492,6 +495,15 @@ mod control {
     /// other one at debug.
     const SLOW_TOPIC_LIST: Duration = Duration::from_secs(1);
 
+    /// How long a list request with nothing kept waits for the refresh it
+    /// joined: the longest pause before a retry, one ask (connect, hello,
+    /// `topics_list`) and some slack.
+    const FIRST_TOPIC_LIST_WAIT: Duration = Duration::from_secs(16);
+
+    /// The waits before a failed refresh asks the agent again; after the
+    /// last one it waits for the next change or list request.
+    const TOPIC_LIST_RETRIES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+
     /// Ask the agent for its topics, logging how long it took.
     fn ask_topic_list(control: &ControlHandle) -> Result<TopicList, ControlError> {
         let started = Instant::now();
@@ -539,18 +551,18 @@ mod control {
         )
     }
 
-    /// `agent.topics.list` with nothing kept yet: ask the agent and keep its
-    /// answer.
-    fn first_topic_list(id: String, target: &TopicsTarget) -> String {
-        match ask_topic_list(&target.control) {
-            Ok(list) => {
-                target.control.list.store(list.clone());
-                encode_topic_list(id, target, list)
-            }
-            Err(error) => {
-                log_control_error("topics list", &error);
-                encode_error(id, error.code(), error.message())
-            }
+    /// `agent.topics.list` with nothing kept yet: join the one refresh (or
+    /// start it) and answer with what it kept, so no second ask races it.
+    fn first_topic_list(
+        id: String,
+        target: &TopicsTarget,
+        event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    ) -> String {
+        let seen = target.control.list.rounds();
+        start_topic_list_refresh(&target.terminal_id, &target.control, event_tx);
+        match target.control.list.wait_answer(seen, FIRST_TOPIC_LIST_WAIT) {
+            Ok(list) => encode_topic_list(id, target, list),
+            Err(failure) => encode_error(id, failure.code, failure.message),
         }
     }
 
@@ -577,16 +589,20 @@ mod control {
     }
 
     /// The claimed refresh: ask the agent, keep its answer and emit
-    /// `agent.topics.changed` (`listed`) when the list changed.
+    /// `agent.topics.changed` (`listed`) when the list changed. A failed ask
+    /// is retried after each of [`TOPIC_LIST_RETRIES`].
     fn refresh_topic_list(
         terminal_id: &str,
         control: &ControlHandle,
         event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
     ) {
+        let mut retries = TOPIC_LIST_RETRIES.iter();
         loop {
+            let ticket = control.list.ticket();
             match ask_topic_list(control) {
                 Ok(list) => {
-                    if control.list.store(list) {
+                    retries = TOPIC_LIST_RETRIES.iter();
+                    if control.list.store(ticket, list) {
                         let event = AppEvent::AgentTopicsChanged {
                             terminal_id: terminal_id.to_owned(),
                             generation: control.generation,
@@ -605,7 +621,16 @@ mod control {
                 }
                 Err(error) => {
                     log_control_error("topics refresh", &error);
-                    control.list.refresh_failed();
+                    control.list.refresh_failed(ListFailure {
+                        code: error.code(),
+                        message: error.message(),
+                    });
+                    if let Some(wait) = retries.next() {
+                        std::thread::sleep(*wait);
+                        if control.list.is_live() {
+                            continue;
+                        }
+                    }
                 }
             }
             if !control.list.end_refresh() {

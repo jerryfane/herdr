@@ -1158,6 +1158,60 @@ fn a_streamed_change_updates_the_kept_list_while_the_agent_is_busy() {
 }
 
 #[test]
+fn list_requests_with_nothing_kept_share_the_one_ask() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    // omp records a frame only once it answered, so the asks are counted
+    // as they arrive.
+    let asks = Arc::new(AtomicUsize::new(0));
+    let busy = Arc::new(AtomicBool::new(true));
+    let fake = {
+        let (asks, busy) = (Arc::clone(&asks), Arc::clone(&busy));
+        FakeControl::start("cache-join", move |frame| {
+            if frame["type"] != "topics_list" {
+                return json!({"success": false, "error": "Unknown command."});
+            }
+            asks.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + WAIT;
+            while busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            json!({"success": true, "data": {"topics": [omp_topic("Plan", "Plan", "idle")]}})
+        })
+    };
+    let (_session, app, pane) = offered("cache-join", &fake);
+    let (respond_to, responses) = std::sync::mpsc::channel();
+    for id in ["first", "second"] {
+        app.handle_deferred_topics_request(
+            Request {
+                id: id.into(),
+                method: list(&pane),
+            },
+            respond_to.clone(),
+        );
+    }
+    eventually("the first ask", || asks.load(Ordering::SeqCst) == 1);
+    // The second request joined the ask the first one started, so no
+    // second answer can race it.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        asks.load(Ordering::SeqCst),
+        1,
+        "a second ask while the first runs"
+    );
+    busy.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        let response: Value =
+            serde_json::from_str(&responses.recv_timeout(WAIT).expect("no topics reply")).unwrap();
+        assert_eq!(
+            response["result"]["topics"][0]["topic_id"], "Plan",
+            "{response}"
+        );
+        assert_eq!(response["result"]["stale"], false, "{response}");
+    }
+}
+
+#[test]
 fn a_probe_miss_is_unreachable_for_an_agent_with_topics_and_unsupported_otherwise() {
     let omp = std::process::id();
     let session = Fixture::new("probe-none");
