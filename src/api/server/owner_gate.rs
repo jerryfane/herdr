@@ -168,6 +168,7 @@ const TERMINAL_CAPABILITIES: &[&str] = &[
     "agent_session_transfer",
     "agent_session_transfer_harnesses",
     "guest_relabel",
+    "guest_relabel_rev",
 ];
 
 /// The `agent.read` sources an owner browser may read: never the whole

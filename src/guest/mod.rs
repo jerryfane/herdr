@@ -920,6 +920,7 @@ pub(crate) fn create_invite(
     name: &str,
     owner_name: &str,
     machine_label: &str,
+    machine_label_rev: u64,
     ttl_secs: Option<u64>,
     share_gram: bool,
     relay: &InviteRelay,
@@ -954,6 +955,7 @@ pub(crate) fn create_invite(
         grant,
         owner_name,
         machine_label,
+        machine_label_rev,
         ttl_secs,
         share_gram,
         store::now_ms(),
@@ -1270,22 +1272,26 @@ pub(crate) enum Relabeled {
 
 /// `guest.update {machine_label}`: relabel this machine for the shares in
 /// `scope`. Guests see it in their next hello reply. A pending invite's links
-/// keep the old label; whoever accepts it gets the new one.
+/// keep the old label; whoever accepts it gets the new one. With `rev`, only
+/// records holding a lower revision change (`store::relabel`); the others
+/// still come back, as they are.
 pub(crate) fn relabel(
     scope: RelabelScope<'_>,
     machine_label: &str,
+    rev: Option<u64>,
 ) -> Result<Relabeled, OwnerError> {
-    relabel_at(&store::guest_dir(), scope, machine_label)
+    relabel_at(&store::guest_dir(), scope, machine_label, rev)
 }
 
 pub(crate) fn relabel_at(
     dir: &std::path::Path,
     scope: RelabelScope<'_>,
     machine_label: &str,
+    rev: Option<u64>,
 ) -> Result<Relabeled, OwnerError> {
     check_label("machine_label", machine_label)?;
     let (guests, invites) =
-        store::relabel(dir, scope, machine_label, store::now_ms()).map_err(io_error)?;
+        store::relabel(dir, scope, machine_label, rev, store::now_ms()).map_err(io_error)?;
     let relabeled = match scope {
         RelabelScope::Guest(_) => {
             let guest = guests.first().ok_or((
@@ -1410,6 +1416,7 @@ mod tests {
             "plotarmordev",
             "Jerry",
             "Mac",
+            0,
             None,
             false,
             &relay,
@@ -1432,6 +1439,7 @@ mod tests {
             "second",
             "Jerry",
             "Mac",
+            0,
             None,
             false,
             &relay,
@@ -1473,6 +1481,7 @@ mod tests {
             store::tests::grant(),
             "Jerry",
             "Jerry's Mac Studio",
+            0,
             3600,
             false,
             store::now_ms(),
@@ -1513,6 +1522,7 @@ mod tests {
             store::tests::grant(),
             "Jerry",
             "Mac",
+            0,
             3600,
             share_gram,
             store::now_ms(),
@@ -1571,10 +1581,10 @@ mod tests {
     fn relabel_validates_like_invites_and_reaches_the_next_hello() {
         let dir = store::tests::TempDir::new("relabel");
         for bad in ["", "   ", "a\nb", &"x".repeat(65)] {
-            let err = relabel_at(&dir.0, RelabelScope::All, bad).unwrap_err();
+            let err = relabel_at(&dir.0, RelabelScope::All, bad, None).unwrap_err();
             assert_eq!(err.0, "invalid_params", "{bad:?}");
         }
-        let refused = |scope| relabel_at(&dir.0, scope, "Mac").unwrap_err().0;
+        let refused = |scope| relabel_at(&dir.0, scope, "Mac", None).unwrap_err().0;
         assert_eq!(refused(RelabelScope::Guest("unknown")), "guest_not_found");
         assert_eq!(refused(RelabelScope::Invite("unknown")), "guest_not_found");
 
@@ -1589,14 +1599,14 @@ mod tests {
             Admission::Admitted { reply, .. } => reply["machine_label"].clone(),
             Admission::Refused(error) => panic!("refused: {error}"),
         };
-        let shares = |scope, label| match relabel_at(&dir.0, scope, label).unwrap() {
+        let shares = |scope, label| match relabel_at(&dir.0, scope, label, None).unwrap() {
             Relabeled::Shares { guests, invites } => (guests, invites),
             Relabeled::Guest(guest) => panic!("one guest: {guest:?}"),
         };
 
         // One guest.
         let Relabeled::Guest(guest) =
-            relabel_at(&dir.0, RelabelScope::Guest(first_id), "Studio").unwrap()
+            relabel_at(&dir.0, RelabelScope::Guest(first_id), "Studio", None).unwrap()
         else {
             panic!("the guest");
         };
@@ -1630,6 +1640,150 @@ mod tests {
         assert_eq!(returning(1), "Jerry's Mac");
         assert_eq!(returning(3), "Jerry's Mac");
         assert_eq!(accept_in(&dir.0, &other, 4)["machine_label"], "Jerry's Mac");
+    }
+
+    #[test]
+    fn relabel_rev_never_reverts_a_newer_label() {
+        let dir = store::tests::TempDir::new("relabel-rev");
+        let guest = accept_in(&dir.0, &invite_in(&dir.0, false), 1);
+        let guest_id = guest["guest_id"].as_str().unwrap();
+        let pending = invite_in(&dir.0, false);
+        let stored_guest = |dir: &std::path::Path| {
+            store::load_store(dir)
+                .unwrap()
+                .guests
+                .into_iter()
+                .find(|guest| guest.guest_id == guest_id)
+                .unwrap()
+        };
+        let shares = |label, rev| match relabel_at(&dir.0, RelabelScope::All, label, rev).unwrap() {
+            Relabeled::Shares { guests, invites } => (guests, invites),
+            Relabeled::Guest(guest) => panic!("one guest: {guest:?}"),
+        };
+
+        let (guests, invites) = shares("Studio", Some(20));
+        assert_eq!(
+            (
+                guests[0].machine_label.as_str(),
+                guests[0].machine_label_rev
+            ),
+            ("Studio", 20)
+        );
+        assert_eq!(
+            (
+                invites[0].machine_label.as_str(),
+                invites[0].machine_label_rev
+            ),
+            ("Studio", 20)
+        );
+
+        // An older rev arriving late changes no record and still succeeds,
+        // reporting the current label and rev.
+        let (guests, invites) = shares("Old", Some(10));
+        assert_eq!(
+            (
+                guests[0].machine_label.as_str(),
+                guests[0].machine_label_rev
+            ),
+            ("Studio", 20)
+        );
+        assert_eq!(
+            (
+                invites[0].machine_label.as_str(),
+                invites[0].machine_label_rev
+            ),
+            ("Studio", 20)
+        );
+        let Relabeled::Guest(one) =
+            relabel_at(&dir.0, RelabelScope::Guest(guest_id), "Old", Some(19)).unwrap()
+        else {
+            panic!("the guest");
+        };
+        assert_eq!(
+            (one.machine_label.as_str(), one.machine_label_rev),
+            ("Studio", 20)
+        );
+        assert_eq!(stored_guest(&dir.0).machine_label, "Studio");
+        assert_eq!(
+            stored_invite(&dir.0, &pending.record.invite_id).machine_label,
+            "Studio"
+        );
+
+        // The same rev again is an idempotent resend.
+        let (guests, _) = shares("Other", Some(20));
+        assert_eq!(
+            (
+                guests[0].machine_label.as_str(),
+                guests[0].machine_label_rev
+            ),
+            ("Studio", 20)
+        );
+
+        // No rev overwrites unconditionally and keeps the stored rev.
+        let (guests, invites) = shares("Plain", None);
+        assert_eq!(
+            (
+                guests[0].machine_label.as_str(),
+                guests[0].machine_label_rev
+            ),
+            ("Plain", 20)
+        );
+        assert_eq!(
+            (
+                invites[0].machine_label.as_str(),
+                invites[0].machine_label_rev
+            ),
+            ("Plain", 20)
+        );
+
+        // A newer rev applies; redemption carries the invite's rev over.
+        shares("Newest", Some(30));
+        let accepted = accept_in(&dir.0, &pending, 2);
+        assert_eq!(accepted["machine_label"], "Newest");
+        let redeemed = store::load_store(&dir.0)
+            .unwrap()
+            .guests
+            .into_iter()
+            .find(|guest| Some(guest.guest_id.as_str()) == accepted["guest_id"].as_str())
+            .unwrap();
+        assert_eq!(redeemed.machine_label_rev, 30);
+        assert_eq!(stored_guest(&dir.0).machine_label_rev, 30);
+    }
+
+    #[test]
+    fn invite_rev_carries_over_on_redemption() {
+        let dir = store::tests::TempDir::new("invite-rev");
+        let invite = store::create_invite(
+            &dir.0,
+            "plotarmordev",
+            store::tests::grant(),
+            "Jerry",
+            "Mac",
+            42,
+            3600,
+            false,
+            store::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(invite.record.info().machine_label_rev, 42);
+        let accepted = accept_in(&dir.0, &invite, 1);
+        let guest = store::load_store(&dir.0).unwrap().guests.remove(0);
+        assert_eq!(Some(guest.guest_id.as_str()), accepted["guest_id"].as_str());
+        assert_eq!(guest.info().machine_label_rev, 42);
+        // A relabel at or below the inherited rev leaves it alone.
+        let Relabeled::Guest(same) = relabel_at(
+            &dir.0,
+            RelabelScope::Guest(&guest.guest_id),
+            "Old",
+            Some(42),
+        )
+        .unwrap() else {
+            panic!("the guest");
+        };
+        assert_eq!(
+            (same.machine_label.as_str(), same.machine_label_rev),
+            ("Mac", 42)
+        );
     }
 
     fn device(token: &str) -> crate::persist::devices::RegisteredDevice {

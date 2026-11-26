@@ -1068,6 +1068,7 @@ fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
         "{chat}"
     );
     assert!(chat.get("guest_relabel").is_none(), "{chat}");
+    assert!(chat.get("guest_relabel_rev").is_none(), "{chat}");
 
     let terminal = pong(OwnerScope::Terminal);
     assert_eq!(terminal["agent_topics_switch"], true, "{terminal}");
@@ -1082,6 +1083,7 @@ fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
     );
     assert_eq!(terminal["agent_session_transfer"], true, "{terminal}");
     assert_eq!(terminal["guest_relabel"], true, "{terminal}");
+    assert_eq!(terminal["guest_relabel_rev"], true, "{terminal}");
     assert_eq!(
         terminal["agent_session_transfer_harnesses"],
         serde_json::to_value(&host.agent_session_transfer_harnesses).unwrap(),

@@ -258,6 +258,10 @@ pub(crate) struct GuestRecord {
     pub owner_name: String,
     #[serde(default)]
     pub machine_label: String,
+    /// Revision of `machine_label`: `guest.update {machine_label_rev}` only
+    /// applies a higher one.
+    #[serde(default)]
+    pub machine_label_rev: u64,
     pub created_ms: u64,
     #[serde(default)]
     pub last_seen_ms: Option<u64>,
@@ -345,6 +349,9 @@ pub(crate) struct InviteRecord {
     pub grant: GuestGrantInfo,
     pub owner_name: String,
     pub machine_label: String,
+    /// [`GuestRecord::machine_label_rev`], copied to the guest on redemption.
+    #[serde(default)]
+    pub machine_label_rev: u64,
     pub created_ms: u64,
     pub expires_ms: u64,
     #[serde(default)]
@@ -399,6 +406,7 @@ impl GuestRecord {
             account_bound: self.account.is_some(),
             person: self.person().to_owned(),
             machine_label: self.machine_label.clone(),
+            machine_label_rev: self.machine_label_rev,
             devices: self
                 .devices
                 .iter()
@@ -449,6 +457,7 @@ impl InviteRecord {
             grant: self.grant.clone(),
             owner_name: self.owner_name.clone(),
             machine_label: self.machine_label.clone(),
+            machine_label_rev: self.machine_label_rev,
             created_ms: self.created_ms,
             expires_ms: self.expires_ms,
             used_by: self.used_by.clone(),
@@ -775,6 +784,7 @@ pub(crate) fn create_invite(
     grant: GuestGrantInfo,
     owner_name: &str,
     machine_label: &str,
+    machine_label_rev: u64,
     ttl_secs: u64,
     share_gram: bool,
     now: u64,
@@ -787,6 +797,7 @@ pub(crate) fn create_invite(
         grant,
         owner_name: owner_name.to_string(),
         machine_label: machine_label.to_string(),
+        machine_label_rev,
         created_ms: now,
         expires_ms: now.saturating_add(ttl_secs.saturating_mul(1000)),
         used_by: None,
@@ -837,14 +848,30 @@ pub(crate) enum RelabelScope<'a> {
     All,
 }
 
-/// Set the machine label of the shares in `scope`. Returns the matched
-/// records, already relabeled.
+/// Set the machine label of the shares in `scope`. With `rev`, a record
+/// takes the label only when `rev` is above its stored revision; without it
+/// the label overwrites and the revision stays. Returns the matched records
+/// as they now are.
 pub(crate) fn relabel(
     dir: &Path,
     scope: RelabelScope<'_>,
     machine_label: &str,
+    rev: Option<u64>,
     now: u64,
 ) -> io::Result<(Vec<GuestRecord>, Vec<InviteRecord>)> {
+    fn apply(label: &mut String, stored_rev: &mut u64, new: &str, rev: Option<u64>) -> bool {
+        match rev {
+            Some(rev) if rev <= *stored_rev => return false,
+            Some(rev) => *stored_rev = rev,
+            None => {
+                if label == new {
+                    return false;
+                }
+            }
+        }
+        *label = new.to_owned();
+        true
+    }
     let (guest_id, invite_id) = match scope {
         RelabelScope::Guest(id) => (Some(id), None),
         RelabelScope::Invite(id) => (None, Some(id)),
@@ -859,8 +886,12 @@ pub(crate) fn relabel(
                 .iter_mut()
                 .filter(|guest| !guest.revoked && guest_id.is_none_or(|id| guest.guest_id == id))
             {
-                changed |= guest.machine_label != machine_label;
-                guest.machine_label = machine_label.to_owned();
+                changed |= apply(
+                    &mut guest.machine_label,
+                    &mut guest.machine_label_rev,
+                    machine_label,
+                    rev,
+                );
                 guests.push(guest.clone());
             }
         }
@@ -869,8 +900,12 @@ pub(crate) fn relabel(
             for invite in store.invites.iter_mut().filter(|invite| {
                 invite.pending(now) && invite_id.is_none_or(|id| invite.invite_id == id)
             }) {
-                changed |= invite.machine_label != machine_label;
-                invite.machine_label = machine_label.to_owned();
+                changed |= apply(
+                    &mut invite.machine_label,
+                    &mut invite.machine_label_rev,
+                    machine_label,
+                    rev,
+                );
                 invites.push(invite.clone());
             }
         }
@@ -1102,6 +1137,7 @@ pub(crate) fn admit_in(
             grant: invite.grant.clone(),
             owner_name: invite.owner_name.clone(),
             machine_label: invite.machine_label.clone(),
+            machine_label_rev: invite.machine_label_rev,
             created_ms: now,
             last_seen_ms: Some(now),
             last_connected_ms: None,
@@ -1466,6 +1502,7 @@ pub(crate) mod tests {
             grant(),
             "Jerry",
             "Mac",
+            0,
             3600,
             false,
             now,
@@ -1649,6 +1686,7 @@ pub(crate) mod tests {
             second_grant.clone(),
             "Jerry",
             "Mac",
+            0,
             3600,
             true,
             at(3_000),
@@ -1973,6 +2011,7 @@ pub(crate) mod tests {
             other_terminal,
             "Jerry",
             "Mac",
+            0,
             3600,
             false,
             at(3_000),

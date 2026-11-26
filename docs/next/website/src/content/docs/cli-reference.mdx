@@ -171,7 +171,7 @@ Share one named, running agent with one outside person, who uses it from the Her
 herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram]
 herdr guest list                                  # guests, invites and relay link state (no secrets or keys)
 herdr guest share-gram <guest-id> on|off          # share the agent's Gram with an accepted guest, or stop
-herdr guest relabel <label> [--guest ID | --invite ID] # rename this machine for existing guests and pending invites
+herdr guest relabel <label> [--guest ID | --invite ID] # rename this machine for existing guests and pending invites (revision: now, in unix ms)
 herdr guest revoke <guest-or-invite-id>           # closes the guest's live sessions immediately
 herdr guest revoke --person <person>              # every share of one person, from `guest list`
 herdr guest remove-device <guest-id> <fingerprint> # drop one device of an account-bound share

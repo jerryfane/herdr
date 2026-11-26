@@ -144,6 +144,7 @@ fn invite(args: &[String]) -> Result<i32, String> {
             name,
             owner_name,
             machine_label,
+            machine_label_rev: None,
             ttl_secs,
             share_gram: parsed.flag("share-gram"),
             machine: parsed.option("machine"),
@@ -198,6 +199,14 @@ fn relabel_params(args: &[String]) -> Result<GuestUpdateParams, String> {
         guest_id,
         invite_id,
         machine_label: Some(label.clone()),
+        // The rename's wall-clock ms, stamped here: this CLI also runs on Windows against a
+        // remote host, where the unix-only guest store does not exist.
+        machine_label_rev: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis() as u64)
+                .unwrap_or_default(),
+        ),
         machine: parsed.option("machine"),
         ..Default::default()
     })
@@ -334,6 +343,7 @@ mod tests {
     fn relabel_builds_a_scoped_or_host_wide_update() {
         let all = relabel_params(&args(&["Jerry's Mac"])).unwrap();
         assert_eq!(all.machine_label.as_deref(), Some("Jerry's Mac"));
+        assert!(all.machine_label_rev.is_some_and(|rev| rev > 0));
         assert_eq!(
             (all.guest_id, all.invite_id, all.share_gram),
             (None, None, None)

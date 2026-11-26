@@ -3894,6 +3894,15 @@
             "machine_label": {
               "type": "string"
             },
+            "machine_label_rev": {
+              "description": "Revision of `machine_label` (see `guest.update`). The guest who\naccepts the invite inherits it. Default: 0. Served where ping reports\n`guest_relabel_rev`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "name": {
               "description": "Guest name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`. Prompts arrive labeled\n`<name> (via HerdrUp): `.",
               "type": "string"
@@ -3994,7 +4003,7 @@
           "type": "object"
         },
         "GuestUpdateParams": {
-          "description": "`guest.update`: change shares on this machine, either `share_gram` or\n`machine_label`, never both. `share_gram` needs `guest_id`.\n`machine_label` (1 to 64 printable characters, as for\n`guest.invite.create`) relabels the machine for the guest picked by\n`guest_id`, the pending invite picked by `invite_id`, or, with neither,\nevery active guest and pending invite. Guests see the new label in their\nnext hello reply; a pending invite's links keep showing the old label\nuntil it is accepted. Served where ping reports `guest_relabel`.",
+          "description": "`guest.update`: change shares on this machine, either `share_gram` or\n`machine_label`, never both. `share_gram` needs `guest_id`.\n`machine_label` (1 to 64 printable characters, as for\n`guest.invite.create`) relabels the machine for the guest picked by\n`guest_id`, the pending invite picked by `invite_id`, or, with neither,\nevery active guest and pending invite. Guests see the new label in their\nnext hello reply; a pending invite's links keep showing the old label\nuntil it is accepted. Served where ping reports `guest_relabel`.\n\nWith `machine_label_rev` (where ping reports `guest_relabel_rev`) the\nlabel reaches only records whose stored revision is lower, which then\nstore this one; an equal or lower revision leaves the record as it is\nand still succeeds, the reply showing each record's current label and\nrevision, so a relabel held across a reconnect never reverts a newer\none. Without it the label overwrites unconditionally and the stored\nrevisions stay as they are.",
           "properties": {
             "guest_id": {
               "type": [
@@ -4017,6 +4026,15 @@
             "machine_label": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "machine_label_rev": {
+              "description": "Revision of `machine_label`, for example the unix-ms it was chosen.\nNeeds `machine_label`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -15860,6 +15878,13 @@
               "description": "This machine's name as the guest sees it (`guest.update`).",
               "type": "string"
             },
+            "machine_label_rev": {
+              "default": 0,
+              "description": "Revision of `machine_label` (`guest.update`); 0 when never given.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "name": {
               "type": "string"
             },
@@ -15908,6 +15933,13 @@
             },
             "machine_label": {
               "type": "string"
+            },
+            "machine_label_rev": {
+              "default": 0,
+              "description": "Revision of `machine_label` (`guest.update`); 0 when never given.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "name": {
               "type": "string"
@@ -20940,6 +20972,11 @@
             "guest_relabel": {
               "default": false,
               "description": "`guest.update` takes `machine_label` (scoped by `guest_id`,\n`invite_id` or neither). Older servers refuse a call without\n`guest_id` and `share_gram`.",
+              "type": "boolean"
+            },
+            "guest_relabel_rev": {
+              "default": false,
+              "description": "`guest.update` and `guest.invite.create` take `machine_label_rev`:\na relabel lands only on records holding a lower revision, so one\nheld across a reconnect never reverts a newer one. Older servers\nignore the field and overwrite unconditionally.",
               "type": "boolean"
             },
             "health_check": {

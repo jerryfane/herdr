@@ -18,6 +18,11 @@ pub struct GuestInviteCreateParams {
     pub name: String,
     pub owner_name: String,
     pub machine_label: String,
+    /// Revision of `machine_label` (see `guest.update`). The guest who
+    /// accepts the invite inherits it. Default: 0. Served where ping reports
+    /// `guest_relabel_rev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label_rev: Option<u64>,
     /// Invite lifetime in seconds (60 to 604800). Default: 86400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
@@ -39,6 +44,14 @@ pub struct GuestInviteCreateParams {
 /// every active guest and pending invite. Guests see the new label in their
 /// next hello reply; a pending invite's links keep showing the old label
 /// until it is accepted. Served where ping reports `guest_relabel`.
+///
+/// With `machine_label_rev` (where ping reports `guest_relabel_rev`) the
+/// label reaches only records whose stored revision is lower, which then
+/// store this one; an equal or lower revision leaves the record as it is
+/// and still succeeds, the reply showing each record's current label and
+/// revision, so a relabel held across a reconnect never reverts a newer
+/// one. Without it the label overwrites unconditionally and the stored
+/// revisions stay as they are.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +63,10 @@ pub struct GuestUpdateParams {
     pub share_gram: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_label: Option<String>,
+    /// Revision of `machine_label`, for example the unix-ms it was chosen.
+    /// Needs `machine_label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label_rev: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }
@@ -144,6 +161,9 @@ pub struct GuestInviteInfo {
     pub grant: GuestGrantInfo,
     pub owner_name: String,
     pub machine_label: String,
+    /// Revision of `machine_label` (`guest.update`); 0 when never given.
+    #[serde(default)]
+    pub machine_label_rev: u64,
     pub created_ms: u64,
     pub expires_ms: u64,
     /// Guest id that accepted this invite, once used.
@@ -184,6 +204,9 @@ pub struct GuestInfo {
     /// This machine's name as the guest sees it (`guest.update`).
     #[serde(default)]
     pub machine_label: String,
+    /// Revision of `machine_label` (`guest.update`); 0 when never given.
+    #[serde(default)]
+    pub machine_label_rev: u64,
 }
 
 /// One more device of an account-bound share.
