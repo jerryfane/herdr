@@ -214,6 +214,11 @@ pub struct ServerCapabilities {
     /// ignore the field and overwrite unconditionally.
     #[serde(default)]
     pub guest_relabel_rev: bool,
+    /// `pair.add_key`, `pair.keys.list` and `pair.keys.remove` manage device
+    /// keys in `authorized_keys` (macOS and Linux). Owner's own connection
+    /// only; an owner browser's `ping` never reports it.
+    #[serde(default)]
+    pub pair_add_key: bool,
     /// `agent.transcript` honours `relay_entries`: with it, the messages omp
     /// hands between an agent's Inbox and its topics are `relay` entries.
     /// Older servers ignore the field and send them as `user`/`note`.

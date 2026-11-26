@@ -2349,6 +2349,9 @@ pub(super) mod tests {
             json!({"id": "d", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "Chrome", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "Mac"}}),
             json!({"id": "d", "method": "owner_access.renew", "params": {"grant_id": "g", "ttl_secs": 3600}}),
             json!({"id": "d", "method": "owner_access.remove", "params": {"grant_id": "g"}}),
+            json!({"id": "d", "method": "pair.add_key", "params": {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF", "label": "guest"}}),
+            json!({"id": "d", "method": "pair.keys.list", "params": {}}),
+            json!({"id": "d", "method": "pair.keys.remove", "params": {"fingerprint": "SHA256:vL7GMFHkifrUqP8D1g/8YJGKWxWjkvRaHfKjeLXytuc"}}),
             json!({"id": "d", "method": "server.stop", "params": {}}),
         ] {
             let lines = harness.call(&guest, request.clone());

@@ -63,6 +63,9 @@ const TABLE: &[(&str, &str)] = &[
     ("owner_access.add", "-"),
     ("owner_access.renew", "-"),
     ("owner_access.remove", "-"),
+    ("pair.add_key", "-"),
+    ("pair.keys.list", "-"),
+    ("pair.keys.remove", "-"),
     ("guest.agent_probe", "-"),
     ("client.window_title.set", "-"),
     ("client.window_title.clear", "-"),
@@ -925,10 +928,13 @@ fn terminal_scope_runs_the_owner_shell_chat_scope_never_does() {
         json!({"id": "42", "method": "owner_access.add", "params": {"device_pub": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "device_name": "x", "ttl_secs": 3600, "account_statement": "a.b.c", "approved_by": "x"}}),
         json!({"id": "43", "method": "owner_access.renew", "params": {"grant_id": "g", "ttl_secs": 2_592_000}}),
         json!({"id": "44", "method": "owner_access.remove", "params": {"grant_id": "g"}}),
+        json!({"id": "45", "method": "pair.add_key", "params": {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF", "label": "browser"}}),
+        json!({"id": "46", "method": "pair.keys.list", "params": {}}),
+        json!({"id": "47", "method": "pair.keys.remove", "params": {"fingerprint": "SHA256:vL7GMFHkifrUqP8D1g/8YJGKWxWjkvRaHfKjeLXytuc"}}),
     ];
     for scope in [OwnerScope::Chat, OwnerScope::Terminal] {
         let replies = codes(&harness, scope, &owner_access);
-        assert_eq!(replies, ["owner_forbidden"; 5], "{scope:?}: {replies:?}");
+        assert_eq!(replies, ["owner_forbidden"; 8], "{scope:?}: {replies:?}");
     }
 }
 
@@ -1084,6 +1090,7 @@ fn ping_advertises_the_menu_flags_the_scope_allows_and_the_host_has() {
     assert_eq!(terminal["agent_session_transfer"], true, "{terminal}");
     assert_eq!(terminal["guest_relabel"], true, "{terminal}");
     assert_eq!(terminal["guest_relabel_rev"], true, "{terminal}");
+    assert!(terminal.get("pair_add_key").is_none(), "{terminal}");
     assert_eq!(
         terminal["agent_session_transfer_harnesses"],
         serde_json::to_value(&host.agent_session_transfer_harnesses).unwrap(),

@@ -28,6 +28,8 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     let mut port: u16 = 0; // 0 = let the OS choose
     let mut open_qr = false;
     let mut qr_file: Option<PathBuf> = None;
+    let mut list = false;
+    let mut revoke: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -38,6 +40,17 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             }
             "--lan" => lan = true,
             "--open" => open_qr = true,
+            "--list" => list = true,
+            "--revoke" => {
+                i += 1;
+                match args.get(i).filter(|value| !value.trim().is_empty()) {
+                    Some(target) => revoke = Some(target.clone()),
+                    None => {
+                        eprintln!("--revoke takes a fingerprint (SHA256:…) or a label");
+                        return Ok(2);
+                    }
+                }
+            }
             "--qr-file" => {
                 i += 1;
                 match args.get(i).filter(|value| !value.is_empty()) {
@@ -75,6 +88,44 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             }
         }
         i += 1;
+    }
+
+    if list || revoke.is_some() {
+        if list && revoke.is_some() {
+            eprintln!("herdr pair: --list and --revoke are separate commands");
+            return Ok(2);
+        }
+        let path = pairing::authorized_keys_path(&pairing::home_dir());
+        return Ok(match revoke {
+            Some(target) => match revoke_paired_key(&path, &target) {
+                Ok(removed) => {
+                    for key in removed {
+                        println!("revoked {}", key_row(&key));
+                    }
+                    0
+                }
+                Err(err) => {
+                    eprintln!("herdr pair: {err}");
+                    1
+                }
+            },
+            None => match pairing::list_paired_keys(&path) {
+                Ok(keys) if keys.is_empty() => {
+                    println!("no paired device keys in {}", path.display());
+                    0
+                }
+                Ok(keys) => {
+                    for key in keys {
+                        println!("{}", key_row(&key));
+                    }
+                    0
+                }
+                Err(err) => {
+                    eprintln!("herdr pair: could not read {}: {err}", path.display());
+                    1
+                }
+            },
+        });
     }
 
     // Decide where to listen BEFORE anything else. Every refusal here is a refusal to put
@@ -245,7 +296,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     writeln!(out)?;
     out.flush()?;
 
-    let keys = pairing::authorized_keys_path(&home_dir());
+    let keys = pairing::authorized_keys_path(&pairing::home_dir());
     let outcome =
         pairing::serve_one_pairing(&listener, token, &keys, Instant::now() + ttl, |event| {
             eprintln!("  {event}")
@@ -276,12 +327,6 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             Ok(1)
         }
     }
-}
-
-fn home_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/root"))
 }
 
 /// The account the phone signs in as. Unix keeps its historical `root` default; Windows
@@ -337,6 +382,58 @@ fn app_link_line(link: &str, tty: bool) -> String {
     } else {
         format!("  Or open   {link}   (this computer)")
     }
+}
+
+fn key_row(key: &pairing::PairedKey) -> String {
+    if key.label.is_empty() {
+        key.fingerprint.clone()
+    } else {
+        format!("{}  {}", key.fingerprint, key.label)
+    }
+}
+
+/// Remove the herdr-pair key named by a fingerprint (`SHA256:…`) or an exact label. A
+/// label held by several different keys is refused, listing them, so one name never
+/// revokes more than the user meant.
+fn revoke_paired_key(
+    path: &std::path::Path,
+    target: &str,
+) -> Result<Vec<pairing::PairedKey>, String> {
+    let keys = pairing::list_paired_keys(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    let fingerprint = if target.starts_with("SHA256:") {
+        target.to_string()
+    } else {
+        let matches: Vec<&pairing::PairedKey> =
+            keys.iter().filter(|key| key.label == target).collect();
+        let mut fingerprints: Vec<&str> =
+            matches.iter().map(|key| key.fingerprint.as_str()).collect();
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        match fingerprints.as_slice() {
+            [] => return Err(format!("no paired device key is labelled {target:?}")),
+            [one] => (*one).to_string(),
+            _ => {
+                let rows: Vec<String> = matches
+                    .iter()
+                    .map(|key| format!("  {}", key_row(key)))
+                    .collect();
+                return Err(format!(
+                    "{} keys are labelled {target:?}; revoke one by fingerprint:\n{}",
+                    fingerprints.len(),
+                    rows.join("\n")
+                ));
+            }
+        }
+    };
+    let removed = pairing::remove_paired_keys(path, &fingerprint)
+        .map_err(|err| format!("could not rewrite {}: {err}", path.display()))?;
+    if removed.is_empty() {
+        return Err(format!(
+            "no paired device key has fingerprint {fingerprint}"
+        ));
+    }
+    Ok(removed)
 }
 
 /// Render the SAME help clap builds for `herdr pair --help`, taken from `spec.rs`.
@@ -456,5 +553,61 @@ mod tests {
     fn qr_file_requires_a_path_before_any_network_work() {
         let exit = run_pair_command(&["--qr-file".into()]).expect("command result");
         assert_eq!(exit, 2);
+    }
+
+    fn ed25519_key(byte: u8) -> String {
+        use base64::Engine as _;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&11u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32u32.to_be_bytes());
+        blob.extend_from_slice(&[byte; 32]);
+        format!(
+            "ssh-ed25519 {}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        )
+    }
+
+    #[test]
+    fn revoking_by_a_shared_label_is_refused_and_lists_the_keys() {
+        let dir = std::env::temp_dir().join(format!("herdr-pair-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = pairing::authorized_keys_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (own, a, b, c) = (
+            ed25519_key(1),
+            ed25519_key(2),
+            ed25519_key(3),
+            ed25519_key(5),
+        );
+        let original = format!(
+            "{own} iPhone\n{a} herdr-pair:iPhone\n{b} herdr-pair:iPhone\n{c} herdr-pair:iPad\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+        let fingerprint =
+            |key: &str| pairing::key_fingerprint(key.split(' ').nth(1).unwrap()).unwrap();
+
+        let err = revoke_paired_key(&path, "iPhone").unwrap_err();
+        assert!(err.starts_with("2 keys are labelled \"iPhone\""), "{err}");
+        assert!(
+            err.contains(&fingerprint(&a)) && err.contains(&fingerprint(&b)),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(revoke_paired_key(&path, "Nope").is_err());
+        assert!(
+            revoke_paired_key(&path, &fingerprint(&own)).is_err(),
+            "not a herdr-pair line"
+        );
+
+        let removed = revoke_paired_key(&path, "iPad").unwrap();
+        assert_eq!(removed[0].fingerprint, fingerprint(&c));
+        let removed = revoke_paired_key(&path, &fingerprint(&a)).unwrap();
+        assert_eq!(removed[0].label, "iPhone");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{own} iPhone\n{b} herdr-pair:iPhone\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
