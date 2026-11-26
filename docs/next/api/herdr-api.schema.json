@@ -21241,7 +21241,7 @@
               "type": "object"
             },
             {
-              "description": "A message omp handed between an agent's Inbox and one of its topics\n(or between two topics), not one the owner typed. `from` is `Inbox`\nor the sending topic's title, and `topic_id` the sending topic's id\n(absent when the Inbox sent it). `text` is the message alone, without\nomp's `<irc>` wrapper, its header line and its reply instructions.\nOlder servers send these as `user` entries (in a topic) or `note`\nentries (in the Inbox).",
+              "description": "A message omp handed between an agent's Inbox and one of its topics\n(or between two topics), not one the owner typed. `from` is `Inbox`\nor the sending topic's title, and `topic_id` the sending topic's id\n(absent when the Inbox sent it). `text` is the message alone, without\nomp's `<irc>` wrapper, its header line and its reply instructions.\nOlder servers send these as `user` or `note` entries, one `user`\nentry for a turn that carried several.",
               "properties": {
                 "direction": {
                   "$ref": "#/schemas/success_response/$defs/TranscriptRelayDirection"

@@ -596,7 +596,8 @@ pub(super) fn note(line: &NoteLine) -> Option<Note> {
 /// Who handed a topic a message, as omp's header line names them.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RelaySender {
-    /// The agent's Inbox (`Inbox (\`<id>\`)`).
+    /// The agent's Inbox (`Inbox (\`<id>\`)` in an envelope, the topic's
+    /// parent in an `irc:incoming` note).
     Inbox,
     /// Another agent by its id: a topic, or an agent working for one.
     Agent(String),
@@ -610,11 +611,82 @@ const RELAY_LABELS: &[&str] = &[
     "Broadcast by ",
 ];
 
-/// A user message omp delivered into a topic, split into its sender and the
-/// message alone. omp writes
+/// A piece of a user turn omp delivered into a topic.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TopicTurnPiece<T> {
+    /// A message the Inbox or another agent handed the topic, as `relay`
+    /// made it.
+    Relay(T),
+    /// The text around those: the owner's words, or an envelope `relay`
+    /// did not take.
+    Text(String),
+}
+
+/// A user turn omp delivered into a topic, split into the messages handed it
+/// and the text around them. omp joins the entries it queued for one turn
+/// with a blank line, each the owner's text or an envelope
 /// `<irc>\n<label> <sender>:\n\n<message>[\n<reply instructions>]\n</irc>`;
-/// any other text is not one.
-pub(super) fn relay_into_topic(text: &str) -> Option<(RelaySender, String)> {
+/// every envelope `relay` takes (given its sender and the message alone) is
+/// a piece of its own. `None` when it takes none.
+pub(super) fn relays_into_topic<T>(
+    text: &str,
+    mut relay: impl FnMut(RelaySender, String) -> Option<T>,
+) -> Option<Vec<TopicTurnPiece<T>>> {
+    let mut pieces = Vec::new();
+    let mut text_from = 0;
+    let mut search_from = 0;
+    while let Some((start, end)) = next_envelope(text, search_from) {
+        search_from = end;
+        let Some(taken) =
+            relay_envelope(&text[start..end]).and_then(|(sender, message)| relay(sender, message))
+        else {
+            continue;
+        };
+        push_turn_text(&mut pieces, &text[text_from..start]);
+        pieces.push(TopicTurnPiece::Relay(taken));
+        text_from = end;
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    push_turn_text(&mut pieces, &text[text_from..]);
+    Some(pieces)
+}
+
+fn push_turn_text<T>(pieces: &mut Vec<TopicTurnPiece<T>>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        pieces.push(TopicTurnPiece::Text(text.to_owned()));
+    }
+}
+
+/// Where the first envelope at or after byte `from` of `text` starts and
+/// ends: `<irc>` opening a line, through the first `</irc>` line after it.
+/// omp escapes the tag in the messages it wraps, so none closes early.
+fn next_envelope(text: &str, mut from: usize) -> Option<(usize, usize)> {
+    const OPEN: &str = "<irc>\n";
+    const CLOSE: &str = "\n</irc>";
+    loop {
+        let start = from + text[from..].find(OPEN)?;
+        from = start + OPEN.len();
+        if start > 0 && !text[..start].ends_with('\n') {
+            continue;
+        }
+        let mut close_from = start + OPEN.len() - 1;
+        while let Some(close) = text[close_from..].find(CLOSE) {
+            let end = close_from + close + CLOSE.len();
+            if text[end..].is_empty() || text[end..].starts_with('\n') {
+                return Some((start, end));
+            }
+            close_from = end;
+        }
+        return None;
+    }
+}
+
+/// One envelope omp delivered into a topic, split into its sender and the
+/// message alone; any other text is not one.
+fn relay_envelope(text: &str) -> Option<(RelaySender, String)> {
     let inner = text
         .strip_prefix("<irc>\n")?
         .trim_end()
@@ -690,9 +762,11 @@ fn without_inbox_signature(body: &str) -> &str {
         .map_or(body, |(_, message)| message.trim_start())
 }
 
-/// The `irc:incoming` note omp writes into the Inbox for a message an agent
-/// sent it: the sender's id and the message alone, from the note's details.
-pub(super) fn relay_into_inbox(line: &NoteLine) -> Option<(&str, &str)> {
+/// The `irc:incoming` note omp writes into a session for a message an agent
+/// sent it: who sent it and the message alone, from the note's details. omp
+/// marks a message from the session's parent `fromParent`; a topic's parent
+/// is its Inbox.
+pub(super) fn irc_incoming(line: &NoteLine) -> Option<(RelaySender, &str)> {
     if line.custom_type.as_deref() != Some("irc:incoming") {
         return None;
     }
@@ -701,8 +775,14 @@ pub(super) fn relay_into_inbox(line: &NoteLine) -> Option<(&str, &str)> {
         .get("from")?
         .as_str()
         .filter(|from| plain_name(from))?;
-    let message = details.get("message")?.as_str()?.trim();
-    (!message.is_empty()).then_some((from, message))
+    let mut message = details.get("message")?.as_str()?.trim();
+    let sender = if details.get("fromParent").and_then(Value::as_bool) == Some(true) {
+        message = without_inbox_signature(message);
+        RelaySender::Inbox
+    } else {
+        RelaySender::Agent(from.to_owned())
+    };
+    (!message.is_empty()).then_some((sender, message))
 }
 
 /// `<tag …>` or `</tag>` on a line of its own.

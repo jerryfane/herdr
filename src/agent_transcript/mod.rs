@@ -296,6 +296,32 @@ fn mark_other_origins(entries: &mut [TranscriptEntry], others: &[(usize, String)
     }
 }
 
+/// A user entry for `text`, with its author.
+fn user_entry(id: String, ts_ms: u64, text: &str) -> TranscriptEntry {
+    let (author, author_name, text) = normalize::user_author(text);
+    TranscriptEntry::User {
+        id,
+        ts_ms,
+        text,
+        author,
+        author_name,
+        origin: None,
+    }
+}
+
+/// Who handed a topic a message as its `relay` entry names them (`from`,
+/// `topic_id`): the Inbox, or one of the session's topics (`titles`). `None`
+/// for any other agent.
+fn relay_sender(
+    titles: &HashMap<String, String>,
+    sender: normalize::RelaySender,
+) -> Option<(String, Option<String>)> {
+    match sender {
+        normalize::RelaySender::Inbox => Some(("Inbox".to_owned(), None)),
+        normalize::RelaySender::Agent(topic) => Some((titles.get(&topic)?.clone(), Some(topic))),
+    }
+}
+
 /// Length of `value` serialized as JSON, without building the string.
 fn json_len(value: &impl serde::Serialize) -> usize {
     struct Count(usize);
@@ -1241,40 +1267,66 @@ impl View<'_> {
         Ok(kept)
     }
 
-    /// On a topic's page, a user message the Inbox or another topic handed
-    /// it, as a `relay` entry. A sender that is neither stays a `user` entry.
-    fn relay_into_topic(&self, id: &str, ts_ms: u64, text: &str) -> Option<TranscriptEntry> {
+    /// On a topic's page, a user turn with messages the Inbox or other topics
+    /// handed it: each such message a `relay` entry, the text around them
+    /// `user` entries. The turn's first entry keeps the record's id, the
+    /// `n`th later one is `<id>:<n>`. `None` when no message in it came from
+    /// either; it stays one `user` entry.
+    fn relays_into_topic(&self, id: &str, ts_ms: u64, text: &str) -> Option<Vec<TranscriptEntry>> {
         let Relays::IntoTopic(titles) = &self.relays else {
             return None;
         };
-        let (sender, text) = normalize::relay_into_topic(text)?;
-        let (from, topic_id) = match sender {
-            normalize::RelaySender::Inbox => ("Inbox".to_owned(), None),
-            normalize::RelaySender::Agent(topic) => (titles.get(&topic)?.clone(), Some(topic)),
+        let pieces = normalize::relays_into_topic(text, |sender, text| {
+            let (from, topic_id) = relay_sender(titles, sender)?;
+            Some((from, topic_id, text))
+        })?;
+        let entries = pieces.into_iter().enumerate().map(|(n, piece)| {
+            let id = match n {
+                0 => id.to_owned(),
+                n => format!("{id}:{n}"),
+            };
+            match piece {
+                normalize::TopicTurnPiece::Relay((from, topic_id, text)) => {
+                    TranscriptEntry::Relay {
+                        id,
+                        ts_ms,
+                        from,
+                        topic_id,
+                        direction: TranscriptRelayDirection::ToTopic,
+                        text,
+                    }
+                }
+                normalize::TopicTurnPiece::Text(text) => user_entry(id, ts_ms, &text),
+            }
+        });
+        Some(entries.collect())
+    }
+
+    /// An `irc:incoming` note as a `relay` entry: on a topic's page, a message
+    /// the Inbox or another topic sent it as plain IRC (omp's path for a
+    /// reply or progress while the topic works); on the Inbox's page, one of
+    /// its topics sent it. Other agents' messages stay notes.
+    fn relay_note(&self, id: &str, ts_ms: u64, line: &NoteLine) -> Option<TranscriptEntry> {
+        let (sender, text) = normalize::irc_incoming(line)?;
+        let (from, topic_id, direction) = match (&self.relays, sender) {
+            (Relays::None, _) => return None,
+            (Relays::IntoTopic(titles), sender) => {
+                let (from, topic_id) = relay_sender(titles, sender)?;
+                (from, topic_id, TranscriptRelayDirection::ToTopic)
+            }
+            (Relays::IntoInbox(_), normalize::RelaySender::Inbox) => return None,
+            (Relays::IntoInbox(titles), normalize::RelaySender::Agent(topic)) => (
+                titles.get(&topic)?.clone(),
+                Some(topic),
+                TranscriptRelayDirection::ToInbox,
+            ),
         };
         Some(TranscriptEntry::Relay {
             id: id.to_owned(),
             ts_ms,
             from,
             topic_id,
-            direction: TranscriptRelayDirection::ToTopic,
-            text,
-        })
-    }
-
-    /// On the Inbox's page, a message one of its topics sent it, as a
-    /// `relay` entry. Other agents' messages stay notes.
-    fn relay_into_inbox(&self, id: &str, ts_ms: u64, line: &NoteLine) -> Option<TranscriptEntry> {
-        let Relays::IntoInbox(titles) = &self.relays else {
-            return None;
-        };
-        let (topic, text) = normalize::relay_into_inbox(line)?;
-        Some(TranscriptEntry::Relay {
-            id: id.to_owned(),
-            ts_ms,
-            from: titles.get(topic)?.clone(),
-            topic_id: Some(topic.to_owned()),
-            direction: TranscriptRelayDirection::ToInbox,
+            direction,
             text: text.to_owned(),
         })
     }
@@ -1303,19 +1355,11 @@ impl View<'_> {
                         }
                         let ts_ms =
                             normalize::ts_ms(line.message.timestamp, line.timestamp.as_deref());
-                        if let Some(relay) = self.relay_into_topic(id, ts_ms, &text) {
-                            entries.push(relay);
+                        if let Some(relays) = self.relays_into_topic(id, ts_ms, &text) {
+                            entries.extend(relays);
                             continue;
                         }
-                        let (author, author_name, text) = normalize::user_author(&text);
-                        entries.push(TranscriptEntry::User {
-                            id: id.to_owned(),
-                            ts_ms,
-                            text,
-                            author,
-                            author_name,
-                            origin: None,
-                        });
+                        entries.push(user_entry(id.to_owned(), ts_ms, &text));
                     }
                 }
                 Kind::Assistant => self.render_assistant(position, None, entries)?,
@@ -1332,7 +1376,7 @@ impl View<'_> {
                 Kind::Note | Kind::AsyncResult => {
                     if let Some(line) = self.parse::<NoteLine>(record)? {
                         let ts_ms = normalize::ts_ms(None, line.timestamp.as_deref());
-                        if let Some(relay) = self.relay_into_inbox(id, ts_ms, &line) {
+                        if let Some(relay) = self.relay_note(id, ts_ms, &line) {
                             entries.push(relay);
                         } else if let Some(note) = normalize::note(&line) {
                             entries.push(TranscriptEntry::Note {
