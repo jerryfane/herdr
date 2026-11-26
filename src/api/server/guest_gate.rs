@@ -3339,6 +3339,41 @@ pub(super) mod tests {
         assert_eq!(projected["relay_entries"], true);
     }
 
+    #[test]
+    fn a_guest_sees_relays_into_a_topic_but_not_into_the_inbox() {
+        use crate::api::schema::TranscriptRelayDirection;
+        let relay = |id: &str, direction| TranscriptEntry::Relay {
+            id: id.into(),
+            ts_ms: 1,
+            from: "Alpha work".into(),
+            topic_id: Some("Alpha".into()),
+            direction,
+            text: "The check passed.".into(),
+        };
+        let to_topic = relay("r1", TranscriptRelayDirection::ToTopic);
+        let projected = project_transcript(ResponseResult::AgentTranscript {
+            agent: "a".into(),
+            pane_id: "p".into(),
+            session_id: "s".into(),
+            entries: vec![
+                to_topic.clone(),
+                relay("r2", TranscriptRelayDirection::ToInbox),
+            ],
+            before: None,
+            after: "cursor".into(),
+            pending_ask: None,
+            working: None,
+            model: None,
+            plan: None,
+            recap: None,
+            subagents: None,
+            resent: None,
+            relay_entries: true,
+        })
+        .unwrap();
+        assert_eq!(projected["entries"], json!([to_topic]));
+    }
+
     /// Open the granted stream and read up to its `stream_started` ack.
     fn open_stream(
         harness: &Harness,

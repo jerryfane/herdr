@@ -513,6 +513,136 @@ mod page_tests {
             "{entries}"
         );
     }
+
+    #[test]
+    fn a_batched_turn_is_one_entry_per_message_with_ids_from_its_record() {
+        let mut session = Fixture::new("relay-batch");
+        let alpha = Fixture::new("relay-batch-alpha");
+        let beta = Fixture::new("relay-batch-beta");
+        spawned(&mut session, "Alpha", "Alpha work", &alpha);
+        spawned(&mut session, "Beta", "Beta work", &beta);
+        // omp joins the entries it queued for one turn with a blank line.
+        let two_replies = "<irc>\nReply from `Alpha`:\n\nFirst answer.\n</irc>\n\n<irc>\nReply from `Beta`:\n\nSecond answer.\n\nIts second paragraph.\n</irc>";
+        let progress_and_owner =
+            "<irc>\nProgress from `Alpha`:\n\nHalfway there.\n</irc>\n\nPlease also check the notes.";
+        let single = "<irc>\nReply from `Beta`:\n\nDone.\n</irc>";
+        let unknown_first = "<irc>\nReply from `helper`:\n\nNot a topic.\n</irc>\n\n<irc>\nReply from `Alpha`:\n\nThird answer.\n</irc>";
+        let mut gamma = Fixture::new("relay-batch-gamma");
+        let ids =
+            [two_replies, progress_and_owner, single, unknown_first].map(|text| gamma.user(text));
+        spawned(&mut session, "Gamma", "Gamma work", &gamma);
+
+        let entries = topic_page(&session, "Gamma", true);
+        let relay = |id: String, from: &str, topic_id: &str, text: &str| {
+            serde_json::json!({"kind": "relay", "id": id, "from": from, "topic_id": topic_id,
+                "direction": "to_topic", "text": text})
+        };
+        let user = |id: String, text: &str| serde_json::json!({"kind": "user", "id": id, "text": text, "author": "owner"});
+        let expected = [
+            relay(ids[0].clone(), "Alpha work", "Alpha", "First answer."),
+            relay(
+                format!("{}:1", ids[0]),
+                "Beta work",
+                "Beta",
+                "Second answer.\n\nIts second paragraph.",
+            ),
+            relay(ids[1].clone(), "Alpha work", "Alpha", "Halfway there."),
+            user(format!("{}:1", ids[1]), "Please also check the notes."),
+            // A lone message keeps its record's id.
+            relay(ids[2].clone(), "Beta work", "Beta", "Done."),
+            // Not a topic of this session: its text stays the user's.
+            user(
+                ids[3].clone(),
+                "<irc>\nReply from `helper`:\n\nNot a topic.\n</irc>",
+            ),
+            relay(
+                format!("{}:1", ids[3]),
+                "Alpha work",
+                "Alpha",
+                "Third answer.",
+            ),
+        ];
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), expected.len(), "{entries:?}");
+        for (entry, mut expected) in entries.iter().zip(expected) {
+            expected["ts_ms"] = entry["ts_ms"].clone();
+            assert_eq!(*entry, expected);
+        }
+
+        // A client that did not ask for relays gets one user entry a turn.
+        let entries = topic_page(&session, "Gamma", false);
+        let expected = [two_replies, progress_and_owner, single, unknown_first]
+            .into_iter()
+            .zip(&ids)
+            .map(|(text, id)| (id.as_str(), "user", text))
+            .collect::<Vec<_>>();
+        let got = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["id"].as_str().unwrap(),
+                    entry["kind"].as_str().unwrap(),
+                    entry["text"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn irc_sent_to_a_working_topic_is_a_relay_and_other_agents_stay_notes() {
+        let mut session = Fixture::new("relay-irc");
+        let alpha = Fixture::new("relay-irc-alpha");
+        spawned(&mut session, "Alpha", "Alpha work", &alpha);
+        let mut beta = Fixture::new("relay-irc-beta");
+        beta.user("start");
+        // omp's plain IRC to a topic in a turn: a sibling's reply, the
+        // Inbox (the topic's parent), and an agent that is neither.
+        let reply = beta.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `Alpha`:\n\nThe check passed.\n</irc>",
+            true,
+            serde_json::json!({"id": "m1", "from": "Alpha", "message": "The check passed."}),
+        );
+        let from_inbox = beta.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `Main`:\n\nOne more thing.\n</irc>",
+            true,
+            serde_json::json!({"id": "m2", "from": "Main", "message": "One more thing.",
+                "fromParent": true}),
+        );
+        beta.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `helper`:\n\nUnrelated.\n</irc>",
+            true,
+            serde_json::json!({"id": "m3", "from": "helper", "message": "Unrelated."}),
+        );
+        spawned(&mut session, "Beta", "Beta work", &beta);
+
+        let entries = topic_page(&session, "Beta", true);
+        assert_eq!(
+            entries[1],
+            serde_json::json!({"kind": "relay", "id": reply, "ts_ms": entries[1]["ts_ms"],
+                "from": "Alpha work", "topic_id": "Alpha", "direction": "to_topic",
+                "text": "The check passed."}),
+            "{entries}"
+        );
+        assert_eq!(
+            entries[2],
+            serde_json::json!({"kind": "relay", "id": from_inbox, "ts_ms": entries[2]["ts_ms"],
+                "from": "Inbox", "direction": "to_topic", "text": "One more thing."}),
+            "{entries}"
+        );
+        assert_eq!(entries[3]["kind"], "note", "{entries}");
+
+        // A client that did not ask for relays gets the notes it always got.
+        let entries = topic_page(&session, "Beta", false);
+        for entry in 1..=3 {
+            assert_eq!(entries[entry]["kind"], "note", "{entries}");
+        }
+    }
 }
 
 #[cfg(test)]

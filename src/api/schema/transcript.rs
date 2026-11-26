@@ -338,8 +338,8 @@ pub enum TranscriptEntry {
     /// or the sending topic's title, and `topic_id` the sending topic's id
     /// (absent when the Inbox sent it). `text` is the message alone, without
     /// omp's `<irc>` wrapper, its header line and its reply instructions.
-    /// Older servers send these as `user` entries (in a topic) or `note`
-    /// entries (in the Inbox).
+    /// Older servers send these as `user` or `note` entries, one `user`
+    /// entry for a turn that carried several.
     Relay {
         id: String,
         ts_ms: u64,
