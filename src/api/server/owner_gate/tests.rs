@@ -315,7 +315,8 @@ fn chat_scope_never_types_into_a_terminal_and_reaches_agents_only() {
     assert_eq!(codes[9], "<success>", "a local agent is reachable");
     assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
 
-    // Prompts arrive as the owner's own, unlabeled.
+    // Prompts arrive as the owner's own, unlabeled, and start the owner's
+    // turn even though the browser sent no `input_source`.
     let (mut reader, handle) = open(
         &harness,
         owner(&harness, OwnerScope::Chat),
@@ -328,6 +329,11 @@ fn chat_scope_never_types_into_a_terminal_and_reaches_agents_only() {
     let typed = harness.pty_text(0, Duration::from_millis(500));
     assert!(typed.contains("hello"), "{typed:?}");
     assert!(!typed.contains("via HerdrUp"), "{typed:?}");
+    assert_eq!(
+        harness.granted_turn_origin(),
+        (Some(crate::terminal::TurnOrigin::Mine), 0),
+        "an owner-browser prompt is the owner's, never an `other` transcript entry"
+    );
 }
 
 #[test]
@@ -393,6 +399,7 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
         assert_eq!(capabilities["owner_scope"], json!(scope), "{pong}");
         assert_eq!(capabilities["agent_transcript"], true, "{pong}");
         assert_eq!(capabilities["agent_topic_suggestions"], true, "{pong}");
+        assert_eq!(capabilities["owner_browser_origin"], true, "{pong}");
         assert_eq!(capabilities["agent_read_recent_unwrapped"], true, "{pong}");
         assert_eq!(
             capabilities.get("server_update").is_some(),
@@ -636,6 +643,12 @@ fn chat_scope_sends_menu_keys_only_while_an_agent_waits_on_a_menu() {
         "{typed:?}"
     );
     assert!(typed.contains('\r'), "{typed:?}");
+    // The menu path keeps the gate's owner stamp: the choice is the owner's
+    // own input (an unstamped write would leave no owner turn here).
+    assert_eq!(
+        harness.granted_turn_origin().0,
+        Some(crate::terminal::TurnOrigin::Mine)
+    );
 }
 
 /// The first error line the server sends, skipping stream frames.

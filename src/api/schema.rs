@@ -309,18 +309,23 @@ impl Method {
         )
     }
 
-    /// Forget the request's `input_source` claim. Only the owner's own
-    /// connection may say a write acts for the owner; guests and federation
-    /// peers never can.
+    /// Forget the request's `input_source` claim. Only the owner may say a
+    /// write acts for the owner; guests and federation peers never can.
     pub(crate) fn clear_input_source(&mut self) {
+        self.set_input_source(None);
+    }
+
+    /// Replace the request's `input_source` claim on every write that
+    /// carries one: a gate that knows who is writing says so itself.
+    pub(crate) fn set_input_source(&mut self, source: Option<InputSource>) {
         match self {
-            Self::AgentPrompt(params) => params.input_source = None,
-            Self::AgentSendKeys(params) => params.input_source = None,
-            Self::PaneSendText(params) => params.input_source = None,
-            Self::PaneSendBracketedText(params) => params.input_source = None,
-            Self::PaneSendInput(params) => params.input_source = None,
-            Self::PaneSendKeys(params) => params.input_source = None,
-            Self::PaneInputStream(params) => params.input_source = None,
+            Self::AgentPrompt(params) => params.input_source = source,
+            Self::AgentSendKeys(params) => params.input_source = source,
+            Self::PaneSendText(params) => params.input_source = source,
+            Self::PaneSendBracketedText(params) => params.input_source = source,
+            Self::PaneSendInput(params) => params.input_source = source,
+            Self::PaneSendKeys(params) => params.input_source = source,
+            Self::PaneInputStream(params) => params.input_source = source,
             _ => {}
         }
     }

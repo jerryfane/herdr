@@ -20950,6 +20950,11 @@
             "live_handoff": {
               "type": "boolean"
             },
+            "owner_browser_origin": {
+              "default": false,
+              "description": "Writes from an owner browser (`agent.prompt`, pane input) are recorded\nas the owner's: they start turns with origin `mine`, as if they had\nsent `\"input_source\": \"app\"`.",
+              "type": "boolean"
+            },
             "pane_history": {
               "default": false,
               "description": "`pane.stream` reset keyframes carry `history_cursor` and `pane.history`\npages older scrollback above it.",

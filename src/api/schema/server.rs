@@ -151,6 +151,11 @@ pub struct ServerCapabilities {
     /// methods `topics_unsupported`.
     #[serde(default)]
     pub agent_topic_suggestions: bool,
+    /// Writes from an owner browser (`agent.prompt`, pane input) are recorded
+    /// as the owner's: they start turns with origin `mine`, as if they had
+    /// sent `"input_source": "app"`.
+    #[serde(default)]
+    pub owner_browser_origin: bool,
     /// `agent.list` marks each remote agent with `gram_reachable`, whether
     /// `gram.post` may name it. Without this, a client cannot tell and should
     /// keep offering every live agent.

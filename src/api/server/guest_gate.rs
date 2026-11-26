@@ -1080,7 +1080,7 @@ fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(stream);
             };
-            let sent = send_menu_keys(api_tx, &guest.dir, &agent, keys, &id, |keys| {
+            let sent = send_menu_keys(api_tx, &guest.dir, &agent, keys, &id, None, |keys| {
                 guest.audit(
                     GuestAuditEvent::Prompt,
                     Some(method),
@@ -3150,6 +3150,21 @@ pub(super) mod tests {
         );
         assert_eq!(code(&lines), "invalid_params");
         assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
+    }
+
+    #[test]
+    fn a_guests_prompt_is_never_the_owners_even_when_it_claims_the_app() {
+        let harness = start("guest-origin");
+        let guest = harness.admit();
+        let lines = harness.call(
+            &guest,
+            json!({"id": "p", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "hi", "input_source": "app"}}),
+        );
+        assert_eq!(code(&lines), "<success>", "{lines:?}");
+        assert_eq!(
+            harness.granted_turn_origin(),
+            (Some(crate::terminal::TurnOrigin::Other), 1)
+        );
     }
 
     #[test]

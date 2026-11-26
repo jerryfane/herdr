@@ -157,6 +157,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "transcript_max_bytes",
     "pane_stream_resync",
     "gram_thumbnails",
+    "owner_browser_origin",
 ];
 const TERMINAL_CAPABILITIES: &[&str] = &[
     "pane_input_stream",
@@ -364,8 +365,11 @@ fn serve_request(
             return Ok(true);
         }
     };
-    // Input from the web is not the owner's app.
-    request.method.clear_input_source();
+    // An owner browser holds a grant the owner approved: it is the owner, so
+    // its writes count as the owner's whether or not the client says so.
+    request
+        .method
+        .set_input_source(Some(crate::api::schema::InputSource::App));
     let forbidden = |stream: &mut ApiStream| -> std::io::Result<bool> {
         let key = format!("{}\n{method}", owner.grant_id);
         if audit_due(GuestAuditEvent::OwnerDenied, &key) {
@@ -471,7 +475,10 @@ fn serve_request(
                 let Some(agent) = chat_probe.and_then(|probe| probe.agent) else {
                     return forbidden(stream);
                 };
-                let Some(response) = send_menu_keys(api_tx, &owner.dir, &agent, keys, &id, |_| {})
+                // The gate stamped this write as the owner's (App) above; the menu path keeps it.
+                let source = params.input_source;
+                let Some(response) =
+                    send_menu_keys(api_tx, &owner.dir, &agent, keys, &id, source, |_| {})
                 else {
                     return forbidden(stream);
                 };
