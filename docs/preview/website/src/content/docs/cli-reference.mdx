@@ -206,6 +206,8 @@ A granted browser connects through the relay like a guest's app, with its own He
 
 ```bash
 herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+herdr pair --list
+herdr pair --revoke <fingerprint|label>
 ```
 
 `herdr pair` shows a QR for the HerdrUp app to scan. It carries a single-use token (valid for `--ttl`, 300 seconds by default) and public facts about this machine, never a key: the app makes its own keypair and sends only the public half, which `herdr pair` adds to `~/.ssh/authorized_keys`.
@@ -217,6 +219,8 @@ Under the QR it prints an app link for pairing HerdrUp desktop on this same comp
 ```
 
 The part after `#` is the exact JSON the QR encodes, base64url without padding, so the link carries the same single-use token and nothing more. On a terminal the link is an OSC 8 hyperlink, so one click opens it; the full URL is always printed as plain text too, for copying when the terminal doesn't support OSC 8 or the output isn't a terminal.
+
+`herdr pair --list` prints the device keys pairing added (the `herdr-pair` lines of `~/.ssh/authorized_keys`), one `SHA256:…` fingerprint and label per line. `herdr pair --revoke` removes one by its fingerprint or its exact label; a label shared by several keys is refused and the matching keys are listed, so revoke one by fingerprint. Other lines of the file are never listed or removed, and the file is rewritten atomically with mode 0600.
 
 ## Sessions
 
