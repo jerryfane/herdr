@@ -95,6 +95,10 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
             eprintln!("herdr pair: --list and --revoke are separate commands");
             return Ok(2);
         }
+        if cfg!(not(unix)) {
+            eprintln!("herdr pair: {}", pairing::PAIR_KEYS_UNSUPPORTED);
+            return Ok(1);
+        }
         let path = pairing::authorized_keys_path(&pairing::home_dir());
         return Ok(match revoke {
             Some(target) => match revoke_paired_key(&path, &target) {
@@ -553,6 +557,17 @@ mod tests {
     fn qr_file_requires_a_path_before_any_network_work() {
         let exit = run_pair_command(&["--qr-file".into()]).expect("command result");
         assert_eq!(exit, 2);
+    }
+
+    /// Off Unix the device-key commands refuse before touching any path.
+    #[cfg(not(unix))]
+    #[test]
+    fn list_and_revoke_are_refused_off_unix() {
+        assert_eq!(run_pair_command(&["--list".into()]).unwrap(), 1);
+        assert_eq!(
+            run_pair_command(&["--revoke".into(), "iPhone".into()]).unwrap(),
+            1
+        );
     }
 
     fn ed25519_key(byte: u8) -> String {

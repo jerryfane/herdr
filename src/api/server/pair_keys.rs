@@ -41,7 +41,7 @@ fn handle(request: &Request) -> String {
     error_response_json(
         request.id.clone(),
         "pair_unsupported",
-        "device keys are available on macOS and Linux only".into(),
+        crate::pairing::PAIR_KEYS_UNSUPPORTED.into(),
     )
 }
 
