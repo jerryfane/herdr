@@ -1064,6 +1064,7 @@ pub fn append_authorized_key(path: &Path, line: &str) -> io::Result<bool> {
 }
 
 /// Longest label `pair.add_key` accepts before sanitising.
+#[cfg(unix)]
 pub const MAX_PAIR_LABEL_CHARS: usize = 80;
 
 /// A key line in `authorized_keys` that carries the herdr-pair marker.
@@ -1078,6 +1079,7 @@ pub struct PairedKey {
 }
 
 /// The outcome of [`add_paired_key`].
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedPairedKey {
     /// False when the key material was already in the file.
@@ -1088,6 +1090,7 @@ pub struct AddedPairedKey {
 }
 
 /// Why [`add_paired_key`] refused, with a stable error code.
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddPairedKeyError {
     pub code: &'static str,
@@ -1240,6 +1243,7 @@ pub fn list_paired_keys(path: &Path) -> io::Result<Vec<PairedKey>> {
 
 /// The label already stored for this key material: a herdr-pair line's label, else the
 /// comment of the user's own line holding it.
+#[cfg(unix)]
 fn stored_label(path: &Path, blob: &str) -> io::Result<Option<String>> {
     let bytes = read_authorized_keys(path)?;
     let lines: Vec<KeyLine<'_>> = key_lines(&bytes)
@@ -1263,6 +1267,7 @@ pub const PAIR_KEYS_UNSUPPORTED: &str = "device keys are available on macOS and 
 /// The label must be 1 to [`MAX_PAIR_LABEL_CHARS`] characters without control
 /// characters; it is then sanitised as `pair.redeem` does. Only the key type and material
 /// are written, never the client's own comment.
+#[cfg(unix)]
 pub fn add_paired_key(
     path: &Path,
     public_key: &str,
@@ -2475,6 +2480,7 @@ mod tests {
         assert_eq!(key_fingerprint("not base64!"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn adding_a_key_writes_it_once_and_a_second_add_is_idempotent() {
         let path = temp_keys("add-twice");
@@ -2497,6 +2503,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn adding_refuses_other_key_types_and_bad_labels_before_writing() {
         let path = temp_keys("add-refused");
@@ -2588,6 +2595,7 @@ mod tests {
 
     /// A key the user restricted with options (`from=`, `command="…"`) is already present:
     /// appending a bare line for it would let it log in unrestricted.
+    #[cfg(unix)]
     #[test]
     fn a_key_with_options_counts_as_present() {
         let path = temp_keys("options");
@@ -2608,6 +2616,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_repeated_add_replies_with_the_stored_label() {
         let path = temp_keys("stored-label");
@@ -2621,6 +2630,7 @@ mod tests {
 
     /// A line that is not UTF-8 is someone else's: listing, adding and removing work
     /// around it and keep it byte for byte.
+    #[cfg(unix)]
     #[test]
     fn non_utf8_lines_are_kept_byte_for_byte() {
         let path = temp_keys("non-utf8");
