@@ -273,6 +273,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         pane_send_bracketed_text: true,
         // Guest RPCs are Unix-only.
         guest_relabel: cfg!(unix),
+        guest_relabel_rev: cfg!(unix),
         transcript_relay_entries: true,
     })
 }
@@ -4085,6 +4086,7 @@ mod tests {
                 pane_send_text_bracketed: false,
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
+                guest_relabel_rev: false,
                 transcript_relay_entries: false,
             }),
             None,
@@ -4979,6 +4981,10 @@ mod tests {
             true
         );
         assert_eq!(value["result"]["capabilities"]["guest_relabel"], cfg!(unix));
+        assert_eq!(
+            value["result"]["capabilities"]["guest_relabel_rev"],
+            cfg!(unix)
+        );
     }
 
     /// A daemon refuses a method it does not list before anything reaches the
@@ -5942,6 +5948,7 @@ mod federation_tests {
                 name: "friend".into(),
                 owner_name: "Jerry".into(),
                 machine_label: "Mac".into(),
+                machine_label_rev: None,
                 ttl_secs: None,
                 share_gram: true,
                 machine: None,
@@ -8554,6 +8561,7 @@ mod federation_tests {
         let old_peer = ServerCapabilities {
             pane_send_bracketed_text: false,
             guest_relabel: false,
+            guest_relabel_rev: false,
             ..default_capabilities().expect("capabilities")
         };
         let (peer, route) = polled_rename_peer(old_peer, sent);

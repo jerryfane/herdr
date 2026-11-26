@@ -2003,6 +2003,7 @@ pub(super) mod tests {
                 grant,
                 "Jerry",
                 "Jerry's Mac Studio",
+                0,
                 3600,
                 share_gram,
                 now_ms(),

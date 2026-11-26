@@ -119,6 +119,7 @@ pub(super) fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> Stri
                     &params.name,
                     &params.owner_name,
                     &params.machine_label,
+                    params.machine_label_rev.unwrap_or(0),
                     params.ttl_secs,
                     params.share_gram,
                     &crate::guest::InviteRelay::configured(),
@@ -198,6 +199,9 @@ fn update_guest(
     match (params.share_gram, &params.machine_label) {
         (Some(_), Some(_)) => invalid("give share_gram or machine_label, not both"),
         (None, None) => invalid("give share_gram or machine_label"),
+        (Some(_), None) if params.machine_label_rev.is_some() => {
+            invalid("machine_label_rev needs machine_label")
+        }
         (Some(share_gram), None) => {
             let (Some(guest_id), None) = (&params.guest_id, &params.invite_id) else {
                 return invalid("share_gram needs guest_id and no invite_id");
@@ -217,12 +221,14 @@ fn update_guest(
                 (None, Some(invite_id)) => RelabelScope::Invite(invite_id),
                 (None, None) => RelabelScope::All,
             };
-            Ok(match crate::guest::relabel(scope, label)? {
-                Relabeled::Guest(guest) => ResponseResult::GuestUpdated { guest: *guest },
-                Relabeled::Shares { guests, invites } => {
-                    ResponseResult::GuestRelabeled { guests, invites }
-                }
-            })
+            Ok(
+                match crate::guest::relabel(scope, label, params.machine_label_rev)? {
+                    Relabeled::Guest(guest) => ResponseResult::GuestUpdated { guest: *guest },
+                    Relabeled::Shares { guests, invites } => {
+                        ResponseResult::GuestRelabeled { guests, invites }
+                    }
+                },
+            )
         }
     }
 }

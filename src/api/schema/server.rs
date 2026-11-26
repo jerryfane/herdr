@@ -203,6 +203,12 @@ pub struct ServerCapabilities {
     /// `guest_id` and `share_gram`.
     #[serde(default)]
     pub guest_relabel: bool,
+    /// `guest.update` and `guest.invite.create` take `machine_label_rev`:
+    /// a relabel lands only on records holding a lower revision, so one
+    /// held across a reconnect never reverts a newer one. Older servers
+    /// ignore the field and overwrite unconditionally.
+    #[serde(default)]
+    pub guest_relabel_rev: bool,
     /// `agent.transcript` honours `relay_entries`: with it, the messages omp
     /// hands between an agent's Inbox and its topics are `relay` entries.
     /// Older servers ignore the field and send them as `user`/`note`.

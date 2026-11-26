@@ -2688,6 +2688,7 @@ mod tests {
                 pane_send_text_bracketed: false,
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
+                guest_relabel_rev: false,
                 transcript_relay_entries: false,
             }),
         };
@@ -2795,6 +2796,7 @@ mod tests {
                     pane_send_text_bracketed: false,
                     pane_send_bracketed_text: false,
                     guest_relabel: false,
+                    guest_relabel_rev: false,
                     transcript_relay_entries: false,
                 }),
             },
@@ -3089,6 +3091,7 @@ mod tests {
                     pane_send_text_bracketed: false,
                     pane_send_bracketed_text: false,
                     guest_relabel: false,
+                    guest_relabel_rev: false,
                     transcript_relay_entries: false,
                 }),
             },
