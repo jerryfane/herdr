@@ -279,8 +279,12 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         relay_entries: bool,
     },
-    /// `agent.topics.list`: the agent's topics, live from the agent; empty
-    /// when it has none (an unreachable agent is an error instead).
+    /// `agent.topics.list`: the agent's topics, as Herdr last heard them from
+    /// the agent (or, before the agent first answers, as the session file
+    /// records them: `stale`, every `state` `unknown`). Herdr answers at once
+    /// and asks the agent behind the answer; `agent.topics.changed` with
+    /// reason `listed` follows when that changes the list. Empty when the
+    /// agent has none; an agent that never answered is an error instead.
     AgentTopics {
         agent: String,
         pane_id: String,
@@ -290,6 +294,15 @@ pub enum ResponseResult {
         /// (`agent.topics.accept_suggestion`); absent for an omp without them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggestions: Option<Vec<AgentTopicSuggestionInfo>>,
+        /// When the agent gave this list (unix ms), or when it was read from
+        /// the session file.
+        #[serde(default)]
+        as_of_unix_ms: u64,
+        /// Not the agent's own latest answer: read from the session file,
+        /// changed since (a refresh is under way), or the agent did not
+        /// answer the last refresh. Keep showing it.
+        #[serde(default)]
+        stale: bool,
     },
     /// `agent.topics.new`: the topic the agent started.
     AgentTopicCreated {

@@ -108,12 +108,13 @@ pub enum AgentTopicState {
     Idle,
     Dead,
     Closed,
-    /// A state this server does not know yet.
+    /// A state this server does not know yet, or a topic read from the
+    /// session file before the agent answered (`stale` lists).
     #[serde(other)]
     Unknown,
 }
 
-/// One topic as `agent.topics.list` reports it, live from the agent.
+/// One topic as `agent.topics.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentTopicInfo {
     pub topic_id: String,
@@ -172,6 +173,10 @@ pub enum AgentTopicChangeReason {
     /// suggestion, `suggestion_id` names it: it stays open, and the agent's
     /// Inbox note about it is in `agent.transcript`.
     StartFailed,
+    /// Herdr's list of the agent's topics changed: a refresh behind an
+    /// `agent.topics.list` answer, or after a change the agent streamed,
+    /// found it different. `topic_id` is empty; list again.
+    Listed,
     /// A reason this server does not know yet.
     #[serde(other)]
     Unknown,
