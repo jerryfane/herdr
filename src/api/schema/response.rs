@@ -271,6 +271,13 @@ pub enum ResponseResult {
         /// other entry was appended since. Absent on newest and `before` pages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resent: Option<Vec<String>>,
+        /// The page shows the handovers between the agent's Inbox and its
+        /// topics as `relay` entries: asked with `relay_entries`, and the
+        /// session's topics could be read. Absent when the page shows them
+        /// as `user`/`note` entries (not asked, a subagent's page, an
+        /// unreadable topic list, a server or peer without relays).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay_entries: bool,
     },
     /// `agent.topics.list`: the agent's topics, live from the agent; empty
     /// when it has none (an unreachable agent is an error instead).

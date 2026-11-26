@@ -593,6 +593,118 @@ pub(super) fn note(line: &NoteLine) -> Option<Note> {
     })
 }
 
+/// Who handed a topic a message, as omp's header line names them.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RelaySender {
+    /// The agent's Inbox (`Inbox (\`<id>\`)`).
+    Inbox,
+    /// Another agent by its id: a topic, or an agent working for one.
+    Agent(String),
+}
+
+/// The labels omp puts before the sender of a message it hands a topic.
+const RELAY_LABELS: &[&str] = &[
+    "Asked by ",
+    "Reply from ",
+    "Progress from ",
+    "Broadcast by ",
+];
+
+/// A user message omp delivered into a topic, split into its sender and the
+/// message alone. omp writes
+/// `<irc>\n<label> <sender>:\n\n<message>[\n<reply instructions>]\n</irc>`;
+/// any other text is not one.
+pub(super) fn relay_into_topic(text: &str) -> Option<(RelaySender, String)> {
+    let inner = text
+        .strip_prefix("<irc>\n")?
+        .trim_end()
+        .strip_suffix("</irc>")?;
+    let (header, body) = inner.split_once("\n\n")?;
+    let sender = RELAY_LABELS
+        .iter()
+        .find_map(|label| header.strip_prefix(label))?
+        .strip_suffix(':')?;
+    let sender = match sender
+        .strip_prefix("Inbox (`")
+        .and_then(|owner| owner.strip_suffix("`)"))
+    {
+        Some(owner) if plain_name(owner) => RelaySender::Inbox,
+        Some(_) => return None,
+        None => {
+            let name = sender.strip_prefix('`')?.strip_suffix('`')?;
+            if !plain_name(name) {
+                return None;
+            }
+            RelaySender::Agent(name.to_owned())
+        }
+    };
+    let mut body = body.trim_end();
+    while let Some(rest) = without_relay_instruction(body) {
+        body = rest.trim_end();
+    }
+    if sender == RelaySender::Inbox {
+        body = without_inbox_signature(body);
+    }
+    let body = body.trim();
+    (!body.is_empty()).then(|| (sender, body.to_owned()))
+}
+
+/// One line naming an agent: no backticks, no line breaks.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['`', '\n'])
+}
+
+/// `text` without its last line when that line is exactly one of the
+/// instructions omp appends for the topic (where its answer goes; that it
+/// may not ask other topics).
+fn without_relay_instruction(text: &str) -> Option<&str> {
+    let (rest, last) = text.rsplit_once('\n')?;
+    let last = last.trim();
+    let instruction = last
+        == "Another agent started this turn, so in it you cannot ask other topics."
+        || is_answer_instruction(last);
+    instruction.then_some(rest)
+}
+
+/// omp's ``Your answer goes back to `<from>` when this turn ends; for an
+/// interim note write `agent://<from>?progress`.``, both names the same.
+fn is_answer_instruction(line: &str) -> bool {
+    line.strip_prefix("Your answer goes back to `")
+        .and_then(|rest| {
+            rest.split_once("` when this turn ends; for an interim note write `agent://")
+        })
+        .is_some_and(|(from, rest)| {
+            plain_name(from)
+                && rest
+                    .strip_prefix(from)
+                    .is_some_and(|rest| rest == "?progress`.")
+        })
+}
+
+/// The Inbox signs what it hands a topic `From <agent> (Inbox): `; the relay
+/// already says so.
+fn without_inbox_signature(body: &str) -> &str {
+    body.strip_prefix("From ")
+        .and_then(|rest| rest.split_once(" (Inbox):"))
+        .filter(|(name, _)| plain_name(name))
+        .map_or(body, |(_, message)| message.trim_start())
+}
+
+/// The `irc:incoming` note omp writes into the Inbox for a message an agent
+/// sent it: the sender's id and the message alone, from the note's details.
+pub(super) fn relay_into_inbox(line: &NoteLine) -> Option<(&str, &str)> {
+    if line.custom_type.as_deref() != Some("irc:incoming") {
+        return None;
+    }
+    let details = line.details.as_ref()?;
+    let from = details
+        .get("from")?
+        .as_str()
+        .filter(|from| plain_name(from))?;
+    let message = details.get("message")?.as_str()?.trim();
+    (!message.is_empty()).then_some((from, message))
+}
+
 /// `<tag …>` or `</tag>` on a line of its own.
 fn is_wrapper_tag(line: &str) -> bool {
     line.starts_with('<')

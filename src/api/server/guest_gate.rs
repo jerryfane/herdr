@@ -326,7 +326,7 @@ fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
         "type": "pong",
         "version": version,
         "protocol": protocol,
-        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true},
+        "capabilities": {"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true, "transcript_relay_entries": true},
     }))
 }
 
@@ -483,6 +483,7 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         recap: _,
         subagents,
         resent,
+        relay_entries,
     } = result
     else {
         return None;
@@ -491,6 +492,11 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
         .into_iter()
         .filter_map(|entry| match entry {
             TranscriptEntry::Note { .. } => None,
+            // What a topic sends the Inbox was a note, the owner's only.
+            TranscriptEntry::Relay {
+                direction: crate::api::schema::TranscriptRelayDirection::ToInbox,
+                ..
+            } => None,
             TranscriptEntry::Step {
                 id,
                 ts_ms,
@@ -560,6 +566,9 @@ fn project_transcript(result: ResponseResult) -> Option<serde_json::Value> {
     }
     if let Some(resent) = resent {
         projected["resent"] = serde_json::to_value(resent).ok()?;
+    }
+    if relay_entries {
+        projected["relay_entries"] = serde_json::Value::Bool(true);
     }
     Some(projected)
 }
@@ -3322,10 +3331,12 @@ pub(super) mod tests {
             recap: None,
             subagents: None,
             resent: Some(vec!["sg_1".into()]),
+            relay_entries: true,
         })
         .unwrap();
         assert_eq!(projected["entries"], json!([suggestion]));
         assert_eq!(projected["resent"], json!(["sg_1"]));
+        assert_eq!(projected["relay_entries"], true);
     }
 
     /// Open the granted stream and read up to its `stream_started` ack.
@@ -3850,6 +3861,7 @@ pub(super) mod tests {
                     held_from: None,
                     subagent: None,
                     topic: None,
+                    relay_entries: false,
                 }),
             },
             &harness.api_tx,
@@ -3946,6 +3958,7 @@ pub(super) mod tests {
             recap: None,
             subagents: None,
             resent,
+            relay_entries: false,
         };
         let projected = project_transcript(page(Some(vec!["old".into(), "note".into()]))).unwrap();
         assert_eq!(projected["resent"], json!(["old"]));
@@ -4536,7 +4549,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             pong[0]["result"]["capabilities"],
-            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true}),
+            json!({"agent_transcript": true, "agent_avatar": true, "gram_thumbnails": true, "ask_form": true, "ask_dismiss": true, "agent_topics": true, "agent_transcript_topic": true, "agent_topic_suggestions": true, "transcript_relay_entries": true}),
             "only what the gate serves"
         );
 

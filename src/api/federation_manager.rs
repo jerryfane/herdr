@@ -142,6 +142,8 @@ struct PeerRouteState {
     pane_send_text_bracketed: AtomicBool,
     /// The peer's latest poll advertised `pane_send_bracketed_text`.
     pane_send_bracketed_text: AtomicBool,
+    /// The peer's latest poll advertised `transcript_relay_entries`.
+    transcript_relay_entries: AtomicBool,
 }
 impl PeerRoute {
     pub(crate) fn new(
@@ -170,6 +172,7 @@ impl PeerRoute {
                 agent_topic_suggestions: AtomicBool::new(false),
                 pane_send_text_bracketed: AtomicBool::new(false),
                 pane_send_bracketed_text: AtomicBool::new(false),
+                transcript_relay_entries: AtomicBool::new(false),
             }),
             presentation: None,
             peer_channel: None,
@@ -245,6 +248,10 @@ impl PeerRoute {
             capabilities.is_some_and(|capabilities| capabilities.pane_send_bracketed_text),
             Ordering::Release,
         );
+        self.state.transcript_relay_entries.store(
+            capabilities.is_some_and(|capabilities| capabilities.transcript_relay_entries),
+            Ordering::Release,
+        );
     }
 
     /// Record whether the peer's latest poll advertised `api_bridge_multi`.
@@ -296,6 +303,11 @@ impl PeerRoute {
     /// Whether the peer is known to serve `pane.send_bracketed_text`.
     pub(crate) fn pane_send_bracketed_text(&self) -> bool {
         self.state.pane_send_bracketed_text.load(Ordering::Acquire)
+    }
+
+    /// Whether the peer is known to honour `relay_entries` on `agent.transcript`.
+    pub(crate) fn transcript_relay_entries(&self) -> bool {
+        self.state.transcript_relay_entries.load(Ordering::Acquire)
     }
 
     /// Whether the peer is known to serve `agent.answer_form`. An unpolled
@@ -434,6 +446,9 @@ impl PeerRoute {
                     .store(false, Ordering::Release);
                 self.state
                     .pane_send_bracketed_text
+                    .store(false, Ordering::Release);
+                self.state
+                    .transcript_relay_entries
                     .store(false, Ordering::Release);
             }
             *current = Some(remote_boot_id.to_owned());

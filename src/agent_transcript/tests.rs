@@ -207,6 +207,7 @@ fn request(before: Option<&str>, after: Option<&str>, limit: Option<u32>) -> Pag
         held_from: None,
         subagent: None,
         topic: None,
+        relay_entries: false,
     }
 }
 
@@ -237,6 +238,7 @@ fn kinds(entries: &[TranscriptEntry]) -> Vec<&'static str> {
         .iter()
         .map(|entry| match entry {
             TranscriptEntry::User { .. } => "user",
+            TranscriptEntry::Relay { .. } => "relay",
             TranscriptEntry::Reply { .. } => "reply",
             TranscriptEntry::Thinking { .. } => "thinking",
             TranscriptEntry::Step { .. } => "step",

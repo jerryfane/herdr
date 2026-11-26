@@ -351,6 +351,168 @@ mod page_tests {
         );
         assert!(matches!(unknown, Err(TranscriptError::TopicNotFound)));
     }
+
+    /// omp's wrappers as a real omp topics session file records them (enyo,
+    /// topic InvestordeckwithNicola, entry 16e61ea9, and the Inbox's
+    /// `irc:incoming` notes from that topic); the bodies are shortened and
+    /// neutral.
+    const INBOX_ASK: &str = "<irc>\nAsked by Inbox (`Main`):\n\nFrom enyo (Inbox): The comments on deck v33 arrived in the Inbox. Please take it from here.\n\nHis 2 comments:\n1. Slide 2: align the boxes.\n2. Two scores: Option D only.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Main?progress`.\n\nAnother agent started this turn, so in it you cannot ask other topics.\n</irc>";
+    const TOPIC_REPLY: &str =
+        "<irc>\nReply from `Review`:\n\nThe numbers on slide 7 check out.\n</irc>";
+    const HELPER_ASK: &str = "<irc>\nAsked by `helper`:\n\nWhich file?\n</irc>";
+
+    fn topic_page(session: &Fixture, topic: &str, relay_entries: bool) -> serde_json::Value {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                topic: Some(topic.into()),
+                relay_entries,
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        serde_json::to_value(&page.entries).unwrap()
+    }
+
+    fn inbox_page(session: &Fixture, relay_entries: bool) -> serde_json::Value {
+        let page = read_page(
+            &session.path,
+            &PageRequest {
+                relay_entries,
+                ..PageRequest::default()
+            },
+        )
+        .unwrap();
+        serde_json::to_value(&page.entries).unwrap()
+    }
+
+    fn spawned(session: &mut Fixture, id: &str, title: &str, child: &Fixture) {
+        let mut spawn = spawn_entry(id);
+        spawn["data"]["title"] = serde_json::json!(title);
+        session.push(spawn);
+        let path = super::super::subagents::child_path(&session.path, id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(&child.path, &path).unwrap();
+    }
+
+    #[test]
+    fn handovers_into_a_topic_are_relays_and_other_irc_stays_the_users() {
+        let mut session = Fixture::new("relay-main");
+        let review = Fixture::new("relay-review");
+        spawned(&mut session, "Review", "Review the numbers", &review);
+        let mut deck = Fixture::new("relay-deck");
+        deck.user(INBOX_ASK);
+        deck.user(TOPIC_REPLY);
+        deck.user(HELPER_ASK);
+        deck.user("plain owner text");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+
+        let entries = topic_page(&session, "Deck", true);
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"kind": "relay", "id": entries[0]["id"], "ts_ms": entries[0]["ts_ms"],
+                "from": "Inbox", "direction": "to_topic",
+                "text": "The comments on deck v33 arrived in the Inbox. Please take it from here.\n\nHis 2 comments:\n1. Slide 2: align the boxes.\n2. Two scores: Option D only."}),
+            "{entries}"
+        );
+        assert_eq!(entries[1]["kind"], "relay");
+        assert_eq!(entries[1]["from"], "Review the numbers");
+        assert_eq!(entries[1]["topic_id"], "Review");
+        assert_eq!(entries[1]["text"], "The numbers on slide 7 check out.");
+        // Not a topic of this session: as before.
+        assert_eq!(entries[2]["kind"], "user");
+        assert_eq!(entries[2]["text"], HELPER_ASK);
+        assert_eq!(entries[3]["kind"], "user");
+
+        // A client that did not ask for relays gets the user entries it always got.
+        let entries = topic_page(&session, "Deck", false);
+        for (entry, text) in [INBOX_ASK, TOPIC_REPLY, HELPER_ASK].into_iter().enumerate() {
+            assert_eq!(entries[entry]["kind"], "user", "{entries}");
+            assert_eq!(entries[entry]["text"], text);
+        }
+    }
+
+    #[test]
+    fn what_a_topic_sends_the_inbox_is_a_relay_and_other_agents_stay_notes() {
+        let mut session = Fixture::new("relay-inbox");
+        let deck = Fixture::new("relay-inbox-deck");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        session.user("start the deck");
+        session.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `Deck` (progress; its reply follows later):\n\nBrief sent; waiting for the build.\n</irc>",
+            true,
+            serde_json::json!({"id": "15dc457762d6e2ec", "from": "Deck",
+                "message": "Brief sent; waiting for the build.", "progress": true}),
+        );
+        session.note(
+            "irc:incoming",
+            "<irc>\nIncoming IRC message from agent `GridReview`:\n\nCap verified.\n</irc>",
+            true,
+            serde_json::json!({"id": "15dc", "from": "GridReview", "message": "Cap verified."}),
+        );
+        let entries = inbox_page(&session, true);
+        assert_eq!(entries[1]["kind"], "relay", "{entries}");
+        assert_eq!(entries[1]["from"], "Investor deck");
+        assert_eq!(entries[1]["topic_id"], "Deck");
+        assert_eq!(entries[1]["direction"], "to_inbox");
+        assert_eq!(entries[1]["text"], "Brief sent; waiting for the build.");
+        assert_eq!(entries[2]["kind"], "note", "{entries}");
+
+        // A client that did not ask for relays gets the notes it always got.
+        let entries = inbox_page(&session, false);
+        assert_eq!(entries[1]["kind"], "note", "{entries}");
+        assert!(entries[1]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Brief sent; waiting for the build.")));
+        assert_eq!(entries[2]["kind"], "note");
+    }
+
+    #[test]
+    fn a_page_says_whether_it_shows_relays() {
+        let mut session = Fixture::new("relay-flag");
+        let deck = Fixture::new("relay-flag-deck");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        session.user("start the deck");
+        let shows_relays = |relay_entries, topic: Option<&str>| {
+            read_page(
+                &session.path,
+                &PageRequest {
+                    relay_entries,
+                    topic: topic.map(str::to_owned),
+                    ..PageRequest::default()
+                },
+            )
+            .unwrap()
+            .relay_entries
+        };
+        assert!(shows_relays(true, None));
+        assert!(shows_relays(true, Some("Deck")));
+        assert!(!shows_relays(false, None));
+        assert!(!shows_relays(false, Some("Deck")));
+        // A session whose topics cannot be read tells no handover apart.
+        assert!(super::super::topic_titles(session.path.parent().unwrap()).is_none());
+    }
+
+    #[test]
+    fn only_omps_exact_instruction_lines_are_dropped() {
+        let mut session = Fixture::new("relay-lookalike");
+        let mut deck = Fixture::new("relay-lookalike-deck");
+        deck.user("<irc>\nAsked by Inbox (`Main`):\n\nCheck slide 4.\nYour answer goes back to `Main` when this turn ends, so be brief.\n</irc>");
+        deck.user("<irc>\nAsked by Inbox (`Main`):\n\nCheck slide 5.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Other?progress`.\n</irc>");
+        spawned(&mut session, "Deck", "Investor deck", &deck);
+        let entries = topic_page(&session, "Deck", true);
+        assert_eq!(
+            entries[0]["text"],
+            "Check slide 4.\nYour answer goes back to `Main` when this turn ends, so be brief.",
+            "{entries}"
+        );
+        assert_eq!(
+            entries[1]["text"],
+            "Check slide 5.\nYour answer goes back to `Main` when this turn ends; for an interim note write `agent://Other?progress`.",
+            "{entries}"
+        );
+    }
 }
 
 #[cfg(test)]

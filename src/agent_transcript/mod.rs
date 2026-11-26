@@ -16,7 +16,7 @@ mod subagents;
 pub(crate) mod tests;
 pub(crate) mod topics;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -26,7 +26,8 @@ use base64::Engine as _;
 use crate::api::schema::{AskFormAnswer, PendingAsk};
 use crate::api::schema::{
     TopicSuggestionState, TranscriptEntry, TranscriptModel, TranscriptPlanItem, TranscriptRecap,
-    TranscriptStepStatus, TranscriptSubagent, TranscriptTurnStatus, TranscriptWorking,
+    TranscriptRelayDirection, TranscriptStepStatus, TranscriptSubagent, TranscriptTurnStatus,
+    TranscriptWorking,
 };
 use index::{read_line, Kind, SessionIndex};
 use normalize::{
@@ -72,6 +73,9 @@ pub(crate) struct PageRequest {
     /// or `""` when it holds the session from its start. Origin marks that
     /// changed are re-sent from there instead of from the cursor's floor.
     pub(crate) held_from: Option<String>,
+    /// Show the handovers between the agent's Inbox and its topics as
+    /// `relay` entries; without it they stay `user`/`note` entries.
+    pub(crate) relay_entries: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +93,8 @@ pub(crate) struct Page {
     /// On an `after` page, the ids of the entries re-sent from before the
     /// cursor, in page order; `None` on newest and `before` pages.
     pub(crate) resent: Option<Vec<String>>,
+    /// The page shows Inbox↔topic handovers as `relay` entries.
+    pub(crate) relay_entries: bool,
 }
 
 #[derive(Debug)]
@@ -165,6 +171,15 @@ fn with_index<T>(
     path: &Path,
     read: impl FnOnce(&View<'_>) -> Result<T, TranscriptError>,
 ) -> Result<T, TranscriptError> {
+    with_index_relaying(path, Relays::None, read)
+}
+
+/// [`with_index`] for a page that shows the handovers `relays` recognises.
+fn with_index_relaying<T>(
+    path: &Path,
+    relays: Relays,
+    read: impl FnOnce(&View<'_>) -> Result<T, TranscriptError>,
+) -> Result<T, TranscriptError> {
     let index = cached_index(path);
     let mut index = index
         .lock()
@@ -181,8 +196,41 @@ fn with_index<T>(
         index: &index,
         branch: index.branch(),
         file: Mutex::new(file),
+        relays,
     };
     read(&view)
+}
+
+/// The handovers between an agent's Inbox and its topics a page shows as
+/// `relay` entries, with the titles of the session's topics by id.
+#[derive(Default)]
+enum Relays {
+    #[default]
+    None,
+    /// A topic's page: what the Inbox or another topic handed it.
+    IntoTopic(HashMap<String, String>),
+    /// The Inbox's page: what its topics sent it.
+    IntoInbox(HashMap<String, String>),
+}
+
+/// The titles of the topics `session` records, by id (the id when untitled);
+/// `None` when its topics cannot be read, so handovers cannot be told apart.
+fn topic_titles(session: &Path) -> Option<HashMap<String, String>> {
+    match topics::topic_sessions(session) {
+        Ok(sessions) => Some(
+            sessions
+                .into_iter()
+                .map(|topic| {
+                    let title = topic.title.unwrap_or_else(|| topic.topic_id.clone());
+                    (topic.topic_id, title)
+                })
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::debug!(error = %error, "agent transcript: topics unreadable, no relay entries");
+            None
+        }
+    }
 }
 
 /// One page of `path`'s conversation, as the owner sees it, or of its topic
@@ -194,6 +242,7 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         ));
     }
     let limit = request.limit.unwrap_or(DEFAULT_TURNS).clamp(1, MAX_TURNS) as usize;
+    let inbox = path;
     let topic_path;
     let (path, other_prompts) = match request.topic.as_deref() {
         Some(id) => {
@@ -208,12 +257,24 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
                 subagents::child_session(path, id).ok_or(TranscriptError::SubagentNotFound)?;
             with_index(&child, |view| view.page(request, limit, &[]))
         }
-        None => match with_index(path, |view| view.page(request, limit, other_prompts)) {
-            Err(TranscriptError::Unavailable(error)) if not_written_yet(path, &error) => {
-                unwritten_page(path, request)
+        None => {
+            // Without the session's topics no handover can be told apart:
+            // the page says so by its `relay_entries` staying false.
+            let titles = request.relay_entries.then(|| topic_titles(inbox)).flatten();
+            let relays = match (titles, &request.topic) {
+                (None, _) => Relays::None,
+                (Some(titles), Some(_)) => Relays::IntoTopic(titles),
+                (Some(titles), None) => Relays::IntoInbox(titles),
+            };
+            match with_index_relaying(path, relays, |view| {
+                view.page(request, limit, other_prompts)
+            }) {
+                Err(TranscriptError::Unavailable(error)) if not_written_yet(path, &error) => {
+                    unwritten_page(path, request)
+                }
+                read => read,
             }
-            read => read,
-        },
+        }
     }
 }
 
@@ -294,6 +355,7 @@ fn unwritten_page(path: &Path, request: &PageRequest) -> Result<Page, Transcript
         recap: None,
         subagents: None,
         resent: request.after.as_ref().map(|_| Vec::new()),
+        relay_entries: false,
     })
 }
 
@@ -544,6 +606,7 @@ struct View<'a> {
     /// Visible active branch: record indices, root first.
     branch: &'a [u32],
     file: Mutex<File>,
+    relays: Relays,
 }
 
 impl View<'_> {
@@ -796,6 +859,7 @@ impl View<'_> {
             recap: self.current_recap()?,
             subagents: self.current_subagents()?,
             resent,
+            relay_entries: !matches!(self.relays, Relays::None),
         })
     }
 
@@ -1177,6 +1241,44 @@ impl View<'_> {
         Ok(kept)
     }
 
+    /// On a topic's page, a user message the Inbox or another topic handed
+    /// it, as a `relay` entry. A sender that is neither stays a `user` entry.
+    fn relay_into_topic(&self, id: &str, ts_ms: u64, text: &str) -> Option<TranscriptEntry> {
+        let Relays::IntoTopic(titles) = &self.relays else {
+            return None;
+        };
+        let (sender, text) = normalize::relay_into_topic(text)?;
+        let (from, topic_id) = match sender {
+            normalize::RelaySender::Inbox => ("Inbox".to_owned(), None),
+            normalize::RelaySender::Agent(topic) => (titles.get(&topic)?.clone(), Some(topic)),
+        };
+        Some(TranscriptEntry::Relay {
+            id: id.to_owned(),
+            ts_ms,
+            from,
+            topic_id,
+            direction: TranscriptRelayDirection::ToTopic,
+            text,
+        })
+    }
+
+    /// On the Inbox's page, a message one of its topics sent it, as a
+    /// `relay` entry. Other agents' messages stay notes.
+    fn relay_into_inbox(&self, id: &str, ts_ms: u64, line: &NoteLine) -> Option<TranscriptEntry> {
+        let Relays::IntoInbox(titles) = &self.relays else {
+            return None;
+        };
+        let (topic, text) = normalize::relay_into_inbox(line)?;
+        Some(TranscriptEntry::Relay {
+            id: id.to_owned(),
+            ts_ms,
+            from: titles.get(topic)?.clone(),
+            topic_id: Some(topic.to_owned()),
+            direction: TranscriptRelayDirection::ToInbox,
+            text: text.to_owned(),
+        })
+    }
+
     /// Renders `start..end`. A turn's plan goes with the first todo result in
     /// the range, or, given `plan_owners`, only with those records.
     fn render_records(
@@ -1199,13 +1301,16 @@ impl View<'_> {
                         if text.trim().is_empty() {
                             continue;
                         }
+                        let ts_ms =
+                            normalize::ts_ms(line.message.timestamp, line.timestamp.as_deref());
+                        if let Some(relay) = self.relay_into_topic(id, ts_ms, &text) {
+                            entries.push(relay);
+                            continue;
+                        }
                         let (author, author_name, text) = normalize::user_author(&text);
                         entries.push(TranscriptEntry::User {
                             id: id.to_owned(),
-                            ts_ms: normalize::ts_ms(
-                                line.message.timestamp,
-                                line.timestamp.as_deref(),
-                            ),
+                            ts_ms,
                             text,
                             author,
                             author_name,
@@ -1226,10 +1331,13 @@ impl View<'_> {
                 }
                 Kind::Note | Kind::AsyncResult => {
                     if let Some(line) = self.parse::<NoteLine>(record)? {
-                        if let Some(note) = normalize::note(&line) {
+                        let ts_ms = normalize::ts_ms(None, line.timestamp.as_deref());
+                        if let Some(relay) = self.relay_into_inbox(id, ts_ms, &line) {
+                            entries.push(relay);
+                        } else if let Some(note) = normalize::note(&line) {
                             entries.push(TranscriptEntry::Note {
                                 id: id.to_owned(),
-                                ts_ms: normalize::ts_ms(None, line.timestamp.as_deref()),
+                                ts_ms,
                                 source: note.source,
                                 title: note.title,
                                 from: note.from,

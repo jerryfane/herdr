@@ -2688,6 +2688,7 @@ mod tests {
                 pane_send_text_bracketed: false,
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
+                transcript_relay_entries: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2794,6 +2795,7 @@ mod tests {
                     pane_send_text_bracketed: false,
                     pane_send_bracketed_text: false,
                     guest_relabel: false,
+                    transcript_relay_entries: false,
                 }),
             },
         };
@@ -3087,6 +3089,7 @@ mod tests {
                     pane_send_text_bracketed: false,
                     pane_send_bracketed_text: false,
                     guest_relabel: false,
+                    transcript_relay_entries: false,
                 }),
             },
         };
