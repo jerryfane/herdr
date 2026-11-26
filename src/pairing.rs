@@ -1040,7 +1040,7 @@ pub fn append_authorized_key(path: &Path, line: &str) -> io::Result<bool> {
     // options (`from="…",restrict ssh-ed25519 …`) holds the material after them. Appending
     // a second, unrestricted line for a key the user restricted would undo the restriction.
     let material = key_line.split_whitespace().nth(1).unwrap_or_default();
-    if key_lines(&existing).any(|(_, key)| key.blob == material) {
+    if key_lines(&existing).any(|key| key.blob == material.as_bytes()) {
         return Ok(false);
     }
 
@@ -1107,53 +1107,71 @@ pub fn key_fingerprint(blob_base64: &str) -> Option<String> {
     ))
 }
 
-/// The key material and comment of one `authorized_keys` line.
+/// The key material and comment of one `authorized_keys` line, as bytes: the comment is
+/// the user's and need not be UTF-8.
 struct KeyLine<'a> {
-    blob: &'a str,
-    comment: &'a str,
+    blob: &'a [u8],
+    comment: &'a [u8],
 }
 
-fn is_key_type(token: &str) -> bool {
-    token.starts_with("ssh-") || token.starts_with("ecdsa-") || token.starts_with("sk-")
+fn is_key_type(token: &[u8]) -> bool {
+    token.starts_with(b"ssh-") || token.starts_with(b"ecdsa-") || token.starts_with(b"sk-")
 }
 
-/// The first whitespace-separated token of `text` and what follows it, trimmed.
-fn split_token(text: &str) -> Option<(&str, &str)> {
-    let text = text.trim_start();
+/// sshd separates fields with spaces and tabs only.
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+fn skip_blanks(text: &[u8]) -> &[u8] {
+    let start = text
+        .iter()
+        .position(|byte| !is_blank(*byte))
+        .unwrap_or(text.len());
+    &text[start..]
+}
+
+/// The first field of `text` (after leading blanks) and what follows it.
+fn split_token(text: &[u8]) -> Option<(&[u8], &[u8])> {
+    let text = skip_blanks(text);
     if text.is_empty() {
         return None;
     }
-    Some(match text.find(char::is_whitespace) {
-        Some(end) => (&text[..end], text[end..].trim()),
-        None => (text, ""),
-    })
+    let end = text
+        .iter()
+        .position(|byte| is_blank(*byte))
+        .unwrap_or(text.len());
+    Some(text.split_at(end))
 }
 
-/// What follows the options field, which ends at the first whitespace outside quotes
-/// (sshd's rule, so `command="a b"` is one field).
-fn after_options(line: &str) -> Option<&str> {
+/// OpenSSH's `sshkey_advance_past_options`: the options end at the first space or tab
+/// outside quotes; a backslash followed by `"` skips both, inside quotes or not. An
+/// unterminated quote makes the line unusable (`None`).
+fn after_options(line: &[u8]) -> Option<&[u8]> {
     let mut quoted = false;
-    let mut escaped = false;
-    for (at, c) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+    let mut at = 0;
+    while at < line.len() && (quoted || !is_blank(line[at])) {
+        if line[at] == b'\\' && line.get(at + 1) == Some(&b'"') {
+            at += 1;
+        } else if line[at] == b'"' {
+            quoted = !quoted;
         }
-        match c {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => return Some(&line[at..]),
-            _ => {}
-        }
+        at += 1;
     }
-    None
+    if at >= line.len() && quoted {
+        return None;
+    }
+    Some(&line[at.min(line.len())..])
 }
 
-/// Parse one `authorized_keys` line as sshd reads it: optional options, key type, key
-/// material, comment. Blank lines, comments and anything unparseable give `None`.
-fn parse_key_line(line: &str) -> Option<KeyLine<'_>> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
+/// Parse one `authorized_keys` line as sshd reads it: the key at the start of the line,
+/// else after the options; key type, key material, comment. Blank lines, comments and
+/// anything unparseable give `None`.
+fn parse_key_line(line: &[u8]) -> Option<KeyLine<'_>> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line = skip_blanks(line);
+    if line.is_empty() || line[0] == b'#' {
         return None;
     }
     let (first, _) = split_token(line)?;
@@ -1167,7 +1185,10 @@ fn parse_key_line(line: &str) -> Option<KeyLine<'_>> {
         return None;
     }
     let (blob, comment) = split_token(rest)?;
-    Some(KeyLine { blob, comment })
+    Some(KeyLine {
+        blob,
+        comment: skip_blanks(comment).trim_ascii_end(),
+    })
 }
 
 /// The file's bytes; a missing file is empty.
@@ -1179,18 +1200,21 @@ fn read_authorized_keys(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Every line of the file, each with its newline, paired with its parsed key when it is
-/// valid UTF-8 and a key line. Lines that are not (another tool's bytes) are never ours.
-fn key_lines(bytes: &[u8]) -> impl Iterator<Item = (&[u8], KeyLine<'_>)> {
+/// Every key line of the file, whatever the encoding of its comment.
+fn key_lines(bytes: &[u8]) -> impl Iterator<Item = KeyLine<'_>> {
     bytes
         .split_inclusive(|byte| *byte == b'\n')
-        .filter_map(|raw| Some((raw, parse_key_line(std::str::from_utf8(raw).ok()?)?)))
+        .filter_map(parse_key_line)
 }
 
-/// A parsed key line, returned only when it carries the herdr-pair marker.
+/// A parsed key line, returned only when it carries the herdr-pair marker. A comment that
+/// is not UTF-8 is not one herdr wrote.
 fn paired_key(key: &KeyLine<'_>) -> Option<PairedKey> {
-    let fingerprint = key_fingerprint(key.blob)?;
-    let tokens: Vec<&str> = key.comment.split_whitespace().collect();
+    let fingerprint = key_fingerprint(std::str::from_utf8(key.blob).ok()?)?;
+    let tokens: Vec<&str> = std::str::from_utf8(key.comment)
+        .ok()?
+        .split_whitespace()
+        .collect();
     let label_prefix = format!("{AUTHORIZED_KEYS_MARKER}:");
     let marker = tokens
         .iter()
@@ -1210,7 +1234,7 @@ fn paired_key(key: &KeyLine<'_>) -> Option<PairedKey> {
 pub fn list_paired_keys(path: &Path) -> io::Result<Vec<PairedKey>> {
     let bytes = read_authorized_keys(path)?;
     Ok(key_lines(&bytes)
-        .filter_map(|(_, key)| paired_key(&key))
+        .filter_map(|key| paired_key(&key))
         .collect())
 }
 
@@ -1219,13 +1243,16 @@ pub fn list_paired_keys(path: &Path) -> io::Result<Vec<PairedKey>> {
 fn stored_label(path: &Path, blob: &str) -> io::Result<Option<String>> {
     let bytes = read_authorized_keys(path)?;
     let lines: Vec<KeyLine<'_>> = key_lines(&bytes)
-        .map(|(_, key)| key)
-        .filter(|key| key.blob == blob)
+        .filter(|key| key.blob == blob.as_bytes())
         .collect();
     Ok(lines
         .iter()
         .find_map(|key| paired_key(key).map(|paired| paired.label))
-        .or_else(|| lines.first().map(|key| key.comment.to_string())))
+        .or_else(|| {
+            lines
+                .first()
+                .map(|key| String::from_utf8_lossy(key.comment).into_owned())
+        }))
 }
 
 /// Why device keys are refused off Unix, for the API (`pair_unsupported`) and the CLI.
@@ -1291,9 +1318,7 @@ pub fn remove_paired_keys(path: &Path, fingerprint: &str) -> io::Result<Vec<Pair
     let mut removed = Vec::new();
     let mut kept = Vec::with_capacity(bytes.len());
     for raw in bytes.split_inclusive(|byte| *byte == b'\n') {
-        let ours = std::str::from_utf8(raw)
-            .ok()
-            .and_then(parse_key_line)
+        let ours = parse_key_line(raw)
             .and_then(|key| paired_key(&key))
             .filter(|key| key.fingerprint == fingerprint);
         match ours {
@@ -2619,5 +2644,59 @@ mod tests {
             b"# caf\xe9 \xff\xfe\nssh-rsa AAAA \xff own\n"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// Write `options ssh-ed25519 <blob> comment` and try to append the same key; returns
+    /// whether it was appended, after checking the file is unchanged when it was not.
+    /// The presence check must read options exactly as OpenSSH's
+    /// `sshkey_advance_past_options` does and never decode the comment, so a key sshd
+    /// accepts with restrictions is never duplicated without them.
+    fn appends_beside(tag: &str, options: &[u8], comment: &[u8]) -> bool {
+        let key = key_with(10);
+        let blob = key.split(' ').nth(1).unwrap();
+        let contents = [options, b" ssh-ed25519 ", blob.as_bytes(), comment, b"\n"].concat();
+        let marked = marked_authorized_key(&key, "iPhone");
+        let path = temp_keys(tag);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &contents).unwrap();
+        let appended = append_authorized_key(&path, &marked).unwrap();
+        let expected = if appended {
+            [contents.as_slice(), marked.as_bytes(), b"\n"].concat()
+        } else {
+            contents
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        appended
+    }
+
+    #[test]
+    fn a_restricted_key_with_a_non_utf8_comment_is_present() {
+        assert!(!appends_beside(
+            "sshd-latin1",
+            br#"from="10.0.0.1",restrict"#,
+            b" Jos\xE9"
+        ));
+    }
+
+    /// `\"` skips both characters, so `\\"` ends with an escaped quote and the next `"`
+    /// closes the string.
+    #[test]
+    fn a_backslash_quote_in_options_skips_both_characters() {
+        assert!(!appends_beside(
+            "sshd-escape",
+            br#"from="10.0.0.1",restrict,command="echo \\"x""#,
+            b""
+        ));
+    }
+
+    /// Here the quote never closes, so sshd rejects the line: the key is not present.
+    #[test]
+    fn a_line_with_an_unterminated_quote_does_not_hold_the_key() {
+        assert!(appends_beside(
+            "sshd-unterminated",
+            br#"command="echo \\""#,
+            b""
+        ));
     }
 }
