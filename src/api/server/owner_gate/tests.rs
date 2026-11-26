@@ -399,6 +399,7 @@ fn ping_reports_the_owner_protocol_and_scope_but_not_the_owners_capabilities() {
         assert_eq!(capabilities["owner_scope"], json!(scope), "{pong}");
         assert_eq!(capabilities["agent_transcript"], true, "{pong}");
         assert_eq!(capabilities["agent_topic_suggestions"], true, "{pong}");
+        assert_eq!(capabilities["owner_browser_origin"], true, "{pong}");
         assert_eq!(capabilities["agent_read_recent_unwrapped"], true, "{pong}");
         assert_eq!(
             capabilities.get("server_update").is_some(),

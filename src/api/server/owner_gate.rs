@@ -157,6 +157,7 @@ const CHAT_CAPABILITIES: &[&str] = &[
     "transcript_max_bytes",
     "pane_stream_resync",
     "gram_thumbnails",
+    "owner_browser_origin",
 ];
 const TERMINAL_CAPABILITIES: &[&str] = &[
     "pane_input_stream",

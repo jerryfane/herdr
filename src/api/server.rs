@@ -262,6 +262,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_topics_switch_when_idle: false,
         // Suggestions go through the same Unix-only control socket.
         agent_topic_suggestions: cfg!(unix),
+        owner_browser_origin: true,
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,
@@ -4076,6 +4077,7 @@ mod tests {
                 agent_topics_switch: false,
                 agent_topics_switch_when_idle: false,
                 agent_topic_suggestions: false,
+                owner_browser_origin: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
@@ -8697,6 +8699,7 @@ mod federation_tests {
         .to_string();
         let with_suggestions = ServerCapabilities {
             agent_topic_suggestions: true,
+            owner_browser_origin: true,
             ..default_capabilities().expect("capabilities")
         };
         let (peer, route) = polled_rename_peer(with_suggestions, refusal.clone());

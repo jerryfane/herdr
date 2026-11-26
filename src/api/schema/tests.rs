@@ -1303,6 +1303,7 @@ fn success_response_round_trips() {
                 agent_topics_switch: false,
                 agent_topics_switch_when_idle: false,
                 agent_topic_suggestions: false,
+                owner_browser_origin: false,
                 gram_reachable: false,
                 transcript_max_bytes: false,
                 api_bridge_frames: false,
