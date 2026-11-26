@@ -13,6 +13,7 @@ pub mod integrations;
 pub mod machines;
 pub(crate) mod operations;
 pub mod owner_access;
+pub mod pair;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -37,6 +38,7 @@ pub use guest::*;
 pub use integrations::*;
 pub use machines::*;
 pub use owner_access::*;
+pub use pair::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -114,6 +116,11 @@ operations::define_operations! {
     OwnerAccessAdd(OwnerAccessAddParams) => "owner_access.add", false, false;
     OwnerAccessRenew(OwnerAccessRenewParams) => "owner_access.renew", false, false;
     OwnerAccessRemove(OwnerAccessRemoveParams) => "owner_access.remove", false, false;
+    /// Owner only: device keys in this machine's `authorized_keys`. Never
+    /// reachable by guests, owner browsers, federation peers or fenced callers.
+    PairAddKey(PairAddKeyParams) => "pair.add_key", false, false;
+    PairKeysList(PairKeysListParams) => "pair.keys.list", false, false;
+    PairKeysRemove(PairKeysRemoveParams) => "pair.keys.remove", false, false;
     /// Internal only: resolve an agent and its live-agent check for the guest gate.
     #[serde(skip)]
     #[schemars(skip)]

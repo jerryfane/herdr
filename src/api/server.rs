@@ -54,6 +54,7 @@ mod guest_owner;
 mod owner_access;
 #[cfg(unix)]
 mod owner_gate;
+mod pair_keys;
 #[cfg(unix)]
 mod remote_gate;
 #[cfg(unix)]
@@ -276,6 +277,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         // Guest RPCs are Unix-only.
         guest_relabel: cfg!(unix),
         guest_relabel_rev: cfg!(unix),
+        // `authorized_keys` device keys are Unix-only.
+        pair_add_key: cfg!(unix),
         transcript_relay_entries: true,
     })
 }
@@ -1790,6 +1793,11 @@ fn handle_principal_connection(
     // Owner-only `owner_access.*`, local to this machine. Federation peers and
     // fenced callers were refused above, and guests never get here.
     if let Some(result) = owner_access::maybe_handle(&mut stream, &request, changes_ui) {
+        return result;
+    }
+
+    // Owner-only `pair.*`, local to this machine, refused as `owner_access.*` is.
+    if let Some(result) = pair_keys::maybe_handle(&mut stream, &request, changes_ui) {
         return result;
     }
 
@@ -4090,6 +4098,7 @@ mod tests {
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
                 guest_relabel_rev: false,
+                pair_add_key: false,
                 transcript_relay_entries: false,
             }),
             None,
@@ -4988,6 +4997,7 @@ mod tests {
             value["result"]["capabilities"]["guest_relabel_rev"],
             cfg!(unix)
         );
+        assert_eq!(value["result"]["capabilities"]["pair_add_key"], cfg!(unix));
     }
 
     /// A daemon refuses a method it does not list before anything reaches the
@@ -5599,6 +5609,9 @@ mod federation_tests {
             ("owner_access.add", Denied),
             ("owner_access.renew", Denied),
             ("owner_access.remove", Denied),
+            ("pair.add_key", Denied),
+            ("pair.keys.list", Denied),
+            ("pair.keys.remove", Denied),
             ("fence.scoped", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
@@ -6028,6 +6041,42 @@ mod federation_tests {
         assert!(
             fed.api_rx.try_recv().is_err(),
             "no owner_access RPC reached the app"
+        );
+    }
+
+    #[test]
+    fn admin_federation_peers_are_forbidden_every_pair_method() {
+        use crate::api::schema::{PairAddKeyParams, PairKeysListParams, PairKeysRemoveParams};
+        let names: Vec<&str> = Method::OPERATIONS
+            .iter()
+            .map(|operation| operation.name)
+            .filter(|name| name.starts_with("pair."))
+            .collect();
+        assert_eq!(
+            names,
+            ["pair.add_key", "pair.keys.list", "pair.keys.remove"]
+        );
+        let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
+        for method in [
+            Method::PairAddKey(PairAddKeyParams {
+                public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF".into(),
+                label: "peer".into(),
+            }),
+            Method::PairKeysList(PairKeysListParams {}),
+            Method::PairKeysRemove(PairKeysRemoveParams {
+                fingerprint: "SHA256:vL7GMFHkifrUqP8D1g/8YJGKWxWjkvRaHfKjeLXytuc".into(),
+            }),
+        ] {
+            let mut stream = raw_hello(fed.addr, "adm");
+            send_request(&mut stream, "owner", method);
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["error"]["code"], "forbidden", "{line}");
+        }
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "no pair RPC reached the app"
         );
     }
 
@@ -7807,6 +7856,9 @@ mod federation_tests {
             r#"{"id":"1","method":"owner_access.add","params":{"device_pub":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI","device_name":"Chrome","ttl_secs":3600,"account_statement":"a.b.c","approved_by":"Mac"}}"#,
             r#"{"id":"1","method":"owner_access.renew","params":{"grant_id":"g","ttl_secs":3600}}"#,
             r#"{"id":"1","method":"owner_access.remove","params":{"grant_id":"g"}}"#,
+            r#"{"id":"1","method":"pair.add_key","params":{"public_key":"ssh-ed25519 AAAA","label":"x"}}"#,
+            r#"{"id":"1","method":"pair.keys.list","params":{}}"#,
+            r#"{"id":"1","method":"pair.keys.remove","params":{"fingerprint":"SHA256:x"}}"#,
         ] {
             let mut request = fence_request(json);
             match fence_gate(&mut request, fenced, &peers) {
@@ -8288,6 +8340,28 @@ mod federation_tests {
         );
         let remove: serde_json::Value = serde_json::from_str(&remove).unwrap();
         assert_eq!(remove["error"]["code"], "invalid_params", "{remove}");
+        assert!(conn.api_rx.try_recv().is_err(), "nothing reached the app");
+    }
+
+    /// The owner's own connection reaches `pair.*`: these refusals come from the
+    /// handler itself, before `authorized_keys` is touched.
+    #[cfg(unix)]
+    #[test]
+    fn owner_connections_reach_pair_keys_without_the_app() {
+        let mut conn = drive_home(HashMap::new());
+        let rsa = home_roundtrip(
+            &mut conn,
+            serde_json::json!({"id": "a", "method": "pair.add_key", "params": {"public_key": "ssh-rsa AAAAB3NzaC1yc2E user@host", "label": "Mac"}}),
+        );
+        let rsa: serde_json::Value = serde_json::from_str(&rsa).unwrap();
+        assert_eq!(rsa["error"]["code"], "pair_key_invalid", "{rsa}");
+        let mut conn = drive_home(HashMap::new());
+        let label = home_roundtrip(
+            &mut conn,
+            serde_json::json!({"id": "b", "method": "pair.add_key", "params": {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF", "label": "a\nb"}}),
+        );
+        let label: serde_json::Value = serde_json::from_str(&label).unwrap();
+        assert_eq!(label["error"]["code"], "pair_label_invalid", "{label}");
         assert!(conn.api_rx.try_recv().is_err(), "nothing reached the app");
     }
 

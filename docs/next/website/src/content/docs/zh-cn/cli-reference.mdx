@@ -181,6 +181,8 @@ herdr guest log [<guest-id>] [--limit N]          # 活动记录,最新在前
 
 ```bash
 herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+herdr pair --list
+herdr pair --revoke <fingerprint|label>
 ```
 
 `herdr pair` 会显示一个供 HerdrUp 应用扫描的二维码。二维码只包含一次性令牌(有效期为 `--ttl`,默认 300 秒)和本机的公开信息,绝不包含密钥:应用自行生成密钥对,只发送公钥,`herdr pair` 将其追加到 `~/.ssh/authorized_keys`。
@@ -192,6 +194,8 @@ herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
 ```
 
 `#` 之后是二维码所编码的同一份 JSON,经无填充的 base64url 编码,因此只携带同一个一次性令牌。在终端中该链接以 OSC 8 超链接输出,点击一次即可打开;完整 URL 也始终以纯文本显示,便于在不支持 OSC 8 的终端或非终端输出中复制。
+
+`herdr pair --list` 列出配对添加的设备密钥(`~/.ssh/authorized_keys` 中带 `herdr-pair` 标记的行),每行一个 `SHA256:…` 指纹和标签。`herdr pair --revoke` 按指纹或完全匹配的标签移除一个密钥;若多个密钥共用同一标签,则拒绝移除并列出这些密钥,请改用指纹。文件中的其他行既不会列出也不会被移除,文件以 0600 权限原子地重写。
 
 ## 会话
 

@@ -153,6 +153,15 @@ fn pair_command() -> Command {
                 .value_parser(clap::value_parser!(u16))
                 .help("Listen on a fixed port instead of one the OS picks"),
         )
+        .arg(
+            flag("list")
+                .conflicts_with("revoke")
+                .help("List the device keys pairing added to ~/.ssh/authorized_keys"),
+        )
+        .arg(option("revoke", "FINGERPRINT|LABEL").help(
+            "Remove one paired device key by its SHA256 fingerprint or its label; a label \
+             shared by several keys is refused",
+        ))
 }
 
 fn status_command() -> Command {

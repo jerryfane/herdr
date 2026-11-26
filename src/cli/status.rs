@@ -460,6 +460,7 @@ mod tests {
                 pane_send_bracketed_text: false,
                 guest_relabel: false,
                 guest_relabel_rev: false,
+                pair_add_key: false,
                 transcript_relay_entries: false,
             }),
         }

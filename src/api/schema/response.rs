@@ -493,6 +493,22 @@ pub enum ResponseResult {
         /// Grants this call revoked; `[]` when none matched.
         removed: Vec<String>,
     },
+    PairKeyAdded {
+        /// False when the key's material was already in `authorized_keys`.
+        added: bool,
+        /// True when nothing was written because the key was already there.
+        already: bool,
+        fingerprint: String,
+        /// The label as stored, after sanitising.
+        label: String,
+    },
+    PairKeysList {
+        keys: Vec<super::pair::PairKeyInfo>,
+    },
+    PairKeysRemoved {
+        /// The lines this call removed; `[]` when none matched.
+        removed: Vec<super::pair::PairKeyInfo>,
+    },
     /// Internal: the guest gate's agent lookup plus its live-agent check.
     #[cfg(unix)]
     #[schemars(skip)]

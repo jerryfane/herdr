@@ -195,6 +195,8 @@ herdr owner-access remove <grant-id> | --device-pub KEY | --fingerprint FINGERPR
 
 ```bash
 herdr pair [--lan] [--ttl <seconds>] [--port <port>] [--open] [--qr-file <path>]
+herdr pair --list
+herdr pair --revoke <fingerprint|label>
 ```
 
 `herdr pair` は HerdrUp アプリで読み取る QR を表示します。QR には 1 回限りのトークン(有効期間は `--ttl`、既定 300 秒)とこのマシンの公開情報だけが入り、鍵は含まれません。アプリは自分で鍵ペアを作り、公開鍵だけを送ります。`herdr pair` はそれを `~/.ssh/authorized_keys` に追加します。
@@ -206,6 +208,8 @@ QR の下には、画面の QR を自分では読み取れない同じコンピ�
 ```
 
 `#` 以降は QR と同じ JSON をパディングなしの base64url にしたもので、同じ 1 回限りのトークン以外は含みません。端末ではリンクを OSC 8 ハイパーリンクとして出力するのでクリック 1 回で開けます。OSC 8 非対応の端末や端末以外への出力でもコピーできるよう、URL 全体は常にプレーンテキストでも表示します。
+
+`herdr pair --list` はペアリングで追加したデバイス鍵(`~/.ssh/authorized_keys` の `herdr-pair` 行)を、1 行に 1 つずつ `SHA256:…` フィンガープリントとラベルで表示します。`herdr pair --revoke` はフィンガープリントか完全一致のラベルで 1 つ削除します。複数の鍵が同じラベルを持つ場合は削除せずに該当する鍵を一覧表示するので、フィンガープリントで指定してください。ファイルの他の行は表示も削除もされず、ファイルはモード 0600 でアトミックに書き換えられます。
 
 ## セッション
 

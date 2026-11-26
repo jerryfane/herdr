@@ -949,19 +949,29 @@ pub fn serve_one_pairing(
     }
 }
 
+/// The home whose `~/.ssh/authorized_keys` pairing writes: `$HOME`, else `/root`.
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"))
+}
+
 pub fn authorized_keys_path(home: &Path) -> PathBuf {
     home.join(".ssh").join("authorized_keys")
 }
 
 /// The line we append, carrying the marker and a device label so it can be identified and
-/// revoked later.
+/// revoked later. Only the key type and material are kept from `public_key_line`: the
+/// client's own comment never reaches the file.
 pub fn marked_authorized_key(public_key_line: &str, device_label: &str) -> String {
-    let key = public_key_line.trim();
+    let mut fields = public_key_line.split_whitespace();
+    let kind = fields.next().unwrap_or_default();
+    let blob = fields.next().unwrap_or_default();
     let label = device_label.trim();
     if label.is_empty() {
-        format!("{key} {AUTHORIZED_KEYS_MARKER}")
+        format!("{kind} {blob} {AUTHORIZED_KEYS_MARKER}")
     } else {
-        format!("{key} {AUTHORIZED_KEYS_MARKER}:{label}")
+        format!("{kind} {blob} {AUTHORIZED_KEYS_MARKER}:{label}")
     }
 }
 
@@ -1024,18 +1034,17 @@ pub fn append_authorized_key(path: &Path, line: &str) -> io::Result<bool> {
         }
     }
 
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = read_authorized_keys(path)?;
     // Compare on the key material, not the whole line: the comment carries a device label
-    // that can legitimately differ between pairings of the same key.
+    // that can legitimately differ between pairings of the same key, and a line with
+    // options (`from="…",restrict ssh-ed25519 …`) holds the material after them. Appending
+    // a second, unrestricted line for a key the user restricted would undo the restriction.
     let material = key_line.split_whitespace().nth(1).unwrap_or_default();
-    let already = existing
-        .lines()
-        .any(|l| l.split_whitespace().nth(1) == Some(material));
-    if already {
+    if key_lines(&existing).any(|key| key.blob == material.as_bytes()) {
         return Ok(false);
     }
 
-    let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
+    let needs_newline = !existing.is_empty() && !existing.ends_with(b"\n");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1052,6 +1061,310 @@ pub fn append_authorized_key(path: &Path, line: &str) -> io::Result<bool> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(true)
+}
+
+/// Longest label `pair.add_key` accepts before sanitising.
+#[cfg(unix)]
+pub const MAX_PAIR_LABEL_CHARS: usize = 80;
+
+/// A key line in `authorized_keys` that carries the herdr-pair marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedKey {
+    /// OpenSSH form: `SHA256:` and the unpadded base64 of the key blob's SHA-256.
+    pub fingerprint: String,
+    /// The text after `herdr-pair:`; empty for a bare marker.
+    pub label: String,
+    /// Everything after the key material.
+    pub comment: String,
+}
+
+/// The outcome of [`add_paired_key`].
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedPairedKey {
+    /// False when the key material was already in the file.
+    pub added: bool,
+    pub fingerprint: String,
+    /// The label as written, after sanitising.
+    pub label: String,
+}
+
+/// Why [`add_paired_key`] refused, with a stable error code.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPairedKeyError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// OpenSSH's SHA256 fingerprint of a base64 key blob, or `None` when it is not base64.
+pub fn key_fingerprint(blob_base64: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob_base64)
+        .ok()?;
+    Some(format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(blob))
+    ))
+}
+
+/// The key material and comment of one `authorized_keys` line, as bytes: the comment is
+/// the user's and need not be UTF-8.
+struct KeyLine<'a> {
+    blob: &'a [u8],
+    comment: &'a [u8],
+}
+
+fn is_key_type(token: &[u8]) -> bool {
+    token.starts_with(b"ssh-") || token.starts_with(b"ecdsa-") || token.starts_with(b"sk-")
+}
+
+/// sshd separates fields with spaces and tabs only.
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+fn skip_blanks(text: &[u8]) -> &[u8] {
+    let start = text
+        .iter()
+        .position(|byte| !is_blank(*byte))
+        .unwrap_or(text.len());
+    &text[start..]
+}
+
+/// The first field of `text` (after leading blanks) and what follows it.
+fn split_token(text: &[u8]) -> Option<(&[u8], &[u8])> {
+    let text = skip_blanks(text);
+    if text.is_empty() {
+        return None;
+    }
+    let end = text
+        .iter()
+        .position(|byte| is_blank(*byte))
+        .unwrap_or(text.len());
+    Some(text.split_at(end))
+}
+
+/// OpenSSH's `sshkey_advance_past_options`: the options end at the first space or tab
+/// outside quotes; a backslash followed by `"` skips both, inside quotes or not. An
+/// unterminated quote makes the line unusable (`None`).
+fn after_options(line: &[u8]) -> Option<&[u8]> {
+    let mut quoted = false;
+    let mut at = 0;
+    while at < line.len() && (quoted || !is_blank(line[at])) {
+        if line[at] == b'\\' && line.get(at + 1) == Some(&b'"') {
+            at += 1;
+        } else if line[at] == b'"' {
+            quoted = !quoted;
+        }
+        at += 1;
+    }
+    if at >= line.len() && quoted {
+        return None;
+    }
+    Some(&line[at.min(line.len())..])
+}
+
+/// Parse one `authorized_keys` line as sshd reads it: the key at the start of the line,
+/// else after the options; key type, key material, comment. Blank lines, comments and
+/// anything unparseable give `None`.
+fn parse_key_line(line: &[u8]) -> Option<KeyLine<'_>> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line = skip_blanks(line);
+    if line.is_empty() || line[0] == b'#' {
+        return None;
+    }
+    let (first, _) = split_token(line)?;
+    let key = if is_key_type(first) {
+        line
+    } else {
+        after_options(line)?
+    };
+    let (kind, rest) = split_token(key)?;
+    if !is_key_type(kind) {
+        return None;
+    }
+    let (blob, comment) = split_token(rest)?;
+    Some(KeyLine {
+        blob,
+        comment: skip_blanks(comment).trim_ascii_end(),
+    })
+}
+
+/// The file's bytes; a missing file is empty.
+fn read_authorized_keys(path: &Path) -> io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Every key line of the file, whatever the encoding of its comment.
+fn key_lines(bytes: &[u8]) -> impl Iterator<Item = KeyLine<'_>> {
+    bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter_map(parse_key_line)
+}
+
+/// A parsed key line, returned only when it carries the herdr-pair marker. A comment that
+/// is not UTF-8 is not one herdr wrote.
+fn paired_key(key: &KeyLine<'_>) -> Option<PairedKey> {
+    let fingerprint = key_fingerprint(std::str::from_utf8(key.blob).ok()?)?;
+    let tokens: Vec<&str> = std::str::from_utf8(key.comment)
+        .ok()?
+        .split_whitespace()
+        .collect();
+    let label_prefix = format!("{AUTHORIZED_KEYS_MARKER}:");
+    let marker = tokens
+        .iter()
+        .position(|token| *token == AUTHORIZED_KEYS_MARKER || token.starts_with(&label_prefix))?;
+    let mut label_words = vec![tokens[marker]
+        .strip_prefix(&label_prefix)
+        .unwrap_or_default()];
+    label_words.extend(&tokens[marker + 1..]);
+    Some(PairedKey {
+        fingerprint,
+        label: label_words.join(" ").trim().to_string(),
+        comment: tokens.join(" "),
+    })
+}
+
+/// Every herdr-pair line in `authorized_keys`, in file order. A missing file has none.
+pub fn list_paired_keys(path: &Path) -> io::Result<Vec<PairedKey>> {
+    let bytes = read_authorized_keys(path)?;
+    Ok(key_lines(&bytes)
+        .filter_map(|key| paired_key(&key))
+        .collect())
+}
+
+/// The label already stored for this key material: a herdr-pair line's label, else the
+/// comment of the user's own line holding it.
+#[cfg(unix)]
+fn stored_label(path: &Path, blob: &str) -> io::Result<Option<String>> {
+    let bytes = read_authorized_keys(path)?;
+    let lines: Vec<KeyLine<'_>> = key_lines(&bytes)
+        .filter(|key| key.blob == blob.as_bytes())
+        .collect();
+    Ok(lines
+        .iter()
+        .find_map(|key| paired_key(key).map(|paired| paired.label))
+        .or_else(|| {
+            lines
+                .first()
+                .map(|key| String::from_utf8_lossy(key.comment).into_owned())
+        }))
+}
+
+/// Why device keys are refused off Unix, for the API (`pair_unsupported`) and the CLI.
+pub const PAIR_KEYS_UNSUPPORTED: &str = "device keys are available on macOS and Linux only";
+
+/// Validate, sanitise and append one device key with the herdr-pair marker.
+///
+/// The label must be 1 to [`MAX_PAIR_LABEL_CHARS`] characters without control
+/// characters; it is then sanitised as `pair.redeem` does. Only the key type and material
+/// are written, never the client's own comment.
+#[cfg(unix)]
+pub fn add_paired_key(
+    path: &Path,
+    public_key: &str,
+    label: &str,
+) -> Result<AddedPairedKey, AddPairedKeyError> {
+    let refuse = |code: &'static str, message: String| AddPairedKeyError { code, message };
+    let length = label.chars().count();
+    if length == 0 || length > MAX_PAIR_LABEL_CHARS || label.chars().any(char::is_control) {
+        return Err(refuse(
+            "pair_label_invalid",
+            format!("label must be 1 to {MAX_PAIR_LABEL_CHARS} printable characters"),
+        ));
+    }
+    let key =
+        validate_public_key_line(public_key).map_err(|err| refuse("pair_key_invalid", err))?;
+    let blob = key.split_whitespace().nth(1).unwrap_or_default();
+    let fingerprint = key_fingerprint(blob).unwrap_or_default();
+    let label = sanitize_device_label(label);
+    let write_failed = |err: io::Error| {
+        refuse(
+            "pair_write_failed",
+            format!("could not write authorized_keys: {err}"),
+        )
+    };
+    let added =
+        append_authorized_key(path, &marked_authorized_key(key, &label)).map_err(write_failed)?;
+    // Nothing was written: reply with what the file holds, not the label asked for.
+    let label = if added {
+        label
+    } else {
+        stored_label(path, blob)
+            .map_err(|err| {
+                refuse(
+                    "pair_io_failed",
+                    format!("could not read authorized_keys: {err}"),
+                )
+            })?
+            .unwrap_or_default()
+    };
+    Ok(AddedPairedKey {
+        added,
+        fingerprint,
+        label,
+    })
+}
+
+/// Remove the herdr-pair lines with this fingerprint, returning them. Every other line,
+/// a user's own key with the same material included, is kept byte for byte. The file is
+/// replaced atomically (a 0600 temp file renamed over it), and not touched at all when
+/// nothing matches.
+pub fn remove_paired_keys(path: &Path, fingerprint: &str) -> io::Result<Vec<PairedKey>> {
+    let bytes = read_authorized_keys(path)?;
+    let mut removed = Vec::new();
+    let mut kept = Vec::with_capacity(bytes.len());
+    for raw in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let ours = parse_key_line(raw)
+            .and_then(|key| paired_key(&key))
+            .filter(|key| key.fingerprint == fingerprint);
+        match ours {
+            Some(key) => removed.push(key),
+            None => kept.extend_from_slice(raw),
+        }
+    }
+    if !removed.is_empty() {
+        replace_file(path, &kept)?;
+    }
+    Ok(removed)
+}
+
+fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".{name}.herdr-{}-{nonce}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(contents)?;
+        file.sync_all()
+    });
+    let result = written.and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1716,10 +2029,12 @@ mod tests {
             .expect("base64");
         assert_eq!(blob.len(), 51);
 
-        // And it survives the write path unchanged.
+        // Its key material survives the write path unchanged; its own comment does not.
         let marked = marked_authorized_key(ok, "iPhone");
-        assert!(marked.starts_with(from_swift));
-        assert!(marked.ends_with("herdr-pair:iPhone"));
+        assert_eq!(
+            marked,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF herdr-pair:iPhone"
+        );
     }
 
     #[test]
@@ -2134,5 +2449,264 @@ mod tests {
         assert_eq!(file_mode, 0o600);
         assert_eq!(dir_mode, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key_with(byte: u8) -> String {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&11u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32u32.to_be_bytes());
+        blob.extend_from_slice(&[byte; 32]);
+        use base64::Engine as _;
+        format!(
+            "ssh-ed25519 {}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        )
+    }
+
+    fn fingerprint_of(key: &str) -> String {
+        key_fingerprint(key.split_whitespace().nth(1).unwrap()).unwrap()
+    }
+
+    /// The fingerprint is OpenSSH's: this is what `ssh-keygen -lf` prints for the key the
+    /// iOS side generated (the same pinned line as above).
+    #[test]
+    fn fingerprints_match_ssh_keygen() {
+        assert_eq!(
+            key_fingerprint("AAAAC3NzaC1lZDI1NTE5AAAAIDYBEgq6QqJ3tTOxBY+efdRE3BnChf8Bpq2SozDhVhUF")
+                .as_deref(),
+            Some("SHA256:vL7GMFHkifrUqP8D1g/8YJGKWxWjkvRaHfKjeLXytuc")
+        );
+        assert_eq!(key_fingerprint("not base64!"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adding_a_key_writes_it_once_and_a_second_add_is_idempotent() {
+        let path = temp_keys("add-twice");
+        let key = key_with(9);
+        let first = add_paired_key(&path, &format!("{key} jerry@phone"), "Jerry's iPhone").unwrap();
+        assert_eq!(
+            first,
+            AddedPairedKey {
+                added: true,
+                fingerprint: fingerprint_of(&key),
+                label: "Jerry's iPhone".into(),
+            }
+        );
+        let second = add_paired_key(&path, &key, "Another name").unwrap();
+        assert!(!second.added);
+        assert_eq!(second.fingerprint, first.fingerprint);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The client's own comment never reaches the file.
+        assert_eq!(text, format!("{key} herdr-pair:Jerry's iPhone\n"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adding_refuses_other_key_types_and_bad_labels_before_writing() {
+        let path = temp_keys("add-refused");
+        let rsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 user@host";
+        assert_eq!(
+            add_paired_key(&path, rsa, "Mac").unwrap_err().code,
+            "pair_key_invalid"
+        );
+        let key = key_with(3);
+        for label in ["", "a\nb", "tab\there", &"x".repeat(81)] {
+            assert_eq!(
+                add_paired_key(&path, &key, label).unwrap_err().code,
+                "pair_label_invalid",
+                "{label:?}"
+            );
+        }
+        assert!(!path.exists(), "nothing was written");
+        // 80 characters is the longest accepted, and the label is sanitised as
+        // `pair.redeem` does: exotic characters dropped, length capped.
+        let added = add_paired_key(&path, &key, &format!("Mac<b>{}", "y".repeat(74))).unwrap();
+        assert!(added.added);
+        assert_eq!(
+            added.label,
+            sanitize_device_label(&format!("Mac<b>{}", "y".repeat(74)))
+        );
+        assert!(!added.label.contains('<'));
+        assert_eq!(added.label.chars().count(), 48);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn list_and_remove_touch_only_herdr_pair_lines() {
+        let path = temp_keys("list-remove");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mine = key_with(1);
+        let phone = key_with(2);
+        let tablet = key_with(4);
+        // The user's own line holds the same material as the phone's herdr-pair line.
+        let original = format!(
+            "# my keys\n{mine} me@laptop\n{phone} me@phone-by-hand\n{phone} old@comment herdr-pair:Jerry's iPhone\n{tablet} herdr-pair\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let listed = list_paired_keys(&path).unwrap();
+        assert_eq!(
+            listed,
+            [
+                PairedKey {
+                    fingerprint: fingerprint_of(&phone),
+                    label: "Jerry's iPhone".into(),
+                    comment: "old@comment herdr-pair:Jerry's iPhone".into(),
+                },
+                PairedKey {
+                    fingerprint: fingerprint_of(&tablet),
+                    label: String::new(),
+                    comment: "herdr-pair".into(),
+                },
+            ]
+        );
+
+        // A user's own key is not removable here.
+        assert!(remove_paired_keys(&path, &fingerprint_of(&mine))
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let removed = remove_paired_keys(&path, &fingerprint_of(&phone)).unwrap();
+        assert_eq!(removed, listed[..1]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("# my keys\n{mine} me@laptop\n{phone} me@phone-by-hand\n{tablet} herdr-pair\n")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["authorized_keys"], "no temp file left behind");
+        assert!(list_paired_keys(&path.with_file_name("missing"))
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// A key the user restricted with options (`from=`, `command="…"`) is already present:
+    /// appending a bare line for it would let it log in unrestricted.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_with_options_counts_as_present() {
+        let path = temp_keys("options");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let key = key_with(6);
+        let blob = key.split(' ').nth(1).unwrap();
+        let original = format!(
+            "from=\"10.0.0.1\",command=\"echo a b\",restrict ssh-ed25519 {blob} restricted phone\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let added = add_paired_key(&path, &key, "iPhone").unwrap();
+        assert!(!added.added);
+        // Nothing was written, so the reply names what the file holds.
+        assert_eq!(added.label, "restricted phone");
+        assert!(!append_authorized_key(&path, &marked_authorized_key(&key, "iPhone")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_add_replies_with_the_stored_label() {
+        let path = temp_keys("stored-label");
+        let key = key_with(7);
+        assert!(add_paired_key(&path, &key, "Old Name").unwrap().added);
+        let again = add_paired_key(&path, &key, "New Name").unwrap();
+        assert!(!again.added);
+        assert_eq!(again.label, "Old Name");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// A line that is not UTF-8 is someone else's: listing, adding and removing work
+    /// around it and keep it byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_lines_are_kept_byte_for_byte() {
+        let path = temp_keys("non-utf8");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let phone = key_with(8);
+        let mut original = b"# caf\xe9 \xff\xfe\n".to_vec();
+        original.extend_from_slice(format!("{phone} herdr-pair:iPhone\n").as_bytes());
+        original.extend_from_slice(b"ssh-rsa AAAA \xff own\n");
+        std::fs::write(&path, &original).unwrap();
+
+        let listed = list_paired_keys(&path).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "iPhone");
+        assert!(!add_paired_key(&path, &phone, "iPhone").unwrap().added);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let removed = remove_paired_keys(&path, &fingerprint_of(&phone)).unwrap();
+        assert_eq!(removed, listed);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"# caf\xe9 \xff\xfe\nssh-rsa AAAA \xff own\n"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// Write `options ssh-ed25519 <blob> comment` and try to append the same key; returns
+    /// whether it was appended, after checking the file is unchanged when it was not.
+    /// The presence check must read options exactly as OpenSSH's
+    /// `sshkey_advance_past_options` does and never decode the comment, so a key sshd
+    /// accepts with restrictions is never duplicated without them.
+    fn appends_beside(tag: &str, options: &[u8], comment: &[u8]) -> bool {
+        let key = key_with(10);
+        let blob = key.split(' ').nth(1).unwrap();
+        let contents = [options, b" ssh-ed25519 ", blob.as_bytes(), comment, b"\n"].concat();
+        let marked = marked_authorized_key(&key, "iPhone");
+        let path = temp_keys(tag);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &contents).unwrap();
+        let appended = append_authorized_key(&path, &marked).unwrap();
+        let expected = if appended {
+            [contents.as_slice(), marked.as_bytes(), b"\n"].concat()
+        } else {
+            contents
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        appended
+    }
+
+    #[test]
+    fn a_restricted_key_with_a_non_utf8_comment_is_present() {
+        assert!(!appends_beside(
+            "sshd-latin1",
+            br#"from="10.0.0.1",restrict"#,
+            b" Jos\xE9"
+        ));
+    }
+
+    /// `\"` skips both characters, so `\\"` ends with an escaped quote and the next `"`
+    /// closes the string.
+    #[test]
+    fn a_backslash_quote_in_options_skips_both_characters() {
+        assert!(!appends_beside(
+            "sshd-escape",
+            br#"from="10.0.0.1",restrict,command="echo \\"x""#,
+            b""
+        ));
+    }
+
+    /// Here the quote never closes, so sshd rejects the line: the key is not present.
+    #[test]
+    fn a_line_with_an_unterminated_quote_does_not_hold_the_key() {
+        assert!(appends_beside(
+            "sshd-unterminated",
+            br#"command="echo \\""#,
+            b""
+        ));
     }
 }
