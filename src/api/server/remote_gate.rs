@@ -16,8 +16,7 @@ use super::{
 };
 use crate::api::schema::{
     AgentInfo, GuestAgentProbeParams, GuestAuditEvent, InputSource, Method, PaneSendKeysParams,
-    Request,
-    ResponseResult, SuccessResponse,
+    Request, ResponseResult, SuccessResponse,
 };
 use crate::api::transport::{ApiStream, ApiStreamRead};
 
