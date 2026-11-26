@@ -589,46 +589,46 @@ mod control {
     }
 
     /// The claimed refresh: ask the agent, keep its answer and emit
-    /// `agent.topics.changed` (`listed`) when the list changed. A failed ask
-    /// is retried after each of [`TOPIC_LIST_RETRIES`].
+    /// `agent.topics.changed` (`listed`) when the list changed. Each round
+    /// retries a failed ask after each of [`TOPIC_LIST_RETRIES`], and only
+    /// a round whose retries all failed counts as failed, so a list request
+    /// waiting for the round gets the retry's answer.
     fn refresh_topic_list(
         terminal_id: &str,
         control: &ControlHandle,
         event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
     ) {
-        let mut retries = TOPIC_LIST_RETRIES.iter();
         loop {
-            let ticket = control.list.ticket();
-            match ask_topic_list(control) {
-                Ok(list) => {
-                    retries = TOPIC_LIST_RETRIES.iter();
-                    if control.list.store(ticket, list) {
-                        let event = AppEvent::AgentTopicsChanged {
-                            terminal_id: terminal_id.to_owned(),
-                            generation: control.generation,
-                            change: TopicChange {
-                                topic_id: String::new(),
-                                reason: AgentTopicChangeReason::Listed,
-                                suggestion_id: None,
-                                code: None,
-                            },
-                        };
-                        if event_tx.blocking_send(event).is_err() {
+            let mut retries = TOPIC_LIST_RETRIES.iter();
+            loop {
+                let ticket = control.list.ticket();
+                match ask_topic_list(control) {
+                    Ok(list) => {
+                        if control.list.store(ticket, list)
+                            && !announce_listed(terminal_id, control, event_tx)
+                        {
                             control.list.abandon_refresh();
                             return;
                         }
+                        break;
                     }
-                }
-                Err(error) => {
-                    log_control_error("topics refresh", &error);
-                    control.list.refresh_failed(ListFailure {
-                        code: error.code(),
-                        message: error.message(),
-                    });
-                    if let Some(wait) = retries.next() {
+                    Err(error) => {
+                        log_control_error("topics refresh", &error);
+                        // A refusal stays one; an agent busy or briefly gone
+                        // may answer the next ask.
+                        let transient =
+                            matches!(error, ControlError::Unreachable(_) | ControlError::TimedOut);
+                        let Some(wait) = retries.next().filter(|_| transient) else {
+                            control.list.refresh_failed(ListFailure {
+                                code: error.code(),
+                                message: error.message(),
+                            });
+                            break;
+                        };
+                        control.list.mark_stale();
                         std::thread::sleep(*wait);
-                        if control.list.is_live() {
-                            continue;
+                        if !control.list.is_live() {
+                            break;
                         }
                     }
                 }
@@ -637,6 +637,26 @@ mod control {
                 return;
             }
         }
+    }
+
+    /// Emit `agent.topics.changed` (`listed`) for the kept list; false once
+    /// the app is gone.
+    fn announce_listed(
+        terminal_id: &str,
+        control: &ControlHandle,
+        event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
+    ) -> bool {
+        let event = AppEvent::AgentTopicsChanged {
+            terminal_id: terminal_id.to_owned(),
+            generation: control.generation,
+            change: TopicChange {
+                topic_id: String::new(),
+                reason: AgentTopicChangeReason::Listed,
+                suggestion_id: None,
+                code: None,
+            },
+        };
+        event_tx.blocking_send(event).is_ok()
     }
 
     fn log_control_error(what: &'static str, error: &ControlError) {

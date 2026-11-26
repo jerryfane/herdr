@@ -1212,6 +1212,35 @@ fn list_requests_with_nothing_kept_share_the_one_ask() {
 }
 
 #[test]
+fn a_list_request_with_nothing_kept_gets_the_answer_of_a_retried_ask() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let asks = Arc::new(AtomicUsize::new(0));
+    let fake = {
+        let asks = Arc::clone(&asks);
+        FakeControl::start("cache-retry", move |frame| {
+            if frame["type"] != "topics_list" {
+                return json!({"success": false, "error": "Unknown command."});
+            }
+            if asks.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Busy past the command timeout: the ask times out.
+                std::thread::sleep(
+                    crate::agent_topics::control::COMMAND_TIMEOUT + Duration::from_secs(1),
+                );
+            }
+            json!({"success": true, "data": {"topics": [omp_topic("Plan", "Plan", "idle")]}})
+        })
+    };
+    let (_session, app, pane) = offered("cache-retry", &fake);
+    let response = topics(&app, list(&pane));
+    assert_eq!(
+        response["result"]["topics"][0]["topic_id"], "Plan",
+        "{response}"
+    );
+    assert_eq!(asks.load(Ordering::SeqCst), 2, "one failed ask, one retry");
+}
+
+#[test]
 fn a_probe_miss_is_unreachable_for_an_agent_with_topics_and_unsupported_otherwise() {
     let omp = std::process::id();
     let session = Fixture::new("probe-none");

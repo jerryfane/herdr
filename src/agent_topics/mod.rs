@@ -227,6 +227,9 @@ struct ListState {
     rounds: u64,
     /// Why the last round did not answer, if it did not.
     failure: Option<ListFailure>,
+    /// A list request gave up waiting with nothing kept: the first answer
+    /// kept after it is announced (`listed`), as nobody else got it.
+    missed: bool,
 }
 
 /// Why the agent's topics could not be listed, as `agent.topics.list`
@@ -314,8 +317,9 @@ impl ListCache {
     /// Keep the agent's answer to the ask that took `ticket`, unless an
     /// answer to a later ask is kept already. A change applied after the
     /// ask began may be missing from it, so it is kept stale (the refresh
-    /// asks again for that change). Whether it replaced a different list:
-    /// the first answer is no change, its requests get it as their answer.
+    /// asks again for that change). Whether it replaced a different list,
+    /// or is the first answer after a list request gave up waiting for it;
+    /// otherwise the first answer goes to the requests that wait for it.
     pub(crate) fn store(&self, ticket: u64, mut list: TopicList) -> bool {
         let mut state = self.lock();
         if state.cancelled {
@@ -330,16 +334,17 @@ impl ListCache {
         if ticket < state.changed {
             list.stale = true;
         }
-        let changed = state
-            .list
-            .as_ref()
-            .is_some_and(|kept| kept.topics != list.topics || kept.suggestions != list.suggestions);
+        let changed = match state.list.as_ref() {
+            Some(kept) => kept.topics != list.topics || kept.suggestions != list.suggestions,
+            None => std::mem::take(&mut state.missed),
+        };
         state.stored = ticket;
         state.list = Some(list);
         changed
     }
 
-    /// The agent did not answer a refresh: what is kept is stale.
+    /// The agent did not answer this round's asks, retries included: what
+    /// is kept is stale, and requests waiting for the round get `failure`.
     pub(crate) fn refresh_failed(&self, failure: ListFailure) {
         let mut state = self.lock();
         state.rounds += 1;
@@ -348,6 +353,14 @@ impl ListCache {
             list.stale = true;
         }
         self.rounds.notify_all();
+    }
+
+    /// One ask of the round failed and is retried: what is kept is stale,
+    /// and requests waiting for the round keep waiting.
+    pub(crate) fn mark_stale(&self) {
+        if let Some(list) = self.lock().list.as_mut() {
+            list.stale = true;
+        }
     }
 
     /// Claim the one refresh; false while one runs (it then asks once more)
@@ -401,7 +414,7 @@ impl ListCache {
         timeout: Duration,
     ) -> Result<TopicList, ListFailure> {
         let state = self.lock();
-        let (state, _) = self
+        let (mut state, _) = self
             .rounds
             .wait_timeout_while(state, timeout, |state| {
                 state.rounds == seen && state.refreshing && !state.cancelled
@@ -416,6 +429,7 @@ impl ListCache {
                 message: "the agent's control endpoint went away".into(),
             });
         }
+        state.missed = true;
         if state.rounds == seen && state.refreshing {
             return Err(ListFailure {
                 code: "topics_timeout",
@@ -660,6 +674,47 @@ mod tests {
             Err(failure()),
             "an abandoned refresh does not keep it waiting"
         );
+    }
+
+    #[test]
+    fn a_waiting_list_request_gets_the_answer_of_a_retried_ask() {
+        let cache = Arc::new(ListCache::default());
+        let seen = cache.rounds();
+        assert!(cache.begin_refresh());
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.wait_answer(seen, Duration::from_secs(30)))
+        };
+        // The first ask failed; the round pauses and asks again.
+        let _failed = cache.ticket();
+        cache.mark_stale();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "a retried ask does not end the round"
+        );
+        let retried = cache.ticket();
+        assert!(
+            !cache.store(retried, answer(vec![topic("a", AgentTopicState::Idle)], 1)),
+            "the waiting request gets it, so nothing is announced"
+        );
+        assert_eq!(waiter.join().unwrap().unwrap().topics[0].topic_id, "a");
+    }
+
+    #[test]
+    fn the_first_answer_after_a_request_gave_up_is_announced() {
+        let cache = ListCache::default();
+        let seen = cache.rounds();
+        assert!(cache.begin_refresh());
+        let gave_up = cache.wait_answer(seen, Duration::from_millis(10));
+        assert_eq!(gave_up.unwrap_err().code, "topics_timeout");
+        let ticket = cache.ticket();
+        assert!(
+            cache.store(ticket, answer(vec![topic("a", AgentTopicState::Idle)], 1)),
+            "nobody got it: `listed` tells the request that gave up"
+        );
+        let ticket = cache.ticket();
+        assert!(!cache.store(ticket, answer(vec![topic("a", AgentTopicState::Idle)], 2)));
     }
 
     #[test]
