@@ -199,7 +199,14 @@ fn relabel_params(args: &[String]) -> Result<GuestUpdateParams, String> {
         guest_id,
         invite_id,
         machine_label: Some(label.clone()),
-        machine_label_rev: Some(crate::guest::store::now_ms()),
+        // The rename's wall-clock ms, stamped here: this CLI also runs on Windows against a
+        // remote host, where the unix-only guest store does not exist.
+        machine_label_rev: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis() as u64)
+                .unwrap_or_default(),
+        ),
         machine: parsed.option("machine"),
         ..Default::default()
     })
