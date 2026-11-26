@@ -262,7 +262,8 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         agent_topics_switch_when_idle: false,
         // Suggestions go through the same Unix-only control socket.
         agent_topic_suggestions: cfg!(unix),
-        owner_browser_origin: true,
+        // The owner gate that stamps owner-browser writes is Unix-only.
+        owner_browser_origin: cfg!(unix),
         gram_reachable: true,
         transcript_max_bytes: true,
         api_bridge_frames: true,

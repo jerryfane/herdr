@@ -15,7 +15,8 @@ use super::{
     write_json_line_allow_disconnect, ApiRequestSender, EventHub,
 };
 use crate::api::schema::{
-    AgentInfo, GuestAgentProbeParams, GuestAuditEvent, Method, PaneSendKeysParams, Request,
+    AgentInfo, GuestAgentProbeParams, GuestAuditEvent, InputSource, Method, PaneSendKeysParams,
+    Request,
     ResponseResult, SuccessResponse,
 };
 use crate::api::transport::{ApiStream, ApiStreamRead};
@@ -239,14 +240,16 @@ fn menu_commit(marker: MenuMarker) -> MenuCommit {
 /// awaits a menu and no committing batch since its last state change is on
 /// record for its terminal (in the store at `dir`). The record is held from
 /// that check through the write. `accepted` runs once the batch passes,
-/// before the write (the caller's audit). Returns the app's reply, or `None`
-/// when the batch is refused.
+/// before the write (the caller's audit). `input_source` is the gate's own
+/// decision for this principal: `Some(App)` for an owner browser, `None` for a
+/// guest. Returns the app's reply, or `None` when the batch is refused.
 pub(super) fn send_menu_keys(
     api_tx: &ApiRequestSender,
     dir: &std::path::Path,
     agent: &AgentInfo,
     keys: Vec<&'static str>,
     id: &str,
+    input_source: Option<InputSource>,
     accepted: impl FnOnce(&[&'static str]),
 ) -> Option<String> {
     let commit = menu_commit((dir.to_path_buf(), agent.terminal_id.clone()));
@@ -265,7 +268,7 @@ pub(super) fn send_menu_keys(
         method: Method::PaneSendKeys(PaneSendKeysParams {
             pane_id: agent.pane_id.clone(),
             keys: keys.into_iter().map(str::to_owned).collect(),
-            input_source: None,
+            input_source,
         }),
     };
     let response = dispatch_to_app_with_timeout(request, api_tx, None);

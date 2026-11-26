@@ -475,7 +475,10 @@ fn serve_request(
                 let Some(agent) = chat_probe.and_then(|probe| probe.agent) else {
                     return forbidden(stream);
                 };
-                let Some(response) = send_menu_keys(api_tx, &owner.dir, &agent, keys, &id, |_| {})
+                // The gate stamped this write as the owner's (App) above; the menu path keeps it.
+                let source = params.input_source;
+                let Some(response) =
+                    send_menu_keys(api_tx, &owner.dir, &agent, keys, &id, source, |_| {})
                 else {
                     return forbidden(stream);
                 };

@@ -643,6 +643,12 @@ fn chat_scope_sends_menu_keys_only_while_an_agent_waits_on_a_menu() {
         "{typed:?}"
     );
     assert!(typed.contains('\r'), "{typed:?}");
+    // The menu path keeps the gate's owner stamp: the choice is the owner's
+    // own input (an unstamped write would leave no owner turn here).
+    assert_eq!(
+        harness.granted_turn_origin().0,
+        Some(crate::terminal::TurnOrigin::Mine)
+    );
 }
 
 /// The first error line the server sends, skipping stream frames.

@@ -1080,7 +1080,7 @@ fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(stream);
             };
-            let sent = send_menu_keys(api_tx, &guest.dir, &agent, keys, &id, |keys| {
+            let sent = send_menu_keys(api_tx, &guest.dir, &agent, keys, &id, None, |keys| {
                 guest.audit(
                     GuestAuditEvent::Prompt,
                     Some(method),
