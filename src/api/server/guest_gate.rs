@@ -3153,6 +3153,21 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_guests_prompt_is_never_the_owners_even_when_it_claims_the_app() {
+        let harness = start("guest-origin");
+        let guest = harness.admit();
+        let lines = harness.call(
+            &guest,
+            json!({"id": "p", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "hi", "input_source": "app"}}),
+        );
+        assert_eq!(code(&lines), "<success>", "{lines:?}");
+        assert_eq!(
+            harness.granted_turn_origin(),
+            (Some(crate::terminal::TurnOrigin::Other), 1)
+        );
+    }
+
+    #[test]
     fn a_guest_reaches_the_granted_agents_topics_only() {
         let harness = start("topics");
         let guest = harness.admit();

@@ -315,7 +315,8 @@ fn chat_scope_never_types_into_a_terminal_and_reaches_agents_only() {
     assert_eq!(codes[9], "<success>", "a local agent is reachable");
     assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
 
-    // Prompts arrive as the owner's own, unlabeled.
+    // Prompts arrive as the owner's own, unlabeled, and start the owner's
+    // turn even though the browser sent no `input_source`.
     let (mut reader, handle) = open(
         &harness,
         owner(&harness, OwnerScope::Chat),
@@ -328,6 +329,11 @@ fn chat_scope_never_types_into_a_terminal_and_reaches_agents_only() {
     let typed = harness.pty_text(0, Duration::from_millis(500));
     assert!(typed.contains("hello"), "{typed:?}");
     assert!(!typed.contains("via HerdrUp"), "{typed:?}");
+    assert_eq!(
+        harness.granted_turn_origin(),
+        (Some(crate::terminal::TurnOrigin::Mine), 0),
+        "an owner-browser prompt is the owner's, never an `other` transcript entry"
+    );
 }
 
 #[test]

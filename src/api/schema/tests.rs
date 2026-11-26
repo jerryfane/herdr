@@ -2143,3 +2143,27 @@ fn read_choices_cover_every_api_value() {
     crate::cli::projection::assert_choices_cover_api_enum(READ_SOURCES);
     crate::cli::projection::assert_choices_cover_api_enum(READ_FORMATS);
 }
+
+#[test]
+fn input_source_is_set_and_cleared_on_every_write_that_carries_it() {
+    use serde_json::json;
+    let writes = [
+        json!({"method": "agent.prompt", "params": {"target": "a", "text": "hi"}}),
+        json!({"method": "agent.send_keys", "params": {"target": "a", "keys": ["a"]}}),
+        json!({"method": "pane.send_text", "params": {"pane_id": "w1:p1", "text": "hi"}}),
+        json!({"method": "pane.send_bracketed_text", "params": {"pane_id": "w1:p1", "text": "hi"}}),
+        json!({"method": "pane.send_input", "params": {"pane_id": "w1:p1", "text": "hi"}}),
+        json!({"method": "pane.send_keys", "params": {"pane_id": "w1:p1", "keys": ["a"]}}),
+        json!({"method": "pane.input.stream", "params": {"pane_id": "w1:p1"}}),
+    ];
+    for mut write in writes {
+        write["id"] = json!("1");
+        let mut request: Request = serde_json::from_value(write.clone()).unwrap();
+        request.method.set_input_source(Some(InputSource::App));
+        let stamped = serde_json::to_value(&request).unwrap();
+        assert_eq!(stamped["params"]["input_source"], "app", "{write}");
+        request.method.clear_input_source();
+        let cleared = serde_json::to_value(&request).unwrap();
+        assert!(cleared["params"].get("input_source").is_none(), "{write}");
+    }
+}

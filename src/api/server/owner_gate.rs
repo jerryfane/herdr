@@ -364,8 +364,11 @@ fn serve_request(
             return Ok(true);
         }
     };
-    // Input from the web is not the owner's app.
-    request.method.clear_input_source();
+    // An owner browser holds a grant the owner approved: it is the owner, so
+    // its writes count as the owner's whether or not the client says so.
+    request
+        .method
+        .set_input_source(Some(crate::api::schema::InputSource::App));
     let forbidden = |stream: &mut ApiStream| -> std::io::Result<bool> {
         let key = format!("{}\n{method}", owner.grant_id);
         if audit_due(GuestAuditEvent::OwnerDenied, &key) {

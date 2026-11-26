@@ -204,6 +204,18 @@ impl Harness {
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
+    /// Who started the granted agent's current turn, and how many prompts
+    /// that were not the owner's its transcript will mark `other`.
+    pub(in crate::api::server) fn granted_turn_origin(
+        &self,
+    ) -> (Option<crate::terminal::TurnOrigin>, usize) {
+        let (tx, rx) = std_mpsc::channel();
+        self.with_granted_terminal(move |terminal| {
+            let _ = tx.send((terminal.turn_origin, terminal.other_prompts.len()));
+        });
+        rx.recv().unwrap()
+    }
+
     /// The granted agent's process ends: the pane is left with its shell.
     pub(in crate::api::server) fn agent_exits(&self) {
         self.control
