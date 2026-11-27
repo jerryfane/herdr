@@ -20,6 +20,90 @@ fn valid_agent_name(name: &str) -> bool {
 }
 
 impl App {
+    /// Discovers and caches the live Antigravity CLI (`agy`) conversation ID as a
+    /// stable `agent_session` when an `agy` pane has not reported one via hooks.
+    /// When `force` is true (e.g. `guest.invite` / guest probe), re-inspects the
+    /// live process descriptors so switching conversations updates the session ID.
+    pub(super) fn refresh_agy_agent_session(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        force: bool,
+    ) {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        let (is_agy, has_hook_session, has_session) = match self.state.terminals.get(&terminal_id) {
+            Some(terminal) => (
+                terminal.effective_known_agent() == Some(crate::detect::Agent::Antigravity),
+                terminal
+                    .hook_authority
+                    .as_ref()
+                    .and_then(|authority| authority.session_ref.as_ref())
+                    .is_some(),
+                super::creation::terminal_agent_session_info(terminal).is_some(),
+            ),
+            None => return,
+        };
+        if !is_agy || has_hook_session || (!force && has_session) {
+            return;
+        }
+        let shell_pid = self
+            .lookup_runtime(ws_idx, pane_id)
+            .and_then(|(runtime, _)| runtime.child_pid());
+        let Some(conv_id) =
+            crate::agent_transcript::agy::resolve_conversation_id(shell_pid, None, None)
+        else {
+            return;
+        };
+        let Some(session_ref) = crate::agent_resume::AgentSessionRef::id(conv_id) else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            let next = crate::agent_resume::PersistedAgentSession {
+                source: "herdr:antigravity_cli".to_string(),
+                agent: "agy".to_string(),
+                session_ref,
+            };
+            if terminal.persisted_agent_session.as_ref() != Some(&next) {
+                terminal.set_persisted_agent_session(next);
+            }
+        }
+    }
+
+    /// Populates missing `agy` `agent_session` entries across all local panes before
+    /// answering `agent.list`, skipping panes that already have a session cached.
+    pub(super) fn refresh_missing_agy_agent_sessions(&mut self) {
+        let mut targets = Vec::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    let Some(terminal_id) = ws.terminal_id(pane_id) else {
+                        continue;
+                    };
+                    let Some(terminal) = self.state.terminals.get(terminal_id) else {
+                        continue;
+                    };
+                    let is_agy =
+                        terminal.effective_known_agent() == Some(crate::detect::Agent::Antigravity);
+                    let missing = super::creation::terminal_agent_session_info(terminal).is_none();
+                    if is_agy && missing {
+                        targets.push((ws_idx, pane_id));
+                    }
+                }
+            }
+        }
+        for (ws_idx, pane_id) in targets {
+            self.refresh_agy_agent_session(ws_idx, pane_id, false);
+        }
+    }
+
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         // Live agents derived from panes, then the paneless archived store. The
         // archived entries bypass the `is_agent_terminal` pane gate (they have no

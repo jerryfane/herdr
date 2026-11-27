@@ -154,6 +154,25 @@ pub(crate) fn resolve_db_path(
     None
 }
 
+/// Resolve the live Antigravity conversation ID for a pane from its open
+/// conversation database path (or CLI flags / reported session).
+pub(crate) fn resolve_conversation_id(
+    shell_pid: Option<u32>,
+    reported_session_id: Option<&str>,
+    reported_session_path: Option<&Path>,
+) -> Option<String> {
+    let db_path = resolve_db_path(shell_pid, reported_session_id, reported_session_path)?;
+    conversation_id_from_db_path(&db_path)
+}
+
+pub(crate) fn conversation_id_from_db_path(path: &Path) -> Option<String> {
+    if path.extension().and_then(|e| e.to_str()) != Some("db") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?.trim();
+    is_valid_conversation_id(stem).then(|| stem.to_owned())
+}
+
 /// Extract `<id>` from `<app_data_dir>/brain/<id>/...`.
 fn conversation_id_from_brain_path(path: &Path) -> Option<&str> {
     let mut iter = path.components();
@@ -3837,5 +3856,30 @@ mod tests {
             parse_agy_ask_answers(empty_first),
             Some(vec!["Only second".to_owned()])
         );
+    }
+
+    #[test]
+    fn resolve_conversation_id_extracts_valid_id_from_db_and_brain_path() {
+        let dir = std::env::temp_dir().join(format!("herdr-agy-session-id-{}", std::process::id()));
+        let conv_dir = dir.join("conversations");
+        let brain_dir = dir
+            .join("brain")
+            .join("080fb2b3-f965-484b-8c38-a6d66bd35979");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::create_dir_all(&brain_dir).unwrap();
+        let db = conv_dir.join("080fb2b3-f965-484b-8c38-a6d66bd35979.db");
+        std::fs::write(&db, b"").unwrap();
+
+        assert_eq!(
+            conversation_id_from_db_path(&db).as_deref(),
+            Some("080fb2b3-f965-484b-8c38-a6d66bd35979")
+        );
+        assert_eq!(
+            resolve_conversation_id(None, None, Some(&brain_dir)).as_deref(),
+            Some("080fb2b3-f965-484b-8c38-a6d66bd35979")
+        );
+        assert_eq!(conversation_id_from_db_path(Path::new("/tmp/.db")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
