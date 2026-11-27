@@ -1384,12 +1384,19 @@ fn page_steps(
     let mut running = Vec::new();
     let mut running_emitted = Vec::new();
     let mut scratch = Vec::new();
+    let prev_emitted_set: HashSet<&str> = prev_running_emitted.iter().map(String::as_str).collect();
     for (pos, step) in steps[..seen_end_pos].iter().enumerate() {
         if step.is_running() {
             running.push(step.idx);
             scratch.clear();
             render_step(steps, pos, false, &mut scratch);
             for entry in &scratch {
+                // On an `after` poll, a still-running step strictly before `start`
+                // was skipped above (not sent in `entries`), so only carry forward
+                // entry ids that were already emitted to the client on a prior poll.
+                if is_after && pos < start && !prev_emitted_set.contains(entry.id()) {
+                    continue;
+                }
                 running_emitted.push(entry.id().to_owned());
             }
         }
@@ -1865,26 +1872,28 @@ fn agy_ask_questions(
 
 fn parse_agy_ask_answers(raw: &str) -> Option<Vec<String>> {
     let mut answers: Vec<String> = Vec::new();
-    let mut in_answer = false;
-    for line in raw.lines() {
-        if let Some(rest) = strip_agy_answer_prefix(line) {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty() {
+    let mut current: Option<String> = None;
+    let flush = |current: &mut Option<String>, answers: &mut Vec<String>| {
+        if let Some(buf) = current.take() {
+            let trimmed = buf.trim_matches(|c| c == '\n' || c == '\r');
+            if !trimmed.trim().is_empty() {
                 answers.push(trimmed.to_owned());
-                in_answer = true;
-            } else {
-                in_answer = false;
-            }
-        } else if in_answer {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                if let Some(last) = answers.last_mut() {
-                    last.push('\n');
-                    last.push_str(trimmed);
-                }
             }
         }
+    };
+    for line in raw.lines() {
+        if let Some(rest) = strip_agy_answer_prefix(line) {
+            flush(&mut current, &mut answers);
+            let first = rest.strip_prefix(' ').unwrap_or(rest).trim_end();
+            current = Some(first.to_owned());
+        } else if let Some(buf) = current.as_mut() {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(line.trim_end());
+        }
     }
+    flush(&mut current, &mut answers);
     (!answers.is_empty()).then_some(answers)
 }
 
@@ -3711,5 +3720,122 @@ mod tests {
                     && questions[0].question == "Ship now?"
                     && ans == &["Yes"]
         ));
+    }
+
+    #[test]
+    fn intermediate_generating_poll_with_partial_reply_does_not_mark_reply_resent_on_done() {
+        // Regression for #538:
+        // Poll 1: planner is STATUS_GENERATING with no reply yet -> running_emitted has no :reply.
+        // Poll 2: planner is STILL STATUS_GENERATING with partial reply -> skipped by after-poll
+        //   (not sent in entries), so running_emitted MUST NOT add :reply.
+        // Poll 3: planner finishes (STATUS_DONE) with final reply -> :reply must be emitted and
+        //   NOT marked in resent so incremental clients append it instead of dropping it.
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Status?".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_GENERATING,
+                step_id: "agy-1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: String::new(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+
+        let p1 = page_steps("s-stream-lost", &steps, &PageRequest::default(), 20).unwrap();
+        assert!(p1
+            .entries
+            .iter()
+            .all(|e| !matches!(e, TranscriptEntry::Reply { .. })));
+
+        steps[1].payload = StepPayload::Planner {
+            thinking: String::new(),
+            reply: "Partial streamed text".into(),
+            has_tool_calls: false,
+        };
+        let p2 = page_steps(
+            "s-stream-lost",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert!(
+            p2.entries.is_empty(),
+            "still-generating step is skipped on after-poll"
+        );
+
+        steps[1].status = STATUS_DONE;
+        steps[1].completed_ms = Some(1500);
+        steps[1].payload = StepPayload::Planner {
+            thinking: String::new(),
+            reply: "Final complete answer".into(),
+            has_tool_calls: false,
+        };
+        let p3 = page_steps(
+            "s-stream-lost",
+            &steps,
+            &PageRequest {
+                after: Some(p2.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert!(p3.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::Reply { id, text, is_final: true, .. }
+                if id == "agy-1:reply" && text == "Final complete answer"
+        )));
+        let resent = p3.resent.unwrap_or_default();
+        assert!(
+            !resent.iter().any(|id| id == "agy-1:reply"),
+            "brand-new reply that was never sent in entries must not appear in resent: {resent:?}"
+        );
+    }
+
+    #[test]
+    fn parse_agy_ask_answers_preserves_leading_newline_blank_lines_and_indentation() {
+        // Regression for #539:
+        // 1) A1 followed by answer text starting on the next line before A2.
+        let leading_nl =
+            "Created At: 2026-11-27T08:38:59+01:00\nA1:\nFirst line\n    indented\nA2: Web\n";
+        assert_eq!(
+            parse_agy_ask_answers(leading_nl),
+            Some(vec![
+                "First line\n    indented".to_owned(),
+                "Web".to_owned()
+            ])
+        );
+
+        // 2) Multiline answer with internal blank line and 4-space indentation.
+        let multiline = "A1: Para one\n\n    code block line\n";
+        assert_eq!(
+            parse_agy_ask_answers(multiline),
+            Some(vec!["Para one\n\n    code block line".to_owned()])
+        );
+
+        // 3) Blank A1 with no content before A2 is still ignored.
+        let empty_first = "A1:\n\nA2: Only second\n";
+        assert_eq!(
+            parse_agy_ask_answers(empty_first),
+            Some(vec!["Only second".to_owned()])
+        );
     }
 }
