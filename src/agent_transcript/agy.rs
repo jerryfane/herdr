@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::schema::{
@@ -73,11 +74,17 @@ const AGY_DETAIL_KEYS: &[&str] = &[
 pub(crate) fn resolve_db_path(
     shell_pid: Option<u32>,
     reported_session_id: Option<&str>,
+    reported_session_path: Option<&Path>,
 ) -> Option<PathBuf> {
     let mut preferred_id = reported_session_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            reported_session_path
+                .and_then(conversation_id_from_brain_path)
+                .map(str::to_owned)
+        });
     let mut fg_pids = Vec::new();
 
     if let Some(pid) = shell_pid {
@@ -124,6 +131,15 @@ pub(crate) fn resolve_db_path(
         }
     }
 
+    if let Some(reported_path) = reported_session_path {
+        if let Some(path) = conversation_db_from_brain_path(reported_path, preferred_id.as_deref())
+        {
+            if path.is_file() || path.parent().is_some_and(Path::is_dir) {
+                return Some(path);
+            }
+        }
+    }
+
     if let Some(id) = preferred_id.as_deref() {
         if let Some(path) = default_conversation_db_path(id) {
             if path.is_file() || path.parent().is_some_and(Path::is_dir) {
@@ -133,6 +149,49 @@ pub(crate) fn resolve_db_path(
     }
 
     None
+}
+
+/// Extract `<id>` from `<app_data_dir>/brain/<id>/...`.
+fn conversation_id_from_brain_path(path: &Path) -> Option<&str> {
+    let mut iter = path.components();
+    while let Some(comp) = iter.next() {
+        if comp.as_os_str() == "brain" {
+            let id = iter.next()?.as_os_str().to_str()?;
+            return is_valid_conversation_id(id).then_some(id);
+        }
+    }
+    None
+}
+
+/// Derive `<app_data_dir>/conversations/<id>.db` from a reported path under
+/// `<app_data_dir>/brain/<id>/...` so custom app data directories work even
+/// when open-file enumeration is unavailable (e.g. Windows).
+pub(crate) fn conversation_db_from_brain_path(
+    reported_path: &Path,
+    preferred_id: Option<&str>,
+) -> Option<PathBuf> {
+    let mut app_dir = PathBuf::new();
+    let mut iter = reported_path.components();
+    let mut found_brain = false;
+    let mut path_id = None;
+    while let Some(comp) = iter.next() {
+        if comp.as_os_str() == "brain" {
+            found_brain = true;
+            path_id = iter
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .filter(|id| is_valid_conversation_id(id));
+            break;
+        }
+        app_dir.push(comp);
+    }
+    if !found_brain || app_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let id = preferred_id
+        .filter(|id| is_valid_conversation_id(id))
+        .or(path_id)?;
+    Some(app_dir.join("conversations").join(format!("{id}.db")))
 }
 
 fn is_agy_process(name: &str, argv0: Option<&str>) -> bool {
@@ -218,10 +277,14 @@ pub(crate) fn extract_db_from_open_files(
         }
     }
 
+    // When the caller named a specific conversation id, never silently return
+    // a different conversation's open DB: match that id's open DB or presence
+    // lock, or return None so resolve_db_path falls back to its own path.
     if let Some(pref) = preferred_id {
         if let Some((_, path)) = db_candidates.iter().find(|(id, _)| id == pref) {
             return Some(path.clone());
         }
+        return presence_locks.get(pref).cloned();
     }
 
     if db_candidates.len() == 1 {
@@ -237,12 +300,6 @@ pub(crate) fn extract_db_from_open_files(
 
     if let Some((_, path)) = db_candidates.first() {
         return Some(path.clone());
-    }
-
-    if let Some(pref) = preferred_id {
-        if let Some(path) = presence_locks.get(pref) {
-            return Some(path.clone());
-        }
     }
 
     presence_locks.into_values().next()
@@ -398,7 +455,6 @@ fn pb_timestamp_ms(buf: &[u8]) -> Option<u64> {
 #[derive(Debug, Clone)]
 struct DecodedStep {
     idx: u32,
-    step_type: i64,
     status: i64,
     step_id: String,
     created_ms: u64,
@@ -450,8 +506,21 @@ impl DecodedStep {
         }
     }
 
-    fn is_running_tool(&self) -> bool {
-        self.step_type == STEP_TYPE_GENERIC && self.status == STATUS_RUNNING
+    fn is_running(&self) -> bool {
+        self.status == STATUS_RUNNING
+            && matches!(
+                self.payload,
+                StepPayload::Tool { .. } | StepPayload::Planner { .. }
+            )
+    }
+
+    fn plan_items(&self) -> Option<Vec<TranscriptPlanItem>> {
+        match &self.payload {
+            StepPayload::Tool {
+                tool, args_json, ..
+            } if tool == "update_steps" => parse_update_steps_plan(args_json.as_ref()),
+            _ => None,
+        }
     }
 }
 
@@ -639,7 +708,6 @@ fn decode_step_row(
 
     DecodedStep {
         idx,
-        step_type,
         status,
         step_id,
         created_ms: meta.created_ms,
@@ -652,132 +720,60 @@ fn decode_step_row(
 // Cursors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k")]
 enum AgyCursor {
-    Before {
-        idx: u32,
-        id: String,
-    },
+    #[serde(rename = "b")]
+    Before { idx: u32, id: String },
+    #[serde(rename = "a")]
     After {
         seen_next_idx: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         tip: Option<(u32, String)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         running: Vec<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         origins: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         floor: Option<u32>,
+        /// `(reply_idx, was_final, turn_end_emitted)` for the newest planner
+        /// reply in the latest turn before `seen_next_idx`, so an `after` poll
+        /// can flip `final` and emit `TurnEnd` once when trailing tools settle
+        /// or when a later tool/planner arrives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tip_reply: Option<(u32, bool, bool)>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+struct CursorEnvelope {
+    v: String,
+    s: String,
+    #[serde(flatten)]
+    cursor: AgyCursor,
 }
 
 impl AgyCursor {
     fn encode(&self, session_id: &str) -> String {
-        let raw = match self {
-            Self::Before { idx, id } => format!("{CURSOR_VERSION}\nb\n{session_id}\n{idx}\n{id}"),
-            Self::After {
-                seen_next_idx,
-                tip,
-                running,
-                origins,
-                floor,
-            } => {
-                let tip_str = tip
-                    .as_ref()
-                    .map(|(i, id)| format!("{i} {id}"))
-                    .unwrap_or_default();
-                let running_str = running
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let origins_str = origins.map(|o| format!("{o:x}")).unwrap_or_default();
-                let floor_str = floor.map(|f| f.to_string()).unwrap_or_default();
-                format!(
-                    "{CURSOR_VERSION}\na\n{session_id}\n{seen_next_idx}\n{tip_str}\n{running_str}\n{origins_str}\n{floor_str}"
-                )
-            }
+        let env = CursorEnvelope {
+            v: CURSOR_VERSION.to_owned(),
+            s: session_id.to_owned(),
+            cursor: self.clone(),
         };
+        let raw = serde_json::to_vec(&env).unwrap_or_default();
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
     }
 
     fn decode(token: &str, session_id: &str) -> Result<Self, TranscriptError> {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .ok_or(TranscriptError::CursorExpired)?;
-        let mut parts = raw.split('\n');
-        let (Some(ver), Some(kind), Some(sess), Some(num_str)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(TranscriptError::CursorExpired);
-        };
-        if ver != CURSOR_VERSION || sess != session_id {
-            return Err(TranscriptError::CursorExpired);
-        }
-        let num: u32 = num_str
-            .parse()
             .map_err(|_| TranscriptError::CursorExpired)?;
-        match kind {
-            "b" => {
-                let id = parts.next().ok_or(TranscriptError::CursorExpired)?;
-                if parts.next().is_some() {
-                    return Err(TranscriptError::CursorExpired);
-                }
-                Ok(Self::Before {
-                    idx: num,
-                    id: id.to_owned(),
-                })
-            }
-            "a" => {
-                let tip_raw = parts.next().ok_or(TranscriptError::CursorExpired)?;
-                let running_raw = parts.next().ok_or(TranscriptError::CursorExpired)?;
-                let origins_raw = parts.next().ok_or(TranscriptError::CursorExpired)?;
-                let floor_raw = parts.next().ok_or(TranscriptError::CursorExpired)?;
-                if parts.next().is_some() {
-                    return Err(TranscriptError::CursorExpired);
-                }
-                let tip = if tip_raw.is_empty() {
-                    None
-                } else {
-                    let (i_str, id) = tip_raw
-                        .split_once(' ')
-                        .ok_or(TranscriptError::CursorExpired)?;
-                    let i: u32 = i_str.parse().map_err(|_| TranscriptError::CursorExpired)?;
-                    Some((i, id.to_owned()))
-                };
-                let running = if running_raw.is_empty() {
-                    Vec::new()
-                } else {
-                    running_raw
-                        .split(',')
-                        .map(|s| s.parse::<u32>().map_err(|_| TranscriptError::CursorExpired))
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let origins = if origins_raw.is_empty() {
-                    None
-                } else {
-                    Some(
-                        u64::from_str_radix(origins_raw, 16)
-                            .map_err(|_| TranscriptError::CursorExpired)?,
-                    )
-                };
-                let floor = if floor_raw.is_empty() {
-                    None
-                } else {
-                    Some(
-                        floor_raw
-                            .parse()
-                            .map_err(|_| TranscriptError::CursorExpired)?,
-                    )
-                };
-                Ok(Self::After {
-                    seen_next_idx: num,
-                    tip,
-                    running,
-                    origins,
-                    floor,
-                })
-            }
-            _ => Err(TranscriptError::CursorExpired),
+        let env: CursorEnvelope =
+            serde_json::from_slice(&bytes).map_err(|_| TranscriptError::CursorExpired)?;
+        if env.v != CURSOR_VERSION || env.s != session_id {
+            return Err(TranscriptError::CursorExpired);
         }
+        Ok(env.cursor)
     }
 }
 
@@ -842,6 +838,7 @@ fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptErro
         running: Vec::new(),
         origins: Some(origin::fingerprint(&request.other_prompts)),
         floor: Some(0),
+        tip_reply: None,
     }
     .encode(&session_id);
     Ok(Page {
@@ -940,71 +937,84 @@ fn page_steps(
         steps.binary_search_by_key(&target_idx, |s| s.idx).ok()
     };
 
-    let (start, end, is_after, prev_running, served_origins, served_floor, issued_floor) =
-        match (&request.before, &request.after) {
-            (Some(token), _) => {
-                let AgyCursor::Before { idx, id } = AgyCursor::decode(token, session_id)? else {
-                    return Err(TranscriptError::CursorExpired);
-                };
-                let end = pos_of_idx(idx)
-                    .filter(|&pos| steps[pos].step_id == id)
+    let (
+        start,
+        end,
+        is_after,
+        prev_running,
+        served_origins,
+        served_floor,
+        issued_floor,
+        prev_tip_reply,
+    ) = match (&request.before, &request.after) {
+        (Some(token), _) => {
+            let AgyCursor::Before { idx, id } = AgyCursor::decode(token, session_id)? else {
+                return Err(TranscriptError::CursorExpired);
+            };
+            let end = pos_of_idx(idx)
+                .filter(|&pos| steps[pos].step_id == id)
+                .ok_or(TranscriptError::CursorExpired)?;
+            (
+                page_start(steps, end, limit),
+                end,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        (None, Some(token)) => {
+            let AgyCursor::After {
+                seen_next_idx,
+                tip,
+                running,
+                origins: prev_origins,
+                floor,
+                tip_reply,
+            } = AgyCursor::decode(token, session_id)?
+            else {
+                return Err(TranscriptError::CursorExpired);
+            };
+            if seen_next_idx > max_next_idx {
+                return Err(TranscriptError::CursorExpired);
+            }
+            if let Some((tip_idx, tip_id)) = tip {
+                pos_of_idx(tip_idx)
+                    .filter(|&pos| steps[pos].step_id == tip_id)
                     .ok_or(TranscriptError::CursorExpired)?;
-                (
-                    page_start(steps, end, limit),
-                    end,
-                    false,
-                    Vec::new(),
-                    None,
-                    None,
-                    None,
-                )
             }
-            (None, Some(token)) => {
-                let AgyCursor::After {
-                    seen_next_idx,
-                    tip,
-                    running,
-                    origins: prev_origins,
-                    floor,
-                } = AgyCursor::decode(token, session_id)?
-                else {
-                    return Err(TranscriptError::CursorExpired);
-                };
-                if seen_next_idx > max_next_idx {
-                    return Err(TranscriptError::CursorExpired);
-                }
-                if let Some((tip_idx, tip_id)) = tip {
-                    pos_of_idx(tip_idx)
-                        .filter(|&pos| steps[pos].step_id == tip_id)
-                        .ok_or(TranscriptError::CursorExpired)?;
-                }
-                let start = steps.partition_point(|s| s.idx < seen_next_idx);
-                let held = held_floor(steps, request.held_from.as_deref(), session_id, floor);
-                (
-                    start,
-                    budget_end(steps, start),
-                    true,
-                    running,
-                    prev_origins,
-                    held,
-                    floor,
-                )
-            }
-            (None, None) => {
-                let end = steps.len();
-                (
-                    page_start(steps, end, limit),
-                    end,
-                    false,
-                    Vec::new(),
-                    None,
-                    None,
-                    None,
-                )
-            }
-        };
+            let start = steps.partition_point(|s| s.idx < seen_next_idx);
+            let held = held_floor(steps, request.held_from.as_deref(), session_id, floor);
+            (
+                start,
+                budget_end(steps, start),
+                true,
+                running,
+                prev_origins,
+                held,
+                floor,
+                tip_reply,
+            )
+        }
+        (None, None) => {
+            let end = steps.len();
+            (
+                page_start(steps, end, limit),
+                end,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+    };
 
     let mut entries = Vec::new();
+    let mut resent_ids = Vec::new();
     let mut others: Option<Vec<(usize, String)>> = None;
 
     if is_after {
@@ -1022,27 +1032,100 @@ fn page_steps(
         if let Some(range) = replay {
             let matched = other_user_turns(steps, other_prompts);
             for &(pos, _) in matched.iter().filter(|(pos, _)| range.contains(pos)) {
+                let before_len = entries.len();
                 render_step(steps, pos, &mut entries);
+                for entry in &entries[before_len..] {
+                    resent_ids.push(entry.id().to_owned());
+                }
             }
             others = Some(matched);
         }
 
-        // Re-send any previously-running tool step before `start` that has now finished.
+        // Re-send any previously-running tool or planner step before `start`
+        // that has now finished (excluding update_steps, handled below per turn).
+        let mut resent_planners = HashSet::new();
+        let mut resent_plan_turns = HashSet::new();
         for run_idx in prev_running {
-            if let Some(pos) = pos_of_idx(run_idx) {
-                if pos < start && !steps[pos].is_running_tool() {
-                    render_step(steps, pos, &mut entries);
+            let Some(pos) = pos_of_idx(run_idx) else {
+                continue;
+            };
+            if pos >= start || steps[pos].is_running() {
+                continue;
+            }
+            if steps[pos].plan_items().is_some() {
+                let (turn_start, turn_end) = turn_bounds(steps, pos);
+                if resent_plan_turns.insert(turn_start) {
+                    if let Some(plan_entry) = build_turn_plan(steps, turn_start, turn_end) {
+                        resent_ids.push(plan_entry.id().to_owned());
+                        entries.push(plan_entry);
+                    }
+                }
+                continue;
+            }
+            if matches!(steps[pos].payload, StepPayload::Planner { .. }) {
+                resent_planners.insert(pos);
+            }
+            let before_len = entries.len();
+            render_step(steps, pos, &mut entries);
+            for entry in &entries[before_len..] {
+                if !matches!(entry, TranscriptEntry::TurnEnd { .. }) {
+                    resent_ids.push(entry.id().to_owned());
+                }
+            }
+        }
+
+        // Re-send `{turn_id}:plan` when a new `update_steps` in `start..end`
+        // updates a turn whose plan owner was already sent before `start`.
+        for pos in start..end {
+            if steps[pos].plan_items().is_none() {
+                continue;
+            }
+            let (turn_start, turn_end) = turn_bounds(steps, pos);
+            if turn_plan_owner(steps, turn_start, turn_end).is_some_and(|owner| owner < start)
+                && resent_plan_turns.insert(turn_start)
+            {
+                if let Some(plan_entry) = build_turn_plan(steps, turn_start, turn_end) {
+                    resent_ids.push(plan_entry.id().to_owned());
+                    entries.push(plan_entry);
+                }
+            }
+        }
+
+        // Re-send the previous turn-tip reply if its `final` state flipped
+        // (e.g. a trailing tool finished, or a new tool/planner arrived after
+        // the reply), and emit `TurnEnd` once when the turn settles.
+        if let Some((reply_idx, was_final, end_emitted)) = prev_tip_reply {
+            if let Some(pos) = pos_of_idx(reply_idx) {
+                if pos < start && !resent_planners.contains(&pos) {
+                    if let StepPayload::Planner { reply, .. } = &steps[pos].payload {
+                        if !reply.trim().is_empty() {
+                            let now_final = is_reply_final(steps, pos);
+                            if now_final != was_final {
+                                let reply_id = format!("{}:reply", steps[pos].step_id);
+                                resent_ids.push(reply_id.clone());
+                                entries.push(TranscriptEntry::Reply {
+                                    id: reply_id,
+                                    ts_ms: steps[pos].created_ms,
+                                    text: reply.clone(),
+                                    is_final: now_final,
+                                });
+                            }
+                            if now_final && !end_emitted {
+                                entries.push(TranscriptEntry::TurnEnd {
+                                    id: format!("{}:end", steps[pos].step_id),
+                                    ts_ms: turn_completed_ms(steps, pos),
+                                    status: turn_end_status(steps, pos),
+                                    error: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    let resent = is_after.then(|| {
-        entries
-            .iter()
-            .map(|entry| entry.id().to_owned())
-            .collect::<Vec<_>>()
-    });
+    let resent = is_after.then_some(resent_ids);
 
     let start = match request.max_bytes {
         Some(max_bytes) if !is_after => {
@@ -1096,9 +1179,10 @@ fn page_steps(
         .map(|pos| (steps[pos].idx, steps[pos].step_id.clone()));
     let running: Vec<u32> = steps[..seen_end_pos]
         .iter()
-        .filter(|s| s.is_running_tool())
+        .filter(|s| s.is_running())
         .map(|s| s.idx)
         .collect();
+    let tip_reply = latest_tip_reply_state(steps, seen_end_pos, prev_tip_reply);
     let floor = if is_after {
         served_floor
     } else {
@@ -1111,6 +1195,7 @@ fn page_steps(
         running,
         origins: Some(origins),
         floor,
+        tip_reply,
     }
     .encode(session_id);
 
@@ -1258,15 +1343,12 @@ fn render_within(
     kept
 }
 
-fn continues_after(steps: &[DecodedStep], pos: usize) -> bool {
-    steps[pos + 1..]
-        .iter()
-        .find_map(|step| match &step.payload {
-            StepPayload::User { text } if !text.trim().is_empty() => Some(false),
-            StepPayload::Planner { .. } | StepPayload::Tool { .. } => Some(true),
-            _ => None,
-        })
-        == Some(true)
+fn turn_bounds(steps: &[DecodedStep], pos: usize) -> (usize, usize) {
+    let start = (0..=pos).rev().find(|&p| steps[p].is_user()).unwrap_or(0);
+    let end = ((pos + 1)..steps.len())
+        .find(|&p| steps[p].is_user())
+        .unwrap_or(steps.len());
+    (start, end)
 }
 
 fn turn_id_for(steps: &[DecodedStep], pos: usize) -> &str {
@@ -1274,6 +1356,118 @@ fn turn_id_for(steps: &[DecodedStep], pos: usize) -> &str {
         .rev()
         .find(|&p| steps[p].is_user())
         .map_or(steps[pos].step_id.as_str(), |p| steps[p].step_id.as_str())
+}
+
+fn turn_plan_owner(steps: &[DecodedStep], turn_start: usize, turn_end: usize) -> Option<usize> {
+    (turn_start..turn_end).find(|&p| steps[p].plan_items().is_some())
+}
+
+fn build_turn_plan(
+    steps: &[DecodedStep],
+    turn_start: usize,
+    turn_end: usize,
+) -> Option<TranscriptEntry> {
+    let turn_id = turn_id_for(steps, turn_start);
+    for p in (turn_start..turn_end).rev() {
+        if let Some(items) = steps[p].plan_items() {
+            return Some(TranscriptEntry::Plan {
+                id: format!("{turn_id}:plan"),
+                ts_ms: steps[p].created_ms,
+                items,
+            });
+        }
+    }
+    None
+}
+
+/// A planner reply at `pos` is final when:
+/// - the step itself is not still running,
+/// - no later planner step exists in the same turn,
+/// - nothing after it in the same turn is still running, and
+/// - if the planner explicitly requested tool calls (`has_tool_calls`), those
+///   tool steps have already landed (and none are still running).
+fn is_reply_final(steps: &[DecodedStep], pos: usize) -> bool {
+    let step = &steps[pos];
+    let StepPayload::Planner {
+        reply,
+        has_tool_calls,
+        ..
+    } = &step.payload
+    else {
+        return false;
+    };
+    if reply.trim().is_empty() || step.status == STATUS_RUNNING {
+        return false;
+    }
+    let (_, turn_end) = turn_bounds(steps, pos);
+    let tail = &steps[(pos + 1)..turn_end];
+    if tail
+        .iter()
+        .any(|s| matches!(s.payload, StepPayload::Planner { .. }) || s.status == STATUS_RUNNING)
+    {
+        return false;
+    }
+    if *has_tool_calls
+        && !tail
+            .iter()
+            .any(|s| matches!(s.payload, StepPayload::Tool { .. }))
+    {
+        return false;
+    }
+    true
+}
+
+fn turn_completed_ms(steps: &[DecodedStep], pos: usize) -> u64 {
+    let (_, turn_end) = turn_bounds(steps, pos);
+    steps[pos..turn_end]
+        .iter()
+        .filter_map(|s| s.completed_ms.or(Some(s.created_ms)))
+        .max()
+        .unwrap_or(steps[pos].created_ms)
+}
+
+fn turn_end_status(steps: &[DecodedStep], pos: usize) -> TranscriptTurnStatus {
+    let (_, turn_end) = turn_bounds(steps, pos);
+    let last_status = steps[pos..turn_end]
+        .iter()
+        .rev()
+        .find(|s| {
+            matches!(
+                s.payload,
+                StepPayload::Planner { .. } | StepPayload::Tool { .. }
+            )
+        })
+        .map(|s| s.status)
+        .unwrap_or(steps[pos].status);
+    match last_status {
+        STATUS_CANCELED => TranscriptTurnStatus::Aborted,
+        STATUS_ERROR => TranscriptTurnStatus::Error,
+        _ => TranscriptTurnStatus::Done,
+    }
+}
+
+fn latest_tip_reply_state(
+    steps: &[DecodedStep],
+    seen_end_pos: usize,
+    prev_tip_reply: Option<(u32, bool, bool)>,
+) -> Option<(u32, bool, bool)> {
+    if seen_end_pos == 0 {
+        return None;
+    }
+    let last_turn_start = (0..seen_end_pos)
+        .rev()
+        .find(|&p| steps[p].is_user())
+        .unwrap_or(0);
+    let reply_pos = (last_turn_start..seen_end_pos).rev().find(|&p| {
+        matches!(
+            &steps[p].payload,
+            StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
+        )
+    })?;
+    let reply_idx = steps[reply_pos].idx;
+    let now_final = is_reply_final(steps, reply_pos);
+    let prev_ended = prev_tip_reply.is_some_and(|(idx, _, ended)| idx == reply_idx && ended);
+    Some((reply_idx, now_final, prev_ended || now_final))
 }
 
 fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>) {
@@ -1285,9 +1479,7 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
             }
         }
         StepPayload::Planner {
-            thinking,
-            reply,
-            has_tool_calls,
+            thinking, reply, ..
         } => {
             if !thinking.trim().is_empty() {
                 out.push(TranscriptEntry::Thinking {
@@ -1297,7 +1489,7 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
                 });
             }
             if !reply.trim().is_empty() {
-                let is_final = !has_tool_calls && !continues_after(steps, pos);
+                let is_final = is_reply_final(steps, pos);
                 out.push(TranscriptEntry::Reply {
                     id: format!("{}:reply", step.step_id),
                     ts_ms: step.created_ms,
@@ -1307,8 +1499,8 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
                 if is_final {
                     out.push(TranscriptEntry::TurnEnd {
                         id: format!("{}:end", step.step_id),
-                        ts_ms: step.completed_ms.unwrap_or(step.created_ms),
-                        status: TranscriptTurnStatus::Done,
+                        ts_ms: turn_completed_ms(steps, pos),
+                        status: turn_end_status(steps, pos),
                         error: None,
                     });
                 }
@@ -1322,15 +1514,14 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
             ui_verb,
             error_message,
         } => {
-            if tool == "update_steps" {
-                if let Some(items) = parse_update_steps_plan(args_json.as_ref()) {
-                    out.push(TranscriptEntry::Plan {
-                        id: format!("{}:plan", turn_id_for(steps, pos)),
-                        ts_ms: step.created_ms,
-                        items,
-                    });
-                    return;
+            if step.plan_items().is_some() {
+                let (turn_start, turn_end) = turn_bounds(steps, pos);
+                if turn_plan_owner(steps, turn_start, turn_end) == Some(pos) {
+                    if let Some(plan_entry) = build_turn_plan(steps, turn_start, turn_end) {
+                        out.push(plan_entry);
+                    }
                 }
+                return;
             }
             let status = match step.status {
                 STATUS_RUNNING => TranscriptStepStatus::Running,
@@ -1724,7 +1915,8 @@ mod tests {
         assert_eq!(quiet.resent, Some(Vec::new()));
 
         // Update step idx=9 from RUNNING (2) to DONE (3) in place: the next
-        // `after` poll must re-send that step under the same id and clear `working`.
+        // `after` poll must re-send that step under the same id, clear `working`,
+        // flip step 8's reply to `final: true` (resent), and emit `TurnEnd` once.
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute("UPDATE steps SET status = 3 WHERE idx = 9", [])
@@ -1739,7 +1931,7 @@ mod tests {
         )
         .unwrap();
         assert!(updated.working.is_none());
-        assert_eq!(updated.entries.len(), 1);
+        assert_eq!(updated.entries.len(), 3, "{:?}", updated.entries);
         assert!(matches!(
             &updated.entries[0],
             TranscriptEntry::Step {
@@ -1749,7 +1941,53 @@ mod tests {
                 ..
             } if id == "step-g9:call_cmd_4" && tool == "run_command"
         ));
-        assert_eq!(updated.resent, Some(vec!["step-g9:call_cmd_4".to_owned()]));
+        assert!(matches!(
+            &updated.entries[1],
+            TranscriptEntry::Reply {
+                id,
+                is_final: true,
+                ..
+            } if id == "step-p8:reply"
+        ));
+        assert!(matches!(
+            &updated.entries[2],
+            TranscriptEntry::TurnEnd {
+                id,
+                status: TranscriptTurnStatus::Done,
+                ..
+            } if id == "step-p8:end"
+        ));
+        assert_eq!(
+            updated.resent,
+            Some(vec![
+                "step-g9:call_cmd_4".to_owned(),
+                "step-p8:reply".to_owned(),
+            ])
+        );
+
+        // Once settled, a subsequent `after` poll returns nothing and a fresh
+        // read shows `final: true` + `TurnEnd` on the turn ending with a tool.
+        let settled = read_page(
+            &path,
+            &PageRequest {
+                after: Some(updated.after.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(settled.entries.is_empty());
+        assert_eq!(settled.resent, Some(Vec::new()));
+
+        let fresh_done = read_page(&path, &PageRequest::default()).unwrap();
+        assert!(fresh_done.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::Reply { id, is_final: true, .. } if id == "step-p8:reply"
+        )));
+        assert!(fresh_done.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::TurnEnd { id, status: TranscriptTurnStatus::Done, .. }
+                if id == "step-p8:end"
+        )));
 
         // Both before and after is invalid_request.
         let err = read_page(
@@ -1782,7 +2020,24 @@ mod tests {
             ))
         );
 
-        // Falls back to presence lock if only lock is open.
+        // When preferred_id is set and does NOT match any open DB or lock,
+        // never silently return another conversation's DB.
+        assert_eq!(extract_db_from_open_files(&files, Some("other-conv")), None);
+
+        // When preferred_id matches a presence lock even without its .db open,
+        // return that preferred conversation's DB path.
+        let mixed = vec![
+            PathBuf::from("/root/.gemini/antigravity-cli/conversations/other-b.db"),
+            PathBuf::from("/root/.gemini/antigravity-cli/presence/wanted-a.lock"),
+        ];
+        assert_eq!(
+            extract_db_from_open_files(&mixed, Some("wanted-a")),
+            Some(PathBuf::from(
+                "/root/.gemini/antigravity-cli/conversations/wanted-a.db"
+            ))
+        );
+
+        // Falls back to presence lock if only lock is open and no preferred id.
         let lock_only = vec![PathBuf::from(
             "/home/u/.gemini/antigravity-cli/presence/def-456.lock",
         )];
@@ -1791,6 +2046,22 @@ mod tests {
             Some(PathBuf::from(
                 "/home/u/.gemini/antigravity-cli/conversations/def-456.db"
             ))
+        );
+
+        // Reported brain/ transcript path resolves sibling conversations/<id>.db.
+        assert_eq!(
+            conversation_db_from_brain_path(
+                Path::new("/custom/app-data/brain/conv-42/.system_generated/logs/transcript.jsonl"),
+                None,
+            ),
+            Some(PathBuf::from("/custom/app-data/conversations/conv-42.db"))
+        );
+        assert_eq!(
+            conversation_db_from_brain_path(
+                Path::new("/custom/app-data/brain/conv-42/transcript.jsonl"),
+                Some("conv-99"),
+            ),
+            Some(PathBuf::from("/custom/app-data/conversations/conv-99.db"))
         );
 
         assert_eq!(
@@ -1809,5 +2080,218 @@ mod tests {
             conversation_id_from_argv(&["agy".into(), "--conversation".into(), "../escape".into()]),
             None
         );
+    }
+
+    #[test]
+    fn plan_updates_emit_one_entry_per_turn_and_resend_on_after() {
+        let make_plan_step = |idx: u32, id: &str, ts: u64, status: &str| DecodedStep {
+            idx,
+            status: STATUS_DONE,
+            step_id: id.into(),
+            created_ms: ts,
+            completed_ms: Some(ts),
+            payload: StepPayload::Tool {
+                call_id: format!("c{idx}"),
+                tool: "update_steps".into(),
+                args_json: Some(serde_json::json!({
+                    "steps": [
+                        { "title": "Build", "status": status },
+                        { "title": "Test", "status": "pending" }
+                    ]
+                })),
+                kv_args: Vec::new(),
+                ui_verb: None,
+                error_message: None,
+            },
+        };
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Ship it".into(),
+                },
+            },
+            make_plan_step(1, "p1", 1100, "in_progress"),
+            DecodedStep {
+                idx: 2,
+                status: STATUS_DONE,
+                step_id: "g2".into(),
+                created_ms: 1150,
+                completed_ms: Some(1150),
+                payload: StepPayload::Tool {
+                    call_id: "c2".into(),
+                    tool: "run_command".into(),
+                    args_json: None,
+                    kv_args: Vec::new(),
+                    ui_verb: Some("Ran build".into()),
+                    error_message: None,
+                },
+            },
+            make_plan_step(3, "p3", 1200, "done"),
+        ];
+
+        // Full read: only ONE `{turn_id}:plan` entry, holding the newest items.
+        let page = page_steps("sess-plan", &steps, &PageRequest::default(), 20).unwrap();
+        let plans: Vec<_> = page
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEntry::Plan { id, items, .. } => Some((id.as_str(), items)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, "u0:plan");
+        assert_eq!(plans[0].1[0].status, TranscriptTaskStatus::Completed);
+
+        // A page sliced after the plan owner (idx 1) covers idx 2..=3 without
+        // repeating `u0:plan` for the second `update_steps` at idx 3.
+        let sliced = page_steps(
+            "sess-plan",
+            &steps,
+            &PageRequest {
+                max_bytes: Some(1),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(sliced.entries.len(), 1);
+        assert!(matches!(
+            &sliced.entries[0],
+            TranscriptEntry::Step { id, .. } if id == "g2:c2"
+        ));
+
+        // Appending a 3rd update_steps re-sends `u0:plan` on an `after` poll.
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_DONE,
+            step_id: "p4".into(),
+            created_ms: 1300,
+            completed_ms: Some(1300),
+            payload: StepPayload::Tool {
+                call_id: "c4".into(),
+                tool: "update_steps".into(),
+                args_json: Some(serde_json::json!({
+                    "steps": [
+                        { "title": "Build", "status": "done" },
+                        { "title": "Test", "status": "done" }
+                    ]
+                })),
+                kv_args: Vec::new(),
+                ui_verb: None,
+                error_message: None,
+            },
+        });
+        let after = page_steps(
+            "sess-plan",
+            &steps,
+            &PageRequest {
+                after: Some(page.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(after.resent, Some(vec!["u0:plan".to_owned()]));
+        assert_eq!(after.entries.len(), 1);
+        match &after.entries[0] {
+            TranscriptEntry::Plan { id, items, .. } => {
+                assert_eq!(id, "u0:plan");
+                assert_eq!(items[1].status, TranscriptTaskStatus::Completed);
+            }
+            other => panic!("expected resent Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_round_trips_delimiters_and_reply_flips_on_late_tool() {
+        let weird_sess = "sess\nwith spaces";
+        let weird_id = "step\nwith spaces";
+        let cur = AgyCursor::After {
+            seen_next_idx: 2,
+            tip: Some((1, weird_id.into())),
+            running: vec![1],
+            origins: Some(7),
+            floor: Some(0),
+            tip_reply: Some((1, true, true)),
+        };
+        let encoded = cur.encode(weird_sess);
+        assert_eq!(AgyCursor::decode(&encoded, weird_sess).unwrap(), cur);
+
+        // Planner with `has_tool_calls: true` must not emit premature TurnEnd
+        // before its tool lands; once the tool arrives and finishes, it settles.
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User { text: "Run".into() },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_DONE,
+                step_id: "p1".into(),
+                created_ms: 1100,
+                completed_ms: Some(1100),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Running now".into(),
+                    has_tool_calls: true,
+                },
+            },
+        ];
+        let p1 = page_steps("s1", &steps, &PageRequest::default(), 20).unwrap();
+        assert!(p1.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::Reply { id, is_final: false, .. } if id == "p1:reply"
+        )));
+        assert!(!p1
+            .entries
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::TurnEnd { .. })));
+
+        // Tool lands DONE -> reply settles (resent `final: true`) + TurnEnd added once.
+        steps.push(DecodedStep {
+            idx: 2,
+            status: STATUS_DONE,
+            step_id: "g2".into(),
+            created_ms: 1200,
+            completed_ms: Some(1250),
+            payload: StepPayload::Tool {
+                call_id: "c2".into(),
+                tool: "run_command".into(),
+                args_json: None,
+                kv_args: Vec::new(),
+                ui_verb: Some("Ran check".into()),
+                error_message: None,
+            },
+        });
+        let p2 = page_steps(
+            "s1",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(p2.resent, Some(vec!["p1:reply".to_owned()]));
+        assert!(p2.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::Reply { id, is_final: true, .. } if id == "p1:reply"
+        )));
+        assert!(p2.entries.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::TurnEnd { id, status: TranscriptTurnStatus::Done, .. }
+                if id == "p1:end"
+        )));
     }
 }

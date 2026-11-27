@@ -20,6 +20,8 @@ pub(crate) enum TranscriptKind {
     Agy {
         shell_pid: Option<u32>,
         reported_session_id: Option<String>,
+        reported_session_path: Option<PathBuf>,
+        #[cfg(test)]
         direct_path: Option<PathBuf>,
     },
 }
@@ -97,18 +99,31 @@ impl App {
             let shell_pid = self
                 .lookup_runtime(resolved.ws_idx, resolved.pane_id)
                 .and_then(|(runtime, _)| runtime.child_pid());
-            let reported_session_id = resume_source
+            let (reported_session_id, reported_session_path) = resume_source
                 .as_ref()
-                .filter(|(_, agent, session_ref)| {
+                .filter(|(_, agent, _)| {
                     crate::detect::parse_agent_label(agent)
                         == Some(crate::detect::Agent::Antigravity)
-                        && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
                 })
-                .map(|(_, _, session_ref)| session_ref.value.clone());
+                .map(|(source, agent, session_ref)| {
+                    let id = (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id)
+                        .then(|| session_ref.value.clone());
+                    let path = terminal
+                        .reported_agent_session_path_for(source, agent, session_ref)
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
+                                .then(|| PathBuf::from(&session_ref.value))
+                        });
+                    (id, path)
+                })
+                .unwrap_or((None, None));
             return Ok(TranscriptSource {
                 kind: TranscriptKind::Agy {
                     shell_pid,
                     reported_session_id,
+                    reported_session_path,
+                    #[cfg(test)]
                     direct_path: None,
                 },
                 agent: info
@@ -185,11 +200,24 @@ fn transcript_response(
         TranscriptKind::Agy {
             shell_pid,
             reported_session_id,
+            reported_session_path,
+            #[cfg(test)]
             direct_path,
         } => {
+            #[cfg(test)]
             let db_path = direct_path.clone().or_else(|| {
-                agent_transcript::agy::resolve_db_path(*shell_pid, reported_session_id.as_deref())
+                agent_transcript::agy::resolve_db_path(
+                    *shell_pid,
+                    reported_session_id.as_deref(),
+                    reported_session_path.as_deref(),
+                )
             });
+            #[cfg(not(test))]
+            let db_path = agent_transcript::agy::resolve_db_path(
+                *shell_pid,
+                reported_session_id.as_deref(),
+                reported_session_path.as_deref(),
+            );
             match db_path {
                 Some(path) => agent_transcript::agy::read_page(&path, &request),
                 None => {
@@ -283,6 +311,7 @@ mod tests {
             kind: TranscriptKind::Agy {
                 shell_pid: None,
                 reported_session_id: None,
+                reported_session_path: None,
                 direct_path: None,
             },
             agent: "agy".into(),
@@ -310,6 +339,7 @@ mod tests {
             kind: TranscriptKind::Agy {
                 shell_pid: None,
                 reported_session_id: None,
+                reported_session_path: None,
                 direct_path: Some(db),
             },
             agent: "agy".into(),

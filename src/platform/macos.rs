@@ -1172,30 +1172,94 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
 }
 
-/// Absolute paths currently held open by `pid`, via `lsof`.
+/// Absolute paths of vnode file descriptors currently held open by `pid`,
+/// via `proc_pidinfo(PROC_PIDLISTFDS)` and `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`.
 pub fn process_open_files(pid: u32) -> Vec<PathBuf> {
     if pid == 0 {
         return Vec::new();
     }
-    let pid_arg = pid.to_string();
-    let output = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-p", &pid_arg, "-Fn"])
-        .output()
-        .or_else(|_| {
-            std::process::Command::new("lsof")
-                .args(["-nP", "-a", "-p", &pid_arg, "-Fn"])
-                .output()
-        });
-    let Ok(output) = output else {
-        return Vec::new();
+
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    const MAX_FDS: usize = 4096;
+
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .filter(|path| path.starts_with('/'))
-        .map(PathBuf::from)
-        .collect()
+    if bytes <= 0 {
+        return Vec::new();
+    }
+
+    let fd_size = std::mem::size_of::<libc::proc_fdinfo>();
+    let count = ((bytes as usize) / fd_size).saturating_add(16).min(MAX_FDS);
+    let mut fds: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; count];
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut libc::c_void,
+            (fds.len() * fd_size) as libc::c_int,
+        )
+    };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    let actual = ((filled as usize) / fd_size).min(fds.len());
+
+    let info_size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+    let mut paths = Vec::new();
+    for fd in &fds[..actual] {
+        if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+            continue;
+        }
+        let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::proc_pidfdinfo(
+                pid as libc::c_int,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                &mut info as *mut _ as *mut libc::c_void,
+                info_size,
+            )
+        };
+        if ret != info_size {
+            continue;
+        }
+        let vip_path = unsafe {
+            std::slice::from_raw_parts(
+                info.pvip.vip_path.as_ptr() as *const u8,
+                libc::MAXPATHLEN as usize,
+            )
+        };
+        let Some(nul) = vip_path.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        if nul > 0 && vip_path[0] == b'/' {
+            paths.push(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])));
+        }
+    }
+    paths
 }
 
 pub fn session_processes(child_pid: u32) -> Vec<u32> {
