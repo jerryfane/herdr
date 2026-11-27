@@ -224,4 +224,9 @@ pub struct ServerCapabilities {
     /// Older servers ignore the field and send them as `user`/`note`.
     #[serde(default)]
     pub transcript_relay_entries: bool,
+    /// `agent.transcript` also serves Antigravity CLI (`agy`) agents by reading
+    /// their SQLite conversation database. Clients offer Chat for `agy` only
+    /// when this is true.
+    #[serde(default)]
+    pub transcript_agy: bool,
 }

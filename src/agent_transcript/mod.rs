@@ -6,6 +6,7 @@
 //! chain of the newest entry, is shown. A per-file index (see `index`) keeps
 //! one small record per entry so a page reads only the lines it renders.
 
+pub(crate) mod agy;
 pub(crate) mod ask_form;
 mod history;
 mod index;

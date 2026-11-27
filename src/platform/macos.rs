@@ -1172,6 +1172,32 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
 }
 
+/// Absolute paths currently held open by `pid`, via `lsof`.
+pub fn process_open_files(pid: u32) -> Vec<PathBuf> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    let pid_arg = pid.to_string();
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid_arg, "-Fn"])
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("lsof")
+                .args(["-nP", "-a", "-p", &pid_arg, "-Fn"])
+                .output()
+        });
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|path| path.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
 pub fn session_processes(child_pid: u32) -> Vec<u32> {
     if child_pid == 0 {
         return Vec::new();

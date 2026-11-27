@@ -11,10 +11,23 @@ use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
+/// Which harness backs a transcript, and how the worker thread locates its store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptKind {
+    Omp {
+        path: PathBuf,
+    },
+    Agy {
+        shell_pid: Option<u32>,
+        reported_session_id: Option<String>,
+        direct_path: Option<PathBuf>,
+    },
+}
+
 /// Where an agent's conversation is recorded, and how the reply names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptSource {
-    pub(crate) path: PathBuf,
+    pub(crate) kind: TranscriptKind,
     pub(crate) agent: String,
     pub(crate) pane_id: String,
     /// The pane's remembered non-owner prompts, to mark their user turns.
@@ -22,10 +35,10 @@ pub(crate) struct TranscriptSource {
 }
 
 impl App {
-    /// The omp session file behind `target` (an agent name or pane id, as
-    /// `agent.read` resolves it). Errors are `agent_not_found` (and the other
-    /// target errors) or `transcript_unsupported` for an agent that is not
-    /// omp or has not reported its session file.
+    /// The session backing `target` (an agent name or pane id, as `agent.read`
+    /// resolves it). Supports omp (reported session JSONL) and agy (live
+    /// conversation SQLite `.db` resolved on the worker thread). Errors are
+    /// `agent_not_found` (and the other target errors) or `transcript_unsupported`.
     pub(crate) fn agent_transcript_source(
         &self,
         target: &str,
@@ -48,29 +61,72 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
             .and_then(|terminal_id| self.state.terminals.get(terminal_id))
             .ok_or_else(not_found)?;
-        let Some((source, agent, session_ref)) = Self::terminal_resume_source(terminal) else {
-            return Err(unsupported("the agent has not reported a session file"));
-        };
-        if crate::detect::parse_agent_label(&agent) != Some(crate::detect::Agent::Omp) {
-            return Err(unsupported("transcripts are read from omp agents only"));
-        }
-        let path = terminal
-            .reported_agent_session_path_for(&source, &agent, &session_ref)
-            .map(PathBuf::from)
-            .or_else(|| {
-                (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
-                    .then(|| PathBuf::from(&session_ref.value))
-            })
-            .ok_or_else(|| unsupported("the agent has not reported a session file"))?;
         let info = self
             .agent_info(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(not_found)?;
-        Ok(TranscriptSource {
-            path,
-            agent: info.name.clone().unwrap_or_else(|| agent.clone()),
-            pane_id: info.pane_id,
-            other_prompts: terminal.other_prompts.delivered(),
-        })
+        let resume_source = Self::terminal_resume_source(terminal);
+
+        if let Some((source, agent, session_ref)) = resume_source.as_ref() {
+            if crate::detect::parse_agent_label(agent) == Some(crate::detect::Agent::Omp) {
+                let path = terminal
+                    .reported_agent_session_path_for(source, agent, session_ref)
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
+                            .then(|| PathBuf::from(&session_ref.value))
+                    })
+                    .ok_or_else(|| unsupported("the agent has not reported a session file"))?;
+                return Ok(TranscriptSource {
+                    kind: TranscriptKind::Omp { path },
+                    agent: info.name.clone().unwrap_or_else(|| agent.clone()),
+                    pane_id: info.pane_id,
+                    other_prompts: terminal.other_prompts.delivered(),
+                });
+            }
+        }
+
+        let is_agy = info
+            .agent
+            .as_deref()
+            .and_then(crate::detect::parse_agent_label)
+            == Some(crate::detect::Agent::Antigravity)
+            || resume_source.as_ref().is_some_and(|(_, agent, _)| {
+                crate::detect::parse_agent_label(agent) == Some(crate::detect::Agent::Antigravity)
+            });
+        if is_agy {
+            let shell_pid = self
+                .lookup_runtime(resolved.ws_idx, resolved.pane_id)
+                .and_then(|(runtime, _)| runtime.child_pid());
+            let reported_session_id = resume_source
+                .as_ref()
+                .filter(|(_, agent, session_ref)| {
+                    crate::detect::parse_agent_label(agent)
+                        == Some(crate::detect::Agent::Antigravity)
+                        && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                })
+                .map(|(_, _, session_ref)| session_ref.value.clone());
+            return Ok(TranscriptSource {
+                kind: TranscriptKind::Agy {
+                    shell_pid,
+                    reported_session_id,
+                    direct_path: None,
+                },
+                agent: info
+                    .name
+                    .clone()
+                    .or_else(|| info.agent.clone())
+                    .unwrap_or_else(|| "agy".into()),
+                pane_id: info.pane_id,
+                other_prompts: terminal.other_prompts.delivered(),
+            });
+        }
+
+        if resume_source.is_none() {
+            return Err(unsupported("the agent has not reported a session file"));
+        }
+        Err(unsupported(
+            "transcripts are read from omp and agy agents only",
+        ))
     }
 
     /// Answers `agent.transcript` through `respond_to` from a worker thread.
@@ -124,7 +180,29 @@ fn transcript_response(
         topic: params.topic,
         relay_entries: params.relay_entries,
     };
-    match agent_transcript::read_page(&source.path, &request) {
+    let page = match &source.kind {
+        TranscriptKind::Omp { path } => agent_transcript::read_page(path, &request),
+        TranscriptKind::Agy {
+            shell_pid,
+            reported_session_id,
+            direct_path,
+        } => {
+            let db_path = direct_path.clone().or_else(|| {
+                agent_transcript::agy::resolve_db_path(*shell_pid, reported_session_id.as_deref())
+            });
+            match db_path {
+                Some(path) => agent_transcript::agy::read_page(&path, &request),
+                None => {
+                    return encode_error(
+                        id,
+                        "transcript_unsupported",
+                        "the agent has not opened a conversation database",
+                    );
+                }
+            }
+        }
+    };
+    match page {
         Ok(page) => encode_success(
             id,
             ResponseResult::AgentTranscript {
@@ -177,7 +255,9 @@ mod tests {
         let header = std::fs::read_to_string(&session.path).unwrap();
         std::fs::remove_file(&session.path).unwrap();
         let source = TranscriptSource {
-            path: session.path.clone(),
+            kind: TranscriptKind::Omp {
+                path: session.path.clone(),
+            },
             agent: "omp".into(),
             pane_id: "w1:p1".into(),
             other_prompts: Vec::new(),
@@ -195,5 +275,59 @@ mod tests {
         let first = respond(&source, Some(after));
         assert_eq!(first["result"]["entries"][0]["kind"], "user", "{first}");
         assert_eq!(first["result"]["entries"][0]["text"], "first");
+    }
+
+    #[test]
+    fn agy_source_without_open_db_answers_transcript_unsupported() {
+        let source = TranscriptSource {
+            kind: TranscriptKind::Agy {
+                shell_pid: None,
+                reported_session_id: None,
+                direct_path: None,
+            },
+            agent: "agy".into(),
+            pane_id: "w1:p2".into(),
+            other_prompts: Vec::new(),
+        };
+        let reply = respond(&source, None);
+        assert_eq!(reply["error"]["code"], "transcript_unsupported", "{reply}");
+    }
+
+    #[test]
+    fn agy_source_with_fixture_db_answers_agent_transcript_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-api-agy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv-fixture-0001.db");
+        std::fs::write(&db, include_bytes!("../../agent_transcript/agy_fixture.db")).unwrap();
+
+        let source = TranscriptSource {
+            kind: TranscriptKind::Agy {
+                shell_pid: None,
+                reported_session_id: None,
+                direct_path: Some(db),
+            },
+            agent: "agy".into(),
+            pane_id: "w1:p2".into(),
+            other_prompts: Vec::new(),
+        };
+        let reply = respond(&source, None);
+        assert_eq!(reply["result"]["type"], "agent_transcript", "{reply}");
+        assert_eq!(reply["result"]["agent"], "agy");
+        assert_eq!(reply["result"]["session_id"], "conv-fixture-0001");
+        assert_eq!(reply["result"]["entries"][0]["kind"], "user");
+        assert_eq!(reply["result"]["entries"][0]["text"], "Hey");
+        assert_eq!(reply["result"]["entries"][1]["kind"], "reply");
+        assert_eq!(
+            reply["result"]["entries"][1]["text"],
+            "Hey! How can I help?"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

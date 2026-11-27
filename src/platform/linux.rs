@@ -800,6 +800,26 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
+/// Absolute paths currently held open by `pid`, via `/proc/<pid>/fd`.
+pub fn process_open_files(pid: u32) -> Vec<PathBuf> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            if target.is_absolute() {
+                paths.push(target);
+            }
+        }
+    }
+    paths
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {
