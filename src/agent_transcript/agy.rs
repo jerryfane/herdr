@@ -3756,7 +3756,10 @@ mod tests {
         ];
 
         let p1 = page_steps("s-stream-lost", &steps, &PageRequest::default(), 20).unwrap();
-        assert!(p1.entries.iter().all(|e| !matches!(e, TranscriptEntry::Reply { .. })));
+        assert!(p1
+            .entries
+            .iter()
+            .all(|e| !matches!(e, TranscriptEntry::Reply { .. })));
 
         steps[1].payload = StepPayload::Planner {
             thinking: String::new(),
@@ -3773,7 +3776,10 @@ mod tests {
             20,
         )
         .unwrap();
-        assert!(p2.entries.is_empty(), "still-generating step is skipped on after-poll");
+        assert!(
+            p2.entries.is_empty(),
+            "still-generating step is skipped on after-poll"
+        );
 
         steps[1].status = STATUS_DONE;
         steps[1].completed_ms = Some(1500);
@@ -3812,7 +3818,10 @@ mod tests {
             "Created At: 2026-11-27T08:38:59+01:00\nA1:\nFirst line\n    indented\nA2: Web\n";
         assert_eq!(
             parse_agy_ask_answers(leading_nl),
-            Some(vec!["First line\n    indented".to_owned(), "Web".to_owned()])
+            Some(vec![
+                "First line\n    indented".to_owned(),
+                "Web".to_owned()
+            ])
         );
 
         // 2) Multiline answer with internal blank line and 4-space indentation.
