@@ -280,6 +280,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         // `authorized_keys` device keys are Unix-only.
         pair_add_key: cfg!(unix),
         transcript_relay_entries: true,
+        transcript_agy: true,
     })
 }
 
@@ -4100,6 +4101,7 @@ mod tests {
                 guest_relabel_rev: false,
                 pair_add_key: false,
                 transcript_relay_entries: false,
+                transcript_agy: false,
             }),
             None,
             None,
@@ -4998,6 +5000,7 @@ mod tests {
             cfg!(unix)
         );
         assert_eq!(value["result"]["capabilities"]["pair_add_key"], cfg!(unix));
+        assert_eq!(value["result"]["capabilities"]["transcript_agy"], true);
     }
 
     /// A daemon refuses a method it does not list before anything reaches the

@@ -2692,6 +2692,7 @@ mod tests {
                 guest_relabel_rev: false,
                 pair_add_key: false,
                 transcript_relay_entries: false,
+                transcript_agy: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2802,6 +2803,7 @@ mod tests {
                     guest_relabel_rev: false,
                     pair_add_key: false,
                     transcript_relay_entries: false,
+                    transcript_agy: false,
                 }),
             },
         };
@@ -3099,6 +3101,7 @@ mod tests {
                     guest_relabel_rev: false,
                     pair_add_key: false,
                     transcript_relay_entries: false,
+                    transcript_agy: false,
                 }),
             },
         };

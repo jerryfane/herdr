@@ -1806,6 +1806,10 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     process_cwd_from_handle(process.0)
 }
 
+pub fn process_open_files(_pid: u32) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 pub(crate) fn pane_process_cwd(child_pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(
         child_pid,
