@@ -1211,23 +1211,20 @@ fn page_steps(
             if pos >= start || steps[pos].is_running() {
                 continue;
             }
-            // If a previously running/pending step settles in an earlier turn
-            // whose tip reply is no longer tracked by `prev_tip_reply` (e.g. a
-            // newer turn already started before `start`), and that turn's reply
-            // is now final, incremental replay cannot insert its `TurnEnd`
-            // ahead of the later turn's entries. Expire the cursor so the
-            // client reloads in order.
+            // If a previously running/pending step settles at or after an
+            // earlier turn's tip reply (so it held that reply open) and that
+            // turn's reply is no longer tracked by `prev_tip_reply` (e.g. a
+            // newer turn already started before `start`), incremental replay
+            // cannot insert its `TurnEnd` ahead of the later turn's entries.
+            // Expire the cursor so the client reloads in order. A background
+            // command strictly before `reply_pos` never held `TurnEnd` open,
+            // so it simply resends its settled status in place.
             let (turn_start, turn_end) = turn_bounds(steps, pos);
             if turn_end < start {
-                if let Some(reply_pos) = (turn_start..turn_end).rev().find(|&p| {
-                    matches!(
-                        &steps[p].payload,
-                        StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
-                    )
-                }) {
+                if let Some(reply_pos) = last_nonblank_planner_reply(steps, turn_start..turn_end) {
                     let tracked = prev_tip_reply
                         .is_some_and(|(reply_idx, _, _)| reply_idx == steps[reply_pos].idx);
-                    if !tracked && is_reply_final(steps, reply_pos) {
+                    if pos >= reply_pos && !tracked && is_reply_final(steps, reply_pos) {
                         return Err(TranscriptError::CursorExpired);
                     }
                 }
@@ -1677,16 +1674,23 @@ fn turn_close_pos_for_reply(steps: &[DecodedStep], reply_pos: usize) -> Option<u
     Some(last_tool.unwrap_or(reply_pos))
 }
 
-/// If `pos` is the closing step of a settled turn, return the `reply_pos` that
-/// owns that turn's `{step_id}:end` entry.
-fn settled_turn_reply_for_close_pos(steps: &[DecodedStep], pos: usize) -> Option<usize> {
-    let (turn_start, turn_end) = turn_bounds(steps, pos);
-    let reply_pos = (turn_start..turn_end).rev().find(|&p| {
+fn last_nonblank_planner_reply(
+    steps: &[DecodedStep],
+    range: std::ops::Range<usize>,
+) -> Option<usize> {
+    range.rev().find(|&p| {
         matches!(
             &steps[p].payload,
             StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
         )
-    })?;
+    })
+}
+
+/// If `pos` is the closing step of a settled turn, return the `reply_pos` that
+/// owns that turn's `{step_id}:end` entry.
+fn settled_turn_reply_for_close_pos(steps: &[DecodedStep], pos: usize) -> Option<usize> {
+    let (turn_start, turn_end) = turn_bounds(steps, pos);
+    let reply_pos = last_nonblank_planner_reply(steps, turn_start..turn_end)?;
     (turn_close_pos_for_reply(steps, reply_pos) == Some(pos)).then_some(reply_pos)
 }
 
@@ -1701,12 +1705,7 @@ fn latest_tip_reply_state(
         .rev()
         .find(|&p| steps[p].is_user())
         .unwrap_or(0);
-    let reply_pos = (last_turn_start..seen_end_pos).rev().find(|&p| {
-        matches!(
-            &steps[p].payload,
-            StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
-        )
-    })?;
+    let reply_pos = last_nonblank_planner_reply(steps, last_turn_start..seen_end_pos)?;
     let reply_idx = steps[reply_pos].idx;
     let now_final = is_reply_final(steps, reply_pos);
     let end_at_idx = turn_close_pos_for_reply(steps, reply_pos)
@@ -3325,6 +3324,129 @@ mod tests {
             .position(|e| matches!(e, TranscriptEntry::User { text, .. } if text == "Turn B"))
             .expect("Turn B present");
         assert!(p1_end_idx < u3_idx, "p1:end must precede Turn B");
+    }
+
+    #[test]
+    fn earlier_turn_pre_reply_background_command_resends_without_expiring_cursor() {
+        // Turn A starts a background command BEFORE its already-final planner reply.
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Start background build".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_RUNNING,
+                step_id: "g1".into(),
+                created_ms: 1050,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c1".into(),
+                    tool: "run_command".into(),
+                    args_json: Some(serde_json::json!({"CommandLine": "cargo build"})),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                    ask_answer: None,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_DONE,
+                step_id: "p2".into(),
+                created_ms: 1100,
+                completed_ms: Some(1100),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Build running in background.".into(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+
+        // Poll 1: Turn A already closed with p2:end even though g1 is still running.
+        let p1 = page_steps("s-prereply", &steps, &PageRequest::default(), 20).unwrap();
+        assert_eq!(
+            p1.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["u0", "g1:c1", "p2:reply", "p2:end"]
+        );
+
+        // Turn B lands while g1 is still running.
+        steps.push(DecodedStep {
+            idx: 3,
+            status: STATUS_DONE,
+            step_id: "u3".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Next question".into(),
+            },
+        });
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_DONE,
+            step_id: "p4".into(),
+            created_ms: 2050,
+            completed_ms: Some(2050),
+            payload: StepPayload::Planner {
+                thinking: String::new(),
+                reply: "Answered.".into(),
+                has_tool_calls: false,
+            },
+        });
+        let p2 = page_steps(
+            "s-prereply",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+
+        // Turn A's pre-reply background command finishes while Turn C appends:
+        // cursor must NOT expire; g1:c1 resends as Ok and Turn C appends cleanly.
+        steps[1].status = STATUS_DONE;
+        steps[1].completed_ms = Some(2500);
+        steps.push(DecodedStep {
+            idx: 5,
+            status: STATUS_DONE,
+            step_id: "u5".into(),
+            created_ms: 3000,
+            completed_ms: Some(3000),
+            payload: StepPayload::User {
+                text: "Turn C".into(),
+            },
+        });
+        let p3 = page_steps(
+            "s-prereply",
+            &steps,
+            &PageRequest {
+                after: Some(p2.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(p3.resent, Some(vec!["g1:c1".to_owned()]));
+        assert_eq!(
+            p3.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["g1:c1", "u5"]
+        );
+        assert!(matches!(
+            &p3.entries[0],
+            TranscriptEntry::Step {
+                status: TranscriptStepStatus::Ok,
+                ..
+            }
+        ));
     }
 
     #[test]
