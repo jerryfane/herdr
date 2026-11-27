@@ -899,6 +899,7 @@ impl View<'_> {
         Ok(Some(TranscriptModel {
             provider,
             id,
+            harness: Some("omp".to_owned()),
             thinking_level,
             thinking_auto,
         }))
