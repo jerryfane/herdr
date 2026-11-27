@@ -3050,7 +3050,10 @@ mod tests {
         let p1 = page_steps("s-multi", &steps, &PageRequest::default(), 20).unwrap();
         assert!(matches!(
             p1.entries.iter().find(|e| e.id() == "p1:reply"),
-            Some(TranscriptEntry::Reply { is_final: false, .. })
+            Some(TranscriptEntry::Reply {
+                is_final: false,
+                ..
+            })
         ));
 
         // Turn B starts while turn A's command is still pending.
