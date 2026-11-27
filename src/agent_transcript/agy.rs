@@ -3862,7 +3862,9 @@ mod tests {
     fn resolve_conversation_id_extracts_valid_id_from_db_and_brain_path() {
         let dir = std::env::temp_dir().join(format!("herdr-agy-session-id-{}", std::process::id()));
         let conv_dir = dir.join("conversations");
-        let brain_dir = dir.join("brain").join("080fb2b3-f965-484b-8c38-a6d66bd35979");
+        let brain_dir = dir
+            .join("brain")
+            .join("080fb2b3-f965-484b-8c38-a6d66bd35979");
         std::fs::create_dir_all(&conv_dir).unwrap();
         std::fs::create_dir_all(&brain_dir).unwrap();
         let db = conv_dir.join("080fb2b3-f965-484b-8c38-a6d66bd35979.db");

@@ -90,10 +90,9 @@ impl App {
                     let Some(terminal) = self.state.terminals.get(terminal_id) else {
                         continue;
                     };
-                    let is_agy = terminal.effective_known_agent()
-                        == Some(crate::detect::Agent::Antigravity);
-                    let missing =
-                        super::creation::terminal_agent_session_info(terminal).is_none();
+                    let is_agy =
+                        terminal.effective_known_agent() == Some(crate::detect::Agent::Antigravity);
+                    let missing = super::creation::terminal_agent_session_info(terminal).is_none();
                     if is_agy && missing {
                         targets.push((ws_idx, pane_id));
                     }
