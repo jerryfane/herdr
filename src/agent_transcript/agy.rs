@@ -854,7 +854,7 @@ fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptErro
         after,
         pending_ask: None,
         working: None,
-        model: model_from_cli_log(path),
+        model: None,
         plan: None,
         recap: None,
         subagents: None,
@@ -928,14 +928,14 @@ fn load_conversation(
             step_payload.as_deref(),
         ));
     }
-    let model = load_conversation_model(&conn).or_else(|| model_from_cli_log(path));
+    let model = load_conversation_model(&conn);
     Ok((session_id, steps, model))
 }
 
 /// Extract the active model from the conversation's `gen_metadata` table:
-/// newest row's field `1.21` (display label like `"Gemini 4 Neon (High)"`) or
-/// `1.19` (slug like `"gemini-4-neon"`), falling back to field `3.28`
-/// (`"gemini-4-neon-high"`) for brand-new conversations before the first reply.
+/// picks the newest usable row (`ORDER BY idx DESC`), preferring within that
+/// row field `1.21` (display label like `"Gemini 4 Neon (High)"`), then `1.19`
+/// (slug like `"gemini-4-neon"`), then `3.28` (`"gemini-4-neon-high"`).
 fn load_conversation_model(conn: &Connection) -> Option<TranscriptModel> {
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16")
@@ -943,37 +943,41 @@ fn load_conversation_model(conn: &Connection) -> Option<TranscriptModel> {
     let rows = stmt
         .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
         .ok()?;
-    let mut fallback: Option<(String, Option<String>)> = None;
     for row in rows.flatten() {
         let Some(blob) = row else { continue };
-        let Some(fields) = decode_pb(&blob) else {
-            continue;
-        };
-        if let Some(f1_bytes) = pb_bytes(&fields, 1) {
-            if let Some(f1) = decode_pb(f1_bytes) {
-                if let Some(label) = pb_str(&f1, 21) {
-                    if let Some((id, thinking_level)) = parse_agy_model_label(label) {
-                        return Some(agy_transcript_model(id, thinking_level));
-                    }
-                }
-                if let Some(slug) = pb_str(&f1, 19) {
-                    if let Some((id, thinking_level)) = parse_agy_model_slug(slug) {
-                        return Some(agy_transcript_model(id, thinking_level));
-                    }
+        if let Some(model) = decode_gen_metadata_model(&blob) {
+            return Some(model);
+        }
+    }
+    None
+}
+
+fn decode_gen_metadata_model(blob: &[u8]) -> Option<TranscriptModel> {
+    let fields = decode_pb(blob)?;
+    if let Some(f1_bytes) = pb_bytes(&fields, 1) {
+        if let Some(f1) = decode_pb(f1_bytes) {
+            if let Some(label) = pb_str(&f1, 21) {
+                if let Some((id, thinking_level)) = parse_agy_model_label(label) {
+                    return Some(agy_transcript_model(id, thinking_level));
                 }
             }
-        }
-        if fallback.is_none() {
-            if let Some(f3_bytes) = pb_bytes(&fields, 3) {
-                if let Some(f3) = decode_pb(f3_bytes) {
-                    if let Some(slug) = pb_str(&f3, 28) {
-                        fallback = parse_agy_model_slug(slug);
-                    }
+            if let Some(slug) = pb_str(&f1, 19) {
+                if let Some((id, thinking_level)) = parse_agy_model_slug(slug) {
+                    return Some(agy_transcript_model(id, thinking_level));
                 }
             }
         }
     }
-    fallback.map(|(id, thinking_level)| agy_transcript_model(id, thinking_level))
+    if let Some(f3_bytes) = pb_bytes(&fields, 3) {
+        if let Some(f3) = decode_pb(f3_bytes) {
+            if let Some(slug) = pb_str(&f3, 28) {
+                if let Some((id, thinking_level)) = parse_agy_model_slug(slug) {
+                    return Some(agy_transcript_model(id, thinking_level));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn agy_transcript_model(id: String, thinking_level: Option<String>) -> TranscriptModel {
@@ -986,21 +990,26 @@ fn agy_transcript_model(id: String, thinking_level: Option<String>) -> Transcrip
     }
 }
 
+fn parse_agy_effort(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    matches!(
+        lowered.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+    .then_some(lowered)
+}
+
 fn parse_agy_model_label(raw: &str) -> Option<(String, Option<String>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(open) = trimmed.rfind(" (") {
-        if let Some(inner) = trimmed[open + 2..].strip_suffix(')') {
-            let lowered = inner.trim().to_ascii_lowercase();
-            if matches!(
-                lowered.as_str(),
-                "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-            ) {
-                let base = trimmed[..open].trim();
+    if let Some((base, rest)) = trimmed.rsplit_once(" (") {
+        if let Some(inner) = rest.strip_suffix(')') {
+            if let Some(effort) = parse_agy_effort(inner) {
+                let base = base.trim();
                 if !base.is_empty() {
-                    return Some((base.to_owned(), Some(lowered)));
+                    return Some((base.to_owned(), Some(effort)));
                 }
             }
         }
@@ -1013,50 +1022,15 @@ fn parse_agy_model_slug(raw: &str) -> Option<(String, Option<String>)> {
     if trimmed.is_empty() {
         return None;
     }
-    for suffix in ["minimal", "low", "medium", "high", "xhigh", "max"] {
-        let needle = format!("-{suffix}");
-        if trimmed.len() > needle.len()
-            && trimmed[trimmed.len() - needle.len()..].eq_ignore_ascii_case(&needle)
-        {
-            let base = trimmed[..trimmed.len() - needle.len()].trim();
+    if let Some((base, suffix)) = trimmed.rsplit_once('-') {
+        if let Some(effort) = parse_agy_effort(suffix) {
+            let base = base.trim();
             if !base.is_empty() {
-                return Some((base.to_owned(), Some(suffix.to_owned())));
+                return Some((base.to_owned(), Some(effort)));
             }
         }
     }
     Some((trimmed.to_owned(), None))
-}
-
-/// Fallback when a conversation has no `gen_metadata` rows yet: inspect the
-/// sibling `<app_data_dir>/cli.log` for the latest model override line.
-fn model_from_cli_log(db_path: &Path) -> Option<TranscriptModel> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
-    const NEEDLE: &str = "Propagating selected model override to backend: label=\"";
-
-    let log_path = db_path.parent()?.parent()?.join("cli.log");
-    let mut file = std::fs::File::open(log_path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let mut buf = Vec::new();
-    if len > MAX_TAIL_BYTES {
-        file.seek(SeekFrom::End(-(MAX_TAIL_BYTES as i64))).ok()?;
-    }
-    file.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    for line in text.lines().rev() {
-        let Some(pos) = line.find(NEEDLE) else {
-            continue;
-        };
-        let rest = &line[pos + NEEDLE.len()..];
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        if let Some((id, thinking_level)) = parse_agy_model_label(&rest[..end]) {
-            return Some(agy_transcript_model(id, thinking_level));
-        }
-    }
-    None
 }
 
 fn page_steps(
@@ -1562,14 +1536,14 @@ fn is_reply_final(steps: &[DecodedStep], pos: usize) -> bool {
     else {
         return false;
     };
-    if reply.trim().is_empty() || step.status == STATUS_RUNNING {
+    if reply.trim().is_empty() || step.is_running() {
         return false;
     }
     let (_, turn_end) = turn_bounds(steps, pos);
     let tail = &steps[(pos + 1)..turn_end];
     if tail
         .iter()
-        .any(|s| matches!(s.payload, StepPayload::Planner { .. }) || s.status == STATUS_RUNNING)
+        .any(|s| matches!(s.payload, StepPayload::Planner { .. }) || s.is_running())
     {
         return false;
     }
@@ -1768,48 +1742,40 @@ fn render_step(
 fn current_working(steps: &[DecodedStep]) -> Option<TranscriptWorking> {
     let last_user = steps.iter().rposition(DecodedStep::is_user).unwrap_or(0);
     // Prefer any active tool step (running or queued) in the current turn, even
-    // if a planner reply has already been emitted (e.g. a backgrounded command).
-    for step in steps[last_user..].iter().rev() {
-        if let StepPayload::Tool {
-            tool,
-            args_json,
-            kv_args,
-            ui_verb,
-            ..
-        } = &step.payload
-        {
-            if matches!(step.status, STATUS_PENDING | STATUS_RUNNING) && tool != "schedule" {
-                return Some(TranscriptWorking {
-                    intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
-                    tool: tool.clone(),
-                    since_ms: step.created_ms,
-                });
-            }
-        }
-    }
-    // Also surface a background command/workflow started in an earlier turn
-    // that is still running.
-    for step in steps[..last_user].iter().rev() {
-        if let StepPayload::Tool {
-            tool,
-            args_json,
-            kv_args,
-            ui_verb,
-            ..
-        } = &step.payload
-        {
-            if step.status == STATUS_RUNNING
-                && matches!(tool.as_str(), "run_command" | "run_workflow")
-            {
-                return Some(TranscriptWorking {
-                    intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
-                    tool: tool.clone(),
-                    since_ms: step.created_ms,
-                });
-            }
-        }
-    }
-    None
+    // if a planner reply has already been emitted; otherwise surface a
+    // background command/workflow still running from an earlier turn.
+    let active = steps[last_user..]
+        .iter()
+        .rev()
+        .find(|s| {
+            s.is_running()
+                && matches!(&s.payload, StepPayload::Tool { tool, .. } if tool != "schedule")
+        })
+        .or_else(|| {
+            steps[..last_user].iter().rev().find(|s| {
+                s.status == STATUS_RUNNING
+                    && matches!(
+                        &s.payload,
+                        StepPayload::Tool { tool, .. }
+                            if matches!(tool.as_str(), "run_command" | "run_workflow")
+                    )
+            })
+        })?;
+    let StepPayload::Tool {
+        tool,
+        args_json,
+        kv_args,
+        ui_verb,
+        ..
+    } = &active.payload
+    else {
+        return None;
+    };
+    Some(TranscriptWorking {
+        intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
+        tool: tool.clone(),
+        since_ms: active.created_ms,
+    })
 }
 
 fn current_plan(steps: &[DecodedStep]) -> Option<Vec<TranscriptPlanItem>> {
@@ -1879,15 +1845,6 @@ fn agy_step_intent(
             return format!("{verb} {base}");
         }
         return verb.to_owned();
-    }
-    if tool == "run_command" {
-        if let Some(cmd) = lookup_arg(args_json, kv_args, "CommandLine")
-            .or_else(|| lookup_arg(args_json, kv_args, "command"))
-        {
-            if let Some(first_line) = cmd.lines().map(str::trim).find(|line| !line.is_empty()) {
-                return truncate_chars(first_line, 120);
-            }
-        }
     }
     match tool {
         "read_file" => "Read file",
@@ -2772,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn gen_metadata_model_decodes_label_slug_and_cli_log_fallback() {
+    fn gen_metadata_model_prefers_newest_row_handles_utf8_and_omits_unlinked_log() {
         let dir = std::env::temp_dir().join(format!(
             "herdr-agy-model-test-{}-{}",
             std::process::id(),
@@ -2790,20 +2747,11 @@ mod tests {
         )
         .unwrap();
 
-        // Empty conversation falls back to cli.log.
+        // Empty conversation does NOT attribute unrelated app-wide cli.log overrides.
         let empty = read_page(&missing_db, &PageRequest::default()).unwrap();
-        assert_eq!(
-            empty.model,
-            Some(TranscriptModel {
-                provider: "antigravity".into(),
-                id: "Gemini 4 Neon".into(),
-                harness: Some("agy".into()),
-                thinking_level: Some("high".into()),
-                thinking_auto: false,
-            })
-        );
+        assert_eq!(empty.model, None);
 
-        // Conversation with gen_metadata field 3.28 slug only (before first reply).
+        // Conversation with older field 1.19 + newer field 3.28 prefers the newer row (recency).
         let slug_db = conv_dir.join("slug-conv.db");
         let conn = Connection::open(&slug_db).unwrap();
         conn.execute_batch(
@@ -2811,11 +2759,16 @@ mod tests {
              CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
         )
         .unwrap();
-        let f3 = pb_len_delim(28, b"gemini-4-neon-medium");
-        let blob_slug = pb_len_delim(3, &f3);
+        let f1_old = pb_len_delim(19, b"gemini-old");
         conn.execute(
             "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
-            [&blob_slug],
+            [&pb_len_delim(1, &f1_old)],
+        )
+        .unwrap();
+        let f3_new = pb_len_delim(28, b"gemini-4-neon-medium");
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [&pb_len_delim(3, &f3_new)],
         )
         .unwrap();
         drop(conn);
@@ -2831,14 +2784,23 @@ mod tests {
             })
         );
 
-        // Newer gen_metadata row with field 1.21 display label overrides slug + cli.log.
+        // Non-ASCII UTF-8 slug never panics during suffix parsing.
+        assert_eq!(
+            parse_agy_model_slug("é1234567"),
+            Some(("é1234567".into(), None))
+        );
+        assert_eq!(
+            parse_agy_model_slug("café-model-HIGH"),
+            Some(("café-model".into(), Some("high".into())))
+        );
+
+        // Newer gen_metadata row with field 1.21 display label wins within that row.
         let conn = Connection::open(&slug_db).unwrap();
         let mut f1 = pb_len_delim(19, b"gemini-4-neon");
         f1.extend(pb_len_delim(21, b"Gemini 4 Neon (Low)"));
-        let blob_label = pb_len_delim(1, &f1);
         conn.execute(
-            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
-            [&blob_label],
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [&pb_len_delim(1, &f1)],
         )
         .unwrap();
         drop(conn);
@@ -2878,9 +2840,7 @@ mod tests {
                 payload: StepPayload::Tool {
                     call_id: "c1".into(),
                     tool: "run_command".into(),
-                    args_json: Some(
-                        serde_json::json!({"CommandLine": "cargo test --all\necho done"}),
-                    ),
+                    args_json: Some(serde_json::json!({"CommandLine": "cargo test --secret-flag"})),
                     kv_args: Vec::new(),
                     ui_verb: None,
                     error_message: None,
@@ -2900,10 +2860,11 @@ mod tests {
             },
         ];
 
-        // Even after a non-tool planner reply, the backgrounded run_command is still working.
+        // Even after a non-tool planner reply, the backgrounded run_command is still working,
+        // and raw CommandLine args stay out of shared intent (kept in owner-only detail).
         let working = current_working(&steps).expect("background run_command still working");
         assert_eq!(working.tool, "run_command");
-        assert_eq!(working.intent, "cargo test --all");
+        assert_eq!(working.intent, "Run command");
 
         // A later turn with only a waiting `schedule` timer still surfaces the earlier running command.
         steps.push(DecodedStep {
@@ -2933,7 +2894,7 @@ mod tests {
         });
         let still = current_working(&steps).expect("earlier background command still working");
         assert_eq!(still.tool, "run_command");
-        assert_eq!(still.intent, "cargo test --all");
+        assert_eq!(still.intent, "Run command");
 
         // Once the command settles, the waiting schedule timer alone is not reported as working.
         steps[1].status = STATUS_DONE;
@@ -2941,8 +2902,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_tool_step_renders_running_and_command_line_fallback_intent() {
-        let steps = vec![
+    fn pending_tool_step_keeps_turn_open_until_settled_and_keeps_raw_command_in_detail_only() {
+        let mut steps = vec![
             DecodedStep {
                 idx: 0,
                 status: STATUS_DONE,
@@ -2955,30 +2916,73 @@ mod tests {
             },
             DecodedStep {
                 idx: 1,
+                status: STATUS_DONE,
+                step_id: "p1".into(),
+                created_ms: 1050,
+                completed_ms: Some(1050),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Checking status.".into(),
+                    has_tool_calls: true,
+                },
+            },
+            DecodedStep {
+                idx: 2,
                 status: STATUS_PENDING,
-                step_id: "g1".into(),
+                step_id: "g2".into(),
                 created_ms: 1100,
                 completed_ms: None,
                 payload: StepPayload::Tool {
-                    call_id: "c1".into(),
+                    call_id: "c2".into(),
                     tool: "run_command".into(),
-                    args_json: Some(serde_json::json!({"CommandLine": "\n  git status --short\n"})),
+                    args_json: Some(
+                        serde_json::json!({"CommandLine": "git status --private-token"}),
+                    ),
                     kv_args: Vec::new(),
                     ui_verb: None,
                     error_message: None,
                 },
             },
         ];
-        let page = page_steps("s-pending", &steps, &PageRequest::default(), 20).unwrap();
-        let working = page.working.expect("pending tool reports working");
-        assert_eq!(working.intent, "git status --short");
+        let p1 = page_steps("s-pending", &steps, &PageRequest::default(), 20).unwrap();
+        let working = p1.working.expect("pending tool reports working");
+        assert_eq!(working.intent, "Run command");
+        assert!(!working.intent.contains("--private-token"));
+        assert!(
+            p1.entries
+                .iter()
+                .all(|e| !matches!(e, TranscriptEntry::TurnEnd { .. })),
+            "pending tool must keep turn open"
+        );
         assert!(matches!(
-            page.entries.last(),
+            p1.entries.iter().find(|e| e.id() == "p1:reply"),
+            Some(TranscriptEntry::Reply {
+                is_final: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            p1.entries.last(),
             Some(TranscriptEntry::Step {
                 status: TranscriptStepStatus::Running,
                 intent,
+                detail: Some(detail),
                 ..
-            }) if intent == "git status --short"
+            }) if intent == "Run command" && detail.contains("--private-token")
         ));
+
+        // Transitioning pending -> running must NOT expire the after cursor.
+        steps[2].status = STATUS_RUNNING;
+        let p2 = page_steps(
+            "s-pending",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert!(p2.working.is_some());
     }
 }

@@ -21903,6 +21903,13 @@
         },
         "TranscriptModel": {
           "properties": {
+            "harness": {
+              "description": "The agent harness running this session (`\"omp\"`, `\"agy\"`, etc.).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
@@ -21914,7 +21921,7 @@
               "type": "boolean"
             },
             "thinking_level": {
-              "description": "The effort omp runs the model at: minimal, low, medium, high, xhigh or\nmax. Absent when thinking is off or the level is unknown.",
+              "description": "The effort the agent runs the model at: minimal, low, medium, high,\nxhigh or max. Absent when thinking is off or the level is unknown.",
               "type": [
                 "string",
                 "null"
