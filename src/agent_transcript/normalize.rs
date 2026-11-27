@@ -381,6 +381,7 @@ pub(super) fn ask_questions(arguments: Option<&Value>) -> Vec<AskQuestion> {
             options,
             multi: question
                 .get("multi")
+                .or_else(|| question.get("is_multi_select"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             recommended: question

@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::schema::{
-    TranscriptEntry, TranscriptModel, TranscriptNoteSource, TranscriptPlanItem,
-    TranscriptStepStatus, TranscriptTaskStatus, TranscriptTurnStatus, TranscriptWorking,
+    AskFormStatus, PendingAsk, TranscriptEntry, TranscriptModel, TranscriptNoteSource,
+    TranscriptPlanItem, TranscriptStepStatus, TranscriptTaskStatus, TranscriptTurnStatus,
+    TranscriptWorking,
 };
 
 use super::normalize::{self, DETAIL_MAX_CHARS, NOTE_BODY_MAX_CHARS};
@@ -38,6 +39,7 @@ const STATUS_RUNNING: i64 = 2;
 const STATUS_DONE: i64 = 3;
 const STATUS_CANCELED: i64 = 6;
 const STATUS_ERROR: i64 = 7;
+const STATUS_GENERATING: i64 = 8;
 
 const CURSOR_VERSION: &str = "agy1";
 
@@ -480,6 +482,7 @@ enum StepPayload {
         kv_args: Vec<(String, String)>,
         ui_verb: Option<String>,
         error_message: Option<String>,
+        ask_answer: Option<Vec<String>>,
     },
     Ephemeral {
         tag: String,
@@ -508,11 +511,13 @@ impl DecodedStep {
     }
 
     fn is_running(&self) -> bool {
-        matches!(self.status, STATUS_PENDING | STATUS_RUNNING)
-            && matches!(
-                self.payload,
-                StepPayload::Tool { .. } | StepPayload::Planner { .. }
-            )
+        matches!(
+            self.status,
+            STATUS_PENDING | STATUS_RUNNING | STATUS_GENERATING
+        ) && matches!(
+            self.payload,
+            StepPayload::Tool { .. } | StepPayload::Planner { .. }
+        )
     }
 
     fn plan_items(&self) -> Option<Vec<TranscriptPlanItem>> {
@@ -658,6 +663,8 @@ fn decode_step_row(
         STEP_TYPE_GENERIC => {
             let mut kv_args = Vec::new();
             let mut ui_verb = None;
+            let mut ask_answer = None;
+            let is_ask = meta.tool_name.as_deref() == Some("ask_question");
             if let Some(g_fields) = pb_bytes(&payload_fields, 140).and_then(decode_pb) {
                 for field in &g_fields {
                     if field.num == 1 {
@@ -671,6 +678,11 @@ fn decode_step_row(
                     } else if field.num == 2 {
                         if let PbVal::Bytes(b) = field.val {
                             if let Some(res) = decode_pb(b) {
+                                if is_ask {
+                                    if let Some(text) = pb_str(&res, 1) {
+                                        ask_answer = parse_agy_ask_answers(text);
+                                    }
+                                }
                                 if let Some(ui) = pb_bytes(&res, 3).and_then(decode_pb) {
                                     ui_verb = pb_str(&ui, 5)
                                         .filter(|s| !s.trim().is_empty())
@@ -691,6 +703,7 @@ fn decode_step_row(
                 kv_args,
                 ui_verb,
                 error_message,
+                ask_answer,
             }
         }
         STEP_TYPE_EPHEMERAL => {
@@ -733,6 +746,12 @@ enum AgyCursor {
         tip: Option<(u32, String)>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         running: Vec<u32>,
+        /// Entry ids already emitted for steps in `running`, so when a
+        /// generating planner step later finishes with a brand-new `:reply`
+        /// entry, only previously-emitted ids go into `resent` (clients drop
+        /// unknown ids listed in `resent`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        running_emitted: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origins: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -842,6 +861,7 @@ fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptErro
         seen_next_idx: 0,
         tip: None,
         running: Vec::new(),
+        running_emitted: Vec::new(),
         origins: Some(origin::fingerprint(&request.other_prompts)),
         floor: Some(0),
         tip_reply: None,
@@ -1051,6 +1071,7 @@ fn page_steps(
         end,
         is_after,
         prev_running,
+        prev_running_emitted,
         served_origins,
         served_floor,
         issued_floor,
@@ -1068,6 +1089,7 @@ fn page_steps(
                 end,
                 false,
                 Vec::new(),
+                Vec::new(),
                 None,
                 None,
                 None,
@@ -1079,6 +1101,7 @@ fn page_steps(
                 seen_next_idx,
                 tip,
                 running,
+                running_emitted,
                 origins: prev_origins,
                 floor,
                 tip_reply,
@@ -1101,6 +1124,7 @@ fn page_steps(
                 budget_end(steps, start),
                 true,
                 running,
+                running_emitted,
                 prev_origins,
                 held,
                 floor,
@@ -1113,6 +1137,7 @@ fn page_steps(
                 page_start(steps, end, limit),
                 end,
                 false,
+                Vec::new(),
                 Vec::new(),
                 None,
                 None,
@@ -1169,8 +1194,14 @@ fn page_steps(
             others = Some(matched);
         }
 
-        // Re-send any previously-running tool or planner step before `start`
-        // that has now finished (excluding update_steps, handled below per turn).
+        // Re-send any previously-running/generating tool or planner step before
+        // `start` that has now finished (excluding update_steps, handled below
+        // per turn). Only entry ids already emitted while running go into
+        // `resent_ids`; brand-new entries (e.g. a generating planner's newly
+        // populated `:reply`) are omitted from `resent_ids` so incremental
+        // clients append them instead of dropping them as unloaded history.
+        let prev_emitted_set: HashSet<&str> =
+            prev_running_emitted.iter().map(String::as_str).collect();
         let mut resent_planners = HashSet::new();
         let mut resent_plan_turns = HashSet::new();
         for run_idx in prev_running {
@@ -1180,23 +1211,20 @@ fn page_steps(
             if pos >= start || steps[pos].is_running() {
                 continue;
             }
-            // If a previously running/pending step settles in an earlier turn
-            // whose tip reply is no longer tracked by `prev_tip_reply` (e.g. a
-            // newer turn already started before `start`), and that turn's reply
-            // is now final, incremental replay cannot insert its `TurnEnd`
-            // ahead of the later turn's entries. Expire the cursor so the
-            // client reloads in order.
+            // If a previously running/pending step settles at or after an
+            // earlier turn's tip reply (so it held that reply open) and that
+            // turn's reply is no longer tracked by `prev_tip_reply` (e.g. a
+            // newer turn already started before `start`), incremental replay
+            // cannot insert its `TurnEnd` ahead of the later turn's entries.
+            // Expire the cursor so the client reloads in order. A background
+            // command strictly before `reply_pos` never held `TurnEnd` open,
+            // so it simply resends its settled status in place.
             let (turn_start, turn_end) = turn_bounds(steps, pos);
             if turn_end < start {
-                if let Some(reply_pos) = (turn_start..turn_end).rev().find(|&p| {
-                    matches!(
-                        &steps[p].payload,
-                        StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
-                    )
-                }) {
+                if let Some(reply_pos) = last_nonblank_planner_reply(steps, turn_start..turn_end) {
                     let tracked = prev_tip_reply
                         .is_some_and(|(reply_idx, _, _)| reply_idx == steps[reply_pos].idx);
-                    if !tracked && is_reply_final(steps, reply_pos) {
+                    if pos >= reply_pos && !tracked && is_reply_final(steps, reply_pos) {
                         return Err(TranscriptError::CursorExpired);
                     }
                 }
@@ -1210,13 +1238,30 @@ fn page_steps(
                 }
                 continue;
             }
-            if matches!(steps[pos].payload, StepPayload::Planner { .. }) {
-                resent_planners.insert(pos);
-            }
             let before_len = entries.len();
             render_step(steps, pos, false, &mut entries);
+            let has_brand_new = entries[before_len..]
+                .iter()
+                .any(|entry| !prev_emitted_set.contains(entry.id()));
+            if has_brand_new && pos + 1 < start {
+                // Appending a brand-new entry (like `:reply`) from an earlier
+                // step after later steps already sent in `(pos + 1)..start`
+                // would violate entry order; expire the cursor to reload cleanly.
+                return Err(TranscriptError::CursorExpired);
+            }
             for entry in &entries[before_len..] {
-                resent_ids.push(entry.id().to_owned());
+                if prev_emitted_set.contains(entry.id()) {
+                    resent_ids.push(entry.id().to_owned());
+                }
+            }
+            if matches!(steps[pos].payload, StepPayload::Planner { .. }) {
+                resent_planners.insert(pos);
+                if is_reply_final(steps, pos)
+                    && prev_tip_reply
+                        .is_none_or(|(idx, _, end_at)| idx != steps[pos].idx || end_at.is_none())
+                {
+                    pending_turn_end = Some(pos);
+                }
             }
         }
 
@@ -1336,11 +1381,19 @@ fn page_steps(
     let tip = seen_end_pos
         .checked_sub(1)
         .map(|pos| (steps[pos].idx, steps[pos].step_id.clone()));
-    let running: Vec<u32> = steps[..seen_end_pos]
-        .iter()
-        .filter(|s| s.is_running())
-        .map(|s| s.idx)
-        .collect();
+    let mut running = Vec::new();
+    let mut running_emitted = Vec::new();
+    let mut scratch = Vec::new();
+    for (pos, step) in steps[..seen_end_pos].iter().enumerate() {
+        if step.is_running() {
+            running.push(step.idx);
+            scratch.clear();
+            render_step(steps, pos, false, &mut scratch);
+            for entry in &scratch {
+                running_emitted.push(entry.id().to_owned());
+            }
+        }
+    }
     let tip_reply = latest_tip_reply_state(steps, seen_end_pos);
     let floor = if is_after {
         served_floor
@@ -1352,6 +1405,7 @@ fn page_steps(
         seen_next_idx,
         tip,
         running,
+        running_emitted,
         origins: Some(origins),
         floor,
         tip_reply,
@@ -1363,7 +1417,7 @@ fn page_steps(
         entries,
         before,
         after,
-        pending_ask: None,
+        pending_ask: current_pending_ask(steps),
         working: current_working(steps),
         model: None,
         plan: current_plan(steps),
@@ -1620,16 +1674,23 @@ fn turn_close_pos_for_reply(steps: &[DecodedStep], reply_pos: usize) -> Option<u
     Some(last_tool.unwrap_or(reply_pos))
 }
 
-/// If `pos` is the closing step of a settled turn, return the `reply_pos` that
-/// owns that turn's `{step_id}:end` entry.
-fn settled_turn_reply_for_close_pos(steps: &[DecodedStep], pos: usize) -> Option<usize> {
-    let (turn_start, turn_end) = turn_bounds(steps, pos);
-    let reply_pos = (turn_start..turn_end).rev().find(|&p| {
+fn last_nonblank_planner_reply(
+    steps: &[DecodedStep],
+    range: std::ops::Range<usize>,
+) -> Option<usize> {
+    range.rev().find(|&p| {
         matches!(
             &steps[p].payload,
             StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
         )
-    })?;
+    })
+}
+
+/// If `pos` is the closing step of a settled turn, return the `reply_pos` that
+/// owns that turn's `{step_id}:end` entry.
+fn settled_turn_reply_for_close_pos(steps: &[DecodedStep], pos: usize) -> Option<usize> {
+    let (turn_start, turn_end) = turn_bounds(steps, pos);
+    let reply_pos = last_nonblank_planner_reply(steps, turn_start..turn_end)?;
     (turn_close_pos_for_reply(steps, reply_pos) == Some(pos)).then_some(reply_pos)
 }
 
@@ -1644,12 +1705,7 @@ fn latest_tip_reply_state(
         .rev()
         .find(|&p| steps[p].is_user())
         .unwrap_or(0);
-    let reply_pos = (last_turn_start..seen_end_pos).rev().find(|&p| {
-        matches!(
-            &steps[p].payload,
-            StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
-        )
-    })?;
+    let reply_pos = last_nonblank_planner_reply(steps, last_turn_start..seen_end_pos)?;
     let reply_idx = steps[reply_pos].idx;
     let now_final = is_reply_final(steps, reply_pos);
     let end_at_idx = turn_close_pos_for_reply(steps, reply_pos)
@@ -1698,6 +1754,7 @@ fn render_step(
             kv_args,
             ui_verb,
             error_message,
+            ask_answer,
         } => {
             if step.plan_items().is_some() {
                 let (turn_start, turn_end) = turn_bounds(steps, pos);
@@ -1708,8 +1765,40 @@ fn render_step(
                 }
                 return;
             }
+            if tool == "ask_question" {
+                let questions = agy_ask_questions(args_json.as_ref(), kv_args);
+                if !questions.is_empty() {
+                    let answer = (!step.is_running()).then(|| ask_answer.clone()).flatten();
+                    let form_status = match step.status {
+                        STATUS_CANCELED | STATUS_ERROR => Some(AskFormStatus::Cancelled),
+                        _ => None,
+                    };
+                    out.push(TranscriptEntry::Ask {
+                        id: format!("{}:{call_id}", step.step_id),
+                        ts_ms: step.created_ms,
+                        questions,
+                        answer,
+                        form: None,
+                        form_answer: None,
+                        form_status,
+                    });
+                    if include_turn_end {
+                        if let Some(reply_pos) = settled_turn_reply_for_close_pos(steps, pos) {
+                            out.push(TranscriptEntry::TurnEnd {
+                                id: format!("{}:end", steps[reply_pos].step_id),
+                                ts_ms: turn_completed_ms(steps, reply_pos),
+                                status: turn_end_status(steps, reply_pos),
+                                error: None,
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
             let status = match step.status {
-                STATUS_PENDING | STATUS_RUNNING => TranscriptStepStatus::Running,
+                STATUS_PENDING | STATUS_RUNNING | STATUS_GENERATING => {
+                    TranscriptStepStatus::Running
+                }
                 STATUS_CANCELED | STATUS_ERROR => TranscriptStepStatus::Error,
                 STATUS_DONE => TranscriptStepStatus::Ok,
                 _ => TranscriptStepStatus::Ok,
@@ -1758,17 +1847,101 @@ fn render_step(
     }
 }
 
+fn agy_ask_questions(
+    args_json: Option<&Value>,
+    kv_args: &[(String, String)],
+) -> Vec<crate::api::schema::AskQuestion> {
+    let direct = normalize::ask_questions(args_json);
+    if !direct.is_empty() {
+        return direct;
+    }
+    if let Some((_, raw)) = kv_args.iter().find(|(k, _)| k == "questions") {
+        if let Ok(arr @ Value::Array(_)) = serde_json::from_str::<Value>(raw) {
+            return normalize::ask_questions(Some(&serde_json::json!({ "questions": arr })));
+        }
+    }
+    Vec::new()
+}
+
+fn parse_agy_ask_answers(raw: &str) -> Option<Vec<String>> {
+    let mut answers: Vec<String> = Vec::new();
+    let mut in_answer = false;
+    for line in raw.lines() {
+        if let Some(rest) = strip_agy_answer_prefix(line) {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                answers.push(trimmed.to_owned());
+                in_answer = true;
+            } else {
+                in_answer = false;
+            }
+        } else if in_answer {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                if let Some(last) = answers.last_mut() {
+                    last.push('\n');
+                    last.push_str(trimmed);
+                }
+            }
+        }
+    }
+    (!answers.is_empty()).then_some(answers)
+}
+
+fn strip_agy_answer_prefix(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('A')?;
+    let (digits, after) = rest.split_once(':')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(after)
+}
+
+fn current_pending_ask(steps: &[DecodedStep]) -> Option<PendingAsk> {
+    let last_user = steps.iter().rposition(DecodedStep::is_user).unwrap_or(0);
+    for step in steps[last_user..].iter().rev() {
+        if !step.is_running() {
+            continue;
+        }
+        if let StepPayload::Tool {
+            call_id,
+            tool,
+            args_json,
+            kv_args,
+            ..
+        } = &step.payload
+        {
+            if tool == "ask_question" {
+                let questions = agy_ask_questions(args_json.as_ref(), kv_args);
+                if !questions.is_empty() {
+                    return Some(PendingAsk {
+                        id: format!("{}:{call_id}", step.step_id),
+                        questions,
+                        answerable: false,
+                        form: None,
+                        form_answerable: false,
+                        dismissable: false,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn current_working(steps: &[DecodedStep]) -> Option<TranscriptWorking> {
     let last_user = steps.iter().rposition(DecodedStep::is_user).unwrap_or(0);
     // Prefer any active tool step (running or queued) in the current turn, even
     // if a planner reply has already been emitted; otherwise surface a
-    // background command/workflow still running from an earlier turn.
-    let active = steps[last_user..]
+    // generating planner in the current turn, or a background command/workflow
+    // still running from an earlier turn.
+    let active_tool = steps[last_user..]
         .iter()
         .rev()
         .find(|s| {
             s.is_running()
-                && matches!(&s.payload, StepPayload::Tool { tool, .. } if tool != "schedule")
+                && matches!(
+                    &s.payload,
+                    StepPayload::Tool { tool, .. }
+                        if tool != "schedule" && tool != "ask_question"
+                )
         })
         .or_else(|| {
             steps[..last_user].iter().rev().find(|s| {
@@ -1779,22 +1952,37 @@ fn current_working(steps: &[DecodedStep]) -> Option<TranscriptWorking> {
                             if matches!(tool.as_str(), "run_command" | "run_workflow")
                     )
             })
-        })?;
-    let StepPayload::Tool {
-        tool,
-        args_json,
-        kv_args,
-        ui_verb,
-        ..
-    } = &active.payload
-    else {
+        });
+    if let Some(active) = active_tool {
+        if let StepPayload::Tool {
+            tool,
+            args_json,
+            kv_args,
+            ui_verb,
+            ..
+        } = &active.payload
+        {
+            return Some(TranscriptWorking {
+                intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
+                tool: tool.clone(),
+                since_ms: active.created_ms,
+            });
+        }
+    }
+    // If a pending ask_question is waiting for the user, show the ask card
+    // rather than spinning "Thinking".
+    if current_pending_ask(steps).is_some() {
         return None;
-    };
-    Some(TranscriptWorking {
-        intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
-        tool: tool.clone(),
-        since_ms: active.created_ms,
-    })
+    }
+    steps[last_user..]
+        .iter()
+        .rev()
+        .find(|s| s.is_running() && matches!(s.payload, StepPayload::Planner { .. }))
+        .map(|s| TranscriptWorking {
+            intent: "Thinking".to_owned(),
+            tool: "planner".to_owned(),
+            since_ms: s.created_ms,
+        })
 }
 
 fn current_plan(steps: &[DecodedStep]) -> Option<Vec<TranscriptPlanItem>> {
@@ -2309,6 +2497,7 @@ mod tests {
                 kv_args: Vec::new(),
                 ui_verb: None,
                 error_message: None,
+                ask_answer: None,
             },
         };
         let mut steps = vec![
@@ -2336,6 +2525,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: Some("Ran build".into()),
                     error_message: None,
+                    ask_answer: None,
                 },
             },
             make_plan_step(3, "p3", 1200, "done"),
@@ -2392,6 +2582,7 @@ mod tests {
                 kv_args: Vec::new(),
                 ui_verb: None,
                 error_message: None,
+                ask_answer: None,
             },
         });
         let after = page_steps(
@@ -2423,6 +2614,7 @@ mod tests {
             seen_next_idx: 2,
             tip: Some((1, weird_id.into())),
             running: vec![1],
+            running_emitted: vec!["p1:thinking".into()],
             origins: Some(7),
             floor: Some(0),
             tip_reply: Some((1, true, Some(1))),
@@ -2480,6 +2672,7 @@ mod tests {
                 kv_args: Vec::new(),
                 ui_verb: Some("Ran check".into()),
                 error_message: None,
+                ask_answer: None,
             },
         });
         let p2 = page_steps(
@@ -2585,6 +2778,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: Some("Late tool".into()),
                     error_message: None,
+                    ask_answer: None,
                 },
             });
             let err = page_steps(
@@ -2662,6 +2856,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: Some("Check".into()),
                     error_message: None,
+                    ask_answer: None,
                 },
             },
         ];
@@ -2863,6 +3058,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: None,
                     error_message: None,
+                    ask_answer: None,
                 },
             },
             DecodedStep {
@@ -2909,6 +3105,7 @@ mod tests {
                 kv_args: Vec::new(),
                 ui_verb: None,
                 error_message: None,
+                ask_answer: None,
             },
         });
         let still = current_working(&steps).expect("earlier background command still working");
@@ -2960,6 +3157,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: None,
                     error_message: None,
+                    ask_answer: None,
                 },
             },
         ];
@@ -3043,6 +3241,7 @@ mod tests {
                     kv_args: Vec::new(),
                     ui_verb: None,
                     error_message: None,
+                    ask_answer: None,
                 },
             },
         ];
@@ -3125,5 +3324,392 @@ mod tests {
             .position(|e| matches!(e, TranscriptEntry::User { text, .. } if text == "Turn B"))
             .expect("Turn B present");
         assert!(p1_end_idx < u3_idx, "p1:end must precede Turn B");
+    }
+
+    #[test]
+    fn earlier_turn_pre_reply_background_command_resends_without_expiring_cursor() {
+        // Turn A starts a background command BEFORE its already-final planner reply.
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Start background build".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_RUNNING,
+                step_id: "g1".into(),
+                created_ms: 1050,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c1".into(),
+                    tool: "run_command".into(),
+                    args_json: Some(serde_json::json!({"CommandLine": "cargo build"})),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                    ask_answer: None,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_DONE,
+                step_id: "p2".into(),
+                created_ms: 1100,
+                completed_ms: Some(1100),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Build running in background.".into(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+
+        // Poll 1: Turn A already closed with p2:end even though g1 is still running.
+        let p1 = page_steps("s-prereply", &steps, &PageRequest::default(), 20).unwrap();
+        assert_eq!(
+            p1.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["u0", "g1:c1", "p2:reply", "p2:end"]
+        );
+
+        // Turn B lands while g1 is still running.
+        steps.push(DecodedStep {
+            idx: 3,
+            status: STATUS_DONE,
+            step_id: "u3".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Next question".into(),
+            },
+        });
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_DONE,
+            step_id: "p4".into(),
+            created_ms: 2050,
+            completed_ms: Some(2050),
+            payload: StepPayload::Planner {
+                thinking: String::new(),
+                reply: "Answered.".into(),
+                has_tool_calls: false,
+            },
+        });
+        let p2 = page_steps(
+            "s-prereply",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+
+        // Turn A's pre-reply background command finishes while Turn C appends:
+        // cursor must NOT expire; g1:c1 resends as Ok and Turn C appends cleanly.
+        steps[1].status = STATUS_DONE;
+        steps[1].completed_ms = Some(2500);
+        steps.push(DecodedStep {
+            idx: 5,
+            status: STATUS_DONE,
+            step_id: "u5".into(),
+            created_ms: 3000,
+            completed_ms: Some(3000),
+            payload: StepPayload::User {
+                text: "Turn C".into(),
+            },
+        });
+        let p3 = page_steps(
+            "s-prereply",
+            &steps,
+            &PageRequest {
+                after: Some(p2.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(p3.resent, Some(vec!["g1:c1".to_owned()]));
+        assert_eq!(
+            p3.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["g1:c1", "u5"]
+        );
+        assert!(matches!(
+            &p3.entries[0],
+            TranscriptEntry::Step {
+                status: TranscriptStepStatus::Ok,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn generating_planner_delivers_reply_not_in_resent_and_reports_thinking_working() {
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Explain the bug".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_GENERATING,
+                step_id: "p1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Planner {
+                    thinking: "Inspecting live transcript...".into(),
+                    reply: String::new(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+
+        // Poll 1 while planner is still STATUS_GENERATING (8): only `:thinking`
+        // exists yet, no `:reply` or `:end`, and `working` reports "Thinking".
+        let p1 = page_steps("s-gen", &steps, &PageRequest::default(), 20).unwrap();
+        assert_eq!(
+            p1.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["u0", "p1:thinking"]
+        );
+        let working = p1
+            .working
+            .expect("generating planner should report working");
+        assert_eq!(working.intent, "Thinking");
+
+        // Poll 2 after planner finishes (STATUS_DONE = 3) with full reply text:
+        // `:thinking` was emitted on poll 1 so it is in `resent`, while brand-new
+        // `:reply` MUST NOT be in `resent` (clients drop unheld resent entries),
+        // and `:end` closes the turn.
+        steps[1].status = STATUS_DONE;
+        steps[1].completed_ms = Some(1500);
+        steps[1].payload = StepPayload::Planner {
+            thinking: "Inspecting live transcript...".into(),
+            reply: "Full answer rendered cleanly.".into(),
+            has_tool_calls: false,
+        };
+        let p2 = page_steps(
+            "s-gen",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after.clone()),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert!(p2.working.is_none());
+        assert_eq!(p2.resent, Some(vec!["p1:thinking".to_owned()]));
+        assert_eq!(
+            p2.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["p1:thinking", "p1:reply", "p1:end"]
+        );
+        assert!(matches!(
+            &p2.entries[1],
+            TranscriptEntry::Reply {
+                text,
+                is_final: true,
+                ..
+            } if text == "Full answer rendered cleanly."
+        ));
+
+        // Out-of-order case: if a later step (`g2`) was already delivered on
+        // poll 1 while `p1` was still generating without a `:reply`, finishing
+        // `p1` with a brand-new `:reply` before `g2` must expire the cursor so
+        // the client reloads in proper order rather than appending `:reply`
+        // after `g2`.
+        let mut ooo_steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Check".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_GENERATING,
+                step_id: "p1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Planner {
+                    thinking: "Planning...".into(),
+                    reply: String::new(),
+                    has_tool_calls: true,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_RUNNING,
+                step_id: "g2".into(),
+                created_ms: 1150,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c2".into(),
+                    tool: "run_command".into(),
+                    args_json: None,
+                    kv_args: Vec::new(),
+                    ui_verb: Some("Check".into()),
+                    error_message: None,
+                    ask_answer: None,
+                },
+            },
+        ];
+        let ooo1 = page_steps("s-gen-ooo", &ooo_steps, &PageRequest::default(), 20).unwrap();
+        ooo_steps[1].status = STATUS_DONE;
+        ooo_steps[1].payload = StepPayload::Planner {
+            thinking: "Planning...".into(),
+            reply: "Late reply text".into(),
+            has_tool_calls: true,
+        };
+        let err = page_steps(
+            "s-gen-ooo",
+            &ooo_steps,
+            &PageRequest {
+                after: Some(ooo1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "cursor_expired");
+    }
+
+    #[test]
+    fn ask_question_renders_ask_entry_and_pending_ask_with_multi_select() {
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Ask me".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_RUNNING,
+                step_id: "g1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c1".into(),
+                    tool: "ask_question".into(),
+                    args_json: Some(serde_json::json!({
+                        "questions": [
+                            {
+                                "question": "Which targets should ship?",
+                                "is_multi_select": true,
+                                "options": ["Desktop", "iOS", "Web"]
+                            }
+                        ]
+                    })),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                    ask_answer: None,
+                },
+            },
+        ];
+
+        // Running ask_question renders as TranscriptEntry::Ask + Page.pending_ask
+        // (read-only) and suppresses the "Thinking" working spinner.
+        let p1 = page_steps("s-ask", &steps, &PageRequest::default(), 20).unwrap();
+        assert!(p1.working.is_none());
+        let pending = p1
+            .pending_ask
+            .expect("running ask_question sets pending_ask");
+        assert_eq!(pending.id, "g1:c1");
+        assert!(!pending.answerable);
+        assert!(!pending.form_answerable);
+        assert!(!pending.dismissable);
+        assert_eq!(pending.questions.len(), 1);
+        assert_eq!(pending.questions[0].question, "Which targets should ship?");
+        assert!(pending.questions[0].multi);
+        assert_eq!(pending.questions[0].options, ["Desktop", "iOS", "Web"]);
+        assert!(matches!(
+            p1.entries.last(),
+            Some(TranscriptEntry::Ask { id, questions, .. })
+                if id == "g1:c1" && questions.len() == 1 && questions[0].multi
+        ));
+
+        // Once answered/completed (STATUS_DONE), pending_ask clears and the Ask
+        // entry is resent on the incremental poll with the extracted answer.
+        steps[1].status = STATUS_DONE;
+        steps[1].completed_ms = Some(1400);
+        if let StepPayload::Tool { ask_answer, .. } = &mut steps[1].payload {
+            *ask_answer = parse_agy_ask_answers(
+                "Created At: 2026-11-27T08:38:59+01:00\nCompleted At: 2026-11-27T08:39:46+01:00\nA1: Desktop, iOS\nA2: Line one\nLine two",
+            );
+        }
+        let p2 = page_steps(
+            "s-ask",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert!(p2.pending_ask.is_none());
+        assert_eq!(p2.resent, Some(vec!["g1:c1".to_owned()]));
+        assert!(matches!(
+            p2.entries.first(),
+            Some(TranscriptEntry::Ask { id, answer: Some(ans), form_status: None, .. })
+                if id == "g1:c1" && ans == &["Desktop, iOS", "Line one\nLine two"]
+        ));
+
+        // Decode real protobuf shape for ask_question (f5 metadata + f140 kv_args + f140.f2.f1 answer).
+        let mut tc = pb_len_delim(1, b"call_ask_pb");
+        tc.extend(pb_len_delim(2, b"ask_question"));
+        let mut meta = pb_len_delim(4, &tc);
+        meta.extend(pb_len_delim(35, b"step-ask-pb"));
+        let mut kv = pb_len_delim(1, b"questions");
+        kv.extend(pb_len_delim(
+            2,
+            br#"[{"question":"Ship now?","is_multi_select":false,"options":["Yes","No"]}]"#,
+        ));
+        let res = pb_len_delim(
+            1,
+            b"Created At: 2026-11-27T08:38:59+01:00\nCompleted At: 2026-11-27T08:39:46+01:00\nA1: Yes",
+        );
+        let mut f140 = pb_len_delim(1, &kv);
+        f140.extend(pb_len_delim(2, &res));
+        let mut payload = pb_len_delim(5, &meta);
+        payload.extend(pb_len_delim(140, &f140));
+        let decoded = decode_step_row(
+            10,
+            STEP_TYPE_GENERIC,
+            STATUS_DONE,
+            None,
+            None,
+            Some(&payload),
+        );
+        let pb_page = page_steps("s-ask-pb", &[decoded], &PageRequest::default(), 20).unwrap();
+        assert!(matches!(
+            pb_page.entries.first(),
+            Some(TranscriptEntry::Ask { id, questions, answer: Some(ans), .. })
+                if id == "step-ask-pb:call_ask_pb"
+                    && questions.len() == 1
+                    && questions[0].question == "Ship now?"
+                    && ans == &["Yes"]
+        ));
     }
 }
