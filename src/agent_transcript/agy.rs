@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::schema::{
-    TranscriptEntry, TranscriptNoteSource, TranscriptPlanItem, TranscriptStepStatus,
-    TranscriptTaskStatus, TranscriptTurnStatus, TranscriptWorking,
+    TranscriptEntry, TranscriptModel, TranscriptNoteSource, TranscriptPlanItem,
+    TranscriptStepStatus, TranscriptTaskStatus, TranscriptTurnStatus, TranscriptWorking,
 };
 
 use super::normalize::{self, DETAIL_MAX_CHARS, NOTE_BODY_MAX_CHARS};
@@ -33,6 +33,7 @@ const STEP_TYPE_PLANNER_RESPONSE: i64 = 15;
 const STEP_TYPE_EPHEMERAL: i64 = 101;
 const STEP_TYPE_GENERIC: i64 = 132;
 
+const STATUS_PENDING: i64 = 1;
 const STATUS_RUNNING: i64 = 2;
 const STATUS_DONE: i64 = 3;
 const STATUS_CANCELED: i64 = 6;
@@ -507,7 +508,7 @@ impl DecodedStep {
     }
 
     fn is_running(&self) -> bool {
-        self.status == STATUS_RUNNING
+        matches!(self.status, STATUS_PENDING | STATUS_RUNNING)
             && matches!(
                 self.payload,
                 StepPayload::Tool { .. } | StepPayload::Planner { .. }
@@ -810,8 +811,10 @@ pub(crate) fn read_page(path: &Path, request: &PageRequest) -> Result<Page, Tran
         )));
     }
 
-    let (session_id, steps) = load_conversation(path)?;
-    page_steps(&session_id, &steps, request, limit)
+    let (session_id, steps, model) = load_conversation(path)?;
+    let mut page = page_steps(&session_id, &steps, request, limit)?;
+    page.model = model;
+    Ok(page)
 }
 
 fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptError> {
@@ -851,7 +854,7 @@ fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptErro
         after,
         pending_ask: None,
         working: None,
-        model: None,
+        model: model_from_cli_log(path),
         plan: None,
         recap: None,
         subagents: None,
@@ -860,7 +863,9 @@ fn empty_page(path: &Path, request: &PageRequest) -> Result<Page, TranscriptErro
     })
 }
 
-fn load_conversation(path: &Path) -> Result<(String, Vec<DecodedStep>), TranscriptError> {
+fn load_conversation(
+    path: &Path,
+) -> Result<(String, Vec<DecodedStep>, Option<TranscriptModel>), TranscriptError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|err| TranscriptError::Unavailable(std::io::Error::other(err.to_string())))?;
@@ -923,7 +928,135 @@ fn load_conversation(path: &Path) -> Result<(String, Vec<DecodedStep>), Transcri
             step_payload.as_deref(),
         ));
     }
-    Ok((session_id, steps))
+    let model = load_conversation_model(&conn).or_else(|| model_from_cli_log(path));
+    Ok((session_id, steps, model))
+}
+
+/// Extract the active model from the conversation's `gen_metadata` table:
+/// newest row's field `1.21` (display label like `"Gemini 4 Neon (High)"`) or
+/// `1.19` (slug like `"gemini-4-neon"`), falling back to field `3.28`
+/// (`"gemini-4-neon-high"`) for brand-new conversations before the first reply.
+fn load_conversation_model(conn: &Connection) -> Option<TranscriptModel> {
+    let mut stmt = conn
+        .prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .ok()?;
+    let mut fallback: Option<(String, Option<String>)> = None;
+    for row in rows.flatten() {
+        let Some(blob) = row else { continue };
+        let Some(fields) = decode_pb(&blob) else {
+            continue;
+        };
+        if let Some(f1_bytes) = pb_bytes(&fields, 1) {
+            if let Some(f1) = decode_pb(f1_bytes) {
+                if let Some(label) = pb_str(&f1, 21) {
+                    if let Some((id, thinking_level)) = parse_agy_model_label(label) {
+                        return Some(agy_transcript_model(id, thinking_level));
+                    }
+                }
+                if let Some(slug) = pb_str(&f1, 19) {
+                    if let Some((id, thinking_level)) = parse_agy_model_slug(slug) {
+                        return Some(agy_transcript_model(id, thinking_level));
+                    }
+                }
+            }
+        }
+        if fallback.is_none() {
+            if let Some(f3_bytes) = pb_bytes(&fields, 3) {
+                if let Some(f3) = decode_pb(f3_bytes) {
+                    if let Some(slug) = pb_str(&f3, 28) {
+                        fallback = parse_agy_model_slug(slug);
+                    }
+                }
+            }
+        }
+    }
+    fallback.map(|(id, thinking_level)| agy_transcript_model(id, thinking_level))
+}
+
+fn agy_transcript_model(id: String, thinking_level: Option<String>) -> TranscriptModel {
+    TranscriptModel {
+        provider: "antigravity".to_owned(),
+        id,
+        harness: Some("agy".to_owned()),
+        thinking_level,
+        thinking_auto: false,
+    }
+}
+
+fn parse_agy_model_label(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(open) = trimmed.rfind(" (") {
+        if let Some(inner) = trimmed[open + 2..].strip_suffix(')') {
+            let lowered = inner.trim().to_ascii_lowercase();
+            if matches!(
+                lowered.as_str(),
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
+                let base = trimmed[..open].trim();
+                if !base.is_empty() {
+                    return Some((base.to_owned(), Some(lowered)));
+                }
+            }
+        }
+    }
+    Some((trimmed.to_owned(), None))
+}
+
+fn parse_agy_model_slug(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for suffix in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+        let needle = format!("-{suffix}");
+        if trimmed.len() > needle.len()
+            && trimmed[trimmed.len() - needle.len()..].eq_ignore_ascii_case(&needle)
+        {
+            let base = trimmed[..trimmed.len() - needle.len()].trim();
+            if !base.is_empty() {
+                return Some((base.to_owned(), Some(suffix.to_owned())));
+            }
+        }
+    }
+    Some((trimmed.to_owned(), None))
+}
+
+/// Fallback when a conversation has no `gen_metadata` rows yet: inspect the
+/// sibling `<app_data_dir>/cli.log` for the latest model override line.
+fn model_from_cli_log(db_path: &Path) -> Option<TranscriptModel> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+    const NEEDLE: &str = "Propagating selected model override to backend: label=\"";
+
+    let log_path = db_path.parent()?.parent()?.join("cli.log");
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut buf = Vec::new();
+    if len > MAX_TAIL_BYTES {
+        file.seek(SeekFrom::End(-(MAX_TAIL_BYTES as i64))).ok()?;
+    }
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines().rev() {
+        let Some(pos) = line.find(NEEDLE) else {
+            continue;
+        };
+        let rest = &line[pos + NEEDLE.len()..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        if let Some((id, thinking_level)) = parse_agy_model_label(&rest[..end]) {
+            return Some(agy_transcript_model(id, thinking_level));
+        }
+    }
+    None
 }
 
 fn page_steps(
@@ -1583,7 +1716,7 @@ fn render_step(
                 return;
             }
             let status = match step.status {
-                STATUS_RUNNING => TranscriptStepStatus::Running,
+                STATUS_PENDING | STATUS_RUNNING => TranscriptStepStatus::Running,
                 STATUS_CANCELED | STATUS_ERROR => TranscriptStepStatus::Error,
                 STATUS_DONE => TranscriptStepStatus::Ok,
                 _ => TranscriptStepStatus::Ok,
@@ -1634,27 +1767,46 @@ fn render_step(
 
 fn current_working(steps: &[DecodedStep]) -> Option<TranscriptWorking> {
     let last_user = steps.iter().rposition(DecodedStep::is_user).unwrap_or(0);
+    // Prefer any active tool step (running or queued) in the current turn, even
+    // if a planner reply has already been emitted (e.g. a backgrounded command).
     for step in steps[last_user..].iter().rev() {
-        match &step.payload {
-            StepPayload::Tool {
-                tool,
-                args_json,
-                kv_args,
-                ui_verb,
-                ..
-            } if step.status == STATUS_RUNNING => {
+        if let StepPayload::Tool {
+            tool,
+            args_json,
+            kv_args,
+            ui_verb,
+            ..
+        } = &step.payload
+        {
+            if matches!(step.status, STATUS_PENDING | STATUS_RUNNING) && tool != "schedule" {
                 return Some(TranscriptWorking {
                     intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
                     tool: tool.clone(),
                     since_ms: step.created_ms,
                 });
             }
-            StepPayload::Planner {
-                reply,
-                has_tool_calls: false,
-                ..
-            } if !reply.trim().is_empty() => return None,
-            _ => {}
+        }
+    }
+    // Also surface a background command/workflow started in an earlier turn
+    // that is still running.
+    for step in steps[..last_user].iter().rev() {
+        if let StepPayload::Tool {
+            tool,
+            args_json,
+            kv_args,
+            ui_verb,
+            ..
+        } = &step.payload
+        {
+            if step.status == STATUS_RUNNING
+                && matches!(tool.as_str(), "run_command" | "run_workflow")
+            {
+                return Some(TranscriptWorking {
+                    intent: agy_step_intent(tool, args_json.as_ref(), kv_args, ui_verb.as_deref()),
+                    tool: tool.clone(),
+                    since_ms: step.created_ms,
+                });
+            }
         }
     }
     None
@@ -1727,6 +1879,15 @@ fn agy_step_intent(
             return format!("{verb} {base}");
         }
         return verb.to_owned();
+    }
+    if tool == "run_command" {
+        if let Some(cmd) = lookup_arg(args_json, kv_args, "CommandLine")
+            .or_else(|| lookup_arg(args_json, kv_args, "command"))
+        {
+            if let Some(first_line) = cmd.lines().map(str::trim).find(|line| !line.is_empty()) {
+                return truncate_chars(first_line, 120);
+            }
+        }
     }
     match tool {
         "read_file" => "Read file",
@@ -2578,5 +2739,246 @@ mod tests {
             p2.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
             ["g2:c2", "p1:reply", "p1:end", "u3", "p4:reply", "p4:end"]
         );
+    }
+
+    fn pb_len_delim(field_num: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut tag = ((field_num as u64) << 3) | 2;
+        loop {
+            let mut b = (tag & 0x7f) as u8;
+            tag >>= 7;
+            if tag != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if tag == 0 {
+                break;
+            }
+        }
+        let mut len = payload.len() as u64;
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn gen_metadata_model_decodes_label_slug_and_cli_log_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-agy-model-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conv_dir = dir.join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let missing_db = conv_dir.join("new-conv.db");
+        std::fs::write(
+            dir.join("cli.log"),
+            "I1127 12:34:02 model_config_manager.go:375] Propagating selected model override to backend: label=\"Gemini 4 Neon (High)\"\n",
+        )
+        .unwrap();
+
+        // Empty conversation falls back to cli.log.
+        let empty = read_page(&missing_db, &PageRequest::default()).unwrap();
+        assert_eq!(
+            empty.model,
+            Some(TranscriptModel {
+                provider: "antigravity".into(),
+                id: "Gemini 4 Neon".into(),
+                harness: Some("agy".into()),
+                thinking_level: Some("high".into()),
+                thinking_auto: false,
+            })
+        );
+
+        // Conversation with gen_metadata field 3.28 slug only (before first reply).
+        let slug_db = conv_dir.join("slug-conv.db");
+        let conn = Connection::open(&slug_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, metadata BLOB, error_details BLOB, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+        let f3 = pb_len_delim(28, b"gemini-4-neon-medium");
+        let blob_slug = pb_len_delim(3, &f3);
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+            [&blob_slug],
+        )
+        .unwrap();
+        drop(conn);
+        let slug_page = read_page(&slug_db, &PageRequest::default()).unwrap();
+        assert_eq!(
+            slug_page.model,
+            Some(TranscriptModel {
+                provider: "antigravity".into(),
+                id: "gemini-4-neon".into(),
+                harness: Some("agy".into()),
+                thinking_level: Some("medium".into()),
+                thinking_auto: false,
+            })
+        );
+
+        // Newer gen_metadata row with field 1.21 display label overrides slug + cli.log.
+        let conn = Connection::open(&slug_db).unwrap();
+        let mut f1 = pb_len_delim(19, b"gemini-4-neon");
+        f1.extend(pb_len_delim(21, b"Gemini 4 Neon (Low)"));
+        let blob_label = pb_len_delim(1, &f1);
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [&blob_label],
+        )
+        .unwrap();
+        drop(conn);
+        let label_page = read_page(&slug_db, &PageRequest::default()).unwrap();
+        assert_eq!(
+            label_page.model,
+            Some(TranscriptModel {
+                provider: "antigravity".into(),
+                id: "Gemini 4 Neon".into(),
+                harness: Some("agy".into()),
+                thinking_level: Some("low".into()),
+                thinking_auto: false,
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_working_tracks_background_running_command_after_reply_and_across_turns() {
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Run tests".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_RUNNING,
+                step_id: "g1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c1".into(),
+                    tool: "run_command".into(),
+                    args_json: Some(
+                        serde_json::json!({"CommandLine": "cargo test --all\necho done"}),
+                    ),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_DONE,
+                step_id: "p2".into(),
+                created_ms: 1200,
+                completed_ms: Some(1200),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Started tests in background.".into(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+
+        // Even after a non-tool planner reply, the backgrounded run_command is still working.
+        let working = current_working(&steps).expect("background run_command still working");
+        assert_eq!(working.tool, "run_command");
+        assert_eq!(working.intent, "cargo test --all");
+
+        // A later turn with only a waiting `schedule` timer still surfaces the earlier running command.
+        steps.push(DecodedStep {
+            idx: 3,
+            status: STATUS_DONE,
+            step_id: "u3".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Any updates?".into(),
+            },
+        });
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_RUNNING,
+            step_id: "g4".into(),
+            created_ms: 2100,
+            completed_ms: None,
+            payload: StepPayload::Tool {
+                call_id: "c4".into(),
+                tool: "schedule".into(),
+                args_json: Some(serde_json::json!({"DurationSeconds": 60})),
+                kv_args: Vec::new(),
+                ui_verb: None,
+                error_message: None,
+            },
+        });
+        let still = current_working(&steps).expect("earlier background command still working");
+        assert_eq!(still.tool, "run_command");
+        assert_eq!(still.intent, "cargo test --all");
+
+        // Once the command settles, the waiting schedule timer alone is not reported as working.
+        steps[1].status = STATUS_DONE;
+        assert!(current_working(&steps).is_none());
+    }
+
+    #[test]
+    fn pending_tool_step_renders_running_and_command_line_fallback_intent() {
+        let steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Check".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_PENDING,
+                step_id: "g1".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c1".into(),
+                    tool: "run_command".into(),
+                    args_json: Some(serde_json::json!({"CommandLine": "\n  git status --short\n"})),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                },
+            },
+        ];
+        let page = page_steps("s-pending", &steps, &PageRequest::default(), 20).unwrap();
+        let working = page.working.expect("pending tool reports working");
+        assert_eq!(working.intent, "git status --short");
+        assert!(matches!(
+            page.entries.last(),
+            Some(TranscriptEntry::Step {
+                status: TranscriptStepStatus::Running,
+                intent,
+                ..
+            }) if intent == "git status --short"
+        ));
     }
 }

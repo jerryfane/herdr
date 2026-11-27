@@ -680,6 +680,7 @@ fn current_model_tracks_selection_role_branch_and_clear() {
         Some(TranscriptModel {
             provider: "other".into(),
             id: "selected".into(),
+            harness: Some("omp".into()),
             thinking_level: None,
             thinking_auto: false,
         })
@@ -1845,6 +1846,7 @@ fn current_model_carries_the_newest_thinking_level() {
     let plain = serde_json::to_value(TranscriptModel {
         provider: "p".into(),
         id: "m".into(),
+        harness: None,
         thinking_level: None,
         thinking_auto: false,
     })

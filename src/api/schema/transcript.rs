@@ -93,8 +93,11 @@ pub enum TranscriptTurnStatus {
 pub struct TranscriptModel {
     pub provider: String,
     pub id: String,
-    /// The effort omp runs the model at: minimal, low, medium, high, xhigh or
-    /// max. Absent when thinking is off or the level is unknown.
+    /// The agent harness running this session (`"omp"`, `"agy"`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// The effort the agent runs the model at: minimal, low, medium, high,
+    /// xhigh or max. Absent when thinking is off or the level is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
     /// omp picks the level per turn (`/thinking auto`).
