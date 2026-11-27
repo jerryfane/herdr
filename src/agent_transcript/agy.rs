@@ -991,12 +991,11 @@ fn agy_transcript_model(id: String, thinking_level: Option<String>) -> Transcrip
 }
 
 fn parse_agy_effort(raw: &str) -> Option<String> {
-    let lowered = raw.trim().to_ascii_lowercase();
-    matches!(
-        lowered.as_str(),
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-    )
-    .then_some(lowered)
+    let trimmed = raw.trim();
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .find(|&&level| trimmed.eq_ignore_ascii_case(level))
+        .map(|&level| level.to_owned())
 }
 
 fn parse_agy_model_label(raw: &str) -> Option<(String, Option<String>)> {
@@ -1181,8 +1180,28 @@ fn page_steps(
             if pos >= start || steps[pos].is_running() {
                 continue;
             }
+            // If a previously running/pending step settles in an earlier turn
+            // whose tip reply is no longer tracked by `prev_tip_reply` (e.g. a
+            // newer turn already started before `start`), and that turn's reply
+            // is now final, incremental replay cannot insert its `TurnEnd`
+            // ahead of the later turn's entries. Expire the cursor so the
+            // client reloads in order.
+            let (turn_start, turn_end) = turn_bounds(steps, pos);
+            if turn_end < start {
+                if let Some(reply_pos) = (turn_start..turn_end).rev().find(|&p| {
+                    matches!(
+                        &steps[p].payload,
+                        StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
+                    )
+                }) {
+                    let tracked = prev_tip_reply
+                        .is_some_and(|(reply_idx, _, _)| reply_idx == steps[reply_pos].idx);
+                    if !tracked && is_reply_final(steps, reply_pos) {
+                        return Err(TranscriptError::CursorExpired);
+                    }
+                }
+            }
             if steps[pos].plan_items().is_some() {
-                let (turn_start, turn_end) = turn_bounds(steps, pos);
                 if resent_plan_turns.insert(turn_start) {
                     if let Some(plan_entry) = build_turn_plan(steps, turn_start, turn_end) {
                         resent_ids.push(plan_entry.id().to_owned());
@@ -2984,5 +3003,124 @@ mod tests {
         )
         .unwrap();
         assert!(p2.working.is_some());
+    }
+
+    #[test]
+    fn earlier_turn_pending_command_settling_after_next_turn_expires_cursor() {
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Turn A".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_DONE,
+                step_id: "p1".into(),
+                created_ms: 1050,
+                completed_ms: Some(1050),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Running command in turn A.".into(),
+                    has_tool_calls: true,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_PENDING,
+                step_id: "g2".into(),
+                created_ms: 1100,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c2".into(),
+                    tool: "run_command".into(),
+                    args_json: Some(serde_json::json!({"CommandLine": "sleep 1"})),
+                    kv_args: Vec::new(),
+                    ui_verb: None,
+                    error_message: None,
+                },
+            },
+        ];
+        // Poll 1: turn A has reply (not final) + pending command.
+        let p1 = page_steps("s-multi", &steps, &PageRequest::default(), 20).unwrap();
+        assert!(matches!(
+            p1.entries.iter().find(|e| e.id() == "p1:reply"),
+            Some(TranscriptEntry::Reply { is_final: false, .. })
+        ));
+
+        // Turn B starts while turn A's command is still pending.
+        steps.push(DecodedStep {
+            idx: 3,
+            status: STATUS_DONE,
+            step_id: "u3".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Turn B".into(),
+            },
+        });
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_DONE,
+            step_id: "p4".into(),
+            created_ms: 2050,
+            completed_ms: Some(2050),
+            payload: StepPayload::Planner {
+                thinking: String::new(),
+                reply: "Done with turn B.".into(),
+                has_tool_calls: false,
+            },
+        });
+        // Poll 2: cursor advances past turn B while turn A's command is still tracked as running.
+        let p2 = page_steps(
+            "s-multi",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+
+        // Turn A's command now finishes -> reply p1:reply becomes final and needs p1:end
+        // BEFORE turn B, so incremental replay must expire the cursor rather than leave
+        // p1:reply permanently non-final.
+        steps[2].status = STATUS_DONE;
+        steps[2].completed_ms = Some(2100);
+        let err = page_steps(
+            "s-multi",
+            &steps,
+            &PageRequest {
+                after: Some(p2.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TranscriptError::CursorExpired));
+
+        // Fresh read after CursorExpired includes p1:reply (final=true) and p1:end in order.
+        let fresh = page_steps("s-multi", &steps, &PageRequest::default(), 20).unwrap();
+        assert!(matches!(
+            fresh.entries.iter().find(|e| e.id() == "p1:reply"),
+            Some(TranscriptEntry::Reply { is_final: true, .. })
+        ));
+        let p1_end_idx = fresh
+            .entries
+            .iter()
+            .position(|e| e.id() == "p1:end")
+            .expect("p1:end present on fresh reload");
+        let u3_idx = fresh
+            .entries
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::User { text, .. } if text == "Turn B"))
+            .expect("Turn B present");
+        assert!(p1_end_idx < u3_idx, "p1:end must precede Turn B");
     }
 }
