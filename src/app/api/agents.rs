@@ -51,6 +51,7 @@ impl App {
         // Local agents first. Ordinary callers also receive the coordinator's
         // cached remote directory, while federation pollers explicitly request
         // local-only state so peers cannot recursively re-export aggregates.
+        self.refresh_missing_agy_agent_sessions();
         let mut agents = self.collect_agent_infos();
         for agent in &mut agents {
             self.fill_topic_sessions(agent);
@@ -114,6 +115,7 @@ impl App {
         let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &label);
         };
+        self.refresh_agy_agent_session(resolved.ws_idx, resolved.pane_id, true);
         let agent = self.agent_info(resolved.ws_idx, resolved.pane_id);
         let running =
             agent.is_some() && self.agent_pane_runs_agent(resolved.ws_idx, resolved.pane_id);
@@ -154,6 +156,9 @@ impl App {
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
         self.reconcile_managed_agent_target(&target.target);
+        if let Ok(resolved) = self.resolve_agent_target(&target.target) {
+            self.refresh_agy_agent_session(resolved.ws_idx, resolved.pane_id, false);
+        }
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
