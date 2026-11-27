@@ -1142,6 +1142,24 @@ fn page_steps(
 
     let resent = is_after.then_some(resent_ids);
 
+    // If a previously unsettled turn-tip reply (`pos < start`) has now settled
+    // AND its closing step is also `< start` (e.g. its trailing tool or planner
+    // transitioned RUNNING -> DONE in place), append its `TurnEnd` here — AFTER
+    // snapshotting `resent` (it is a brand-new entry) and strictly BEFORE any
+    // new steps in `start..end` (which may begin with the next user turn).
+    // When `close_pos >= start`, `render_step` emits `TurnEnd` right after the
+    // closing step inside `start..end`, still before any subsequent user turn.
+    if let Some(reply_pos) = pending_turn_end {
+        if turn_close_pos_for_reply(steps, reply_pos).is_some_and(|close_pos| close_pos < start) {
+            entries.push(TranscriptEntry::TurnEnd {
+                id: format!("{}:end", steps[reply_pos].step_id),
+                ts_ms: turn_completed_ms(steps, reply_pos),
+                status: turn_end_status(steps, reply_pos),
+                error: None,
+            });
+        }
+    }
+
     let start = match request.max_bytes {
         Some(max_bytes) if !is_after => {
             let matched = other_user_turns(steps, other_prompts);
@@ -1163,27 +1181,6 @@ fn page_steps(
             start
         }
     };
-
-    // If a previously unsettled turn-tip reply (`pos < start`) has now settled
-    // and its `TurnEnd` was not already emitted while rendering `start..end`
-    // (e.g. its closing tool was `< start` and transitioned RUNNING -> DONE in
-    // place), append `TurnEnd` now, strictly after all steps.
-    if let Some(reply_pos) = pending_turn_end {
-        let end_id = format!("{}:end", steps[reply_pos].step_id);
-        let close_in_new = turn_close_pos_for_reply(steps, reply_pos)
-            .is_some_and(|close_pos| close_pos >= start && close_pos < end);
-        let already_emitted = entries.iter().any(|e| e.id() == end_id);
-        let close_visible =
-            turn_close_pos_for_reply(steps, reply_pos).is_some_and(|close_pos| close_pos < end);
-        if close_visible && !close_in_new && !already_emitted {
-            entries.push(TranscriptEntry::TurnEnd {
-                id: end_id,
-                ts_ms: turn_completed_ms(steps, reply_pos),
-                status: turn_end_status(steps, reply_pos),
-                error: None,
-            });
-        }
-    }
 
     let has_user = entries
         .iter()
@@ -2484,5 +2481,102 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn inplace_settlement_with_next_user_turn_places_turn_end_before_next_user() {
+        // Turn 1 starts with a reply + RUNNING tool; on the next `after` poll,
+        // the tool settles RUNNING -> DONE in place AND Turn 2 (User + Reply)
+        // lands in the same poll. Turn 1's TurnEnd must appear BEFORE Turn 2's
+        // User entry (and not in `resent`).
+        let mut steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User {
+                    text: "Turn 1".into(),
+                },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_DONE,
+                step_id: "p1".into(),
+                created_ms: 1100,
+                completed_ms: Some(1100),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Running command".into(),
+                    has_tool_calls: true,
+                },
+            },
+            DecodedStep {
+                idx: 2,
+                status: STATUS_RUNNING,
+                step_id: "g2".into(),
+                created_ms: 1200,
+                completed_ms: None,
+                payload: StepPayload::Tool {
+                    call_id: "c2".into(),
+                    tool: "run_command".into(),
+                    args_json: None,
+                    kv_args: Vec::new(),
+                    ui_verb: Some("Check".into()),
+                    error_message: None,
+                },
+            },
+        ];
+        let p1 = page_steps("s-order", &steps, &PageRequest::default(), 20).unwrap();
+        assert_eq!(
+            p1.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["u0", "p1:reply", "g2:c2"]
+        );
+
+        // Settle g2 in place AND append Turn 2 (u3 + p4) in the same poll.
+        steps[2].status = STATUS_DONE;
+        steps[2].completed_ms = Some(1300);
+        steps.push(DecodedStep {
+            idx: 3,
+            status: STATUS_DONE,
+            step_id: "u3".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Turn 2".into(),
+            },
+        });
+        steps.push(DecodedStep {
+            idx: 4,
+            status: STATUS_DONE,
+            step_id: "p4".into(),
+            created_ms: 2100,
+            completed_ms: Some(2100),
+            payload: StepPayload::Planner {
+                thinking: String::new(),
+                reply: "Done with turn 2".into(),
+                has_tool_calls: false,
+            },
+        });
+
+        let p2 = page_steps(
+            "s-order",
+            &steps,
+            &PageRequest {
+                after: Some(p1.after),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            p2.resent,
+            Some(vec!["g2:c2".to_owned(), "p1:reply".to_owned()])
+        );
+        assert_eq!(
+            p2.entries.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            ["g2:c2", "p1:reply", "p1:end", "u3", "p4:reply", "p4:end"]
+        );
     }
 }
