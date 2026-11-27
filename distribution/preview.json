@@ -2,42 +2,79 @@
   "schema_version": 2,
   "channel": "preview",
   "base_version": "0.9.5",
-  "build_id": "2026-11-27-4865ab380f8e",
-  "commit": "4865ab380f8e4d2f57d75e674a54cc46628bfe6d",
-  "commit_time": 1795794792,
-  "built_at": "2026-11-27T16:25:28Z",
+  "build_id": "2026-11-27-28df491fe55e",
+  "commit": "28df491fe55e8cd30562ee9166dc4d2eeae1be44",
+  "commit_time": 1795811210,
+  "built_at": "2026-11-27T20:44:02Z",
   "protocol": 22,
   "endpoint_generation": 1,
-  "notes": "Preview build 2026-11-27-4865ab380f8e\n\n[View changes](https://github.com/jerryfane/herdr/compare/c07ada3a5416be47fd6e104a3e1fb3470e7a8f9e...4865ab380f8e4d2f57d75e674a54cc46628bfe6d)",
+  "notes": "Preview build 2026-11-27-28df491fe55e\n\n[View changes](https://github.com/jerryfane/herdr/compare/4865ab380f8e4d2f57d75e674a54cc46628bfe6d...28df491fe55e8cd30562ee9166dc4d2eeae1be44)",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-4865ab380f8e/herdr-linux-x86_64",
-      "sha256": "656152a8c8bfc3a6787438c6ce96a924e933cfdf88367714f43d924c631beea0",
-      "size": 48814600
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-linux-x86_64",
+      "sha256": "bbbe8c249a826e299e6cc6d284452e67ba3ab19c34ee1161f37b8a837c2d3b32",
+      "size": 48785656
     },
     "linux-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-4865ab380f8e/herdr-linux-aarch64",
-      "sha256": "333718be965918eb6e225795f095f78592bce3fbe409d11cef03890c9b0115df",
-      "size": 44398616
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-linux-aarch64",
+      "sha256": "07e1f6e157fab5688817aacc3ef8a6dc5f25c6e7bf75261ab15cb5cc83a349eb",
+      "size": 44760960
     },
     "macos-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-4865ab380f8e/herdr-macos-x86_64",
-      "sha256": "20e7e045705ccb618351d00559f44b79a4d42c619e62260e27a834b69376d73c",
-      "size": 41120856
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-macos-x86_64",
+      "sha256": "a957929660313f426e0dc96c78ccf89d1b19d8bc887010168311d119dbeb2919",
+      "size": 40839832
     },
     "macos-aarch64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-4865ab380f8e/herdr-macos-aarch64",
-      "sha256": "fd547943b6e96f7d507570f00a94f273ec929d9c875eecf102ad78eb0aee7fdd",
-      "size": 37935824
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-macos-aarch64",
+      "sha256": "cb7aa073a427f8b5ef60587b6b843a361b9ed753bc146a82f1eca42a351b1834",
+      "size": 38032208
     },
     "windows-x86_64": {
-      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-4865ab380f8e/herdr-windows-x86_64.zip",
-      "sha256": "8ea2af12c5b72894bbde4d2f68ef61892626f7f2463bffc8d97fd7739ff6ceeb",
-      "size": 14560524,
+      "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-windows-x86_64.zip",
+      "sha256": "e7bc92700f518a5e8ef14df4a58f0a86227f68cf6946c74b57c9e5436803670d",
+      "size": 14533151,
       "format": "zip"
     }
   },
   "builds": {
+    "2026-11-27-28df491fe55e": {
+      "base_version": "0.9.5",
+      "commit": "28df491fe55e8cd30562ee9166dc4d2eeae1be44",
+      "commit_time": 1795811210,
+      "built_at": "2026-11-27T20:44:02Z",
+      "protocol": 22,
+      "endpoint_generation": 1,
+      "tag": "preview-2026-11-27-28df491fe55e",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-linux-x86_64",
+          "sha256": "bbbe8c249a826e299e6cc6d284452e67ba3ab19c34ee1161f37b8a837c2d3b32",
+          "size": 48785656
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-linux-aarch64",
+          "sha256": "07e1f6e157fab5688817aacc3ef8a6dc5f25c6e7bf75261ab15cb5cc83a349eb",
+          "size": 44760960
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-macos-x86_64",
+          "sha256": "a957929660313f426e0dc96c78ccf89d1b19d8bc887010168311d119dbeb2919",
+          "size": 40839832
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-macos-aarch64",
+          "sha256": "cb7aa073a427f8b5ef60587b6b843a361b9ed753bc146a82f1eca42a351b1834",
+          "size": 38032208
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-27-28df491fe55e/herdr-windows-x86_64.zip",
+          "sha256": "e7bc92700f518a5e8ef14df4a58f0a86227f68cf6946c74b57c9e5436803670d",
+          "size": 14533151,
+          "format": "zip"
+        }
+      }
+    },
     "2026-11-27-4865ab380f8e": {
       "base_version": "0.9.5",
       "commit": "4865ab380f8e4d2f57d75e674a54cc46628bfe6d",
@@ -1107,43 +1144,6 @@
           "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-09-37dd406b6aec/herdr-windows-x86_64.zip",
           "sha256": "37e0a698781465ffa8b16d289302519552fbe3076065c6c052cb3ebe76ba3110",
           "size": 13550220,
-          "format": "zip"
-        }
-      }
-    },
-    "2026-11-08-ef8b80d63233": {
-      "base_version": "0.9.5",
-      "commit": "ef8b80d63233bb55b9f1cc6b07a9e24192061d04",
-      "commit_time": 1794175848,
-      "built_at": "2026-11-08T22:34:43Z",
-      "protocol": 22,
-      "endpoint_generation": 1,
-      "tag": "preview-2026-11-08-ef8b80d63233",
-      "assets": {
-        "linux-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-08-ef8b80d63233/herdr-linux-x86_64",
-          "sha256": "1a403c3e058e6e5a1024b74b062288ced16a94b81867e5deca006f4fece7c2e6",
-          "size": 44022136
-        },
-        "linux-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-08-ef8b80d63233/herdr-linux-aarch64",
-          "sha256": "bc362537ded04d38a34a40424f655e0e4ce4e3c01d68a881047e5b6011765635",
-          "size": 40460080
-        },
-        "macos-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-08-ef8b80d63233/herdr-macos-x86_64",
-          "sha256": "2614b2a2cecd44e3ce0730d4686b6262dd7ce9f201803f2fcb35ae969e537ee2",
-          "size": 37208528
-        },
-        "macos-aarch64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-08-ef8b80d63233/herdr-macos-aarch64",
-          "sha256": "88826b44972a3090641395eae1e47a3e5a247be1f52265263c16ad01ba35f821",
-          "size": 34413840
-        },
-        "windows-x86_64": {
-          "url": "https://github.com/jerryfane/herdr/releases/download/preview-2026-11-08-ef8b80d63233/herdr-windows-x86_64.zip",
-          "sha256": "5f9a3c74cf376476004d94868fab5a89865523ded0c7ae1368faa34a9758e3ac",
-          "size": 13623764,
           "format": "zip"
         }
       }
