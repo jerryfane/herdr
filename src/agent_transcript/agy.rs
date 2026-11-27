@@ -736,12 +736,15 @@ enum AgyCursor {
         origins: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         floor: Option<u32>,
-        /// `(reply_idx, was_final, turn_end_emitted)` for the newest planner
-        /// reply in the latest turn before `seen_next_idx`, so an `after` poll
-        /// can flip `final` and emit `TurnEnd` once when trailing tools settle
-        /// or when a later tool/planner arrives.
+        /// `(reply_idx, was_final, end_at_idx)` for the newest planner reply
+        /// in the latest turn before `seen_next_idx`. `end_at_idx` is `Some(idx)`
+        /// when `{step_id}:end` (`TurnEnd`) was emitted at step `idx`, so an
+        /// `after` poll can expire the cursor if a late tool/planner extends an
+        /// already-closed turn (clients merge by id in place and cannot move a
+        /// previously sent `TurnEnd`), or emit `TurnEnd` once after trailing
+        /// tools settle.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        tip_reply: Option<(u32, bool, bool)>,
+        tip_reply: Option<(u32, bool, Option<u32>)>,
     },
 }
 
@@ -1016,8 +1019,27 @@ fn page_steps(
     let mut entries = Vec::new();
     let mut resent_ids = Vec::new();
     let mut others: Option<Vec<(usize, String)>> = None;
+    let mut pending_turn_end: Option<usize> = None;
 
     if is_after {
+        // If the previous `after` cursor already emitted `TurnEnd` for the
+        // turn-tip reply and a late tool or planner has since extended that
+        // same turn (either RUNNING or DONE), expire the cursor so the client
+        // reloads cleanly: client-side `mergeTranscript` updates by id in place
+        // and cannot delete or relocate an earlier `TurnEnd` in front of new
+        // steps.
+        if let Some((reply_idx, _, Some(prev_end_idx))) = prev_tip_reply {
+            if let Some(pos) = pos_of_idx(reply_idx) {
+                if pos < start {
+                    let now_final = is_reply_final(steps, pos);
+                    let now_close_idx = turn_close_pos_for_reply(steps, pos).map(|p| steps[p].idx);
+                    if !now_final || now_close_idx != Some(prev_end_idx) {
+                        return Err(TranscriptError::CursorExpired);
+                    }
+                }
+            }
+        }
+
         let floor_pos = |floor_idx: Option<u32>| -> usize {
             steps.partition_point(|s| s.idx < floor_idx.unwrap_or(0))
         };
@@ -1033,7 +1055,7 @@ fn page_steps(
             let matched = other_user_turns(steps, other_prompts);
             for &(pos, _) in matched.iter().filter(|(pos, _)| range.contains(pos)) {
                 let before_len = entries.len();
-                render_step(steps, pos, &mut entries);
+                render_step(steps, pos, false, &mut entries);
                 for entry in &entries[before_len..] {
                     resent_ids.push(entry.id().to_owned());
                 }
@@ -1066,11 +1088,9 @@ fn page_steps(
                 resent_planners.insert(pos);
             }
             let before_len = entries.len();
-            render_step(steps, pos, &mut entries);
+            render_step(steps, pos, false, &mut entries);
             for entry in &entries[before_len..] {
-                if !matches!(entry, TranscriptEntry::TurnEnd { .. }) {
-                    resent_ids.push(entry.id().to_owned());
-                }
+                resent_ids.push(entry.id().to_owned());
             }
         }
 
@@ -1092,15 +1112,15 @@ fn page_steps(
         }
 
         // Re-send the previous turn-tip reply if its `final` state flipped
-        // (e.g. a trailing tool finished, or a new tool/planner arrived after
-        // the reply), and emit `TurnEnd` once when the turn settles.
-        if let Some((reply_idx, was_final, end_emitted)) = prev_tip_reply {
+        // (e.g. a trailing tool finished), and defer emitting `TurnEnd` until
+        // after `start..end` so `TurnEnd` always appears after any new steps.
+        if let Some((reply_idx, was_final, end_at_idx)) = prev_tip_reply {
             if let Some(pos) = pos_of_idx(reply_idx) {
-                if pos < start && !resent_planners.contains(&pos) {
+                if pos < start {
                     if let StepPayload::Planner { reply, .. } = &steps[pos].payload {
                         if !reply.trim().is_empty() {
                             let now_final = is_reply_final(steps, pos);
-                            if now_final != was_final {
+                            if !resent_planners.contains(&pos) && now_final != was_final {
                                 let reply_id = format!("{}:reply", steps[pos].step_id);
                                 resent_ids.push(reply_id.clone());
                                 entries.push(TranscriptEntry::Reply {
@@ -1110,13 +1130,8 @@ fn page_steps(
                                     is_final: now_final,
                                 });
                             }
-                            if now_final && !end_emitted {
-                                entries.push(TranscriptEntry::TurnEnd {
-                                    id: format!("{}:end", steps[pos].step_id),
-                                    ts_ms: turn_completed_ms(steps, pos),
-                                    status: turn_end_status(steps, pos),
-                                    error: None,
-                                });
+                            if now_final && end_at_idx.is_none() {
+                                pending_turn_end = Some(pos);
                             }
                         }
                     }
@@ -1143,11 +1158,32 @@ fn page_steps(
         }
         _ => {
             for pos in start..end {
-                render_step(steps, pos, &mut entries);
+                render_step(steps, pos, true, &mut entries);
             }
             start
         }
     };
+
+    // If a previously unsettled turn-tip reply (`pos < start`) has now settled
+    // and its `TurnEnd` was not already emitted while rendering `start..end`
+    // (e.g. its closing tool was `< start` and transitioned RUNNING -> DONE in
+    // place), append `TurnEnd` now, strictly after all steps.
+    if let Some(reply_pos) = pending_turn_end {
+        let end_id = format!("{}:end", steps[reply_pos].step_id);
+        let close_in_new = turn_close_pos_for_reply(steps, reply_pos)
+            .is_some_and(|close_pos| close_pos >= start && close_pos < end);
+        let already_emitted = entries.iter().any(|e| e.id() == end_id);
+        let close_visible =
+            turn_close_pos_for_reply(steps, reply_pos).is_some_and(|close_pos| close_pos < end);
+        if close_visible && !close_in_new && !already_emitted {
+            entries.push(TranscriptEntry::TurnEnd {
+                id: end_id,
+                ts_ms: turn_completed_ms(steps, reply_pos),
+                status: turn_end_status(steps, reply_pos),
+                error: None,
+            });
+        }
+    }
 
     let has_user = entries
         .iter()
@@ -1182,7 +1218,7 @@ fn page_steps(
         .filter(|s| s.is_running())
         .map(|s| s.idx)
         .collect();
-    let tip_reply = latest_tip_reply_state(steps, seen_end_pos, prev_tip_reply);
+    let tip_reply = latest_tip_reply_state(steps, seen_end_pos);
     let floor = if is_after {
         served_floor
     } else {
@@ -1328,7 +1364,7 @@ fn render_within(
     let mut rendered: Vec<Vec<TranscriptEntry>> = Vec::new();
     for pos in (start..end).rev() {
         let mut one = Vec::new();
-        render_step(steps, pos, &mut one);
+        render_step(steps, pos, true, &mut one);
         mark_other_origins(&mut one, others);
         let size: usize = one.iter().map(|entry| json_len(entry) + 1).sum();
         if size > 0 && kept_any && total + size > max_bytes {
@@ -1446,11 +1482,38 @@ fn turn_end_status(steps: &[DecodedStep], pos: usize) -> TranscriptTurnStatus {
     }
 }
 
+/// The step position that closes a settled turn owned by the planner reply at
+/// `reply_pos`: the last trailing tool step (if any) in the turn, otherwise
+/// `reply_pos` itself. `TurnEnd` is attached here so it always appears after
+/// any trailing tool steps.
+fn turn_close_pos_for_reply(steps: &[DecodedStep], reply_pos: usize) -> Option<usize> {
+    if !is_reply_final(steps, reply_pos) {
+        return None;
+    }
+    let (_, turn_end) = turn_bounds(steps, reply_pos);
+    let last_tool = ((reply_pos + 1)..turn_end).rev().find(|&p| {
+        matches!(steps[p].payload, StepPayload::Tool { .. }) && steps[p].plan_items().is_none()
+    });
+    Some(last_tool.unwrap_or(reply_pos))
+}
+
+/// If `pos` is the closing step of a settled turn, return the `reply_pos` that
+/// owns that turn's `{step_id}:end` entry.
+fn settled_turn_reply_for_close_pos(steps: &[DecodedStep], pos: usize) -> Option<usize> {
+    let (turn_start, turn_end) = turn_bounds(steps, pos);
+    let reply_pos = (turn_start..turn_end).rev().find(|&p| {
+        matches!(
+            &steps[p].payload,
+            StepPayload::Planner { reply, .. } if !reply.trim().is_empty()
+        )
+    })?;
+    (turn_close_pos_for_reply(steps, reply_pos) == Some(pos)).then_some(reply_pos)
+}
+
 fn latest_tip_reply_state(
     steps: &[DecodedStep],
     seen_end_pos: usize,
-    prev_tip_reply: Option<(u32, bool, bool)>,
-) -> Option<(u32, bool, bool)> {
+) -> Option<(u32, bool, Option<u32>)> {
     if seen_end_pos == 0 {
         return None;
     }
@@ -1466,11 +1529,18 @@ fn latest_tip_reply_state(
     })?;
     let reply_idx = steps[reply_pos].idx;
     let now_final = is_reply_final(steps, reply_pos);
-    let prev_ended = prev_tip_reply.is_some_and(|(idx, _, ended)| idx == reply_idx && ended);
-    Some((reply_idx, now_final, prev_ended || now_final))
+    let end_at_idx = turn_close_pos_for_reply(steps, reply_pos)
+        .filter(|&close_pos| close_pos < seen_end_pos)
+        .map(|close_pos| steps[close_pos].idx);
+    Some((reply_idx, now_final, end_at_idx))
 }
 
-fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>) {
+fn render_step(
+    steps: &[DecodedStep],
+    pos: usize,
+    include_turn_end: bool,
+    out: &mut Vec<TranscriptEntry>,
+) {
     let step = &steps[pos];
     match &step.payload {
         StepPayload::User { text } => {
@@ -1496,14 +1566,6 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
                     text: reply.clone(),
                     is_final,
                 });
-                if is_final {
-                    out.push(TranscriptEntry::TurnEnd {
-                        id: format!("{}:end", step.step_id),
-                        ts_ms: turn_completed_ms(steps, pos),
-                        status: turn_end_status(steps, pos),
-                        error: None,
-                    });
-                }
             }
         }
         StepPayload::Tool {
@@ -1559,6 +1621,17 @@ fn render_step(steps: &[DecodedStep], pos: usize, out: &mut Vec<TranscriptEntry>
             });
         }
         StepPayload::Ignored => {}
+    }
+
+    if include_turn_end {
+        if let Some(reply_pos) = settled_turn_reply_for_close_pos(steps, pos) {
+            out.push(TranscriptEntry::TurnEnd {
+                id: format!("{}:end", steps[reply_pos].step_id),
+                ts_ms: turn_completed_ms(steps, reply_pos),
+                status: turn_end_status(steps, reply_pos),
+                error: None,
+            });
+        }
     }
 }
 
@@ -2218,13 +2291,14 @@ mod tests {
             running: vec![1],
             origins: Some(7),
             floor: Some(0),
-            tip_reply: Some((1, true, true)),
+            tip_reply: Some((1, true, Some(1))),
         };
         let encoded = cur.encode(weird_sess);
         assert_eq!(AgyCursor::decode(&encoded, weird_sess).unwrap(), cur);
 
         // Planner with `has_tool_calls: true` must not emit premature TurnEnd
-        // before its tool lands; once the tool arrives and finishes, it settles.
+        // before its tool lands; once the tool arrives DONE, the after page
+        // order must be [Reply(final: true), Step(Ok), TurnEnd] (TurnEnd AFTER Step).
         let mut steps = vec![
             DecodedStep {
                 idx: 0,
@@ -2257,7 +2331,8 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TranscriptEntry::TurnEnd { .. })));
 
-        // Tool lands DONE -> reply settles (resent `final: true`) + TurnEnd added once.
+        // Tool lands DONE -> reply settles (resent `final: true`), Step lands,
+        // and TurnEnd is emitted ONCE strictly AFTER Step.
         steps.push(DecodedStep {
             idx: 2,
             status: STATUS_DONE,
@@ -2284,14 +2359,130 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p2.resent, Some(vec!["p1:reply".to_owned()]));
-        assert!(p2.entries.iter().any(|e| matches!(
-            e,
-            TranscriptEntry::Reply { id, is_final: true, .. } if id == "p1:reply"
-        )));
-        assert!(p2.entries.iter().any(|e| matches!(
-            e,
-            TranscriptEntry::TurnEnd { id, status: TranscriptTurnStatus::Done, .. }
-                if id == "p1:end"
-        )));
+        let kinds: Vec<&str> = p2.entries.iter().map(|e| e.id()).collect();
+        assert_eq!(kinds, ["p1:reply", "g2:c2", "p1:end"]);
+        assert!(matches!(
+            &p2.entries[0],
+            TranscriptEntry::Reply { is_final: true, .. }
+        ));
+        assert!(matches!(
+            &p2.entries[2],
+            TranscriptEntry::TurnEnd {
+                status: TranscriptTurnStatus::Done,
+                ..
+            }
+        ));
+
+        // Fresh read also puts TurnEnd strictly AFTER the trailing tool step.
+        let fresh = page_steps("s1", &steps, &PageRequest::default(), 20).unwrap();
+        let fresh_ids: Vec<&str> = fresh.entries.iter().map(|e| e.id()).collect();
+        assert_eq!(fresh_ids, ["u0", "p1:reply", "g2:c2", "p1:end"]);
+
+        // Fixture shape: reply with NO field 7 (`has_tool_calls: false`) read
+        // BEFORE a later tool is inserted closes the turn with TurnEnd; if a
+        // late tool is then inserted (RUNNING or DONE), the after poll expires
+        // the cursor so the client reloads without a stale TurnEnd in front of
+        // the tool. A normal new user turn does NOT expire the cursor.
+        let base_steps = vec![
+            DecodedStep {
+                idx: 0,
+                status: STATUS_DONE,
+                step_id: "u0".into(),
+                created_ms: 1000,
+                completed_ms: Some(1000),
+                payload: StepPayload::User { text: "Go".into() },
+            },
+            DecodedStep {
+                idx: 1,
+                status: STATUS_DONE,
+                step_id: "p1".into(),
+                created_ms: 1100,
+                completed_ms: Some(1100),
+                payload: StepPayload::Planner {
+                    thinking: String::new(),
+                    reply: "Summary".into(),
+                    has_tool_calls: false,
+                },
+            },
+        ];
+        let closed = page_steps("s2", &base_steps, &PageRequest::default(), 20).unwrap();
+        let closed_ids: Vec<&str> = closed.entries.iter().map(|e| e.id()).collect();
+        assert_eq!(closed_ids, ["u0", "p1:reply", "p1:end"]);
+
+        // Normal next turn (new User step) continues cleanly without expiring.
+        let mut next_turn = base_steps.clone();
+        next_turn.push(DecodedStep {
+            idx: 2,
+            status: STATUS_DONE,
+            step_id: "u2".into(),
+            created_ms: 2000,
+            completed_ms: Some(2000),
+            payload: StepPayload::User {
+                text: "Next".into(),
+            },
+        });
+        let cont = page_steps(
+            "s2",
+            &next_turn,
+            &PageRequest {
+                after: Some(closed.after.clone()),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(cont.entries.len(), 1);
+        assert_eq!(cont.entries[0].id(), "u2");
+
+        // Late RUNNING or DONE tool in the same turn expires the closed cursor,
+        // and the fresh reload places TurnEnd only when settled and after Step.
+        for tool_status in [STATUS_RUNNING, STATUS_DONE] {
+            let mut late = base_steps.clone();
+            late.push(DecodedStep {
+                idx: 2,
+                status: tool_status,
+                step_id: "g2".into(),
+                created_ms: 1200,
+                completed_ms: (tool_status == STATUS_DONE).then_some(1250),
+                payload: StepPayload::Tool {
+                    call_id: "c2".into(),
+                    tool: "run_command".into(),
+                    args_json: None,
+                    kv_args: Vec::new(),
+                    ui_verb: Some("Late tool".into()),
+                    error_message: None,
+                },
+            });
+            let err = page_steps(
+                "s2",
+                &late,
+                &PageRequest {
+                    after: Some(closed.after.clone()),
+                    ..Default::default()
+                },
+                20,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "cursor_expired");
+
+            let reloaded = page_steps("s2", &late, &PageRequest::default(), 20).unwrap();
+            let ids: Vec<&str> = reloaded.entries.iter().map(|e| e.id()).collect();
+            if tool_status == STATUS_RUNNING {
+                assert_eq!(ids, ["u0", "p1:reply", "g2:c2"]);
+                assert!(matches!(
+                    &reloaded.entries[1],
+                    TranscriptEntry::Reply {
+                        is_final: false,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(ids, ["u0", "p1:reply", "g2:c2", "p1:end"]);
+                assert!(matches!(
+                    &reloaded.entries[1],
+                    TranscriptEntry::Reply { is_final: true, .. }
+                ));
+            }
+        }
     }
 }
