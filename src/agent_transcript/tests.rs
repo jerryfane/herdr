@@ -697,6 +697,80 @@ fn current_model_tracks_selection_role_branch_and_clear() {
 }
 
 #[test]
+fn current_model_maps_agy_cli_provider_to_agy_harness() {
+    // ModelChange path: OMP-spawned agy CLI subagents write `agy-cli/<model>`.
+    let mut session = Fixture::new("agy-cli-subagent-model");
+    let root =
+        session.push(json!({"type": "model_change", "model": "agy-cli/gemini-4-neon-medium"}));
+    session.push(json!({
+        "type": "custom",
+        "customType": "agy_session",
+        "data": {"conversationId": "conv-1"}
+    }));
+    session.user("Work");
+    assert_eq!(
+        session.newest().model,
+        Some(TranscriptModel {
+            provider: "agy-cli".into(),
+            id: "gemini-4-neon-medium".into(),
+            harness: Some("agy".into()),
+            thinking_level: None,
+            thinking_auto: false,
+        })
+    );
+
+    // Switching back to a regular OMP provider restores `omp` harness.
+    session.push(json!({"type": "model_change", "model": "anthropic/claude-opus-5-5"}));
+    assert_eq!(
+        session.newest().model,
+        Some(TranscriptModel {
+            provider: "anthropic".into(),
+            id: "claude-opus-5-5".into(),
+            harness: Some("omp".into()),
+            thinking_level: None,
+            thinking_auto: false,
+        })
+    );
+
+    // Rewinding to the `agy-cli` branch restores `agy` harness.
+    session.push_under(
+        json!({"type": "message", "message": {
+            "role": "user", "content": "Rewound to agy-cli branch"
+        }}),
+        Some(&root),
+    );
+    assert_eq!(
+        session.newest().model.unwrap().harness.as_deref(),
+        Some("agy")
+    );
+
+    // Assistant-message fallback path (without an explicit `model_change` entry).
+    let mut assistant_only = Fixture::new("agy-cli-assistant-only");
+    assistant_only.user("Work");
+    assistant_only.push(json!({
+        "type": "message",
+        "message": {
+            "role": "assistant",
+            "provider": "agy-cli",
+            "model": "gemini-4-neon-high",
+            "content": [{"type": "text", "text": "Done"}],
+            "stopReason": "stop",
+            "timestamp": 1700000001000_u64
+        }
+    }));
+    assert_eq!(
+        assistant_only.newest().model,
+        Some(TranscriptModel {
+            provider: "agy-cli".into(),
+            id: "gemini-4-neon-high".into(),
+            harness: Some("agy".into()),
+            thinking_level: None,
+            thinking_auto: false,
+        })
+    );
+}
+
+#[test]
 fn latest_plan_preserves_phases_states_and_blockers_outside_the_page() {
     let mut session = Fixture::new("plan-metadata");
     session.user("Work");

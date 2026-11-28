@@ -890,16 +890,17 @@ impl View<'_> {
         })
     }
 
-    /// The selected model with the effort omp runs it at.
+    /// The selected model with the effort the harness runs it at.
     fn current_model(&self) -> Result<Option<TranscriptModel>, TranscriptError> {
         let Some((provider, id)) = self.selected_model()? else {
             return Ok(None);
         };
         let (thinking_level, thinking_auto) = self.thinking_level()?;
+        let harness = if provider == "agy-cli" { "agy" } else { "omp" };
         Ok(Some(TranscriptModel {
             provider,
             id,
-            harness: Some("omp".to_owned()),
+            harness: Some(harness.to_owned()),
             thinking_level,
             thinking_auto,
         }))
